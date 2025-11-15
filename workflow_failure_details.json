@@ -1,0 +1,403 @@
+{
+  "workflow_name": "WebSocket Self-Healing Validation",
+  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/19384578932",
+  "branch": "feature/macos-hud-ui",
+  "commit_sha": "e95f4c8",
+  "run_number": 25,
+  "failed_count": 6,
+  "fix_branch": "fix/ci/websocket-self-healing-validation-run25-20251115-044412",
+  "pr_title": "\ud83d\udea8 Fix CI/CD: WebSocket Self-Healing Validation (Run #25)",
+  "analyses": [
+    {
+      "error_patterns": [
+        {
+          "pattern": "ERROR|Error|error",
+          "matches": [
+            {
+              "line_number": 45,
+              "content": "2025-11-15T04:43:04.8529389Z ERROR: Cannot install psutil==5.9.6 and psutil==5.9.8 because these package versions have conflicting dependencies.",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 58,
+              "content": "2025-11-15T04:43:04.8543776Z ERROR: ResolutionImpossible: for help visit https://pip.pypa.io/en/latest/topics/dependency-resolution/#dealing-with-dependency-conflicts",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 59,
+              "content": "2025-11-15T04:43:05.3721130Z ##[error]Process completed with exit code 1.",
+              "severity": "high",
+              "emoji": "\u274c"
+            }
+          ],
+          "count": 3
+        },
+        {
+          "pattern": "FAIL|Failed|failed",
+          "matches": [
+            {
+              "line_number": 67,
+              "content": "2025-11-15T04:43:05.3788484Z \u001b[36;1m  echo \"\u274c Some tests failed - review logs\" >> $GITHUB_STEP_SUMMARY\u001b[0m",
+              "severity": "high",
+              "emoji": "\ud83d\udca5"
+            },
+            {
+              "line_number": 97,
+              "content": "2025-11-15T04:43:05.5343792Z ##[warning]The process '/usr/bin/git' failed with exit code 128",
+              "severity": "high",
+              "emoji": "\ud83d\udca5"
+            }
+          ],
+          "count": 2
+        },
+        {
+          "pattern": "WARN|Warning|warning",
+          "matches": [
+            {
+              "line_number": 97,
+              "content": "2025-11-15T04:43:05.5343792Z ##[warning]The process '/usr/bin/git' failed with exit code 128",
+              "severity": "medium",
+              "emoji": "\u26a0\ufe0f"
+            }
+          ],
+          "count": 1
+        }
+      ],
+      "suggested_fixes": [
+        "Consider increasing timeout values or optimizing slow operations",
+        "Review test cases and ensure code changes haven't broken existing functionality"
+      ],
+      "severity": "high",
+      "category": "test_failure",
+      "similar_failures": []
+    },
+    {
+      "error_patterns": [
+        {
+          "pattern": "ERROR|Error|error",
+          "matches": [
+            {
+              "line_number": 45,
+              "content": "2025-11-15T04:42:43.6299096Z ERROR: Cannot install psutil==5.9.6 and psutil==5.9.8 because these package versions have conflicting dependencies.",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 58,
+              "content": "2025-11-15T04:42:43.6313313Z ERROR: ResolutionImpossible: for help visit https://pip.pypa.io/en/latest/topics/dependency-resolution/#dealing-with-dependency-conflicts",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 59,
+              "content": "2025-11-15T04:42:44.0236954Z ##[error]Process completed with exit code 1.",
+              "severity": "high",
+              "emoji": "\u274c"
+            }
+          ],
+          "count": 3
+        },
+        {
+          "pattern": "FAIL|Failed|failed",
+          "matches": [
+            {
+              "line_number": 67,
+              "content": "2025-11-15T04:42:44.0304013Z \u001b[36;1m  echo \"\u274c Some tests failed - review logs\" >> $GITHUB_STEP_SUMMARY\u001b[0m",
+              "severity": "high",
+              "emoji": "\ud83d\udca5"
+            },
+            {
+              "line_number": 97,
+              "content": "2025-11-15T04:42:44.1830882Z ##[warning]The process '/usr/bin/git' failed with exit code 128",
+              "severity": "high",
+              "emoji": "\ud83d\udca5"
+            }
+          ],
+          "count": 2
+        },
+        {
+          "pattern": "WARN|Warning|warning",
+          "matches": [
+            {
+              "line_number": 97,
+              "content": "2025-11-15T04:42:44.1830882Z ##[warning]The process '/usr/bin/git' failed with exit code 128",
+              "severity": "medium",
+              "emoji": "\u26a0\ufe0f"
+            }
+          ],
+          "count": 1
+        }
+      ],
+      "suggested_fixes": [
+        "Consider increasing timeout values or optimizing slow operations",
+        "Review test cases and ensure code changes haven't broken existing functionality"
+      ],
+      "severity": "high",
+      "category": "test_failure",
+      "similar_failures": []
+    },
+    {
+      "error_patterns": [
+        {
+          "pattern": "ERROR|Error|error",
+          "matches": [
+            {
+              "line_number": 45,
+              "content": "2025-11-15T04:42:49.0791287Z ERROR: Cannot install psutil==5.9.6 and psutil==5.9.8 because these package versions have conflicting dependencies.",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 58,
+              "content": "2025-11-15T04:42:49.0804970Z ERROR: ResolutionImpossible: for help visit https://pip.pypa.io/en/latest/topics/dependency-resolution/#dealing-with-dependency-conflicts",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 59,
+              "content": "2025-11-15T04:42:49.5883295Z ##[error]Process completed with exit code 1.",
+              "severity": "high",
+              "emoji": "\u274c"
+            }
+          ],
+          "count": 3
+        },
+        {
+          "pattern": "FAIL|Failed|failed",
+          "matches": [
+            {
+              "line_number": 67,
+              "content": "2025-11-15T04:42:49.5946341Z \u001b[36;1m  echo \"\u274c Some tests failed - review logs\" >> $GITHUB_STEP_SUMMARY\u001b[0m",
+              "severity": "high",
+              "emoji": "\ud83d\udca5"
+            },
+            {
+              "line_number": 97,
+              "content": "2025-11-15T04:42:49.7402258Z ##[warning]The process '/usr/bin/git' failed with exit code 128",
+              "severity": "high",
+              "emoji": "\ud83d\udca5"
+            }
+          ],
+          "count": 2
+        },
+        {
+          "pattern": "WARN|Warning|warning",
+          "matches": [
+            {
+              "line_number": 97,
+              "content": "2025-11-15T04:42:49.7402258Z ##[warning]The process '/usr/bin/git' failed with exit code 128",
+              "severity": "medium",
+              "emoji": "\u26a0\ufe0f"
+            }
+          ],
+          "count": 1
+        }
+      ],
+      "suggested_fixes": [
+        "Consider increasing timeout values or optimizing slow operations",
+        "Review test cases and ensure code changes haven't broken existing functionality"
+      ],
+      "severity": "high",
+      "category": "test_failure",
+      "similar_failures": []
+    },
+    {
+      "error_patterns": [
+        {
+          "pattern": "ERROR|Error|error",
+          "matches": [
+            {
+              "line_number": 45,
+              "content": "2025-11-15T04:42:46.6375671Z ERROR: Cannot install psutil==5.9.6 and psutil==5.9.8 because these package versions have conflicting dependencies.",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 58,
+              "content": "2025-11-15T04:42:46.6390781Z ERROR: ResolutionImpossible: for help visit https://pip.pypa.io/en/latest/topics/dependency-resolution/#dealing-with-dependency-conflicts",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 59,
+              "content": "2025-11-15T04:42:47.0130046Z ##[error]Process completed with exit code 1.",
+              "severity": "high",
+              "emoji": "\u274c"
+            }
+          ],
+          "count": 3
+        },
+        {
+          "pattern": "FAIL|Failed|failed",
+          "matches": [
+            {
+              "line_number": 67,
+              "content": "2025-11-15T04:42:47.0198173Z \u001b[36;1m  echo \"\u274c Some tests failed - review logs\" >> $GITHUB_STEP_SUMMARY\u001b[0m",
+              "severity": "high",
+              "emoji": "\ud83d\udca5"
+            },
+            {
+              "line_number": 97,
+              "content": "2025-11-15T04:42:47.1740926Z ##[warning]The process '/usr/bin/git' failed with exit code 128",
+              "severity": "high",
+              "emoji": "\ud83d\udca5"
+            }
+          ],
+          "count": 2
+        },
+        {
+          "pattern": "WARN|Warning|warning",
+          "matches": [
+            {
+              "line_number": 97,
+              "content": "2025-11-15T04:42:47.1740926Z ##[warning]The process '/usr/bin/git' failed with exit code 128",
+              "severity": "medium",
+              "emoji": "\u26a0\ufe0f"
+            }
+          ],
+          "count": 1
+        }
+      ],
+      "suggested_fixes": [
+        "Consider increasing timeout values or optimizing slow operations",
+        "Review test cases and ensure code changes haven't broken existing functionality"
+      ],
+      "severity": "high",
+      "category": "test_failure",
+      "similar_failures": []
+    },
+    {
+      "error_patterns": [
+        {
+          "pattern": "ERROR|Error|error",
+          "matches": [
+            {
+              "line_number": 45,
+              "content": "2025-11-15T04:42:52.5741538Z ERROR: Cannot install psutil==5.9.6 and psutil==5.9.8 because these package versions have conflicting dependencies.",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 58,
+              "content": "2025-11-15T04:42:52.5756863Z ERROR: ResolutionImpossible: for help visit https://pip.pypa.io/en/latest/topics/dependency-resolution/#dealing-with-dependency-conflicts",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 59,
+              "content": "2025-11-15T04:42:53.0839833Z ##[error]Process completed with exit code 1.",
+              "severity": "high",
+              "emoji": "\u274c"
+            }
+          ],
+          "count": 3
+        },
+        {
+          "pattern": "FAIL|Failed|failed",
+          "matches": [
+            {
+              "line_number": 67,
+              "content": "2025-11-15T04:42:53.0908741Z \u001b[36;1m  echo \"\u274c Some tests failed - review logs\" >> $GITHUB_STEP_SUMMARY\u001b[0m",
+              "severity": "high",
+              "emoji": "\ud83d\udca5"
+            },
+            {
+              "line_number": 97,
+              "content": "2025-11-15T04:42:53.2449906Z ##[warning]The process '/usr/bin/git' failed with exit code 128",
+              "severity": "high",
+              "emoji": "\ud83d\udca5"
+            }
+          ],
+          "count": 2
+        },
+        {
+          "pattern": "WARN|Warning|warning",
+          "matches": [
+            {
+              "line_number": 97,
+              "content": "2025-11-15T04:42:53.2449906Z ##[warning]The process '/usr/bin/git' failed with exit code 128",
+              "severity": "medium",
+              "emoji": "\u26a0\ufe0f"
+            }
+          ],
+          "count": 1
+        }
+      ],
+      "suggested_fixes": [
+        "Consider increasing timeout values or optimizing slow operations",
+        "Review test cases and ensure code changes haven't broken existing functionality"
+      ],
+      "severity": "high",
+      "category": "test_failure",
+      "similar_failures": []
+    },
+    {
+      "error_patterns": [
+        {
+          "pattern": "ERROR|Error|error",
+          "matches": [
+            {
+              "line_number": 45,
+              "content": "2025-11-15T04:42:53.4167889Z ERROR: Cannot install psutil==5.9.6 and psutil==5.9.8 because these package versions have conflicting dependencies.",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 58,
+              "content": "2025-11-15T04:42:53.4182459Z ERROR: ResolutionImpossible: for help visit https://pip.pypa.io/en/latest/topics/dependency-resolution/#dealing-with-dependency-conflicts",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 59,
+              "content": "2025-11-15T04:42:53.8966217Z ##[error]Process completed with exit code 1.",
+              "severity": "high",
+              "emoji": "\u274c"
+            }
+          ],
+          "count": 3
+        },
+        {
+          "pattern": "FAIL|Failed|failed",
+          "matches": [
+            {
+              "line_number": 67,
+              "content": "2025-11-15T04:42:53.9034965Z \u001b[36;1m  echo \"\u274c Some tests failed - review logs\" >> $GITHUB_STEP_SUMMARY\u001b[0m",
+              "severity": "high",
+              "emoji": "\ud83d\udca5"
+            },
+            {
+              "line_number": 97,
+              "content": "2025-11-15T04:42:54.0573935Z ##[warning]The process '/usr/bin/git' failed with exit code 128",
+              "severity": "high",
+              "emoji": "\ud83d\udca5"
+            }
+          ],
+          "count": 2
+        },
+        {
+          "pattern": "WARN|Warning|warning",
+          "matches": [
+            {
+              "line_number": 97,
+              "content": "2025-11-15T04:42:54.0573935Z ##[warning]The process '/usr/bin/git' failed with exit code 128",
+              "severity": "medium",
+              "emoji": "\u26a0\ufe0f"
+            }
+          ],
+          "count": 1
+        }
+      ],
+      "suggested_fixes": [
+        "Consider increasing timeout values or optimizing slow operations",
+        "Review test cases and ensure code changes haven't broken existing functionality"
+      ],
+      "severity": "high",
+      "category": "test_failure",
+      "similar_failures": []
+    }
+  ],
+  "timestamp": "2025-11-15T04:44:12.284951"
+}
