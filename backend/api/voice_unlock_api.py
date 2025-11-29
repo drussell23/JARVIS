@@ -3,6 +3,11 @@ Voice Unlock API Router
 ======================
 
 FastAPI endpoints for voice unlock enrollment and authentication.
+
+This API connects to the ACTUAL working IntelligentVoiceUnlockService,
+not legacy placeholder modules. All endpoints are async and robust.
+
+Version: 2.0.0 - Connected to Real Services
 """
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, HTTPException, UploadFile, File
@@ -11,465 +16,301 @@ from typing import Optional, Dict, Any
 import logging
 import asyncio
 import json
-import numpy as np
 import base64
 from datetime import datetime
 
-import sys
-import os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-# Initialize logger BEFORE using it in except blocks
 logger = logging.getLogger(__name__)
-
-try:
-    from voice_unlock import (
-        VoiceEnrollmentManager,
-        VoiceAuthenticator,
-        MacUnlockService
-    )
-    from voice_unlock.config import get_config
-    from voice_unlock.services.keychain_service import KeychainService
-    from voice_unlock.services.screensaver_integration import ScreensaverManager
-    VOICE_UNLOCK_AVAILABLE = True
-except ImportError as e:
-    logger.warning(f"Voice unlock modules not available: {e}")
-    VOICE_UNLOCK_AVAILABLE = False
-    # Dummy classes
-    class VoiceEnrollmentManager: pass
-    class VoiceAuthenticator: pass
-    class MacUnlockService: pass
-    class KeychainService: pass
-    class ScreensaverManager: pass
-    def get_config(): return {}
 
 router = APIRouter(prefix="/api/voice-unlock", tags=["voice_unlock"])
 
-# Global instances
-enrollment_manager = None
-authenticator = None
-unlock_service = None
-keychain_service = None
-screensaver_manager = None
+# ============================================================================
+# Global Service Instances (Lazy Initialized)
+# ============================================================================
+_intelligent_service = None
+_speaker_service = None
+_learning_db = None
 
 
-def initialize_voice_unlock():
-    """Initialize voice unlock components"""
-    global enrollment_manager, authenticator, unlock_service, keychain_service, screensaver_manager
-    
-    if not VOICE_UNLOCK_AVAILABLE:
-        logger.warning("Voice unlock modules not available, using daemon connector instead")
-        # Initialize the voice_unlock_integration for JARVIS command handling
+async def get_intelligent_service():
+    """Get or initialize the IntelligentVoiceUnlockService."""
+    global _intelligent_service
+    if _intelligent_service is None:
         try:
-            from . import voice_unlock_integration
-            logger.info("Voice unlock integration loaded for JARVIS commands")
-        except ImportError:
-            logger.error("Could not import voice_unlock_integration")
-        return True
-    
-    try:
-        # Initialize services
-        enrollment_manager = VoiceEnrollmentManager()
-        authenticator = VoiceAuthenticator()
-        keychain_service = KeychainService()
-        
-        # Initialize system integration
-        from voice_unlock.services.mac_unlock_service import MacUnlockService
-        unlock_service = MacUnlockService(authenticator)
-        
-        # Initialize screensaver integration
-        screensaver_manager = ScreensaverManager()
-        
-        logger.info("✅ Voice Unlock services initialized")
-        return True
-    except Exception as e:
-        logger.error(f"Failed to initialize Voice Unlock: {e}")
-        return False
+            from voice_unlock.intelligent_voice_unlock_service import (
+                get_intelligent_unlock_service
+            )
+            _intelligent_service = get_intelligent_unlock_service()
+            await _intelligent_service.initialize()
+            logger.info("✅ IntelligentVoiceUnlockService initialized")
+        except Exception as e:
+            logger.error(f"Failed to initialize IntelligentVoiceUnlockService: {e}")
+            raise
+    return _intelligent_service
 
+
+async def get_speaker_service():
+    """Get or initialize the SpeakerVerificationService."""
+    global _speaker_service
+    if _speaker_service is None:
+        try:
+            from voice.speaker_verification_service import get_speaker_verification_service
+            _speaker_service = await get_speaker_verification_service()
+            logger.info("✅ SpeakerVerificationService initialized")
+        except Exception as e:
+            logger.error(f"Failed to initialize SpeakerVerificationService: {e}")
+            raise
+    return _speaker_service
+
+
+async def get_learning_db():
+    """Get or initialize the JARVISLearningDatabase."""
+    global _learning_db
+    if _learning_db is None:
+        try:
+            from intelligence.learning_database import JARVISLearningDatabase
+            _learning_db = JARVISLearningDatabase()
+            await _learning_db.initialize()
+            logger.info("✅ JARVISLearningDatabase initialized")
+        except Exception as e:
+            logger.error(f"Failed to initialize JARVISLearningDatabase: {e}")
+            raise
+    return _learning_db
+
+
+# ============================================================================
+# API Endpoints
+# ============================================================================
 
 @router.get("/status")
 async def get_voice_unlock_status():
-    """Get voice unlock system status"""
+    """
+    Get voice unlock system status.
+
+    Returns comprehensive status including:
+    - Service availability
+    - Model loading status
+    - Enrolled users count
+    - Component health
+    """
+    status = {
+        "enabled": False,
+        "ready": False,
+        "models_loaded": False,
+        "initialized": False,
+        "timestamp": datetime.now().isoformat()
+    }
+
     try:
-        config = get_config()
+        # Try to get the intelligent service
+        try:
+            service = await get_intelligent_service()
+            status["enabled"] = True
+            status["initialized"] = service.initialized
 
-        # Primary status fields expected by monitoring system
-        status = {
-            "enabled": VOICE_UNLOCK_AVAILABLE and enrollment_manager is not None,
-            "ready": authenticator is not None and keychain_service is not None,
-            "models_loaded": authenticator is not None,
-            "initialized": enrollment_manager is not None,
-        }
+            # Get service stats
+            stats = service.get_stats()
+            status["stats"] = stats
+            status["models_loaded"] = stats.get("components_initialized", {}).get("speaker_recognition", False)
+            status["ready"] = service.initialized and status["models_loaded"]
 
-        # Detailed configuration
-        if config:
-            status["config"] = {
-                "integration_mode": config.system.integration_mode,
-                "min_samples": config.enrollment.min_samples,
-                "anti_spoofing_level": config.security.anti_spoofing_level,
-                "adaptive_thresholds": config.authentication.adaptive_thresholds,
-            }
+            # Get owner info
+            if stats.get("owner_profile_loaded"):
+                status["owner_name"] = stats.get("owner_name")
 
-        # Service status
-        status["services"] = {
-            "enrollment": enrollment_manager is not None,
-            "authentication": authenticator is not None,
-            "keychain": keychain_service is not None,
-            "screensaver": screensaver_manager is not None and hasattr(screensaver_manager, 'integration') and screensaver_manager.integration.monitoring
-        }
+        except Exception as e:
+            logger.debug(f"IntelligentVoiceUnlockService not available: {e}")
 
-        # Get enrolled users count
-        if keychain_service:
-            try:
-                voiceprints = keychain_service.list_voiceprints()
-                status["enrolled_users"] = len(voiceprints)
-            except:
+        # Try to get speaker profiles count
+        try:
+            speaker_service = await get_speaker_service()
+            if hasattr(speaker_service, 'speaker_profiles'):
+                status["enrolled_users"] = len(speaker_service.speaker_profiles)
+            else:
                 status["enrolled_users"] = 0
-        else:
+        except Exception as e:
+            logger.debug(f"Could not get enrolled users count: {e}")
             status["enrolled_users"] = 0
 
+        # Service component status
+        status["services"] = {
+            "intelligent_service": _intelligent_service is not None,
+            "speaker_service": _speaker_service is not None,
+            "learning_db": _learning_db is not None
+        }
+
         return status
+
     except Exception as e:
         logger.error(f"Status check error: {e}")
-        # Return minimal status on error
         return {
             "enabled": False,
             "ready": False,
             "models_loaded": False,
-            "error": str(e)
+            "error": str(e),
+            "timestamp": datetime.now().isoformat()
         }
-
-
-@router.post("/enrollment/start")
-async def start_enrollment(user_id: str, metadata: Optional[Dict[str, Any]] = None):
-    """Start new enrollment session"""
-    if not enrollment_manager:
-        raise HTTPException(status_code=503, detail="Voice unlock not initialized")
-    
-    try:
-        session_id = enrollment_manager.start_enrollment(user_id, metadata)
-        
-        return {
-            "success": True,
-            "session_id": session_id,
-            "user_id": user_id,
-            "message": f"Enrollment session started for {user_id}"
-        }
-    except Exception as e:
-        logger.error(f"Failed to start enrollment: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-@router.websocket("/enrollment/ws/{session_id}")
-async def enrollment_websocket(websocket: WebSocket, session_id: str):
-    """WebSocket for real-time enrollment with audio streaming"""
-    await websocket.accept()
-    
-    if not enrollment_manager:
-        await websocket.send_json({
-            "type": "error",
-            "message": "Voice unlock not initialized"
-        })
-        await websocket.close()
-        return
-    
-    # Validate session
-    session_status = enrollment_manager.get_session_status(session_id)
-    if not session_status:
-        await websocket.send_json({
-            "type": "error",
-            "message": "Invalid session ID"
-        })
-        await websocket.close()
-        return
-    
-    try:
-        # Send initial status
-        await websocket.send_json({
-            "type": "status",
-            "data": session_status
-        })
-        
-        # Add visualization callback
-        def audio_visualization(audio_chunk: np.ndarray):
-            """Send audio visualization data"""
-            try:
-                # Downsample for visualization
-                viz_data = audio_chunk[::10].tolist()
-                asyncio.create_task(websocket.send_json({
-                    "type": "audio_visualization",
-                    "data": {
-                        "waveform": viz_data,
-                        "energy": float(np.sqrt(np.mean(audio_chunk ** 2)))
-                    }
-                }))
-            except:
-                pass
-        
-        enrollment_manager.audio_capture.add_callback(audio_visualization)
-        
-        while True:
-            # Receive commands or audio data
-            data = await websocket.receive_json()
-            
-            if data["type"] == "collect_sample":
-                # Get current phrase
-                session = enrollment_manager.sessions[session_id]
-                phrase = enrollment_manager._get_enrollment_phrase(session)
-                
-                # Send phrase to user
-                await websocket.send_json({
-                    "type": "phrase",
-                    "data": {
-                        "phrase": phrase,
-                        "sample_number": len(session.samples) + 1
-                    }
-                })
-                
-                # Collect sample
-                if "audio_data" in data:
-                    # Decode base64 audio
-                    audio_bytes = base64.b64decode(data["audio_data"])
-                    audio_array = np.frombuffer(audio_bytes, dtype=np.float32)
-                    
-                    success, message = await enrollment_manager.collect_sample(
-                        session_id,
-                        phrase=phrase,
-                        audio_data=audio_array
-                    )
-                else:
-                    # Use microphone
-                    success, message = await enrollment_manager.collect_sample(
-                        session_id,
-                        phrase=phrase
-                    )
-                
-                # Send result
-                await websocket.send_json({
-                    "type": "sample_result",
-                    "data": {
-                        "success": success,
-                        "message": message,
-                        "status": enrollment_manager.get_session_status(session_id)
-                    }
-                })
-                
-                # Check if enrollment complete
-                session = enrollment_manager.sessions.get(session_id)
-                if session and session.status.value == "completed":
-                    await websocket.send_json({
-                        "type": "enrollment_complete",
-                        "data": {
-                            "user_id": session.user_id,
-                            "quality_score": np.mean([s.quality_score for s in session.samples])
-                        }
-                    })
-                    break
-                    
-            elif data["type"] == "cancel":
-                enrollment_manager.cancel_enrollment(session_id)
-                await websocket.send_json({
-                    "type": "cancelled",
-                    "message": "Enrollment cancelled"
-                })
-                break
-                
-    except WebSocketDisconnect:
-        logger.info(f"Enrollment WebSocket disconnected for session {session_id}")
-    except Exception as e:
-        logger.error(f"Enrollment WebSocket error: {e}")
-        await websocket.send_json({
-            "type": "error",
-            "message": str(e)
-        })
-    finally:
-        # Clean up
-        if enrollment_manager and hasattr(enrollment_manager.audio_capture, 'callbacks'):
-            enrollment_manager.audio_capture.callbacks.clear()
 
 
 @router.post("/authenticate")
 async def authenticate_voice(
-    user_id: Optional[str] = None,
-    audio_file: Optional[UploadFile] = File(None)
+    audio_file: Optional[UploadFile] = File(None),
+    audio_data: Optional[str] = None
 ):
-    """Authenticate user with voice"""
-    if not authenticator:
-        raise HTTPException(status_code=503, detail="Voice unlock not initialized")
-    
+    """
+    Authenticate user with voice biometrics.
+
+    Accepts audio as:
+    - File upload (audio_file)
+    - Base64 encoded string (audio_data in request body)
+
+    Returns authentication result with confidence scores.
+    """
     try:
-        # Process audio file if provided
-        audio_data = None
+        service = await get_intelligent_service()
+
+        # Get audio data
+        audio_bytes = None
         if audio_file:
             audio_bytes = await audio_file.read()
-            # Convert to numpy array (assuming WAV format)
-            import wave
-            import io
-            
-            with wave.open(io.BytesIO(audio_bytes), 'rb') as wav:
-                frames = wav.readframes(wav.getnframes())
-                audio_data = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
-        
-        # Perform authentication
-        result, details = await authenticator.authenticate(
-            user_id=user_id,
-            audio_data=audio_data
+        elif audio_data:
+            # Decode base64
+            try:
+                audio_bytes = base64.b64decode(audio_data)
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"Invalid base64 audio: {e}")
+        else:
+            raise HTTPException(status_code=400, detail="No audio provided")
+
+        # Process authentication
+        result = await service.process_voice_unlock_command(
+            audio_data=audio_bytes,
+            context={"source": "api"}
         )
-        
+
         return {
-            "success": result.value == "success",
-            "result": result.value,
-            "details": details
+            "success": result.get("success", False),
+            "speaker_name": result.get("speaker_name"),
+            "confidence": result.get("speaker_confidence", 0.0),
+            "is_owner": result.get("is_owner", False),
+            "message": result.get("message"),
+            "timestamp": datetime.now().isoformat()
         }
-        
+
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Authentication error: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.post("/unlock/toggle")
-async def toggle_voice_unlock(enable: bool):
-    """Enable or disable voice unlock monitoring"""
-    if not screensaver_manager:
-        raise HTTPException(status_code=503, detail="Voice unlock not initialized")
-    
+@router.post("/verify-speaker")
+async def verify_speaker(
+    speaker_name: str,
+    audio_file: Optional[UploadFile] = File(None),
+    audio_data: Optional[str] = None
+):
+    """
+    Verify if audio matches a specific speaker.
+
+    Args:
+        speaker_name: Name of speaker to verify against
+        audio_file: Audio file upload
+        audio_data: Base64 encoded audio
+
+    Returns verification result with confidence.
+    """
     try:
-        if enable:
-            screensaver_manager.setup()
-            message = "Voice unlock monitoring enabled"
+        speaker_service = await get_speaker_service()
+
+        # Get audio data
+        audio_bytes = None
+        if audio_file:
+            audio_bytes = await audio_file.read()
+        elif audio_data:
+            try:
+                audio_bytes = base64.b64decode(audio_data)
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"Invalid base64 audio: {e}")
         else:
-            screensaver_manager.shutdown()
-            message = "Voice unlock monitoring disabled"
-            
+            raise HTTPException(status_code=400, detail="No audio provided")
+
+        # Verify speaker
+        result = await speaker_service.verify_speaker(audio_bytes, speaker_name)
+
         return {
-            "success": True,
-            "enabled": enable,
-            "message": message
+            "verified": result.get("verified", False),
+            "speaker_name": speaker_name,
+            "confidence": result.get("confidence", 0.0),
+            "threshold": result.get("threshold", 0.0),
+            "timestamp": datetime.now().isoformat()
         }
+
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Failed to toggle voice unlock: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
+        logger.error(f"Speaker verification error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/users")
 async def list_enrolled_users():
-    """List all enrolled users"""
-    if not keychain_service:
-        raise HTTPException(status_code=503, detail="Voice unlock not initialized")
-    
+    """List all enrolled voice profiles."""
     try:
-        voiceprints = keychain_service.list_voiceprints()
-        
+        speaker_service = await get_speaker_service()
+
+        users = []
+        if hasattr(speaker_service, 'speaker_profiles'):
+            for name, profile in speaker_service.speaker_profiles.items():
+                users.append({
+                    "speaker_name": name,
+                    "is_primary_user": profile.get("is_primary_user", False),
+                    "total_samples": profile.get("total_samples", 0),
+                    "created_at": profile.get("created_at"),
+                    "last_updated": profile.get("last_updated")
+                })
+
         return {
             "success": True,
-            "users": voiceprints,
-            "count": len(voiceprints)
+            "users": users,
+            "count": len(users),
+            "timestamp": datetime.now().isoformat()
         }
+
     except Exception as e:
         logger.error(f"Failed to list users: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.delete("/users/{user_id}")
-async def delete_user_voiceprint(user_id: str):
-    """Delete user's voiceprint"""
-    if not keychain_service:
-        raise HTTPException(status_code=503, detail="Voice unlock not initialized")
-    
+@router.get("/users/{speaker_name}")
+async def get_user_profile(speaker_name: str):
+    """Get detailed profile for a specific user."""
     try:
-        success = keychain_service.delete_voiceprint(user_id)
-        
-        if success:
-            return {
-                "success": True,
-                "message": f"Voiceprint deleted for user {user_id}"
-            }
-        else:
-            raise HTTPException(status_code=404, detail="User not found")
-            
-    except Exception as e:
-        logger.error(f"Failed to delete voiceprint: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
+        speaker_service = await get_speaker_service()
 
+        if not hasattr(speaker_service, 'speaker_profiles'):
+            raise HTTPException(status_code=404, detail="Speaker profiles not available")
 
-@router.post("/backup/export")
-async def export_backup(password: Optional[str] = None):
-    """Export encrypted backup of all voiceprints"""
-    if not keychain_service:
-        raise HTTPException(status_code=503, detail="Voice unlock not initialized")
-    
-    try:
-        from pathlib import Path
-        import tempfile
-        
-        # Create temporary file
-        with tempfile.NamedTemporaryFile(suffix='.vubak', delete=False) as tmp:
-            backup_path = Path(tmp.name)
-            
-        success = keychain_service.export_backup(backup_path, password)
-        
-        if success:
-            # Read backup data
-            with open(backup_path, 'rb') as f:
-                backup_data = f.read()
-                
-            # Clean up
-            backup_path.unlink()
-            
-            # Return as base64
-            return {
-                "success": True,
-                "backup_data": base64.b64encode(backup_data).decode(),
-                "encrypted": password is not None
-            }
-        else:
-            raise HTTPException(status_code=500, detail="Failed to create backup")
-            
-    except Exception as e:
-        logger.error(f"Backup export error: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
+        profile = speaker_service.speaker_profiles.get(speaker_name)
+        if not profile:
+            raise HTTPException(status_code=404, detail=f"Speaker '{speaker_name}' not found")
 
-
-@router.get("/config")
-async def get_configuration():
-    """Get current voice unlock configuration"""
-    config = get_config()
-    
-    return {
-        "audio": config.audio.__dict__,
-        "enrollment": config.enrollment.__dict__,
-        "authentication": config.authentication.__dict__,
-        "security": {
-            k: v for k, v in config.security.__dict__.items()
-            if k not in ['encryption_key', 'master_key']  # Don't expose sensitive
-        },
-        "system": config.system.__dict__,
-        "performance": config.performance.__dict__
-    }
-
-
-@router.post("/config/update")
-async def update_configuration(section: str, updates: Dict[str, Any]):
-    """Update voice unlock configuration"""
-    try:
-        config = get_config()
-
-        if not hasattr(config, section):
-            raise HTTPException(status_code=400, detail=f"Invalid config section: {section}")
-
-        # Update configuration
-        config.update_from_dict({section: updates})
-
-        # Save to file
-        config.save_to_file()
-
+        # Return profile without sensitive embedding data
         return {
             "success": True,
-            "message": f"Configuration section '{section}' updated"
+            "speaker_name": speaker_name,
+            "is_primary_user": profile.get("is_primary_user", False),
+            "total_samples": profile.get("total_samples", 0),
+            "created_at": profile.get("created_at"),
+            "last_updated": profile.get("last_updated"),
+            "embedding_dimension": len(profile.get("embedding", [])) if profile.get("embedding") is not None else 0,
+            "timestamp": datetime.now().isoformat()
         }
+
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Config update error: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
+        logger.error(f"Failed to get user profile: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/profiles/reload")
@@ -481,29 +322,30 @@ async def reload_speaker_profiles():
     - Completing voice enrollment
     - Updating acoustic features
     - Database migrations
-
-    Returns:
-        Status information about the reload operation
     """
     try:
-        # Get the speaker verification service from the global voice unlock system
-        from voice.speaker_verification_service import _global_speaker_service
+        speaker_service = await get_speaker_service()
 
-        if _global_speaker_service is None:
-            raise HTTPException(
-                status_code=503,
-                detail="Speaker verification service not initialized"
-            )
+        if hasattr(speaker_service, 'manual_reload_profiles'):
+            result = await speaker_service.manual_reload_profiles()
 
-        # Trigger manual reload
-        result = await _global_speaker_service.manual_reload_profiles()
-
-        if result["success"]:
-            logger.info(f"✅ Manual profile reload successful: {result['profiles_after']} profiles loaded")
-            return JSONResponse(content=result)
+            if result.get("success"):
+                logger.info(f"✅ Manual profile reload successful: {result.get('profiles_after')} profiles loaded")
+                return JSONResponse(content=result)
+            else:
+                raise HTTPException(status_code=500, detail=result.get("message"))
         else:
-            logger.error(f"❌ Manual profile reload failed: {result['message']}")
-            raise HTTPException(status_code=500, detail=result["message"])
+            # Fallback: reinitialize service
+            global _speaker_service
+            _speaker_service = None
+            speaker_service = await get_speaker_service()
+
+            return {
+                "success": True,
+                "message": "Speaker service reinitialized",
+                "profiles_after": len(speaker_service.speaker_profiles) if hasattr(speaker_service, 'speaker_profiles') else 0,
+                "timestamp": datetime.now().isoformat()
+            }
 
     except HTTPException:
         raise
@@ -512,11 +354,209 @@ async def reload_speaker_profiles():
         raise HTTPException(status_code=500, detail=f"Profile reload failed: {str(e)}")
 
 
-# Initialize on import if in main JARVIS context
-try:
-    from fastapi import FastAPI
-    # Only initialize if we're being imported by the main app
-    if "voice_unlock" not in globals():
-        voice_unlock_initialized = initialize_voice_unlock()
-except:
-    pass
+@router.get("/stats")
+async def get_unlock_stats():
+    """Get voice unlock statistics."""
+    try:
+        service = await get_intelligent_service()
+        stats = service.get_stats()
+
+        return {
+            "success": True,
+            "stats": stats,
+            "timestamp": datetime.now().isoformat()
+        }
+
+    except Exception as e:
+        logger.error(f"Failed to get stats: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/unlock")
+async def perform_unlock(
+    audio_file: Optional[UploadFile] = File(None),
+    audio_data: Optional[str] = None
+):
+    """
+    Perform voice-authenticated screen unlock.
+
+    This is the main endpoint for unlocking the screen with voice.
+    Requires owner voice verification.
+    """
+    try:
+        service = await get_intelligent_service()
+
+        # Get audio data
+        audio_bytes = None
+        if audio_file:
+            audio_bytes = await audio_file.read()
+        elif audio_data:
+            try:
+                audio_bytes = base64.b64decode(audio_data)
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"Invalid base64 audio: {e}")
+        else:
+            raise HTTPException(status_code=400, detail="No audio provided")
+
+        # Process unlock command
+        result = await service.process_voice_unlock_command(
+            audio_data=audio_bytes,
+            context={"source": "api", "action": "unlock"}
+        )
+
+        return {
+            "success": result.get("success", False),
+            "speaker_name": result.get("speaker_name"),
+            "confidence": result.get("speaker_confidence", 0.0),
+            "is_owner": result.get("is_owner", False),
+            "message": result.get("message"),
+            "latency_ms": result.get("latency_ms"),
+            "timestamp": datetime.now().isoformat()
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Unlock error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.websocket("/ws/authenticate")
+async def websocket_authenticate(websocket: WebSocket):
+    """
+    WebSocket endpoint for real-time voice authentication.
+
+    Supports streaming audio for continuous authentication.
+    """
+    await websocket.accept()
+
+    try:
+        service = await get_intelligent_service()
+
+        await websocket.send_json({
+            "type": "connected",
+            "message": "Voice authentication WebSocket connected"
+        })
+
+        while True:
+            # Receive audio data
+            data = await websocket.receive_json()
+
+            if data.get("type") == "audio":
+                # Decode audio
+                try:
+                    audio_bytes = base64.b64decode(data.get("audio_data", ""))
+                except Exception as e:
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": f"Invalid audio data: {e}"
+                    })
+                    continue
+
+                # Process authentication
+                result = await service.process_voice_unlock_command(
+                    audio_data=audio_bytes,
+                    context={
+                        "source": "websocket",
+                        "audio_sample_rate": data.get("sample_rate")
+                    }
+                )
+
+                await websocket.send_json({
+                    "type": "result",
+                    "success": result.get("success", False),
+                    "speaker_name": result.get("speaker_name"),
+                    "confidence": result.get("speaker_confidence", 0.0),
+                    "is_owner": result.get("is_owner", False),
+                    "message": result.get("message")
+                })
+
+            elif data.get("type") == "ping":
+                await websocket.send_json({"type": "pong"})
+
+            elif data.get("type") == "close":
+                break
+
+    except WebSocketDisconnect:
+        logger.info("Voice authentication WebSocket disconnected")
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}")
+        try:
+            await websocket.send_json({
+                "type": "error",
+                "message": str(e)
+            })
+        except:
+            pass
+
+
+# ============================================================================
+# Initialization Function (for main.py compatibility)
+# ============================================================================
+
+def initialize_voice_unlock() -> bool:
+    """
+    Initialize voice unlock service (sync wrapper for startup).
+
+    Called by main.py during server startup.
+    Services are lazy-loaded on first request, so this just validates
+    that the imports work.
+    """
+    try:
+        # Validate that the service can be imported
+        from voice_unlock.intelligent_voice_unlock_service import (
+            get_intelligent_unlock_service
+        )
+        from voice.speaker_verification_service import get_speaker_verification_service
+
+        logger.info("✅ Voice Unlock API imports validated")
+        return True
+
+    except Exception as e:
+        logger.warning(f"⚠️ Voice Unlock initialization warning: {e}")
+        return True  # Return True to allow API to still be mounted
+
+
+@router.get("/health")
+async def health_check():
+    """Health check endpoint for voice unlock service."""
+    health = {
+        "status": "healthy",
+        "service": "voice_unlock_api",
+        "timestamp": datetime.now().isoformat()
+    }
+
+    try:
+        # Check intelligent service
+        try:
+            service = await get_intelligent_service()
+            health["intelligent_service"] = {
+                "available": True,
+                "initialized": service.initialized
+            }
+        except Exception as e:
+            health["intelligent_service"] = {
+                "available": False,
+                "error": str(e)
+            }
+            health["status"] = "degraded"
+
+        # Check speaker service
+        try:
+            speaker = await get_speaker_service()
+            health["speaker_service"] = {
+                "available": True,
+                "profiles_count": len(speaker.speaker_profiles) if hasattr(speaker, 'speaker_profiles') else 0
+            }
+        except Exception as e:
+            health["speaker_service"] = {
+                "available": False,
+                "error": str(e)
+            }
+            health["status"] = "degraded"
+
+    except Exception as e:
+        health["status"] = "unhealthy"
+        health["error"] = str(e)
+
+    return health

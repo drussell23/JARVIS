@@ -13,9 +13,11 @@ Features:
 - Multi-user support
 - Apple Watch proximity detection
 - ML optimization for 16GB RAM systems
+
+Version: 2.0.0 - Clean Architecture (No Placeholders)
 """
 
-__version__ = "0.2.0"
+__version__ = "2.0.0"
 __author__ = "JARVIS Team"
 
 import logging
@@ -23,15 +25,49 @@ from typing import Optional, Dict, Any
 
 logger = logging.getLogger(__name__)
 
-# Lazy imports to reduce startup time
+# ============================================================================
+# Lazy-loaded Service Instances
+# ============================================================================
+# Services are initialized on first access to reduce startup time and
+# prevent import errors from affecting module loading.
+# ============================================================================
+
+_intelligent_unlock_service = None
 _voice_unlock_system = None
-_ml_system = None
+
+
+async def get_intelligent_unlock_service():
+    """
+    Get the IntelligentVoiceUnlockService instance.
+
+    This is the main service for voice-authenticated screen unlocking.
+    Lazy-loaded to prevent blocking on import.
+    """
+    global _intelligent_unlock_service
+
+    if _intelligent_unlock_service is None:
+        try:
+            from .intelligent_voice_unlock_service import (
+                get_intelligent_unlock_service as _get_service
+            )
+            _intelligent_unlock_service = _get_service()
+            await _intelligent_unlock_service.initialize()
+            logger.info("✅ IntelligentVoiceUnlockService initialized")
+        except Exception as e:
+            logger.error(f"Failed to initialize IntelligentVoiceUnlockService: {e}")
+            raise
+
+    return _intelligent_unlock_service
 
 
 def get_voice_unlock_system():
-    """Get or create the voice unlock system instance"""
+    """
+    Get or create the voice unlock system instance (synchronous).
+
+    For backwards compatibility with code expecting synchronous access.
+    """
     global _voice_unlock_system
-    
+
     if _voice_unlock_system is None:
         try:
             from .voice_unlock_integration import VoiceUnlockSystem
@@ -39,75 +75,55 @@ def get_voice_unlock_system():
             logger.info("Voice Unlock System initialized")
         except Exception as e:
             logger.error(f"Failed to initialize Voice Unlock System: {e}")
-            # Fallback to old system if available
-            try:
-                from .services.mac_unlock_service import MacUnlockService
-                return MacUnlockService()
-            except:
-                pass
             return None
-            
+
     return _voice_unlock_system
 
 
-def get_ml_system():
-    """Get or create the ML system instance"""
-    global _ml_system
-    
-    if _ml_system is None:
-        try:
-            from .ml import VoiceUnlockMLSystem
-            _ml_system = VoiceUnlockMLSystem()
-            logger.info("ML System initialized with optimization")
-        except Exception as e:
-            logger.error(f"Failed to initialize ML System: {e}")
-            return None
-            
-    return _ml_system
-
-
 async def initialize_voice_unlock():
-    """Initialize the voice unlock system asynchronously"""
+    """Initialize the voice unlock system asynchronously."""
     try:
-        system = get_voice_unlock_system()
-        if system and hasattr(system, 'start'):
-            await system.start()
+        service = await get_intelligent_unlock_service()
+        if service:
             logger.info("Voice Unlock System started successfully")
-            return system
+            return service
     except Exception as e:
         logger.error(f"Failed to start Voice Unlock System: {e}")
         return None
 
 
 async def cleanup_voice_unlock():
-    """Cleanup voice unlock system resources"""
-    global _voice_unlock_system, _ml_system
-    
+    """Cleanup voice unlock system resources."""
+    global _intelligent_unlock_service, _voice_unlock_system
+
     try:
+        if _intelligent_unlock_service:
+            # No explicit cleanup needed for intelligent service
+            _intelligent_unlock_service = None
+
         if _voice_unlock_system and hasattr(_voice_unlock_system, 'stop'):
             await _voice_unlock_system.stop()
             _voice_unlock_system = None
-            
-        if _ml_system and hasattr(_ml_system, 'cleanup'):
-            _ml_system.cleanup()
-            _ml_system = None
-            
+
         logger.info("Voice Unlock System cleaned up")
     except Exception as e:
         logger.error(f"Error during Voice Unlock cleanup: {e}")
 
 
-# Status helpers
 def get_voice_unlock_status() -> Dict[str, Any]:
-    """Get current voice unlock status"""
+    """Get current voice unlock status."""
     try:
-        system = get_voice_unlock_system()
-        if system and hasattr(system, 'get_status'):
-            return system.get_status()
+        if _intelligent_unlock_service:
+            stats = _intelligent_unlock_service.get_stats()
+            return {
+                'available': True,
+                'initialized': _intelligent_unlock_service.initialized,
+                'stats': stats
+            }
         else:
             return {
                 'available': False,
-                'error': 'Voice Unlock System not initialized'
+                'error': 'Voice Unlock Service not initialized'
             }
     except Exception as e:
         logger.error(f"Failed to get Voice Unlock status: {e}")
@@ -117,58 +133,42 @@ def get_voice_unlock_status() -> Dict[str, Any]:
         }
 
 
-# Check if all dependencies are available
 def check_dependencies() -> Dict[str, bool]:
-    """Check if all required dependencies are available"""
+    """Check if all required dependencies are available."""
     dependencies = {
         'numpy': False,
         'scipy': False,
         'scikit-learn': False,
-        'librosa': False,
+        'torch': False,
+        'torchaudio': False,
+        'speechbrain': False,
         'sounddevice': False,
-        'bleak': False,
-        'speech_recognition': False
     }
-    
+
     for dep in dependencies:
         try:
             if dep == 'scikit-learn':
                 __import__('sklearn')
-            elif dep == 'speech_recognition':
-                __import__('speech_recognition')
             else:
                 __import__(dep.replace('-', '_'))
             dependencies[dep] = True
         except ImportError:
             pass
-            
+
     return dependencies
 
 
-# Legacy imports for backward compatibility
-try:
-    from .core.enrollment import VoiceEnrollmentManager
-    from .core.authentication import VoiceAuthenticator
-    from .services.mac_unlock_service import MacUnlockService
-    
-    __all__ = [
-        'VoiceEnrollmentManager',
-        'VoiceAuthenticator', 
-        'MacUnlockService',
-        'get_voice_unlock_system',
-        'get_ml_system',
-        'initialize_voice_unlock',
-        'cleanup_voice_unlock',
-        'get_voice_unlock_status',
-        'check_dependencies'
-    ]
-except ImportError:
-    # New system only
-    __all__ = [
-        'get_voice_unlock_system',
-        'get_ml_system',
-        'initialize_voice_unlock',
-        'cleanup_voice_unlock',
-        'get_voice_unlock_status',
-        'check_dependencies'
-    ]
+# ============================================================================
+# Public API
+# ============================================================================
+__all__ = [
+    # Async services
+    'get_intelligent_unlock_service',
+    'initialize_voice_unlock',
+    'cleanup_voice_unlock',
+    # Sync compatibility
+    'get_voice_unlock_system',
+    # Status & utilities
+    'get_voice_unlock_status',
+    'check_dependencies',
+]
