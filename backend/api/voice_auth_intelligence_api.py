@@ -1472,3 +1472,1129 @@ async def test_component_health():
         results["overall"] = "degraded"
 
     return results
+
+
+# ============================================================================
+# Advanced ML & Calibration System API Endpoints
+# ============================================================================
+
+# Lazy-loaded calibration system
+_calibrated_auth_system = None
+
+
+async def get_calibrated_auth_system():
+    """Get or initialize the calibrated authentication system."""
+    global _calibrated_auth_system
+    if _calibrated_auth_system is None:
+        try:
+            from voice_unlock.advanced_ml_features import CalibratedAuthenticationSystem
+            _calibrated_auth_system = CalibratedAuthenticationSystem(
+                embedding_dim=192,
+                persist_dir="/tmp/jarvis_voice_auth"
+            )
+            await _calibrated_auth_system.initialize()
+            logger.info("✅ Calibrated Authentication System initialized for API")
+        except Exception as e:
+            logger.error(f"Failed to initialize calibrated auth system: {e}")
+            return None
+    return _calibrated_auth_system
+
+
+class CalibratedAuthRequest(BaseModel):
+    """Request model for calibrated authentication."""
+    embedding: List[float] = Field(..., description="192-dimensional speaker embedding")
+    is_owner_known: Optional[bool] = Field(None, description="True if known Derek, False if impostor, None if unknown")
+    security_level: str = Field(default="base", description="Security level: 'base', 'high', or 'critical'")
+
+
+class CalibrationSampleRequest(BaseModel):
+    """Request model for adding calibration samples."""
+    raw_score: float = Field(..., ge=0, le=1, description="Raw model score (0-1)")
+    is_genuine: bool = Field(..., description="True if genuine Derek, False if impostor")
+
+
+class TrainFineTuningRequest(BaseModel):
+    """Request model for training the fine-tuning system."""
+    embeddings: List[List[float]] = Field(..., description="List of 192-dim embeddings")
+    labels: List[int] = Field(..., description="Labels: 1=Derek, 0=non-Derek")
+    use_triplet: bool = Field(default=True, description="Include triplet loss in training")
+
+
+class EvaluateEmbeddingRequest(BaseModel):
+    """Request model for evaluating a single embedding."""
+    embedding: List[float] = Field(..., description="192-dimensional speaker embedding")
+
+
+@router.post("/calibration/authenticate")
+async def calibrated_authenticate(request: CalibratedAuthRequest):
+    """
+    Perform calibrated authentication using the full AAM-Softmax + Calibration pipeline.
+
+    This endpoint:
+    1. Evaluates the embedding using AAM-Softmax fine-tuned classification
+    2. Applies Platt/Isotonic score calibration to get true probabilities
+    3. Uses adaptive thresholds that evolve toward 0.90/0.95/0.98
+
+    Returns detailed authentication result with calibration information.
+    """
+    system = await get_calibrated_auth_system()
+    if not system:
+        raise HTTPException(status_code=503, detail="Calibrated authentication system not available")
+
+    try:
+        embedding = np.array(request.embedding, dtype=np.float32)
+
+        if len(embedding) != 192:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Embedding must be 192-dimensional, got {len(embedding)}"
+            )
+
+        result = await system.authenticate(
+            embedding=embedding,
+            is_owner_known=request.is_owner_known,
+            security_level=request.security_level
+        )
+
+        return {
+            "success": True,
+            "authenticated": result["authenticated"],
+            "raw_score": result["raw_score"],
+            "calibrated_probability": result["probability"],
+            "threshold_used": result["threshold"],
+            "security_level": result["security_level"],
+            "calibration_applied": result["calibration_applied"],
+            "embedding_evaluation": result["embedding_evaluation"],
+            "debug_info": result["debug_info"],
+            "total_authentications": result["total_authentications"],
+            "system_success_rate": result["success_rate"]
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Calibrated authentication error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/calibration/add-sample")
+async def add_calibration_sample(request: CalibrationSampleRequest):
+    """
+    Add a calibration sample to improve threshold calibration.
+
+    Call this after each authentication attempt where you know the true label.
+    The system will periodically recalibrate as samples accumulate.
+
+    Args:
+        raw_score: The raw model score (0-1)
+        is_genuine: True if this was actually Derek, False if impostor
+    """
+    system = await get_calibrated_auth_system()
+    if not system:
+        raise HTTPException(status_code=503, detail="Calibrated authentication system not available")
+
+    try:
+        system.calibrator.add_calibration_sample(request.raw_score, request.is_genuine)
+        system.threshold_manager.record_attempt(
+            raw_score=request.raw_score,
+            is_genuine=request.is_genuine,
+            authentication_result=request.raw_score >= system.threshold_manager.get_threshold()
+        )
+
+        stats = system.calibrator.get_calibration_stats()
+
+        return {
+            "success": True,
+            "sample_added": True,
+            "raw_score": request.raw_score,
+            "is_genuine": request.is_genuine,
+            "calibration_stats": stats,
+            "message": f"Sample added. Total samples: {stats['num_calibration_samples']}"
+        }
+
+    except Exception as e:
+        logger.error(f"Add calibration sample error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/calibration/fit")
+async def fit_calibration():
+    """
+    Force a calibration fit using collected samples.
+
+    This fits the Platt scaling or Isotonic regression model
+    to the collected calibration data.
+
+    Requires at least 30 samples.
+    """
+    system = await get_calibrated_auth_system()
+    if not system:
+        raise HTTPException(status_code=503, detail="Calibrated authentication system not available")
+
+    try:
+        success = await system.calibrator.fit()
+
+        stats = system.calibrator.get_calibration_stats()
+
+        return {
+            "success": success,
+            "calibration_stats": stats,
+            "message": "Calibration complete" if success else "Not enough samples (need 30+)"
+        }
+
+    except Exception as e:
+        logger.error(f"Calibration fit error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/calibration/status")
+async def get_calibration_status():
+    """
+    Get comprehensive status of the calibration and threshold system.
+
+    Returns:
+    - Current vs target thresholds
+    - FRR/FAR metrics
+    - Calibration quality
+    - Progress toward 0.90/0.95/0.98 thresholds
+    """
+    system = await get_calibrated_auth_system()
+    if not system:
+        raise HTTPException(status_code=503, detail="Calibrated authentication system not available")
+
+    try:
+        status = await system.get_system_status()
+        progress_report = await system.get_progress_report()
+
+        return {
+            "success": True,
+            "system_status": status,
+            "progress_report": progress_report,
+            "recommendation": progress_report.get("recommendation", ""),
+            "summary": progress_report.get("summary", "")
+        }
+
+    except Exception as e:
+        logger.error(f"Calibration status error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/calibration/thresholds")
+async def get_adaptive_thresholds():
+    """
+    Get current adaptive thresholds and their progress toward targets.
+
+    Returns:
+    - Current thresholds (base, high, critical)
+    - Target thresholds (0.90, 0.95, 0.98)
+    - FRR (False Rejection Rate) - how often Derek gets rejected
+    - FAR (False Acceptance Rate) - how often impostors get through
+    """
+    system = await get_calibrated_auth_system()
+    if not system:
+        raise HTTPException(status_code=503, detail="Calibrated authentication system not available")
+
+    try:
+        threshold_status = system.threshold_manager.get_status()
+
+        return {
+            "success": True,
+            "current_thresholds": threshold_status["current_thresholds"],
+            "target_thresholds": threshold_status["target_thresholds"],
+            "performance_metrics": {
+                "frr": threshold_status["current_frr"],
+                "far": threshold_status["current_far"],
+                "target_frr": threshold_status["target_frr"],
+                "target_far": threshold_status["target_far"]
+            },
+            "progress_percent": threshold_status.get("progress_to_target_base", 0),
+            "calibration_quality": threshold_status["calibration_status"]
+        }
+
+    except Exception as e:
+        logger.error(f"Get thresholds error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/calibration/calibrate-score")
+async def calibrate_single_score(raw_score: float = Query(..., ge=0, le=1, description="Raw score to calibrate")):
+    """
+    Calibrate a single raw score to a true probability.
+
+    Useful for testing how calibration transforms scores.
+
+    Args:
+        raw_score: Raw model output (0-1)
+
+    Returns:
+        Calibrated probability that represents true confidence
+    """
+    system = await get_calibrated_auth_system()
+    if not system:
+        raise HTTPException(status_code=503, detail="Calibrated authentication system not available")
+
+    try:
+        calibrated = system.calibrator.calibrate(raw_score)
+
+        return {
+            "success": True,
+            "raw_score": raw_score,
+            "calibrated_probability": calibrated,
+            "calibration_applied": system.calibrator.is_calibrated,
+            "calibration_method": system.calibrator.calibration_method_used,
+            "platt_parameters": {
+                "a": system.calibrator.platt_a,
+                "b": system.calibrator.platt_b
+            } if system.calibrator.calibration_method_used == "platt" else None
+        }
+
+    except Exception as e:
+        logger.error(f"Calibrate score error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# Fine-Tuning System API Endpoints (AAM-Softmax + Center Loss + Triplet Loss)
+# ============================================================================
+
+@router.post("/fine-tuning/train-step")
+async def fine_tuning_train_step(request: TrainFineTuningRequest):
+    """
+    Perform one training step with the AAM-Softmax + Center Loss + Triplet Loss system.
+
+    This endpoint allows manual batch training on collected embeddings.
+
+    Args:
+        embeddings: List of 192-dim embeddings
+        labels: Class labels (1=Derek, 0=non-Derek)
+        use_triplet: Whether to include triplet loss
+
+    Returns:
+        Training metrics including loss values and accuracy
+    """
+    system = await get_calibrated_auth_system()
+    if not system:
+        raise HTTPException(status_code=503, detail="Calibrated authentication system not available")
+
+    try:
+        embeddings = np.array(request.embeddings, dtype=np.float32)
+        labels = np.array(request.labels, dtype=np.int64)
+
+        if embeddings.shape[1] != 192:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Embeddings must be 192-dimensional, got {embeddings.shape[1]}"
+            )
+
+        if len(embeddings) != len(labels):
+            raise HTTPException(
+                status_code=400,
+                detail="Number of embeddings must match number of labels"
+            )
+
+        metrics = await system.fine_tuning.train_step(embeddings, labels, request.use_triplet)
+
+        return {
+            "success": True,
+            "training_metrics": metrics,
+            "message": f"Training step complete. Accuracy: {metrics['accuracy']:.1%}"
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Fine-tuning train step error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/fine-tuning/evaluate")
+async def evaluate_embedding(request: EvaluateEmbeddingRequest):
+    """
+    Evaluate how well an embedding fits the Derek vs non-Derek classes.
+
+    Returns distances and scores useful for understanding classification.
+    """
+    system = await get_calibrated_auth_system()
+    if not system:
+        raise HTTPException(status_code=503, detail="Calibrated authentication system not available")
+
+    try:
+        embedding = np.array(request.embedding, dtype=np.float32)
+
+        if len(embedding) != 192:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Embedding must be 192-dimensional, got {len(embedding)}"
+            )
+
+        result = await system.fine_tuning.evaluate_embedding(embedding)
+
+        return {
+            "success": True,
+            "evaluation": result,
+            "classification": result["classification"],
+            "derek_probability": result["derek_probability"],
+            "inter_class_distance": result["inter_class_distance"]
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Evaluate embedding error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/fine-tuning/summary")
+async def get_fine_tuning_summary():
+    """
+    Get summary of the fine-tuning system's training progress.
+
+    Returns:
+    - Total samples seen
+    - Best accuracy achieved
+    - Recent loss trends
+    - Inter-class distance (want this to be large)
+    """
+    system = await get_calibrated_auth_system()
+    if not system:
+        raise HTTPException(status_code=503, detail="Calibrated authentication system not available")
+
+    try:
+        summary = system.fine_tuning.get_training_summary()
+
+        return {
+            "success": True,
+            "fine_tuning_summary": summary
+        }
+
+    except Exception as e:
+        logger.error(f"Fine-tuning summary error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/fine-tuning/save")
+async def save_fine_tuning_state():
+    """
+    Save the current fine-tuning and calibration state to disk.
+
+    This persists:
+    - AAM-Softmax weights
+    - Center Loss centers
+    - Calibration parameters
+    - Threshold history
+    """
+    system = await get_calibrated_auth_system()
+    if not system:
+        raise HTTPException(status_code=503, detail="Calibrated authentication system not available")
+
+    try:
+        await system.save_state()
+
+        return {
+            "success": True,
+            "message": "All state saved successfully",
+            "persist_dir": str(system.persist_dir)
+        }
+
+    except Exception as e:
+        logger.error(f"Save state error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# Comprehensive Testing Endpoint for Postman
+# ============================================================================
+
+@router.post("/test/full-calibrated-pipeline")
+async def test_full_calibrated_pipeline(
+    simulate_owner: bool = Query(default=True, description="Simulate as owner (Derek)"),
+    voice_confidence_override: Optional[float] = Query(None, description="Override voice confidence"),
+    security_level: str = Query(default="base", description="Security level to test")
+):
+    """
+    Test the full calibrated authentication pipeline with simulated data.
+
+    This is a comprehensive test endpoint for Postman that:
+    1. Creates a synthetic embedding
+    2. Runs it through the calibrated authentication system
+    3. Records the attempt for learning
+    4. Returns full trace of the decision
+
+    Perfect for testing the path toward 0.90/0.95/0.98 thresholds.
+    """
+    start_time = time.time()
+    results = {
+        "timestamp": datetime.utcnow().isoformat(),
+        "simulate_owner": simulate_owner,
+        "security_level": security_level,
+        "steps": []
+    }
+
+    try:
+        # Step 1: Initialize system
+        system = await get_calibrated_auth_system()
+        if not system:
+            results["steps"].append({
+                "step": "system_init",
+                "success": False,
+                "error": "System not available"
+            })
+            results["overall_success"] = False
+            return results
+
+        results["steps"].append({
+            "step": "system_init",
+            "success": True,
+            "total_prior_authentications": system.total_authentications
+        })
+
+        # Step 2: Generate synthetic embedding
+        np.random.seed(42 if simulate_owner else 123)
+        base_embedding = np.random.randn(192).astype(np.float32)
+        base_embedding = base_embedding / np.linalg.norm(base_embedding)  # Normalize
+
+        results["steps"].append({
+            "step": "embedding_generation",
+            "success": True,
+            "embedding_norm": float(np.linalg.norm(base_embedding)),
+            "is_simulated_owner": simulate_owner
+        })
+
+        # Step 3: Evaluate embedding
+        eval_result = await system.fine_tuning.evaluate_embedding(base_embedding)
+        results["steps"].append({
+            "step": "embedding_evaluation",
+            "success": True,
+            "derek_probability": eval_result["derek_probability"],
+            "classification": eval_result["classification"],
+            "derek_center_distance": eval_result["derek_center_distance"]
+        })
+
+        # Step 4: Run calibrated authentication
+        auth_result = await system.authenticate(
+            embedding=base_embedding,
+            is_owner_known=simulate_owner,
+            security_level=security_level
+        )
+
+        results["steps"].append({
+            "step": "calibrated_authentication",
+            "success": True,
+            "authenticated": auth_result["authenticated"],
+            "raw_score": auth_result["raw_score"],
+            "calibrated_probability": auth_result["probability"],
+            "threshold_used": auth_result["threshold"],
+            "calibration_applied": auth_result["calibration_applied"]
+        })
+
+        # Step 5: Get current system status
+        status = await system.get_system_status()
+        progress = await system.get_progress_report()
+
+        results["steps"].append({
+            "step": "system_status",
+            "success": True,
+            "current_thresholds": status["thresholds"]["current_thresholds"],
+            "target_thresholds": status["thresholds"]["target_thresholds"],
+            "progress_percent": progress["progress_percent"],
+            "calibration_quality": progress["calibration_quality"]
+        })
+
+        # Final result
+        results["processing_time_ms"] = (time.time() - start_time) * 1000
+        results["overall_success"] = True
+        results["authenticated"] = auth_result["authenticated"]
+        results["final_probability"] = auth_result["probability"]
+        results["recommendation"] = progress.get("recommendation", "")
+        results["summary"] = progress.get("summary", "")
+
+        return results
+
+    except Exception as e:
+        logger.error(f"Full pipeline test error: {e}", exc_info=True)
+        results["steps"].append({
+            "step": "error",
+            "success": False,
+            "error": str(e)
+        })
+        results["overall_success"] = False
+        return results
+
+
+# ============================================================================
+# Enhanced Anti-Spoofing API Endpoints
+# ============================================================================
+
+class ComprehensiveAntiSpoofRequest(BaseModel):
+    """Request model for comprehensive anti-spoofing check."""
+    speaker_name: str = Field(default="Derek", description="Speaker name")
+    audio_features: Dict[str, float] = Field(
+        default_factory=lambda: {
+            "pitch_std": 25.0,
+            "jitter": 0.02,
+            "shimmer": 0.05,
+            "hnr": 18.0,
+            "spectral_flatness": 0.4,
+            "breathing_detected": True,
+            "frame_discontinuity": 0.1,
+            "reverb_time": 0.3,
+            "noise_floor_db": -45
+        },
+        description="Audio features for analysis"
+    )
+    embedding: Optional[List[float]] = Field(None, description="Optional 192-dim embedding")
+    session_embeddings: Optional[List[List[float]]] = Field(None, description="Optional session embeddings for trajectory analysis")
+
+
+class SynthesisDetectionRequest(BaseModel):
+    """Request model for synthesis attack detection."""
+    speaker_name: str = Field(default="Derek", description="Speaker name")
+    pitch_std: float = Field(default=25.0, description="Pitch standard deviation")
+    jitter: float = Field(default=0.02, description="Jitter percentage")
+    shimmer: float = Field(default=0.05, description="Shimmer percentage")
+    hnr: float = Field(default=18.0, description="Harmonics-to-noise ratio (dB)")
+    spectral_flatness: float = Field(default=0.4, description="Spectral flatness (0-1)")
+    breathing_detected: bool = Field(default=True, description="Whether breathing sounds are present")
+    frame_discontinuity: float = Field(default=0.1, description="Frame boundary discontinuity score")
+
+
+class VoiceConversionDetectionRequest(BaseModel):
+    """Request model for voice conversion attack detection."""
+    speaker_name: str = Field(default="Derek", description="Speaker name")
+    current_embedding: List[float] = Field(..., description="Current 192-dim embedding")
+    session_embeddings: Optional[List[List[float]]] = Field(None, description="Previous embeddings in session")
+
+
+@router.post("/anti-spoofing/comprehensive")
+async def comprehensive_anti_spoofing_check(request: ComprehensiveAntiSpoofRequest):
+    """
+    Perform comprehensive anti-spoofing analysis combining all detection methods.
+
+    This endpoint checks for:
+    - Replay attacks (exact audio match)
+    - Synthesis/deepfake attacks (acoustic anomalies)
+    - Voice conversion attacks (embedding trajectory analysis)
+    - Environmental anomalies (acoustic environment inconsistencies)
+
+    Returns detailed analysis with threat type and recommendations.
+    """
+    pattern_store = await get_pattern_store()
+    if not pattern_store:
+        # Return simulated result if pattern store unavailable
+        return {
+            "success": True,
+            "simulated": True,
+            "is_spoofed": False,
+            "overall_confidence": 0.05,
+            "threat_type": "none",
+            "message": "Pattern store unavailable - simulated result"
+        }
+
+    try:
+        # Prepare embedding
+        if request.embedding:
+            embedding = np.array(request.embedding, dtype=np.float32)
+        else:
+            # Generate placeholder embedding for testing
+            np.random.seed(42)
+            embedding = np.random.randn(192).astype(np.float32)
+            embedding = embedding / np.linalg.norm(embedding)
+
+        # Prepare session embeddings
+        session_embeddings = None
+        if request.session_embeddings:
+            session_embeddings = [np.array(e, dtype=np.float32) for e in request.session_embeddings]
+
+        # Generate simulated audio data for fingerprinting
+        audio_data = np.random.bytes(16000)  # Simulated audio
+
+        result = await pattern_store.comprehensive_anti_spoofing_check(
+            audio_data=audio_data,
+            embedding=embedding,
+            audio_features=request.audio_features,
+            speaker_name=request.speaker_name,
+            session_embeddings=session_embeddings
+        )
+
+        return {
+            "success": True,
+            "anti_spoofing_result": result
+        }
+
+    except Exception as e:
+        logger.error(f"Comprehensive anti-spoofing error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/anti-spoofing/detect-synthesis")
+async def detect_synthesis_attack(request: SynthesisDetectionRequest):
+    """
+    Detect synthetic/deepfake voice attacks using acoustic anomaly detection.
+
+    Checks for unnatural pitch variation, missing micro-variations,
+    spectral artifacts, and temporal consistency issues.
+
+    Synthetic voices typically show:
+    - Too flat or too perfect pitch
+    - Missing jitter/shimmer (natural voice quality variations)
+    - Unnaturally clean harmonics
+    - Missing breathing sounds
+    """
+    pattern_store = await get_pattern_store()
+    if not pattern_store:
+        # Return simulated analysis
+        is_synthetic = request.jitter < 0.005 or request.shimmer < 0.02
+        return {
+            "success": True,
+            "simulated": True,
+            "is_synthetic": is_synthetic,
+            "confidence": 0.6 if is_synthetic else 0.1,
+            "indicators": ["missing_jitter"] if request.jitter < 0.005 else [],
+            "message": "Pattern store unavailable - simulated analysis"
+        }
+
+    try:
+        audio_features = {
+            "pitch_std": request.pitch_std,
+            "jitter": request.jitter,
+            "shimmer": request.shimmer,
+            "hnr": request.hnr,
+            "spectral_flatness": request.spectral_flatness,
+            "breathing_detected": request.breathing_detected,
+            "frame_discontinuity": request.frame_discontinuity
+        }
+
+        is_synthetic, confidence, indicators = await pattern_store.detect_synthesis_attack(
+            audio_features, request.speaker_name
+        )
+
+        return {
+            "success": True,
+            "is_synthetic": is_synthetic,
+            "confidence": confidence,
+            "anomaly_indicators": indicators,
+            "analysis": {
+                "pitch_std_check": "suspicious" if request.pitch_std < 5 or request.pitch_std > 100 else "normal",
+                "jitter_check": "suspicious" if request.jitter < 0.001 else "normal",
+                "shimmer_check": "suspicious" if request.shimmer < 0.01 else "normal",
+                "hnr_check": "suspicious" if request.hnr > 35 else "normal",
+                "breathing_check": "suspicious" if not request.breathing_detected else "normal"
+            }
+        }
+
+    except Exception as e:
+        logger.error(f"Synthesis detection error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/anti-spoofing/detect-voice-conversion")
+async def detect_voice_conversion_attack(request: VoiceConversionDetectionRequest):
+    """
+    Detect voice conversion (VC) attacks where an attacker's voice is morphed.
+
+    Voice conversion attacks show:
+    - Inconsistent speaker identity across phrases
+    - Spectral instability (different formant patterns frame-to-frame)
+    - Unusual embedding trajectory during speech
+
+    Requires the current embedding and optionally previous embeddings from the session.
+    """
+    pattern_store = await get_pattern_store()
+
+    try:
+        current_embedding = np.array(request.current_embedding, dtype=np.float32)
+
+        if len(current_embedding) != 192:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Embedding must be 192-dimensional, got {len(current_embedding)}"
+            )
+
+        session_embeddings = None
+        if request.session_embeddings:
+            session_embeddings = [np.array(e, dtype=np.float32) for e in request.session_embeddings]
+
+        if not pattern_store:
+            # Simulated analysis based on session embeddings
+            if session_embeddings and len(session_embeddings) >= 2:
+                similarities = []
+                for i in range(len(session_embeddings) - 1):
+                    sim = np.dot(session_embeddings[i], session_embeddings[i + 1]) / (
+                        np.linalg.norm(session_embeddings[i]) * np.linalg.norm(session_embeddings[i + 1]) + 1e-10
+                    )
+                    similarities.append(float(sim))
+                avg_stability = np.mean(similarities)
+                is_vc = avg_stability < 0.85
+            else:
+                is_vc = False
+                avg_stability = 1.0
+
+            return {
+                "success": True,
+                "simulated": True,
+                "is_voice_conversion": is_vc,
+                "confidence": 0.5 if is_vc else 0.1,
+                "embedding_stability": avg_stability,
+                "message": "Pattern store unavailable - simulated analysis"
+            }
+
+        is_vc, confidence, analysis = await pattern_store.detect_voice_conversion_attack(
+            current_embedding, request.speaker_name, session_embeddings
+        )
+
+        return {
+            "success": True,
+            "is_voice_conversion": is_vc,
+            "confidence": confidence,
+            "analysis": analysis
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Voice conversion detection error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/anti-spoofing/analyze-environment")
+async def analyze_environment(
+    speaker_name: str = Query(default="Derek", description="Speaker name"),
+    reverb_time: float = Query(default=0.3, description="Reverb time in seconds"),
+    noise_floor_db: float = Query(default=-45, description="Noise floor in dB")
+):
+    """
+    Analyze environmental audio signature for anomalies.
+
+    Legitimate users typically have consistent environmental patterns.
+    Attackers often have different acoustic environments.
+
+    Suspicious indicators:
+    - noise_floor < -70 dB: Suspiciously clean (might be pre-recorded)
+    - noise_floor > -20 dB: Very noisy (might be phone playback)
+    - Reverb time significantly different from known environments
+    """
+    pattern_store = await get_pattern_store()
+
+    audio_features = {
+        "reverb_time": reverb_time,
+        "noise_floor_db": noise_floor_db
+    }
+
+    if not pattern_store:
+        # Simulated analysis
+        indicators = []
+        anomaly_score = 0.0
+
+        if noise_floor_db < -70:
+            indicators.append("suspiciously_clean_audio")
+            anomaly_score += 0.30
+        if noise_floor_db > -20:
+            indicators.append("high_background_noise")
+            anomaly_score += 0.25
+
+        return {
+            "success": True,
+            "simulated": True,
+            "is_anomalous": anomaly_score > 0.40,
+            "anomaly_score": anomaly_score,
+            "indicators": indicators,
+            "message": "Pattern store unavailable - simulated analysis"
+        }
+
+    try:
+        is_anomalous, confidence, analysis = await pattern_store.analyze_environmental_signature(
+            audio_features, speaker_name
+        )
+
+        return {
+            "success": True,
+            "is_anomalous": is_anomalous,
+            "confidence": confidence,
+            "analysis": analysis
+        }
+
+    except Exception as e:
+        logger.error(f"Environment analysis error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/anti-spoofing/test-full-pipeline")
+async def test_anti_spoofing_pipeline(
+    scenario: str = Query(
+        default="legitimate",
+        description="Scenario: 'legitimate', 'replay_attack', 'deepfake', 'voice_conversion', 'mixed_attack'"
+    ),
+    speaker_name: str = Query(default="Derek", description="Speaker name")
+):
+    """
+    Test the full anti-spoofing pipeline with predefined scenarios.
+
+    Scenarios:
+    - legitimate: Normal voice from real user
+    - replay_attack: Exact audio replay detected
+    - deepfake: Synthetic voice with acoustic anomalies
+    - voice_conversion: Voice morphing attack
+    - mixed_attack: Multiple attack vectors detected
+
+    This is perfect for Postman testing of the anti-spoofing system.
+    """
+    start_time = time.time()
+
+    # Define scenario parameters
+    scenarios = {
+        "legitimate": {
+            "audio_features": {
+                "pitch_std": 25.0,
+                "jitter": 0.025,
+                "shimmer": 0.06,
+                "hnr": 18.0,
+                "spectral_flatness": 0.35,
+                "breathing_detected": True,
+                "frame_discontinuity": 0.08,
+                "reverb_time": 0.3,
+                "noise_floor_db": -42
+            },
+            "session_stability": 0.95
+        },
+        "replay_attack": {
+            "audio_features": {
+                "pitch_std": 22.0,
+                "jitter": 0.02,
+                "shimmer": 0.05,
+                "hnr": 20.0,
+                "spectral_flatness": 0.3,
+                "breathing_detected": True,
+                "frame_discontinuity": 0.05,
+                "reverb_time": 0.25,
+                "noise_floor_db": -55  # Too clean
+            },
+            "is_replay": True,
+            "session_stability": 0.98
+        },
+        "deepfake": {
+            "audio_features": {
+                "pitch_std": 3.0,  # Too flat
+                "jitter": 0.0005,  # Missing
+                "shimmer": 0.005,  # Missing
+                "hnr": 38.0,  # Too clean
+                "spectral_flatness": 0.92,  # Synthesis artifact
+                "breathing_detected": False,  # No breathing
+                "frame_discontinuity": 0.35,  # Boundary artifacts
+                "reverb_time": 0.2,
+                "noise_floor_db": -75  # Suspiciously clean
+            },
+            "session_stability": 0.99
+        },
+        "voice_conversion": {
+            "audio_features": {
+                "pitch_std": 30.0,
+                "jitter": 0.015,
+                "shimmer": 0.04,
+                "hnr": 16.0,
+                "spectral_flatness": 0.45,
+                "breathing_detected": True,
+                "frame_discontinuity": 0.15,
+                "reverb_time": 0.35,
+                "noise_floor_db": -40
+            },
+            "session_stability": 0.72  # Unstable identity
+        },
+        "mixed_attack": {
+            "audio_features": {
+                "pitch_std": 4.0,  # Flat
+                "jitter": 0.0008,  # Very low
+                "shimmer": 0.008,  # Very low
+                "hnr": 36.0,  # Too clean
+                "spectral_flatness": 0.85,
+                "breathing_detected": False,
+                "frame_discontinuity": 0.25,
+                "reverb_time": 0.15,
+                "noise_floor_db": -72
+            },
+            "is_replay": True,
+            "session_stability": 0.65
+        }
+    }
+
+    if scenario not in scenarios:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown scenario. Available: {list(scenarios.keys())}"
+        )
+
+    scenario_data = scenarios[scenario]
+    pattern_store = await get_pattern_store()
+
+    # Generate test embeddings based on scenario
+    np.random.seed(42)
+    base_embedding = np.random.randn(192).astype(np.float32)
+    base_embedding = base_embedding / np.linalg.norm(base_embedding)
+
+    # Generate session embeddings with specified stability
+    stability = scenario_data.get("session_stability", 0.95)
+    session_embeddings = [base_embedding.copy()]
+    for _ in range(3):
+        noise_scale = 1.0 - stability
+        noisy_emb = base_embedding + np.random.randn(192).astype(np.float32) * noise_scale
+        noisy_emb = noisy_emb / np.linalg.norm(noisy_emb)
+        session_embeddings.append(noisy_emb)
+
+    result = {
+        "scenario": scenario,
+        "timestamp": datetime.utcnow().isoformat(),
+        "speaker_name": speaker_name,
+        "checks": {},
+        "overall_result": {}
+    }
+
+    # Run all checks
+    if pattern_store:
+        # 1. Synthesis detection
+        is_synth, synth_conf, synth_ind = await pattern_store.detect_synthesis_attack(
+            scenario_data["audio_features"], speaker_name
+        )
+        result["checks"]["synthesis"] = {
+            "detected": is_synth,
+            "confidence": synth_conf,
+            "indicators": synth_ind
+        }
+
+        # 2. Voice conversion detection
+        is_vc, vc_conf, vc_analysis = await pattern_store.detect_voice_conversion_attack(
+            base_embedding, speaker_name, session_embeddings
+        )
+        result["checks"]["voice_conversion"] = {
+            "detected": is_vc,
+            "confidence": vc_conf,
+            "analysis": vc_analysis
+        }
+
+        # 3. Environmental analysis
+        is_env, env_conf, env_analysis = await pattern_store.analyze_environmental_signature(
+            scenario_data["audio_features"], speaker_name
+        )
+        result["checks"]["environmental"] = {
+            "detected": is_env,
+            "confidence": env_conf,
+            "analysis": env_analysis
+        }
+
+        # 4. Simulated replay detection (based on scenario)
+        is_replay = scenario_data.get("is_replay", False)
+        result["checks"]["replay"] = {
+            "detected": is_replay,
+            "confidence": 0.95 if is_replay else 0.0
+        }
+
+        # Overall result
+        threat_scores = []
+        if is_replay:
+            threat_scores.append(("replay", 0.95))
+        if is_synth:
+            threat_scores.append(("synthesis", synth_conf))
+        if is_vc:
+            threat_scores.append(("voice_conversion", vc_conf))
+        if is_env:
+            threat_scores.append(("environmental", env_conf))
+
+        if threat_scores:
+            max_threat = max(threat_scores, key=lambda x: x[1])
+            overall_score = max_threat[1]
+            if len(threat_scores) > 1:
+                overall_score = min(1.0, overall_score * (1 + 0.1 * (len(threat_scores) - 1)))
+        else:
+            overall_score = 0.0
+
+        result["overall_result"] = {
+            "is_spoofed": overall_score > 0.50,
+            "spoofing_confidence": overall_score,
+            "primary_threat": threat_scores[0][0] if threat_scores else "none",
+            "threat_count": len(threat_scores),
+            "recommendation": "DENY" if overall_score > 0.50 else "ALLOW"
+        }
+    else:
+        # Simulated results when pattern store unavailable
+        result["checks"] = {
+            "synthesis": {"detected": scenario in ["deepfake", "mixed_attack"], "simulated": True},
+            "voice_conversion": {"detected": scenario in ["voice_conversion", "mixed_attack"], "simulated": True},
+            "environmental": {"detected": scenario in ["replay_attack", "mixed_attack"], "simulated": True},
+            "replay": {"detected": scenario in ["replay_attack", "mixed_attack"], "simulated": True}
+        }
+        result["overall_result"] = {
+            "is_spoofed": scenario != "legitimate",
+            "simulated": True
+        }
+
+    result["processing_time_ms"] = (time.time() - start_time) * 1000
+
+    return result
+
+
+@router.get("/test/threshold-progress")
+async def test_threshold_progress():
+    """
+    Get a visual progress report of the journey toward 0.90/0.95/0.98 thresholds.
+
+    This endpoint provides a human-readable summary of:
+    - Where we are now
+    - Where we want to be
+    - What needs to happen to get there
+    """
+    system = await get_calibrated_auth_system()
+    if not system:
+        return {
+            "success": False,
+            "error": "Calibrated authentication system not available",
+            "recommendation": "The system needs to be initialized first"
+        }
+
+    try:
+        progress = await system.get_progress_report()
+        status = await system.get_system_status()
+
+        # Build visual progress bars
+        def progress_bar(percent, width=20):
+            filled = int(percent / 100 * width)
+            bar = "█" * filled + "░" * (width - filled)
+            return f"[{bar}] {percent:.0f}%"
+
+        threshold_status = status["thresholds"]
+        current_base = threshold_status["current_thresholds"]["base"]
+        target_base = threshold_status["target_thresholds"]["base"]
+
+        return {
+            "success": True,
+            "journey_to_90_percent": {
+                "current_base_threshold": current_base,
+                "target_base_threshold": target_base,
+                "progress_visual": progress_bar(progress["progress_percent"]),
+                "progress_percent": progress["progress_percent"]
+            },
+            "calibration": {
+                "is_calibrated": status["calibration"]["is_calibrated"],
+                "quality": progress["calibration_quality"],
+                "samples_collected": status["calibration"]["num_calibration_samples"],
+                "samples_needed_for_isotonic": 100
+            },
+            "performance": {
+                "frr_current": f"{threshold_status['current_frr']:.1%}",
+                "frr_target": f"{threshold_status['target_frr']:.1%}",
+                "far_current": f"{threshold_status['current_far']:.1%}",
+                "far_target": f"{threshold_status['target_far']:.1%}"
+            },
+            "summary": progress["summary"],
+            "recommendation": progress["recommendation"],
+            "what_helps": [
+                "More successful Derek authentications (trains the model)",
+                "Occasional impostor attempts (calibrates separation)",
+                "Consistent usage patterns (improves behavioral confidence)",
+                "High-quality audio samples (better embeddings)"
+            ]
+        }
+
+    except Exception as e:
+        logger.error(f"Threshold progress error: {e}", exc_info=True)
+        return {
+            "success": False,
+            "error": str(e)
+        }

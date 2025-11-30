@@ -1,0 +1,1083 @@
+{
+  "info": {
+    "_postman_id": "jarvis-voice-auth-intelligence-2024",
+    "name": "JARVIS Voice Auth Intelligence (Advanced ML)",
+    "description": "Advanced Voice Authentication Intelligence API Collection\n\n## Features\n- **AAM-Softmax + Center Loss + Triplet Loss Fine-Tuning**: Train embeddings for better speaker separation\n- **Platt/Isotonic Score Calibration**: Calibrate scores for meaningful 90%/95%/98% thresholds\n- **Adaptive Threshold Management**: Thresholds that evolve based on FRR/FAR\n- **Comprehensive Anti-Spoofing**: Replay, synthesis, voice conversion, environmental detection\n- **LangGraph Adaptive Reasoning**: Intelligent retry strategies\n- **Langfuse Audit Trail**: Complete authentication transparency\n- **Helicone-style Caching**: Cost optimization for voice processing\n\n## Base URL\n`http://localhost:8010`\n\n## Journey to 0.90/0.95/0.98 Thresholds\nThis collection helps you test and train the system toward production-grade thresholds.\n\n**Current (interim):** base=0.40, high=0.60, critical=0.75\n**Target:** base=0.90, high=0.95, critical=0.98\n\nThe system learns from every authentication attempt!",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://localhost:8010",
+      "type": "string"
+    },
+    {
+      "key": "speaker_name",
+      "value": "Derek",
+      "type": "string"
+    }
+  ],
+  "item": [
+    {
+      "name": "1. System Status",
+      "description": "Health and status endpoints",
+      "item": [
+        {
+          "name": "Voice Auth Intelligence Status",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/voice-auth-intelligence/status",
+              "host": ["{{base_url}}"],
+              "path": ["api", "voice-auth-intelligence", "status"]
+            },
+            "description": "Get comprehensive status of all voice auth intelligence components:\n- LangGraph\n- Langfuse\n- ChromaDB\n- Voice Cache\n- Multi-Factor Fusion"
+          }
+        },
+        {
+          "name": "Health Check",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/voice-auth-intelligence/health",
+              "host": ["{{base_url}}"],
+              "path": ["api", "voice-auth-intelligence", "health"]
+            },
+            "description": "Quick health check for the voice auth intelligence API"
+          }
+        },
+        {
+          "name": "Component Health Test",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/voice-auth-intelligence/test/component-health",
+              "host": ["{{base_url}}"],
+              "path": ["api", "voice-auth-intelligence", "test", "component-health"]
+            },
+            "description": "Test all component initialization status"
+          }
+        }
+      ]
+    },
+    {
+      "name": "2. Calibration System",
+      "description": "Score calibration and adaptive threshold management for 90%/95%/98% targets",
+      "item": [
+        {
+          "name": "Get Calibration Status",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "try {",
+                  "    const response = pm.response.json();",
+                  "    console.log('📊 Calibration Status');",
+                  "    console.log('   Summary: ' + response.summary);",
+                  "    console.log('   Recommendation: ' + response.recommendation);",
+                  "    if (response.progress_report) {",
+                  "        console.log('   Progress: ' + response.progress_report.progress_percent + '%');",
+                  "    }",
+                  "} catch (e) {",
+                  "    console.log('Response: ' + pm.response.text());",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/voice-auth-intelligence/calibration/status",
+              "host": ["{{base_url}}"],
+              "path": ["api", "voice-auth-intelligence", "calibration", "status"]
+            },
+            "description": "Get comprehensive calibration and threshold system status.\n\nReturns:\n- Current vs target thresholds\n- FRR/FAR metrics\n- Calibration quality\n- Progress toward 0.90/0.95/0.98"
+          }
+        },
+        {
+          "name": "Get Adaptive Thresholds",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "try {",
+                  "    const response = pm.response.json();",
+                  "    console.log('📈 Threshold Progress');",
+                  "    console.log('   Current: base=' + response.current_thresholds.base);",
+                  "    console.log('   Target:  base=' + response.target_thresholds.base);",
+                  "    console.log('   Progress: ' + response.progress_percent.toFixed(1) + '%');",
+                  "    console.log('   FRR: ' + (response.performance_metrics.frr * 100).toFixed(1) + '%');",
+                  "    console.log('   FAR: ' + (response.performance_metrics.far * 100).toFixed(1) + '%');",
+                  "} catch (e) {",
+                  "    console.log('Response: ' + pm.response.text());",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/voice-auth-intelligence/calibration/thresholds",
+              "host": ["{{base_url}}"],
+              "path": ["api", "voice-auth-intelligence", "calibration", "thresholds"]
+            },
+            "description": "Get current adaptive thresholds and progress toward targets.\n\nShows:\n- Current thresholds (base, high, critical)\n- Target thresholds (0.90, 0.95, 0.98)\n- FRR (False Rejection Rate)\n- FAR (False Acceptance Rate)"
+          }
+        },
+        {
+          "name": "Threshold Progress Visual",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "try {",
+                  "    const response = pm.response.json();",
+                  "    console.log('');",
+                  "    console.log('════════════════════════════════════════════');",
+                  "    console.log('  JOURNEY TO 90% THRESHOLD');",
+                  "    console.log('════════════════════════════════════════════');",
+                  "    console.log('  ' + response.journey_to_90_percent.progress_visual);",
+                  "    console.log('');",
+                  "    console.log('  Calibration: ' + response.calibration.quality);",
+                  "    console.log('  Samples: ' + response.calibration.samples_collected);",
+                  "    console.log('');",
+                  "    console.log('  ' + response.summary);",
+                  "    console.log('════════════════════════════════════════════');",
+                  "} catch (e) {",
+                  "    console.log('Response: ' + pm.response.text());",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/voice-auth-intelligence/test/threshold-progress",
+              "host": ["{{base_url}}"],
+              "path": ["api", "voice-auth-intelligence", "test", "threshold-progress"]
+            },
+            "description": "Visual progress report of the journey toward 0.90/0.95/0.98 thresholds.\n\nShows a progress bar and recommendations!"
+          }
+        },
+        {
+          "name": "Add Calibration Sample (Genuine)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "try {",
+                  "    const response = pm.response.json();",
+                  "    console.log('✅ Sample added: ' + response.message);",
+                  "} catch (e) {",
+                  "    console.log('Response: ' + pm.response.text());",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n    \"raw_score\": 0.85,\n    \"is_genuine\": true\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/voice-auth-intelligence/calibration/add-sample",
+              "host": ["{{base_url}}"],
+              "path": ["api", "voice-auth-intelligence", "calibration", "add-sample"]
+            },
+            "description": "Add a calibration sample for genuine Derek.\n\nCall this after successful authentications to train the calibrator.\n\nThe system recalibrates automatically every 20 samples."
+          }
+        },
+        {
+          "name": "Add Calibration Sample (Impostor)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n    \"raw_score\": 0.35,\n    \"is_genuine\": false\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/voice-auth-intelligence/calibration/add-sample",
+              "host": ["{{base_url}}"],
+              "path": ["api", "voice-auth-intelligence", "calibration", "add-sample"]
+            },
+            "description": "Add a calibration sample for an impostor.\n\nThis helps the system learn to separate Derek from non-Derek."
+          }
+        },
+        {
+          "name": "Force Calibration Fit",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/voice-auth-intelligence/calibration/fit",
+              "host": ["{{base_url}}"],
+              "path": ["api", "voice-auth-intelligence", "calibration", "fit"]
+            },
+            "description": "Force a calibration fit using collected samples.\n\nRequires at least 30 samples.\n\nFits Platt scaling (sigmoid) or Isotonic regression (with 100+ samples)."
+          }
+        },
+        {
+          "name": "Calibrate Single Score",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "try {",
+                  "    const response = pm.response.json();",
+                  "    console.log('📊 Score Calibration');",
+                  "    console.log('   Raw:        ' + response.raw_score);",
+                  "    console.log('   Calibrated: ' + response.calibrated_probability);",
+                  "    console.log('   Method:     ' + response.calibration_method);",
+                  "} catch (e) {",
+                  "    console.log('Response: ' + pm.response.text());",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/voice-auth-intelligence/calibration/calibrate-score?raw_score=0.78",
+              "host": ["{{base_url}}"],
+              "path": ["api", "voice-auth-intelligence", "calibration", "calibrate-score"],
+              "query": [
+                {
+                  "key": "raw_score",
+                  "value": "0.78"
+                }
+              ]
+            },
+            "description": "Calibrate a single raw score to a true probability.\n\nUseful for testing how calibration transforms scores."
+          }
+        },
+        {
+          "name": "Calibrated Authentication",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "try {",
+                  "    const response = pm.response.json();",
+                  "    console.log('🔐 Calibrated Authentication');",
+                  "    console.log('   Authenticated: ' + response.authenticated);",
+                  "    console.log('   Raw Score:     ' + response.raw_score.toFixed(3));",
+                  "    console.log('   Calibrated:    ' + response.calibrated_probability.toFixed(3));",
+                  "    console.log('   Threshold:     ' + response.threshold_used);",
+                  "    console.log('   Classification: ' + response.embedding_evaluation.classification);",
+                  "} catch (e) {",
+                  "    console.log('Response: ' + pm.response.text());",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            },
+            {
+              "listen": "prerequest",
+              "script": {
+                "exec": [
+                  "// Generate a random 192-dim embedding for testing",
+                  "const embedding = [];",
+                  "for (let i = 0; i < 192; i++) {",
+                  "    embedding.push((Math.random() * 2 - 1) * 0.1);",
+                  "}",
+                  "// Normalize",
+                  "const norm = Math.sqrt(embedding.reduce((a, b) => a + b*b, 0));",
+                  "const normalized = embedding.map(x => x / norm);",
+                  "pm.variables.set('test_embedding', JSON.stringify(normalized));"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n    \"embedding\": {{test_embedding}},\n    \"is_owner_known\": true,\n    \"security_level\": \"base\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/voice-auth-intelligence/calibration/authenticate",
+              "host": ["{{base_url}}"],
+              "path": ["api", "voice-auth-intelligence", "calibration", "authenticate"]
+            },
+            "description": "Perform calibrated authentication using the full pipeline:\n1. AAM-Softmax fine-tuned classification\n2. Platt/Isotonic score calibration\n3. Adaptive thresholds evolving toward 0.90/0.95/0.98"
+          }
+        }
+      ]
+    },
+    {
+      "name": "3. Fine-Tuning System",
+      "description": "AAM-Softmax + Center Loss + Triplet Loss training",
+      "item": [
+        {
+          "name": "Get Fine-Tuning Summary",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/voice-auth-intelligence/fine-tuning/summary",
+              "host": ["{{base_url}}"],
+              "path": ["api", "voice-auth-intelligence", "fine-tuning", "summary"]
+            },
+            "description": "Get summary of the fine-tuning system's training progress.\n\nReturns:\n- Total samples seen\n- Best accuracy achieved\n- Recent loss trends\n- Inter-class distance (want this large!)"
+          }
+        },
+        {
+          "name": "Evaluate Embedding",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "exec": [
+                  "// Generate a random 192-dim embedding for testing",
+                  "const embedding = [];",
+                  "for (let i = 0; i < 192; i++) {",
+                  "    embedding.push((Math.random() * 2 - 1) * 0.1);",
+                  "}",
+                  "const norm = Math.sqrt(embedding.reduce((a, b) => a + b*b, 0));",
+                  "const normalized = embedding.map(x => x / norm);",
+                  "pm.variables.set('test_embedding', JSON.stringify(normalized));"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n    \"embedding\": {{test_embedding}}\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/voice-auth-intelligence/fine-tuning/evaluate",
+              "host": ["{{base_url}}"],
+              "path": ["api", "voice-auth-intelligence", "fine-tuning", "evaluate"]
+            },
+            "description": "Evaluate how well an embedding fits Derek vs non-Derek classes.\n\nReturns distances and classification scores."
+          }
+        },
+        {
+          "name": "Train Step (Batch)",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "exec": [
+                  "// Generate batch of embeddings for training",
+                  "const embeddings = [];",
+                  "const labels = [];",
+                  "",
+                  "// Generate 4 'Derek' embeddings (label 1)",
+                  "for (let j = 0; j < 4; j++) {",
+                  "    const emb = [];",
+                  "    for (let i = 0; i < 192; i++) {",
+                  "        emb.push((Math.random() * 0.2 - 0.1) + 0.1);  // Clustered around 0.1",
+                  "    }",
+                  "    const norm = Math.sqrt(emb.reduce((a, b) => a + b*b, 0));",
+                  "    embeddings.push(emb.map(x => x / norm));",
+                  "    labels.push(1);",
+                  "}",
+                  "",
+                  "// Generate 4 'non-Derek' embeddings (label 0)",
+                  "for (let j = 0; j < 4; j++) {",
+                  "    const emb = [];",
+                  "    for (let i = 0; i < 192; i++) {",
+                  "        emb.push((Math.random() * 0.2 - 0.1) - 0.1);  // Clustered around -0.1",
+                  "    }",
+                  "    const norm = Math.sqrt(emb.reduce((a, b) => a + b*b, 0));",
+                  "    embeddings.push(emb.map(x => x / norm));",
+                  "    labels.push(0);",
+                  "}",
+                  "",
+                  "pm.variables.set('train_embeddings', JSON.stringify(embeddings));",
+                  "pm.variables.set('train_labels', JSON.stringify(labels));"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n    \"embeddings\": {{train_embeddings}},\n    \"labels\": {{train_labels}},\n    \"use_triplet\": true\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/voice-auth-intelligence/fine-tuning/train-step",
+              "host": ["{{base_url}}"],
+              "path": ["api", "voice-auth-intelligence", "fine-tuning", "train-step"]
+            },
+            "description": "Perform one training step with:\n- AAM-Softmax Loss (global discrimination)\n- Center Loss (tight Derek cluster)\n- Triplet Loss (push impostors away)\n\nGenerates 8 synthetic embeddings: 4 Derek, 4 non-Derek."
+          }
+        },
+        {
+          "name": "Save Fine-Tuning State",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/voice-auth-intelligence/fine-tuning/save",
+              "host": ["{{base_url}}"],
+              "path": ["api", "voice-auth-intelligence", "fine-tuning", "save"]
+            },
+            "description": "Save the current fine-tuning and calibration state to disk.\n\nPersists:\n- AAM-Softmax weights\n- Center Loss centers\n- Calibration parameters\n- Threshold history"
+          }
+        }
+      ]
+    },
+    {
+      "name": "4. Anti-Spoofing",
+      "description": "Comprehensive anti-spoofing detection: replay, synthesis, voice conversion, environmental",
+      "item": [
+        {
+          "name": "Test Anti-Spoofing Pipeline (Legitimate)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "try {",
+                  "    const response = pm.response.json();",
+                  "    console.log('🔒 Anti-Spoofing Result: ' + response.scenario);",
+                  "    console.log('   Is Spoofed: ' + response.overall_result.is_spoofed);",
+                  "    console.log('   Recommendation: ' + response.overall_result.recommendation);",
+                  "} catch (e) {",
+                  "    console.log('Response: ' + pm.response.text());",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/voice-auth-intelligence/anti-spoofing/test-full-pipeline?scenario=legitimate&speaker_name={{speaker_name}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "voice-auth-intelligence", "anti-spoofing", "test-full-pipeline"],
+              "query": [
+                {
+                  "key": "scenario",
+                  "value": "legitimate"
+                },
+                {
+                  "key": "speaker_name",
+                  "value": "{{speaker_name}}"
+                }
+              ]
+            },
+            "description": "Test anti-spoofing with legitimate voice.\n\nExpected: ALLOW"
+          }
+        },
+        {
+          "name": "Test Anti-Spoofing Pipeline (Replay Attack)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "try {",
+                  "    const response = pm.response.json();",
+                  "    console.log('🚨 Anti-Spoofing Result: ' + response.scenario);",
+                  "    console.log('   Is Spoofed: ' + response.overall_result.is_spoofed);",
+                  "    console.log('   Primary Threat: ' + response.overall_result.primary_threat);",
+                  "    console.log('   Recommendation: ' + response.overall_result.recommendation);",
+                  "} catch (e) {",
+                  "    console.log('Response: ' + pm.response.text());",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/voice-auth-intelligence/anti-spoofing/test-full-pipeline?scenario=replay_attack&speaker_name={{speaker_name}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "voice-auth-intelligence", "anti-spoofing", "test-full-pipeline"],
+              "query": [
+                {
+                  "key": "scenario",
+                  "value": "replay_attack"
+                },
+                {
+                  "key": "speaker_name",
+                  "value": "{{speaker_name}}"
+                }
+              ]
+            },
+            "description": "Test anti-spoofing with replay attack scenario.\n\nExpected: DENY - replay detected"
+          }
+        },
+        {
+          "name": "Test Anti-Spoofing Pipeline (Deepfake)",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/voice-auth-intelligence/anti-spoofing/test-full-pipeline?scenario=deepfake&speaker_name={{speaker_name}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "voice-auth-intelligence", "anti-spoofing", "test-full-pipeline"],
+              "query": [
+                {
+                  "key": "scenario",
+                  "value": "deepfake"
+                },
+                {
+                  "key": "speaker_name",
+                  "value": "{{speaker_name}}"
+                }
+              ]
+            },
+            "description": "Test anti-spoofing with deepfake/synthetic voice.\n\nExpected: DENY - synthesis detected"
+          }
+        },
+        {
+          "name": "Test Anti-Spoofing Pipeline (Voice Conversion)",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/voice-auth-intelligence/anti-spoofing/test-full-pipeline?scenario=voice_conversion&speaker_name={{speaker_name}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "voice-auth-intelligence", "anti-spoofing", "test-full-pipeline"],
+              "query": [
+                {
+                  "key": "scenario",
+                  "value": "voice_conversion"
+                },
+                {
+                  "key": "speaker_name",
+                  "value": "{{speaker_name}}"
+                }
+              ]
+            },
+            "description": "Test anti-spoofing with voice conversion (morphing) attack.\n\nExpected: DENY - voice conversion detected"
+          }
+        },
+        {
+          "name": "Test Anti-Spoofing Pipeline (Mixed Attack)",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/voice-auth-intelligence/anti-spoofing/test-full-pipeline?scenario=mixed_attack&speaker_name={{speaker_name}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "voice-auth-intelligence", "anti-spoofing", "test-full-pipeline"],
+              "query": [
+                {
+                  "key": "scenario",
+                  "value": "mixed_attack"
+                },
+                {
+                  "key": "speaker_name",
+                  "value": "{{speaker_name}}"
+                }
+              ]
+            },
+            "description": "Test anti-spoofing with multiple attack vectors.\n\nExpected: DENY with high confidence"
+          }
+        },
+        {
+          "name": "Detect Synthesis Attack",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n    \"speaker_name\": \"{{speaker_name}}\",\n    \"pitch_std\": 3.0,\n    \"jitter\": 0.0005,\n    \"shimmer\": 0.005,\n    \"hnr\": 38.0,\n    \"spectral_flatness\": 0.92,\n    \"breathing_detected\": false,\n    \"frame_discontinuity\": 0.35\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/voice-auth-intelligence/anti-spoofing/detect-synthesis",
+              "host": ["{{base_url}}"],
+              "path": ["api", "voice-auth-intelligence", "anti-spoofing", "detect-synthesis"]
+            },
+            "description": "Detect synthetic/deepfake voice using acoustic anomalies.\n\nThis example uses suspicious values that indicate synthesis:\n- pitch_std: 3.0 (too flat)\n- jitter: 0.0005 (missing)\n- shimmer: 0.005 (missing)\n- hnr: 38.0 (too clean)\n- breathing_detected: false"
+          }
+        },
+        {
+          "name": "Analyze Environment",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/voice-auth-intelligence/anti-spoofing/analyze-environment?speaker_name={{speaker_name}}&reverb_time=0.3&noise_floor_db=-75",
+              "host": ["{{base_url}}"],
+              "path": ["api", "voice-auth-intelligence", "anti-spoofing", "analyze-environment"],
+              "query": [
+                {
+                  "key": "speaker_name",
+                  "value": "{{speaker_name}}"
+                },
+                {
+                  "key": "reverb_time",
+                  "value": "0.3"
+                },
+                {
+                  "key": "noise_floor_db",
+                  "value": "-75"
+                }
+              ]
+            },
+            "description": "Analyze environmental audio signature.\n\nnoise_floor_db=-75 is suspiciously clean (might be pre-recorded)."
+          }
+        },
+        {
+          "name": "Comprehensive Anti-Spoofing Check",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n    \"speaker_name\": \"{{speaker_name}}\",\n    \"audio_features\": {\n        \"pitch_std\": 25.0,\n        \"jitter\": 0.02,\n        \"shimmer\": 0.05,\n        \"hnr\": 18.0,\n        \"spectral_flatness\": 0.4,\n        \"breathing_detected\": true,\n        \"frame_discontinuity\": 0.1,\n        \"reverb_time\": 0.3,\n        \"noise_floor_db\": -45\n    }\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/voice-auth-intelligence/anti-spoofing/comprehensive",
+              "host": ["{{base_url}}"],
+              "path": ["api", "voice-auth-intelligence", "anti-spoofing", "comprehensive"]
+            },
+            "description": "Comprehensive anti-spoofing analysis combining all detection methods:\n- Replay attack detection\n- Synthesis/deepfake detection\n- Voice conversion detection\n- Environmental anomaly detection"
+          }
+        }
+      ]
+    },
+    {
+      "name": "5. Authentication Simulation",
+      "description": "Simulate various authentication scenarios",
+      "item": [
+        {
+          "name": "Simulate: Success",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n    \"scenario\": \"success\",\n    \"speaker_name\": \"{{speaker_name}}\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/voice-auth-intelligence/authenticate/simulate",
+              "host": ["{{base_url}}"],
+              "path": ["api", "voice-auth-intelligence", "authenticate", "simulate"]
+            },
+            "description": "Simulate successful high-confidence authentication"
+          }
+        },
+        {
+          "name": "Simulate: Borderline",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n    \"scenario\": \"borderline\",\n    \"speaker_name\": \"{{speaker_name}}\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/voice-auth-intelligence/authenticate/simulate",
+              "host": ["{{base_url}}"],
+              "path": ["api", "voice-auth-intelligence", "authenticate", "simulate"]
+            },
+            "description": "Simulate borderline case that triggers challenge question"
+          }
+        },
+        {
+          "name": "Simulate: Sick Voice",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n    \"scenario\": \"sick_voice\",\n    \"speaker_name\": \"{{speaker_name}}\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/voice-auth-intelligence/authenticate/simulate",
+              "host": ["{{base_url}}"],
+              "path": ["api", "voice-auth-intelligence", "authenticate", "simulate"]
+            },
+            "description": "Simulate authentication when voice sounds sick/hoarse"
+          }
+        },
+        {
+          "name": "Simulate: Replay Attack",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n    \"scenario\": \"replay_attack\",\n    \"speaker_name\": \"{{speaker_name}}\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/voice-auth-intelligence/authenticate/simulate",
+              "host": ["{{base_url}}"],
+              "path": ["api", "voice-auth-intelligence", "authenticate", "simulate"]
+            },
+            "description": "Simulate replay attack detection"
+          }
+        },
+        {
+          "name": "Simulate: Noisy Environment",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n    \"scenario\": \"noisy_environment\",\n    \"speaker_name\": \"{{speaker_name}}\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/voice-auth-intelligence/authenticate/simulate",
+              "host": ["{{base_url}}"],
+              "path": ["api", "voice-auth-intelligence", "authenticate", "simulate"]
+            },
+            "description": "Simulate authentication in noisy environment"
+          }
+        }
+      ]
+    },
+    {
+      "name": "6. Audit Trail (Langfuse)",
+      "description": "Authentication audit and session management",
+      "item": [
+        {
+          "name": "Start Audit Session",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "try {",
+                  "    const response = pm.response.json();",
+                  "    if (response.session_id) {",
+                  "        pm.collectionVariables.set('audit_session_id', response.session_id);",
+                  "        console.log('📝 Session started: ' + response.session_id);",
+                  "    }",
+                  "} catch (e) {",
+                  "    console.log('Response: ' + pm.response.text());",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n    \"user_id\": \"{{speaker_name}}\",\n    \"source\": \"postman_test\",\n    \"device\": \"mac\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/voice-auth-intelligence/audit/session/start",
+              "host": ["{{base_url}}"],
+              "path": ["api", "voice-auth-intelligence", "audit", "session", "start"]
+            },
+            "description": "Start a new Langfuse audit session"
+          }
+        },
+        {
+          "name": "End Audit Session",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n    \"session_id\": \"{{audit_session_id}}\",\n    \"status\": \"authenticated\",\n    \"outcome\": \"test_completed\",\n    \"voice_confidence\": 0.92\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/voice-auth-intelligence/audit/session/end",
+              "host": ["{{base_url}}"],
+              "path": ["api", "voice-auth-intelligence", "audit", "session", "end"]
+            },
+            "description": "End an audit session with final outcome"
+          }
+        },
+        {
+          "name": "Get Recent Traces",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/voice-auth-intelligence/audit/traces/recent?limit=10",
+              "host": ["{{base_url}}"],
+              "path": ["api", "voice-auth-intelligence", "audit", "traces", "recent"],
+              "query": [
+                {
+                  "key": "limit",
+                  "value": "10"
+                }
+              ]
+            },
+            "description": "Get recent authentication traces"
+          }
+        }
+      ]
+    },
+    {
+      "name": "7. Multi-Factor Fusion",
+      "description": "Multi-factor authentication fusion",
+      "item": [
+        {
+          "name": "Calculate Fusion Score",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "try {",
+                  "    const response = pm.response.json();",
+                  "    console.log('🧠 Multi-Factor Fusion');",
+                  "    console.log('   Fused Confidence: ' + (response.fused_confidence * 100).toFixed(1) + '%');",
+                  "    console.log('   Authenticated: ' + response.authenticated);",
+                  "} catch (e) {",
+                  "    console.log('Response: ' + pm.response.text());",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n    \"voice_confidence\": 0.72,\n    \"behavioral_context\": {\n        \"time_of_day\": \"morning\",\n        \"typical_unlock_hour\": 7,\n        \"same_wifi_network\": true,\n        \"device_moved_since_lock\": false\n    },\n    \"weights\": {\n        \"voice\": 0.50,\n        \"behavioral\": 0.35,\n        \"context\": 0.15\n    },\n    \"apply_bonuses\": true,\n    \"proximity_confidence\": 0.95,\n    \"history_confidence\": 0.88\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/voice-auth-intelligence/fusion/calculate",
+              "host": ["{{base_url}}"],
+              "path": ["api", "voice-auth-intelligence", "fusion", "calculate"]
+            },
+            "description": "Calculate multi-factor fusion score.\n\nCombines:\n- Voice confidence\n- Behavioral context\n- Proximity (Apple Watch)\n- Historical patterns"
+          }
+        }
+      ]
+    },
+    {
+      "name": "8. Full Pipeline Tests",
+      "description": "End-to-end pipeline testing",
+      "item": [
+        {
+          "name": "Test Full Calibrated Pipeline (Owner)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "try {",
+                  "    const response = pm.response.json();",
+                  "    console.log('');",
+                  "    console.log('════════════════════════════════════════════');",
+                  "    console.log('  FULL PIPELINE TEST RESULT');",
+                  "    console.log('════════════════════════════════════════════');",
+                  "    console.log('  Authenticated: ' + response.authenticated);",
+                  "    console.log('  Probability:   ' + (response.final_probability * 100).toFixed(1) + '%');",
+                  "    console.log('  Summary:       ' + response.summary);",
+                  "    console.log('════════════════════════════════════════════');",
+                  "} catch (e) {",
+                  "    console.log('Response: ' + pm.response.text());",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/voice-auth-intelligence/test/full-calibrated-pipeline?simulate_owner=true&security_level=base",
+              "host": ["{{base_url}}"],
+              "path": ["api", "voice-auth-intelligence", "test", "full-calibrated-pipeline"],
+              "query": [
+                {
+                  "key": "simulate_owner",
+                  "value": "true"
+                },
+                {
+                  "key": "security_level",
+                  "value": "base"
+                }
+              ]
+            },
+            "description": "Test the full calibrated authentication pipeline simulating the owner (Derek).\n\nThis:\n1. Creates a synthetic embedding\n2. Runs through calibrated auth system\n3. Records for learning\n4. Returns full decision trace"
+          }
+        },
+        {
+          "name": "Test Full Calibrated Pipeline (Impostor)",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/voice-auth-intelligence/test/full-calibrated-pipeline?simulate_owner=false&security_level=base",
+              "host": ["{{base_url}}"],
+              "path": ["api", "voice-auth-intelligence", "test", "full-calibrated-pipeline"],
+              "query": [
+                {
+                  "key": "simulate_owner",
+                  "value": "false"
+                },
+                {
+                  "key": "security_level",
+                  "value": "base"
+                }
+              ]
+            },
+            "description": "Test pipeline with impostor (non-Derek) to train separation"
+          }
+        },
+        {
+          "name": "Test Full Calibrated Pipeline (High Security)",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/voice-auth-intelligence/test/full-calibrated-pipeline?simulate_owner=true&security_level=high",
+              "host": ["{{base_url}}"],
+              "path": ["api", "voice-auth-intelligence", "test", "full-calibrated-pipeline"],
+              "query": [
+                {
+                  "key": "simulate_owner",
+                  "value": "true"
+                },
+                {
+                  "key": "security_level",
+                  "value": "high"
+                }
+              ]
+            },
+            "description": "Test with high security level (0.95 target threshold)"
+          }
+        },
+        {
+          "name": "Test Integration Flow",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/voice-auth-intelligence/test/integration?simulate_success=true&voice_confidence=0.88",
+              "host": ["{{base_url}}"],
+              "path": ["api", "voice-auth-intelligence", "test", "integration"],
+              "query": [
+                {
+                  "key": "simulate_success",
+                  "value": "true"
+                },
+                {
+                  "key": "voice_confidence",
+                  "value": "0.88"
+                }
+              ]
+            },
+            "description": "Test integration of all voice auth intelligence components"
+          }
+        }
+      ]
+    }
+  ]
+}

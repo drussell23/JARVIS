@@ -2918,7 +2918,323 @@
 					]
 				},
 				{
-					"name": "8. Integration Tests",
+					"name": "8. Score Calibration (PRD v2.0)",
+					"description": "Platt Scaling and Isotonic Regression for probability calibration. Enables meaningful 90%/95%/98% thresholds.",
+					"item": [
+						{
+							"name": "Calibrated Authenticate",
+							"request": {
+								"method": "POST",
+								"header": [
+									{
+										"key": "Content-Type",
+										"value": "application/json"
+									}
+								],
+								"body": {
+									"mode": "raw",
+									"raw": "{\n    \"embedding\": [0.1, 0.2, 0.3],\n    \"is_owner_known\": true,\n    \"security_level\": \"base\"\n}"
+								},
+								"url": {
+									"raw": "{{base_url}}/api/voice-auth-intelligence/calibration/authenticate",
+									"host": ["{{base_url}}"],
+									"path": ["api", "voice-auth-intelligence", "calibration", "authenticate"]
+								},
+								"description": "Full calibrated authentication pipeline. Combines fine-tuning evaluation + score calibration + adaptive thresholds."
+							}
+						},
+						{
+							"name": "Add Calibration Sample",
+							"request": {
+								"method": "POST",
+								"header": [
+									{
+										"key": "Content-Type",
+										"value": "application/json"
+									}
+								],
+								"body": {
+									"mode": "raw",
+									"raw": "{\n    \"raw_score\": 0.85,\n    \"is_genuine\": true\n}"
+								},
+								"url": {
+									"raw": "{{base_url}}/api/voice-auth-intelligence/calibration/add-sample",
+									"host": ["{{base_url}}"],
+									"path": ["api", "voice-auth-intelligence", "calibration", "add-sample"]
+								},
+								"description": "Add a calibration training sample. Need 30+ samples for Platt scaling, 100+ for Isotonic regression."
+							}
+						},
+						{
+							"name": "Fit Calibration Model",
+							"request": {
+								"method": "POST",
+								"header": [],
+								"url": {
+									"raw": "{{base_url}}/api/voice-auth-intelligence/calibration/fit",
+									"host": ["{{base_url}}"],
+									"path": ["api", "voice-auth-intelligence", "calibration", "fit"]
+								},
+								"description": "Force-fit the calibration model with current samples. Uses Platt (30-99 samples) or Isotonic (100+ samples)."
+							}
+						},
+						{
+							"name": "Get Calibration Status",
+							"request": {
+								"method": "GET",
+								"header": [],
+								"url": {
+									"raw": "{{base_url}}/api/voice-auth-intelligence/calibration/status",
+									"host": ["{{base_url}}"],
+									"path": ["api", "voice-auth-intelligence", "calibration", "status"]
+								},
+								"description": "Get system status including calibration readiness, training progress, and threshold adaptation."
+							}
+						},
+						{
+							"name": "Get Thresholds",
+							"request": {
+								"method": "GET",
+								"header": [],
+								"url": {
+									"raw": "{{base_url}}/api/voice-auth-intelligence/calibration/thresholds",
+									"host": ["{{base_url}}"],
+									"path": ["api", "voice-auth-intelligence", "calibration", "thresholds"]
+								},
+								"description": "Get current vs target thresholds. Targets: base=0.90, high=0.95, critical=0.98."
+							}
+						},
+						{
+							"name": "Calibrate Single Score",
+							"request": {
+								"method": "POST",
+								"header": [
+									{
+										"key": "Content-Type",
+										"value": "application/json"
+									}
+								],
+								"body": {
+									"mode": "raw",
+									"raw": "{\n    \"raw_score\": 0.72\n}"
+								},
+								"url": {
+									"raw": "{{base_url}}/api/voice-auth-intelligence/calibration/calibrate-score",
+									"host": ["{{base_url}}"],
+									"path": ["api", "voice-auth-intelligence", "calibration", "calibrate-score"]
+								},
+								"description": "Calibrate a raw cosine similarity score to a meaningful probability."
+							}
+						},
+						{
+							"name": "Threshold Progress Report",
+							"request": {
+								"method": "GET",
+								"header": [],
+								"url": {
+									"raw": "{{base_url}}/api/voice-auth-intelligence/test/threshold-progress",
+									"host": ["{{base_url}}"],
+									"path": ["api", "voice-auth-intelligence", "test", "threshold-progress"]
+								},
+								"description": "Visual progress report showing current vs target thresholds with progress bars."
+							}
+						}
+					]
+				},
+				{
+					"name": "9. Fine-Tuning (PRD v2.0)",
+					"description": "AAM-Softmax + Center Loss + Triplet Loss for speaker embedding improvement.",
+					"item": [
+						{
+							"name": "Training Step",
+							"request": {
+								"method": "POST",
+								"header": [
+									{
+										"key": "Content-Type",
+										"value": "application/json"
+									}
+								],
+								"body": {
+									"mode": "raw",
+									"raw": "{\n    \"embeddings\": [[0.1, 0.2, 0.3]],\n    \"labels\": [1],\n    \"use_triplet\": true\n}"
+								},
+								"url": {
+									"raw": "{{base_url}}/api/voice-auth-intelligence/fine-tuning/train-step",
+									"host": ["{{base_url}}"],
+									"path": ["api", "voice-auth-intelligence", "fine-tuning", "train-step"]
+								},
+								"description": "Perform a manual training step with batch embeddings and labels."
+							}
+						},
+						{
+							"name": "Evaluate Embedding",
+							"request": {
+								"method": "POST",
+								"header": [
+									{
+										"key": "Content-Type",
+										"value": "application/json"
+									}
+								],
+								"body": {
+									"mode": "raw",
+									"raw": "{\n    \"embedding\": [0.1, 0.2, 0.3]\n}"
+								},
+								"url": {
+									"raw": "{{base_url}}/api/voice-auth-intelligence/fine-tuning/evaluate",
+									"host": ["{{base_url}}"],
+									"path": ["api", "voice-auth-intelligence", "fine-tuning", "evaluate"]
+								},
+								"description": "Evaluate an embedding against the fine-tuned model (center distances, AAM logits)."
+							}
+						},
+						{
+							"name": "Training Summary",
+							"request": {
+								"method": "GET",
+								"header": [],
+								"url": {
+									"raw": "{{base_url}}/api/voice-auth-intelligence/fine-tuning/summary",
+									"host": ["{{base_url}}"],
+									"path": ["api", "voice-auth-intelligence", "fine-tuning", "summary"]
+								},
+								"description": "Get training progress including total steps, loss trends, and center distances."
+							}
+						},
+						{
+							"name": "Save Model State",
+							"request": {
+								"method": "POST",
+								"header": [],
+								"url": {
+									"raw": "{{base_url}}/api/voice-auth-intelligence/fine-tuning/save",
+									"host": ["{{base_url}}"],
+									"path": ["api", "voice-auth-intelligence", "fine-tuning", "save"]
+								},
+								"description": "Persist the current fine-tuning state to disk."
+							}
+						}
+					]
+				},
+				{
+					"name": "10. Anti-Spoofing (PRD v2.0)",
+					"description": "Comprehensive anti-spoofing detection: replay, synthesis, voice conversion, environmental.",
+					"item": [
+						{
+							"name": "Comprehensive Anti-Spoof Check",
+							"request": {
+								"method": "POST",
+								"header": [
+									{
+										"key": "Content-Type",
+										"value": "application/json"
+									}
+								],
+								"body": {
+									"mode": "raw",
+									"raw": "{\n    \"speaker_name\": \"Derek\",\n    \"audio_features\": {\n        \"pitch_std\": 25.0,\n        \"jitter\": 0.015,\n        \"shimmer\": 0.03,\n        \"hnr\": 20.0,\n        \"spectral_flatness\": 0.15,\n        \"breathing_detected\": true,\n        \"frame_discontinuity\": 0.02,\n        \"reverb_time\": 0.3,\n        \"noise_floor_db\": -45\n    },\n    \"embedding\": null,\n    \"session_embeddings\": null\n}"
+								},
+								"url": {
+									"raw": "{{base_url}}/api/voice-auth-intelligence/anti-spoofing/comprehensive",
+									"host": ["{{base_url}}"],
+									"path": ["api", "voice-auth-intelligence", "anti-spoofing", "comprehensive"]
+								},
+								"description": "Run all anti-spoofing checks: replay, synthesis/deepfake, voice conversion, environmental anomaly."
+							}
+						},
+						{
+							"name": "Detect Synthesis Attack",
+							"request": {
+								"method": "POST",
+								"header": [
+									{
+										"key": "Content-Type",
+										"value": "application/json"
+									}
+								],
+								"body": {
+									"mode": "raw",
+									"raw": "{\n    \"speaker_name\": \"Derek\",\n    \"audio_features\": {\n        \"pitch_std\": 5.0,\n        \"jitter\": 0.001,\n        \"shimmer\": 0.005,\n        \"hnr\": 30.0,\n        \"spectral_flatness\": 0.05,\n        \"breathing_detected\": false,\n        \"frame_discontinuity\": 0.0\n    }\n}"
+								},
+								"url": {
+									"raw": "{{base_url}}/api/voice-auth-intelligence/anti-spoofing/detect-synthesis",
+									"host": ["{{base_url}}"],
+									"path": ["api", "voice-auth-intelligence", "anti-spoofing", "detect-synthesis"]
+								},
+								"description": "Detect synthetic/deepfake audio. Checks pitch variation, jitter, shimmer, HNR, breathing patterns."
+							}
+						},
+						{
+							"name": "Detect Voice Conversion",
+							"request": {
+								"method": "POST",
+								"header": [
+									{
+										"key": "Content-Type",
+										"value": "application/json"
+									}
+								],
+								"body": {
+									"mode": "raw",
+									"raw": "{\n    \"speaker_name\": \"Derek\",\n    \"current_embedding\": [0.1, 0.2, 0.3],\n    \"session_embeddings\": [[0.1, 0.2, 0.3], [0.15, 0.25, 0.35]]\n}"
+								},
+								"url": {
+									"raw": "{{base_url}}/api/voice-auth-intelligence/anti-spoofing/detect-voice-conversion",
+									"host": ["{{base_url}}"],
+									"path": ["api", "voice-auth-intelligence", "anti-spoofing", "detect-voice-conversion"]
+								},
+								"description": "Detect voice conversion/morphing attacks by analyzing embedding stability across a session."
+							}
+						},
+						{
+							"name": "Analyze Environment",
+							"request": {
+								"method": "POST",
+								"header": [
+									{
+										"key": "Content-Type",
+										"value": "application/json"
+									}
+								],
+								"body": {
+									"mode": "raw",
+									"raw": "{\n    \"speaker_name\": \"Derek\",\n    \"audio_features\": {\n        \"reverb_time\": 0.3,\n        \"noise_floor_db\": -45\n    }\n}"
+								},
+								"url": {
+									"raw": "{{base_url}}/api/voice-auth-intelligence/anti-spoofing/analyze-environment",
+									"host": ["{{base_url}}"],
+									"path": ["api", "voice-auth-intelligence", "anti-spoofing", "analyze-environment"]
+								},
+								"description": "Analyze environmental signature to detect anomalies (unusual reverb, noise floor changes)."
+							}
+						},
+						{
+							"name": "Test Full Anti-Spoof Pipeline",
+							"request": {
+								"method": "POST",
+								"header": [
+									{
+										"key": "Content-Type",
+										"value": "application/json"
+									}
+								],
+								"body": {
+									"mode": "raw",
+									"raw": "{\n    \"scenario\": \"legitimate\",\n    \"speaker_name\": \"Derek\"\n}"
+								},
+								"url": {
+									"raw": "{{base_url}}/api/voice-auth-intelligence/anti-spoofing/test-full-pipeline",
+									"host": ["{{base_url}}"],
+									"path": ["api", "voice-auth-intelligence", "anti-spoofing", "test-full-pipeline"]
+								},
+								"description": "Test anti-spoofing with simulated scenarios: legitimate, replay_attack, synthesis_attack, voice_conversion."
+							}
+						}
+					]
+				},
+				{
+					"name": "11. Integration Tests",
 					"item": [
 						{
 							"name": "Full Pipeline Test",

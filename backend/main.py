@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 JARVIS AI Backend - Optimized Main Entry Point with Advanced Intelligence
+v17.8.0 - PRD v2.0 Voice Biometric Intelligence Edition
 
 This backend loads 10 critical components that power the JARVIS AI system:
 
@@ -59,8 +60,13 @@ This backend loads 10 critical components that power the JARVIS AI system:
    - Essential for production stability
    - Integration metrics tracking for all vision components
 
-7. VOICE UNLOCK (BEAST MODE Multi-Modal Biometric Authentication)
+7. VOICE UNLOCK (PRD v2.0 BEAST MODE Multi-Modal Biometric Authentication)
    - Advanced probabilistic voice biometric authentication for macOS
+   - PRD v2.0 Voice Biometric Intelligence (NEW!):
+     * ML Fine-Tuning: AAM-Softmax + Center Loss + Triplet Loss
+     * Score Calibration: Platt Scaling (30+ samples), Isotonic (100+ samples)
+     * Adaptive Thresholds: Auto-adjusts toward 90%/95%/98% targets
+     * Comprehensive Anti-Spoofing: Replay, Synthesis, Voice Conversion, Environmental
    - Multi-Modal Verification: 5 independent biometric signals
      * Deep learning embeddings (ECAPA-TDNN 192D)
      * Mahalanobis distance (statistical with adaptive covariance)

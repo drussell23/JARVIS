@@ -505,6 +505,387 @@ class VoicePatternStore:
         )
         await self.store_pattern(pattern)
 
+    # =========================================================================
+    # ENHANCED ANTI-SPOOFING DETECTION METHODS (v2.0)
+    # =========================================================================
+
+    async def detect_synthesis_attack(
+        self,
+        audio_features: Dict[str, float],
+        speaker_name: str
+    ) -> Tuple[bool, float, List[str]]:
+        """
+        Detect synthetic/deepfake voice attacks using acoustic anomaly detection.
+
+        Checks for:
+        - Unnatural pitch variation (too perfect or too flat)
+        - Missing micro-variations (breathing, natural pauses)
+        - Spectral artifacts from synthesis
+        - Temporal consistency issues
+
+        Args:
+            audio_features: Dict with keys like 'pitch_std', 'jitter', 'shimmer', 'hnr', etc.
+            speaker_name: The claimed speaker
+
+        Returns:
+            Tuple of (is_synthetic, confidence, anomaly_indicators)
+        """
+        anomaly_indicators: List[str] = []
+        anomaly_score = 0.0
+
+        # Check pitch variation - synthetic voices often have unnatural pitch patterns
+        pitch_std = audio_features.get('pitch_std', 0)
+        if pitch_std < 5:  # Too flat - often indicates synthesis
+            anomaly_indicators.append("unnaturally_flat_pitch")
+            anomaly_score += 0.25
+        elif pitch_std > 100:  # Too variable - might be voice conversion artifact
+            anomaly_indicators.append("excessive_pitch_variation")
+            anomaly_score += 0.15
+
+        # Check jitter (pitch variation between cycles) - synthetic voices have minimal jitter
+        jitter = audio_features.get('jitter', 0)
+        if jitter < 0.001:  # Less than 0.1% jitter is suspicious
+            anomaly_indicators.append("missing_jitter")
+            anomaly_score += 0.20
+
+        # Check shimmer (amplitude variation) - similar to jitter
+        shimmer = audio_features.get('shimmer', 0)
+        if shimmer < 0.01:  # Less than 1% shimmer is suspicious
+            anomaly_indicators.append("missing_shimmer")
+            anomaly_score += 0.20
+
+        # Check harmonics-to-noise ratio - synthetic voices often have perfect HNR
+        hnr = audio_features.get('hnr', 15)
+        if hnr > 35:  # HNR > 35 dB is unusually clean
+            anomaly_indicators.append("unnaturally_clean_harmonics")
+            anomaly_score += 0.15
+
+        # Check for spectral artifacts
+        spectral_flatness = audio_features.get('spectral_flatness', 0.5)
+        if spectral_flatness > 0.9:  # Very flat spectrum indicates synthesis
+            anomaly_indicators.append("spectral_synthesis_artifact")
+            anomaly_score += 0.20
+
+        # Check breathing patterns - natural speech has breath sounds
+        has_breathing = audio_features.get('breathing_detected', True)
+        if not has_breathing:
+            anomaly_indicators.append("missing_breathing_sounds")
+            anomaly_score += 0.15
+
+        # Check for frame boundary artifacts (common in generated audio)
+        frame_discontinuity = audio_features.get('frame_discontinuity', 0)
+        if frame_discontinuity > 0.3:
+            anomaly_indicators.append("frame_boundary_artifact")
+            anomaly_score += 0.20
+
+        # Normalize score
+        anomaly_score = min(1.0, anomaly_score)
+
+        is_synthetic = anomaly_score > 0.50  # Threshold for synthetic detection
+
+        if is_synthetic:
+            self.logger.warning(f"⚠️ SYNTHESIS ATTACK DETECTED for {speaker_name}: {anomaly_indicators}")
+
+        return is_synthetic, anomaly_score, anomaly_indicators
+
+    async def detect_voice_conversion_attack(
+        self,
+        current_embedding: np.ndarray,
+        speaker_name: str,
+        session_embeddings: Optional[List[np.ndarray]] = None
+    ) -> Tuple[bool, float, Dict[str, Any]]:
+        """
+        Detect voice conversion (VC) attacks where attacker's voice is morphed.
+
+        Voice conversion attacks show:
+        - Inconsistent speaker identity across phrases
+        - Spectral instability (different formant patterns frame-to-frame)
+        - Unusual embedding trajectory during speech
+
+        Args:
+            current_embedding: Current 192-dim embedding
+            speaker_name: Claimed speaker
+            session_embeddings: Multiple embeddings from same session (if available)
+
+        Returns:
+            Tuple of (is_voice_conversion, confidence, analysis_details)
+        """
+        analysis = {
+            "embedding_stability": 0.0,
+            "formant_consistency": 0.0,
+            "speaker_trajectory": 0.0,
+            "anomalies": []
+        }
+
+        vc_score = 0.0
+
+        if session_embeddings and len(session_embeddings) >= 2:
+            # Analyze embedding stability across session
+            # Natural speech has stable speaker identity even across phrases
+            similarities = []
+            for i in range(len(session_embeddings) - 1):
+                sim = np.dot(session_embeddings[i], session_embeddings[i + 1]) / (
+                    np.linalg.norm(session_embeddings[i]) * np.linalg.norm(session_embeddings[i + 1]) + 1e-10
+                )
+                similarities.append(sim)
+
+            avg_stability = np.mean(similarities)
+            analysis["embedding_stability"] = float(avg_stability)
+
+            # Voice conversion often shows unstable identity
+            if avg_stability < 0.85:
+                analysis["anomalies"].append("unstable_speaker_identity")
+                vc_score += 0.30
+
+            # Check for unnatural trajectory (jumping around in embedding space)
+            if len(similarities) > 2:
+                stability_std = np.std(similarities)
+                if stability_std > 0.15:  # High variance in similarity
+                    analysis["anomalies"].append("erratic_embedding_trajectory")
+                    vc_score += 0.25
+                analysis["speaker_trajectory"] = float(stability_std)
+
+        # Compare against stored patterns for this speaker
+        if self._initialized:
+            try:
+                similar_patterns = await self.find_similar_patterns(
+                    current_embedding,
+                    speaker_name,
+                    pattern_type="audio_fingerprint",
+                    top_k=10
+                )
+
+                if similar_patterns:
+                    # Check consistency with historical patterns
+                    distances = [p.get("distance", 1.0) for p in similar_patterns]
+                    avg_distance = np.mean(distances)
+
+                    if avg_distance > 0.5:  # Far from known patterns
+                        analysis["anomalies"].append("distant_from_known_patterns")
+                        vc_score += 0.25
+
+                    analysis["formant_consistency"] = float(1.0 - min(avg_distance, 1.0))
+
+            except Exception as e:
+                self.logger.debug(f"Pattern comparison failed: {e}")
+
+        is_vc_attack = vc_score > 0.40
+        analysis["vc_score"] = float(vc_score)
+
+        if is_vc_attack:
+            self.logger.warning(f"⚠️ VOICE CONVERSION ATTACK suspected for {speaker_name}")
+
+        return is_vc_attack, vc_score, analysis
+
+    async def analyze_environmental_signature(
+        self,
+        audio_features: Dict[str, float],
+        speaker_name: str
+    ) -> Tuple[bool, float, Dict[str, Any]]:
+        """
+        Analyze environmental audio signature for anomalies.
+
+        Legitimate users typically have consistent environmental patterns.
+        Attackers often have different acoustic environments.
+
+        Args:
+            audio_features: Environmental audio characteristics
+            speaker_name: The claimed speaker
+
+        Returns:
+            Tuple of (is_anomalous, confidence, analysis)
+        """
+        analysis = {
+            "known_environments": [],
+            "current_environment": {},
+            "anomaly_score": 0.0,
+            "indicators": []
+        }
+
+        # Extract environmental characteristics
+        reverb_time = audio_features.get('reverb_time', 0.3)
+        noise_floor = audio_features.get('noise_floor_db', -50)
+        room_impulse = audio_features.get('room_impulse_signature', None)
+
+        analysis["current_environment"] = {
+            "reverb_time": reverb_time,
+            "noise_floor": noise_floor
+        }
+
+        # Check against known environments for this speaker
+        if self._initialized:
+            try:
+                env_patterns = await self.find_similar_patterns(
+                    np.zeros(192, dtype=np.float32),  # Dummy embedding for metadata search
+                    speaker_name,
+                    pattern_type="environment",
+                    top_k=5
+                )
+
+                if env_patterns:
+                    analysis["known_environments"] = [
+                        p.get("metadata", {}).get("environment_name", "unknown")
+                        for p in env_patterns
+                    ]
+
+                    # Compare current environment to known ones
+                    # This is simplified - in production would use proper acoustic matching
+                    known_reverbs = [
+                        p.get("metadata", {}).get("reverb_time", 0.3)
+                        for p in env_patterns
+                    ]
+
+                    if known_reverbs:
+                        reverb_deviation = min(
+                            abs(reverb_time - kr) for kr in known_reverbs
+                        )
+                        if reverb_deviation > 0.3:  # Significant difference
+                            analysis["indicators"].append("unknown_acoustic_environment")
+                            analysis["anomaly_score"] += 0.30
+
+            except Exception as e:
+                self.logger.debug(f"Environment analysis failed: {e}")
+
+        # Check for recording artifacts (suggestive of replayed audio)
+        if noise_floor < -70:  # Unusually quiet - might be clean recording
+            analysis["indicators"].append("suspiciously_clean_audio")
+            analysis["anomaly_score"] += 0.20
+
+        if noise_floor > -20:  # Very noisy - might be phone playback
+            analysis["indicators"].append("high_background_noise")
+            analysis["anomaly_score"] += 0.15
+
+        is_anomalous = analysis["anomaly_score"] > 0.40
+
+        return is_anomalous, analysis["anomaly_score"], analysis
+
+    async def comprehensive_anti_spoofing_check(
+        self,
+        audio_data: bytes,
+        embedding: np.ndarray,
+        audio_features: Dict[str, float],
+        speaker_name: str,
+        session_embeddings: Optional[List[np.ndarray]] = None
+    ) -> Dict[str, Any]:
+        """
+        Perform comprehensive anti-spoofing analysis combining all detection methods.
+
+        This is the main entry point for anti-spoofing that should be called
+        during authentication.
+
+        Args:
+            audio_data: Raw audio bytes
+            embedding: Speaker embedding
+            audio_features: Extracted audio features
+            speaker_name: Claimed speaker
+            session_embeddings: Optional list of embeddings from current session
+
+        Returns:
+            Comprehensive anti-spoofing analysis result
+        """
+        import hashlib
+
+        result = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "speaker_name": speaker_name,
+            "is_spoofed": False,
+            "overall_confidence": 0.0,
+            "threat_type": ThreatType.NONE.value,
+            "checks": {},
+            "recommendations": []
+        }
+
+        threat_scores = []
+
+        # 1. Replay attack detection
+        audio_fingerprint = hashlib.sha256(audio_data).hexdigest()
+        is_replay, replay_confidence = await self.detect_replay_attack(
+            audio_fingerprint, speaker_name
+        )
+        result["checks"]["replay_attack"] = {
+            "detected": is_replay,
+            "confidence": replay_confidence
+        }
+        if is_replay:
+            threat_scores.append(("replay", replay_confidence))
+            result["threat_type"] = ThreatType.REPLAY_ATTACK.value
+
+        # 2. Synthesis detection
+        is_synthetic, synth_confidence, synth_indicators = await self.detect_synthesis_attack(
+            audio_features, speaker_name
+        )
+        result["checks"]["synthesis_attack"] = {
+            "detected": is_synthetic,
+            "confidence": synth_confidence,
+            "indicators": synth_indicators
+        }
+        if is_synthetic:
+            threat_scores.append(("synthesis", synth_confidence))
+            if result["threat_type"] == ThreatType.NONE.value:
+                result["threat_type"] = ThreatType.SYNTHETIC_VOICE.value
+
+        # 3. Voice conversion detection
+        is_vc, vc_confidence, vc_analysis = await self.detect_voice_conversion_attack(
+            embedding, speaker_name, session_embeddings
+        )
+        result["checks"]["voice_conversion"] = {
+            "detected": is_vc,
+            "confidence": vc_confidence,
+            "analysis": vc_analysis
+        }
+        if is_vc:
+            threat_scores.append(("voice_conversion", vc_confidence))
+            if result["threat_type"] == ThreatType.NONE.value:
+                result["threat_type"] = ThreatType.VOICE_CLONING.value
+
+        # 4. Environmental analysis
+        is_env_anomaly, env_confidence, env_analysis = await self.analyze_environmental_signature(
+            audio_features, speaker_name
+        )
+        result["checks"]["environmental_anomaly"] = {
+            "detected": is_env_anomaly,
+            "confidence": env_confidence,
+            "analysis": env_analysis
+        }
+        if is_env_anomaly:
+            threat_scores.append(("environmental", env_confidence))
+            if result["threat_type"] == ThreatType.NONE.value:
+                result["threat_type"] = ThreatType.ENVIRONMENTAL_ANOMALY.value
+
+        # Calculate overall spoofing score
+        if threat_scores:
+            # Use max threat as primary, but boost if multiple threats detected
+            max_threat = max(threat_scores, key=lambda x: x[1])
+            base_score = max_threat[1]
+
+            # Boost for multiple detections (correlated threats = higher confidence)
+            if len(threat_scores) > 1:
+                base_score = min(1.0, base_score * (1 + 0.1 * (len(threat_scores) - 1)))
+
+            result["overall_confidence"] = base_score
+            result["is_spoofed"] = base_score > 0.50
+
+        # Generate recommendations
+        if result["is_spoofed"]:
+            result["recommendations"].append("DENY authentication - spoofing detected")
+            result["recommendations"].append(f"Threat type: {result['threat_type']}")
+
+            if is_replay:
+                result["recommendations"].append("This exact audio was used before")
+            if is_synthetic:
+                result["recommendations"].append("Voice appears artificially generated")
+            if is_vc:
+                result["recommendations"].append("Voice conversion artifacts detected")
+        else:
+            if any(s[1] > 0.30 for s in threat_scores):
+                result["recommendations"].append("Minor anomalies detected - monitor closely")
+
+        # Store this audio fingerprint for future replay detection (if legitimate)
+        if not result["is_spoofed"] and self._initialized:
+            await self.store_audio_fingerprint(speaker_name, audio_fingerprint, embedding)
+
+        return result
+
 
 # ============================================================================
 # Authentication Audit Trail (Langfuse)

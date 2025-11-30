@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-Unified startup script for JARVIS AI System v14.1.0 - INTELLIGENT EDITION
-Advanced Browser Automation + v2.0 ML-Powered Intelligence Systems
+Unified startup script for JARVIS AI System v14.2.0 - PRD v2.0 VOICE INTELLIGENCE EDITION
+Advanced Browser Automation + v2.0 ML-Powered Intelligence Systems + PRD v2.0 Voice Biometrics
 ⚡ ULTRA-OPTIMIZED: 30% Memory Target (4.8GB on 16GB Systems)
 🤖 AUTONOMOUS: Self-Discovering, Self-Healing, Self-Optimizing
 🧠 INTELLIGENT: 6 Upgraded v2.0 Systems with Proactive Monitoring
+🔐 PRD v2.0: AAM-Softmax + Center Loss + Triplet Loss + Platt/Isotonic Calibration
 
 The JARVIS backend loads 11 critical components + 6 intelligent systems:
 
@@ -31,10 +32,32 @@ The JARVIS backend loads 11 critical components + 6 intelligent systems:
 4. VOICE - Voice activation ("Hey JARVIS") with proactive announcements
 5. ML_MODELS - NLP and sentiment analysis (lazy-loaded)
 6. MONITORING - System health tracking and component metrics
-7. VOICE_UNLOCK - BEAST MODE Multi-Modal Biometric Authentication (ADVANCED!)
+7. VOICE_UNLOCK - PRD v2.0 BEAST MODE Multi-Modal Biometric Authentication (ADVANCED!)
    ✨ Manual Unlock: "Hey JARVIS, unlock my screen" - Direct control 24/7
    ✨ Context-Aware: Automatically unlocks when needed for tasks
    🔬 BEAST MODE: Advanced Probabilistic Verification System
+   🔐 PRD v2.0: Next-Gen Voice Biometric Intelligence (NEW!)
+
+   📊 ML Fine-Tuning (advanced_ml_features.py):
+     - AAM-Softmax (ArcFace): Additive Angular Margin for discriminative embeddings
+     - Center Loss: Intra-class compactness - tight "Derek cluster"
+     - Triplet Loss: Metric learning with semi-hard negative mining
+     - Combined Training: α*AAM + β*Center + γ*Triplet joint optimization
+     - Real-time Fine-tuning: Improves from every authentication attempt
+
+   📈 Score Calibration (Platt/Isotonic):
+     - Platt Scaling: Sigmoid calibration for 30-99 training samples
+     - Isotonic Regression: Non-parametric for 100+ samples
+     - Adaptive Thresholds: Auto-adjusts toward 90%/95%/98% targets
+     - Meaningful Confidence: True probability instead of cosine similarity
+
+   🛡️ Comprehensive Anti-Spoofing (speaker_verification_service.py):
+     - Replay Attack Detection: Audio fingerprinting + spectral analysis
+     - Synthesis/Deepfake Detection: Pitch, jitter, shimmer, HNR analysis
+     - Voice Conversion Detection: Embedding stability across session
+     - Environmental Anomaly: Reverb time, noise floor signature
+     - Breathing Pattern Analysis: Natural speech indicator
+
    • Multi-Modal Fusion: 5 independent biometric signals
      - Deep learning embeddings (ECAPA-TDNN 192D)
      - Mahalanobis distance (statistical with adaptive covariance)
