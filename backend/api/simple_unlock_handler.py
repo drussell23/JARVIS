@@ -39,21 +39,21 @@ async def _get_owner_name():
     """
     Get the device owner's name dynamically from the database.
     Caches the result for performance.
-    
+
     Returns:
         str: Owner's name (first name only for natural speech)
     """
     global _owner_name_cache
-    
+
     if _owner_name_cache is not None:
         return _owner_name_cache
-    
+
     try:
         from intelligence.learning_database import get_learning_database
-        
+
         db = await get_learning_database()
         profiles = await db.get_all_speaker_profiles()
-        
+
         # Find the primary user (owner)
         for profile in profiles:
             if profile.get('is_primary_user'):
@@ -63,14 +63,72 @@ async def _get_owner_name():
                 _owner_name_cache = first_name
                 logger.info(f"✅ Retrieved owner name from database: {first_name}")
                 return first_name
-        
+
         # No owner found - return generic
         logger.warning("⚠️ No primary user found in database")
         return "User"
-        
+
     except Exception as e:
         logger.error(f"Error retrieving owner name: {e}")
         return "User"
+
+
+async def _preload_owner_name():
+    """
+    Pre-load owner name cache at startup for faster first unlock.
+    Fire-and-forget - does not block startup.
+    """
+    global _owner_name_cache
+    if _owner_name_cache is None:
+        await _get_owner_name()
+
+
+# Pre-cached speaker verification service for fast path
+_speaker_service_cache = None
+_speaker_service_lock = asyncio.Lock()
+
+
+async def _get_cached_speaker_service():
+    """
+    Get or initialize speaker verification service with caching.
+    Uses lock to prevent multiple concurrent initializations.
+    """
+    global _speaker_service_cache
+
+    if _speaker_service_cache is not None:
+        return _speaker_service_cache
+
+    async with _speaker_service_lock:
+        # Double-check after acquiring lock
+        if _speaker_service_cache is not None:
+            return _speaker_service_cache
+
+        try:
+            from voice.speaker_verification_service import get_speaker_verification_service
+            _speaker_service_cache = await get_speaker_verification_service()
+            logger.info("✅ Speaker verification service cached for fast path")
+            return _speaker_service_cache
+        except Exception as e:
+            logger.error(f"Failed to cache speaker service: {e}")
+            return None
+
+
+async def preload_unlock_dependencies():
+    """
+    Pre-load all unlock dependencies at startup for faster first unlock.
+    Call this from main.py during startup.
+    """
+    logger.info("🚀 Pre-loading unlock dependencies...")
+
+    # Run all preloads in parallel
+    await asyncio.gather(
+        _preload_owner_name(),
+        _get_cached_speaker_service(),
+        _get_transport_manager(),
+        return_exceptions=True  # Don't fail if one preload fails
+    )
+
+    logger.info("✅ Unlock dependencies pre-loaded")
 
 
 async def _get_transport_manager():
@@ -535,25 +593,27 @@ async def _execute_screen_action(
         if audio_data:
             # Verify speaker using voice biometrics with TIMEOUT PROTECTION
             try:
-                from voice.speaker_verification_service import get_speaker_verification_service
-
                 # Step 1: Announce verification start
                 logger.info("🎤 Starting voice biometric verification...")
                 context["status_message"] = "Verifying your voice biometrics..."
 
-                # Get speaker service with timeout
-                try:
-                    speaker_service = await asyncio.wait_for(
-                        get_speaker_verification_service(),
-                        timeout=10.0  # 10 second timeout for service initialization
-                    )
-                except asyncio.TimeoutError:
-                    logger.error("⏱️ Speaker service initialization timed out")
-                    return {
-                        "success": False,
-                        "error": "verification_timeout",
-                        "message": "Voice verification service initialization timed out. Please try again.",
-                    }
+                # FAST PATH: Use cached speaker service (pre-loaded at startup)
+                speaker_service = await _get_cached_speaker_service()
+                if speaker_service is None:
+                    # Fallback: Initialize service if cache failed
+                    try:
+                        from voice.speaker_verification_service import get_speaker_verification_service
+                        speaker_service = await asyncio.wait_for(
+                            get_speaker_verification_service(),
+                            timeout=10.0  # 10 second timeout for service initialization
+                        )
+                    except asyncio.TimeoutError:
+                        logger.error("⏱️ Speaker service initialization timed out")
+                        return {
+                            "success": False,
+                            "error": "verification_timeout",
+                            "message": "Voice verification service initialization timed out. Please try again.",
+                        }
 
                 sample_count = sum(
                     profile.get("total_samples", 0)
@@ -839,125 +899,27 @@ async def _try_system_lock_command(context: Dict[str, Any]) -> Tuple[bool, str]:
 
 async def _try_keychain_unlock(context: Dict[str, Any]) -> Tuple[bool, str]:
     """
-    Try keychain-based unlock method with voice verification using 25 voice samples.
+    Try keychain-based unlock method.
+
+    NOTE: Voice verification is now handled in _execute_screen_action().
+    This function focuses solely on password retrieval and unlock execution.
 
     Security Flow:
-    1. Verify speaker identity from audio using 25 biometric samples
-    2. Check if speaker is the device owner
-    3. Retrieve password from keychain
-    4. Perform unlock
+    1. Get verified speaker from context (already verified upstream)
+    2. Retrieve password from keychain
+    3. Perform unlock
     """
-    # Step 1: Voice verification (if audio data is available in context)
-    # Extract audio data from jarvis_instance if present
-    jarvis_instance = context.get("jarvis_instance")
-    audio_data = context.get("audio_data")
-    speaker_name = context.get("speaker_name")
+    # FAST PATH: Speaker already verified in _execute_screen_action()
+    # Check if verification was already done
+    verified_speaker = context.get("verified_speaker_name")
 
-    # Try to get audio from jarvis_instance if not in context directly
-    if not audio_data and jarvis_instance:
-        if hasattr(jarvis_instance, "last_audio_data"):
-            audio_data = jarvis_instance.last_audio_data
-            logger.info(
-                f"[VOICE] Extracted audio from jarvis_instance: {len(audio_data) if audio_data else 0} bytes"
-            )
-        if hasattr(jarvis_instance, "last_speaker_name"):
-            speaker_name = jarvis_instance.last_speaker_name
+    if not verified_speaker:
+        # No verification done yet - get owner name for text commands
+        logger.info("📝 No prior verification - using database owner for text command")
+        verified_speaker = await _get_owner_name()
+        context["verified_speaker_name"] = verified_speaker
 
-    logger.info(
-        f"🎤 Audio data status: {len(audio_data) if audio_data else 0} bytes, speaker: {speaker_name}"
-    )
-
-    if audio_data:
-        # Verify speaker using NEW speaker verification service (with pre-loaded profiles)
-        try:
-            from voice.speaker_verification_service import get_speaker_verification_service
-
-            # Step 1: Announce verification start
-            logger.info("🎤 Starting voice biometric verification...")
-            context["status_message"] = "Verifying your voice biometrics..."
-
-            speaker_service = await get_speaker_verification_service()
-            sample_count = sum(
-                profile.get("total_samples", 0)
-                for profile in speaker_service.speaker_profiles.values()
-            )
-            logger.info(
-                f"🔐 Speaker service ready: {len(speaker_service.speaker_profiles)} profiles, "
-                f"{sample_count} voice samples loaded"
-            )
-
-            # Step 2: Verify speaker using voice biometrics from database
-            logger.info("🔐 Analyzing voice pattern against biometric database...")
-            context["status_message"] = "Analyzing voice pattern..."
-
-            verification_result = await speaker_service.verify_speaker(audio_data, speaker_name)
-            logger.info(f"🎤 Verification result: {verification_result}")
-
-            speaker_name = verification_result["speaker_name"]
-            is_verified = verification_result["verified"]
-            confidence = verification_result["confidence"]
-            is_owner = verification_result["is_owner"]
-
-            # Step 3: Announce verification result
-            logger.info(
-                f"🔐 Speaker verification: {speaker_name} - "
-                f"{'✅ VERIFIED' if is_verified else '❌ FAILED'} "
-                f"(confidence: {confidence:.1%}, owner: {is_owner})"
-            )
-
-            if not is_verified:
-                logger.warning(f"🚫 Voice verification failed for {speaker_name} - unlock denied")
-                context["status_message"] = "Voice verification failed - access denied"
-                return (
-                    False,
-                    f"I'm sorry, I couldn't verify your voice biometrics. "
-                    f"Confidence was {confidence:.0%}, but I need at least 75% to unlock your screen for security.",
-                )
-
-            # Check if speaker is the device owner
-            if not is_owner:
-                logger.warning(f"🚫 Non-owner {speaker_name} attempted unlock - denied")
-                context["status_message"] = "Non-owner detected - access denied"
-                return (
-                    False,
-                    f"Voice verified as {speaker_name}, but only the device owner Derek can unlock the screen.",
-                )
-
-            # Store verified speaker name in context for personalized response
-            context["verified_speaker_name"] = speaker_name
-            context["verification_confidence"] = confidence
-
-            logger.info(
-                f"✅ Voice verification passed for owner: {speaker_name} ({confidence:.1%})"
-            )
-            context["status_message"] = (
-                f"Identity verified: {speaker_name} ({confidence:.0%} confidence)"
-            )
-            # Store intermediate message for JARVIS to speak
-            context["verification_message"] = (
-                f"Identity confirmed, {speaker_name}. "
-                f"Initiating screen unlock sequence now."
-            )
-
-        except Exception as e:
-            logger.error(f"Voice verification error: {e}", exc_info=True)
-            # No fallback - require proper voice verification
-            context["verified_speaker_name"] = None
-            context["status_message"] = "Voice verification system error"
-            logger.warning("⚠️ Voice verification failed - speaker not recognized")
-            return (
-                False,
-                f"Voice verification encountered an error: {str(e)}. Please try again.",
-            )
-    else:
-        # No audio data provided - get owner name dynamically from database
-        # TODO: Enforce voice verification once audio capture is confirmed working
-        logger.warning("⚠️ No audio data for voice verification - using database owner")
-        owner_name = await _get_owner_name()
-        context["verified_speaker_name"] = owner_name
-        logger.info(f"⚠️ Using database owner '{owner_name}' - text command without voice verification")
-
-    # Step 2: Use enhanced Keychain integration for actual unlock
+    # Use enhanced Keychain integration for actual unlock
     try:
         from macos_keychain_unlock import MacOSKeychainUnlock
 
@@ -1028,7 +990,7 @@ async def _try_keychain_unlock(context: Dict[str, Any]) -> Tuple[bool, str]:
             unlock_result = await _perform_direct_unlock(password)
 
             if unlock_result:
-                return True, f"Screen unlocked by {speaker_name or 'verified user'}"
+                return True, f"Screen unlocked by {verified_speaker or 'verified user'}"
 
         return False, "Password not found in keychain"
 

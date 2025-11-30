@@ -2777,16 +2777,29 @@ class SpeakerVerificationService:
         )
 
         self.speechbrain_engine = SpeechBrainEngine(model_config)
-        await self.speechbrain_engine.initialize()
 
-        # Load speaker profiles from database
-        await self._load_speaker_profiles()
-
-        # Pre-load speaker encoder for instant unlock (if enabled)
+        # OPTIMIZED: Initialize engine and start encoder pre-load in PARALLEL
+        # This significantly reduces startup time
         if preload_encoder:
-            logger.info("🔄 Pre-loading speaker encoder (ECAPA-TDNN) for instant unlock...")
-            await self.speechbrain_engine._load_speaker_encoder()
+            logger.info("🚀 Starting parallel initialization (engine + encoder + profiles)...")
+
+            # Start encoder pre-loading in background (non-blocking)
+            await self.speechbrain_engine.initialize()
+            encoder_task = await self.speechbrain_engine.preload_speaker_encoder_async()
+
+            # Load speaker profiles while encoder loads
+            await self._load_speaker_profiles()
+
+            # Wait for encoder if it's still loading
+            if encoder_task and not encoder_task.done():
+                logger.info("⏳ Waiting for encoder pre-load to complete...")
+                await encoder_task
+
             logger.info("✅ Speaker encoder pre-loaded - unlock will be instant!")
+        else:
+            await self.speechbrain_engine.initialize()
+            # Load speaker profiles from database
+            await self._load_speaker_profiles()
 
         self.initialized = True
         logger.info(
@@ -4167,6 +4180,8 @@ class SpeakerVerificationService:
         """
         Verify speaker from audio with adaptive learning
 
+        OPTIMIZED: Fast-path for cached embeddings, parallel post-verification tasks
+
         Args:
             audio_data: Audio bytes (WAV format)
             speaker_name: Expected speaker name (if None, identifies from all profiles)
@@ -4180,11 +4195,15 @@ class SpeakerVerificationService:
                 - security_level: str
                 - adaptive_threshold: float (current dynamic threshold)
         """
+        import time as time_module
+        verify_start = time_module.perf_counter()
+
         if not self.initialized:
             await self.initialize()
 
-        # Debug audio data
-        logger.info(f"🎤 AUDIO DEBUG: Received {len(audio_data) if audio_data else 0} bytes of audio")
+        # Debug audio data (reduced logging for speed)
+        audio_size = len(audio_data) if audio_data else 0
+        logger.info(f"🎤 Verifying speaker from {audio_size} bytes of audio...")
         if audio_data and len(audio_data) > 0:
             # Check if audio is not silent
             import numpy as np
@@ -4313,36 +4332,7 @@ class SpeakerVerificationService:
                     logger.info(f"  📍 Final verification decision: {'✅ PASS' if is_verified else '❌ FAIL'}")
                     logger.info(f"  📍 Final confidence: {confidence:.2%} vs threshold: {adaptive_threshold:.2%}")
 
-                # Handle calibration mode
-                if self.calibration_mode and confidence > 0.10:
-                    await self._handle_calibration_sample(
-                        audio_data, speaker_name, confidence
-                    )
-
-                logger.info(f"🔍 DEBUG: Final result - Confidence: {confidence:.2%}, Verified: {is_verified}")
-
-                # Store voice sample for continuous learning
-                if self.continuous_learning_enabled and self.store_all_audio:
-                    await self._store_voice_sample_async(
-                        speaker_name=speaker_name,
-                        audio_data=audio_data,
-                        confidence=confidence,
-                        verified=is_verified,
-                        command="unlock_screen",
-                        environment_type=self.current_environment
-                    )
-
-                # Learn from this attempt
-                await self._record_verification_attempt(speaker_name, confidence, is_verified)
-
-                # 🧠 Update Voice Memory Agent
-                try:
-                    from agents.voice_memory_agent import get_voice_memory_agent
-                    voice_agent = await get_voice_memory_agent()
-                    await voice_agent.record_interaction(speaker_name, confidence, is_verified)
-                except Exception as e:
-                    logger.debug(f"Voice memory agent update skipped: {e}")
-
+                # Build result FIRST (fast) - post-processing happens in background
                 result = {
                     "verified": is_verified,
                     "confidence": confidence,
@@ -4353,10 +4343,58 @@ class SpeakerVerificationService:
                     "adaptive_threshold": adaptive_threshold,
                 }
 
+                # Calculate verification time
+                verify_elapsed = (time_module.perf_counter() - verify_start) * 1000
+                logger.info(f"✅ Verification complete: {confidence:.1%} ({'PASS' if is_verified else 'FAIL'}) in {verify_elapsed:.0f}ms")
+
                 # If confidence is very low, suggest re-enrollment
                 if confidence < 0.10:
                     result["suggestion"] = "Voice profile may need re-enrollment"
                     logger.warning(f"⚠️ Very low confidence ({confidence:.2%}) for {speaker_name} - consider re-enrollment")
+
+                # OPTIMIZATION: Run post-verification tasks in PARALLEL (non-blocking for unlock)
+                # These don't affect the verification result, so we can fire-and-forget
+                async def _post_verification_tasks():
+                    """Background tasks that don't block unlock"""
+                    try:
+                        tasks = []
+
+                        # Calibration sample handling
+                        if self.calibration_mode and confidence > 0.10:
+                            tasks.append(self._handle_calibration_sample(
+                                audio_data, speaker_name, confidence
+                            ))
+
+                        # Store voice sample for continuous learning
+                        if self.continuous_learning_enabled and self.store_all_audio:
+                            tasks.append(self._store_voice_sample_async(
+                                speaker_name=speaker_name,
+                                audio_data=audio_data,
+                                confidence=confidence,
+                                verified=is_verified,
+                                command="unlock_screen",
+                                environment_type=self.current_environment
+                            ))
+
+                        # Learn from this attempt
+                        tasks.append(self._record_verification_attempt(speaker_name, confidence, is_verified))
+
+                        # Update Voice Memory Agent
+                        try:
+                            from agents.voice_memory_agent import get_voice_memory_agent
+                            voice_agent = await get_voice_memory_agent()
+                            tasks.append(voice_agent.record_interaction(speaker_name, confidence, is_verified))
+                        except Exception:
+                            pass  # Agent not available
+
+                        # Run all tasks in parallel
+                        if tasks:
+                            await asyncio.gather(*tasks, return_exceptions=True)
+                    except Exception as e:
+                        logger.debug(f"Post-verification tasks error (non-critical): {e}")
+
+                # Fire and forget - don't wait for post-verification tasks
+                asyncio.create_task(_post_verification_tasks())
 
                 return result
 

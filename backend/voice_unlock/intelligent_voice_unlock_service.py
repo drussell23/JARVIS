@@ -111,35 +111,35 @@ class IntelligentVoiceUnlockService:
         }
 
     async def initialize(self):
-        """Initialize all components"""
+        """Initialize all components - PARALLELIZED for speed"""
         if self.initialized:
             return
 
-        logger.info("🚀 Initializing Intelligent Voice Unlock Service...")
+        logger.info("🚀 Initializing Intelligent Voice Unlock Service (parallel)...")
+        init_start = datetime.now()
 
-        # Initialize Hybrid STT Router
-        await self._initialize_stt()
+        # PHASE 1: Initialize core services in parallel (these don't depend on each other)
+        await asyncio.gather(
+            self._initialize_stt(),
+            self._initialize_speaker_recognition(),
+            self._initialize_learning_db(),
+            return_exceptions=True  # Don't fail if one init fails
+        )
 
-        # Initialize Speaker Recognition
-        await self._initialize_speaker_recognition()
+        # PHASE 2: Initialize intelligence layers in parallel (can run after core)
+        await asyncio.gather(
+            self._initialize_cai(),
+            self._initialize_sai(),
+            self._initialize_ml_engine(),
+            return_exceptions=True
+        )
 
-        # Initialize Learning Database
-        await self._initialize_learning_db()
-
-        # Initialize CAI Handler
-        await self._initialize_cai()
-
-        # Initialize SAI Analyzer
-        await self._initialize_sai()
-
-        # 🤖 Initialize ML Continuous Learning Engine
-        await self._initialize_ml_engine()
-
-        # Load owner profile
+        # PHASE 3: Load owner profile (depends on learning_db and speaker_engine)
         await self._load_owner_profile()
 
+        init_time = (datetime.now() - init_start).total_seconds() * 1000
         self.initialized = True
-        logger.info("✅ Intelligent Voice Unlock Service initialized")
+        logger.info(f"✅ Intelligent Voice Unlock Service initialized in {init_time:.0f}ms")
 
     async def _initialize_stt(self):
         """Initialize Hybrid STT Router"""
@@ -676,13 +676,30 @@ class IntelligentVoiceUnlockService:
         except Exception as e:
             logger.debug(f"Failed to track verification in monitoring: {e}")
 
-        # Stage 7: Context Analysis (CAI)
+        # Stage 7 & 8: Context and Scenario Analysis (PARALLEL)
         stage_context = metrics_logger.create_stage(
             "context_analysis",
             text=transcribed_text
         )
+        stage_scenario = metrics_logger.create_stage(
+            "scenario_analysis",
+            speaker=speaker_identified
+        )
 
-        context_analysis = await self._analyze_context(transcribed_text, context)
+        # Run context and scenario analysis in parallel for speed
+        context_analysis, scenario_analysis = await asyncio.gather(
+            self._analyze_context(transcribed_text, context),
+            self._analyze_scenario(transcribed_text, context, speaker_identified),
+            return_exceptions=True
+        )
+
+        # Handle exceptions from parallel execution
+        if isinstance(context_analysis, Exception):
+            logger.warning(f"Context analysis failed: {context_analysis}")
+            context_analysis = {"available": False, "error": str(context_analysis)}
+        if isinstance(scenario_analysis, Exception):
+            logger.warning(f"Scenario analysis failed: {scenario_analysis}")
+            scenario_analysis = {"available": False, "error": str(scenario_analysis)}
 
         stage_context.complete(
             success=True,
@@ -690,16 +707,6 @@ class IntelligentVoiceUnlockService:
             metadata={'context_data': context_analysis}
         )
         stages.append(stage_context)
-
-        # Stage 8: Scenario Analysis (SAI)
-        stage_scenario = metrics_logger.create_stage(
-            "scenario_analysis",
-            speaker=speaker_identified
-        )
-
-        scenario_analysis = await self._analyze_scenario(
-            transcribed_text, context, speaker_identified
-        )
 
         stage_scenario.complete(
             success=True,
@@ -743,32 +750,19 @@ class IntelligentVoiceUnlockService:
         )
         stages.append(stage_unlock)
 
-        # Step 8: Update stats and speaker profile
+        # Calculate total latency BEFORE post-processing (for accurate user-facing latency)
+        total_latency_ms = (datetime.now() - start_time).total_seconds() * 1000
+
+        # Update stats immediately (fast, in-memory)
         if unlock_result["success"]:
             self.stats["successful_unlocks"] += 1
             self.stats["last_unlock_time"] = datetime.now()
-
-            logger.info(f"🔓 Screen unlocked successfully by owner '{speaker_identified}'")
-
-            # Update speaker profile with continuous learning
-            await self._update_speaker_profile(
-                speaker_identified, audio_data, transcribed_text, success=True
-            )
-
-        # Calculate total latency
-        total_latency_ms = (datetime.now() - start_time).total_seconds() * 1000
-
-        # Cleanup caffeinate
-        try:
-            caffeinate_process.terminate()
-            logger.info("🔋 Caffeinate terminated")
-        except:
-            pass
+            logger.info(f"🔓 Screen unlocked successfully by owner '{speaker_identified}' in {total_latency_ms:.0f}ms")
 
         # Get speaker verification threshold dynamically
         threshold = getattr(self.speaker_engine, 'threshold', 0.35) if self.speaker_engine else 0.35
 
-        # Build detailed developer metrics (logged to JSON file)
+        # Build detailed developer metrics (fast, in-memory)
         developer_metrics = {
             "biometrics": {
                 "speaker_confidence": verification_confidence,
@@ -789,34 +783,8 @@ class IntelligentVoiceUnlockService:
             }
         }
 
-        # Get system information
-        import platform
-        import sys
-        system_info = {
-            "platform": platform.system(),
-            "platform_version": platform.version(),
-            "python_version": sys.version.split()[0],
-            "stt_engine": diagnostics.stt_engine_used,
-            "speaker_engine": "SpeechBrain" if self.speaker_engine else "None",
-        }
-
-        # Log advanced metrics with all stages to JSON file (async)
-        try:
-            await metrics_logger.log_unlock_attempt(
-                success=unlock_result["success"],
-                speaker_name=speaker_identified,
-                transcribed_text=transcribed_text,
-                stages=stages,
-                biometrics=developer_metrics["biometrics"],
-                performance=developer_metrics["performance"],
-                quality_indicators=developer_metrics["quality_indicators"],
-                system_info=system_info,
-                error=None if unlock_result["success"] else unlock_result.get("message")
-            )
-        except Exception as e:
-            logger.warning(f"Failed to log metrics: {e}")
-
-        return {
+        # Build result BEFORE fire-and-forget tasks (return fast)
+        result = {
             "success": unlock_result["success"],
             "speaker_name": speaker_identified,
             "transcribed_text": transcribed_text,
@@ -832,6 +800,55 @@ class IntelligentVoiceUnlockService:
             # Developer metrics (UI only, not announced)
             "dev_metrics": developer_metrics,
         }
+
+        # FIRE-AND-FORGET: Non-blocking post-processing tasks
+        # These run in the background and don't delay the response
+        async def _post_unlock_tasks():
+            """Non-critical tasks that run after response is sent"""
+            try:
+                # Cleanup caffeinate
+                try:
+                    caffeinate_process.terminate()
+                    logger.debug("🔋 Caffeinate terminated")
+                except:
+                    pass
+
+                # Update speaker profile with continuous learning (if successful)
+                if unlock_result["success"]:
+                    await self._update_speaker_profile(
+                        speaker_identified, audio_data, transcribed_text, success=True
+                    )
+
+                # Log advanced metrics to JSON file
+                import platform
+                import sys
+                system_info = {
+                    "platform": platform.system(),
+                    "platform_version": platform.version(),
+                    "python_version": sys.version.split()[0],
+                    "stt_engine": diagnostics.stt_engine_used,
+                    "speaker_engine": "SpeechBrain" if self.speaker_engine else "None",
+                }
+
+                await metrics_logger.log_unlock_attempt(
+                    success=unlock_result["success"],
+                    speaker_name=speaker_identified,
+                    transcribed_text=transcribed_text,
+                    stages=stages,
+                    biometrics=developer_metrics["biometrics"],
+                    performance=developer_metrics["performance"],
+                    quality_indicators=developer_metrics["quality_indicators"],
+                    system_info=system_info,
+                    error=None if unlock_result["success"] else unlock_result.get("message")
+                )
+            except Exception as e:
+                logger.warning(f"Post-unlock task error (non-critical): {e}")
+
+        # Launch post-unlock tasks without waiting
+        asyncio.create_task(_post_unlock_tasks())
+
+        # Return pre-built result immediately (fast path)
+        return result
 
     def _check_circuit_breaker(self, service_name: str) -> bool:
         """

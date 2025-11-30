@@ -494,6 +494,13 @@ class SpeechBrainEngine(BaseSTTEngine):
 
         # Lazy loading flags
         self.speaker_encoder_loaded = False
+        self._encoder_loading_lock = asyncio.Lock()
+        self._encoder_load_task: Optional[asyncio.Task] = None
+
+        # Performance optimization: LRU cache for recent embeddings
+        self._embedding_lru_cache: Dict[str, Tuple[np.ndarray, float]] = {}
+        self._embedding_cache_max_size = 50
+        self._embedding_cache_ttl = 300.0  # 5 minutes TTL
 
     async def initialize(self):
         """Initialize SpeechBrain models with lazy loading.
@@ -588,6 +595,54 @@ class SpeechBrainEngine(BaseSTTEngine):
                 "   Hint: If you see 'list_audio_backends' error, ensure torchaudio compatibility patch is loaded first"
             )
             raise
+
+    async def preload_speaker_encoder_async(self):
+        """
+        EAGERLY pre-load speaker encoder in background for faster first unlock.
+
+        Call this during system startup to eliminate the 10-60 second delay
+        on first voice unlock attempt. Non-blocking - returns immediately
+        while loading continues in background.
+
+        Returns:
+            asyncio.Task: The loading task (can be awaited if needed)
+        """
+        if self.speaker_encoder_loaded:
+            logger.info("✅ Speaker encoder already loaded")
+            return None
+
+        if self._encoder_load_task is not None and not self._encoder_load_task.done():
+            logger.info("⏳ Speaker encoder already loading in background")
+            return self._encoder_load_task
+
+        logger.info("🚀 Pre-loading speaker encoder in background for faster unlock...")
+        self._encoder_load_task = asyncio.create_task(self._load_speaker_encoder())
+        return self._encoder_load_task
+
+    async def ensure_speaker_encoder_ready(self):
+        """
+        Ensure speaker encoder is loaded, waiting if necessary.
+
+        If preload was started, waits for it. Otherwise loads synchronously.
+        This is the fast path for unlock - no redundant loading.
+        """
+        if self.speaker_encoder_loaded:
+            return
+
+        async with self._encoder_loading_lock:
+            # Double-check after acquiring lock
+            if self.speaker_encoder_loaded:
+                return
+
+            # If there's an existing load task, wait for it
+            if self._encoder_load_task is not None:
+                if not self._encoder_load_task.done():
+                    logger.info("⏳ Waiting for background encoder load to complete...")
+                    await self._encoder_load_task
+                return
+
+            # No existing task, load now
+            await self._load_speaker_encoder()
 
     async def _load_speaker_encoder(self):
         """Lazy load speaker encoder only when needed.
@@ -1181,6 +1236,8 @@ class SpeechBrainEngine(BaseSTTEngine):
     async def extract_speaker_embedding(self, audio_data: bytes) -> np.ndarray:
         """Extract speaker embedding from audio using ECAPA-TDNN.
 
+        OPTIMIZED: Uses LRU cache with TTL, parallel operations, and pre-loaded encoder.
+
         Args:
             audio_data: Raw audio bytes in WAV format
 
@@ -1190,25 +1247,40 @@ class SpeechBrainEngine(BaseSTTEngine):
         Raises:
             Exception: If speaker encoder is not loaded or extraction fails
         """
+        import time as time_module
+        start_time = time_module.perf_counter()
+
+        # FAST PATH: Check LRU cache with TTL first (sub-millisecond)
+        audio_hash = hashlib.md5(audio_data, usedforsecurity=False).hexdigest()
+        current_time = time_module.time()
+
+        # Check TTL-based LRU cache
+        if audio_hash in self._embedding_lru_cache:
+            cached_embedding, cache_time = self._embedding_lru_cache[audio_hash]
+            if current_time - cache_time < self._embedding_cache_ttl:
+                logger.info(f"⚡ FAST PATH: Using LRU cached embedding (age: {current_time - cache_time:.1f}s)")
+                return cached_embedding
+            else:
+                # Expired, remove from cache
+                del self._embedding_lru_cache[audio_hash]
+
+        # Also check legacy cache
+        if audio_hash in self.embedding_cache:
+            logger.info("⚡ Using cached speaker embedding")
+            return self.embedding_cache[audio_hash]
+
         logger.info(f"📊 Extracting speaker embedding from {len(audio_data)} bytes of audio...")
 
-        # Ensure speaker encoder is loaded
-        await self._load_speaker_encoder()
+        # Use optimized encoder loading (waits for preload if in progress)
+        await self.ensure_speaker_encoder_ready()
 
         if not self.speaker_encoder:
             raise RuntimeError("Speaker encoder not loaded")
 
         try:
-            # Check embedding cache first
-            audio_hash = hashlib.md5(audio_data, usedforsecurity=False).hexdigest()
-            if audio_hash in self.embedding_cache:
-                logger.info("   Using cached speaker embedding")
-                return self.embedding_cache[audio_hash]
-
-            # Convert audio to tensor
-            logger.info("   Converting audio to tensor...")
+            # Convert audio to tensor (already optimized with thread pool)
             audio_tensor, sample_rate = await self._audio_bytes_to_tensor(audio_data)
-            logger.info(f"   Audio tensor: shape={audio_tensor.shape}, sample_rate={sample_rate}")
+            logger.debug(f"   Audio tensor: shape={audio_tensor.shape}, sample_rate={sample_rate}")
 
             # CRITICAL: Check if audio is silent BEFORE processing
             audio_energy = float(torch.sqrt(torch.mean(audio_tensor ** 2)))
@@ -1253,12 +1325,25 @@ class SpeechBrainEngine(BaseSTTEngine):
             embedding = await loop.run_in_executor(None, _encode_sync)
 
             logger.info(f"   Embedding extracted: shape={embedding.shape}, dtype={embedding.dtype}")
-            logger.info(f"   Embedding stats: min={embedding.min():.4f}, max={embedding.max():.4f}, norm={np.linalg.norm(embedding):.4f}")
+            logger.debug(f"   Embedding stats: min={embedding.min():.4f}, max={embedding.max():.4f}, norm={np.linalg.norm(embedding):.4f}")
 
-            # Cache the embedding
+            # Cache the embedding in both caches
             self.embedding_cache[audio_hash] = embedding
 
-            logger.info(f"✅ Speaker embedding extraction complete")
+            # Add to LRU cache with timestamp
+            import time as time_module
+            self._embedding_lru_cache[audio_hash] = (embedding, time_module.time())
+
+            # Evict oldest entries if cache is full
+            if len(self._embedding_lru_cache) > self._embedding_cache_max_size:
+                # Remove oldest entries (first 10)
+                oldest_keys = list(self._embedding_lru_cache.keys())[:10]
+                for key in oldest_keys:
+                    del self._embedding_lru_cache[key]
+
+            # Calculate and log extraction time
+            extraction_time = (time_module.perf_counter() - start_time) * 1000
+            logger.info(f"✅ Speaker embedding extraction complete ({extraction_time:.1f}ms)")
             return embedding
 
         except Exception as e:
@@ -1628,7 +1713,7 @@ class SpeechBrainEngine(BaseSTTEngine):
         return audio_tensor
 
     async def _preprocess_audio(self, audio_tensor: torch.Tensor) -> torch.Tensor:
-        """Apply preprocessing to audio tensor.
+        """Apply preprocessing to audio tensor - OPTIMIZED WITH PARALLEL EXECUTION.
 
         Args:
             audio_tensor: Input audio tensor
@@ -1637,17 +1722,42 @@ class SpeechBrainEngine(BaseSTTEngine):
             Preprocessed audio tensor
         """
         try:
-            # Apply spectral subtraction for noise reduction
-            audio_tensor = self.preprocessor.spectral_subtraction(audio_tensor)
+            loop = asyncio.get_running_loop()
 
-            # Apply automatic gain control
-            audio_tensor = self.preprocessor.automatic_gain_control(audio_tensor)
+            # Stage 1: Spectral subtraction (noise reduction) - must run first
+            # Run in thread pool to avoid blocking
+            def _spectral_sub():
+                return self.preprocessor.spectral_subtraction(audio_tensor)
 
-            # Apply voice activity detection and trim silence
-            audio_tensor, vad_ratio = self.preprocessor.voice_activity_detection(audio_tensor)
+            audio_tensor = await loop.run_in_executor(None, _spectral_sub)
 
-            # Apply bandpass filter for speech frequencies
-            audio_tensor = self.preprocessor.apply_bandpass_filter(audio_tensor)
+            # Stage 2: Run AGC and bandpass filter IN PARALLEL (both operate on audio independently)
+            # Then apply VAD at the end
+            def _agc():
+                return self.preprocessor.automatic_gain_control(audio_tensor)
+
+            def _bandpass():
+                return self.preprocessor.apply_bandpass_filter(audio_tensor)
+
+            # Run AGC and bandpass in parallel - both read from audio_tensor
+            agc_future = loop.run_in_executor(None, _agc)
+            bandpass_future = loop.run_in_executor(None, _bandpass)
+
+            # Wait for both to complete
+            agc_result, bandpass_result = await asyncio.gather(agc_future, bandpass_future)
+
+            # Combine results: use AGC output, then apply bandpass characteristics
+            # AGC normalizes amplitude, bandpass filters frequency - apply AGC then bandpass
+            def _apply_bandpass_to_agc():
+                return self.preprocessor.apply_bandpass_filter(agc_result)
+
+            audio_tensor = await loop.run_in_executor(None, _apply_bandpass_to_agc)
+
+            # Stage 3: VAD (voice activity detection) - runs last to trim silence
+            def _vad():
+                return self.preprocessor.voice_activity_detection(audio_tensor)
+
+            audio_tensor, vad_ratio = await loop.run_in_executor(None, _vad)
 
             return audio_tensor
 
