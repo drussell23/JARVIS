@@ -1,0 +1,656 @@
+{
+  "info": {
+    "name": "JARVIS Voice Unlock Authentication Flow",
+    "description": "Comprehensive voice biometric authentication pipeline with multi-factor fusion, anti-spoofing, adaptive reasoning, and intelligent feedback generation.\n\nThis Flow implements the full PRD vision for voice authentication:\n- LangGraph adaptive reasoning for borderline cases\n- ChromaDB pattern matching for anti-spoofing\n- Multi-factor fusion (voice + behavioral + context)\n- Langfuse audit trail for security logging\n- Intelligent feedback generation\n- Automatic screen unlock on success",
+    "version": "1.0.0",
+    "author": "JARVIS AI System",
+    "created": "2024-12-01",
+    "tags": ["voice", "biometric", "authentication", "security", "unlock"]
+  },
+  "trigger": {
+    "type": "request",
+    "description": "Triggered by voice unlock request from JARVIS voice system",
+    "config": {
+      "method": "POST",
+      "path": "/flows/voice-unlock",
+      "authentication": "none",
+      "rate_limit": {
+        "requests_per_minute": 10,
+        "burst": 3
+      }
+    },
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "audio_base64": {
+          "type": "string",
+          "description": "Base64 encoded audio data (WAV format, 16kHz)"
+        },
+        "speaker_name": {
+          "type": "string",
+          "description": "Expected speaker name (optional, for targeted auth)",
+          "default": "Derek"
+        },
+        "device_context": {
+          "type": "object",
+          "properties": {
+            "microphone": {"type": "string"},
+            "location": {"type": "string"},
+            "time_of_day": {"type": "string"},
+            "ambient_noise_db": {"type": "number"}
+          }
+        },
+        "behavioral_context": {
+          "type": "object",
+          "properties": {
+            "last_unlock_time": {"type": "string", "format": "date-time"},
+            "typical_unlock_hour": {"type": "integer"},
+            "same_wifi_network": {"type": "boolean"},
+            "device_moved_since_lock": {"type": "boolean"}
+          }
+        }
+      },
+      "required": ["audio_base64"]
+    }
+  },
+  "variables": {
+    "base_url": "{{base_url}}",
+    "confidence_threshold_high": 0.90,
+    "confidence_threshold_pass": 0.85,
+    "confidence_threshold_borderline": 0.75,
+    "max_retry_attempts": 3,
+    "enable_anti_spoofing": true,
+    "enable_behavioral_fusion": true,
+    "enable_audit_trail": true
+  },
+  "blocks": [
+    {
+      "id": "start",
+      "type": "start",
+      "name": "Voice Unlock Request Received",
+      "description": "Entry point - receives voice unlock request with audio data",
+      "position": {"x": 100, "y": 300},
+      "outputs": ["check_system_health"]
+    },
+    {
+      "id": "check_system_health",
+      "type": "http_request",
+      "name": "Check System Health",
+      "description": "Verify voice unlock system is operational",
+      "position": {"x": 300, "y": 300},
+      "config": {
+        "method": "GET",
+        "url": "{{base_url}}/api/voice-auth-intelligence/health",
+        "timeout": 5000
+      },
+      "outputs": ["health_condition"]
+    },
+    {
+      "id": "health_condition",
+      "type": "condition",
+      "name": "System Healthy?",
+      "description": "Check if all components are operational",
+      "position": {"x": 500, "y": 300},
+      "config": {
+        "expression": "$response.status == 'healthy' || $response.status == 'degraded'"
+      },
+      "outputs": {
+        "true": "start_audit_session",
+        "false": "system_unavailable_response"
+      }
+    },
+    {
+      "id": "start_audit_session",
+      "type": "http_request",
+      "name": "Start Langfuse Audit Session",
+      "description": "Begin audit trail for this authentication attempt",
+      "position": {"x": 700, "y": 200},
+      "config": {
+        "method": "POST",
+        "url": "{{base_url}}/api/voice-auth-intelligence/audit/session/start",
+        "headers": {"Content-Type": "application/json"},
+        "body": {
+          "user_id": "{{$input.speaker_name}}",
+          "source": "postman_flow",
+          "metadata": {
+            "flow_version": "1.0.0",
+            "device_context": "{{$input.device_context}}",
+            "timestamp": "{{$now}}"
+          }
+        }
+      },
+      "outputs": ["check_replay_attack"]
+    },
+    {
+      "id": "check_replay_attack",
+      "type": "http_request",
+      "name": "Anti-Spoofing: Detect Replay Attack",
+      "description": "Check if this audio matches known replay attack patterns",
+      "position": {"x": 900, "y": 200},
+      "config": {
+        "method": "POST",
+        "url": "{{base_url}}/api/voice-auth-intelligence/patterns/detect-replay",
+        "headers": {"Content-Type": "application/json"},
+        "body": {
+          "audio_base64": "{{$input.audio_base64}}",
+          "check_exact_match": true,
+          "check_spectral_fingerprint": true,
+          "check_environmental_signature": true
+        }
+      },
+      "outputs": ["replay_check_condition"]
+    },
+    {
+      "id": "replay_check_condition",
+      "type": "condition",
+      "name": "Replay Attack Detected?",
+      "description": "Block if replay attack is detected",
+      "position": {"x": 1100, "y": 200},
+      "config": {
+        "expression": "$response.is_replay == true"
+      },
+      "outputs": {
+        "true": "log_security_alert",
+        "false": "perform_voice_authentication"
+      }
+    },
+    {
+      "id": "log_security_alert",
+      "type": "http_request",
+      "name": "Log Security Alert",
+      "description": "Log replay attack attempt to Langfuse",
+      "position": {"x": 1100, "y": 50},
+      "config": {
+        "method": "POST",
+        "url": "{{base_url}}/api/voice-auth-intelligence/feedback/security-alert",
+        "headers": {"Content-Type": "application/json"},
+        "body": {
+          "alert_type": "replay_attack",
+          "severity": "high",
+          "details": {
+            "detection_confidence": "{{$previous.response.confidence}}",
+            "pattern_match_type": "{{$previous.response.match_type}}",
+            "timestamp": "{{$now}}"
+          }
+        }
+      },
+      "outputs": ["security_alert_response"]
+    },
+    {
+      "id": "security_alert_response",
+      "type": "output",
+      "name": "Return Security Alert",
+      "description": "Return security alert response and block access",
+      "position": {"x": 1300, "y": 50},
+      "config": {
+        "status_code": 403,
+        "body": {
+          "success": false,
+          "authenticated": false,
+          "reason": "security_alert",
+          "message": "Security alert: Characteristics consistent with a voice recording detected. Access denied.",
+          "jarvis_response": "Security alert: I detected characteristics consistent with a voice recording rather than a live person. Access denied. This attempt has been logged.",
+          "should_speak": true,
+          "unlock_screen": false
+        }
+      }
+    },
+    {
+      "id": "perform_voice_authentication",
+      "type": "http_request",
+      "name": "Enhanced Voice Authentication",
+      "description": "Perform primary voice biometric authentication with ECAPA-TDNN",
+      "position": {"x": 1300, "y": 200},
+      "config": {
+        "method": "POST",
+        "url": "{{base_url}}/api/voice-auth-intelligence/authenticate/enhanced",
+        "headers": {"Content-Type": "application/json"},
+        "body": {
+          "speaker_name": "{{$input.speaker_name}}",
+          "audio_base64": "{{$input.audio_base64}}",
+          "use_adaptive": true,
+          "max_attempts": 1,
+          "include_analysis": true
+        },
+        "timeout": 15000
+      },
+      "outputs": ["evaluate_voice_confidence"]
+    },
+    {
+      "id": "evaluate_voice_confidence",
+      "type": "evaluate",
+      "name": "Evaluate Voice Confidence",
+      "description": "Extract and evaluate voice match confidence score",
+      "position": {"x": 1500, "y": 200},
+      "config": {
+        "typescript": "const response = $input;\nconst voiceConfidence = response.voice_confidence || response.confidence || 0;\nconst analysisDetails = response.analysis || {};\n\nreturn {\n  voice_confidence: voiceConfidence,\n  speaker_matched: response.speaker_matched || false,\n  voice_quality: analysisDetails.snr_db || 'unknown',\n  anomalies_detected: analysisDetails.anomalies || [],\n  embedding_quality: analysisDetails.embedding_quality || 1.0\n};"
+      },
+      "outputs": ["confidence_router"]
+    },
+    {
+      "id": "confidence_router",
+      "type": "switch",
+      "name": "Route by Confidence Level",
+      "description": "Route based on voice confidence score",
+      "position": {"x": 1700, "y": 200},
+      "config": {
+        "expression": "$input.voice_confidence",
+        "cases": [
+          {
+            "condition": ">= 0.90",
+            "label": "High Confidence",
+            "output": "high_confidence_path"
+          },
+          {
+            "condition": ">= 0.85",
+            "label": "Pass Threshold",
+            "output": "pass_threshold_path"
+          },
+          {
+            "condition": ">= 0.75",
+            "label": "Borderline",
+            "output": "borderline_path"
+          },
+          {
+            "condition": "< 0.75",
+            "label": "Low Confidence",
+            "output": "low_confidence_path"
+          }
+        ]
+      }
+    },
+    {
+      "id": "high_confidence_path",
+      "type": "parallel",
+      "name": "High Confidence: Quick Unlock",
+      "description": "Voice matched with high confidence - proceed directly to unlock",
+      "position": {"x": 1900, "y": 100},
+      "config": {
+        "blocks": ["generate_success_feedback", "cache_voice_pattern"]
+      },
+      "outputs": ["unlock_screen"]
+    },
+    {
+      "id": "pass_threshold_path",
+      "type": "http_request",
+      "name": "Multi-Factor Fusion (Standard)",
+      "description": "Add behavioral analysis for additional confidence",
+      "position": {"x": 1900, "y": 200},
+      "config": {
+        "method": "POST",
+        "url": "{{base_url}}/api/voice-auth-intelligence/fusion/calculate",
+        "headers": {"Content-Type": "application/json"},
+        "body": {
+          "voice_confidence": "{{$previous.voice_confidence}}",
+          "behavioral_context": "{{$input.behavioral_context}}",
+          "device_context": "{{$input.device_context}}",
+          "weights": {
+            "voice": 0.70,
+            "behavioral": 0.20,
+            "context": 0.10
+          }
+        }
+      },
+      "outputs": ["check_fused_confidence"]
+    },
+    {
+      "id": "borderline_path",
+      "type": "http_request",
+      "name": "Multi-Factor Fusion (Enhanced)",
+      "description": "Borderline voice - apply heavy behavioral weighting",
+      "position": {"x": 1900, "y": 350},
+      "config": {
+        "method": "POST",
+        "url": "{{base_url}}/api/voice-auth-intelligence/fusion/calculate",
+        "headers": {"Content-Type": "application/json"},
+        "body": {
+          "voice_confidence": "{{$previous.voice_confidence}}",
+          "behavioral_context": "{{$input.behavioral_context}}",
+          "device_context": "{{$input.device_context}}",
+          "weights": {
+            "voice": 0.50,
+            "behavioral": 0.35,
+            "context": 0.15
+          },
+          "apply_bonuses": true
+        }
+      },
+      "outputs": ["check_borderline_fusion"]
+    },
+    {
+      "id": "low_confidence_path",
+      "type": "http_request",
+      "name": "Generate Retry Guidance",
+      "description": "Voice didn't match well - analyze why and provide guidance",
+      "position": {"x": 1900, "y": 500},
+      "config": {
+        "method": "POST",
+        "url": "{{base_url}}/api/voice-auth-intelligence/feedback/generate",
+        "headers": {"Content-Type": "application/json"},
+        "body": {
+          "scenario": "low_confidence",
+          "voice_confidence": "{{$previous.voice_confidence}}",
+          "analysis": "{{$previous}}",
+          "suggest_alternatives": true
+        }
+      },
+      "outputs": ["low_confidence_response"]
+    },
+    {
+      "id": "check_fused_confidence",
+      "type": "condition",
+      "name": "Fused Confidence >= 85%?",
+      "description": "Check if multi-factor fusion reaches threshold",
+      "position": {"x": 2100, "y": 200},
+      "config": {
+        "expression": "$response.fused_confidence >= 0.85"
+      },
+      "outputs": {
+        "true": "generate_success_feedback",
+        "false": "request_clarification"
+      }
+    },
+    {
+      "id": "check_borderline_fusion",
+      "type": "condition",
+      "name": "Borderline Fusion >= 80%?",
+      "description": "Check if enhanced fusion reaches borderline threshold",
+      "position": {"x": 2100, "y": 350},
+      "config": {
+        "expression": "$response.fused_confidence >= 0.80"
+      },
+      "outputs": {
+        "true": "generate_borderline_success_feedback",
+        "false": "request_challenge_question"
+      }
+    },
+    {
+      "id": "generate_success_feedback",
+      "type": "http_request",
+      "name": "Generate Success Feedback",
+      "description": "Generate personalized success message",
+      "position": {"x": 2300, "y": 150},
+      "config": {
+        "method": "POST",
+        "url": "{{base_url}}/api/voice-auth-intelligence/feedback/generate",
+        "headers": {"Content-Type": "application/json"},
+        "body": {
+          "scenario": "success",
+          "speaker_name": "{{$input.speaker_name}}",
+          "voice_confidence": "{{$vars.voice_confidence}}",
+          "time_of_day": "{{$input.device_context.time_of_day}}",
+          "personalize": true
+        }
+      },
+      "outputs": ["unlock_screen"]
+    },
+    {
+      "id": "generate_borderline_success_feedback",
+      "type": "http_request",
+      "name": "Generate Borderline Success Feedback",
+      "description": "Generate feedback acknowledging voice was different but patterns matched",
+      "position": {"x": 2300, "y": 350},
+      "config": {
+        "method": "POST",
+        "url": "{{base_url}}/api/voice-auth-intelligence/feedback/generate",
+        "headers": {"Content-Type": "application/json"},
+        "body": {
+          "scenario": "borderline_success",
+          "speaker_name": "{{$input.speaker_name}}",
+          "voice_confidence": "{{$vars.voice_confidence}}",
+          "fused_confidence": "{{$previous.fused_confidence}}",
+          "message_template": "Your voice sounds a bit different today, but your behavioral patterns match perfectly."
+        }
+      },
+      "outputs": ["unlock_screen"]
+    },
+    {
+      "id": "cache_voice_pattern",
+      "type": "http_request",
+      "name": "Cache Voice Pattern",
+      "description": "Store successful voice pattern for faster future auth",
+      "position": {"x": 2100, "y": 50},
+      "config": {
+        "method": "POST",
+        "url": "{{base_url}}/api/voice-auth-intelligence/patterns/store",
+        "headers": {"Content-Type": "application/json"},
+        "body": {
+          "speaker_name": "{{$input.speaker_name}}",
+          "audio_base64": "{{$input.audio_base64}}",
+          "context": {
+            "microphone": "{{$input.device_context.microphone}}",
+            "location": "{{$input.device_context.location}}",
+            "ambient_noise_db": "{{$input.device_context.ambient_noise_db}}"
+          },
+          "ttl_hours": 24
+        }
+      }
+    },
+    {
+      "id": "request_clarification",
+      "type": "http_request",
+      "name": "Generate Clarification Request",
+      "description": "Ask user to try again with guidance",
+      "position": {"x": 2300, "y": 250},
+      "config": {
+        "method": "POST",
+        "url": "{{base_url}}/api/voice-auth-intelligence/feedback/generate",
+        "headers": {"Content-Type": "application/json"},
+        "body": {
+          "scenario": "clarification_needed",
+          "analysis": "{{$vars}}",
+          "suggestions": ["speak_closer", "reduce_noise", "speak_clearly"]
+        }
+      },
+      "outputs": ["clarification_response"]
+    },
+    {
+      "id": "request_challenge_question",
+      "type": "http_request",
+      "name": "Generate Challenge Question",
+      "description": "Request secondary verification via challenge question",
+      "position": {"x": 2300, "y": 450},
+      "config": {
+        "method": "POST",
+        "url": "{{base_url}}/api/voice-auth-intelligence/feedback/generate",
+        "headers": {"Content-Type": "application/json"},
+        "body": {
+          "scenario": "challenge_required",
+          "speaker_name": "{{$input.speaker_name}}",
+          "challenge_type": "contextual",
+          "example_challenges": [
+            "What was the last project you worked on?",
+            "What time did you lock the screen?",
+            "What was your last JARVIS command?"
+          ]
+        }
+      },
+      "outputs": ["challenge_response"]
+    },
+    {
+      "id": "unlock_screen",
+      "type": "http_request",
+      "name": "Unlock Screen",
+      "description": "Execute screen unlock via keychain method",
+      "position": {"x": 2500, "y": 200},
+      "config": {
+        "method": "POST",
+        "url": "{{base_url}}/api/screen/unlock",
+        "headers": {"Content-Type": "application/json"},
+        "body": {
+          "method": "keychain",
+          "reason": "voice_biometric_authenticated",
+          "authenticated_user": "{{$input.speaker_name}}"
+        },
+        "timeout": 10000
+      },
+      "outputs": ["end_audit_session_success"]
+    },
+    {
+      "id": "end_audit_session_success",
+      "type": "http_request",
+      "name": "End Audit Session (Success)",
+      "description": "Close Langfuse audit trail with success status",
+      "position": {"x": 2700, "y": 200},
+      "config": {
+        "method": "POST",
+        "url": "{{base_url}}/api/voice-auth-intelligence/audit/session/end",
+        "headers": {"Content-Type": "application/json"},
+        "body": {
+          "status": "success",
+          "outcome": "authenticated_and_unlocked",
+          "voice_confidence": "{{$vars.voice_confidence}}",
+          "fused_confidence": "{{$vars.fused_confidence}}",
+          "unlock_success": true
+        }
+      },
+      "outputs": ["success_response"]
+    },
+    {
+      "id": "success_response",
+      "type": "output",
+      "name": "Return Success Response",
+      "description": "Return successful authentication response",
+      "position": {"x": 2900, "y": 200},
+      "config": {
+        "status_code": 200,
+        "body": {
+          "success": true,
+          "authenticated": true,
+          "speaker_name": "{{$input.speaker_name}}",
+          "voice_confidence": "{{$vars.voice_confidence}}",
+          "fused_confidence": "{{$vars.fused_confidence}}",
+          "unlock_success": true,
+          "jarvis_response": "{{$previous.feedback_message}}",
+          "should_speak": true,
+          "audit_session_id": "{{$vars.audit_session_id}}"
+        }
+      }
+    },
+    {
+      "id": "clarification_response",
+      "type": "output",
+      "name": "Return Clarification Request",
+      "description": "Ask user to retry with guidance",
+      "position": {"x": 2500, "y": 250},
+      "config": {
+        "status_code": 200,
+        "body": {
+          "success": false,
+          "authenticated": false,
+          "reason": "clarification_needed",
+          "retry_allowed": true,
+          "attempts_remaining": "{{$vars.max_retry_attempts - 1}}",
+          "jarvis_response": "{{$previous.feedback_message}}",
+          "suggestions": "{{$previous.suggestions}}",
+          "should_speak": true,
+          "unlock_screen": false
+        }
+      }
+    },
+    {
+      "id": "challenge_response",
+      "type": "output",
+      "name": "Return Challenge Question",
+      "description": "Request secondary verification",
+      "position": {"x": 2500, "y": 450},
+      "config": {
+        "status_code": 200,
+        "body": {
+          "success": false,
+          "authenticated": false,
+          "reason": "challenge_required",
+          "challenge_question": "{{$previous.challenge_question}}",
+          "jarvis_response": "{{$previous.feedback_message}}",
+          "should_speak": true,
+          "unlock_screen": false,
+          "awaiting_response": true
+        }
+      }
+    },
+    {
+      "id": "low_confidence_response",
+      "type": "output",
+      "name": "Return Low Confidence Response",
+      "description": "Voice didn't match - offer alternatives",
+      "position": {"x": 2100, "y": 500},
+      "config": {
+        "status_code": 200,
+        "body": {
+          "success": false,
+          "authenticated": false,
+          "reason": "voice_not_matched",
+          "voice_confidence": "{{$vars.voice_confidence}}",
+          "retry_allowed": true,
+          "alternatives": ["retry_voice", "use_password", "use_watch"],
+          "jarvis_response": "{{$previous.feedback_message}}",
+          "should_speak": true,
+          "unlock_screen": false
+        }
+      }
+    },
+    {
+      "id": "system_unavailable_response",
+      "type": "output",
+      "name": "Return System Unavailable",
+      "description": "Voice auth system is unavailable",
+      "position": {"x": 500, "y": 450},
+      "config": {
+        "status_code": 503,
+        "body": {
+          "success": false,
+          "authenticated": false,
+          "reason": "system_unavailable",
+          "jarvis_response": "I'm having trouble with voice authentication right now. Please use your password to unlock.",
+          "alternatives": ["use_password"],
+          "should_speak": true,
+          "unlock_screen": false
+        }
+      }
+    }
+  ],
+  "error_handling": {
+    "global_timeout": 30000,
+    "retry_policy": {
+      "max_retries": 2,
+      "backoff_ms": 1000,
+      "retry_on": ["timeout", "5xx"]
+    },
+    "fallback": {
+      "output": {
+        "success": false,
+        "authenticated": false,
+        "reason": "system_error",
+        "jarvis_response": "I encountered an unexpected error during authentication. Please try again or use an alternative method.",
+        "should_speak": true,
+        "unlock_screen": false
+      }
+    }
+  },
+  "monitoring": {
+    "metrics": {
+      "track_latency": true,
+      "track_success_rate": true,
+      "track_confidence_distribution": true,
+      "track_retry_rate": true,
+      "track_security_events": true
+    },
+    "alerts": [
+      {
+        "condition": "security_events > 3 in 5m",
+        "action": "notify",
+        "severity": "critical"
+      },
+      {
+        "condition": "success_rate < 80%",
+        "action": "notify",
+        "severity": "warning"
+      },
+      {
+        "condition": "avg_latency > 5000ms",
+        "action": "notify",
+        "severity": "warning"
+      }
+    ]
+  }
+}

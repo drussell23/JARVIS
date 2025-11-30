@@ -1,0 +1,173 @@
+{
+  "info": {
+    "name": "JARVIS Voice Unlock - Quick Flow",
+    "description": "Simplified voice unlock flow for quick deployment. Core authentication without all the bells and whistles.",
+    "version": "1.0.0"
+  },
+  "blocks": [
+    {
+      "id": "1-trigger",
+      "type": "start",
+      "name": "🎤 Voice Unlock Request",
+      "next": "2-check-health"
+    },
+    {
+      "id": "2-check-health",
+      "type": "send-request",
+      "name": "🏥 Check System Health",
+      "request": {
+        "method": "GET",
+        "url": "{{base_url}}/api/voice-auth-intelligence/health"
+      },
+      "next": "3-health-check"
+    },
+    {
+      "id": "3-health-check",
+      "type": "if",
+      "name": "System OK?",
+      "condition": "/status = 'healthy'",
+      "then": "4-authenticate",
+      "else": "error-unavailable"
+    },
+    {
+      "id": "4-authenticate",
+      "type": "send-request",
+      "name": "🔐 Voice Authentication",
+      "request": {
+        "method": "POST",
+        "url": "{{base_url}}/api/voice-auth-intelligence/authenticate/enhanced",
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "speaker_name": "{{speaker_name}}",
+          "use_adaptive": true,
+          "max_attempts": 1
+        }
+      },
+      "next": "5-confidence-check"
+    },
+    {
+      "id": "5-confidence-check",
+      "type": "if",
+      "name": "Confidence ≥ 85%?",
+      "condition": "/confidence >= 0.85",
+      "then": "6-unlock",
+      "else": "7-fusion"
+    },
+    {
+      "id": "6-unlock",
+      "type": "send-request",
+      "name": "🔓 Unlock Screen",
+      "request": {
+        "method": "POST",
+        "url": "{{base_url}}/api/screen/unlock",
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "method": "keychain",
+          "reason": "voice_authenticated"
+        }
+      },
+      "next": "8-speak-success"
+    },
+    {
+      "id": "7-fusion",
+      "type": "send-request",
+      "name": "🧠 Multi-Factor Fusion",
+      "request": {
+        "method": "POST",
+        "url": "{{base_url}}/api/voice-auth-intelligence/fusion/calculate",
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "voice_confidence": "{{/4-authenticate/response/body/confidence}}",
+          "weights": {
+            "voice": 0.6,
+            "behavioral": 0.3,
+            "context": 0.1
+          }
+        }
+      },
+      "next": "7b-fusion-check"
+    },
+    {
+      "id": "7b-fusion-check",
+      "type": "if",
+      "name": "Fused ≥ 80%?",
+      "condition": "/fused_confidence >= 0.80",
+      "then": "6-unlock",
+      "else": "error-failed"
+    },
+    {
+      "id": "8-speak-success",
+      "type": "send-request",
+      "name": "🔊 JARVIS Speaks",
+      "request": {
+        "method": "POST",
+        "url": "{{base_url}}/voice/jarvis/speak",
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "text": "Unlocking for you, Derek."
+        }
+      },
+      "next": "output-success"
+    },
+    {
+      "id": "output-success",
+      "type": "output",
+      "name": "✅ Success",
+      "data": {
+        "success": true,
+        "authenticated": true,
+        "unlocked": true,
+        "message": "Voice authenticated and screen unlocked"
+      }
+    },
+    {
+      "id": "error-unavailable",
+      "type": "output",
+      "name": "❌ System Unavailable",
+      "data": {
+        "success": false,
+        "error": "system_unavailable",
+        "message": "Voice auth system is not available"
+      }
+    },
+    {
+      "id": "error-failed",
+      "type": "send-request",
+      "name": "🔊 JARVIS Retry Message",
+      "request": {
+        "method": "POST",
+        "url": "{{base_url}}/voice/jarvis/speak",
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "text": "I'm having trouble verifying your voice. Could you try again, or use your password?"
+        }
+      },
+      "next": "output-failed"
+    },
+    {
+      "id": "output-failed",
+      "type": "output",
+      "name": "❌ Auth Failed",
+      "data": {
+        "success": false,
+        "authenticated": false,
+        "retry_allowed": true,
+        "alternatives": ["retry", "password"]
+      }
+    }
+  ],
+  "variables": {
+    "base_url": "http://localhost:8010",
+    "speaker_name": "Derek"
+  }
+}
