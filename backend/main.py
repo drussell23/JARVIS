@@ -2217,6 +2217,18 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Neural Mesh shutdown error: {e}")
 
+    # Shutdown Voice Auth Intelligence Services (Langfuse, etc.)
+    try:
+        from api.voice_auth_intelligence_api import shutdown_voice_auth_services
+
+        logger.info("🔐 Shutting down Voice Auth Intelligence services...")
+        shutdown_voice_auth_services()
+        logger.info("✅ Voice Auth Intelligence services shutdown complete")
+    except ImportError:
+        logger.debug("Voice Auth Intelligence API not available")
+    except Exception as e:
+        logger.warning(f"Voice Auth Intelligence shutdown error: {e}")
+
     # Shutdown Advanced Thread Manager with multi-phase escalation
     if THREAD_MANAGER_AVAILABLE and thread_manager:
         try:

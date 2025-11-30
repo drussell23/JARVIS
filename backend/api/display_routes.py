@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 async def get_displays() -> Dict[str, Any]:
     """
     Get all connected displays with space mappings
-    
+
     Returns:
         {
             "total_displays": int,
@@ -44,14 +44,35 @@ async def get_displays() -> Dict[str, Any]:
     """
     try:
         from vision.multi_monitor_detector import MultiMonitorDetector
-        
+
         detector = MultiMonitorDetector()
         summary = await detector.get_display_summary()
-        
+
         return summary
-        
+
     except Exception as e:
         logger.error(f"Error getting displays: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/displays/stats")
+async def get_display_stats() -> Dict[str, Any]:
+    """
+    Get performance statistics for display detection and capture
+
+    Returns:
+        Performance metrics and statistics
+    """
+    try:
+        from vision.multi_monitor_detector import MultiMonitorDetector
+
+        detector = MultiMonitorDetector()
+        stats = detector.get_performance_stats()
+
+        return stats
+
+    except Exception as e:
+        logger.error(f"Error getting display stats: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -129,25 +150,4 @@ async def capture_display(display_id: int) -> Dict[str, Any]:
             
     except Exception as e:
         logger.error(f"Error capturing display {display_id}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.get("/displays/stats")
-async def get_display_stats() -> Dict[str, Any]:
-    """
-    Get performance statistics for display detection and capture
-    
-    Returns:
-        Performance metrics and statistics
-    """
-    try:
-        from vision.multi_monitor_detector import MultiMonitorDetector
-        
-        detector = MultiMonitorDetector()
-        stats = detector.get_performance_stats()
-        
-        return stats
-        
-    except Exception as e:
-        logger.error(f"Error getting display stats: {e}")
         raise HTTPException(status_code=500, detail=str(e))

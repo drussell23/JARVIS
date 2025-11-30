@@ -845,6 +845,27 @@ class AuthenticationAuditTrail:
         traces.sort(key=lambda t: t.timestamp, reverse=True)
         return traces[:limit]
 
+    def shutdown(self):
+        """Gracefully shutdown Langfuse client and flush pending data."""
+        if self._langfuse:
+            try:
+                self.logger.info("🔄 Flushing Langfuse audit trail...")
+                # Flush any pending data with a short timeout
+                self._langfuse.flush()
+                # Shutdown the client if method exists (v3.x SDK)
+                if hasattr(self._langfuse, 'shutdown'):
+                    self._langfuse.shutdown()
+                self.logger.info("✅ Langfuse audit trail shutdown complete")
+            except Exception as e:
+                self.logger.warning(f"⚠️ Langfuse shutdown error: {e}")
+            finally:
+                self._langfuse = None
+                self._initialized = False
+
+    def __del__(self):
+        """Ensure cleanup on garbage collection."""
+        self.shutdown()
+
 
 # ============================================================================
 # Voice Processing Cache (Helicone-style)

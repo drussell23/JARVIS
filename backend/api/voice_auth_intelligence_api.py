@@ -127,6 +127,45 @@ _feedback_generator = None
 _multi_factor_engine = None
 
 
+def shutdown_voice_auth_services():
+    """
+    Shutdown all voice auth intelligence services gracefully.
+
+    This should be called during application shutdown to ensure
+    Langfuse and other services flush their data and release threads.
+    """
+    global _audit_trail, _pattern_store, _speaker_service
+
+    # Shutdown Langfuse audit trail first (has background threads)
+    if _audit_trail is not None:
+        try:
+            logger.info("🔄 Shutting down Langfuse audit trail...")
+            if hasattr(_audit_trail, 'shutdown'):
+                _audit_trail.shutdown()
+            logger.info("✅ Langfuse audit trail shutdown complete")
+        except Exception as e:
+            logger.warning(f"⚠️ Audit trail shutdown error: {e}")
+        finally:
+            _audit_trail = None
+
+    # Shutdown pattern store if it has cleanup
+    if _pattern_store is not None:
+        try:
+            if hasattr(_pattern_store, 'shutdown'):
+                _pattern_store.shutdown()
+        except Exception as e:
+            logger.warning(f"⚠️ Pattern store shutdown error: {e}")
+        finally:
+            _pattern_store = None
+
+    logger.info("✅ Voice auth intelligence services shutdown complete")
+
+
+# Register atexit handler for cleanup
+import atexit
+atexit.register(shutdown_voice_auth_services)
+
+
 async def get_speaker_service():
     """Get or initialize the speaker verification service."""
     global _speaker_service
