@@ -353,6 +353,19 @@ class SwiftCommandClassifier:
             "total_classifications": 0
         }
 
+    def shutdown(self):
+        """Shutdown executor and cleanup resources."""
+        if hasattr(self, 'executor') and self.executor:
+            try:
+                self.executor.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
+            self.executor = None
+
+    def __del__(self):
+        """Ensure cleanup on garbage collection."""
+        self.shutdown()
+
 
 class IntelligentCommandRouter:
     """Intelligent command router using Swift classification.

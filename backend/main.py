@@ -377,6 +377,13 @@ async def parallel_import_components():
 
     import concurrent.futures
 
+    # Use managed executor for clean shutdown if available
+    if THREAD_MANAGER_AVAILABLE:
+        from core.thread_manager import ManagedThreadPoolExecutor
+        _ImportExecutor = ManagedThreadPoolExecutor
+    else:
+        _ImportExecutor = concurrent.futures.ThreadPoolExecutor
+
     # Define import tasks
     import_tasks = {
         "chatbots": import_chatbots,
@@ -392,8 +399,8 @@ async def parallel_import_components():
         "goal_inference": import_goal_inference,
     }
 
-    # Use thread pool for imports
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+    # Use thread pool for imports (ManagedThreadPoolExecutor for clean shutdown)
+    with _ImportExecutor(max_workers=4, name='parallel-imports') if THREAD_MANAGER_AVAILABLE else _ImportExecutor(max_workers=4) as executor:
         # Submit all import tasks
         futures = {name: executor.submit(func) for name, func in import_tasks.items()}
 

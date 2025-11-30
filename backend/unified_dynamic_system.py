@@ -16,10 +16,11 @@ import psutil
 
 # Import daemon executor for clean shutdown
 try:
-    from core.thread_manager import get_daemon_executor
+    from core.thread_manager import get_daemon_executor, ManagedThreadPoolExecutor
     USE_DAEMON_EXECUTOR = True
 except ImportError:
     USE_DAEMON_EXECUTOR = False
+    ManagedThreadPoolExecutor = None
 
 # Import all our components
 from dynamic_jarvis_activation import get_dynamic_activation
@@ -327,8 +328,37 @@ class UnifiedDynamicSystem:
         
         return await python_process()
 
+    def shutdown(self):
+        """Shutdown executor and cleanup resources."""
+        if hasattr(self, 'executor') and self.executor:
+            try:
+                self.executor.shutdown(wait=False, cancel_futures=True)
+                logger.info("✅ UnifiedDynamicSystem executor shutdown complete")
+            except Exception as e:
+                logger.warning(f"⚠️ UnifiedDynamicSystem executor shutdown error: {e}")
+            self.executor = None
+
+    def __del__(self):
+        """Ensure cleanup on garbage collection."""
+        self.shutdown()
+
+
 # Global instance
 _unified_system = None
+
+
+def _cleanup_unified_system():
+    """Cleanup function for atexit."""
+    global _unified_system
+    if _unified_system is not None:
+        _unified_system.shutdown()
+        _unified_system = None
+
+
+# Register atexit handler
+import atexit
+atexit.register(_cleanup_unified_system)
+
 
 def get_unified_system() -> UnifiedDynamicSystem:
     """Get or create unified system instance"""

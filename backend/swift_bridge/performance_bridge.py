@@ -360,8 +360,14 @@ class SwiftAudioProcessor:
     
     def __del__(self) -> None:
         """Clean up Swift audio processor resources."""
+        if hasattr(self, 'executor') and self.executor:
+            try:
+                self.executor.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
         if hasattr(self, '_processor') and self._processor:
             _performance_lib.audio_processor_destroy(self._processor)
+
 
 class SwiftVisionProcessor:
     """High-performance vision processor using Swift/Metal acceleration.
