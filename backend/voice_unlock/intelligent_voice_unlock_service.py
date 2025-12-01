@@ -127,6 +127,9 @@ class IntelligentVoiceUnlockService:
         # 🚀 SEMANTIC CACHE: Instant unlock for repeated requests
         self.voice_biometric_cache = None
 
+        # 🎯 UNIFIED VOICE CACHE: Preloads Derek's voice profile for instant recognition
+        self.unified_cache = None
+
         # Statistics
         self.stats = {
             "total_unlock_attempts": 0,
@@ -219,10 +222,45 @@ class IntelligentVoiceUnlockService:
                 logger.warning(f"Voice biometric cache initialized WITHOUT database recording: {e}")
                 logger.info("🚀 Voice biometric semantic cache initialized (cache-only mode)")
 
+        async def _init_unified_voice_cache():
+            """
+            Initialize unified voice cache manager for instant voice recognition.
+
+            CRITICAL: This preloads Derek's voice profile from SQLite at startup
+            so voice matching is instant (<5ms) without recomputing embeddings!
+            """
+            try:
+                from voice_unlock.unified_voice_cache_manager import (
+                    get_unified_cache_manager,
+                    initialize_unified_cache,
+                )
+
+                # Initialize the unified cache manager
+                self.unified_cache = get_unified_cache_manager()
+                success = await initialize_unified_cache(
+                    preload_profiles=True,
+                    preload_models=False,  # Models loaded elsewhere
+                )
+
+                if success:
+                    profiles_loaded = self.unified_cache.profiles_loaded
+                    logger.info(
+                        f"🎯 Unified Voice Cache initialized "
+                        f"({profiles_loaded} profile(s) preloaded for instant recognition)"
+                    )
+                else:
+                    logger.warning("⚠️ Unified Voice Cache initialization failed - fallback to standard matching")
+                    self.unified_cache = None
+
+            except Exception as e:
+                logger.warning(f"⚠️ Unified Voice Cache not available: {e}")
+                self.unified_cache = None
+
         async def _run_initialization():
             """Run all initialization phases - ALL IN PARALLEL for maximum speed."""
-            # OPTIMIZED v2.1: Run ALL components in single parallel block
+            # OPTIMIZED v2.2: Run ALL components in single parallel block
             # This eliminates sequential phase delays (was 3 phases = 3x latency)
+            # NEW: Added unified voice cache for preloading Derek's voice profile
             await asyncio.gather(
                 # Core services (Phase 1)
                 _init_with_timeout(self._initialize_stt(), "Hybrid STT Router"),
@@ -230,6 +268,8 @@ class IntelligentVoiceUnlockService:
                 _init_with_timeout(self._initialize_learning_db(), "Learning Database"),
                 _init_with_timeout(_preload_keychain_cache(), "Keychain Cache"),
                 _init_with_timeout(_init_voice_biometric_cache(), "Voice Biometric Cache"),
+                # NEW: Unified Voice Cache - preloads Derek's embedding for instant recognition
+                _init_with_timeout(_init_unified_voice_cache(), "Unified Voice Cache"),
                 # Intelligence layers (Phase 2) - now parallel with Phase 1
                 _init_with_timeout(self._initialize_cai(), "Context-Aware Intelligence"),
                 _init_with_timeout(self._initialize_sai(), "Scenario-Aware Intelligence"),
