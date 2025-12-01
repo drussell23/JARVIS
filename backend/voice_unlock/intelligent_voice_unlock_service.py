@@ -111,31 +111,61 @@ class IntelligentVoiceUnlockService:
         }
 
     async def initialize(self):
-        """Initialize all components - PARALLELIZED for speed"""
+        """
+        Initialize all components - PARALLELIZED for speed with timeout protection.
+
+        Timeout Configuration:
+        - Individual component timeout: 10s (prevents single component from blocking)
+        - Total initialization timeout: 30s (prevents overall hang)
+        """
         if self.initialized:
             return
 
-        logger.info("🚀 Initializing Intelligent Voice Unlock Service (parallel)...")
+        # Timeout constants
+        COMPONENT_TIMEOUT = 10.0  # Max time for individual component init
+        TOTAL_INIT_TIMEOUT = 30.0  # Max time for entire initialization
+
+        logger.info("🚀 Initializing Intelligent Voice Unlock Service (parallel with timeout protection)...")
         init_start = datetime.now()
 
-        # PHASE 1: Initialize core services in parallel (these don't depend on each other)
-        await asyncio.gather(
-            self._initialize_stt(),
-            self._initialize_speaker_recognition(),
-            self._initialize_learning_db(),
-            return_exceptions=True  # Don't fail if one init fails
-        )
+        async def _init_with_timeout(coro, name: str, timeout: float = COMPONENT_TIMEOUT):
+            """Wrap initialization coroutine with timeout and error handling."""
+            try:
+                await asyncio.wait_for(coro, timeout=timeout)
+                logger.debug(f"  ✓ {name} initialized")
+            except asyncio.TimeoutError:
+                logger.warning(f"  ⏱️ {name} initialization timed out after {timeout}s (continuing without)")
+            except Exception as e:
+                logger.warning(f"  ⚠️ {name} initialization failed: {e} (continuing without)")
 
-        # PHASE 2: Initialize intelligence layers in parallel (can run after core)
-        await asyncio.gather(
-            self._initialize_cai(),
-            self._initialize_sai(),
-            self._initialize_ml_engine(),
-            return_exceptions=True
-        )
+        async def _run_initialization():
+            """Run all initialization phases."""
+            # PHASE 1: Initialize core services in parallel with individual timeouts
+            await asyncio.gather(
+                _init_with_timeout(self._initialize_stt(), "Hybrid STT Router"),
+                _init_with_timeout(self._initialize_speaker_recognition(), "Speaker Recognition"),
+                _init_with_timeout(self._initialize_learning_db(), "Learning Database"),
+            )
 
-        # PHASE 3: Load owner profile (depends on learning_db and speaker_engine)
-        await self._load_owner_profile()
+            # PHASE 2: Initialize intelligence layers in parallel
+            await asyncio.gather(
+                _init_with_timeout(self._initialize_cai(), "Context-Aware Intelligence"),
+                _init_with_timeout(self._initialize_sai(), "Scenario-Aware Intelligence"),
+                _init_with_timeout(self._initialize_ml_engine(), "ML Learning Engine"),
+            )
+
+            # PHASE 3: Load owner profile with timeout
+            await _init_with_timeout(
+                self._load_owner_profile(),
+                "Owner Profile",
+                timeout=5.0  # Shorter timeout for profile loading
+            )
+
+        try:
+            # Python 3.9 compatible: use wait_for instead of asyncio.timeout
+            await asyncio.wait_for(_run_initialization(), timeout=TOTAL_INIT_TIMEOUT)
+        except asyncio.TimeoutError:
+            logger.error(f"⏱️ Total initialization exceeded {TOTAL_INIT_TIMEOUT}s - service starting in degraded mode")
 
         init_time = (datetime.now() - init_start).total_seconds() * 1000
         self.initialized = True

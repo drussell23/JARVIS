@@ -666,12 +666,19 @@ class AdaptiveAuthenticationEngine:
             "trace_id": None
         }
 
-        # Run graph with detailed logging
+        # Timeout for entire LangGraph execution (prevent infinite hang)
+        LANGGRAPH_TIMEOUT = 45.0  # seconds - generous but finite
+
+        # Run graph with detailed logging and timeout protection
         try:
             self.logger.info(f"🧠 LangGraph adaptive auth starting for {speaker_name}")
             self.logger.debug(f"   Initial state: audio_length={len(audio_data)}, max_attempts={max_attempts}")
 
-            final_state = await self._graph.ainvoke(initial_state)
+            # Wrap LangGraph execution with timeout to prevent hanging
+            final_state = await asyncio.wait_for(
+                self._graph.ainvoke(initial_state),
+                timeout=LANGGRAPH_TIMEOUT
+            )
 
             # Log detailed results
             is_verified = final_state.get("is_verified", False)
@@ -721,6 +728,15 @@ class AdaptiveAuthenticationEngine:
                 "attempts": final_state.get("attempt_count", 1),
                 "threat_detected": final_state.get("threat_detected"),
                 "trace_id": final_state.get("trace_id")
+            }
+        except asyncio.TimeoutError:
+            self.logger.error(f"⏱️ LangGraph adaptive auth timed out after {LANGGRAPH_TIMEOUT}s")
+            return {
+                "verified": False,
+                "confidence": 0.0,
+                "decision": "timeout",
+                "feedback": "Voice authentication took too long. Please try again.",
+                "error": f"LangGraph execution exceeded {LANGGRAPH_TIMEOUT}s timeout"
             }
         except Exception as e:
             self.logger.error(f"Adaptive auth error: {e}", exc_info=True)
