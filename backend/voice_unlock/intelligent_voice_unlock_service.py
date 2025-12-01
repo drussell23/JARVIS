@@ -138,13 +138,24 @@ class IntelligentVoiceUnlockService:
             except Exception as e:
                 logger.warning(f"  ⚠️ {name} initialization failed: {e} (continuing without)")
 
+        async def _preload_keychain_cache():
+            """Preload keychain password into cache for instant first unlock."""
+            from macos_keychain_unlock import preload_keychain_cache
+            success = await preload_keychain_cache()
+            if success:
+                logger.info("🔐 Keychain password preloaded into cache")
+            else:
+                logger.warning("⚠️ Keychain password preload failed - first unlock will be slower")
+
         async def _run_initialization():
             """Run all initialization phases."""
             # PHASE 1: Initialize core services in parallel with individual timeouts
+            # INCLUDES keychain preload for instant first unlock
             await asyncio.gather(
                 _init_with_timeout(self._initialize_stt(), "Hybrid STT Router"),
                 _init_with_timeout(self._initialize_speaker_recognition(), "Speaker Recognition"),
                 _init_with_timeout(self._initialize_learning_db(), "Learning Database"),
+                _init_with_timeout(_preload_keychain_cache(), "Keychain Cache"),  # Preload password
             )
 
             # PHASE 2: Initialize intelligence layers in parallel
@@ -286,29 +297,21 @@ class IntelligentVoiceUnlockService:
             logger.error(f"Failed to load owner profile: {e}")
 
     async def _load_owner_password(self):
-        """Load owner password from keychain"""
+        """
+        Load owner password hash from keychain using enhanced async keychain service.
+
+        Uses non-blocking async subprocess to prevent event loop blocking.
+        Password is cached for subsequent fast access (1 hour TTL).
+        """
         try:
-            import subprocess
+            from macos_keychain_unlock import get_password_hash_async
 
-            result = subprocess.run(
-                [
-                    "security",
-                    "find-generic-password",
-                    "-s",
-                    "JARVIS_Screen_Unlock",
-                    "-a",
-                    "jarvis_user",
-                    "-w",
-                ],
-                capture_output=True,
-                text=True,
-            )
+            # Use enhanced keychain service (non-blocking, cached, parallel lookup)
+            password_hash = await get_password_hash_async()
 
-            if result.returncode == 0:
-                password = result.stdout.strip()
-                # Store hash for verification (not the actual password)
-                self.owner_password_hash = hashlib.sha256(password.encode()).hexdigest()
-                logger.info("🔐 Owner password loaded from keychain")
+            if password_hash:
+                self.owner_password_hash = password_hash
+                logger.info("🔐 Owner password hash loaded from keychain (async, cached)")
             else:
                 logger.warning("⚠️  No password found in keychain")
 
@@ -1459,51 +1462,37 @@ class IntelligentVoiceUnlockService:
     async def _perform_unlock(
         self, speaker_name: str, context_analysis: Dict[str, Any], scenario_analysis: Dict[str, Any], attempt_id: Optional[int] = None
     ) -> Dict[str, Any]:
-        """Perform actual screen unlock with enhanced error handling and ML metrics collection"""
+        """
+        Perform actual screen unlock with enhanced error handling and ML metrics collection.
+
+        Uses enhanced macos_keychain_unlock for non-blocking password retrieval with:
+        - Intelligent caching (1 hour TTL)
+        - Parallel keychain service lookup
+        - Circuit breaker pattern
+        - Comprehensive metrics
+        """
         try:
-            # Get password from keychain
-            import subprocess
+            # Get password from keychain using enhanced service (non-blocking, cached)
+            from macos_keychain_unlock import get_keychain_unlock_service
 
-            # Try multiple keychain service names for compatibility
-            keychain_services = [
-                ("com.jarvis.voiceunlock", "unlock_token"),  # Primary (enable_screen_unlock.sh format)
-                ("jarvis_voice_unlock", "jarvis"),  # Alternative format
-                ("JARVIS_Screen_Unlock", "jarvis_user"),  # Legacy format
-            ]
-
-            password = None
-            service_used = None
-
-            for service_name, account_name in keychain_services:
-                result = subprocess.run(
-                    [
-                        "security",
-                        "find-generic-password",
-                        "-s",
-                        service_name,
-                        "-a",
-                        account_name,
-                        "-w",
-                    ],
-                    capture_output=True,
-                    text=True,
-                )
-
-                if result.returncode == 0:
-                    password = result.stdout.strip()
-                    service_used = service_name
-                    logger.debug(f"Password found in keychain (service: {service_name})")
-                    break
+            keychain_service = await get_keychain_unlock_service()
+            password = await keychain_service.get_password_from_keychain()
 
             if not password:
+                # Get metrics for debugging
+                metrics = keychain_service.get_metrics()
                 logger.error("Password not found in keychain")
                 logger.error("Tried services: com.jarvis.voiceunlock, jarvis_voice_unlock, JARVIS_Screen_Unlock")
+                logger.error(f"Keychain metrics: lookups={metrics['total_lookups']}, failures={metrics['failures']}")
                 logger.error("Run: ~/Documents/repos/JARVIS-AI-Agent/backend/voice_unlock/fix_keychain_password.sh")
                 return {
                     "success": False,
                     "reason": "password_not_found",
                     "message": "Password not found in keychain. Run fix_keychain_password.sh to fix.",
                 }
+
+            # Get service used from metrics
+            service_used = keychain_service.get_metrics().get("last_success_service", "unknown")
 
             # 🖥️ DISPLAY-AWARE SAI: Use situational awareness for display configuration
             # Automatically detects mirrored/TV displays and adapts typing strategy
@@ -1930,7 +1919,16 @@ class IntelligentVoiceUnlockService:
         return response
 
     def get_stats(self) -> Dict[str, Any]:
-        """Get service statistics"""
+        """Get service statistics including keychain cache metrics"""
+        # Get keychain cache metrics (async-safe access to singleton)
+        keychain_metrics = {}
+        try:
+            from macos_keychain_unlock import _keychain_unlock_instance
+            if _keychain_unlock_instance:
+                keychain_metrics = _keychain_unlock_instance.get_metrics()
+        except Exception:
+            pass  # Keychain service not initialized yet
+
         return {
             **self.stats,
             "owner_profile_loaded": self.owner_profile is not None,
@@ -1942,7 +1940,9 @@ class IntelligentVoiceUnlockService:
                 "learning_database": self.learning_db is not None,
                 "cai": self.cai_handler is not None,
                 "sai": self.sai_analyzer is not None,
+                "keychain_cache": keychain_metrics.get("cache_valid", False),
             },
+            "keychain_cache_metrics": keychain_metrics,
         }
 
 

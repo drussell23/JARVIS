@@ -93,6 +93,12 @@ regexes = [
   '''has_password\s*=''',
   '''if not has_password''',
   '''Keychain password''',
+  '''password.*retrieved.*keychain''',
+  '''Password.*retrieved.*keychain''',
+  '''password retrieval''',
+  '''Password retrieval''',
+  '''#.*PASSWORD.*RETRIEVAL''',
+  '''keychain.*password.*management''',
   # Allow password in docstrings and log messages
   '''Type password characters''',
   '''type password characters''',
@@ -119,8 +125,12 @@ regexes = [
   '''password_type_ms''',
   # Allow password variable from keychain retrieval (not exposing secrets)
   '''password\s*=\s*result\.stdout\.strip\(\)''',
+  '''password\s*=\s*stdout\.decode\(\)\.strip\(\)''',
   '''if not password:''',
+  '''if password:''',
   '''# Clear password variable''',
+  '''password=password,''',
+  '''password\s*=\s*password,''',
   # ML Architecture and metrics (documentation, no actual secrets)
   '''Position in password''',
   '''### \*\*Password Typing''',
@@ -184,6 +194,8 @@ paths = [
   '''backend/voice_unlock/voice_unlock_integration.py''',
   '''backend/voice_unlock/fix_keychain_password.sh''',
   '''backend/voice_unlock/metrics_database.py''',
+  # Keychain management (retrieves passwords from keychain, doesn't store hardcoded secrets)
+  '''backend/macos_keychain_unlock.py''',
   '''backend/voice_unlock/ML_ARCHITECTURE.md''',
   '''backend/voice_unlock/continuous_learning_engine.py''',
   '''test_voice_biometric_unlock_e2e.py''',
