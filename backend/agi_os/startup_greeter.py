@@ -909,6 +909,12 @@ class StartupGreeter:
         self._recent_template_ids: Set[str] = set()
         self._greeting_history: List[GreetingResult] = []
 
+        # Enhanced narrator integration
+        self._voice_narrator = None
+        self._last_sleep_time: Optional[datetime] = None
+        self._first_wake_of_day_done: bool = False
+        self._last_wake_date: Optional[str] = None
+
         # Background tasks
         self._wake_monitor_task: Optional[asyncio.Task] = None
 
@@ -923,6 +929,15 @@ class StartupGreeter:
 
             self._voice = await get_voice_communicator()
             self._VoiceMode = VoiceMode
+
+            # Initialize enhanced voice narrator for dynamic wake/sleep responses
+            try:
+                from .voice_authentication_narrator import get_auth_narrator
+                self._voice_narrator = await get_auth_narrator(voice_communicator=self._voice)
+                logger.info("✅ VoiceAuthNarrator integrated for enhanced greetings")
+            except Exception as e:
+                logger.warning(f"VoiceAuthNarrator not available: {e}")
+                self._voice_narrator = None
 
             # Start wake detection if enabled
             if self.config.wake_detection_enabled:
@@ -940,9 +955,88 @@ class StartupGreeter:
             return False
 
     async def _on_wake_detected(self, sleep_duration: float) -> None:
-        """Handle wake detection event."""
+        """
+        Handle wake detection event with enhanced dynamic responses.
+
+        Uses VoiceAuthNarrator for intelligent, context-aware greetings based on:
+        - Time of day
+        - Sleep duration (quick lock vs long absence vs overnight)
+        - Whether this is the first wake of the day
+        - Calendar context (if available)
+        """
         logger.info(f"🌅 Processing wake event (slept {sleep_duration:.1f}s)")
+
+        # Check if this is the first wake of the day
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        is_first_wake = self._last_wake_date != today_str
+        if is_first_wake:
+            self._last_wake_date = today_str
+            self._first_wake_of_day_done = True
+
+        # Use enhanced narrator if available
+        if self._voice_narrator:
+            try:
+                # Try to get upcoming calendar event (if calendar service available)
+                upcoming_event = await self._get_upcoming_calendar_event()
+
+                # Use the enhanced narrator for dynamic wake greeting
+                await self._voice_narrator.narrate_laptop_wake(
+                    sleep_duration_seconds=sleep_duration,
+                    upcoming_calendar_event=upcoming_event,
+                    is_first_wake_of_day=is_first_wake,
+                )
+                logger.info("✅ Enhanced wake greeting delivered via VoiceAuthNarrator")
+                return
+            except Exception as e:
+                logger.warning(f"VoiceAuthNarrator wake greeting failed: {e}, falling back")
+
+        # Fallback to standard greeting if narrator unavailable
         await self.greet(GreetingContext.WAKE_FROM_SLEEP)
+
+    async def _get_upcoming_calendar_event(self) -> Optional[str]:
+        """Get the next upcoming calendar event if available."""
+        try:
+            # Try to get calendar context
+            info = await self._gather_context()
+            if info.upcoming_meetings and len(info.upcoming_meetings) > 0:
+                next_meeting = info.upcoming_meetings[0]
+                return next_meeting.get('title', next_meeting.get('name', 'an event'))
+        except Exception as e:
+            logger.debug(f"Could not get upcoming calendar event: {e}")
+        return None
+
+    async def notify_sleep(self, user_initiated: bool = True) -> None:
+        """
+        Notify when laptop is going to sleep with dynamic farewell.
+
+        Args:
+            user_initiated: Whether user closed the laptop vs automatic sleep
+        """
+        logger.info(f"😴 Processing sleep event (user_initiated={user_initiated})")
+
+        # Record sleep time for duration tracking
+        self._last_sleep_time = datetime.now()
+
+        # Use enhanced narrator if available
+        if self._voice_narrator:
+            try:
+                await self._voice_narrator.narrate_laptop_sleep(
+                    user_initiated=user_initiated
+                )
+                logger.info("✅ Enhanced sleep farewell delivered via VoiceAuthNarrator")
+                return
+            except Exception as e:
+                logger.warning(f"VoiceAuthNarrator sleep farewell failed: {e}, falling back")
+
+        # Fallback to simple farewell
+        if self._voice:
+            try:
+                await self._voice.speak(
+                    "Going to sleep. See you soon.",
+                    mode=self._VoiceMode.THOUGHTFUL
+                )
+            except Exception as e:
+                logger.error(f"Failed to speak sleep farewell: {e}")
 
     async def _gather_context(self) -> ContextualInfo:
         """Gather all contextual information."""
@@ -1258,3 +1352,17 @@ async def greet_on_wake() -> GreetingResult:
     """Convenience function to deliver wake greeting."""
     greeter = await get_startup_greeter()
     return await greeter.greet_on_wake()
+
+
+async def notify_sleep(user_initiated: bool = True) -> None:
+    """
+    Convenience function to deliver sleep farewell.
+
+    This should be called when the laptop is about to go to sleep
+    to give JARVIS a chance to say goodbye dynamically.
+
+    Args:
+        user_initiated: True if user closed the laptop, False for auto-sleep
+    """
+    greeter = await get_startup_greeter()
+    await greeter.notify_sleep(user_initiated=user_initiated)

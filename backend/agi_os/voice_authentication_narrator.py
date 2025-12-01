@@ -688,6 +688,352 @@ class VoiceAuthNarrator:
 
             await self._speak(response, "notification")
 
+    # ============== Wake/Sleep Response Generation ==============
+
+    async def narrate_laptop_wake(
+        self,
+        sleep_duration_seconds: float,
+        upcoming_calendar_event: Optional[str] = None,
+        is_first_wake_of_day: bool = False,
+    ) -> None:
+        """
+        Generate and speak a dynamic, intelligent wake-from-sleep greeting.
+
+        This method creates contextual greetings based on:
+        - Time of day (morning, afternoon, evening, late night)
+        - Sleep duration (quick break vs long sleep vs overnight)
+        - Calendar context (upcoming meetings)
+        - First wake of day vs returning from break
+        - Day type (weekday vs weekend)
+
+        Args:
+            sleep_duration_seconds: How long the laptop was asleep
+            upcoming_calendar_event: Optional next calendar event name
+            is_first_wake_of_day: Whether this is the first wake today
+        """
+        name = await self._get_user_name()
+        time_of_day = self._get_time_of_day()
+        sleep_minutes = sleep_duration_seconds / 60
+        sleep_hours = sleep_duration_seconds / 3600
+
+        # Determine sleep context
+        sleep_context = self._categorize_sleep_duration(sleep_duration_seconds)
+
+        # Build contextual greeting
+        greeting = await self._build_wake_greeting(
+            name=name,
+            time_of_day=time_of_day,
+            sleep_context=sleep_context,
+            sleep_minutes=sleep_minutes,
+            sleep_hours=sleep_hours,
+            upcoming_event=upcoming_calendar_event,
+            is_first_wake=is_first_wake_of_day,
+        )
+
+        # Determine voice mode based on time
+        voice_mode = self._get_wake_voice_mode(time_of_day, sleep_context)
+
+        await self._speak(greeting, voice_mode)
+
+    def _categorize_sleep_duration(self, seconds: float) -> str:
+        """Categorize sleep duration for context-aware responses."""
+        minutes = seconds / 60
+        hours = seconds / 3600
+
+        if minutes < 5:
+            return "quick_lock"      # Just locked briefly
+        elif minutes < 30:
+            return "short_break"     # Coffee/bathroom break
+        elif minutes < 120:
+            return "extended_break"  # Lunch, meeting, etc.
+        elif hours < 8:
+            return "long_absence"    # Away for most of the day
+        else:
+            return "overnight"       # Sleep or next day
+
+    async def _build_wake_greeting(
+        self,
+        name: str,
+        time_of_day: TimeOfDay,
+        sleep_context: str,
+        sleep_minutes: float,
+        sleep_hours: float,
+        upcoming_event: Optional[str],
+        is_first_wake: bool,
+    ) -> str:
+        """Build intelligent wake greeting based on all context factors."""
+
+        # Get day type
+        is_weekend = datetime.now().weekday() >= 5
+
+        # Base greetings by time of day
+        time_greetings = {
+            TimeOfDay.EARLY_MORNING: [
+                f"Good morning, {name}. You're up early.",
+                f"Morning, {name}. Early start today.",
+            ],
+            TimeOfDay.MORNING: [
+                f"Good morning, {name}.",
+                f"Morning, {name}. Ready to get started?",
+            ],
+            TimeOfDay.AFTERNOON: [
+                f"Good afternoon, {name}.",
+                f"Afternoon, {name}. Welcome back.",
+            ],
+            TimeOfDay.EVENING: [
+                f"Good evening, {name}.",
+                f"Evening, {name}. Back at it?",
+            ],
+            TimeOfDay.NIGHT: [
+                f"Evening, {name}. Burning some midnight oil?",
+                f"Still going strong, {name}.",
+            ],
+            TimeOfDay.LATE_NIGHT: [
+                f"Late night session, {name}?",
+                f"{name}, it's quite late. Everything okay?",
+            ],
+        }
+
+        # Context-aware additions based on sleep duration
+        context_additions = {
+            "quick_lock": [
+                "Quick break?",
+                "Just a moment away.",
+                "",  # Sometimes say nothing extra
+            ],
+            "short_break": [
+                "Hope your break was refreshing.",
+                "Back already?",
+                "Ready to continue?",
+            ],
+            "extended_break": [
+                f"You were away for about {int(sleep_minutes)} minutes.",
+                "Good break?",
+                "",
+            ],
+            "long_absence": [
+                f"It's been a while. About {sleep_hours:.1f} hours.",
+                "Missed you around here.",
+                "",
+            ],
+            "overnight": [
+                "New day, new opportunities.",
+                "Hope you got some rest.",
+                "Ready for today?",
+            ],
+        }
+
+        # Build the greeting
+        base_options = time_greetings.get(time_of_day, [f"Hello, {name}."])
+        base = random.choice(base_options)
+
+        # Add context based on sleep duration
+        context_options = context_additions.get(sleep_context, [""])
+        context = random.choice(context_options)
+
+        # Add calendar context if relevant
+        calendar_addition = ""
+        if upcoming_event and sleep_context not in ["quick_lock"]:
+            calendar_additions = [
+                f"You have {upcoming_event} coming up.",
+                f"Don't forget about {upcoming_event}.",
+                f"Heads up, {upcoming_event} is on your calendar.",
+            ]
+            calendar_addition = random.choice(calendar_additions)
+
+        # Add special touches based on conditions
+        special_additions = []
+
+        # Weekend awareness
+        if is_weekend and is_first_wake and time_of_day in [TimeOfDay.EARLY_MORNING, TimeOfDay.MORNING]:
+            special_additions.append(random.choice([
+                "Working on the weekend?",
+                "No rest for the ambitious.",
+                "Weekend warrior mode.",
+            ]))
+
+        # Late night concern (but not annoying)
+        if time_of_day == TimeOfDay.LATE_NIGHT and sleep_context != "quick_lock":
+            special_additions.append(random.choice([
+                "Remember to get some rest.",
+                "Don't forget to take breaks.",
+                "",  # Sometimes don't mention it
+            ]))
+
+        # Combine parts intelligently
+        parts = [base]
+        if context:
+            parts.append(context)
+        if calendar_addition:
+            parts.append(calendar_addition)
+        if special_additions:
+            for addition in special_additions:
+                if addition:
+                    parts.append(addition)
+
+        return " ".join(parts).strip()
+
+    def _get_wake_voice_mode(self, time_of_day: TimeOfDay, sleep_context: str) -> str:
+        """Get appropriate voice mode for wake greeting."""
+        # Quieter in early morning/late night
+        if time_of_day in [TimeOfDay.EARLY_MORNING, TimeOfDay.LATE_NIGHT]:
+            return "thoughtful"
+        # Conversational for quick locks
+        if sleep_context == "quick_lock":
+            return "conversational"
+        # Normal otherwise
+        return "normal"
+
+    async def narrate_laptop_sleep(self, user_initiated: bool = True) -> None:
+        """
+        Generate and speak a dynamic farewell when laptop goes to sleep.
+
+        Args:
+            user_initiated: Whether user closed the laptop vs automatic sleep
+        """
+        name = await self._get_user_name()
+        time_of_day = self._get_time_of_day()
+
+        greeting = await self._build_sleep_farewell(name, time_of_day, user_initiated)
+        voice_mode = "thoughtful" if time_of_day in [TimeOfDay.NIGHT, TimeOfDay.LATE_NIGHT] else "conversational"
+
+        await self._speak(greeting, voice_mode)
+
+    async def _build_sleep_farewell(
+        self,
+        name: str,
+        time_of_day: TimeOfDay,
+        user_initiated: bool
+    ) -> str:
+        """Build intelligent farewell when going to sleep."""
+
+        # Time-based farewells
+        farewells = {
+            TimeOfDay.EARLY_MORNING: [
+                f"Taking a break, {name}? I'll be here.",
+                f"See you soon, {name}.",
+            ],
+            TimeOfDay.MORNING: [
+                f"Going offline, {name}. See you later.",
+                f"Taking a break? I'll be ready when you return.",
+            ],
+            TimeOfDay.AFTERNOON: [
+                f"Enjoy your break, {name}.",
+                f"See you in a bit, {name}.",
+            ],
+            TimeOfDay.EVENING: [
+                f"Have a good evening, {name}.",
+                f"Take care, {name}. I'll be here when you're back.",
+            ],
+            TimeOfDay.NIGHT: [
+                f"Goodnight, {name}. Get some rest.",
+                f"Calling it a night, {name}? Sleep well.",
+                f"Rest up, {name}. See you tomorrow.",
+            ],
+            TimeOfDay.LATE_NIGHT: [
+                f"Finally getting some sleep, {name}? Good call.",
+                f"Rest well, {name}. You've earned it.",
+                f"Goodnight, {name}. Don't stay up too late... oh wait.",
+            ],
+        }
+
+        options = farewells.get(time_of_day, [f"Goodbye for now, {name}."])
+        return random.choice(options)
+
+    async def narrate_screen_unlock_success(
+        self,
+        speaker_name: str,
+        confidence: float,
+        sleep_duration_seconds: float = 0.0,
+    ) -> None:
+        """
+        Generate and speak a success message after voice-authenticated screen unlock.
+
+        This combines authentication confirmation with contextual wake greeting.
+
+        Args:
+            speaker_name: Verified speaker's name
+            confidence: Voice authentication confidence (0.0-1.0)
+            sleep_duration_seconds: How long the screen was locked
+        """
+        time_of_day = self._get_time_of_day()
+        confidence_level = self._get_confidence_level(confidence)
+        sleep_context = self._categorize_sleep_duration(sleep_duration_seconds)
+
+        # Build combined authentication + wake greeting
+        greeting = await self._build_unlock_success_greeting(
+            name=speaker_name,
+            time_of_day=time_of_day,
+            confidence_level=confidence_level,
+            sleep_context=sleep_context,
+        )
+
+        voice_mode = self._get_voice_mode_for_confidence(confidence_level)
+        await self._speak(greeting, voice_mode)
+
+    async def _build_unlock_success_greeting(
+        self,
+        name: str,
+        time_of_day: TimeOfDay,
+        confidence_level: ConfidenceLevel,
+        sleep_context: str,
+    ) -> str:
+        """Build greeting that combines authentication success with wake context."""
+
+        # High confidence - smooth, natural greetings
+        if confidence_level in [ConfidenceLevel.VERY_HIGH, ConfidenceLevel.HIGH]:
+            greetings = {
+                TimeOfDay.EARLY_MORNING: [
+                    f"Morning, {name}. Unlocking.",
+                    f"Good morning, {name}.",
+                ],
+                TimeOfDay.MORNING: [
+                    f"Good morning, {name}. There you go.",
+                    f"Morning, {name}. Unlocked.",
+                ],
+                TimeOfDay.AFTERNOON: [
+                    f"Afternoon, {name}. Unlocking for you.",
+                    f"Welcome back, {name}.",
+                ],
+                TimeOfDay.EVENING: [
+                    f"Evening, {name}. Unlocked.",
+                    f"Hey, {name}. Unlocking now.",
+                ],
+                TimeOfDay.NIGHT: [
+                    f"Still at it, {name}? Unlocked.",
+                    f"Hey, {name}. Here you go.",
+                ],
+                TimeOfDay.LATE_NIGHT: [
+                    f"Late night, {name}? Unlocking.",
+                    f"Burning the midnight oil. Unlocked, {name}.",
+                ],
+            }
+        else:
+            # Lower confidence - acknowledge the verification
+            greetings = {
+                TimeOfDay.EARLY_MORNING: [
+                    f"Verified. Good morning, {name}.",
+                ],
+                TimeOfDay.MORNING: [
+                    f"Got you, {name}. Unlocking now.",
+                ],
+                TimeOfDay.AFTERNOON: [
+                    f"Verified, {name}. Unlocking.",
+                ],
+                TimeOfDay.EVENING: [
+                    f"There you are, {name}. Unlocking.",
+                ],
+                TimeOfDay.NIGHT: [
+                    f"Confirmed. Unlocking for you, {name}.",
+                ],
+                TimeOfDay.LATE_NIGHT: [
+                    f"Voice verified, {name}. Unlocking.",
+                ],
+            }
+
+        options = greetings.get(time_of_day, [f"Unlocking for you, {name}."])
+        return random.choice(options)
+
     def _update_stats(self, result: AuthenticationResult) -> None:
         """Update statistics based on result."""
         if result.success:
