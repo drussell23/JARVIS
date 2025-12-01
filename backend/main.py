@@ -1887,28 +1887,48 @@ async def lifespan(app: FastAPI):
             logger.info(f"👤 Owner: {owner_name}")
             logger.info("=" * 60 + "\n")
 
-            # Initialize and use the advanced startup greeter
+            # Initialize and use the intelligent startup announcer (primary)
+            # Falls back to legacy greeter if intelligent system unavailable
             try:
-                from agi_os import get_startup_greeter
+                from agi_os.intelligent_startup_announcer import (
+                    get_intelligent_announcer,
+                    StartupType,
+                )
 
-                greeter = await get_startup_greeter()
-                app.state.startup_greeter = greeter
+                announcer = await get_intelligent_announcer()
+                app.state.intelligent_announcer = announcer
 
-                # Deliver startup greeting (handles time-of-day, owner name, etc.)
+                # Generate and deliver intelligent startup message
                 if getattr(app.state, 'voice_enabled', True):
-                    asyncio.create_task(greeter.greet_on_startup())
+                    asyncio.create_task(announcer.announce_startup(StartupType.COLD_BOOT))
 
-                logger.info("✅ StartupGreeter: Initialized with wake detection")
+                logger.info("✅ IntelligentStartupAnnouncer: Dynamic context-aware greetings enabled")
+
             except Exception as e:
-                logger.warning(f"⚠️ StartupGreeter init failed: {e}")
-                # Fallback to simple greeting
-                if voice and getattr(app.state, 'voice_enabled', True):
-                    asyncio.create_task(
-                        voice.speak(
-                            f"JARVIS online. Ready for your command, {owner_name}.",
-                            mode=VoiceMode.NORMAL
+                logger.debug(f"Intelligent announcer not available: {e}, trying legacy greeter")
+
+                # Fallback to legacy startup greeter
+                try:
+                    from agi_os import get_startup_greeter
+
+                    greeter = await get_startup_greeter()
+                    app.state.startup_greeter = greeter
+
+                    if getattr(app.state, 'voice_enabled', True):
+                        asyncio.create_task(greeter.greet_on_startup())
+
+                    logger.info("✅ StartupGreeter (legacy): Initialized with wake detection")
+
+                except Exception as e2:
+                    logger.warning(f"⚠️ All startup greeters failed: {e2}")
+                    # Final fallback to simple greeting
+                    if voice and getattr(app.state, 'voice_enabled', True):
+                        asyncio.create_task(
+                            voice.speak(
+                                f"JARVIS online. Ready for your command, {owner_name}.",
+                                mode=VoiceMode.NORMAL
+                            )
                         )
-                    )
 
         except ImportError as e:
             logger.warning(f"⚠️ AGI OS not available: {e}")
