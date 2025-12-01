@@ -178,10 +178,27 @@ class IntelligentVoiceUnlockService:
                 logger.warning("⚠️ Keychain password preload failed - first unlock will be slower")
 
         async def _init_voice_biometric_cache():
-            """Initialize voice biometric semantic cache for instant repeat unlocks."""
+            """
+            Initialize voice biometric semantic cache for instant repeat unlocks.
+            Also sets up database recording for continuous voice learning.
+            """
             from voice_unlock.voice_biometric_cache import get_voice_biometric_cache
+            from voice_unlock.metrics_database import MetricsDatabase
+
             self.voice_biometric_cache = get_voice_biometric_cache()
-            logger.info("🚀 Voice biometric semantic cache initialized")
+
+            # 🎯 CONTINUOUS LEARNING: Set up database recorder callback
+            # This allows the cache to record ALL authentication attempts to SQLite
+            # so JARVIS can continuously improve voice recognition
+            try:
+                metrics_db = MetricsDatabase()
+                self.voice_biometric_cache.set_voice_sample_recorder(
+                    metrics_db.record_voice_sample
+                )
+                logger.info("🚀 Voice biometric cache initialized WITH database recording for continuous learning")
+            except Exception as e:
+                logger.warning(f"Voice biometric cache initialized WITHOUT database recording: {e}")
+                logger.info("🚀 Voice biometric semantic cache initialized (cache-only mode)")
 
         async def _run_initialization():
             """Run all initialization phases."""

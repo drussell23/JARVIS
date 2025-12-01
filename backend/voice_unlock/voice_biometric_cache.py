@@ -1,6 +1,6 @@
 """
-Voice Biometric Semantic Cache
-==============================
+Voice Biometric Semantic Cache with Continuous Learning
+========================================================
 
 Intelligent caching for voice biometric authentication to enable instant
 unlock responses for repeated "unlock my screen" requests.
@@ -9,6 +9,7 @@ Architecture:
 - L1: Voice Embedding Cache (voiceprint similarity matching)
 - L2: Command Semantic Cache (unlock phrase variations)
 - L3: Session Authentication Cache (time-windowed auth tokens)
+- L4: Database Recording Layer (continuous voice learning)
 
 Performance Goals:
 - First unlock: Full biometric verification (2-5 seconds)
@@ -19,6 +20,12 @@ Security:
 - Session expires after configurable timeout (default: 30 minutes)
 - Invalidated on screen lock events
 - Voice embedding must match within similarity threshold
+
+Continuous Learning:
+- ALL authentication attempts (including cache hits) are recorded to SQLite
+- This enables JARVIS to continuously improve voice recognition
+- Cache provides SPEED, Database provides LEARNING
+- Fire-and-forget async recording to avoid latency impact
 """
 
 import asyncio
@@ -29,11 +36,20 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
+from weakref import WeakValueDictionary
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# DATABASE RECORDING CALLBACK TYPES
+# =============================================================================
+# Callback signature for recording voice samples to database
+# async def callback(speaker_name, confidence, was_verified, **kwargs) -> Optional[int]
+VoiceSampleRecorderCallback = Callable[..., "asyncio.coroutine"]
 
 
 # =============================================================================
@@ -110,10 +126,15 @@ class BiometricCacheResult:
 
 class VoiceBiometricCache:
     """
-    Intelligent voice biometric cache for instant unlock authentication.
+    Intelligent voice biometric cache for instant unlock authentication
+    with continuous learning via database recording.
 
     Caches verified voice authentications so repeated "unlock my screen"
     requests within a session window are instant (< 100ms vs 2-5 seconds).
+
+    IMPORTANT: All authentication attempts (including cache hits) are recorded
+    to the SQLite database for continuous voice learning. The cache provides
+    SPEED while the database provides LEARNING.
     """
 
     def __init__(
@@ -121,8 +142,19 @@ class VoiceBiometricCache:
         embedding_ttl: int = VOICE_EMBEDDING_TTL_SECONDS,
         similarity_threshold: float = VOICE_SIMILARITY_THRESHOLD,
         max_entries: int = MAX_CACHE_ENTRIES,
+        voice_sample_recorder: Optional[VoiceSampleRecorderCallback] = None,
     ):
-        """Initialize voice biometric cache"""
+        """
+        Initialize voice biometric cache with optional database recording.
+
+        Args:
+            embedding_ttl: Time-to-live for cached voice embeddings (seconds)
+            similarity_threshold: Cosine similarity threshold for cache hit
+            max_entries: Maximum number of cache entries
+            voice_sample_recorder: Async callback to record voice samples to DB.
+                                   If provided, all auth attempts are recorded
+                                   for continuous voice learning.
+        """
         self.embedding_ttl = embedding_ttl
         self.similarity_threshold = similarity_threshold
         self.max_entries = max_entries
@@ -140,7 +172,14 @@ class VoiceBiometricCache:
         self._active_session_id: Optional[str] = None
         self._active_speaker: Optional[str] = None
 
-        # Statistics
+        # 🎯 DATABASE RECORDING: Callback for continuous voice learning
+        # This records ALL authentication attempts (cache hits too!) to SQLite
+        self._voice_sample_recorder = voice_sample_recorder
+
+        # Track background recording tasks for cleanup
+        self._recording_tasks: List[asyncio.Task] = []
+
+        # Statistics (extended with DB recording stats)
         self._stats = {
             "total_lookups": 0,
             "cache_hits": 0,
@@ -150,15 +189,35 @@ class VoiceBiometricCache:
             "session_auth_hits": 0,
             "avg_lookup_time_ms": 0.0,
             "total_time_saved_ms": 0.0,
+            # Database recording stats
+            "db_recordings_attempted": 0,
+            "db_recordings_successful": 0,
+            "db_recordings_failed": 0,
+            "cache_hits_recorded_to_db": 0,
         }
 
         # Lock for thread safety
         self._lock = asyncio.Lock()
 
+        recorder_status = "WITH DB recording" if voice_sample_recorder else "NO DB recording"
         logger.info(
-            f"🔐 VoiceBiometricCache initialized: "
+            f"🔐 VoiceBiometricCache initialized ({recorder_status}): "
             f"TTL={embedding_ttl}s, similarity_threshold={similarity_threshold}"
         )
+
+    def set_voice_sample_recorder(self, recorder: VoiceSampleRecorderCallback):
+        """
+        Set the database recorder callback for continuous voice learning.
+
+        This allows lazy initialization - you can create the cache first,
+        then set the recorder once MetricsDatabase is available.
+
+        Args:
+            recorder: Async callback to record voice samples to database.
+                      Should match MetricsDatabase.record_voice_sample signature.
+        """
+        self._voice_sample_recorder = recorder
+        logger.info("🎯 Voice sample recorder registered for continuous learning")
 
     def _generate_voice_key(self, embedding: np.ndarray) -> str:
         """Generate cache key from voice embedding"""
@@ -182,6 +241,124 @@ class VoiceBiometricCache:
             return 0.0
         return float(np.dot(a, b) / (norm_a * norm_b))
 
+    async def _record_to_database_async(
+        self,
+        speaker_name: str,
+        confidence: float,
+        was_verified: bool,
+        sample_source: str = "cache_hit",
+        audio_quality: float = 0.8,  # Cache hits have good quality by definition
+        threshold_used: float = VOICE_SIMILARITY_THRESHOLD,
+        added_to_profile: bool = False,  # Cache hits don't add new samples
+        rejection_reason: Optional[str] = None,
+        cache_hit_type: Optional[CacheHitType] = None,
+        similarity_score: float = 0.0,
+    ):
+        """
+        Fire-and-forget database recording for continuous voice learning.
+
+        This is called for EVERY authentication attempt (cache hit or miss)
+        so JARVIS can continuously learn and improve voice recognition.
+
+        Args:
+            speaker_name: Identified speaker name
+            confidence: Verification confidence score
+            was_verified: Whether verification passed
+            sample_source: Source of sample (cache_hit, cache_miss, etc.)
+            audio_quality: Audio quality estimate (0-1)
+            threshold_used: Threshold used for verification
+            added_to_profile: Whether sample was added to voice profile
+            rejection_reason: Why sample was rejected (if any)
+            cache_hit_type: Type of cache hit (for analytics)
+            similarity_score: Similarity score (for cache hits)
+        """
+        if not self._voice_sample_recorder:
+            return  # No recorder configured
+
+        self._stats["db_recordings_attempted"] += 1
+
+        try:
+            # Determine sample source based on cache hit type
+            if cache_hit_type:
+                if cache_hit_type == CacheHitType.SESSION_AUTH:
+                    sample_source = "cache_hit_session"
+                elif cache_hit_type == CacheHitType.VOICE_EMBEDDING:
+                    sample_source = "cache_hit_embedding"
+                elif cache_hit_type == CacheHitType.COMMAND_SEMANTIC:
+                    sample_source = "cache_hit_semantic"
+                else:
+                    sample_source = "cache_miss"
+
+            # Call the database recorder with timeout
+            result = await asyncio.wait_for(
+                self._voice_sample_recorder(
+                    speaker_name=speaker_name,
+                    confidence=confidence,
+                    was_verified=was_verified,
+                    audio_quality=audio_quality,
+                    snr_db=18.0,  # Assume good SNR for cache hits
+                    audio_duration_ms=2000,  # Typical duration
+                    sample_source=sample_source,
+                    environment_type="cached_session",
+                    threshold_used=threshold_used,
+                    added_to_profile=added_to_profile,
+                    rejection_reason=rejection_reason,
+                ),
+                timeout=2.0  # Don't block more than 2 seconds
+            )
+
+            self._stats["db_recordings_successful"] += 1
+            if cache_hit_type and cache_hit_type != CacheHitType.MISS:
+                self._stats["cache_hits_recorded_to_db"] += 1
+
+            logger.debug(
+                f"📝 [CACHE] Recorded to DB: {speaker_name} ({sample_source}, "
+                f"conf={confidence:.2%}, similarity={similarity_score:.2%})"
+            )
+
+        except asyncio.TimeoutError:
+            self._stats["db_recordings_failed"] += 1
+            logger.debug(f"⏱️ [CACHE] DB recording timed out for {speaker_name}")
+        except Exception as e:
+            self._stats["db_recordings_failed"] += 1
+            logger.debug(f"⚠️ [CACHE] DB recording failed: {e}")
+
+    def _schedule_db_recording(
+        self,
+        speaker_name: str,
+        confidence: float,
+        was_verified: bool,
+        cache_hit_type: Optional[CacheHitType] = None,
+        similarity_score: float = 0.0,
+        **kwargs
+    ):
+        """
+        Schedule a fire-and-forget database recording task.
+
+        This does NOT block the cache lookup - recordings happen in background.
+        Failed recordings are logged but don't affect cache performance.
+        """
+        if not self._voice_sample_recorder:
+            return
+
+        # Create background task
+        task = asyncio.create_task(
+            self._record_to_database_async(
+                speaker_name=speaker_name,
+                confidence=confidence,
+                was_verified=was_verified,
+                cache_hit_type=cache_hit_type,
+                similarity_score=similarity_score,
+                **kwargs
+            )
+        )
+
+        # Track task for cleanup
+        self._recording_tasks.append(task)
+
+        # Cleanup completed tasks periodically
+        self._recording_tasks = [t for t in self._recording_tasks if not t.done()]
+
     async def lookup_voice_authentication(
         self,
         voice_embedding: Optional[np.ndarray] = None,
@@ -194,6 +371,9 @@ class VoiceBiometricCache:
         1. Voice embedding matches cached embedding with high similarity
         2. Session is still valid (within TTL window)
         3. Speaker is verified owner
+
+        IMPORTANT: All lookups (hits AND misses) are recorded to the database
+        for continuous voice learning. This happens in background (fire-and-forget).
 
         Args:
             voice_embedding: Current voice embedding to match
@@ -231,6 +411,16 @@ class VoiceBiometricCache:
                             self._stats["cache_hits"] += 1
                             self._stats["session_auth_hits"] += 1
                             self._update_timing_stats(start_time)
+
+                            # 🎯 CONTINUOUS LEARNING: Record cache hit to database
+                            self._schedule_db_recording(
+                                speaker_name=result.speaker_name,
+                                confidence=result.verification_confidence,
+                                was_verified=True,
+                                cache_hit_type=CacheHitType.SESSION_AUTH,
+                                similarity_score=similarity,
+                            )
+
                             return result
 
             # Strategy 2: Voice embedding similarity search
@@ -270,11 +460,32 @@ class VoiceBiometricCache:
                     self._stats["cache_hits"] += 1
                     self._stats["voice_embedding_hits"] += 1
                     self._update_timing_stats(start_time)
+
+                    # 🎯 CONTINUOUS LEARNING: Record cache hit to database
+                    self._schedule_db_recording(
+                        speaker_name=result.speaker_name,
+                        confidence=result.verification_confidence,
+                        was_verified=True,
+                        cache_hit_type=CacheHitType.VOICE_EMBEDDING,
+                        similarity_score=best_similarity,
+                    )
+
                     return result
 
-            # Cache miss
+            # Cache miss - still record for learning (unknown speaker or no match)
             self._stats["cache_misses"] += 1
             self._update_timing_stats(start_time)
+
+            # 🎯 CONTINUOUS LEARNING: Record cache miss to database
+            # This helps JARVIS learn about failed attempts too
+            self._schedule_db_recording(
+                speaker_name="unknown",  # Will be identified by full verification
+                confidence=0.0,
+                was_verified=False,
+                cache_hit_type=CacheHitType.MISS,
+                similarity_score=0.0,
+            )
+
             return result
 
     async def cache_authentication(
@@ -482,9 +693,16 @@ class VoiceBiometricCache:
             )
 
     def get_stats(self) -> Dict[str, Any]:
-        """Get cache statistics"""
+        """Get cache statistics including database recording stats"""
         total = self._stats["cache_hits"] + self._stats["cache_misses"]
         hit_rate = self._stats["cache_hits"] / total if total > 0 else 0.0
+
+        # Calculate DB recording success rate
+        db_total = self._stats["db_recordings_attempted"]
+        db_success_rate = (
+            self._stats["db_recordings_successful"] / db_total
+            if db_total > 0 else 0.0
+        )
 
         return {
             "total_lookups": self._stats["total_lookups"],
@@ -501,6 +719,14 @@ class VoiceBiometricCache:
             "session_cache_entries": len(self._session_cache),
             "active_session": self._active_session_id is not None,
             "active_speaker": self._active_speaker,
+            # Database recording stats for continuous learning
+            "db_recording_enabled": self._voice_sample_recorder is not None,
+            "db_recordings_attempted": self._stats["db_recordings_attempted"],
+            "db_recordings_successful": self._stats["db_recordings_successful"],
+            "db_recordings_failed": self._stats["db_recordings_failed"],
+            "db_recording_success_rate": db_success_rate,
+            "cache_hits_recorded_to_db": self._stats["cache_hits_recorded_to_db"],
+            "pending_recording_tasks": len([t for t in self._recording_tasks if not t.done()]),
         }
 
     def get_active_session(self) -> Optional[Dict[str, Any]]:
