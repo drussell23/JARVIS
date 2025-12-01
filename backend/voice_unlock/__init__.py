@@ -42,8 +42,14 @@ async def get_intelligent_unlock_service():
 
     This is the main service for voice-authenticated screen unlocking.
     Lazy-loaded to prevent blocking on import.
+
+    FAST-PATH: Returns immediately if service is already initialized (no re-init).
     """
     global _intelligent_unlock_service
+
+    # FAST-PATH: Return immediately if already initialized
+    if _intelligent_unlock_service is not None and _intelligent_unlock_service.initialized:
+        return _intelligent_unlock_service
 
     if _intelligent_unlock_service is None:
         try:
@@ -51,6 +57,13 @@ async def get_intelligent_unlock_service():
                 get_intelligent_unlock_service as _get_service
             )
             _intelligent_unlock_service = _get_service()
+        except Exception as e:
+            logger.error(f"Failed to create IntelligentVoiceUnlockService: {e}")
+            raise
+
+    # Only initialize if not already initialized
+    if not _intelligent_unlock_service.initialized:
+        try:
             await _intelligent_unlock_service.initialize()
             logger.info("✅ IntelligentVoiceUnlockService initialized")
         except Exception as e:

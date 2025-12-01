@@ -144,18 +144,20 @@ class IntelligentVoiceUnlockService:
         """
         Initialize all components - PARALLELIZED for speed with timeout protection.
 
-        Timeout Configuration:
-        - Individual component timeout: 10s (prevents single component from blocking)
-        - Total initialization timeout: 30s (prevents overall hang)
+        OPTIMIZED v2.1 - Faster initialization:
+        - Reduced component timeout from 10s to 5s
+        - Reduced total timeout from 30s to 15s
+        - All phases run in single parallel block for maximum speed
+        - Graceful degradation continues even if components timeout
         """
         if self.initialized:
             return
 
-        # Timeout constants
-        COMPONENT_TIMEOUT = 10.0  # Max time for individual component init
-        TOTAL_INIT_TIMEOUT = 30.0  # Max time for entire initialization
+        # OPTIMIZED: Shorter timeouts for faster startup
+        COMPONENT_TIMEOUT = 5.0   # Reduced from 10s - fast-fail for slow components
+        TOTAL_INIT_TIMEOUT = 15.0  # Reduced from 30s - startup must be quick
 
-        logger.info("🚀 Initializing Intelligent Voice Unlock Service (parallel with timeout protection)...")
+        logger.info("🚀 Initializing Intelligent Voice Unlock Service (v2.1 optimized parallel)...")
         init_start = datetime.now()
 
         async def _init_with_timeout(coro, name: str, timeout: float = COMPONENT_TIMEOUT):
@@ -201,30 +203,22 @@ class IntelligentVoiceUnlockService:
                 logger.info("🚀 Voice biometric semantic cache initialized (cache-only mode)")
 
         async def _run_initialization():
-            """Run all initialization phases."""
-            # PHASE 1: Initialize core services in parallel with individual timeouts
-            # INCLUDES keychain preload for instant first unlock
-            # INCLUDES voice biometric cache for instant repeat unlocks
+            """Run all initialization phases - ALL IN PARALLEL for maximum speed."""
+            # OPTIMIZED v2.1: Run ALL components in single parallel block
+            # This eliminates sequential phase delays (was 3 phases = 3x latency)
             await asyncio.gather(
+                # Core services (Phase 1)
                 _init_with_timeout(self._initialize_stt(), "Hybrid STT Router"),
                 _init_with_timeout(self._initialize_speaker_recognition(), "Speaker Recognition"),
                 _init_with_timeout(self._initialize_learning_db(), "Learning Database"),
-                _init_with_timeout(_preload_keychain_cache(), "Keychain Cache"),  # Preload password
-                _init_with_timeout(_init_voice_biometric_cache(), "Voice Biometric Cache"),  # Instant repeat unlocks
-            )
-
-            # PHASE 2: Initialize intelligence layers in parallel
-            await asyncio.gather(
+                _init_with_timeout(_preload_keychain_cache(), "Keychain Cache"),
+                _init_with_timeout(_init_voice_biometric_cache(), "Voice Biometric Cache"),
+                # Intelligence layers (Phase 2) - now parallel with Phase 1
                 _init_with_timeout(self._initialize_cai(), "Context-Aware Intelligence"),
                 _init_with_timeout(self._initialize_sai(), "Scenario-Aware Intelligence"),
                 _init_with_timeout(self._initialize_ml_engine(), "ML Learning Engine"),
-            )
-
-            # PHASE 3: Load owner profile with timeout
-            await _init_with_timeout(
-                self._load_owner_profile(),
-                "Owner Profile",
-                timeout=5.0  # Shorter timeout for profile loading
+                # Owner profile (Phase 3) - now parallel with Phase 1 & 2
+                _init_with_timeout(self._load_owner_profile(), "Owner Profile", timeout=3.0),
             )
 
         try:
