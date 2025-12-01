@@ -124,6 +124,9 @@ class IntelligentVoiceUnlockService:
         # 🤖 CONTINUOUS LEARNING: ML engine for voice biometrics and password typing
         self.ml_engine = None
 
+        # 🚀 SEMANTIC CACHE: Instant unlock for repeated requests
+        self.voice_biometric_cache = None
+
         # Statistics
         self.stats = {
             "total_unlock_attempts": 0,
@@ -174,15 +177,23 @@ class IntelligentVoiceUnlockService:
             else:
                 logger.warning("⚠️ Keychain password preload failed - first unlock will be slower")
 
+        async def _init_voice_biometric_cache():
+            """Initialize voice biometric semantic cache for instant repeat unlocks."""
+            from voice_unlock.voice_biometric_cache import get_voice_biometric_cache
+            self.voice_biometric_cache = get_voice_biometric_cache()
+            logger.info("🚀 Voice biometric semantic cache initialized")
+
         async def _run_initialization():
             """Run all initialization phases."""
             # PHASE 1: Initialize core services in parallel with individual timeouts
             # INCLUDES keychain preload for instant first unlock
+            # INCLUDES voice biometric cache for instant repeat unlocks
             await asyncio.gather(
                 _init_with_timeout(self._initialize_stt(), "Hybrid STT Router"),
                 _init_with_timeout(self._initialize_speaker_recognition(), "Speaker Recognition"),
                 _init_with_timeout(self._initialize_learning_db(), "Learning Database"),
                 _init_with_timeout(_preload_keychain_cache(), "Keychain Cache"),  # Preload password
+                _init_with_timeout(_init_voice_biometric_cache(), "Voice Biometric Cache"),  # Instant repeat unlocks
             )
 
             # PHASE 2: Initialize intelligence layers in parallel
@@ -369,6 +380,8 @@ class IntelligentVoiceUnlockService:
         Process voice unlock command with full intelligence stack.
 
         Features:
+        - SEMANTIC CACHING: Instant unlock for repeated requests within session
+        - GLOBAL TIMEOUT: Prevents infinite hangs (25s max)
         - Retry logic with exponential backoff
         - Circuit breaker pattern for fault tolerance
         - Comprehensive diagnostics tracking
@@ -402,6 +415,107 @@ class IntelligentVoiceUnlockService:
         from voice_unlock.unlock_metrics_logger import get_metrics_logger, StageMetrics
         metrics_logger = get_metrics_logger()
         stages: List[StageMetrics] = []
+
+        # =============================================================================
+        # 🚀 FAST PATH: Check voice biometric cache for instant repeat unlocks
+        # =============================================================================
+        if self.voice_biometric_cache:
+            try:
+                from voice_unlock.voice_biometric_cache import CacheHitType
+
+                # Extract voice embedding for cache lookup (if we have speaker engine)
+                voice_embedding = None
+                if self.speaker_engine and hasattr(self.speaker_engine, 'extract_embedding'):
+                    try:
+                        voice_embedding = await asyncio.wait_for(
+                            self.speaker_engine.extract_embedding(audio_data),
+                            timeout=2.0  # Quick timeout for cache lookup
+                        )
+                    except (asyncio.TimeoutError, Exception):
+                        pass  # Cache lookup is optional - continue without embedding
+
+                cache_result = await self.voice_biometric_cache.lookup_voice_authentication(
+                    voice_embedding=voice_embedding
+                )
+
+                if cache_result.hit_type != CacheHitType.MISS and cache_result.is_owner:
+                    # CACHE HIT: Fast path unlock!
+                    cache_latency = (datetime.now() - start_time).total_seconds() * 1000
+                    logger.info(
+                        f"🚀 CACHE HIT ({cache_result.hit_type.value}): "
+                        f"Instant unlock for {cache_result.speaker_name} in {cache_latency:.0f}ms "
+                        f"(similarity: {cache_result.similarity_score:.2%}, "
+                        f"session age: {cache_result.cache_age_seconds:.0f}s)"
+                    )
+
+                    # Still need to perform the actual unlock
+                    unlock_result = await asyncio.wait_for(
+                        self._perform_unlock(
+                            cache_result.speaker_name, {}, {}, attempt_id=None
+                        ),
+                        timeout=PERFORM_UNLOCK_TIMEOUT
+                    )
+
+                    # Terminate caffeinate
+                    try:
+                        caffeinate_process.terminate()
+                    except:
+                        pass
+
+                    return {
+                        "success": unlock_result["success"],
+                        "speaker_name": cache_result.speaker_name,
+                        "transcribed_text": "unlock my screen",  # Cached command
+                        "stt_confidence": 1.0,  # Cached
+                        "speaker_confidence": cache_result.verification_confidence,
+                        "verification_confidence": cache_result.verification_confidence,
+                        "is_owner": True,
+                        "message": f"Instant unlock (cached session: {cache_result.hit_type.value})",
+                        "latency_ms": cache_latency,
+                        "cache_hit": True,
+                        "cache_hit_type": cache_result.hit_type.value,
+                        "cache_similarity": cache_result.similarity_score,
+                        "timestamp": datetime.now().isoformat(),
+                    }
+            except Exception as e:
+                logger.debug(f"Cache lookup failed (continuing with full verification): {e}")
+
+        # =============================================================================
+        # FULL VERIFICATION PATH (with global timeout protection)
+        # =============================================================================
+        try:
+            return await asyncio.wait_for(
+                self._process_voice_unlock_internal(
+                    audio_data, context, diagnostics, metrics_logger, stages, start_time, caffeinate_process
+                ),
+                timeout=TOTAL_UNLOCK_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            logger.error(f"⏱️ TOTAL UNLOCK TIMEOUT: Processing exceeded {TOTAL_UNLOCK_TIMEOUT}s")
+            try:
+                caffeinate_process.terminate()
+            except:
+                pass
+            return await self._create_failure_response(
+                "total_timeout",
+                f"Unlock processing exceeded {TOTAL_UNLOCK_TIMEOUT}s timeout. Please try again.",
+                diagnostics=diagnostics.__dict__
+            )
+
+    async def _process_voice_unlock_internal(
+        self,
+        audio_data,
+        context: Optional[Dict[str, Any]],
+        diagnostics: UnlockDiagnostics,
+        metrics_logger,
+        stages: list,
+        start_time: datetime,
+        caffeinate_process
+    ) -> Dict[str, Any]:
+        """
+        Internal processing with all stages - wrapped by global timeout.
+        """
+        from voice_unlock.unlock_metrics_logger import StageMetrics
 
         logger.info("🎤 Processing voice unlock command...")
 
@@ -603,7 +717,14 @@ class IntelligentVoiceUnlockService:
             speaker_name=speaker_identified
         )
 
-        is_owner = await self._verify_owner(speaker_identified)
+        try:
+            is_owner = await asyncio.wait_for(
+                self._verify_owner(speaker_identified),
+                timeout=OWNER_CHECK_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            logger.error(f"⏱️ Owner verification timed out after {OWNER_CHECK_TIMEOUT}s")
+            is_owner = False  # Fail-safe: treat as not owner on timeout
 
         stage_owner_check.complete(
             success=is_owner,
@@ -616,33 +737,53 @@ class IntelligentVoiceUnlockService:
             self.stats["rejected_attempts"] += 1
             logger.warning(f"🚫 Non-owner '{speaker_identified}' attempted unlock - REJECTED")
 
-            # Analyze security event with SAI
-            security_analysis = await self._analyze_security_event(
-                speaker_name=speaker_identified,
-                transcribed_text=transcribed_text,
-                context=context,
-                speaker_confidence=speaker_confidence,
-            )
+            # Analyze security event with SAI (with timeout)
+            try:
+                security_analysis = await asyncio.wait_for(
+                    self._analyze_security_event(
+                        speaker_name=speaker_identified,
+                        transcribed_text=transcribed_text,
+                        context=context,
+                        speaker_confidence=speaker_confidence,
+                    ),
+                    timeout=SECURITY_ANALYSIS_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                logger.warning(f"⏱️ Security analysis timed out, using default")
+                security_analysis = {"level": "warning", "reason": "timeout"}
 
-            # Record rejection to database with full analysis
-            await self._record_unlock_attempt(
-                speaker_name=speaker_identified,
-                transcribed_text=transcribed_text,
-                success=False,
-                rejection_reason="not_owner",
-                audio_data=audio_data,
-                stt_confidence=stt_confidence,
-                speaker_confidence=speaker_confidence,
-                security_analysis=security_analysis,
-            )
+            # Record rejection to database with full analysis (with timeout)
+            try:
+                await asyncio.wait_for(
+                    self._record_unlock_attempt(
+                        speaker_name=speaker_identified,
+                        transcribed_text=transcribed_text,
+                        success=False,
+                        rejection_reason="not_owner",
+                        audio_data=audio_data,
+                        stt_confidence=stt_confidence,
+                        speaker_confidence=speaker_confidence,
+                        security_analysis=security_analysis,
+                    ),
+                    timeout=RECORD_ATTEMPT_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                logger.warning("⏱️ Recording unlock attempt timed out (non-critical)")
 
-            # Generate intelligent, dynamic security response
-            security_message = await self._generate_security_response(
-                speaker_name=speaker_identified,
-                reason="not_owner",
-                analysis=security_analysis,
-                context=context,
-            )
+            # Generate intelligent, dynamic security response (with timeout)
+            try:
+                security_message = await asyncio.wait_for(
+                    self._generate_security_response(
+                        speaker_name=speaker_identified,
+                        reason="not_owner",
+                        analysis=security_analysis,
+                        context=context,
+                    ),
+                    timeout=SECURITY_RESPONSE_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                logger.warning("⏱️ Security response generation timed out")
+                security_message = "Access denied. You are not authorized to unlock this device."
 
             return await self._create_failure_response(
                 "not_owner",
@@ -657,6 +798,18 @@ class IntelligentVoiceUnlockService:
             speaker_name=speaker_identified,
             audio_size=diagnostics.audio_size_bytes
         )
+
+        # 🔑 CAPTURE VOICE EMBEDDING for semantic cache storage later
+        voice_embedding_for_cache = None
+        if self.speaker_engine and hasattr(self.speaker_engine, 'extract_embedding'):
+            try:
+                voice_embedding_for_cache = await asyncio.wait_for(
+                    self.speaker_engine.extract_embedding(audio_data),
+                    timeout=2.0  # Quick extraction timeout
+                )
+                logger.debug(f"🔐 Voice embedding extracted for cache: shape={voice_embedding_for_cache.shape if hasattr(voice_embedding_for_cache, 'shape') else 'N/A'}")
+            except Exception as e:
+                logger.debug(f"Voice embedding extraction failed (non-critical): {e}")
 
         try:
             verification_passed, verification_confidence = await asyncio.wait_for(
@@ -706,13 +859,25 @@ class IntelligentVoiceUnlockService:
         if not verification_passed:
             self.stats["failed_authentications"] += 1
 
-            # 🔍 DETAILED DIAGNOSTICS: Analyze why verification failed
-            failure_diagnostics = await self._analyze_verification_failure(
-                audio_data=audio_data,
-                speaker_name=speaker_identified,
-                confidence=verification_confidence,
-                transcription=transcribed_text
-            )
+            # 🔍 DETAILED DIAGNOSTICS: Analyze why verification failed (with timeout)
+            try:
+                failure_diagnostics = await asyncio.wait_for(
+                    self._analyze_verification_failure(
+                        audio_data=audio_data,
+                        speaker_name=speaker_identified,
+                        confidence=verification_confidence,
+                        transcription=transcribed_text
+                    ),
+                    timeout=FAILURE_ANALYSIS_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                logger.warning("⏱️ Verification failure analysis timed out")
+                failure_diagnostics = {
+                    "threshold": 0.35,
+                    "audio_quality": "unknown",
+                    "primary_reason": "analysis_timeout",
+                    "user_message": "Please try again."
+                }
 
             logger.error(
                 f"🚫 Voice verification FAILED for owner '{speaker_identified}'\n"
@@ -727,16 +892,22 @@ class IntelligentVoiceUnlockService:
                 f"   └─ Architecture issue: {failure_diagnostics.get('architecture_issue', 'none detected')}"
             )
 
-            # Record failed authentication with diagnostics
-            await self._record_unlock_attempt(
-                speaker_name=speaker_identified,
-                transcribed_text=transcribed_text,
-                success=False,
-                rejection_reason="verification_failed",
-                audio_data=audio_data,
-                stt_confidence=stt_confidence,
-                speaker_confidence=verification_confidence,
-            )
+            # Record failed authentication with diagnostics (with timeout)
+            try:
+                await asyncio.wait_for(
+                    self._record_unlock_attempt(
+                        speaker_name=speaker_identified,
+                        transcribed_text=transcribed_text,
+                        success=False,
+                        rejection_reason="verification_failed",
+                        audio_data=audio_data,
+                        stt_confidence=stt_confidence,
+                        speaker_confidence=verification_confidence,
+                    ),
+                    timeout=RECORD_ATTEMPT_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                logger.warning("⏱️ Recording failed authentication timed out (non-critical)")
 
             # Track in monitoring system
             try:
@@ -809,28 +980,48 @@ class IntelligentVoiceUnlockService:
         stages.append(stage_scenario)
 
         # 🤖 ML LEARNING: Record unlock attempt BEFORE performing unlock to get attempt_id
-        # This allows password typing metrics to be linked to the unlock attempt
-        attempt_id = await self._record_unlock_attempt(
-            speaker_name=speaker_identified,
-            transcribed_text=transcribed_text,
-            success=True,  # Will be updated after unlock completes
-            rejection_reason=None,
-            audio_data=audio_data,
-            stt_confidence=stt_confidence,
-            speaker_confidence=verification_confidence,
-            context_data=context_analysis,
-            scenario_data=scenario_analysis,
-        )
+        # This allows password typing metrics to be linked to the unlock attempt (with timeout)
+        try:
+            attempt_id = await asyncio.wait_for(
+                self._record_unlock_attempt(
+                    speaker_name=speaker_identified,
+                    transcribed_text=transcribed_text,
+                    success=True,  # Will be updated after unlock completes
+                    rejection_reason=None,
+                    audio_data=audio_data,
+                    stt_confidence=stt_confidence,
+                    speaker_confidence=verification_confidence,
+                    context_data=context_analysis,
+                    scenario_data=scenario_analysis,
+                ),
+                timeout=RECORD_ATTEMPT_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            logger.warning("⏱️ Recording unlock attempt timed out, proceeding without ML tracking")
+            attempt_id = None
 
-        # Stage 9: Screen Unlock Execution
+        # Stage 9: Screen Unlock Execution (critical - with timeout)
         stage_unlock = metrics_logger.create_stage(
             "unlock_execution",
             speaker=speaker_identified
         )
 
-        unlock_result = await self._perform_unlock(
-            speaker_identified, context_analysis, scenario_analysis, attempt_id=attempt_id
-        )
+        try:
+            unlock_result = await asyncio.wait_for(
+                self._perform_unlock(
+                    speaker_identified, context_analysis, scenario_analysis, attempt_id=attempt_id
+                ),
+                timeout=PERFORM_UNLOCK_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            logger.error(f"⏱️ Screen unlock timed out after {PERFORM_UNLOCK_TIMEOUT}s")
+            stage_unlock.complete(success=False, error_message="Unlock timeout")
+            stages.append(stage_unlock)
+            return await self._create_failure_response(
+                "unlock_timeout",
+                "Screen unlock operation timed out. Please try again.",
+                diagnostics=diagnostics.__dict__
+            )
 
         stage_unlock.complete(
             success=unlock_result["success"],
@@ -911,6 +1102,28 @@ class IntelligentVoiceUnlockService:
                     await self._update_speaker_profile(
                         speaker_identified, audio_data, transcribed_text, success=True
                     )
+
+                    # 🚀 CACHE SUCCESSFUL AUTHENTICATION for instant repeat unlocks
+                    if self.voice_biometric_cache:
+                        try:
+                            session_id = await asyncio.wait_for(
+                                self.voice_biometric_cache.cache_authentication(
+                                    speaker_name=speaker_identified,
+                                    voice_embedding=voice_embedding_for_cache,  # Captured during verification
+                                    verification_confidence=verification_confidence,
+                                    is_owner=True,
+                                    transcribed_text=transcribed_text,
+                                ),
+                                timeout=1.0  # Quick cache store timeout
+                            )
+                            logger.info(
+                                f"🔐 Voice auth cached: session={session_id[:8]}... "
+                                f"(next unlock will be instant!)"
+                            )
+                        except asyncio.TimeoutError:
+                            logger.debug("Voice auth cache storage timed out (non-critical)")
+                        except Exception as e:
+                            logger.debug(f"Voice auth cache storage failed (non-critical): {e}")
 
                 # Log advanced metrics to JSON file
                 import platform
