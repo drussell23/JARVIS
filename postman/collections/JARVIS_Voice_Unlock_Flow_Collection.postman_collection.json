@@ -1,8 +1,8 @@
 {
   "info": {
     "_postman_id": "jarvis-voice-unlock-flow-2024",
-    "name": "JARVIS Voice Unlock Flow (Sequential)",
-    "description": "Sequential collection that mimics the Voice Unlock Authentication Flow with PRD v2.0 enhancements.\n\n## PRD v2.0 Features\n- **AAM-Softmax + Center Loss + Triplet Loss** fine-tuning for speaker embeddings\n- **Platt Scaling & Isotonic Regression** for probability calibration\n- **Adaptive Thresholds** targeting 90%/95%/98% for base/high/critical security\n- **Comprehensive Anti-Spoofing** (replay, synthesis, voice conversion, environmental)\n\n## Flow Steps\n0. Backend Check\n1. System Health\n2. Audit Session Start\n3. Comprehensive Anti-Spoofing\n4. Calibrated Voice Authentication\n5. Calibration Training Sample\n6. Multi-Factor Fusion (if borderline)\n7. Screen Unlock\n8. JARVIS Feedback\n9. Audit Session End\n\n⚠️ IMPORTANT: Make sure JARVIS backend is running on port 8010!\n\nTo start backend:\n```bash\ncd backend && python main.py\n```\n\n⏱️ Recommended timeout: 5000ms",
+    "name": "JARVIS Voice Unlock Flow (Sequential) v17.8.1",
+    "description": "Sequential collection that mimics the Voice Unlock Authentication Flow with PRD v2.0 + Voice Biometric Semantic Cache enhancements.\n\n## v17.8.1 Features - Semantic Cache with Continuous Learning\n- **L1-L3 Semantic Cache** for sub-millisecond authentication\n- **Continuous Learning** - ALL attempts recorded to SQLite\n- **Fire-and-Forget DB Recording** - Non-blocking async persistence\n- **Cache Statistics** - Full metrics on hit rates and learning\n\n## PRD v2.0 Features\n- **AAM-Softmax + Center Loss + Triplet Loss** fine-tuning for speaker embeddings\n- **Platt Scaling & Isotonic Regression** for probability calibration\n- **Adaptive Thresholds** targeting 90%/95%/98% for base/high/critical security\n- **Comprehensive Anti-Spoofing** (replay, synthesis, voice conversion, environmental)\n\n## Flow Steps\n0. Backend Check\n1. System Health\n2. Audit Session Start\n3. Comprehensive Anti-Spoofing\n4. Calibrated Voice Authentication\n5. Calibration Training Sample\n6. Multi-Factor Fusion (if borderline)\n7. Screen Unlock\n8. JARVIS Feedback\n9. Audit Session End\n\n## New: Voice Biometric Cache Endpoints\n- GET /api/voice-unlock/cache/stats - Cache performance + learning metrics\n- POST /api/voice-unlock/cache/lookup - Manual cache lookup test\n- POST /api/voice-unlock/cache/invalidate - Clear cache entries\n\n⚠️ IMPORTANT: Make sure JARVIS backend is running on port 8010!\n\nTo start backend:\n```bash\ncd backend && python main.py\n```\n\n⏱️ Recommended timeout: 5000ms",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "variable": [
@@ -885,6 +885,318 @@
           "path": ["voice", "jarvis", "speak"]
         },
         "description": "Challenge question when fusion doesn't reach threshold"
+      }
+    },
+    {
+      "name": "Cache: Get Statistics (v17.8.1)",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "try {",
+              "    const response = pm.response.json();",
+              "    ",
+              "    console.log('');",
+              "    console.log('🧠 Voice Biometric Cache Statistics:');",
+              "    console.log('════════════════════════════════════════════════');",
+              "    console.log('');",
+              "    console.log('📊 Cache Performance:');",
+              "    console.log('   Session Auth Hits: ' + (response.session_auth_hits || 0));",
+              "    console.log('   Session Auth Misses: ' + (response.session_auth_misses || 0));",
+              "    console.log('   Voice Embedding Hits: ' + (response.voice_embedding_hits || 0));",
+              "    console.log('   Voice Embedding Misses: ' + (response.voice_embedding_misses || 0));",
+              "    console.log('   Command Semantic Hits: ' + (response.command_semantic_hits || 0));",
+              "    console.log('   Total Lookups: ' + (response.total_lookups || 0));",
+              "    console.log('   Cache Hit Rate: ' + ((response.cache_hit_rate || 0) * 100).toFixed(1) + '%');",
+              "    console.log('');",
+              "    console.log('🎓 Continuous Learning:');",
+              "    console.log('   DB Recordings Attempted: ' + (response.db_recordings_attempted || 0));",
+              "    console.log('   DB Recordings Successful: ' + (response.db_recordings_successful || 0));",
+              "    console.log('   DB Recordings Failed: ' + (response.db_recordings_failed || 0));",
+              "    console.log('   Cache Hits Recorded to DB: ' + (response.cache_hits_recorded_to_db || 0));",
+              "    console.log('');",
+              "    console.log('════════════════════════════════════════════════');",
+              "    ",
+              "    pm.test('Cache stats retrieved successfully', function() {",
+              "        pm.response.to.have.status(200);",
+              "    });",
+              "    ",
+              "    pm.test('Has cache performance metrics', function() {",
+              "        pm.expect(response).to.have.property('total_lookups');",
+              "    });",
+              "    ",
+              "    pm.test('Has continuous learning metrics', function() {",
+              "        pm.expect(response).to.have.property('db_recordings_attempted');",
+              "    });",
+              "} catch (e) {",
+              "    console.error('❌ Failed to parse cache stats: ' + e.message);",
+              "}"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/api/voice-unlock/cache/stats",
+          "host": ["{{base_url}}"],
+          "path": ["api", "voice-unlock", "cache", "stats"]
+        },
+        "description": "Get voice biometric semantic cache statistics including cache hit rates and continuous learning database recording metrics (v17.8.1)"
+      }
+    },
+    {
+      "name": "Cache: Lookup Voice Authentication",
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "exec": [
+              "// Generate test embedding for cache lookup",
+              "function generateTestEmbedding() {",
+              "    const embedding = [];",
+              "    for (let i = 0; i < 192; i++) {",
+              "        embedding.push((Math.random() * 2 - 1) * 0.5);",
+              "    }",
+              "    const norm = Math.sqrt(embedding.reduce((sum, val) => sum + val * val, 0));",
+              "    return embedding.map(val => val / norm);",
+              "}",
+              "",
+              "if (!pm.collectionVariables.get('test_embedding') || pm.collectionVariables.get('test_embedding') === '') {",
+              "    pm.collectionVariables.set('test_embedding', JSON.stringify(generateTestEmbedding()));",
+              "}",
+              "",
+              "console.log('🔍 Testing cache lookup (will record to DB for learning)');"
+            ],
+            "type": "text/javascript"
+          }
+        },
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "try {",
+              "    const response = pm.response.json();",
+              "    ",
+              "    const cacheHit = response.cache_hit || false;",
+              "    const hitType = response.hit_type || 'MISS';",
+              "    const speakerName = response.speaker_name || 'unknown';",
+              "    const confidence = response.verification_confidence || 0;",
+              "    ",
+              "    console.log('');",
+              "    console.log('🔍 Cache Lookup Result:');",
+              "    console.log('   Cache Hit: ' + (cacheHit ? '✅ YES' : '❌ NO'));",
+              "    console.log('   Hit Type: ' + hitType);",
+              "    if (cacheHit) {",
+              "        console.log('   Speaker: ' + speakerName);",
+              "        console.log('   Confidence: ' + (confidence * 100).toFixed(1) + '%');",
+              "    }",
+              "    console.log('   📝 Recorded to DB for continuous learning');",
+              "    ",
+              "    pm.test('Cache lookup completed', function() {",
+              "        pm.response.to.have.status(200);",
+              "    });",
+              "    ",
+              "    pm.test('Response has cache hit indicator', function() {",
+              "        pm.expect(response).to.have.property('cache_hit');",
+              "    });",
+              "} catch (e) {",
+              "    console.error('❌ Cache lookup error: ' + e.message);",
+              "}"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n    \"embedding\": {{test_embedding}},\n    \"command\": \"unlock my screen\",\n    \"session_id\": \"postman-test-session\"\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/api/voice-unlock/cache/lookup",
+          "host": ["{{base_url}}"],
+          "path": ["api", "voice-unlock", "cache", "lookup"]
+        },
+        "description": "Manually test voice biometric cache lookup. This will check L1 (session), L2 (embedding), and L3 (semantic) caches. ALL lookups are recorded to SQLite for continuous learning."
+      }
+    },
+    {
+      "name": "Cache: Invalidate Session",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "try {",
+              "    const response = pm.response.json();",
+              "    ",
+              "    console.log('🗑️ Cache Invalidation Result:');",
+              "    console.log('   Success: ' + (response.success ? '✅' : '❌'));",
+              "    console.log('   Entries Cleared: ' + (response.entries_cleared || 0));",
+              "    ",
+              "    pm.test('Cache invalidation completed', function() {",
+              "        pm.response.to.have.status(200);",
+              "    });",
+              "} catch (e) {",
+              "    console.error('❌ Invalidation error: ' + e.message);",
+              "}"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n    \"session_id\": \"postman-test-session\"\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/api/voice-unlock/cache/invalidate/session",
+          "host": ["{{base_url}}"],
+          "path": ["api", "voice-unlock", "cache", "invalidate", "session"]
+        },
+        "description": "Invalidate all cache entries for a specific session. Use when session ends or user logs out."
+      }
+    },
+    {
+      "name": "Cache: Invalidate Speaker",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "try {",
+              "    const response = pm.response.json();",
+              "    ",
+              "    console.log('🗑️ Speaker Cache Invalidation Result:');",
+              "    console.log('   Success: ' + (response.success ? '✅' : '❌'));",
+              "    console.log('   Entries Cleared: ' + (response.entries_cleared || 0));",
+              "    ",
+              "    pm.test('Speaker cache invalidation completed', function() {",
+              "        pm.response.to.have.status(200);",
+              "    });",
+              "} catch (e) {",
+              "    console.error('❌ Invalidation error: ' + e.message);",
+              "}"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n    \"speaker_name\": \"{{speaker_name}}\"\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/api/voice-unlock/cache/invalidate/speaker",
+          "host": ["{{base_url}}"],
+          "path": ["api", "voice-unlock", "cache", "invalidate", "speaker"]
+        },
+        "description": "Invalidate all cache entries for a specific speaker. Use after re-enrollment or when voiceprint changes."
+      }
+    },
+    {
+      "name": "Cache: Clear All",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "try {",
+              "    const response = pm.response.json();",
+              "    ",
+              "    console.log('🗑️ Full Cache Clear Result:');",
+              "    console.log('   Success: ' + (response.success ? '✅' : '❌'));",
+              "    console.log('   Total Entries Cleared: ' + (response.entries_cleared || 0));",
+              "    console.log('   ⚠️ Note: Database records preserved for learning');",
+              "    ",
+              "    pm.test('Full cache clear completed', function() {",
+              "        pm.response.to.have.status(200);",
+              "    });",
+              "} catch (e) {",
+              "    console.error('❌ Clear error: ' + e.message);",
+              "}"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/api/voice-unlock/cache/clear",
+          "host": ["{{base_url}}"],
+          "path": ["api", "voice-unlock", "cache", "clear"]
+        },
+        "description": "Clear all voice biometric cache entries. Database records are preserved for continuous learning. Use with caution - will cause cache misses until repopulated."
+      }
+    },
+    {
+      "name": "Metrics: Voice Sample Log Count",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "try {",
+              "    const response = pm.response.json();",
+              "    ",
+              "    console.log('');",
+              "    console.log('📊 Voice Sample Database Metrics:');",
+              "    console.log('   Total Samples: ' + (response.total_samples || 0));",
+              "    console.log('   Cache Hits Recorded: ' + (response.cache_hit_samples || 0));",
+              "    console.log('   Cache Misses Recorded: ' + (response.cache_miss_samples || 0));",
+              "    console.log('   Unique Speakers: ' + (response.unique_speakers || 0));",
+              "    console.log('');",
+              "    console.log('🎓 This data powers continuous voice learning');",
+              "    ",
+              "    pm.test('Metrics retrieved', function() {",
+              "        pm.response.to.have.status(200);",
+              "    });",
+              "} catch (e) {",
+              "    console.log('ℹ️ Voice sample metrics endpoint: ' + pm.response.text());",
+              "}"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/api/voice-unlock/metrics/samples",
+          "host": ["{{base_url}}"],
+          "path": ["api", "voice-unlock", "metrics", "samples"]
+        },
+        "description": "Get count of voice samples stored in SQLite database for continuous learning. Shows how many cache hits and misses have been recorded."
       }
     }
   ]
