@@ -1,0 +1,71 @@
+{
+  "workflow_name": "PR Automation & Validation",
+  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/19853175068",
+  "branch": "dependabot/github_actions/actions-f12b4159d3",
+  "commit_sha": "e23dbab",
+  "run_number": 685,
+  "failed_count": 1,
+  "fix_branch": "fix/ci/pr-automation-validation-run685-20251202-091302",
+  "pr_title": "\ud83d\udea8 Fix CI/CD: PR Automation & Validation (Run #685)",
+  "analyses": [
+    {
+      "error_patterns": [
+        {
+          "pattern": "ERROR|Error|error",
+          "matches": [
+            {
+              "line_number": 85,
+              "content": "2025-12-02T09:11:15.2141756Z ##[error]HttpError: Bad credentials",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 86,
+              "content": "2025-12-02T09:11:15.2149635Z ##[error]Bad credentials",
+              "severity": "high",
+              "emoji": "\u274c"
+            }
+          ],
+          "count": 2
+        },
+        {
+          "pattern": "FAIL|Failed|failed",
+          "matches": [
+            {
+              "line_number": 97,
+              "content": "2025-12-02T09:11:15.3520144Z ##[warning]The process '/usr/bin/git' failed with exit code 128",
+              "severity": "high",
+              "emoji": "\ud83d\udca5"
+            }
+          ],
+          "count": 1
+        },
+        {
+          "pattern": "WARN|Warning|warning",
+          "matches": [
+            {
+              "line_number": 16,
+              "content": "2025-12-02T09:11:12.3183594Z hint: of your new repositories, which will suppress this warning, call:",
+              "severity": "medium",
+              "emoji": "\u26a0\ufe0f"
+            },
+            {
+              "line_number": 97,
+              "content": "2025-12-02T09:11:15.3520144Z ##[warning]The process '/usr/bin/git' failed with exit code 128",
+              "severity": "medium",
+              "emoji": "\u26a0\ufe0f"
+            }
+          ],
+          "count": 2
+        }
+      ],
+      "suggested_fixes": [
+        "Review the logs above for specific error messages"
+      ],
+      "severity": "high",
+      "category": "permission_error",
+      "similar_failures": []
+    }
+  ],
+  "timestamp": "2025-12-02T09:13:02.318978"
+}
