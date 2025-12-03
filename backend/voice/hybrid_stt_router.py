@@ -165,11 +165,9 @@ class HybridSTTRouter:
                 # Import and cache the WhisperAudioHandler singleton
                 from .whisper_audio_fix import _whisper_handler
 
-                # Load model in thread pool with timeout protection
-                await asyncio.wait_for(
-                    asyncio.to_thread(_whisper_handler.load_model),
-                    timeout=MODEL_PREWARM_TIMEOUT
-                )
+                # Load model asynchronously with proper non-blocking implementation
+                # Using load_model_async() instead of wrapping sync load_model()
+                await _whisper_handler.load_model_async(timeout=MODEL_PREWARM_TIMEOUT)
 
                 self._whisper_handler = _whisper_handler
                 self._whisper_prewarmed = True

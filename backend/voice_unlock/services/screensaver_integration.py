@@ -317,22 +317,33 @@ class ScreensaverIntegration:
     async def _unlock_screen(self, user_id: Optional[str] = None) -> bool:
         """Unlock the screen/screensaver"""
         try:
-            # Method 1: Stop screensaver
+            # Method 1: Stop screensaver (async subprocess)
             if self.current_state == ScreenState.SCREENSAVER:
-                # Kill screensaver process
-                subprocess.run(["killall", "ScreenSaverEngine"], capture_output=True)
-                
+                # Kill screensaver process - use async subprocess
+                proc = await asyncio.create_subprocess_exec(
+                    "killall", "ScreenSaverEngine",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                await proc.communicate()
+
             # Method 2: Simulate unlock (requires password/TouchID normally)
             # This is where PAM integration would help
-            
+
             # For screensaver without password requirement
             script = """
             tell application "System Events"
                 key code 49 -- space key
             end tell
             """
-            
-            subprocess.run(["osascript", "-e", script], capture_output=True)
+
+            # Use async subprocess instead of blocking subprocess.run
+            proc = await asyncio.create_subprocess_exec(
+                "osascript", "-e", script,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            await proc.communicate()
             
             # Verify unlock
             await asyncio.sleep(0.5)

@@ -1120,7 +1120,18 @@ class MetricsDatabase:
         entry: Dict[str, Any],
         stages: List[Dict[str, Any]]
     ) -> Optional[int]:
-        """Store unlock attempt in SQLite"""
+        """Store unlock attempt in SQLite (async-safe via thread executor)"""
+        # Run blocking SQLite operations in a thread to avoid blocking event loop
+        return await asyncio.to_thread(
+            self._store_in_sqlite_sync, entry, stages
+        )
+
+    def _store_in_sqlite_sync(
+        self,
+        entry: Dict[str, Any],
+        stages: List[Dict[str, Any]]
+    ) -> Optional[int]:
+        """Synchronous SQLite storage - called via asyncio.to_thread()"""
         try:
             conn = sqlite3.connect(self.sqlite_path)
             cursor = conn.cursor()
