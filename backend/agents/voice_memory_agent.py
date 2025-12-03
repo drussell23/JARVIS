@@ -132,6 +132,9 @@ class VoiceMemoryAgent:
         # Load voice profiles into memory
         await self._load_voice_profiles()
 
+        # Load historical confidence data from SQLite metrics database
+        await self._load_confidence_history_from_db()
+
         logger.info("✅ Voice Memory Agent initialized")
 
     async def _load_persistent_memory(self):
@@ -245,6 +248,83 @@ class VoiceMemoryAgent:
 
         except Exception as e:
             logger.error(f"Failed to load voice profiles: {e}")
+
+    async def _load_confidence_history_from_db(self):
+        """
+        Load historical confidence data from the unlock metrics database.
+
+        This ensures confidence analytics are available immediately after startup,
+        not just after new interactions occur.
+        """
+        try:
+            import aiosqlite
+            from pathlib import Path
+
+            metrics_db_path = Path.home() / '.jarvis' / 'logs' / 'unlock_metrics' / 'unlock_metrics.db'
+
+            if not metrics_db_path.exists():
+                logger.debug("No unlock metrics database found - confidence history will build from new interactions")
+                return
+
+            async with aiosqlite.connect(str(metrics_db_path)) as db:
+                db.row_factory = aiosqlite.Row
+
+                # Load recent unlock attempts per speaker (last 50)
+                cursor = await db.execute("""
+                    SELECT
+                        speaker_name,
+                        speaker_confidence,
+                        success,
+                        timestamp
+                    FROM unlock_attempts
+                    WHERE speaker_name IS NOT NULL
+                      AND speaker_confidence IS NOT NULL
+                    ORDER BY timestamp DESC
+                    LIMIT 500
+                """)
+
+                rows = await cursor.fetchall()
+
+                # Group by speaker and reverse to chronological order
+                speaker_data = {}
+                for row in reversed(rows):
+                    speaker_name = row['speaker_name']
+                    if not is_valid_speaker_name(speaker_name):
+                        continue
+
+                    if speaker_name not in speaker_data:
+                        speaker_data[speaker_name] = {
+                            'confidence_history': [],
+                            'success_history': []
+                        }
+
+                    # Add to history (keep last confidence_window entries)
+                    if len(speaker_data[speaker_name]['confidence_history']) < self.confidence_window:
+                        speaker_data[speaker_name]['confidence_history'].append({
+                            'confidence': float(row['speaker_confidence']),
+                            'timestamp': row['timestamp'],
+                            'success': bool(row['success'])
+                        })
+                        speaker_data[speaker_name]['success_history'].append(bool(row['success']))
+
+                # Populate in-memory data structures
+                total_loaded = 0
+                for speaker_name, data in speaker_data.items():
+                    if data['confidence_history']:
+                        self.confidence_history[speaker_name] = data['confidence_history']
+                        self.success_history[speaker_name] = data['success_history']
+                        total_loaded += len(data['confidence_history'])
+
+                if total_loaded > 0:
+                    logger.info(
+                        f"📊 Loaded {total_loaded} historical confidence records for "
+                        f"{len(speaker_data)} speaker(s) from unlock metrics database"
+                    )
+
+        except ImportError:
+            logger.debug("aiosqlite not available - confidence history will build from new interactions")
+        except Exception as e:
+            logger.warning(f"Could not load confidence history from database: {e}")
 
     async def startup_check(self) -> Dict:
         """
