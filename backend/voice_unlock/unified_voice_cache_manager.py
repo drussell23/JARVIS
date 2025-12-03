@@ -784,31 +784,32 @@ class UnifiedVoiceCacheManager:
             Loaded encoder or None
         """
         try:
-            import torch
-            from speechbrain.inference.speaker import EncoderClassifier
-
-            # Force CPU to avoid MPS issues
-            torch.set_num_threads(1)
-
             logger.info("🔄 Loading ECAPA-TDNN directly from SpeechBrain...")
 
-            # Run in thread to avoid blocking
+            # Define loader function (imports inside to avoid issues)
             def _load():
+                import torch
+                from speechbrain.inference.speaker import EncoderClassifier
+
+                # Force CPU to avoid MPS issues
+                torch.set_num_threads(1)
+
                 return EncoderClassifier.from_hparams(
                     source="speechbrain/spkrec-ecapa-voxceleb",
                     run_opts={"device": "cpu"}
                 )
 
+            # Use asyncio.to_thread (Python 3.9+) for thread-safe execution
             encoder = await asyncio.wait_for(
-                asyncio.get_event_loop().run_in_executor(None, _load),
+                asyncio.to_thread(_load),
                 timeout=60.0
             )
 
             logger.info("✅ ECAPA-TDNN loaded directly")
             return encoder
 
-        except ImportError:
-            logger.warning("⚠️ SpeechBrain not installed - cannot load ECAPA-TDNN")
+        except ImportError as e:
+            logger.warning(f"⚠️ SpeechBrain not installed - cannot load ECAPA-TDNN: {e}")
             return None
         except asyncio.TimeoutError:
             logger.warning("⏱️ Direct ECAPA load timed out after 60s")
