@@ -1186,11 +1186,27 @@ WantedBy=default.target
             INVALID_NAMES = {'unknown', 'test', 'placeholder', 'anonymous', 'guest', 'none', 'null'}
             profiles_to_cleanup = []
 
+            # First, identify primary user(s) dynamically from is_primary_user flag
+            cursor.execute("""
+                SELECT speaker_id, speaker_name FROM speaker_profiles
+                WHERE is_primary_user = TRUE
+            """)
+            primary_users = {row[0]: row[1] for row in cursor.fetchall()}
+
             for speaker in profile_data['speakers']:
                 speaker_name = speaker['speaker_name']
-                # Check if profile should be cleaned up
-                if (speaker_name.lower() in INVALID_NAMES or
-                    (not speaker['embedding_valid'] and speaker_name != "Derek J. Russell")):
+                speaker_id = speaker['speaker_id']
+                is_primary = speaker_id in primary_users
+
+                # Check if profile should be cleaned up:
+                # 1. Invalid placeholder names (unknown, test, etc.)
+                # 2. Missing embedding AND not a primary user (don't delete owner even if embedding is temporarily missing)
+                should_cleanup = (
+                    speaker_name.lower() in INVALID_NAMES or
+                    (not speaker['embedding_valid'] and not is_primary)
+                )
+
+                if should_cleanup:
                     profiles_to_cleanup.append(speaker)
 
             if profiles_to_cleanup:

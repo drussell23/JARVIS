@@ -3102,8 +3102,25 @@ class JARVISLearningDatabase:
                     speaker_name = profile[1] if isinstance(profile, (list, tuple)) else profile['speaker_name']
                     missing_embedding = profile[2] if isinstance(profile, (list, tuple)) else profile['missing_embedding']
 
-                    # Don't delete the primary user (Derek) even if embedding is temporarily missing
-                    if speaker_name == "Derek J. Russell":
+                    # Don't delete primary users even if embedding is temporarily missing
+                    # Check is_primary_user flag dynamically
+                    if is_cloud:
+                        await cursor.execute(
+                            "SELECT is_primary_user FROM speaker_profiles WHERE speaker_id = %s",
+                            (speaker_id,)
+                        )
+                    else:
+                        await cursor.execute(
+                            "SELECT is_primary_user FROM speaker_profiles WHERE speaker_id = ?",
+                            (speaker_id,)
+                        )
+                    primary_check = await cursor.fetchone()
+                    is_primary = primary_check and (
+                        primary_check.get('is_primary_user', False) if isinstance(primary_check, dict)
+                        else primary_check[0]
+                    )
+
+                    if is_primary:
                         logger.info(f"⚠️ Skipping cleanup of primary user profile: {speaker_name}")
                         continue
 
