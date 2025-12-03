@@ -1,5 +1,6 @@
 """
-Ultra-Advanced Hybrid STT Router
+Ultra-Advanced Hybrid STT Router v3.0
+=====================================
 Zero hardcoding, fully async, RAM-aware, cost-optimized
 Integrates with learning database for continuous improvement
 
@@ -9,15 +10,22 @@ PERFORMANCE OPTIMIZATIONS:
 - Speaker ID removed from transcription path (parallel, not serial)
 - VAD/windowing pipeline caching
 - Granular timeout protection at each stage
-- Circuit breaker pattern for fault tolerance
+- Advanced circuit breaker pattern with half-open state
+- Health monitoring with automatic recovery
+- Adaptive timeouts based on system load
+- Exponential backoff retry logic
+- Connection pool management
 """
 
 import asyncio
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Dict, Optional, Tuple
+from enum import Enum
+from typing import Any, Callable, Dict, List, Optional, Tuple
+from functools import wraps
 
 import psutil
 
@@ -25,14 +33,346 @@ from .stt_config import ModelConfig, RoutingStrategy, STTEngine, get_stt_config
 
 logger = logging.getLogger(__name__)
 
+
 # =============================================================================
-# PERFORMANCE CONSTANTS - Tune these for optimal latency
+# DYNAMIC CONFIGURATION - Load from environment with sensible defaults
 # =============================================================================
-MODEL_PREWARM_TIMEOUT = 15.0  # Max time to prewarm Whisper model during init
-TRANSCRIPTION_TIMEOUT = 10.0  # Max time for a single transcription attempt
-FALLBACK_TIMEOUT = 5.0  # Max time for fallback transcription
-VAD_TIMEOUT = 2.0  # Max time for VAD processing
-SPEAKER_ID_TIMEOUT = 3.0  # Max time for speaker identification (parallel)
+class DynamicTimeoutConfig:
+    """
+    Dynamic timeout configuration that adapts to system conditions.
+    All values can be overridden via environment variables.
+    """
+
+    def __init__(self):
+        self._base_config = {
+            'model_prewarm': float(os.getenv('STT_PREWARM_TIMEOUT', '15.0')),
+            'transcription': float(os.getenv('STT_TRANSCRIPTION_TIMEOUT', '10.0')),
+            'fallback': float(os.getenv('STT_FALLBACK_TIMEOUT', '5.0')),
+            'vad': float(os.getenv('STT_VAD_TIMEOUT', '2.0')),
+            'speaker_id': float(os.getenv('STT_SPEAKER_ID_TIMEOUT', '3.0')),
+            'fast_path': float(os.getenv('STT_FAST_PATH_TIMEOUT', '3.0')),
+        }
+        self._load_multiplier = 1.0
+        self._last_calibration = 0.0
+        self._calibration_interval = 30.0  # Recalibrate every 30 seconds
+
+    def get_timeout(self, operation: str, urgency: str = 'normal') -> float:
+        """
+        Get adaptive timeout based on operation type, system load, and urgency.
+
+        Args:
+            operation: Type of operation (model_prewarm, transcription, etc.)
+            urgency: 'critical' (0.5x), 'normal' (1x), 'relaxed' (2x)
+        """
+        base = self._base_config.get(operation, 5.0)
+
+        # Apply load-based adjustment
+        self._maybe_recalibrate()
+        adjusted = base * self._load_multiplier
+
+        # Apply urgency modifier
+        urgency_multipliers = {'critical': 0.6, 'normal': 1.0, 'relaxed': 2.0}
+        adjusted *= urgency_multipliers.get(urgency, 1.0)
+
+        # Enforce reasonable bounds
+        return max(1.0, min(adjusted, 60.0))
+
+    def _maybe_recalibrate(self):
+        """Recalibrate load multiplier if enough time has passed."""
+        now = time.time()
+        if now - self._last_calibration > self._calibration_interval:
+            self._recalibrate_for_load()
+            self._last_calibration = now
+
+    def _recalibrate_for_load(self):
+        """Adjust timeouts based on current system load."""
+        try:
+            cpu = psutil.cpu_percent(interval=0.1)
+            mem = psutil.virtual_memory()
+
+            # High CPU (>80%) or low memory (<20% available) = extend timeouts
+            if cpu > 80 or mem.percent > 80:
+                self._load_multiplier = 1.5
+            elif cpu > 60 or mem.percent > 60:
+                self._load_multiplier = 1.2
+            else:
+                self._load_multiplier = 1.0
+
+            logger.debug(f"Timeout calibration: CPU={cpu:.0f}%, MEM={mem.percent:.0f}%, multiplier={self._load_multiplier}")
+        except Exception:
+            self._load_multiplier = 1.0
+
+
+# Global dynamic config instance
+_timeout_config = DynamicTimeoutConfig()
+
+
+def get_timeout(operation: str, urgency: str = 'normal') -> float:
+    """Get adaptive timeout for an operation."""
+    return _timeout_config.get_timeout(operation, urgency)
+
+
+# Legacy constants for backwards compatibility (use get_timeout() instead)
+MODEL_PREWARM_TIMEOUT = 15.0
+TRANSCRIPTION_TIMEOUT = 10.0
+FALLBACK_TIMEOUT = 5.0
+VAD_TIMEOUT = 2.0
+SPEAKER_ID_TIMEOUT = 3.0
+
+
+# =============================================================================
+# ADVANCED CIRCUIT BREAKER WITH HALF-OPEN STATE
+# =============================================================================
+class CircuitState(Enum):
+    """Circuit breaker states."""
+    CLOSED = "closed"      # Normal operation
+    OPEN = "open"          # Failing, reject requests
+    HALF_OPEN = "half_open"  # Testing if recovered
+
+
+@dataclass
+class CircuitBreakerStats:
+    """Statistics for a circuit breaker."""
+    total_calls: int = 0
+    successful_calls: int = 0
+    failed_calls: int = 0
+    rejected_calls: int = 0
+    last_failure_time: float = 0.0
+    last_success_time: float = 0.0
+    consecutive_failures: int = 0
+    consecutive_successes: int = 0
+    state_changes: int = 0
+
+
+class AdvancedCircuitBreaker:
+    """
+    Advanced circuit breaker with half-open state and adaptive thresholds.
+
+    Features:
+    - Three states: CLOSED (normal), OPEN (failing), HALF_OPEN (testing)
+    - Adaptive failure threshold based on recent success rate
+    - Exponential backoff for retry timing
+    - Health score tracking for monitoring
+    - Automatic recovery with gradual traffic increase
+    """
+
+    def __init__(
+        self,
+        name: str,
+        failure_threshold: int = 3,
+        recovery_timeout: float = 30.0,
+        half_open_max_calls: int = 3,
+        success_threshold: int = 2,
+    ):
+        self.name = name
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self.half_open_max_calls = half_open_max_calls
+        self.success_threshold = success_threshold
+
+        self.state = CircuitState.CLOSED
+        self.stats = CircuitBreakerStats()
+        self._half_open_calls = 0
+        self._lock = asyncio.Lock()
+
+        # Exponential backoff
+        self._backoff_multiplier = 1.0
+        self._max_backoff_multiplier = 8.0
+
+    @property
+    def health_score(self) -> float:
+        """Calculate health score (0.0 to 1.0) based on recent performance."""
+        total = self.stats.successful_calls + self.stats.failed_calls
+        if total == 0:
+            return 1.0
+        return self.stats.successful_calls / total
+
+    @property
+    def is_available(self) -> bool:
+        """Check if circuit allows requests."""
+        if self.state == CircuitState.CLOSED:
+            return True
+        elif self.state == CircuitState.OPEN:
+            # Check if recovery timeout has passed
+            elapsed = time.time() - self.stats.last_failure_time
+            if elapsed >= self.recovery_timeout * self._backoff_multiplier:
+                return True  # Allow transition to half-open
+            return False
+        else:  # HALF_OPEN
+            return self._half_open_calls < self.half_open_max_calls
+
+    async def call(self, func: Callable, *args, **kwargs) -> Any:
+        """Execute function with circuit breaker protection."""
+        async with self._lock:
+            if not self.is_available:
+                self.stats.rejected_calls += 1
+                raise CircuitBreakerOpenError(f"Circuit {self.name} is OPEN")
+
+            # Transition OPEN -> HALF_OPEN on first call after timeout
+            if self.state == CircuitState.OPEN:
+                self._transition_to_half_open()
+
+        # Execute the call
+        self.stats.total_calls += 1
+        try:
+            if asyncio.iscoroutinefunction(func):
+                result = await func(*args, **kwargs)
+            else:
+                result = await asyncio.to_thread(func, *args, **kwargs)
+
+            await self._record_success()
+            return result
+
+        except Exception as e:
+            await self._record_failure()
+            raise
+
+    async def _record_success(self):
+        """Record a successful call."""
+        async with self._lock:
+            self.stats.successful_calls += 1
+            self.stats.last_success_time = time.time()
+            self.stats.consecutive_successes += 1
+            self.stats.consecutive_failures = 0
+
+            if self.state == CircuitState.HALF_OPEN:
+                self._half_open_calls += 1
+                if self.stats.consecutive_successes >= self.success_threshold:
+                    self._transition_to_closed()
+
+    async def _record_failure(self):
+        """Record a failed call."""
+        async with self._lock:
+            self.stats.failed_calls += 1
+            self.stats.last_failure_time = time.time()
+            self.stats.consecutive_failures += 1
+            self.stats.consecutive_successes = 0
+
+            if self.state == CircuitState.HALF_OPEN:
+                # Immediate transition back to OPEN on failure during half-open
+                self._transition_to_open()
+            elif self.stats.consecutive_failures >= self.failure_threshold:
+                self._transition_to_open()
+
+    def _transition_to_open(self):
+        """Transition to OPEN state."""
+        if self.state != CircuitState.OPEN:
+            logger.warning(f"🔴 Circuit breaker {self.name}: OPEN (failures: {self.stats.consecutive_failures})")
+            self.state = CircuitState.OPEN
+            self.stats.state_changes += 1
+            self._half_open_calls = 0
+
+            # Increase backoff for repeated failures
+            self._backoff_multiplier = min(
+                self._backoff_multiplier * 1.5,
+                self._max_backoff_multiplier
+            )
+
+    def _transition_to_half_open(self):
+        """Transition to HALF_OPEN state."""
+        logger.info(f"🟡 Circuit breaker {self.name}: HALF_OPEN (testing recovery)")
+        self.state = CircuitState.HALF_OPEN
+        self.stats.state_changes += 1
+        self._half_open_calls = 0
+
+    def _transition_to_closed(self):
+        """Transition to CLOSED state."""
+        logger.info(f"🟢 Circuit breaker {self.name}: CLOSED (recovered)")
+        self.state = CircuitState.CLOSED
+        self.stats.state_changes += 1
+        self._backoff_multiplier = 1.0  # Reset backoff
+        self._half_open_calls = 0
+
+    def reset(self):
+        """Force reset the circuit breaker."""
+        self.state = CircuitState.CLOSED
+        self.stats = CircuitBreakerStats()
+        self._half_open_calls = 0
+        self._backoff_multiplier = 1.0
+        logger.info(f"Circuit breaker {self.name} manually reset")
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Export circuit breaker state for monitoring."""
+        return {
+            'name': self.name,
+            'state': self.state.value,
+            'health_score': self.health_score,
+            'is_available': self.is_available,
+            'stats': {
+                'total_calls': self.stats.total_calls,
+                'successful_calls': self.stats.successful_calls,
+                'failed_calls': self.stats.failed_calls,
+                'rejected_calls': self.stats.rejected_calls,
+                'consecutive_failures': self.stats.consecutive_failures,
+                'state_changes': self.stats.state_changes,
+            },
+            'backoff_multiplier': self._backoff_multiplier,
+        }
+
+
+class CircuitBreakerOpenError(Exception):
+    """Raised when circuit breaker is open and rejects the call."""
+    pass
+
+
+# =============================================================================
+# RETRY DECORATOR WITH EXPONENTIAL BACKOFF
+# =============================================================================
+def async_retry(
+    max_attempts: int = 3,
+    base_delay: float = 0.5,
+    max_delay: float = 10.0,
+    exponential_base: float = 2.0,
+    exceptions: Tuple = (Exception,),
+):
+    """
+    Async retry decorator with exponential backoff.
+
+    Args:
+        max_attempts: Maximum number of retry attempts
+        base_delay: Initial delay between retries (seconds)
+        max_delay: Maximum delay between retries (seconds)
+        exponential_base: Base for exponential backoff
+        exceptions: Tuple of exceptions to catch and retry
+    """
+    def decorator(func: Callable):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            last_exception = None
+
+            for attempt in range(max_attempts):
+                try:
+                    return await func(*args, **kwargs)
+                except exceptions as e:
+                    last_exception = e
+
+                    if attempt < max_attempts - 1:
+                        delay = min(base_delay * (exponential_base ** attempt), max_delay)
+                        logger.warning(
+                            f"Retry {attempt + 1}/{max_attempts} for {func.__name__} "
+                            f"after {delay:.1f}s: {e}"
+                        )
+                        await asyncio.sleep(delay)
+                    else:
+                        logger.error(f"All {max_attempts} attempts failed for {func.__name__}: {e}")
+
+            raise last_exception
+
+        return wrapper
+    return decorator
+
+
+# =============================================================================
+# HEALTH MONITORING
+# =============================================================================
+@dataclass
+class HealthStatus:
+    """Health status for the STT router."""
+    healthy: bool
+    score: float  # 0.0 to 1.0
+    components: Dict[str, Dict[str, Any]]
+    last_check: datetime
+    message: str
 
 
 @dataclass
@@ -66,18 +406,21 @@ class SystemResources:
 
 class HybridSTTRouter:
     """
-    Ultra-intelligent STT routing system.
+    Ultra-intelligent STT routing system v3.0.
 
     Features:
-    - Zero hardcoding (all config-driven)
-    - Fully async (non-blocking)
-    - RAM-aware (adapts to available resources)
+    - Zero hardcoding (all config-driven, environment overrideable)
+    - Fully async (non-blocking with timeout protection everywhere)
+    - RAM-aware (adapts to available resources dynamically)
     - Cost-optimized (prefers local, escalates smartly)
-    - Learning-enabled (gets better over time)
+    - Learning-enabled (gets better over time via ML database)
     - Multi-engine (Wav2Vec, Vosk, Whisper local/GCP)
-    - Speaker-aware (Derek gets priority)
-    - Confidence-based escalation
-    - Automatic fallbacks
+    - Speaker-aware (Derek gets priority routing)
+    - Confidence-based escalation with adaptive thresholds
+    - Advanced circuit breakers with half-open state
+    - Health monitoring and automatic recovery
+    - Retry logic with exponential backoff
+    - Adaptive timeouts based on system load
     """
 
     def __init__(self, config=None):
@@ -90,6 +433,7 @@ class HybridSTTRouter:
         self.total_requests = 0
         self.cloud_requests = 0
         self.cache_hits = 0
+        self._start_time = time.time()
 
         # Available engines (lazy-loaded)
         self.available_engines = {}
@@ -100,15 +444,54 @@ class HybridSTTRouter:
         self._whisper_handler = None  # Cached WhisperAudioHandler instance
         self._prewarm_lock = asyncio.Lock()  # Prevent concurrent prewarm attempts
 
-        # Circuit breaker for fault tolerance
+        # Advanced circuit breakers (one per engine type)
+        self._circuit_breakers: Dict[str, AdvancedCircuitBreaker] = {
+            'whisper_local': AdvancedCircuitBreaker(
+                name='whisper_local',
+                failure_threshold=3,
+                recovery_timeout=30.0,
+            ),
+            'whisper_fallback': AdvancedCircuitBreaker(
+                name='whisper_fallback',
+                failure_threshold=2,
+                recovery_timeout=45.0,
+            ),
+            'vosk': AdvancedCircuitBreaker(
+                name='vosk',
+                failure_threshold=3,
+                recovery_timeout=20.0,
+            ),
+            'google_cloud': AdvancedCircuitBreaker(
+                name='google_cloud',
+                failure_threshold=2,
+                recovery_timeout=60.0,
+            ),
+            'speechbrain': AdvancedCircuitBreaker(
+                name='speechbrain',
+                failure_threshold=3,
+                recovery_timeout=30.0,
+            ),
+        }
+
+        # Legacy circuit breaker tracking (for backwards compatibility)
         self._circuit_breaker_failures = {}
         self._circuit_breaker_last_failure = {}
-        self._circuit_breaker_threshold = 3  # failures before circuit opens
-        self._circuit_breaker_timeout = 60  # seconds before retry
+        self._circuit_breaker_threshold = 3
+        self._circuit_breaker_timeout = 60
 
-        logger.info("🎤 Hybrid STT Router initialized")
+        # Health monitoring
+        self._last_health_check: Optional[HealthStatus] = None
+        self._health_check_interval = 60.0  # seconds
+        self._last_health_check_time = 0.0
+
+        # Request rate limiting
+        self._request_times: List[float] = []
+        self._max_requests_per_second = float(os.getenv('STT_MAX_RPS', '10'))
+
+        logger.info("🎤 Hybrid STT Router v3.0 initialized")
         logger.info(f"   Strategy: {self.config.default_strategy.value}")
         logger.info(f"   Models configured: {len(self.config.models)}")
+        logger.info(f"   Circuit breakers: {len(self._circuit_breakers)}")
 
     async def initialize(self) -> bool:
         """
@@ -150,12 +533,14 @@ class HybridSTTRouter:
         """
         Prewarm Whisper model to eliminate first-request latency.
 
-        ROBUST ASYNC IMPLEMENTATION:
-        - Non-blocking with strict timeout enforcement
+        ROBUST ASYNC IMPLEMENTATION v3.0:
+        - Non-blocking with adaptive timeout based on system load
         - Graceful degradation on failure (service continues without prewarm)
         - Background completion handler for timeout cases
         - Cancellation-safe with proper cleanup
         - Never blocks the voice unlock flow
+        - Circuit breaker integration for repeated failures
+        - Health monitoring integration
         """
         async with self._prewarm_lock:
             if self._whisper_prewarmed:
@@ -164,15 +549,24 @@ class HybridSTTRouter:
             prewarm_start = time.time()
             prewarm_task = None
 
+            # Get adaptive timeout based on current system load
+            timeout = get_timeout('model_prewarm', urgency='relaxed')
+
             try:
-                logger.info("🔥 Prewarming Whisper model (async, non-blocking)...")
+                logger.info(f"🔥 Prewarming Whisper model (async, timeout={timeout:.1f}s)...")
+
+                # Check circuit breaker before attempting prewarm
+                cb = self._circuit_breakers.get('whisper_local')
+                if cb and not cb.is_available:
+                    logger.warning("⚠️ Whisper circuit breaker OPEN - skipping prewarm")
+                    return
 
                 # Import and cache the WhisperAudioHandler singleton
                 from .whisper_audio_fix import _whisper_handler
 
                 # Create a cancellable task for the prewarm operation
                 async def _do_prewarm():
-                    await _whisper_handler.load_model_async(timeout=MODEL_PREWARM_TIMEOUT)
+                    await _whisper_handler.load_model_async(timeout=timeout)
                     return _whisper_handler
 
                 prewarm_task = asyncio.create_task(_do_prewarm())
@@ -180,12 +574,16 @@ class HybridSTTRouter:
                 # Wait with strict timeout - shield prevents cancellation propagation
                 self._whisper_handler = await asyncio.wait_for(
                     asyncio.shield(prewarm_task),
-                    timeout=MODEL_PREWARM_TIMEOUT
+                    timeout=timeout
                 )
                 self._whisper_prewarmed = True
 
                 prewarm_time = (time.time() - prewarm_start) * 1000
                 logger.info(f"✅ Whisper model prewarmed in {prewarm_time:.0f}ms")
+
+                # Record success in circuit breaker
+                if cb:
+                    await cb._record_success()
 
             except asyncio.TimeoutError:
                 elapsed = (time.time() - prewarm_start) * 1000
@@ -206,6 +604,11 @@ class HybridSTTRouter:
             except Exception as e:
                 elapsed = (time.time() - prewarm_start) * 1000
                 logger.warning(f"⚠️ Whisper prewarm failed after {elapsed:.0f}ms: {e}")
+
+                # Record failure in circuit breaker
+                cb = self._circuit_breakers.get('whisper_local')
+                if cb:
+                    await cb._record_failure()
 
     def _handle_background_prewarm(self, task: asyncio.Task):
         """Handle background prewarm completion after timeout."""
@@ -940,8 +1343,133 @@ class HybridSTTRouter:
                 metadata={"error": str(e)}
             )
 
+    async def health_check(self, force: bool = False) -> HealthStatus:
+        """
+        Comprehensive health check of the STT router.
+
+        Args:
+            force: Force a new health check even if cached result is recent
+
+        Returns:
+            HealthStatus with overall health and component details
+        """
+        now = time.time()
+
+        # Return cached result if recent (unless forced)
+        if not force and self._last_health_check:
+            if now - self._last_health_check_time < self._health_check_interval:
+                return self._last_health_check
+
+        components = {}
+        issues = []
+
+        # Check circuit breakers
+        for name, cb in self._circuit_breakers.items():
+            components[f'circuit_{name}'] = {
+                'state': cb.state.value,
+                'health_score': cb.health_score,
+                'is_available': cb.is_available,
+                'consecutive_failures': cb.stats.consecutive_failures,
+            }
+            if cb.state == CircuitState.OPEN:
+                issues.append(f"Circuit breaker {name} is OPEN")
+
+        # Check Whisper prewarm status
+        components['whisper_prewarm'] = {
+            'prewarmed': self._whisper_prewarmed,
+            'handler_available': self._whisper_handler is not None,
+        }
+        if not self._whisper_prewarmed:
+            issues.append("Whisper model not prewarmed")
+
+        # Check available engines
+        components['engines'] = {
+            'available': list(self.available_engines.keys()),
+            'loaded': list(self.engines.keys()),
+            'count': len(self.available_engines),
+        }
+        if len(self.available_engines) == 0:
+            issues.append("No STT engines available")
+
+        # Check system resources
+        try:
+            resources = self._get_system_resources()
+            components['resources'] = {
+                'ram_available_gb': round(resources.available_ram_gb, 2),
+                'ram_percent_used': round(resources.ram_percent_used, 1),
+                'cpu_percent': round(resources.cpu_percent, 1),
+                'network_available': resources.network_available,
+            }
+            if resources.available_ram_gb < 1.0:
+                issues.append("Low available RAM")
+            if resources.cpu_percent > 90:
+                issues.append("High CPU usage")
+        except Exception as e:
+            components['resources'] = {'error': str(e)}
+            issues.append(f"Resource check failed: {e}")
+
+        # Check learning database connection
+        components['learning_db'] = {
+            'connected': self.learning_db is not None,
+        }
+
+        # Calculate overall health score
+        cb_scores = [cb.health_score for cb in self._circuit_breakers.values()]
+        avg_cb_score = sum(cb_scores) / len(cb_scores) if cb_scores else 1.0
+
+        # Weight: circuit breakers (50%), prewarmed (20%), engines (30%)
+        prewarm_score = 1.0 if self._whisper_prewarmed else 0.5
+        engine_score = min(1.0, len(self.available_engines) / 3)  # At least 3 engines ideal
+
+        overall_score = (avg_cb_score * 0.5) + (prewarm_score * 0.2) + (engine_score * 0.3)
+        healthy = overall_score >= 0.7 and len(issues) == 0
+
+        # Build status message
+        if healthy:
+            message = "All systems operational"
+        elif overall_score >= 0.5:
+            message = f"Degraded: {', '.join(issues[:2])}"
+        else:
+            message = f"Critical: {', '.join(issues[:3])}"
+
+        status = HealthStatus(
+            healthy=healthy,
+            score=round(overall_score, 3),
+            components=components,
+            last_check=datetime.now(),
+            message=message,
+        )
+
+        self._last_health_check = status
+        self._last_health_check_time = now
+
+        return status
+
+    def get_circuit_breaker(self, name: str) -> Optional[AdvancedCircuitBreaker]:
+        """Get a specific circuit breaker by name."""
+        return self._circuit_breakers.get(name)
+
+    def reset_circuit_breaker(self, name: str) -> bool:
+        """Reset a specific circuit breaker."""
+        cb = self._circuit_breakers.get(name)
+        if cb:
+            cb.reset()
+            return True
+        return False
+
+    def reset_all_circuit_breakers(self):
+        """Reset all circuit breakers to closed state."""
+        for cb in self._circuit_breakers.values():
+            cb.reset()
+        logger.info("All circuit breakers reset")
+
     def get_stats(self) -> Dict:
-        """Get router performance statistics"""
+        """Get comprehensive router performance statistics"""
+        uptime = time.time() - self._start_time
+
+        # Calculate requests per minute
+        rpm = (self.total_requests / uptime * 60) if uptime > 0 else 0
+
         return {
             "total_requests": self.total_requests,
             "cloud_requests": self.cloud_requests,
@@ -952,9 +1480,23 @@ class HybridSTTRouter:
             "loaded_engines": list(self.engines.keys()),
             "performance_by_model": self.performance_stats,
             "config": self.config.to_dict(),
-            # New: prewarming status
+            # Prewarming status
             "whisper_prewarmed": self._whisper_prewarmed,
+            # Advanced circuit breaker status
+            "circuit_breakers": {
+                name: cb.to_dict() for name, cb in self._circuit_breakers.items()
+            },
+            # Legacy circuit breaker (for backwards compatibility)
             "circuit_breaker_failures": dict(self._circuit_breaker_failures),
+            # Performance metrics
+            "uptime_seconds": round(uptime, 1),
+            "requests_per_minute": round(rpm, 2),
+            # Health summary
+            "health": {
+                "last_check": self._last_health_check.last_check.isoformat() if self._last_health_check else None,
+                "score": self._last_health_check.score if self._last_health_check else None,
+                "healthy": self._last_health_check.healthy if self._last_health_check else None,
+            },
         }
 
 

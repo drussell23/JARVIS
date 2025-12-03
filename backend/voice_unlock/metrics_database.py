@@ -1,37 +1,498 @@
 #!/usr/bin/env python3
 """
-Voice Unlock Metrics Database
-==============================
+Voice Unlock Metrics Database v3.0
+===================================
 Stores voice unlock metrics in SQLite (local) and CloudSQL (cloud) simultaneously.
 
 This provides:
 - Local SQLite for fast queries and offline access
 - CloudSQL sync for backup and cross-device access
 - Automatic schema creation
-- Async database operations
+- Async database operations with timeout protection
+- Connection pooling for performance
+- Circuit breaker for database failures
+- Health monitoring and automatic recovery
+- Transaction batching for efficiency
 """
 
 import asyncio
 import logging
 import sqlite3
 import json
+import os
+import time
+import threading
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any, List, Optional
-from dataclasses import asdict
+from typing import Dict, Any, List, Optional, Callable, Tuple
+from dataclasses import dataclass, field, asdict
+from functools import wraps
+from queue import Queue, Empty
+from concurrent.futures import ThreadPoolExecutor
 
 logger = logging.getLogger(__name__)
 
 
+# =============================================================================
+# DYNAMIC CONFIGURATION
+# =============================================================================
+class MetricsDatabaseConfig:
+    """Dynamic configuration for metrics database."""
+
+    def __init__(self):
+        self.query_timeout = float(os.getenv('METRICS_QUERY_TIMEOUT', '5.0'))
+        self.write_timeout = float(os.getenv('METRICS_WRITE_TIMEOUT', '10.0'))
+        self.pool_size = int(os.getenv('METRICS_POOL_SIZE', '3'))
+        self.max_batch_size = int(os.getenv('METRICS_MAX_BATCH_SIZE', '100'))
+        self.batch_flush_interval = float(os.getenv('METRICS_BATCH_INTERVAL', '5.0'))
+        self.circuit_breaker_threshold = int(os.getenv('METRICS_CB_THRESHOLD', '5'))
+        self.circuit_breaker_timeout = float(os.getenv('METRICS_CB_TIMEOUT', '60.0'))
+        self.retry_attempts = int(os.getenv('METRICS_RETRY_ATTEMPTS', '3'))
+        self.retry_delay = float(os.getenv('METRICS_RETRY_DELAY', '0.5'))
+
+
+_metrics_config = MetricsDatabaseConfig()
+
+
+# =============================================================================
+# CIRCUIT BREAKER
+# =============================================================================
+@dataclass
+class DatabaseCircuitBreaker:
+    """Circuit breaker for database operations."""
+    name: str
+    failure_threshold: int = 5
+    recovery_timeout: float = 60.0
+
+    _failures: int = field(default=0, init=False, repr=False)
+    _last_failure_time: float = field(default=0.0, init=False, repr=False)
+    _is_open: bool = field(default=False, init=False, repr=False)
+    _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+
+    def is_available(self) -> bool:
+        """Check if circuit allows execution."""
+        with self._lock:
+            if not self._is_open:
+                return True
+            if time.time() - self._last_failure_time >= self.recovery_timeout:
+                self._is_open = False
+                self._failures = 0
+                logger.info(f"🟢 DB circuit breaker {self.name} recovered")
+                return True
+            return False
+
+    def record_success(self):
+        """Record successful execution."""
+        with self._lock:
+            self._failures = 0
+            if self._is_open:
+                self._is_open = False
+                logger.info(f"🟢 DB circuit breaker {self.name} closed")
+
+    def record_failure(self):
+        """Record failed execution."""
+        with self._lock:
+            self._failures += 1
+            self._last_failure_time = time.time()
+            if self._failures >= self.failure_threshold:
+                self._is_open = True
+                logger.warning(f"🔴 DB circuit breaker {self.name} opened (failures: {self._failures})")
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Export circuit breaker state."""
+        with self._lock:
+            return {
+                'name': self.name,
+                'is_open': self._is_open,
+                'failures': self._failures,
+                'threshold': self.failure_threshold,
+            }
+
+
+# =============================================================================
+# CONNECTION POOL
+# =============================================================================
+class SQLiteConnectionPool:
+    """
+    Thread-safe SQLite connection pool.
+
+    Provides efficient connection reuse and proper cleanup.
+    """
+
+    def __init__(self, db_path: Path, pool_size: int = 3):
+        self.db_path = db_path
+        self.pool_size = pool_size
+        self._pool: Queue = Queue(maxsize=pool_size)
+        self._lock = threading.Lock()
+        self._created_connections = 0
+        self._stats = {
+            'checkouts': 0,
+            'returns': 0,
+            'created': 0,
+            'errors': 0,
+        }
+
+        # Pre-create connections
+        for _ in range(pool_size):
+            try:
+                conn = self._create_connection()
+                self._pool.put(conn)
+                self._created_connections += 1
+                self._stats['created'] += 1
+            except Exception as e:
+                logger.warning(f"Failed to pre-create connection: {e}")
+
+    def _create_connection(self) -> sqlite3.Connection:
+        """Create a new SQLite connection with optimized settings."""
+        conn = sqlite3.connect(
+            self.db_path,
+            timeout=_metrics_config.query_timeout,
+            check_same_thread=False,  # Allow use across threads
+            isolation_level=None,  # Autocommit mode
+        )
+        conn.row_factory = sqlite3.Row
+
+        # Optimize for performance
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA cache_size=-64000")  # 64MB cache
+        conn.execute("PRAGMA temp_store=MEMORY")
+
+        return conn
+
+    @contextmanager
+    def get_connection(self, timeout: float = None):
+        """
+        Get a connection from the pool.
+
+        Usage:
+            with pool.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(...)
+        """
+        timeout = timeout or _metrics_config.query_timeout
+        conn = None
+
+        try:
+            # Try to get from pool
+            try:
+                conn = self._pool.get(timeout=timeout)
+                self._stats['checkouts'] += 1
+            except Empty:
+                # Pool exhausted - create temporary connection
+                with self._lock:
+                    logger.warning("Connection pool exhausted, creating temporary connection")
+                    conn = self._create_connection()
+                    self._stats['created'] += 1
+
+            yield conn
+
+        except Exception as e:
+            self._stats['errors'] += 1
+            raise
+
+        finally:
+            if conn is not None:
+                try:
+                    # Return to pool or close temporary connection
+                    if not self._pool.full():
+                        self._pool.put(conn)
+                        self._stats['returns'] += 1
+                    else:
+                        conn.close()
+                except Exception:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+
+    def close_all(self):
+        """Close all connections in the pool."""
+        while not self._pool.empty():
+            try:
+                conn = self._pool.get_nowait()
+                conn.close()
+            except Empty:
+                break
+            except Exception as e:
+                logger.warning(f"Error closing connection: {e}")
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Get pool statistics."""
+        return {
+            **self._stats,
+            'pool_size': self.pool_size,
+            'available': self._pool.qsize(),
+            'in_use': self._created_connections - self._pool.qsize(),
+        }
+
+
+# =============================================================================
+# ASYNC QUERY EXECUTOR
+# =============================================================================
+class AsyncQueryExecutor:
+    """
+    Execute database queries asynchronously with timeout protection.
+
+    Wraps synchronous SQLite operations with asyncio.to_thread()
+    and adds timeout protection, retry logic, and circuit breaker.
+    """
+
+    def __init__(self, pool: SQLiteConnectionPool, circuit_breaker: DatabaseCircuitBreaker):
+        self.pool = pool
+        self.circuit_breaker = circuit_breaker
+        self._executor = ThreadPoolExecutor(max_workers=_metrics_config.pool_size)
+        self._stats = {
+            'queries': 0,
+            'writes': 0,
+            'timeouts': 0,
+            'retries': 0,
+            'failures': 0,
+        }
+
+    async def execute_query(
+        self,
+        query: str,
+        params: tuple = (),
+        timeout: float = None,
+        fetch: str = 'all',  # 'all', 'one', 'none'
+    ) -> Optional[List[Dict[str, Any]]]:
+        """
+        Execute a query asynchronously with timeout protection.
+
+        Args:
+            query: SQL query string
+            params: Query parameters
+            timeout: Timeout in seconds
+            fetch: 'all' for fetchall, 'one' for fetchone, 'none' for no fetch
+
+        Returns:
+            Query results as list of dicts, or None on error
+        """
+        timeout = timeout or _metrics_config.query_timeout
+
+        # Check circuit breaker
+        if not self.circuit_breaker.is_available():
+            logger.warning("Database circuit breaker open - skipping query")
+            return None
+
+        self._stats['queries'] += 1
+
+        try:
+            result = await asyncio.wait_for(
+                asyncio.to_thread(self._execute_sync, query, params, fetch),
+                timeout=timeout
+            )
+            self.circuit_breaker.record_success()
+            return result
+
+        except asyncio.TimeoutError:
+            self._stats['timeouts'] += 1
+            self.circuit_breaker.record_failure()
+            logger.warning(f"Query timed out after {timeout}s: {query[:50]}...")
+            return None
+
+        except Exception as e:
+            self._stats['failures'] += 1
+            self.circuit_breaker.record_failure()
+            logger.error(f"Query failed: {e}")
+            return None
+
+    async def execute_write(
+        self,
+        query: str,
+        params: tuple = (),
+        timeout: float = None,
+        retry: bool = True,
+    ) -> Optional[int]:
+        """
+        Execute a write operation asynchronously with retry logic.
+
+        Args:
+            query: SQL query string
+            params: Query parameters
+            timeout: Timeout in seconds
+            retry: Whether to retry on failure
+
+        Returns:
+            Last row ID, or None on error
+        """
+        timeout = timeout or _metrics_config.write_timeout
+        max_attempts = _metrics_config.retry_attempts if retry else 1
+
+        # Check circuit breaker
+        if not self.circuit_breaker.is_available():
+            logger.warning("Database circuit breaker open - skipping write")
+            return None
+
+        self._stats['writes'] += 1
+
+        for attempt in range(max_attempts):
+            try:
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(self._execute_write_sync, query, params),
+                    timeout=timeout
+                )
+                self.circuit_breaker.record_success()
+                return result
+
+            except asyncio.TimeoutError:
+                self._stats['timeouts'] += 1
+                if attempt < max_attempts - 1:
+                    self._stats['retries'] += 1
+                    delay = _metrics_config.retry_delay * (2 ** attempt)
+                    logger.warning(f"Write timed out, retrying in {delay:.1f}s ({attempt + 1}/{max_attempts})")
+                    await asyncio.sleep(delay)
+                else:
+                    self.circuit_breaker.record_failure()
+                    logger.error(f"Write failed after {max_attempts} attempts")
+                    return None
+
+            except Exception as e:
+                if attempt < max_attempts - 1:
+                    self._stats['retries'] += 1
+                    delay = _metrics_config.retry_delay * (2 ** attempt)
+                    logger.warning(f"Write failed: {e}, retrying in {delay:.1f}s")
+                    await asyncio.sleep(delay)
+                else:
+                    self._stats['failures'] += 1
+                    self.circuit_breaker.record_failure()
+                    logger.error(f"Write failed after {max_attempts} attempts: {e}")
+                    return None
+
+        return None
+
+    def _execute_sync(self, query: str, params: tuple, fetch: str) -> Optional[List[Dict[str, Any]]]:
+        """Synchronous query execution."""
+        with self.pool.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(query, params)
+
+            if fetch == 'all':
+                rows = cursor.fetchall()
+                return [dict(row) for row in rows]
+            elif fetch == 'one':
+                row = cursor.fetchone()
+                return [dict(row)] if row else []
+            else:
+                return []
+
+    def _execute_write_sync(self, query: str, params: tuple) -> int:
+        """Synchronous write execution."""
+        with self.pool.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(query, params)
+            conn.commit()
+            return cursor.lastrowid
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Get executor statistics."""
+        return {
+            **self._stats,
+            'circuit_breaker': self.circuit_breaker.to_dict(),
+            'pool': self.pool.get_stats(),
+        }
+
+
+# =============================================================================
+# BATCH WRITER
+# =============================================================================
+class BatchWriter:
+    """
+    Batch database writes for efficiency.
+
+    Collects writes and flushes them periodically or when batch is full.
+    """
+
+    def __init__(self, executor: AsyncQueryExecutor):
+        self.executor = executor
+        self._batch: List[Tuple[str, tuple]] = []
+        self._lock = asyncio.Lock()
+        self._last_flush = time.time()
+        self._stats = {
+            'batches_flushed': 0,
+            'items_written': 0,
+            'items_dropped': 0,
+        }
+
+    async def add(self, query: str, params: tuple):
+        """Add a write to the batch."""
+        async with self._lock:
+            self._batch.append((query, params))
+
+            # Flush if batch is full
+            if len(self._batch) >= _metrics_config.max_batch_size:
+                await self._flush_batch()
+
+    async def flush(self):
+        """Force flush the current batch."""
+        async with self._lock:
+            await self._flush_batch()
+
+    async def _flush_batch(self):
+        """Flush the current batch to database."""
+        if not self._batch:
+            return
+
+        batch = self._batch.copy()
+        self._batch = []
+
+        try:
+            # Execute batch as transaction
+            success = await self.executor.execute_write(
+                "BEGIN TRANSACTION", (), retry=False
+            )
+
+            if success is not None:
+                for query, params in batch:
+                    await self.executor.execute_write(query, params, retry=False)
+                await self.executor.execute_write("COMMIT", (), retry=False)
+                self._stats['items_written'] += len(batch)
+            else:
+                self._stats['items_dropped'] += len(batch)
+
+            self._stats['batches_flushed'] += 1
+            self._last_flush = time.time()
+
+        except Exception as e:
+            logger.error(f"Batch flush failed: {e}")
+            self._stats['items_dropped'] += len(batch)
+            try:
+                await self.executor.execute_write("ROLLBACK", (), retry=False)
+            except Exception:
+                pass
+
+    async def check_flush_interval(self):
+        """Flush if interval has elapsed."""
+        if time.time() - self._last_flush >= _metrics_config.batch_flush_interval:
+            await self.flush()
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Get batch writer statistics."""
+        return {
+            **self._stats,
+            'pending': len(self._batch),
+            'last_flush': self._last_flush,
+        }
+
+
 class MetricsDatabase:
     """
-    Dual-database system for voice unlock metrics.
+    Dual-database system for voice unlock metrics v3.0.
 
     Stores metrics in both SQLite (local) and CloudSQL (cloud) for:
     - Fast local queries
     - Cloud backup
     - Historical analysis
     - Cross-device sync
+
+    Enhanced Features:
+    - Connection pooling for performance
+    - Async query execution with timeout protection
+    - Circuit breaker for database failures
+    - Transaction batching for efficiency
+    - Health monitoring and automatic recovery
     """
 
     def __init__(self, sqlite_path: str = None, use_cloud_sql: bool = True):
@@ -52,10 +513,43 @@ class MetricsDatabase:
         self.use_cloud_sql = use_cloud_sql
         self.cloud_db = None
 
-        # Initialize databases
+        # Initialize advanced infrastructure
+        self._circuit_breaker = DatabaseCircuitBreaker(
+            name='metrics_sqlite',
+            failure_threshold=_metrics_config.circuit_breaker_threshold,
+            recovery_timeout=_metrics_config.circuit_breaker_timeout,
+        )
+
+        # Initialize connection pool (lazy - created after schema init)
+        self._pool: Optional[SQLiteConnectionPool] = None
+        self._executor: Optional[AsyncQueryExecutor] = None
+        self._batch_writer: Optional[BatchWriter] = None
+
+        # Statistics
+        self._stats = {
+            'total_writes': 0,
+            'total_reads': 0,
+            'start_time': time.time(),
+        }
+
+        # Initialize databases (creates schema)
         self._init_sqlite()
+
+        # Now initialize connection pool with existing database
+        self._init_pool()
+
         if self.use_cloud_sql:
             self._init_cloud_sql()
+
+    def _init_pool(self):
+        """Initialize connection pool and async executor."""
+        self._pool = SQLiteConnectionPool(
+            self.sqlite_path,
+            pool_size=_metrics_config.pool_size
+        )
+        self._executor = AsyncQueryExecutor(self._pool, self._circuit_breaker)
+        self._batch_writer = BatchWriter(self._executor)
+        logger.info(f"✅ Metrics database pool initialized (size: {_metrics_config.pool_size})")
 
     def _init_sqlite(self):
         """Initialize SQLite database with schema"""
@@ -1249,7 +1743,7 @@ class MetricsDatabase:
         limit: int = 100
     ) -> List[Dict[str, Any]]:
         """
-        Query unlock attempts from database.
+        Query unlock attempts from database (async with timeout protection).
 
         Args:
             speaker_name: Filter by speaker
@@ -1261,9 +1755,7 @@ class MetricsDatabase:
         Returns:
             List of unlock attempt dictionaries
         """
-        conn = sqlite3.connect(self.sqlite_path)
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
+        self._stats['total_reads'] += 1
 
         query = "SELECT * FROM unlock_attempts WHERE 1=1"
         params = []
@@ -1286,11 +1778,150 @@ class MetricsDatabase:
         query += " ORDER BY timestamp DESC LIMIT ?"
         params.append(limit)
 
+        # Use async executor with timeout protection
+        if self._executor:
+            result = await self._executor.execute_query(query, tuple(params), fetch='all')
+            return result or []
+        else:
+            # Fallback to thread-wrapped sync
+            return await asyncio.to_thread(self._query_attempts_sync, query, tuple(params))
+
+    def _query_attempts_sync(self, query: str, params: tuple) -> List[Dict[str, Any]]:
+        """Synchronous fallback for query_attempts."""
+        conn = sqlite3.connect(self.sqlite_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
         cursor.execute(query, params)
         results = [dict(row) for row in cursor.fetchall()]
-
         conn.close()
         return results
+
+    async def health_check(self) -> Dict[str, Any]:
+        """
+        Comprehensive health check for the metrics database.
+
+        Returns health status with component details.
+        """
+        issues = []
+        components = {}
+
+        # Check circuit breaker
+        components['circuit_breaker'] = self._circuit_breaker.to_dict()
+        if self._circuit_breaker._is_open:
+            issues.append("Circuit breaker is open")
+
+        # Check connection pool
+        if self._pool:
+            pool_stats = self._pool.get_stats()
+            components['connection_pool'] = pool_stats
+            if pool_stats['errors'] > pool_stats['checkouts'] * 0.1:  # >10% error rate
+                issues.append("High connection pool error rate")
+        else:
+            components['connection_pool'] = {'error': 'Not initialized'}
+            issues.append("Connection pool not initialized")
+
+        # Check executor
+        if self._executor:
+            exec_stats = self._executor.get_stats()
+            components['query_executor'] = exec_stats
+            timeout_rate = exec_stats['timeouts'] / exec_stats['queries'] if exec_stats['queries'] > 0 else 0
+            if timeout_rate > 0.1:  # >10% timeout rate
+                issues.append(f"High query timeout rate: {timeout_rate:.1%}")
+        else:
+            components['query_executor'] = {'error': 'Not initialized'}
+            issues.append("Query executor not initialized")
+
+        # Check batch writer
+        if self._batch_writer:
+            components['batch_writer'] = self._batch_writer.get_stats()
+        else:
+            components['batch_writer'] = {'error': 'Not initialized'}
+
+        # Check database file
+        try:
+            db_size = self.sqlite_path.stat().st_size / (1024 * 1024)  # MB
+            components['database_file'] = {
+                'path': str(self.sqlite_path),
+                'size_mb': round(db_size, 2),
+                'exists': True,
+            }
+            if db_size > 500:  # Warn if >500MB
+                issues.append(f"Database size is large: {db_size:.0f}MB")
+        except Exception as e:
+            components['database_file'] = {'error': str(e)}
+            issues.append(f"Database file error: {e}")
+
+        # Test database connectivity
+        try:
+            result = await self._executor.execute_query(
+                "SELECT COUNT(*) as count FROM unlock_attempts",
+                timeout=2.0,
+                fetch='one'
+            )
+            if result:
+                components['connectivity'] = {
+                    'connected': True,
+                    'record_count': result[0]['count'] if result else 0,
+                }
+            else:
+                components['connectivity'] = {'connected': False}
+                issues.append("Database connectivity test failed")
+        except Exception as e:
+            components['connectivity'] = {'error': str(e)}
+            issues.append(f"Database connectivity error: {e}")
+
+        # Calculate overall health
+        healthy = len(issues) == 0
+        health_score = 1.0 - (len(issues) * 0.2)  # Each issue reduces score by 20%
+        health_score = max(0.0, health_score)
+
+        # Calculate uptime
+        uptime = time.time() - self._stats['start_time']
+
+        return {
+            'healthy': healthy,
+            'score': round(health_score, 2),
+            'message': "All systems operational" if healthy else f"Issues: {', '.join(issues)}",
+            'components': components,
+            'issues': issues,
+            'stats': {
+                **self._stats,
+                'uptime_seconds': round(uptime, 1),
+            },
+            'last_check': datetime.now().isoformat(),
+        }
+
+    async def close(self):
+        """Close all database connections and flush pending writes."""
+        logger.info("Closing metrics database...")
+
+        # Flush pending batch writes
+        if self._batch_writer:
+            await self._batch_writer.flush()
+
+        # Close connection pool
+        if self._pool:
+            self._pool.close_all()
+
+        logger.info("Metrics database closed")
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Get comprehensive database statistics."""
+        stats = {
+            **self._stats,
+            'uptime_seconds': round(time.time() - self._stats['start_time'], 1),
+        }
+
+        if self._executor:
+            stats['executor'] = self._executor.get_stats()
+
+        if self._batch_writer:
+            stats['batch_writer'] = self._batch_writer.get_stats()
+
+        if self._pool:
+            stats['pool'] = self._pool.get_stats()
+
+        return stats
 
     # 🤖 CONTINUOUS LEARNING METHODS
 
