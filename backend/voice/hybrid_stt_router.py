@@ -150,35 +150,75 @@ class HybridSTTRouter:
         """
         Prewarm Whisper model to eliminate first-request latency.
 
-        This loads the Whisper model into memory during initialization,
-        so the first transcription request doesn't incur model load time.
-        Runs in a thread pool to avoid blocking the event loop.
+        ROBUST ASYNC IMPLEMENTATION:
+        - Non-blocking with strict timeout enforcement
+        - Graceful degradation on failure (service continues without prewarm)
+        - Background completion handler for timeout cases
+        - Cancellation-safe with proper cleanup
+        - Never blocks the voice unlock flow
         """
         async with self._prewarm_lock:
             if self._whisper_prewarmed:
                 return
 
+            prewarm_start = time.time()
+            prewarm_task = None
+
             try:
-                logger.info("🔥 Prewarming Whisper model (background)...")
-                prewarm_start = time.time()
+                logger.info("🔥 Prewarming Whisper model (async, non-blocking)...")
 
                 # Import and cache the WhisperAudioHandler singleton
                 from .whisper_audio_fix import _whisper_handler
 
-                # Load model asynchronously with proper non-blocking implementation
-                # Using load_model_async() instead of wrapping sync load_model()
-                await _whisper_handler.load_model_async(timeout=MODEL_PREWARM_TIMEOUT)
+                # Create a cancellable task for the prewarm operation
+                async def _do_prewarm():
+                    await _whisper_handler.load_model_async(timeout=MODEL_PREWARM_TIMEOUT)
+                    return _whisper_handler
 
-                self._whisper_handler = _whisper_handler
+                prewarm_task = asyncio.create_task(_do_prewarm())
+
+                # Wait with strict timeout - shield prevents cancellation propagation
+                self._whisper_handler = await asyncio.wait_for(
+                    asyncio.shield(prewarm_task),
+                    timeout=MODEL_PREWARM_TIMEOUT
+                )
                 self._whisper_prewarmed = True
 
                 prewarm_time = (time.time() - prewarm_start) * 1000
                 logger.info(f"✅ Whisper model prewarmed in {prewarm_time:.0f}ms")
 
             except asyncio.TimeoutError:
-                logger.warning(f"⏱️ Whisper prewarm timed out after {MODEL_PREWARM_TIMEOUT}s (will load on first use)")
+                elapsed = (time.time() - prewarm_start) * 1000
+                logger.warning(
+                    f"⏱️ Whisper prewarm timed out after {elapsed:.0f}ms "
+                    f"(continuing without prewarm - will load on first use)"
+                )
+                # Let background task complete for future requests
+                if prewarm_task and not prewarm_task.done():
+                    prewarm_task.add_done_callback(self._handle_background_prewarm)
+
+            except asyncio.CancelledError:
+                logger.info("🚫 Whisper prewarm cancelled")
+                if prewarm_task and not prewarm_task.done():
+                    prewarm_task.cancel()
+                raise
+
             except Exception as e:
-                logger.warning(f"⚠️ Whisper prewarm failed: {e} (will load on first use)")
+                elapsed = (time.time() - prewarm_start) * 1000
+                logger.warning(f"⚠️ Whisper prewarm failed after {elapsed:.0f}ms: {e}")
+
+    def _handle_background_prewarm(self, task: asyncio.Task):
+        """Handle background prewarm completion after timeout."""
+        try:
+            if task.cancelled() or task.exception():
+                return
+            result = task.result()
+            if result and not self._whisper_prewarmed:
+                self._whisper_handler = result
+                self._whisper_prewarmed = True
+                logger.info("✅ Whisper prewarmed (background completion)")
+        except Exception:
+            pass  # Silently ignore background failures
 
     def _check_circuit_breaker(self, engine_name: str) -> bool:
         """
