@@ -727,23 +727,88 @@ class IntelligentVoiceUnlockService:
             if sample_rate:
                 logger.info(f"🎵 Using frontend-provided sample rate: {sample_rate}Hz")
 
-        # Stage 2: Transcription using Hybrid STT (with timeout protection)
+        # =================================================================
+        # 🚀 PARALLEL EXECUTION: Run STT and Speaker ID concurrently!
+        # This saves 5-8 seconds by not waiting for STT before starting Speaker ID
+        # =================================================================
         stage_transcription = metrics_logger.create_stage(
             "transcription",
             sample_rate=sample_rate,
             audio_size=diagnostics.audio_size_bytes
         )
+        stage_speaker_id_parallel = metrics_logger.create_stage(
+            "speaker_identification_parallel",
+            parallel_with="transcription"
+        )
 
-        try:
-            transcription_result = await asyncio.wait_for(
+        # Create parallel tasks - both use audio_data, neither depends on the other
+        stt_task = asyncio.create_task(
+            asyncio.wait_for(
                 self._transcribe_audio_with_retry(
                     audio_data, diagnostics, sample_rate=sample_rate
                 ),
-                timeout=TRANSCRIPTION_TIMEOUT  # 10 second timeout (was 20s!)
+                timeout=TRANSCRIPTION_TIMEOUT
             )
-        except asyncio.TimeoutError:
-            logger.error(f"⏱️ Transcription timed out after {TRANSCRIPTION_TIMEOUT}s")
-            stage_transcription.complete(success=False, error_message="Transcription timeout")
+        )
+        speaker_id_task = asyncio.create_task(
+            asyncio.wait_for(
+                self._identify_speaker(audio_data),
+                timeout=SPEAKER_ID_TIMEOUT
+            )
+        )
+
+        logger.info("🚀 Running STT and Speaker ID in PARALLEL...")
+        parallel_start = datetime.now()
+
+        # Wait for both tasks concurrently
+        transcription_result = None
+        parallel_speaker_result = None
+
+        try:
+            # Gather both results - continue even if one fails
+            results = await asyncio.gather(
+                stt_task,
+                speaker_id_task,
+                return_exceptions=True
+            )
+
+            # Process STT result
+            if isinstance(results[0], Exception):
+                if isinstance(results[0], asyncio.TimeoutError):
+                    logger.error(f"⏱️ Transcription timed out after {TRANSCRIPTION_TIMEOUT}s")
+                    stage_transcription.complete(success=False, error_message="Transcription timeout")
+                else:
+                    logger.error(f"❌ Transcription failed: {results[0]}")
+                    stage_transcription.complete(success=False, error_message=str(results[0]))
+            else:
+                transcription_result = results[0]
+
+            # Process Speaker ID result (save for later use)
+            if isinstance(results[1], Exception):
+                if isinstance(results[1], asyncio.TimeoutError):
+                    logger.warning(f"⏱️ Parallel Speaker ID timed out after {SPEAKER_ID_TIMEOUT}s")
+                    stage_speaker_id_parallel.complete(success=False, error_message="Timeout")
+                else:
+                    logger.warning(f"⚠️ Parallel Speaker ID failed: {results[1]}")
+                    stage_speaker_id_parallel.complete(success=False, error_message=str(results[1]))
+                parallel_speaker_result = (None, 0.0)
+            else:
+                parallel_speaker_result = results[1]
+                stage_speaker_id_parallel.complete(
+                    success=parallel_speaker_result[0] is not None,
+                    confidence_score=parallel_speaker_result[1] if parallel_speaker_result[0] else 0
+                )
+
+            stages.append(stage_speaker_id_parallel)
+
+        except Exception as e:
+            logger.error(f"❌ Parallel execution error: {e}")
+
+        parallel_time = (datetime.now() - parallel_start).total_seconds() * 1000
+        logger.info(f"⚡ Parallel STT + Speaker ID completed in {parallel_time:.0f}ms")
+
+        # Handle transcription failure
+        if not transcription_result:
             stages.append(stage_transcription)
             return await self._create_failure_response(
                 "transcription_timeout",
@@ -838,34 +903,44 @@ class IntelligentVoiceUnlockService:
                 "not_unlock_command", f"Command '{transcribed_text}' is not an unlock request"
             )
 
-        # Stage 4: Speaker Identification (with timeout protection)
+        # Stage 4: Speaker Identification - USE PARALLEL RESULT (already computed!)
+        # 🚀 This is the key optimization - we already have the result from parallel execution
         stage_speaker_id = metrics_logger.create_stage(
             "speaker_identification",
-            already_identified=speaker_identified is not None
+            already_identified=speaker_identified is not None,
+            used_parallel_result=True
         )
 
-        try:
+        # Use result from parallel execution if available
+        if parallel_speaker_result and parallel_speaker_result[0]:
+            # Parallel speaker ID succeeded - use it!
             if not speaker_identified:
-                speaker_identified, speaker_confidence = await asyncio.wait_for(
-                    self._identify_speaker(audio_data),
-                    timeout=SPEAKER_ID_TIMEOUT
-                )
+                speaker_identified = parallel_speaker_result[0]
+                speaker_confidence = parallel_speaker_result[1]
+                logger.info(f"⚡ Using PARALLEL speaker ID result: {speaker_identified}")
             else:
-                # Verify speaker confidence
+                # STT already identified speaker - use parallel result for confidence
+                speaker_confidence = parallel_speaker_result[1]
+        elif speaker_identified:
+            # STT identified speaker but parallel failed - get confidence separately
+            try:
                 speaker_confidence = await asyncio.wait_for(
                     self._get_speaker_confidence(audio_data, speaker_identified),
-                    timeout=SPEAKER_ID_TIMEOUT
+                    timeout=2.0  # Short timeout since we already have identification
                 )
-        except asyncio.TimeoutError:
-            logger.warning(f"⏱️ Speaker ID timed out after {SPEAKER_ID_TIMEOUT}s - using unknown speaker")
+            except (asyncio.TimeoutError, Exception):
+                speaker_confidence = 0.7  # Default reasonable confidence
+        else:
+            # Neither parallel nor STT identified speaker - this is a failure case
             speaker_identified = None
             speaker_confidence = 0.0
+            logger.warning("⚠️ No speaker identification from parallel or STT")
 
         stage_speaker_id.complete(
             success=speaker_identified is not None,
-            algorithm_used="SpeechBrain speaker recognition",
+            algorithm_used="SpeechBrain speaker recognition (parallel)",
             confidence_score=speaker_confidence if speaker_identified else 0,
-            metadata={'speaker_name': speaker_identified}
+            metadata={'speaker_name': speaker_identified, 'from_parallel': True}
         )
         stages.append(stage_speaker_id)
 

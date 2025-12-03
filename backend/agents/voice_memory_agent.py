@@ -33,6 +33,20 @@ from voice.speaker_verification_service import get_speaker_verification_service
 
 logger = logging.getLogger(__name__)
 
+# Invalid speaker names that should never be stored - NO hardcoding real names!
+INVALID_SPEAKER_NAMES = frozenset({
+    'unknown', 'test', 'placeholder', 'anonymous', 'guest',
+    'none', 'null', 'undefined', '', ' ', 'user', 'default',
+    'speaker', 'voice', 'sample', 'temp', 'temporary'
+})
+
+
+def is_valid_speaker_name(name: str) -> bool:
+    """Check if a speaker name is valid (not in blocklist)"""
+    if not name or not isinstance(name, str):
+        return False
+    return name.lower().strip() not in INVALID_SPEAKER_NAMES
+
 
 class VoiceMemoryAgent:
     """
@@ -121,19 +135,34 @@ class VoiceMemoryAgent:
         logger.info("✅ Voice Memory Agent initialized")
 
     async def _load_persistent_memory(self):
-        """Load persistent voice memory from disk"""
+        """Load persistent voice memory from disk with validation"""
         try:
             if self.memory_file.exists():
                 import json
                 with open(self.memory_file, 'r') as f:
                     data = json.load(f)
 
-                self.voice_memory = data.get('voice_memory', {})
+                # Filter out invalid speaker names when loading
+                raw_memory = data.get('voice_memory', {})
+                self.voice_memory = {
+                    k: v for k, v in raw_memory.items()
+                    if is_valid_speaker_name(k)
+                }
+
+                # Log any filtered profiles
+                filtered = set(raw_memory.keys()) - set(self.voice_memory.keys())
+                if filtered:
+                    logger.info(f"🚫 Filtered {len(filtered)} invalid profiles: {filtered}")
+
                 self.last_interaction = {
                     k: datetime.fromisoformat(v)
                     for k, v in data.get('last_interaction', {}).items()
+                    if is_valid_speaker_name(k)
                 }
-                self.interaction_count = data.get('interaction_count', {})
+                self.interaction_count = {
+                    k: v for k, v in data.get('interaction_count', {}).items()
+                    if is_valid_speaker_name(k)
+                }
                 self.last_freshness_check = (
                     datetime.fromisoformat(data['last_freshness_check'])
                     if data.get('last_freshness_check') else None
@@ -144,18 +173,26 @@ class VoiceMemoryAgent:
             logger.warning(f"Could not load persistent memory: {e}")
 
     async def _save_persistent_memory(self):
-        """Save voice memory to disk"""
+        """Save voice memory to disk with validation"""
         try:
             import json
             self.memory_file.parent.mkdir(parents=True, exist_ok=True)
 
+            # Filter out invalid speaker names before saving
             data = {
-                'voice_memory': self.voice_memory,
+                'voice_memory': {
+                    k: v for k, v in self.voice_memory.items()
+                    if is_valid_speaker_name(k)
+                },
                 'last_interaction': {
                     k: v.isoformat()
                     for k, v in self.last_interaction.items()
+                    if is_valid_speaker_name(k)
                 },
-                'interaction_count': self.interaction_count,
+                'interaction_count': {
+                    k: v for k, v in self.interaction_count.items()
+                    if is_valid_speaker_name(k)
+                },
                 'last_freshness_check': (
                     self.last_freshness_check.isoformat()
                     if self.last_freshness_check else None
@@ -171,27 +208,40 @@ class VoiceMemoryAgent:
             logger.error(f"Failed to save persistent memory: {e}")
 
     async def _load_voice_profiles(self):
-        """Load all voice profiles into memory"""
+        """Load all voice profiles into memory with validation"""
         try:
             profiles = await self.learning_db.get_all_speaker_profiles()
+            loaded_count = 0
+            skipped_count = 0
 
             for profile in profiles:
                 speaker_name = profile.get('speaker_name')
-                if speaker_name:
-                    # Cache voice characteristics in memory
-                    self.voice_memory[speaker_name] = {
-                        'speaker_id': profile.get('speaker_id'),
-                        'total_samples': profile.get('total_samples', 0),
-                        'last_trained': profile.get('last_trained'),
-                        'confidence': profile.get('avg_confidence', 0.0),
-                        'loaded_at': datetime.now().isoformat()
-                    }
 
-                    # Initialize interaction tracking
-                    if speaker_name not in self.interaction_count:
-                        self.interaction_count[speaker_name] = 0
+                # Validate speaker name - reject invalid names
+                if not is_valid_speaker_name(speaker_name):
+                    logger.debug(f"🚫 Skipping invalid speaker name: '{speaker_name}'")
+                    skipped_count += 1
+                    continue
 
-            logger.info(f"🎤 Loaded {len(self.voice_memory)} voice profiles into memory")
+                # Cache voice characteristics in memory
+                self.voice_memory[speaker_name] = {
+                    'speaker_id': profile.get('speaker_id'),
+                    'total_samples': profile.get('total_samples', 0),
+                    'last_trained': profile.get('last_trained'),
+                    'confidence': profile.get('avg_confidence', 0.0),
+                    'loaded_at': datetime.now().isoformat()
+                }
+
+                # Initialize interaction tracking
+                if speaker_name not in self.interaction_count:
+                    self.interaction_count[speaker_name] = 0
+
+                loaded_count += 1
+
+            if skipped_count > 0:
+                logger.info(f"🚫 Skipped {skipped_count} invalid speaker profile(s)")
+
+            logger.info(f"🎤 Loaded {loaded_count} valid voice profiles into memory")
 
         except Exception as e:
             logger.error(f"Failed to load voice profiles: {e}")
