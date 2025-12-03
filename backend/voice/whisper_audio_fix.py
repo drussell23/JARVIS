@@ -18,6 +18,8 @@ import asyncio
 import soundfile as sf
 import io
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 try:
     import librosa
@@ -45,10 +47,21 @@ class WhisperAudioHandler:
     - VAD filtering (WebRTC-VAD + Silero VAD)
     - Audio windowing (5s global, 2s unlock)
     - Silence removal before transcription
+    - Non-blocking async model loading with thread pool
     """
+
+    # Constants for async loading
+    MODEL_LOAD_TIMEOUT = 120.0  # 2 minutes timeout for model loading
 
     def __init__(self):
         self.model = None
+        self._model_loading = False
+        self._model_load_lock = threading.Lock()
+        self._async_model_load_lock = asyncio.Lock() if asyncio.get_event_loop().is_running() else None
+        self._model_load_event = threading.Event()
+
+        # Thread pool for CPU-bound model loading (avoid blocking event loop)
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="whisper_loader")
 
         # Initialize VAD pipeline (lazy-loaded)
         self.vad_pipeline = None
@@ -291,12 +304,103 @@ class WhisperAudioHandler:
         return await asyncio.to_thread(_normalize_sync)
 
     def load_model(self):
-        """Load Whisper model"""
-        if self.model is None:
-            logger.info("Loading Whisper model...")
+        """
+        Load Whisper model synchronously (for backward compatibility).
+
+        WARNING: This is a blocking call. In async contexts, use load_model_async() instead.
+        """
+        if self.model is not None:
+            return self.model
+
+        with self._model_load_lock:
+            # Double-check after acquiring lock
+            if self.model is not None:
+                return self.model
+
+            logger.info("Loading Whisper model (synchronous)...")
             self.model = whisper.load_model("base")
-            logger.info("✅ Whisper model loaded")
+            logger.info("Whisper model loaded")
+
         return self.model
+
+    async def load_model_async(self, timeout: float = None) -> bool:
+        """
+        Load Whisper model asynchronously without blocking the event loop.
+
+        Uses a thread pool executor to offload the CPU-bound model loading
+        to a background thread, keeping the event loop responsive.
+
+        Args:
+            timeout: Maximum time to wait for model loading (default: MODEL_LOAD_TIMEOUT)
+
+        Returns:
+            True if model loaded successfully, False otherwise
+        """
+        if self.model is not None:
+            return True
+
+        timeout = timeout or self.MODEL_LOAD_TIMEOUT
+
+        # Ensure async lock exists (lazy initialization for when event loop wasn't running at init)
+        if self._async_model_load_lock is None:
+            self._async_model_load_lock = asyncio.Lock()
+
+        async with self._async_model_load_lock:
+            # Double-check after acquiring async lock
+            if self.model is not None:
+                return True
+
+            # Check if another thread is already loading
+            if self._model_loading:
+                logger.info("Whisper model already being loaded, waiting...")
+                # Wait for the loading to complete with timeout
+                try:
+                    await asyncio.wait_for(
+                        asyncio.get_event_loop().run_in_executor(
+                            None,
+                            lambda: self._model_load_event.wait(timeout)
+                        ),
+                        timeout=timeout
+                    )
+                    return self.model is not None
+                except asyncio.TimeoutError:
+                    logger.error(f"Timeout waiting for Whisper model to load ({timeout}s)")
+                    return False
+
+            # Set loading flag
+            self._model_loading = True
+            self._model_load_event.clear()
+
+            try:
+                logger.info("Loading Whisper model (async, non-blocking)...")
+
+                def _load_model_sync():
+                    """Synchronous model loading function for thread pool."""
+                    return whisper.load_model("base")
+
+                # Run in thread pool to avoid blocking event loop
+                loop = asyncio.get_running_loop()
+                self.model = await asyncio.wait_for(
+                    loop.run_in_executor(self._executor, _load_model_sync),
+                    timeout=timeout
+                )
+
+                logger.info("Whisper model loaded (async)")
+                return True
+
+            except asyncio.TimeoutError:
+                logger.error(f"Whisper model loading timed out after {timeout}s")
+                return False
+            except Exception as e:
+                logger.error(f"Failed to load Whisper model: {e}")
+                return False
+            finally:
+                self._model_loading = False
+                self._model_load_event.set()
+
+    def is_model_loaded(self) -> bool:
+        """Check if the Whisper model is already loaded."""
+        return self.model is not None
 
     def decode_audio_data(self, audio_data):
         """Convert any input format to bytes"""
@@ -463,6 +567,7 @@ class WhisperAudioHandler:
         - VAD filtering (WebRTC-VAD + Silero VAD) to remove silence/noise
         - Windowing/truncation (5s global, 2s unlock, 3s command)
         - Mode-aware optimization for ultra-low latency
+        - Non-blocking async model loading
 
         Args:
             audio_data: Audio bytes or base64 string
@@ -474,8 +579,14 @@ class WhisperAudioHandler:
                   - 'command': Command detection (3s window)
         """
 
-        # Load model if needed
-        model = self.load_model()
+        # Load model asynchronously (non-blocking) if not already loaded
+        if not self.is_model_loaded():
+            model_loaded = await self.load_model_async()
+            if not model_loaded:
+                logger.error("Failed to load Whisper model for transcription")
+                return None
+
+        model = self.model
 
         try:
             # Convert to bytes
