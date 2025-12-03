@@ -1018,6 +1018,56 @@ async def load_voice_auth():
                 except Exception as e:
                     logger.warning(f"[WARMUP] ⚠️ Could not pre-warm STT: {e}")
 
+            # 🔐 CRITICAL: Pre-load unified voice cache with Derek's voiceprint
+            logger.info("[WARMUP] 🔐 Pre-loading unified voice cache...")
+            try:
+                from voice_unlock.unified_voice_cache_manager import get_unified_voice_cache
+                unified_cache = await get_unified_voice_cache()
+
+                if unified_cache:
+                    profiles_count = unified_cache.profiles_loaded
+                    cache_state = unified_cache.state.value if hasattr(unified_cache.state, 'value') else str(unified_cache.state)
+
+                    if profiles_count > 0:
+                        logger.info(
+                            f"[WARMUP] ✅ Unified voice cache ready: "
+                            f"{profiles_count} profile(s), state={cache_state}"
+                        )
+                        # Log profile names for verification
+                        for name, profile in unified_cache.get_preloaded_profiles().items():
+                            owner_tag = " [OWNER]" if profile.source == "learning_database" else ""
+                            logger.info(
+                                f"[WARMUP]    └─ {name}{owner_tag} "
+                                f"(dim={profile.embedding_dimensions}, samples={profile.total_samples})"
+                            )
+                    else:
+                        logger.warning(
+                            f"[WARMUP] ⚠️ Unified voice cache has NO profiles! "
+                            f"Voice unlock will fail. state={cache_state}"
+                        )
+                else:
+                    logger.warning("[WARMUP] ⚠️ Unified voice cache is None")
+
+            except ImportError as e:
+                logger.warning(f"[WARMUP] ⚠️ Unified voice cache module not available: {e}")
+            except Exception as e:
+                logger.warning(f"[WARMUP] ⚠️ Unified voice cache error: {e}")
+
+            # 🧠 Pre-load Voice Biometric Intelligence
+            logger.info("[WARMUP] 🧠 Pre-loading Voice Biometric Intelligence...")
+            try:
+                from voice_unlock.voice_biometric_intelligence import get_voice_biometric_intelligence
+                vbi = await get_voice_biometric_intelligence()
+
+                if vbi and vbi._unified_cache: 
+                    vbi_profiles = vbi._unified_cache.profiles_loaded
+                    logger.info(f"[WARMUP] ✅ Voice Biometric Intelligence ready ({vbi_profiles} profiles)")
+                else:
+                    logger.warning("[WARMUP] ⚠️ Voice Biometric Intelligence has no cache")
+
+            except Exception as e:
+                logger.warning(f"[WARMUP] ⚠️ VBI pre-load error: {e}")
+
         elapsed = asyncio.get_event_loop().time() - start_time
         logger.info(f"[WARMUP] ✅ Voice auth ready in {elapsed:.2f}s")
         return service
@@ -1052,14 +1102,38 @@ async def check_voice_auth_health(service) -> bool:
             except:
                 pass
 
-        is_healthy = has_stt and has_speaker and has_profiles
+        # 🔐 Check unified voice cache for preloaded profiles (critical for fast unlock!)
+        has_cache_profiles = False
+        cache_profile_count = 0
+        try:
+            from voice_unlock.unified_voice_cache_manager import get_unified_cache_manager
+            cache = get_unified_cache_manager()
+            if cache:
+                cache_profile_count = cache.profiles_loaded
+                has_cache_profiles = cache_profile_count > 0
+        except:
+            pass
+
+        # 🧠 Check VBI is ready
+        has_vbi = False
+        try:
+            if hasattr(service, 'voice_biometric_intelligence') and service.voice_biometric_intelligence:
+                has_vbi = True
+        except:
+            pass
+
+        is_healthy = has_stt and has_speaker and has_profiles and has_cache_profiles
 
         if is_healthy:
-            logger.info("[WARMUP] ✅ Voice auth health check PASSED")
+            logger.info(
+                f"[WARMUP] ✅ Voice auth health check PASSED "
+                f"(cache: {cache_profile_count} profiles, VBI: {has_vbi})"
+            )
         else:
             logger.warning(
                 f"[WARMUP] ⚠️ Voice auth health check DEGRADED "
-                f"(STT: {has_stt}, Speaker: {has_speaker}, Profiles: {has_profiles})"
+                f"(STT: {has_stt}, Speaker: {has_speaker}, "
+                f"Profiles: {has_profiles}, CacheProfiles: {has_cache_profiles}, VBI: {has_vbi})"
             )
 
         return is_healthy
