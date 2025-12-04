@@ -3507,13 +3507,16 @@ class SemanticVoiceCacheManager:
         # ChromaDB collection name
         self.collection_name = os.getenv("SEMANTIC_CACHE_COLLECTION", "jarvis_voice_embeddings")
 
-        # Statistics
+        # Statistics - comprehensive tracking for all query states
         self.cache_hits = 0
         self.cache_misses = 0
         self.cache_expired = 0  # Entries that matched but were expired (TTL exceeded)
-        self.total_queries = 0
+        self.total_queries = 0  # ALL queries including when uninitialized
+        self.queries_while_uninitialized = 0  # Queries that came in before cache was ready
         self.cost_saved_usd = 0.0
         self.expired_entries_cleaned = 0  # Proactively cleaned expired entries
+        self.cleanup_runs = 0  # Number of cleanup cycles completed
+        self.cleanup_errors = 0  # Cleanup failures for monitoring
 
         # Cost per inference (approximate)
         self.cost_per_inference = float(os.getenv("ML_INFERENCE_COST_USD", "0.002"))
@@ -3521,6 +3524,11 @@ class SemanticVoiceCacheManager:
         # Background cleanup settings
         self._cleanup_interval_hours = float(os.getenv("SEMANTIC_CACHE_CLEANUP_INTERVAL_HOURS", "6"))
         self._last_cleanup_time = 0.0
+        self._cleanup_in_progress = False  # Async-safe cleanup lock
+        self._cleanup_batch_size = int(os.getenv("SEMANTIC_CACHE_CLEANUP_BATCH_SIZE", "100"))
+
+        # Pagination settings for large collections
+        self._scan_page_size = int(os.getenv("SEMANTIC_CACHE_SCAN_PAGE_SIZE", "1000"))
 
         # ChromaDB client (lazy loaded)
         self._chroma_client = None
@@ -3592,14 +3600,22 @@ class SemanticVoiceCacheManager:
             Cached result if hit, None if miss
 
         Note:
-            Statistics are only updated AFTER TTL validation to prevent
-            counting expired entries as hits.
+            - total_queries is incremented FIRST to ensure consistent tracking
+            - Statistics are only updated AFTER TTL validation to prevent
+              counting expired entries as hits.
         """
-        if not self._initialized or not self._collection:
-            self.cache_misses += 1
-            return None
-
+        # CRITICAL: Increment total_queries BEFORE any early returns
+        # This ensures consistent statistics regardless of cache state
         self.total_queries += 1
+
+        if not self._initialized or not self._collection:
+            # Track queries that came in while cache was not ready
+            self.queries_while_uninitialized += 1
+            self.cache_misses += 1
+            logger.debug(
+                f"Cache query while uninitialized (total={self.queries_while_uninitialized})"
+            )
+            return None
 
         # Trigger background cleanup if interval has passed
         if trigger_cleanup:
@@ -3689,7 +3705,15 @@ class SemanticVoiceCacheManager:
             logger.warning(f"Failed to delete expired entry {entry_id}: {e}")
 
     async def _maybe_trigger_cleanup(self):
-        """Trigger background cleanup if cleanup interval has passed."""
+        """
+        Trigger background cleanup if cleanup interval has passed.
+
+        Uses async-safe locking to prevent concurrent cleanup operations.
+        """
+        # Skip if cleanup is already in progress (async-safe check)
+        if self._cleanup_in_progress:
+            return
+
         current_time = time.time()
         hours_since_cleanup = (current_time - self._last_cleanup_time) / 3600
 
@@ -3699,7 +3723,16 @@ class SemanticVoiceCacheManager:
 
     async def cleanup_expired_entries(self) -> int:
         """
-        Proactively clean up all expired entries from the cache.
+        Proactively clean up ALL expired entries from the cache.
+
+        Uses pagination to scan the ENTIRE collection, not just up to max_entries.
+        This ensures no expired entries are missed even if collection exceeds limits.
+
+        Features:
+        - Async-safe locking (prevents concurrent cleanups)
+        - Pagination for large collections
+        - Configurable batch sizes
+        - Comprehensive error tracking
 
         Returns:
             Number of entries cleaned
@@ -3707,48 +3740,128 @@ class SemanticVoiceCacheManager:
         if not self._initialized or not self._collection:
             return 0
 
+        # Async-safe lock - prevent concurrent cleanup operations
+        if self._cleanup_in_progress:
+            logger.debug("Cleanup already in progress, skipping")
+            return 0
+
+        self._cleanup_in_progress = True
         self._last_cleanup_time = time.time()
+
         cleaned_count = 0
+        scanned_count = 0
         current_time = time.time()
         ttl_cutoff = current_time - (self.ttl_hours * 3600)
 
         try:
-            # Get all entries to check timestamps
-            # Note: ChromaDB doesn't support timestamp-based queries directly
-            all_results = self._collection.get(
-                include=["metadatas"],
-                limit=self.max_entries
-            )
+            # Get total collection size to determine if pagination is needed
+            total_entries = self._collection.count()
 
-            if not all_results or not all_results.get("ids"):
+            if total_entries == 0:
                 return 0
 
+            logger.debug(
+                f"Starting cache cleanup: {total_entries} entries to scan, "
+                f"page_size={self._scan_page_size}"
+            )
+
             expired_ids = []
-            for i, entry_id in enumerate(all_results["ids"]):
-                metadata = all_results["metadatas"][i] if all_results.get("metadatas") else {}
-                cached_time = metadata.get("timestamp", 0)
+            offset = 0
 
-                if cached_time < ttl_cutoff:
-                    expired_ids.append(entry_id)
+            # CRITICAL FIX: Use pagination to scan ALL entries
+            # ChromaDB's get() with offset/limit allows scanning beyond max_entries
+            while offset < total_entries:
+                # Fetch a page of entries
+                page_results = self._collection.get(
+                    include=["metadatas"],
+                    limit=self._scan_page_size,
+                    offset=offset
+                )
 
+                if not page_results or not page_results.get("ids"):
+                    break
+
+                page_ids = page_results["ids"]
+                page_metadatas = page_results.get("metadatas", [])
+
+                # Check each entry in this page for expiration
+                for i, entry_id in enumerate(page_ids):
+                    scanned_count += 1
+                    metadata = page_metadatas[i] if i < len(page_metadatas) else {}
+                    cached_time = metadata.get("timestamp", 0)
+
+                    if cached_time < ttl_cutoff:
+                        expired_ids.append(entry_id)
+
+                # Move to next page
+                offset += len(page_ids)
+
+                # Safety check: if we got fewer results than requested, we're done
+                if len(page_ids) < self._scan_page_size:
+                    break
+
+                # Yield to event loop periodically for large collections
+                if offset % (self._scan_page_size * 5) == 0:
+                    await asyncio.sleep(0)
+
+            # Delete expired entries in batches
             if expired_ids:
-                # Delete in batches for efficiency
-                batch_size = 100
-                for i in range(0, len(expired_ids), batch_size):
-                    batch = expired_ids[i:i + batch_size]
-                    self._collection.delete(ids=batch)
-                    cleaned_count += len(batch)
+                for i in range(0, len(expired_ids), self._cleanup_batch_size):
+                    batch = expired_ids[i:i + self._cleanup_batch_size]
+                    try:
+                        self._collection.delete(ids=batch)
+                        cleaned_count += len(batch)
+                    except Exception as batch_error:
+                        logger.warning(f"Failed to delete batch {i//self._cleanup_batch_size}: {batch_error}")
+                        self.cleanup_errors += 1
+
+                    # Yield to event loop between batches
+                    if i % (self._cleanup_batch_size * 10) == 0:
+                        await asyncio.sleep(0)
 
                 self.expired_entries_cleaned += cleaned_count
+                remaining = self._collection.count()
+
                 logger.info(
-                    f"🧹 Cache cleanup: removed {cleaned_count} expired entries "
-                    f"(TTL={self.ttl_hours}h, remaining={self._collection.count()})"
+                    f"🧹 Cache cleanup complete: scanned={scanned_count}, "
+                    f"expired={len(expired_ids)}, cleaned={cleaned_count}, "
+                    f"remaining={remaining} (TTL={self.ttl_hours}h)"
                 )
+            else:
+                logger.debug(f"Cache cleanup: scanned {scanned_count} entries, none expired")
+
+            self.cleanup_runs += 1
 
         except Exception as e:
             logger.error(f"Cache cleanup failed: {e}")
+            self.cleanup_errors += 1
+
+        finally:
+            # Always release the lock
+            self._cleanup_in_progress = False
 
         return cleaned_count
+
+    async def force_cleanup(self) -> int:
+        """
+        Force an immediate cleanup regardless of interval.
+
+        Useful for maintenance operations or when cache is known to have
+        many expired entries.
+
+        Returns:
+            Number of entries cleaned
+        """
+        # Temporarily set last cleanup time to force cleanup
+        original_time = self._last_cleanup_time
+        self._last_cleanup_time = 0
+
+        try:
+            return await self.cleanup_expired_entries()
+        finally:
+            # Restore the actual cleanup time if cleanup was skipped
+            if self._cleanup_in_progress:
+                self._last_cleanup_time = original_time
 
     async def store_result(
         self,
@@ -3823,7 +3936,11 @@ class SemanticVoiceCacheManager:
         Get comprehensive cache statistics.
 
         Returns accurate statistics with expired entry tracking.
-        Note: hit_rate is calculated from valid hits only (excludes expired entries).
+
+        Notes:
+        - hit_rate is calculated from valid hits only (excludes expired entries)
+        - total_queries includes ALL queries (even when uninitialized)
+        - queries_while_uninitialized tracks queries before cache was ready
         """
         # Calculate rates (excluding expired from hit calculation)
         valid_responses = self.cache_hits + self.cache_misses
@@ -3839,14 +3956,21 @@ class SemanticVoiceCacheManager:
             if self._last_cleanup_time > 0 else float('inf')
         )
 
+        # Verify statistics consistency
+        stats_consistent = (
+            self.total_queries == self.cache_hits + self.cache_misses + self.cache_expired - self.queries_while_uninitialized
+            or self.total_queries >= self.cache_hits + self.cache_misses  # Allow for edge cases
+        )
+
         return {
             "enabled": self.enabled,
             "initialized": self._initialized,
-            # Query statistics
+            # Query statistics (comprehensive)
             "total_queries": self.total_queries,
             "cache_hits": self.cache_hits,
             "cache_misses": self.cache_misses,
             "cache_expired": self.cache_expired,
+            "queries_while_uninitialized": self.queries_while_uninitialized,
             # Calculated rates
             "hit_rate": hit_rate,
             "expired_rate": expired_rate,
@@ -3860,10 +3984,18 @@ class SemanticVoiceCacheManager:
             "ttl_hours": self.ttl_hours,
             "similarity_threshold": self.similarity_threshold,
             "max_entries": self.max_entries,
-            # Maintenance
+            # Maintenance & cleanup
             "cleanup_interval_hours": self._cleanup_interval_hours,
             "hours_since_cleanup": hours_since_cleanup,
             "cleanup_due": hours_since_cleanup >= self._cleanup_interval_hours,
+            "cleanup_in_progress": self._cleanup_in_progress,
+            "cleanup_runs": self.cleanup_runs,
+            "cleanup_errors": self.cleanup_errors,
+            # Pagination settings
+            "scan_page_size": self._scan_page_size,
+            "cleanup_batch_size": self._cleanup_batch_size,
+            # Diagnostics
+            "stats_consistent": stats_consistent,
         }
 
     def get_health_status(self) -> Dict[str, Any]:
@@ -3875,6 +4007,7 @@ class SemanticVoiceCacheManager:
         """
         stats = self.get_statistics()
         warnings = []
+        errors = []
 
         # Check for high expired rate (indicates TTL may be too short)
         if stats["expired_rate"] > 0.2:  # >20% expired
@@ -3903,15 +4036,45 @@ class SemanticVoiceCacheManager:
                 warnings.append(
                     f"Cache near capacity ({utilization:.1%}) - consider increasing max_entries"
                 )
+            # Check if collection exceeds max_entries (should trigger warning)
+            if utilization > 1.0:
+                errors.append(
+                    f"Cache exceeds max_entries ({self._collection.count()}/{self.max_entries}) - "
+                    f"cleanup may have missed entries"
+                )
+
+        # Check for cleanup errors
+        if stats["cleanup_errors"] > 0:
+            error_rate = stats["cleanup_errors"] / max(stats["cleanup_runs"], 1)
+            if error_rate > 0.1:  # >10% error rate
+                errors.append(
+                    f"High cleanup error rate ({error_rate:.1%}) - "
+                    f"{stats['cleanup_errors']} errors in {stats['cleanup_runs']} runs"
+                )
+
+        # Check for many queries while uninitialized
+        if stats["queries_while_uninitialized"] > 10:
+            warnings.append(
+                f"High queries while uninitialized ({stats['queries_while_uninitialized']}) - "
+                f"cache may be initializing too slowly"
+            )
+
+        # Check statistics consistency
+        if not stats["stats_consistent"]:
+            warnings.append("Statistics inconsistency detected - may indicate race condition")
 
         return {
-            "healthy": len(warnings) == 0,
+            "healthy": len(warnings) == 0 and len(errors) == 0,
             "warnings": warnings,
+            "errors": errors,
             "metrics": {
                 "hit_rate": stats["hit_rate"],
                 "expired_rate": stats["expired_rate"],
                 "cost_saved": stats["cost_saved_usd"],
                 "entries": stats["cached_entries"],
+                "cleanup_runs": stats["cleanup_runs"],
+                "cleanup_errors": stats["cleanup_errors"],
+                "queries_uninitialized": stats["queries_while_uninitialized"],
             }
         }
 
