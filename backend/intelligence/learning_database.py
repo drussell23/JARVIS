@@ -3193,14 +3193,15 @@ class JARVISLearningDatabase:
             audio_hash = hashlib.sha256(audio_data).hexdigest()[:16]
 
             # Extract acoustic features (if librosa available)
+            # Run in thread pool to avoid blocking event loop
             mfcc_features = None
             pitch_mean = None
             pitch_std = None
             energy_mean = None
 
-            try:
+            def _extract_acoustic_features_sync():
+                """Extract acoustic features synchronously - runs in thread pool."""
                 import io
-
                 import librosa
                 import numpy as np
 
@@ -3214,17 +3215,25 @@ class JARVISLearningDatabase:
                 # Extract pitch
                 pitches, magnitudes = librosa.piptrack(y=audio_array, sr=sr)
                 pitch_values = pitches[pitches > 0]
-                if len(pitch_values) > 0:
-                    pitch_mean = float(np.mean(pitch_values))
-                    pitch_std = float(np.std(pitch_values))
+                pitch_mean = float(np.mean(pitch_values)) if len(pitch_values) > 0 else None
+                pitch_std = float(np.std(pitch_values)) if len(pitch_values) > 0 else None
 
                 # Extract energy
                 energy = librosa.feature.rms(y=audio_array)
                 energy_mean = float(np.mean(energy))
 
-                logger.debug(
-                    f"🎵 Extracted acoustic features: pitch={pitch_mean:.1f}Hz, energy={energy_mean:.3f}"
+                return mfcc_features, pitch_mean, pitch_std, energy_mean
+
+            try:
+                # Run CPU-intensive librosa operations in thread pool
+                import asyncio
+                mfcc_features, pitch_mean, pitch_std, energy_mean = await asyncio.to_thread(
+                    _extract_acoustic_features_sync
                 )
+                if pitch_mean:
+                    logger.debug(
+                        f"🎵 Extracted acoustic features: pitch={pitch_mean:.1f}Hz, energy={energy_mean:.3f}"
+                    )
 
             except ImportError:
                 logger.debug("librosa not available - storing audio hash only")

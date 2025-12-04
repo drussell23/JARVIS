@@ -284,15 +284,15 @@ class IntelligentVoiceRouter:
             raise RuntimeError("Resemblyzer model not loaded")
 
         try:
-            # Convert audio bytes to numpy array
-            import io
+            # Run CPU-intensive operations in thread pool to avoid blocking event loop
+            def _extract_embedding_sync():
+                import io
+                import librosa
+                audio_array, sr = librosa.load(io.BytesIO(audio_data), sr=16000)
+                embedding = self.resemblyzer_model.embed_utterance(audio_array)
+                return embedding
 
-            import librosa
-
-            audio_array, sr = librosa.load(io.BytesIO(audio_data), sr=16000)
-
-            # Extract embedding
-            embedding = self.resemblyzer_model.embed_utterance(audio_array)
+            embedding = await asyncio.to_thread(_extract_embedding_sync)
 
             # Compare to known profiles (from learning database)
             speaker_name, confidence = await self._match_embedding(
@@ -324,18 +324,19 @@ class IntelligentVoiceRouter:
             raise RuntimeError("PyAnnote model not loaded")
 
         try:
-            # PyAnnote processing
-            import io
+            # Run CPU-intensive operations in thread pool to avoid blocking event loop
+            def _extract_embedding_sync():
+                import io
+                import librosa
+                import torch
+                torch.set_num_threads(1)  # Prevent thread pool exhaustion
+                audio_array, sr = librosa.load(io.BytesIO(audio_data), sr=16000)
+                with torch.no_grad():
+                    waveform = torch.from_numpy(audio_array).unsqueeze(0)
+                    embedding = self.pyannote_model(waveform).squeeze().numpy()
+                return embedding
 
-            import librosa
-            import torch
-
-            audio_array, sr = librosa.load(io.BytesIO(audio_data), sr=16000)
-
-            # Extract embedding
-            with torch.no_grad():
-                waveform = torch.from_numpy(audio_array).unsqueeze(0)
-                embedding = self.pyannote_model(waveform).squeeze().numpy()
+            embedding = await asyncio.to_thread(_extract_embedding_sync)
 
             # Match to known profiles
             speaker_name, confidence = await self._match_embedding(

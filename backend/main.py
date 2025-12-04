@@ -1044,6 +1044,15 @@ async def lifespan(app: FastAPI):
     logger.info("🚀 Starting optimized JARVIS backend...")
     start_time = time.time()
 
+    # Start event loop watchdog to detect blocking ML operations
+    try:
+        from core.ml_operation_watchdog import start_event_loop_watchdog, stop_event_loop_watchdog
+        loop = asyncio.get_running_loop()
+        start_event_loop_watchdog(loop)
+        logger.info("🐕 ML operation watchdog started - monitoring event loop health")
+    except Exception as e:
+        logger.warning(f"⚠️ Could not start event loop watchdog: {e}")
+
     # Initialize dynamic component manager if enabled
     global dynamic_component_manager, DYNAMIC_LOADING_ENABLED, gcp_vm_manager
     if DYNAMIC_LOADING_ENABLED and get_component_manager:
@@ -2235,6 +2244,16 @@ async def lifespan(app: FastAPI):
 
     # Cleanup
     logger.info("🛑 Shutting down JARVIS backend...")
+
+    # Stop event loop watchdog
+    try:
+        from core.ml_operation_watchdog import stop_event_loop_watchdog, get_watchdog_stats
+        stats = get_watchdog_stats()
+        stop_event_loop_watchdog()
+        logger.info(f"🐕 Watchdog stopped - Stats: {stats.total_operations} ops, "
+                   f"{stats.timeout_operations} timeouts, {stats.error_operations} errors")
+    except Exception as e:
+        logger.debug(f"Watchdog cleanup: {e}")
 
     # Notify all WebSocket clients about shutdown
     try:
