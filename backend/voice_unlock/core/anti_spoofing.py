@@ -1188,3 +1188,37 @@ class AntiSpoofingDetector:
     def get_physics_extractor(self) -> Optional[PhysicsAwareFeatureExtractor]:
         """Get the physics-aware feature extractor if enabled."""
         return self._physics_extractor if self.enable_physics else None
+
+    @property
+    def num_layers(self) -> int:
+        """Get the number of detection layers (6 traditional + 1 physics if enabled)."""
+        return 7 if self.enable_physics else 6
+
+
+# =============================================================================
+# Global Instance Management
+# =============================================================================
+
+_anti_spoofing_detector: Optional[AntiSpoofingDetector] = None
+
+
+def get_anti_spoofing_detector() -> AntiSpoofingDetector:
+    """
+    Get global Anti-Spoofing Detector instance.
+
+    Uses lazy initialization with environment-driven configuration.
+    Thread-safe singleton pattern.
+
+    Returns:
+        AntiSpoofingDetector: Global detector instance
+    """
+    global _anti_spoofing_detector
+    if _anti_spoofing_detector is None:
+        _anti_spoofing_detector = AntiSpoofingDetector(
+            fingerprint_cache_ttl=int(os.getenv("ANTISPOOFING_CACHE_TTL", "3600")),
+            min_audio_duration_ms=float(os.getenv("ANTISPOOFING_MIN_DURATION_MS", "500")),
+            sample_rate=int(os.getenv("VOICE_SAMPLE_RATE", "16000")),
+            enable_learning=os.getenv("ANTISPOOFING_LEARNING_ENABLED", "true").lower() == "true",
+            enable_physics=os.getenv("ANTISPOOFING_PHYSICS_ENABLED", "true").lower() == "true"
+        )
+    return _anti_spoofing_detector
