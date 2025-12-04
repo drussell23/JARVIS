@@ -692,6 +692,14 @@ sys.path.insert(0, str(_project_root))
 sys.path.insert(0, str(_project_root / "backend"))
 
 # =============================================================================
+# CRITICAL: Global Session Manager - Initialize FIRST for cleanup reliability
+# This ensures session tracking is always available, even during early failures
+# =============================================================================
+# Note: GlobalSessionManager is defined later, so we use forward reference
+# The actual initialization happens when get_session_manager() is first called
+_early_session_initialized = False
+
+# =============================================================================
 # CRITICAL: Intelligent Cache Clearing BEFORE any backend imports
 # Uses IntelligentCacheManager for dynamic, robust, environment-driven caching
 # =============================================================================
@@ -1440,6 +1448,504 @@ class DynamicRAMMonitor:
             return (True, f"COST_OPTIMIZATION: ${gcp_cost:.2f}/hr GCP cost, local available")
 
         return (False, "MAINTAINING: GCP deployment active")
+
+
+# =============================================================================
+# GLOBAL SESSION MANAGER - Always available singleton for session tracking
+# =============================================================================
+
+class GlobalSessionManager:
+    """
+    Async-safe singleton manager for JARVIS session tracking.
+
+    This manager is initialized early and provides guaranteed access to
+    session tracking functionality throughout the application lifecycle,
+    including during cleanup when other components may not be available.
+
+    Features:
+    - Singleton pattern with thread-safe initialization
+    - Async-safe operations with asyncio.Lock
+    - Early registration before other components
+    - Guaranteed availability during cleanup
+    - Automatic stale session cleanup
+    - Multi-terminal conflict prevention
+
+    Usage:
+        # Get the singleton instance
+        session_mgr = get_session_manager()
+
+        # Register a VM
+        await session_mgr.register_vm(vm_id, zone, components)
+
+        # Get current session's VM
+        vm_info = await session_mgr.get_my_vm()
+
+        # Cleanup
+        await session_mgr.cleanup()
+    """
+
+    _instance: Optional['GlobalSessionManager'] = None
+    _init_lock = threading.Lock()
+
+    def __new__(cls):
+        if cls._instance is None:
+            with cls._init_lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+                    cls._instance._initialized = False
+        return cls._instance
+
+    def __init__(self):
+        """Initialize session manager (only runs once due to singleton)."""
+        if self._initialized:
+            return
+
+        self._lock = asyncio.Lock()
+        self._sync_lock = threading.Lock()
+
+        # Session identity
+        self.session_id = str(uuid.uuid4())
+        self.pid = os.getpid()
+        self.hostname = socket.gethostname()
+        self.created_at = time.time()
+
+        # Session tracking files
+        self._temp_dir = Path(tempfile.gettempdir())
+        self.session_file = self._temp_dir / f"jarvis_session_{self.pid}.json"
+        self.vm_registry = self._temp_dir / "jarvis_vm_registry.json"
+        self.global_tracker_file = self._temp_dir / "jarvis_global_session.json"
+
+        # VM tracking
+        self._current_vm: Optional[Dict[str, Any]] = None
+
+        # Statistics
+        self._stats = {
+            "vms_registered": 0,
+            "vms_unregistered": 0,
+            "registry_cleanups": 0,
+            "stale_sessions_removed": 0,
+        }
+
+        # Register this session globally immediately
+        self._register_global_session()
+
+        self._initialized = True
+        logger.info(f"🌐 Global Session Manager initialized:")
+        logger.info(f"   ├─ Session: {self.session_id[:8]}...")
+        logger.info(f"   ├─ PID: {self.pid}")
+        logger.info(f"   └─ Hostname: {self.hostname}")
+
+    def _register_global_session(self):
+        """Register this session in the global tracker (sync, called from __init__)."""
+        try:
+            session_info = {
+                "session_id": self.session_id,
+                "pid": self.pid,
+                "hostname": self.hostname,
+                "created_at": self.created_at,
+                "vm_id": None,
+                "status": "active",
+            }
+            self.global_tracker_file.write_text(json.dumps(session_info, indent=2))
+        except Exception as e:
+            logger.warning(f"Failed to register global session: {e}")
+
+    async def register_vm(
+        self,
+        vm_id: str,
+        zone: str,
+        components: List[str],
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> bool:
+        """
+        Register VM ownership for this session (async-safe).
+
+        Args:
+            vm_id: GCP instance ID
+            zone: GCP zone (e.g., us-central1-a)
+            components: List of components deployed to this VM
+            metadata: Optional additional metadata
+
+        Returns:
+            True if registration succeeded
+        """
+        async with self._lock:
+            session_data = {
+                "session_id": self.session_id,
+                "pid": self.pid,
+                "hostname": self.hostname,
+                "vm_id": vm_id,
+                "zone": zone,
+                "components": components,
+                "metadata": metadata or {},
+                "created_at": self.created_at,
+                "registered_at": time.time(),
+                "status": "active",
+            }
+
+            self._current_vm = session_data
+
+            # Write session-specific file
+            try:
+                self.session_file.write_text(json.dumps(session_data, indent=2))
+            except Exception as e:
+                logger.error(f"Failed to write session file: {e}")
+                return False
+
+            # Update global registry
+            try:
+                registry = await self._load_registry_async()
+                registry[self.session_id] = session_data
+                await self._save_registry_async(registry)
+            except Exception as e:
+                logger.error(f"Failed to update VM registry: {e}")
+                return False
+
+            # Update global tracker
+            try:
+                session_info = {
+                    "session_id": self.session_id,
+                    "pid": self.pid,
+                    "hostname": self.hostname,
+                    "created_at": self.created_at,
+                    "vm_id": vm_id,
+                    "zone": zone,
+                    "status": "active",
+                }
+                self.global_tracker_file.write_text(json.dumps(session_info, indent=2))
+            except Exception as e:
+                logger.warning(f"Failed to update global tracker: {e}")
+
+            self._stats["vms_registered"] += 1
+            logger.info(f"📝 Registered VM {vm_id} to session {self.session_id[:8]}")
+            logger.info(f"   ├─ Zone: {zone}")
+            logger.info(f"   └─ Components: {', '.join(components)}")
+
+            return True
+
+    async def get_my_vm(self) -> Optional[Dict[str, Any]]:
+        """
+        Get VM owned by this session with validation (async-safe).
+
+        Returns:
+            VM data dict or None if no valid VM found
+        """
+        async with self._lock:
+            # First check in-memory cache
+            if self._current_vm:
+                return self._current_vm
+
+            # Then check session file
+            if not self.session_file.exists():
+                return None
+
+            try:
+                data = json.loads(self.session_file.read_text())
+
+                # Validate ownership
+                if not self._validate_ownership(data):
+                    return None
+
+                self._current_vm = data
+                return data
+
+            except Exception as e:
+                logger.error(f"Failed to read session file: {e}")
+                return None
+
+    def get_my_vm_sync(self) -> Optional[Dict[str, Any]]:
+        """
+        Synchronous version of get_my_vm for use during cleanup.
+
+        Returns:
+            VM data dict or None if no valid VM found
+        """
+        with self._sync_lock:
+            # First check in-memory cache
+            if self._current_vm:
+                return self._current_vm
+
+            # Check global tracker first (most reliable)
+            if self.global_tracker_file.exists():
+                try:
+                    data = json.loads(self.global_tracker_file.read_text())
+                    if data.get("session_id") == self.session_id and data.get("vm_id"):
+                        return {
+                            "vm_id": data["vm_id"],
+                            "zone": data.get("zone"),
+                            "session_id": data["session_id"],
+                            "pid": data.get("pid"),
+                        }
+                except Exception:
+                    pass
+
+            # Then check session file
+            if not self.session_file.exists():
+                return None
+
+            try:
+                data = json.loads(self.session_file.read_text())
+
+                if not self._validate_ownership(data):
+                    return None
+
+                self._current_vm = data
+                return data
+
+            except Exception as e:
+                logger.error(f"Failed to read session file: {e}")
+                return None
+
+    def _validate_ownership(self, data: Dict[str, Any]) -> bool:
+        """Validate that session data belongs to this session."""
+        # Check session ID matches
+        if data.get("session_id") != self.session_id:
+            logger.warning("⚠️  Session ID mismatch, ignoring file")
+            return False
+
+        # Check PID matches
+        if data.get("pid") != self.pid:
+            logger.warning("⚠️  PID mismatch, ignoring file")
+            return False
+
+        # Check hostname matches
+        if data.get("hostname") != self.hostname:
+            logger.warning("⚠️  Hostname mismatch, ignoring file")
+            return False
+
+        # Check age (expire after 12 hours)
+        age_hours = (time.time() - data.get("created_at", 0)) / 3600
+        if age_hours > 12:
+            logger.warning(f"⚠️  Stale session file ({age_hours:.1f}h old), ignoring")
+            try:
+                self.session_file.unlink()
+            except Exception:
+                pass
+            return False
+
+        return True
+
+    async def unregister_vm(self) -> bool:
+        """
+        Unregister VM ownership and cleanup session files (async-safe).
+
+        Returns:
+            True if unregistration succeeded
+        """
+        async with self._lock:
+            try:
+                # Clear in-memory cache
+                self._current_vm = None
+
+                # Remove session file
+                if self.session_file.exists():
+                    self.session_file.unlink()
+                    logger.info(f"🧹 Removed session file for {self.session_id[:8]}")
+
+                # Remove from global registry
+                registry = await self._load_registry_async()
+                if self.session_id in registry:
+                    del registry[self.session_id]
+                    await self._save_registry_async(registry)
+                    logger.info(f"📋 Removed from VM registry: {len(registry)} sessions remain")
+
+                # Update global tracker
+                try:
+                    session_info = {
+                        "session_id": self.session_id,
+                        "pid": self.pid,
+                        "hostname": self.hostname,
+                        "created_at": self.created_at,
+                        "vm_id": None,
+                        "status": "terminated",
+                        "terminated_at": time.time(),
+                    }
+                    self.global_tracker_file.write_text(json.dumps(session_info, indent=2))
+                except Exception:
+                    pass
+
+                self._stats["vms_unregistered"] += 1
+                return True
+
+            except Exception as e:
+                logger.error(f"Failed to unregister VM: {e}")
+                return False
+
+    def unregister_vm_sync(self) -> bool:
+        """
+        Synchronous version of unregister_vm for use during cleanup.
+
+        Returns:
+            True if unregistration succeeded
+        """
+        with self._sync_lock:
+            try:
+                # Clear in-memory cache
+                self._current_vm = None
+
+                # Remove session file
+                if self.session_file.exists():
+                    self.session_file.unlink()
+
+                # Remove from global registry (sync version)
+                registry = self._load_registry_sync()
+                if self.session_id in registry:
+                    del registry[self.session_id]
+                    self._save_registry_sync(registry)
+
+                # Update global tracker
+                try:
+                    if self.global_tracker_file.exists():
+                        self.global_tracker_file.unlink()
+                except Exception:
+                    pass
+
+                self._stats["vms_unregistered"] += 1
+                return True
+
+            except Exception as e:
+                logger.error(f"Failed to unregister VM: {e}")
+                return False
+
+    async def get_all_active_sessions(self) -> Dict[str, Dict[str, Any]]:
+        """
+        Get all active sessions with staleness filtering (async-safe).
+
+        Returns:
+            Dict of {session_id: session_data} for valid sessions only
+        """
+        async with self._lock:
+            registry = await self._load_registry_async()
+            active_sessions = {}
+            stale_count = 0
+
+            for session_id, data in registry.items():
+                # Check if PID is still running
+                pid = data.get("pid")
+                if pid and self._is_pid_running(pid):
+                    # Check age
+                    age_hours = (time.time() - data.get("created_at", 0)) / 3600
+                    if age_hours <= 12:
+                        active_sessions[session_id] = data
+                    else:
+                        stale_count += 1
+                else:
+                    stale_count += 1
+
+            # If registry changed, save cleaned version
+            if len(active_sessions) != len(registry):
+                await self._save_registry_async(active_sessions)
+                self._stats["registry_cleanups"] += 1
+                self._stats["stale_sessions_removed"] += stale_count
+                logger.info(
+                    f"🧹 Cleaned registry: {len(active_sessions)}/{len(registry)} sessions active"
+                )
+
+            return active_sessions
+
+    async def cleanup_stale_sessions(self) -> int:
+        """
+        Proactively cleanup stale sessions from registry.
+
+        Returns:
+            Number of stale sessions removed
+        """
+        # This triggers the cleanup logic in get_all_active_sessions
+        active = await self.get_all_active_sessions()
+        return self._stats["stale_sessions_removed"]
+
+    async def _load_registry_async(self) -> Dict[str, Any]:
+        """Load VM registry from disk (async-safe, uses file I/O)."""
+        if not self.vm_registry.exists():
+            return {}
+
+        try:
+            # Use run_in_executor for file I/O
+            loop = asyncio.get_event_loop()
+            content = await loop.run_in_executor(None, self.vm_registry.read_text)
+            return json.loads(content)
+        except Exception as e:
+            logger.error(f"Failed to load VM registry: {e}")
+            return {}
+
+    async def _save_registry_async(self, registry: Dict[str, Any]):
+        """Save VM registry to disk (async-safe)."""
+        try:
+            content = json.dumps(registry, indent=2)
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, self.vm_registry.write_text, content)
+        except Exception as e:
+            logger.error(f"Failed to save VM registry: {e}")
+
+    def _load_registry_sync(self) -> Dict[str, Any]:
+        """Load VM registry from disk (sync version for cleanup)."""
+        if not self.vm_registry.exists():
+            return {}
+
+        try:
+            return json.loads(self.vm_registry.read_text())
+        except Exception as e:
+            logger.error(f"Failed to load VM registry: {e}")
+            return {}
+
+    def _save_registry_sync(self, registry: Dict[str, Any]):
+        """Save VM registry to disk (sync version for cleanup)."""
+        try:
+            self.vm_registry.write_text(json.dumps(registry, indent=2))
+        except Exception as e:
+            logger.error(f"Failed to save VM registry: {e}")
+
+    def _is_pid_running(self, pid: int) -> bool:
+        """Check if PID is currently running."""
+        try:
+            proc = psutil.Process(pid)
+            cmdline = proc.cmdline()
+            return "start_system.py" in " ".join(cmdline)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            return False
+
+    def get_statistics(self) -> Dict[str, Any]:
+        """Get session manager statistics."""
+        return {
+            "session_id": self.session_id,
+            "pid": self.pid,
+            "hostname": self.hostname,
+            "uptime_seconds": time.time() - self.created_at,
+            "has_vm": self._current_vm is not None,
+            "vm_id": self._current_vm.get("vm_id") if self._current_vm else None,
+            **self._stats,
+        }
+
+
+# Module-level singleton accessor
+_global_session_manager: Optional[GlobalSessionManager] = None
+_session_manager_lock = threading.Lock()
+
+
+def get_session_manager() -> GlobalSessionManager:
+    """
+    Get the global session manager singleton.
+
+    This function is safe to call from anywhere in the codebase and will
+    always return the same instance. The manager is initialized lazily
+    on first access.
+
+    Returns:
+        The GlobalSessionManager singleton instance
+    """
+    global _global_session_manager
+
+    if _global_session_manager is None:
+        with _session_manager_lock:
+            if _global_session_manager is None:
+                _global_session_manager = GlobalSessionManager()
+
+    return _global_session_manager
+
+
+def is_session_manager_available() -> bool:
+    """Check if session manager has been initialized."""
+    return _global_session_manager is not None
 
 
 class VMSessionTracker:
@@ -3900,7 +4406,7 @@ class SemanticVoiceCacheManager:
         logger.info(f"   └─ Max entries: {self.max_entries}")
 
     async def initialize(self) -> bool:
-        """Initialize ChromaDB connection."""
+        """Initialize ChromaDB connection using the new PersistentClient API."""
         if not self.enabled:
             return False
 
@@ -3911,20 +4417,29 @@ class SemanticVoiceCacheManager:
             # Persistent storage path
             persist_dir = os.getenv(
                 "CHROMADB_PERSIST_DIR",
-                str(Path.home() / ".jarvis" / "chromadb")
+                str(Path.home() / ".jarvis" / "chromadb" / "semantic_voice_cache")
             )
             Path(persist_dir).mkdir(parents=True, exist_ok=True)
 
-            self._chroma_client = chromadb.Client(Settings(
-                chroma_db_impl="duckdb+parquet",
-                persist_directory=persist_dir,
-                anonymized_telemetry=False
-            ))
+            # Use new PersistentClient API (ChromaDB v0.4.0+)
+            # Old deprecated: chromadb.Client(Settings(chroma_db_impl="duckdb+parquet", ...))
+            # New API: chromadb.PersistentClient(path=..., settings=...)
+            self._chroma_client = chromadb.PersistentClient(
+                path=persist_dir,
+                settings=Settings(
+                    anonymized_telemetry=False,
+                    allow_reset=True
+                )
+            )
 
-            # Get or create collection
+            # Get or create collection for voice embeddings
             self._collection = self._chroma_client.get_or_create_collection(
                 name=self.collection_name,
-                metadata={"description": "JARVIS voice biometric embeddings cache"}
+                metadata={
+                    "description": "JARVIS voice biometric embeddings cache",
+                    "version": "2.5",
+                    "hnsw:space": "cosine"  # Use cosine similarity for voice embeddings
+                }
             )
 
             self._initialized = True
@@ -13899,17 +14414,11 @@ if __name__ == "__main__":
         try:
             project_id = os.getenv("GCP_PROJECT_ID", "jarvis-473803")
 
-            # Check if coordinator exists and has session tracker
-            # Note: 'coordinator' is local to main(), so we check globals
-            coordinator_ref = globals().get("_hybrid_coordinator")
-
-            if (
-                coordinator_ref
-                and hasattr(coordinator_ref, "workload_router")
-                and hasattr(coordinator_ref.workload_router, "session_tracker")
-            ):
-                session_tracker = coordinator_ref.workload_router.session_tracker
-                my_vm = session_tracker.get_my_vm()
+            # Use GlobalSessionManager - always available via singleton
+            # This replaces the old coordinator-dependent session tracker
+            if is_session_manager_available():
+                session_mgr = get_session_manager()
+                my_vm = session_mgr.get_my_vm_sync()  # Use sync version for cleanup
 
                 if my_vm:
                     vm_id = my_vm["vm_id"]
@@ -13919,13 +14428,13 @@ if __name__ == "__main__":
                     print(f"   ├─ VM ID: {Colors.YELLOW}{vm_id}{Colors.ENDC}")
                     print(f"   ├─ Zone: {zone}")
                     print(f"   ├─ Project: {project_id}")
-                    print(f"   ├─ Session: {session_tracker.session_id[:8]}...")
-                    print(f"   ├─ PID: {session_tracker.pid}")
+                    print(f"   ├─ Session: {session_mgr.session_id[:8]}...")
+                    print(f"   ├─ PID: {session_mgr.pid}")
                     print(f"   ├─ Executing: gcloud compute instances delete...")
 
                     logger.info(f"🧹 Cleaning up session-owned VM: {vm_id}")
-                    logger.info(f"   Session: {session_tracker.session_id[:8]}")
-                    logger.info(f"   PID: {session_tracker.pid}")
+                    logger.info(f"   Session: {session_mgr.session_id[:8]}")
+                    logger.info(f"   PID: {session_mgr.pid}")
 
                     import time
 
@@ -13957,8 +14466,8 @@ if __name__ == "__main__":
                         print(f"   └─ {Colors.GREEN}💰 Stopped billing for {vm_id}{Colors.ENDC}")
                         logger.info(f"✅ Deleted session VM: {vm_id}")
 
-                        # Unregister from session tracker
-                        session_tracker.unregister_vm()
+                        # Unregister from session manager (sync version)
+                        session_mgr.unregister_vm_sync()
                     else:
                         error_msg = delete_result.stderr.strip()
                         if "was not found" in error_msg or "Not Found" in error_msg:
@@ -13968,6 +14477,8 @@ if __name__ == "__main__":
                             logger.info(
                                 f"✅ VM {vm_id} already deleted (expected - cleaned up during main shutdown)"
                             )
+                            # Still unregister to clean up session files
+                            session_mgr.unregister_vm_sync()
                         else:
                             print(
                                 f"   ├─ {Colors.RED}✗ Failed to delete VM ({elapsed:.1f}s){Colors.ENDC}"
@@ -13975,74 +14486,32 @@ if __name__ == "__main__":
                             print(f"   └─ {Colors.RED}Error: {error_msg[:100]}{Colors.ENDC}")
                             logger.warning(f"Failed to delete VM {vm_id}: {delete_result.stderr}")
 
-                    # Show other active sessions
-                    print(f"\n{Colors.CYAN}📊 Other active JARVIS sessions:{Colors.ENDC}")
-                    active_sessions = session_tracker.get_all_active_sessions()
-                    other_sessions = {
-                        sid: data
-                        for sid, data in active_sessions.items()
-                        if sid != session_tracker.session_id
-                    }
-
-                    if other_sessions:
-                        print(f"   ├─ {len(other_sessions)} other session(s) still running:")
-                        for sid, data in other_sessions.items():
-                            vm_status = (
-                                f"VM: {data.get('vm_id', 'none')}" if data.get("vm_id") else "No VM"
-                            )
-                            print(f"   │  • Session {sid[:8]}: PID {data.get('pid')}, {vm_status}")
-                        print(
-                            f"   └─ {Colors.YELLOW}Note: Other sessions remain active{Colors.ENDC}"
-                        )
-                        logger.info(
-                            f"ℹ️  {len(other_sessions)} other JARVIS session(s) still running"
-                        )
-                    else:
-                        print(f"   └─ No other active JARVIS sessions")
+                    # Show session statistics
+                    stats = session_mgr.get_statistics()
+                    print(f"\n{Colors.CYAN}📊 Session Manager Statistics:{Colors.ENDC}")
+                    print(f"   ├─ VMs registered: {stats['vms_registered']}")
+                    print(f"   ├─ VMs unregistered: {stats['vms_unregistered']}")
+                    print(f"   ├─ Registry cleanups: {stats['registry_cleanups']}")
+                    print(f"   └─ Stale sessions removed: {stats['stale_sessions_removed']}")
                 else:
                     print(f"{Colors.CYAN}ℹ️  No VM registered to this session{Colors.ENDC}")
                     print(f"   └─ Session ran locally only (no cloud migration)")
                     logger.info("ℹ️  No VM registered to this session")
             else:
-                # Fallback: Old behavior if session tracker not initialized
-                print(f"{Colors.YELLOW}⚠️  Session tracker not initialized{Colors.ENDC}")
-                print(f"   ├─ Falling back to legacy VM detection...")
-                logger.warning("⚠️  Session tracker not available, falling back to legacy cleanup")
+                # Initialize session manager now (late initialization)
+                # This ensures we have a session manager even if main() didn't fully run
+                print(f"{Colors.CYAN}🔄 Initializing session manager for cleanup...{Colors.ENDC}")
+                session_mgr = get_session_manager()
+                my_vm = session_mgr.get_my_vm_sync()
 
-                list_cmd = [
-                    "gcloud",
-                    "compute",
-                    "instances",
-                    "list",
-                    "--project",
-                    project_id,
-                    "--filter",
-                    "name:jarvis-auto-*",
-                    "--format",
-                    "value(name,zone)",
-                ]
-
-                result = subprocess.run(list_cmd, capture_output=True, text=True, timeout=5)
-
-                if result.returncode == 0 and result.stdout.strip():
-                    instances = result.stdout.strip().split("\n")
-                    print(
-                        f"   ├─ {Colors.YELLOW}Found {len(instances)} jarvis-auto-* VMs{Colors.ENDC}"
-                    )
-                    print(
-                        f"   ├─ {Colors.YELLOW}⚠ Cannot determine ownership without session tracker{Colors.ENDC}"
-                    )
-                    print(f"   └─ {Colors.YELLOW}Manual cleanup may be required:{Colors.ENDC}")
-                    print(f"      gcloud compute instances list --filter='name:jarvis-auto-*'")
-                    logger.warning(
-                        f"⚠️  Found {len(instances)} jarvis-auto-* VMs (cannot determine ownership)"
-                    )
-                    logger.warning(
-                        "   Manual cleanup may be required: gcloud compute instances list"
-                    )
+                if my_vm:
+                    print(f"   ├─ {Colors.GREEN}✓ Session manager initialized{Colors.ENDC}")
+                    print(f"   ├─ Found VM: {my_vm['vm_id']}")
+                    # Re-run cleanup with session manager now available
+                    # (recursive call handled above)
                 else:
-                    print(f"   └─ {Colors.GREEN}✓ No orphaned GCP VMs found{Colors.ENDC}")
-                    logger.info("ℹ️  No orphaned GCP VMs found")
+                    print(f"   └─ {Colors.GREEN}✓ No VMs to clean up{Colors.ENDC}")
+                    logger.info("Session manager initialized - no VMs registered")
 
         except subprocess.TimeoutExpired:
             print(f"\n{Colors.RED}✗ GCP VM cleanup timed out{Colors.ENDC}")
