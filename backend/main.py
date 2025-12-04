@@ -1071,11 +1071,18 @@ async def lifespan(app: FastAPI):
         logger.warning(f"⚠️ Pre-startup cleanup failed (continuing anyway): {e}")
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # CRITICAL: Memory-Aware Startup - Check RAM BEFORE loading any ML models
-    # This prevents "Startup timeout" caused by loading heavy ML models on
-    # RAM-constrained systems. If RAM is low, activates GCP cloud ML backend.
+    # CRITICAL: Memory-Aware Startup v17.8.7 - No LOCAL_MINIMAL Gap!
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Architecture Decision:
+    # - RAM >= 6GB → LOCAL_FULL (preload ML models locally, instant voice unlock)
+    # - RAM < 6GB  → CLOUD_FIRST (use GCP Spot VM, prevents "Processing..." hang)
+    # - RAM < 2GB  → CLOUD_ONLY (emergency mode)
+    #
+    # We eliminated LOCAL_MINIMAL because it caused "Processing..." hangs when
+    # ML models were lazily loaded during voice unlock on RAM-constrained systems.
     # ═══════════════════════════════════════════════════════════════════════════
     startup_decision = None
+    cloud_ml_router = None
     try:
         from core.memory_aware_startup import (
             determine_startup_mode,
@@ -1086,20 +1093,36 @@ async def lifespan(app: FastAPI):
         startup_decision = await determine_startup_mode()
         app.state.startup_decision = startup_decision
 
+        # Log the decision with clear explanation
+        logger.info(f"🧠 Memory-Aware Startup Decision:")
+        logger.info(f"   Mode: {startup_decision.mode.value}")
+        logger.info(f"   Reason: {startup_decision.reason}")
+        logger.info(f"   Use Cloud ML: {startup_decision.use_cloud_ml}")
+
         # If cloud ML is needed, activate GCP Spot VM
         if startup_decision.gcp_vm_required:
-            logger.info("☁️  Low RAM detected - activating GCP ML backend...")
+            logger.info("☁️  CLOUD_FIRST mode - activating GCP ML backend...")
             cloud_result = await activate_cloud_ml_if_needed(startup_decision)
             app.state.cloud_ml_result = cloud_result
 
             if cloud_result.get("success"):
                 logger.info(f"✅ GCP ML backend active: {cloud_result.get('vm_id', 'N/A')}")
+                logger.info(f"   Cost: ~${cloud_result.get('cost_per_hour', 0.029)}/hour")
             else:
-                logger.warning(f"⚠️  GCP ML activation failed: {cloud_result.get('error')}")
-                logger.warning("   Falling back to minimal local mode")
-                startup_decision = startup_decision._replace(
-                    mode=StartupMode.LOCAL_MINIMAL
-                ) if hasattr(startup_decision, '_replace') else startup_decision
+                # v17.8.7: Don't fall back to LOCAL_MINIMAL (it's eliminated!)
+                # CloudMLRouter has built-in failover to local if cloud fails
+                logger.warning(f"⚠️  GCP VM creation failed: {cloud_result.get('error')}")
+                logger.warning("   CloudMLRouter will failover to local on first request")
+
+        # Initialize CloudMLRouter with the startup decision
+        # This ensures voice unlock uses the correct backend based on RAM
+        try:
+            from core.cloud_ml_router import get_cloud_ml_router
+            cloud_ml_router = await get_cloud_ml_router()
+            app.state.cloud_ml_router = cloud_ml_router
+            logger.info(f"✅ CloudMLRouter initialized (backend: {cloud_ml_router._current_backend.value})")
+        except Exception as router_e:
+            logger.warning(f"⚠️  CloudMLRouter initialization failed: {router_e}")
 
     except ImportError:
         logger.debug("Memory-aware startup not available - using defaults")
