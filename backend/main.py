@@ -1070,6 +1070,43 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"⚠️ Pre-startup cleanup failed (continuing anyway): {e}")
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # CRITICAL: Memory-Aware Startup - Check RAM BEFORE loading any ML models
+    # This prevents "Startup timeout" caused by loading heavy ML models on
+    # RAM-constrained systems. If RAM is low, activates GCP cloud ML backend.
+    # ═══════════════════════════════════════════════════════════════════════════
+    startup_decision = None
+    try:
+        from core.memory_aware_startup import (
+            determine_startup_mode,
+            activate_cloud_ml_if_needed,
+            StartupMode,
+        )
+
+        startup_decision = await determine_startup_mode()
+        app.state.startup_decision = startup_decision
+
+        # If cloud ML is needed, activate GCP Spot VM
+        if startup_decision.gcp_vm_required:
+            logger.info("☁️  Low RAM detected - activating GCP ML backend...")
+            cloud_result = await activate_cloud_ml_if_needed(startup_decision)
+            app.state.cloud_ml_result = cloud_result
+
+            if cloud_result.get("success"):
+                logger.info(f"✅ GCP ML backend active: {cloud_result.get('vm_id', 'N/A')}")
+            else:
+                logger.warning(f"⚠️  GCP ML activation failed: {cloud_result.get('error')}")
+                logger.warning("   Falling back to minimal local mode")
+                startup_decision = startup_decision._replace(
+                    mode=StartupMode.LOCAL_MINIMAL
+                ) if hasattr(startup_decision, '_replace') else startup_decision
+
+    except ImportError:
+        logger.debug("Memory-aware startup not available - using defaults")
+    except Exception as e:
+        logger.warning(f"⚠️ Memory-aware startup check failed: {e}")
+        logger.warning("   Continuing with default startup mode")
+
     # Start event loop watchdog to detect blocking ML operations
     try:
         from core.ml_operation_watchdog import start_event_loop_watchdog, stop_event_loop_watchdog
@@ -1169,26 +1206,36 @@ async def lifespan(app: FastAPI):
 
     # ═══════════════════════════════════════════════════════════════
     # ADVANCED COMPONENT WARMUP (Pre-initialize for instant response)
+    # Skipped when startup_decision indicates low RAM / cloud-first mode
     # ═══════════════════════════════════════════════════════════════
-    try:
-        logger.info("🚀 Starting advanced component warmup...")
-        from api.unified_command_processor import get_unified_processor
+    should_skip_warmup = (
+        startup_decision is not None and startup_decision.skip_component_warmup
+    )
 
-        processor = get_unified_processor(app=app)
-        warmup_report = await processor.warmup_components()
+    if should_skip_warmup:
+        logger.info("⏭️  Skipping component warmup (cloud-first mode)")
+        logger.info(f"   Reason: {startup_decision.reason if startup_decision else 'Low RAM'}")
+        logger.info("   Components will lazy-load on first use")
+    else:
+        try:
+            logger.info("🚀 Starting advanced component warmup...")
+            from api.unified_command_processor import get_unified_processor
 
-        if warmup_report:
-            logger.info(
-                f"✅ Component warmup complete! "
-                f"{warmup_report['ready_count']}/{warmup_report['total_count']} ready "
-                f"in {warmup_report['total_load_time']:.2f}s"
-            )
-            app.state.warmup_report = warmup_report
-        else:
-            logger.warning("⚠️ Component warmup failed, using lazy initialization")
-    except Exception as e:
-        logger.error(f"❌ Component warmup error: {e}", exc_info=True)
-        logger.warning("⚠️ Falling back to lazy initialization")
+            processor = get_unified_processor(app=app)
+            warmup_report = await processor.warmup_components()
+
+            if warmup_report:
+                logger.info(
+                    f"✅ Component warmup complete! "
+                    f"{warmup_report['ready_count']}/{warmup_report['total_count']} ready "
+                    f"in {warmup_report['total_load_time']:.2f}s"
+                )
+                app.state.warmup_report = warmup_report
+            else:
+                logger.warning("⚠️ Component warmup failed, using lazy initialization")
+        except Exception as e:
+            logger.error(f"❌ Component warmup error: {e}", exc_info=True)
+            logger.warning("⚠️ Falling back to lazy initialization")
 
     # Initialize memory manager
     memory_class = components.get("memory", {}).get("manager_class")
@@ -1199,64 +1246,85 @@ async def lifespan(app: FastAPI):
 
     # ═══════════════════════════════════════════════════════════════
     # VOICE UNLOCK ML MODEL PREWARMING (Critical for instant "unlock my screen")
+    # Skipped when startup_decision indicates low RAM / cloud-first mode
     # ═══════════════════════════════════════════════════════════════
-    try:
-        logger.info("🔥 Prewarming Voice Unlock ML models (Whisper + ECAPA-TDNN)...")
-        from voice_unlock.ml_model_prewarmer import prewarm_voice_unlock_models_background
+    should_skip_ml_prewarm = (
+        startup_decision is not None and
+        (startup_decision.skip_local_whisper or startup_decision.skip_local_ecapa)
+    )
 
-        # Start prewarming in background - doesn't block startup but models will be ready
-        # by the time user says "unlock my screen"
-        await prewarm_voice_unlock_models_background()
-        logger.info("   → ML model prewarming started in background")
-        logger.info("   → First 'unlock my screen' will be instant once prewarming completes")
-    except ImportError as e:
-        logger.debug(f"ML model prewarmer not available: {e}")
-    except Exception as e:
-        logger.warning(f"⚠️ ML model prewarming skipped: {e}")
+    if should_skip_ml_prewarm:
+        logger.info("⏭️  Skipping local ML model prewarming (cloud-first mode)")
+        logger.info(f"   Reason: {startup_decision.reason if startup_decision else 'Low RAM'}")
+        logger.info("   Voice recognition will use GCP ML backend")
+    else:
+        try:
+            logger.info("🔥 Prewarming Voice Unlock ML models (Whisper + ECAPA-TDNN)...")
+            from voice_unlock.ml_model_prewarmer import prewarm_voice_unlock_models_background
+
+            # Start prewarming in background - doesn't block startup but models will be ready
+            # by the time user says "unlock my screen"
+            await prewarm_voice_unlock_models_background()
+            logger.info("   → ML model prewarming started in background")
+            logger.info("   → First 'unlock my screen' will be instant once prewarming completes")
+        except ImportError as e:
+            logger.debug(f"ML model prewarmer not available: {e}")
+        except Exception as e:
+            logger.warning(f"⚠️ ML model prewarming skipped: {e}")
 
     # ═══════════════════════════════════════════════════════════════
     # NEURAL MESH INITIALIZATION (Multi-Agent Collaboration System)
+    # Skipped when startup_decision indicates low RAM / cloud-first mode
     # ═══════════════════════════════════════════════════════════════
-    try:
-        from neural_mesh.integration import (
-            initialize_neural_mesh,
-            NeuralMeshConfig,
-            is_neural_mesh_initialized,
-        )
+    should_skip_neural_mesh = (
+        startup_decision is not None and startup_decision.skip_neural_mesh
+    )
 
-        # Initialize Neural Mesh with Crew system in background
-        logger.info("🧠 Initializing Neural Mesh Multi-Agent System...")
-        neural_mesh_config = NeuralMeshConfig(
-            enable_crew=True,
-            enable_monitoring=True,
-            enable_knowledge_graph=True,
-            enable_communication_bus=True,
-            lazy_load=True,
-        )
-
-        # Run initialization asynchronously
-        neural_mesh_result = await initialize_neural_mesh(neural_mesh_config)
-
-        if neural_mesh_result.get("status") == "initialized":
-            app.state.neural_mesh = neural_mesh_result
-            components_loaded = neural_mesh_result.get("components", [])
-            elapsed = neural_mesh_result.get("elapsed_seconds", 0)
-            logger.info(
-                f"✅ Neural Mesh initialized in {elapsed:.2f}s "
-                f"(components: {', '.join(components_loaded)})"
+    if should_skip_neural_mesh:
+        logger.info("⏭️  Skipping Neural Mesh initialization (cloud-first mode)")
+        logger.info(f"   Reason: {startup_decision.reason if startup_decision else 'Low RAM'}")
+        neural_mesh_result = None
+    else:
+        try:
+            from neural_mesh.integration import (
+                initialize_neural_mesh,
+                NeuralMeshConfig,
+                is_neural_mesh_initialized,
             )
-        elif neural_mesh_result.get("status") == "already_initialized":
-            app.state.neural_mesh = neural_mesh_result
-            logger.info("✅ Neural Mesh already initialized")
-        else:
-            logger.warning(
-                f"⚠️ Neural Mesh initialization: {neural_mesh_result.get('status')} "
-                f"- {neural_mesh_result.get('error', 'unknown error')}"
+
+            # Initialize Neural Mesh with Crew system in background
+            logger.info("🧠 Initializing Neural Mesh Multi-Agent System...")
+            neural_mesh_config = NeuralMeshConfig(
+                enable_crew=True,
+                enable_monitoring=True,
+                enable_knowledge_graph=True,
+                enable_communication_bus=True,
+                lazy_load=True,
             )
-    except ImportError as e:
-        logger.debug(f"Neural Mesh not available: {e}")
-    except Exception as e:
-        logger.warning(f"⚠️ Neural Mesh initialization skipped: {e}")
+
+            # Run initialization asynchronously
+            neural_mesh_result = await initialize_neural_mesh(neural_mesh_config)
+
+            if neural_mesh_result.get("status") == "initialized":
+                app.state.neural_mesh = neural_mesh_result
+                components_loaded = neural_mesh_result.get("components", [])
+                elapsed = neural_mesh_result.get("elapsed_seconds", 0)
+                logger.info(
+                    f"✅ Neural Mesh initialized in {elapsed:.2f}s "
+                    f"(components: {', '.join(components_loaded)})"
+                )
+            elif neural_mesh_result.get("status") == "already_initialized":
+                app.state.neural_mesh = neural_mesh_result
+                logger.info("✅ Neural Mesh already initialized")
+            else:
+                logger.warning(
+                    f"⚠️ Neural Mesh initialization: {neural_mesh_result.get('status')} "
+                    f"- {neural_mesh_result.get('error', 'unknown error')}"
+                )
+        except ImportError as e:
+            logger.debug(f"Neural Mesh not available: {e}")
+        except Exception as e:
+            logger.warning(f"⚠️ Neural Mesh initialization skipped: {e}")
 
     # Initialize Goal Inference and start background tasks
     goal_inference = components.get("goal_inference", {})

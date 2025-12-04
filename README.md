@@ -1,10 +1,266 @@
-# JARVIS AI Assistant v17.8.4 - Database Connection Leak Prevention
+# JARVIS AI Assistant v17.8.5 - Memory-Aware Hybrid Cloud Startup
 
-An intelligent voice-activated AI assistant with **Database Connection Leak Prevention** (proper try/finally resource cleanup), **Parallel Model Loading** (4-worker ThreadPool for 3-4x faster startup), **Comprehensive Timeout Protection** (25s unlock, 10s transcription, 8s speaker ID), **Voice Profile Database Consolidation** (unified `jarvis_learning.db` with owner migration), **Unified Voice Cache Manager** (~1ms Instant Recognition vs 200-500ms), **4-Layer Cache Architecture** (L1 Session + L2 Preloaded Profiles + L3 Database + L4 Continuous Learning), **Voice Biometric Semantic Cache with Continuous Learning** (L1-L3 Cache Layers + SQLite Database Recording), **PRD v2.0 Voice Biometric Intelligence** (AAM-Softmax + Center Loss + Triplet Loss Fine-Tuning, Platt/Isotonic Score Calibration, Comprehensive Anti-Spoofing), **AGI OS** (Autonomous General Intelligence Operating System), **Phase 2 Hybrid Database Sync** (Redis + Prometheus + ML Prefetching), **Advanced Process Detection System**, **Production-Grade Voice System**, **Cloud SQL Voice Biometric Storage**, **Real ECAPA-TDNN Speaker Embeddings**, **Advanced Voice Enrollment**, **Unified TTS Engine**, **Wake Word Detection**, **SpeechBrain STT Engine**, **CAI/SAI Locked Screen Auto-Unlock**, **Contextual Awareness Intelligence**, **Situational Awareness Intelligence**, **Backend Self-Awareness**, **Progressive Startup UX**, **GCP Spot VM Auto-Creation** (>85% memory → 32GB cloud offloading), **Advanced GCP Cost Optimization**, **Intelligent Voice-Authenticated Screen Unlock**, **Platform-Aware Memory Monitoring**, **Dynamic Speaker Recognition**, **Hybrid Cloud Auto-Scaling**, **Phase 4 Proactive Communication**, advanced multi-space desktop awareness, Claude Vision integration, and **continuous learning from every interaction**.
+An intelligent voice-activated AI assistant with **Memory-Aware Startup System** (auto-detects RAM and activates GCP cloud ML when constrained), **Process-Isolated ML Loading** (prevents event loop blocking with true async wrapping), **Database Connection Leak Prevention** (proper try/finally resource cleanup), **Parallel Model Loading** (4-worker ThreadPool for 3-4x faster startup), **Comprehensive Timeout Protection** (25s unlock, 10s transcription, 8s speaker ID), **Voice Profile Database Consolidation** (unified `jarvis_learning.db` with owner migration), **Unified Voice Cache Manager** (~1ms Instant Recognition vs 200-500ms), **4-Layer Cache Architecture** (L1 Session + L2 Preloaded Profiles + L3 Database + L4 Continuous Learning), **Voice Biometric Semantic Cache with Continuous Learning** (L1-L3 Cache Layers + SQLite Database Recording), **PRD v2.0 Voice Biometric Intelligence** (AAM-Softmax + Center Loss + Triplet Loss Fine-Tuning, Platt/Isotonic Score Calibration, Comprehensive Anti-Spoofing), **AGI OS** (Autonomous General Intelligence Operating System), **Phase 2 Hybrid Database Sync** (Redis + Prometheus + ML Prefetching), **Advanced Process Detection System**, **Production-Grade Voice System**, **Cloud SQL Voice Biometric Storage**, **Real ECAPA-TDNN Speaker Embeddings**, **Advanced Voice Enrollment**, **Unified TTS Engine**, **Wake Word Detection**, **SpeechBrain STT Engine**, **CAI/SAI Locked Screen Auto-Unlock**, **Contextual Awareness Intelligence**, **Situational Awareness Intelligence**, **Backend Self-Awareness**, **Progressive Startup UX**, **GCP Spot VM Auto-Creation** (>85% memory → 32GB cloud offloading), **Advanced GCP Cost Optimization**, **Intelligent Voice-Authenticated Screen Unlock**, **Platform-Aware Memory Monitoring**, **Dynamic Speaker Recognition**, **Hybrid Cloud Auto-Scaling**, **Phase 4 Proactive Communication**, advanced multi-space desktop awareness, Claude Vision integration, and **continuous learning from every interaction**.
 
 ---
 
-## ⚡ NEW in v17.8.4: Database Connection Leak Prevention
+## ⚡ NEW in v17.8.5: Memory-Aware Hybrid Cloud Startup
+
+JARVIS v17.8.5 fixes the **"Startup timeout - please check logs"** issue caused by loading heavy ML models on RAM-constrained systems. The system now intelligently detects available RAM and automatically activates the hybrid GCP cloud architecture when local resources are insufficient.
+
+### Problems Solved
+
+```
+Problem 1: "Startup timeout - please check logs"
+─────────────────────────────────────────────────────────────────
+Symptom:   Backend never reaches healthy state, frontend shows timeout
+Cause:     Heavy ML models (Whisper ~1GB, SpeechBrain ~300MB, PyTorch ~500MB)
+           exhaust available RAM, causing memory pressure and swapping
+When:      Systems with <4GB free RAM at startup
+
+Problem 2: Stuck Python Process in Uninterruptible Sleep (UE state)
+─────────────────────────────────────────────────────────────────
+Symptom:   Process stuck at 0% CPU, port 8010 blocked, cannot be killed
+Cause:     Synchronous ML model loading (EncoderClassifier.from_hparams)
+           blocked inside async function, preventing asyncio timeouts
+When:      asyncio.wait_for() timeout cannot fire when event loop is blocked
+
+Problem 3: Event Loop Blocking During ML Loading
+─────────────────────────────────────────────────────────────────
+Symptom:   Backend appears frozen, health checks timeout
+Cause:     PyTorch/SpeechBrain model loading is synchronous and blocks
+           the asyncio event loop for 10-30+ seconds
+When:      Loading ECAPA-TDNN, Whisper, or other heavy ML models
+```
+
+### Root Causes
+
+**Root Cause 1: Synchronous Code Blocking Async Event Loop**
+
+```python
+# BEFORE (BROKEN) - voice/speaker_recognition.py:103-112
+async def _load_model(self):
+    # This BLOCKS the event loop! asyncio.wait_for() CANNOT timeout
+    # because the event loop is frozen while this runs
+    self.model = EncoderClassifier.from_hparams(
+        source="speechbrain/spkrec-ecapa-voxceleb",
+        savedir="pretrained_models/spkrec-ecapa-voxceleb"
+    )  # 10-30 seconds of blocking!
+
+# Why asyncio timeouts DON'T work:
+async def authenticate():
+    # This timeout will NEVER fire because event loop is blocked
+    await asyncio.wait_for(self._load_model(), timeout=30.0)
+```
+
+**Root Cause 2: Loading Heavy ML Models on RAM-Constrained Systems**
+
+```
+16GB MacBook with Chrome + Cursor + Claude Code running:
+├── Chrome:      ~2.5GB
+├── Cursor IDE:  ~1.3GB
+├── Claude CLI:  ~0.5GB
+├── System:      ~8.0GB
+└── Free RAM:    ~3.7GB  ← Not enough for ML models!
+
+ML Models to Load:
+├── Whisper:       ~1.0GB
+├── SpeechBrain:   ~0.3GB
+├── ECAPA-TDNN:    ~0.2GB
+├── PyTorch base:  ~0.5GB
+├── Transformers:  ~0.3GB
+└── Total:         ~2.3GB  ← Causes memory pressure!
+
+Result: macOS starts compressing/swapping → massive slowdown → timeout
+```
+
+### Solution 1: Process-Isolated ML Loading with True Async
+
+```python
+# AFTER (FIXED) - voice/speaker_recognition.py
+async def _load_speaker_model_async(self, timeout: float = 45.0):
+    """Load speaker recognition model asynchronously with timeout protection."""
+
+    def _load_speechbrain_model():
+        """Synchronous SpeechBrain model loader (runs in thread)."""
+        from speechbrain.pretrained import EncoderClassifier
+        import torch
+        torch.set_num_threads(2)  # Limit CPU threads
+
+        model = EncoderClassifier.from_hparams(
+            source="speechbrain/spkrec-ecapa-voxceleb",
+            savedir="pretrained_models/spkrec-ecapa-voxceleb"
+        )
+        return model
+
+    # KEY FIX: asyncio.to_thread() runs sync code in ThreadPool
+    # This allows the event loop to remain responsive!
+    self.model = await asyncio.wait_for(
+        asyncio.to_thread(_load_speechbrain_model),  # ← Runs in thread
+        timeout=timeout  # ← Timeout NOW works!
+    )
+```
+
+**New File: `core/process_isolated_ml_loader.py`**
+
+- Universal wrapper for running ANY synchronous ML operation with timeout
+- Process-level isolation using multiprocessing (can SIGKILL if stuck)
+- Thread-level isolation using asyncio.to_thread() for lighter operations
+- Pre-startup cleanup to detect and kill stuck ML processes
+
+### Solution 2: Memory-Aware Startup System
+
+**New File: `core/memory_aware_startup.py`**
+
+The system now checks available RAM BEFORE loading any ML models and automatically selects the appropriate startup mode:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    Memory-Aware Startup Decision Tree                    │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  Available RAM ≥ 6GB?                                                   │
+│       │                                                                  │
+│       ├── YES → LOCAL_FULL Mode                                         │
+│       │         • Load all ML models locally                            │
+│       │         • Full component warmup                                 │
+│       │         • Neural Mesh initialization                            │
+│       │                                                                  │
+│       └── NO → Available RAM ≥ 4GB?                                     │
+│                    │                                                     │
+│                    ├── YES → LOCAL_MINIMAL Mode                         │
+│                    │         • Defer Whisper loading to first use       │
+│                    │         • Skip component warmup                    │
+│                    │         • Skip Neural Mesh                         │
+│                    │         • Show RAM recommendations                 │
+│                    │                                                     │
+│                    └── NO → Available RAM ≥ 2GB?                        │
+│                                 │                                        │
+│                                 ├── YES → CLOUD_FIRST Mode ☁️            │
+│                                 │         • Skip ALL local ML loading   │
+│                                 │         • Spin up GCP Spot VM         │
+│                                 │         • Route ML to cloud           │
+│                                 │         • Fast local startup          │
+│                                 │                                        │
+│                                 └── NO → CLOUD_ONLY Mode 🔴              │
+│                                          • Emergency mode               │
+│                                          • Only essential services      │
+│                                          • All ML on GCP                │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+**Startup Analysis Output:**
+
+```
+============================================================
+🧠 MEMORY-AWARE STARTUP ANALYSIS
+============================================================
+  Total RAM: 16.0 GB
+  Used: 12.1 GB (75.6%)
+  Free: 0.1 GB
+  Available (with reclaimable): 3.9 GB
+  Compressed: 4.4 GB
+  Page outs: 10917245
+============================================================
+☁️  STARTUP MODE: CLOUD_FIRST
+   Reason: Low RAM (3.9GB < 4.0GB) - activating cloud ML
+   Action: Will spin up GCP Spot VM for ML processing
+📋 Recommendations:
+   • GCP Spot VM will handle ML processing
+   • Close other applications to free local RAM
+   • Local backend will handle real-time tasks only
+============================================================
+```
+
+### Files Changed
+
+| File | Change | Purpose |
+|------|--------|---------|
+| `core/memory_aware_startup.py` | **NEW** | RAM detection, startup mode selection, GCP activation |
+| `core/process_isolated_ml_loader.py` | **NEW** | Process/thread-isolated ML loading with timeouts |
+| `core/ml_operation_watchdog.py` | Enhanced | Event loop health monitoring, stuck operation detection |
+| `voice/speaker_recognition.py` | Fixed | Async ML loading with `asyncio.to_thread()` |
+| `main.py` | Modified | Memory check before ML loading, conditional skipping |
+
+### Architecture: Memory-Aware Hybrid Cloud
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         JARVIS Startup Flow                              │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  1. Pre-Startup Cleanup                                                 │
+│     └── Kill stuck ML processes, free blocked ports                     │
+│                                                                          │
+│  2. Memory-Aware Analysis ← NEW!                                        │
+│     ├── Read macOS vm_stat for available RAM                            │
+│     ├── Determine startup mode (LOCAL_FULL/MINIMAL/CLOUD_FIRST/ONLY)   │
+│     └── If CLOUD_FIRST: Spin up GCP Spot VM (~$0.029/hr)               │
+│                                                                          │
+│  3. Conditional Component Loading                                        │
+│     ├── If LOCAL: Load ML models with async timeout protection          │
+│     └── If CLOUD: Skip local ML, configure hybrid routing               │
+│                                                                          │
+│  4. Event Loop Watchdog                                                  │
+│     └── Monitor for blocking operations (warn >2s, critical >10s)       │
+│                                                                          │
+│  5. Health Check → Ready!                                                │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+
+Hybrid Cloud Routing (CLOUD_FIRST Mode):
+┌──────────────────┐     ┌───────────────────────────────────────────────┐
+│   Local Mac      │     │   GCP Spot VM (e2-highmem-4, 32GB)           │
+│   (16GB RAM)     │     │   ~$0.029/hour                                │
+├──────────────────┤     ├───────────────────────────────────────────────┤
+│ • Wake word      │ ──► │ • Whisper transcription                       │
+│ • Audio capture  │     │ • ECAPA-TDNN speaker verification             │
+│ • Screen unlock  │ ◄── │ • Voice biometric intelligence                │
+│ • Vision capture │     │ • Heavy NLP processing                        │
+│ • Display monitor│     │ • LLM inference (LLaMA 70B)                   │
+└──────────────────┘     └───────────────────────────────────────────────┘
+```
+
+### Configuration
+
+**Environment Variables:**
+
+```bash
+# Memory thresholds (GB)
+JARVIS_FULL_LOCAL_RAM_GB=6.0      # Full local mode threshold
+JARVIS_MINIMAL_LOCAL_RAM_GB=4.0   # Minimal local mode threshold
+JARVIS_CLOUD_FIRST_RAM_GB=2.0     # Cloud-first mode threshold
+
+# GCP Configuration
+GCP_PROJECT_ID=jarvis-473803
+GCP_ZONE=us-central1-a
+GCP_ML_VM_TYPE=e2-highmem-4       # 32GB RAM Spot VM
+```
+
+### Quick Fix for "Startup timeout"
+
+If you see "Startup timeout - please check logs":
+
+```bash
+# 1. Check if there's a stuck process
+ps aux | grep "main.py" | grep -v grep
+
+# 2. If process is in "UE" (Uninterruptible Sleep) state:
+#    You MUST restart your Mac - this cannot be killed programmatically
+
+# 3. After restart, the new code will:
+#    - Detect available RAM
+#    - Automatically skip local ML loading if RAM is low
+#    - Spin up GCP Spot VM for ML processing
+#    - Start much faster without the timeout
+
+python3 start_system.py --restart
+```
+
+---
+
+## ⚡ v17.8.4: Database Connection Leak Prevention
 
 JARVIS v17.8.4 fixes **Database Connection Leaks** that occurred during startup when psycopg2 connections weren't properly closed on exceptions.
 
