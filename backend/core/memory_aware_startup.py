@@ -40,10 +40,20 @@ logger = logging.getLogger(__name__)
 
 
 class StartupMode(Enum):
-    """Startup mode based on available resources"""
+    """Startup mode based on available resources
+
+    IMPORTANT: We eliminated LOCAL_MINIMAL mode because it caused "Processing..." hangs.
+
+    The problem with LOCAL_MINIMAL (4-6GB):
+    - It skipped preloading ML models to save RAM at startup
+    - But when user said "unlock my screen", it tried to load them locally
+    - This caused RAM spikes and the "Processing..." freeze
+
+    The fix: If we can't run FULL LOCAL, go straight to CLOUD_FIRST.
+    This way, GCP handles ML processing and local RAM stays stable.
+    """
     LOCAL_FULL = "local_full"          # Full local ML loading (RAM >= 6GB free)
-    LOCAL_MINIMAL = "local_minimal"    # Minimal local, defer heavy ML (4-6GB free)
-    CLOUD_FIRST = "cloud_first"        # Skip local ML, use GCP (< 4GB free)
+    CLOUD_FIRST = "cloud_first"        # Skip local ML, use GCP (< 6GB free) - INSTANT response!
     CLOUD_ONLY = "cloud_only"          # Critical RAM, all ML on cloud (< 2GB free)
 
 
@@ -113,9 +123,11 @@ class MemoryAwareStartup:
     """
 
     # Default thresholds (can be overridden via env vars)
+    # IMPORTANT: Cloud threshold now equals full local threshold - NO GAP!
+    # This eliminates the "Processing..." hang caused by lazy local loading.
     DEFAULT_FULL_LOCAL_THRESHOLD_GB = 6.0   # Free RAM needed for full local ML
-    DEFAULT_MINIMAL_LOCAL_THRESHOLD_GB = 4.0  # Free RAM for minimal local
-    DEFAULT_CLOUD_FIRST_THRESHOLD_GB = 2.0    # Below this = cloud only
+    DEFAULT_CLOUD_FIRST_THRESHOLD_GB = 6.0  # If < 6GB, go straight to cloud (was 4GB - caused hangs!)
+    DEFAULT_CLOUD_ONLY_THRESHOLD_GB = 2.0   # Below this = critical cloud only mode
 
     # ML model memory requirements (approximate)
     ML_MODEL_MEMORY = {
@@ -131,16 +143,27 @@ class MemoryAwareStartup:
     }
 
     def __init__(self):
-        """Initialize the memory-aware startup manager"""
+        """Initialize the memory-aware startup manager
+
+        ARCHITECTURE DECISION (v17.8.7):
+        We eliminated the LOCAL_MINIMAL gap. Now it's binary:
+        - RAM >= 6GB → LOCAL_FULL (preload everything locally)
+        - RAM < 6GB  → CLOUD_FIRST (use GCP Spot VM for ML)
+        - RAM < 2GB  → CLOUD_ONLY (critical mode)
+
+        This prevents the "Processing..." hang that occurred when
+        LOCAL_MINIMAL mode deferred model loading until voice unlock.
+        """
         # Load thresholds from environment
         self.full_local_threshold = float(
             os.getenv("JARVIS_FULL_LOCAL_RAM_GB", self.DEFAULT_FULL_LOCAL_THRESHOLD_GB)
         )
-        self.minimal_local_threshold = float(
-            os.getenv("JARVIS_MINIMAL_LOCAL_RAM_GB", self.DEFAULT_MINIMAL_LOCAL_THRESHOLD_GB)
-        )
+        # Cloud threshold now equals full local - NO GAP!
         self.cloud_first_threshold = float(
             os.getenv("JARVIS_CLOUD_FIRST_RAM_GB", self.DEFAULT_CLOUD_FIRST_THRESHOLD_GB)
+        )
+        self.cloud_only_threshold = float(
+            os.getenv("JARVIS_CLOUD_ONLY_RAM_GB", self.DEFAULT_CLOUD_ONLY_THRESHOLD_GB)
         )
 
         # Cloud ML configuration
@@ -154,10 +177,10 @@ class MemoryAwareStartup:
         self._cloud_ml_active = False
         self._startup_decision: Optional[StartupDecision] = None
 
-        logger.info(f"MemoryAwareStartup initialized")
+        logger.info(f"MemoryAwareStartup initialized (v17.8.7 - NO LOCAL_MINIMAL GAP)")
         logger.info(f"  Full local threshold: {self.full_local_threshold}GB")
-        logger.info(f"  Minimal local threshold: {self.minimal_local_threshold}GB")
-        logger.info(f"  Cloud-first threshold: {self.cloud_first_threshold}GB")
+        logger.info(f"  Cloud-first threshold: {self.cloud_first_threshold}GB (equals full local - no gap!)")
+        logger.info(f"  Cloud-only threshold: {self.cloud_only_threshold}GB")
 
     async def get_memory_status(self) -> MemoryStatus:
         """
@@ -274,8 +297,9 @@ class MemoryAwareStartup:
         recommendations = []
 
         # Determine startup mode based on available RAM
+        # v17.8.7: BINARY DECISION - No LOCAL_MINIMAL gap that caused "Processing..." hangs!
         if memory.available_gb >= self.full_local_threshold:
-            # Plenty of RAM - full local mode
+            # Plenty of RAM - full local mode (preload everything)
             decision = StartupDecision(
                 mode=StartupMode.LOCAL_FULL,
                 use_cloud_ml=False,
@@ -287,41 +311,21 @@ class MemoryAwareStartup:
                 gcp_vm_required=False,
                 reason=f"Sufficient RAM ({memory.available_gb:.1f}GB available >= {self.full_local_threshold}GB threshold)",
                 memory_status=memory,
-                recommendations=["Full local ML loading enabled"],
+                recommendations=["Full local ML loading enabled - instant voice unlock!"],
             )
             logger.info(f"✅ STARTUP MODE: LOCAL_FULL")
             logger.info(f"   Reason: {decision.reason}")
+            logger.info(f"   Voice Unlock: Instant (models preloaded locally)")
 
-        elif memory.available_gb >= self.minimal_local_threshold:
-            # Moderate RAM - minimal local, defer heavy ML
+        elif memory.available_gb >= self.cloud_only_threshold:
+            # NOT ENOUGH RAM FOR LOCAL - GO STRAIGHT TO CLOUD!
+            # This is the FIX for "Processing..." hang - we used to have LOCAL_MINIMAL here
+            # which deferred loading, causing freezes when user said "unlock my screen"
             recommendations = [
-                "Close Chrome tabs to free RAM",
-                "Consider using cloud ML for heavy operations",
-                "Whisper will load on first use instead of startup",
-            ]
-            decision = StartupDecision(
-                mode=StartupMode.LOCAL_MINIMAL,
-                use_cloud_ml=False,  # Not required but available
-                skip_local_whisper=True,  # Defer to first use
-                skip_local_speechbrain=False,  # Small enough
-                skip_local_ecapa=False,  # Small enough
-                skip_component_warmup=True,  # Skip to reduce pressure
-                skip_neural_mesh=True,  # Defer
-                gcp_vm_required=False,
-                reason=f"Moderate RAM ({memory.available_gb:.1f}GB) - deferring heavy ML models",
-                memory_status=memory,
-                recommendations=recommendations,
-            )
-            logger.info(f"⚠️  STARTUP MODE: LOCAL_MINIMAL")
-            logger.info(f"   Reason: {decision.reason}")
-            logger.info(f"   Skipping: Whisper preload, component warmup, neural mesh")
-
-        elif memory.available_gb >= self.cloud_first_threshold:
-            # Low RAM - cloud first mode
-            recommendations = [
-                "GCP Spot VM will handle ML processing",
-                "Close other applications to free local RAM",
-                "Local backend will handle real-time tasks only",
+                "🚀 GCP Spot VM will handle ML processing (instant response!)",
+                "💰 Cost: ~$0.029/hour for e2-highmem-4 Spot VM",
+                "🛡️ Your Mac RAM stays stable - no freezing!",
+                "Close Chrome tabs if you want to switch to LOCAL_FULL",
             ]
             decision = StartupDecision(
                 mode=StartupMode.CLOUD_FIRST,
@@ -332,20 +336,23 @@ class MemoryAwareStartup:
                 skip_component_warmup=True,
                 skip_neural_mesh=True,
                 gcp_vm_required=True,
-                reason=f"Low RAM ({memory.available_gb:.1f}GB < {self.minimal_local_threshold}GB) - activating cloud ML",
+                reason=f"RAM below threshold ({memory.available_gb:.1f}GB < {self.full_local_threshold}GB) - using GCP for ML (prevents Processing... hang!)",
                 memory_status=memory,
                 recommendations=recommendations,
             )
-            logger.info(f"☁️  STARTUP MODE: CLOUD_FIRST")
+            logger.info(f"☁️  STARTUP MODE: CLOUD_FIRST (v17.8.7 - No more Processing... hangs!)")
             logger.info(f"   Reason: {decision.reason}")
-            logger.info(f"   Action: Will spin up GCP Spot VM for ML processing")
+            logger.info(f"   Action: Spinning up GCP Spot VM for ML processing")
+            logger.info(f"   Voice Unlock: Cloud-powered (instant, no local RAM spike)")
+            logger.info(f"   Cost: ~$0.029/hour Spot VM (auto-terminates when idle)")
 
         else:
-            # Critical RAM - cloud only mode
+            # Critical RAM - cloud only mode (emergency)
             recommendations = [
-                "CRITICAL: Close applications immediately",
+                "⚠️ CRITICAL: Close applications immediately",
                 "All ML processing will be on GCP",
                 "Only essential local services will run",
+                "Consider restarting your Mac to clear memory",
             ]
             decision = StartupDecision(
                 mode=StartupMode.CLOUD_ONLY,
@@ -356,13 +363,13 @@ class MemoryAwareStartup:
                 skip_component_warmup=True,
                 skip_neural_mesh=True,
                 gcp_vm_required=True,
-                reason=f"CRITICAL RAM ({memory.available_gb:.1f}GB < {self.cloud_first_threshold}GB) - cloud only mode",
+                reason=f"CRITICAL RAM ({memory.available_gb:.1f}GB < {self.cloud_only_threshold}GB) - emergency cloud-only mode",
                 memory_status=memory,
                 recommendations=recommendations,
             )
             logger.warning(f"🔴 STARTUP MODE: CLOUD_ONLY (CRITICAL)")
             logger.warning(f"   Reason: {decision.reason}")
-            logger.warning(f"   Action: Emergency cloud-only mode activated")
+            logger.warning(f"   Action: Emergency cloud-only mode - close apps to free RAM!")
 
         # Log recommendations
         if recommendations:
