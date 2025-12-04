@@ -191,6 +191,10 @@ core.*
 !backend/voice_unlock/core/
 !backend/voice_unlock/core/**
 !backend/voice_unlock/core/**/*
+# Exception: Allow docs/core directory (documentation)
+!docs/core/
+!docs/core/**
+!docs/core/**/*
 # But still ignore build artifacts and cache in backend/core/
 backend/core/__pycache__/
 backend/core/**/__pycache__/

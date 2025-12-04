@@ -1,6 +1,268 @@
-# JARVIS AI Assistant v17.9.6 - Cost-Optimized Physics-Aware Voice Authentication
+# JARVIS AI Assistant v17.9.7 - Async-Safe Statistics & Session Management
 
-An intelligent voice-activated AI assistant with **Cost Optimization Framework v3.0** (Scale-to-Zero VMs + Semantic Voice Caching + Spot Instance Resilience + Tiered Storage + Intelligent Cache Management), **Physics-Aware Voice Authentication v2.5** (Vocal Tract Length Verification + Reverberation Analysis + Doppler Effect Detection + Bayesian Confidence Fusion + 7-Layer Anti-Spoofing), **Bayesian Confidence Fusion** (Multi-factor probability fusion with adaptive priors), **Voice Authentication Enhancement v2.1** (ChromaDB Semantic Caching + Scale-to-Zero + Langfuse Audit Trail + Behavioral Pattern Recognition), **Dynamic Restart with UE State Detection** (detects stuck macOS processes in Uninterruptible Sleep state), **Self-Healing Port Fallback System** (automatically finds healthy ports when blocked), **Dynamic Port Configuration** (loads ports from config instead of hardcoding), **Memory-Aware Startup System** (auto-detects RAM and activates GCP cloud ML when constrained), **Process-Isolated ML Loading** (prevents event loop blocking with true async wrapping), **Database Connection Leak Prevention** (proper try/finally resource cleanup), **Parallel Model Loading** (4-worker ThreadPool for 3-4x faster startup), **Comprehensive Timeout Protection** (25s unlock, 10s transcription, 8s speaker ID), **Voice Profile Database Consolidation** (unified `jarvis_learning.db` with owner migration), **Unified Voice Cache Manager** (~1ms Instant Recognition vs 200-500ms), **4-Layer Cache Architecture** (L1 Session + L2 Preloaded Profiles + L3 Database + L4 Continuous Learning), **Voice Biometric Semantic Cache with Continuous Learning** (L1-L3 Cache Layers + SQLite Database Recording), **PRD v2.0 Voice Biometric Intelligence** (AAM-Softmax + Center Loss + Triplet Loss Fine-Tuning, Platt/Isotonic Score Calibration, Comprehensive Anti-Spoofing), **AGI OS** (Autonomous General Intelligence Operating System), **Phase 2 Hybrid Database Sync** (Redis + Prometheus + ML Prefetching), **Advanced Process Detection System**, **Production-Grade Voice System**, **Cloud SQL Voice Biometric Storage**, **Real ECAPA-TDNN Speaker Embeddings**, **Advanced Voice Enrollment**, **Unified TTS Engine**, **Wake Word Detection**, **SpeechBrain STT Engine**, **CAI/SAI Locked Screen Auto-Unlock**, **Contextual Awareness Intelligence**, **Situational Awareness Intelligence**, **Backend Self-Awareness**, **Progressive Startup UX**, **GCP Spot VM Auto-Creation** (>85% memory → 32GB cloud offloading), **Advanced GCP Cost Optimization**, **Intelligent Voice-Authenticated Screen Unlock**, **Platform-Aware Memory Monitoring**, **Dynamic Speaker Recognition**, **Hybrid Cloud Auto-Scaling**, **Phase 4 Proactive Communication**, advanced multi-space desktop awareness, Claude Vision integration, and **continuous learning from every interaction**.
+An intelligent voice-activated AI assistant with **Async-Safe Statistics Tracking v1.0** (Self-Healing Consistency Validation + Atomic Counter Operations + Mathematical Invariant Enforcement), **Global Session Manager v1.0** (Thread-Safe Singleton + Multi-Terminal Conflict Prevention + Cleanup Reliability), **Cost Optimization Framework v3.0** (Scale-to-Zero VMs + Semantic Voice Caching + Spot Instance Resilience + Tiered Storage + Intelligent Cache Management), **Physics-Aware Voice Authentication v2.5** (Vocal Tract Length Verification + Reverberation Analysis + Doppler Effect Detection + Bayesian Confidence Fusion + 7-Layer Anti-Spoofing), **Bayesian Confidence Fusion** (Multi-factor probability fusion with adaptive priors), **Voice Authentication Enhancement v2.1** (ChromaDB Semantic Caching + Scale-to-Zero + Langfuse Audit Trail + Behavioral Pattern Recognition), **Dynamic Restart with UE State Detection** (detects stuck macOS processes in Uninterruptible Sleep state), **Self-Healing Port Fallback System** (automatically finds healthy ports when blocked), **Dynamic Port Configuration** (loads ports from config instead of hardcoding), **Memory-Aware Startup System** (auto-detects RAM and activates GCP cloud ML when constrained), **Process-Isolated ML Loading** (prevents event loop blocking with true async wrapping), **Database Connection Leak Prevention** (proper try/finally resource cleanup), **Parallel Model Loading** (4-worker ThreadPool for 3-4x faster startup), **Comprehensive Timeout Protection** (25s unlock, 10s transcription, 8s speaker ID), **Voice Profile Database Consolidation** (unified `jarvis_learning.db` with owner migration), **Unified Voice Cache Manager** (~1ms Instant Recognition vs 200-500ms), **4-Layer Cache Architecture** (L1 Session + L2 Preloaded Profiles + L3 Database + L4 Continuous Learning), **Voice Biometric Semantic Cache with Continuous Learning** (L1-L3 Cache Layers + SQLite Database Recording), **PRD v2.0 Voice Biometric Intelligence** (AAM-Softmax + Center Loss + Triplet Loss Fine-Tuning, Platt/Isotonic Score Calibration, Comprehensive Anti-Spoofing), **AGI OS** (Autonomous General Intelligence Operating System), **Phase 2 Hybrid Database Sync** (Redis + Prometheus + ML Prefetching), **Advanced Process Detection System**, **Production-Grade Voice System**, **Cloud SQL Voice Biometric Storage**, **Real ECAPA-TDNN Speaker Embeddings**, **Advanced Voice Enrollment**, **Unified TTS Engine**, **Wake Word Detection**, **SpeechBrain STT Engine**, **CAI/SAI Locked Screen Auto-Unlock**, **Contextual Awareness Intelligence**, **Situational Awareness Intelligence**, **Backend Self-Awareness**, **Progressive Startup UX**, **GCP Spot VM Auto-Creation** (>85% memory → 32GB cloud offloading), **Advanced GCP Cost Optimization**, **Intelligent Voice-Authenticated Screen Unlock**, **Platform-Aware Memory Monitoring**, **Dynamic Speaker Recognition**, **Hybrid Cloud Auto-Scaling**, **Phase 4 Proactive Communication**, advanced multi-space desktop awareness, Claude Vision integration, and **continuous learning from every interaction**.
+
+---
+
+## 🔧 NEW in v17.9.7: Async-Safe Statistics & Global Session Management
+
+JARVIS v17.9.7 introduces **production-grade reliability improvements** with async-safe statistics tracking, self-healing data consistency, and always-available session management. These fixes resolve critical edge cases that could cause data corruption, session tracking failures, and cleanup issues.
+
+### Problems Solved in v17.9.7
+
+| Issue | Root Cause | Solution |
+|-------|------------|----------|
+| `AsyncSystemManager has no attribute 'backend_port'` | Missing backwards compatibility alias | Added `backend_port`, `frontend_port`, `websocket_port` properties |
+| Statistics consistency check false positives | Race conditions in async counter updates | `CacheStatisticsTracker` with `asyncio.Lock` |
+| `Session tracker not available` warning | Coordinator-dependent initialization | `GlobalSessionManager` singleton always available |
+| Statistics drift over time | No self-healing mechanism | Automatic invariant validation and correction |
+| Multi-terminal session conflicts | No global session coordination | Thread-safe session registry with PID validation |
+
+### CacheStatisticsTracker - Async-Safe Statistics
+
+The new `CacheStatisticsTracker` class provides mathematically-guaranteed consistent statistics with self-healing capabilities:
+
+```
+Mathematical Invariants (Always Enforced):
+├─ total_queries == cache_hits + cache_misses
+├─ cache_expired <= cache_misses (expired is subset of misses)
+├─ queries_while_uninitialized <= cache_misses
+└─ All counters >= 0 (no negative values)
+
+Self-Healing Process:
+┌─────────────────────────────────────────────────────────────┐
+│ 1. Detect inconsistency via validate_consistency()          │
+│ 2. Identify which invariant is violated                     │
+│ 3. Calculate correction (e.g., drift amount)                │
+│ 4. Apply fix atomically under lock                          │
+│ 5. Log event for debugging                                  │
+│ 6. Increment auto_heal_count for monitoring                 │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Key Features:**
+- **Atomic Operations**: All counter updates protected by `asyncio.Lock`
+- **Self-Healing**: Automatic detection and correction of drift
+- **Event Logging**: Rolling window of last 100 events for debugging
+- **Comprehensive Validation**: 4 mathematical invariants checked
+- **Both Sync/Async APIs**: `record_hit()` async, `cache_hits` property sync
+
+**Usage:**
+```python
+from start_system import CacheStatisticsTracker
+
+tracker = CacheStatisticsTracker(cost_per_inference=0.002)
+
+# Record events (async, atomic)
+await tracker.record_hit()
+await tracker.record_miss(is_expired=True)
+await tracker.record_cleanup(entries_cleaned=5)
+
+# Validate and self-heal
+validation = await tracker.validate_consistency(auto_heal=True)
+print(f"Consistent: {validation['consistent']}")
+print(f"Issues found: {len(validation['issues'])}")
+print(f"Auto-healed: {len(validation['healed'])}")
+
+# Get atomic snapshot
+snapshot = await tracker.get_snapshot()
+print(f"Hit rate: {snapshot['cache_hits'] / snapshot['total_queries']:.1%}")
+```
+
+**Configuration:**
+```bash
+export ML_INFERENCE_COST_USD=0.002  # Cost per ML inference for savings calc
+```
+
+📚 **Deep Dive:** [docs/core/cache-statistics-tracker.md](docs/core/cache-statistics-tracker.md)
+
+### GlobalSessionManager - Always-Available Session Tracking
+
+The new `GlobalSessionManager` singleton ensures session tracking is **always available**, even during early failures or cleanup:
+
+```
+Problem (Before):
+┌─────────────────────────────────────────────────────────────┐
+│ Cleanup Code                                                 │
+│ ├─ Check globals().get("_hybrid_coordinator")               │
+│ ├─ If None → "Session tracker not available" ⚠️             │
+│ └─ Falls back to legacy cleanup (less reliable)             │
+└─────────────────────────────────────────────────────────────┘
+
+Solution (After):
+┌─────────────────────────────────────────────────────────────┐
+│ GlobalSessionManager (Singleton)                             │
+│ ├─ Initialized on first access via get_session_manager()   │
+│ ├─ Thread-safe with threading.Lock                          │
+│ ├─ Async-safe with asyncio.Lock                             │
+│ ├─ Always available - no dependency on coordinator          │
+│ └─ Both sync/async APIs for cleanup flexibility             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Key Features:**
+- **Singleton Pattern**: One instance across entire application
+- **Thread-Safe Init**: `threading.Lock` protects initialization
+- **Async-Safe Operations**: `asyncio.Lock` for all state changes
+- **Both Sync/Async APIs**: Sync versions for cleanup contexts
+- **Automatic Registration**: Session registered on first access
+- **Multi-Terminal Safety**: PID + hostname + session ID validation
+- **Stale Session Cleanup**: Automatic removal of dead sessions
+
+**Usage:**
+```python
+from start_system import get_session_manager, is_session_manager_available
+
+# Check availability
+if is_session_manager_available():
+    print("Session manager already initialized")
+
+# Get singleton (initializes if needed)
+session_mgr = get_session_manager()
+
+# Register a VM (async)
+await session_mgr.register_vm(
+    vm_id="jarvis-auto-12345",
+    zone="us-central1-a",
+    components=["voice", "vision", "ml"]
+)
+
+# Get VM info (async or sync)
+vm_async = await session_mgr.get_my_vm()
+vm_sync = session_mgr.get_my_vm_sync()  # For cleanup contexts
+
+# Unregister (async or sync)
+await session_mgr.unregister_vm()
+session_mgr.unregister_vm_sync()  # For cleanup contexts
+
+# Get statistics
+stats = session_mgr.get_statistics()
+print(f"VMs registered: {stats['vms_registered']}")
+print(f"Stale sessions removed: {stats['stale_sessions_removed']}")
+```
+
+📚 **Deep Dive:** [docs/core/global-session-manager.md](docs/core/global-session-manager.md)
+
+### AsyncSystemManager Port Compatibility
+
+Added backwards compatibility port aliases to `AsyncSystemManager`:
+
+```python
+# Before (would fail):
+manager = AsyncSystemManager()
+port = manager.backend_port  # AttributeError!
+
+# After (works):
+manager = AsyncSystemManager()
+port = manager.backend_port   # ✓ Returns manager.ports["main_api"]
+port = manager.frontend_port  # ✓ Returns manager.ports["frontend"]
+port = manager.websocket_port # ✓ Returns manager.ports["websocket_router"]
+
+# Port aliases stay in sync with dynamic updates
+manager.ports["main_api"] = 8080
+# manager.backend_port automatically reflects new value
+```
+
+### Architecture Overview
+
+```
+v17.9.7 Reliability Architecture
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+┌─────────────────────────────────────────────────────────────┐
+│                    Application Layer                         │
+├─────────────────────────────────────────────────────────────┤
+│  SemanticVoiceCacheManager                                  │
+│  ├─ Uses CacheStatisticsTracker for all counters           │
+│  ├─ Atomic record_hit()/record_miss()/record_cleanup()     │
+│  └─ get_statistics() returns validated, healed data        │
+├─────────────────────────────────────────────────────────────┤
+│  HybridWorkloadRouter                                       │
+│  ├─ Uses GlobalSessionManager for VM tracking              │
+│  ├─ register_vm() on GCP deployment                        │
+│  └─ unregister_vm() on cleanup                             │
+├─────────────────────────────────────────────────────────────┤
+│  AsyncSystemManager                                         │
+│  ├─ Backwards-compatible port aliases                       │
+│  │   ├─ backend_port → ports["main_api"]                   │
+│  │   ├─ frontend_port → ports["frontend"]                  │
+│  │   └─ websocket_port → ports["websocket_router"]         │
+│  └─ Dynamic port updates sync aliases automatically        │
+└─────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────┐
+│                    Core Infrastructure                       │
+├─────────────────────────────────────────────────────────────┤
+│  CacheStatisticsTracker                                     │
+│  ├─ asyncio.Lock for atomic operations                     │
+│  ├─ Mathematical invariant enforcement                      │
+│  ├─ Self-healing with auto_heal_count tracking             │
+│  └─ Event log (rolling 100 events) for debugging           │
+├─────────────────────────────────────────────────────────────┤
+│  GlobalSessionManager (Singleton)                           │
+│  ├─ threading.Lock for thread-safe init                    │
+│  ├─ asyncio.Lock for async-safe operations                 │
+│  ├─ Session file: /tmp/jarvis_session_{pid}.json           │
+│  ├─ VM registry: /tmp/jarvis_vm_registry.json              │
+│  └─ Global tracker: /tmp/jarvis_global_session.json        │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Files Modified in v17.9.7
+
+| File | Changes |
+|------|---------|
+| `start_system.py` | Added `CacheStatisticsTracker` class (~400 lines) |
+| `start_system.py` | Added `GlobalSessionManager` class (~500 lines) |
+| `start_system.py` | Added `get_session_manager()`, `is_session_manager_available()` |
+| `start_system.py` | Added `threading` import |
+| `start_system.py` | Added `backend_port`, `frontend_port`, `websocket_port` to `AsyncSystemManager` |
+| `start_system.py` | Updated `SemanticVoiceCacheManager` to use `CacheStatisticsTracker` |
+| `start_system.py` | Updated cleanup code to use `GlobalSessionManager` |
+
+### Verification
+
+Test the new statistics tracker:
+```bash
+python3 -c "
+import asyncio
+from start_system import CacheStatisticsTracker
+
+async def test():
+    tracker = CacheStatisticsTracker()
+    await tracker.record_hit()
+    await tracker.record_miss()
+    validation = await tracker.validate_consistency()
+    print(f'Consistent: {validation[\"consistent\"]}')
+    print(f'Total queries: {tracker.total_queries}')
+
+asyncio.run(test())
+"
+```
+
+Test the session manager:
+```bash
+python3 -c "
+from start_system import get_session_manager, is_session_manager_available
+
+print(f'Before init: {is_session_manager_available()}')
+mgr = get_session_manager()
+print(f'After init: {is_session_manager_available()}')
+print(f'Session ID: {mgr.session_id[:8]}...')
+print(f'PID: {mgr.pid}')
+"
+```
+
+Test port aliases:
+```bash
+python3 -c "
+from start_system import AsyncSystemManager
+m = AsyncSystemManager()
+print(f'backend_port: {m.backend_port}')
+print(f'frontend_port: {m.frontend_port}')
+print(f'websocket_port: {m.websocket_port}')
+"
+```
 
 ---
 
