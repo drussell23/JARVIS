@@ -179,7 +179,7 @@ coverage.xml
 *.perf
 *.trace
 
-# Core dumps (but allow backend/core/ directory)
+# Core dumps (but allow backend/core/ and backend/voice_unlock/core/ directories)
 # Note: Negation must come AFTER to override
 core
 core.*
@@ -187,16 +187,24 @@ core.*
 !backend/core/
 !backend/core/**
 !backend/core/**/*
-# But still ignore build artifacts, cache, and model files in backend/core/
+# Exception: Allow backend/voice_unlock/core directory (physics-aware authentication)
+!backend/voice_unlock/core/
+!backend/voice_unlock/core/**
+!backend/voice_unlock/core/**/*
+# But still ignore build artifacts and cache in backend/core/
 backend/core/__pycache__/
 backend/core/**/__pycache__/
 backend/core/build/
 backend/core/**/*.so
 backend/core/**/*.dylib
 backend/core/**/*.pyc
-backend/core/models/*.pth
-backend/core/models/*.bin
-backend/core/models/*.mlpackage/
+# Allow model files in backend/core/models/ (small enough to track)
+# Uncomment below to ignore large model files if needed:
+# backend/core/models/*.pth
+# backend/core/models/*.bin
+# backend/core/models/*.mlpackage/
+# Ignore pycache in voice_unlock/core
+backend/voice_unlock/core/__pycache__/
 
 # Benchmark results
 benchmark_results/

@@ -1,0 +1,357 @@
+Ê
+6
+features256-dim TF-IDF feature vector*	
+Ä†ÄR;
+probabilitiesProbabilities for 8 components
+*
+†Ä¢Ì
+"JARVIS Intent Classification Model1.0.0JARVIS AI System"Proprietary¢3
+#com.github.apple.coremltools.sourcetorch==2.7.1¢-
+$com.github.apple.coremltools.version8.3.0¢:
++com.github.apple.coremltools.source_dialectTorchScript≤Çì
+mainä
+
+features
+
+
+ÄCoreML5›
+CoreML5—probabilitiest
+const 
+features_to_fp16_dtype_0
+*.
+name&
+
+"
+features_to_fp16_dtype_0*
+val
+
+
+"
+fp16†
+const*
+fc1_weight_to_fp16
+
+
+Ä
+Ä*(
+name 
+
+"
+fc1_weight_to_fp16*A
+val:
+
+
+Ä
+Ä*"
+@model_path/weights/weight.bin@ê
+const!
+fc1_bias_to_fp16
+
+
+Ä*&
+name
+
+"
+fc1_bias_to_fp16*<
+val5
+
+
+Ä*$
+@model_path/weights/weight.binÄÅá
+cast
+x
+
+
+features%
+dtype
+
+features_to_fp16_dtype_0'
+features_to_fp16
+
+
+
+Ä*
+name
+
+
+"
+cast_1∏
+linear
+x
+
+features_to_fp16
+bias
+
+fc1_bias_to_fp16 
+weight
+
+fc1_weight_to_fp16)
+linear_0_cast_fp16
+
+
+
+Ä*(
+name 
+
+"
+linear_0_cast_fp16v
+relu
+x
+
+linear_0_cast_fp16(
+input_3_cast_fp16
+
+
+
+Ä*'
+name
+
+"
+input_3_cast_fp16¢
+const*
+fc2_weight_to_fp16
+
+
+Ä
+Ä*(
+name 
+
+"
+fc2_weight_to_fp16*C
+val<
+
+
+Ä
+Ä*$
+@model_path/weights/weight.bin¿Öê
+const!
+fc2_bias_to_fp16
+
+
+Ä*&
+name
+
+"
+fc2_bias_to_fp16*<
+val5
+
+
+Ä*$
+@model_path/weights/weight.binÄÜπ
+linear
+x
+
+input_3_cast_fp16
+bias
+
+fc2_bias_to_fp16 
+weight
+
+fc2_weight_to_fp16)
+linear_1_cast_fp16
+
+
+
+Ä*(
+name 
+
+"
+linear_1_cast_fp16v
+relu
+x
+
+linear_1_cast_fp16(
+input_9_cast_fp16
+
+
+
+Ä*'
+name
+
+"
+input_9_cast_fp16†
+const)
+fc3_weight_to_fp16
+
+
+@
+Ä*(
+name 
+
+"
+fc3_weight_to_fp16*B
+val;
+
+
+@
+Ä*$
+@model_path/weights/weight.bin¿àé
+const 
+fc3_bias_to_fp16
+
+
+
+@*&
+name
+
+"
+fc3_bias_to_fp16*;
+val4
+
+
+
+@*$
+@model_path/weights/weight.binÄâ∏
+linear
+x
+
+input_9_cast_fp16
+bias
+
+fc3_bias_to_fp16 
+weight
+
+fc3_weight_to_fp16(
+linear_2_cast_fp16
+
+
+
+@*(
+name 
+
+"
+linear_2_cast_fp16w
+relu
+x
+
+linear_2_cast_fp16(
+input_15_cast_fp16
+
+
+
+@*(
+name 
+
+"
+input_15_cast_fp16§
+const+
+output_weight_to_fp16
+
+
+
+@*+
+name#
+
+"
+output_weight_to_fp16*A
+val:
+
+
+
+@*$
+@model_path/weights/weight.bin¿äÜ
+const#
+output_bias_to_fp16
+
+
+
+*)
+name!
+
+"
+output_bias_to_fp16*-
+val&
+
+
+
+
+:
+5¨∂*90!&u≠=®>Ø¨ø
+linear
+x
+
+input_15_cast_fp16
+bias
+
+output_bias_to_fp16#
+weight
+
+output_weight_to_fp16(
+linear_3_cast_fp16
+
+
+
+*(
+name 
+
+"
+linear_3_cast_fp16u
+sigmoid
+x
+
+linear_3_cast_fp16&
+var_27_cast_fp16
+
+
+
+*%
+name
+
+"
+op_27_cast_fp16É
+const(
+ var_27_cast_fp16_to_fp32_dtype_0
+*5
+name-
+%
+#"!
+op_27_cast_fp16_to_fp32_dtype_0*
+val
+
+
+"
+fp32ì
+cast
+x
+
+var_27_cast_fp16-
+dtype$
+"
+ var_27_cast_fp16_to_fp32_dtype_0#
+probabilities
+
+
+*
+name
+
+
+"
+cast_0"Á
+	buildInfoŸ"
+
+
+∆"√
+8
+!
+
+"
+coremltools-version
+
+	"
+8.3.0
+@
+)
+!
+"
+coremltools-component-torch
+
+	"
+2.7.1
+E
+(
+ 
+"
+coremltools-source-dialect
+
+"
+TorchScript
