@@ -5787,8 +5787,9 @@ class DynamicPortManager:
 
     def __init__(self):
         self.config = self._load_config()
-        self.primary_port = self.config.get('port', 8011)
-        self.fallback_ports = self.config.get('fallback_ports', [8010, 8000, 8001, 8080, 8888])
+        # Primary port 8010 to match frontend expectations (ConfigAwareStartup.js, JarvisVoice.js)
+        self.primary_port = self.config.get('port', 8010)
+        self.fallback_ports = self.config.get('fallback_ports', [8011, 8000, 8001, 8080, 8888])
         self.blacklisted_ports = set()  # Ports with unkillable processes
         self.selected_port = None
         self.port_health_cache = {}  # port -> {'healthy': bool, 'last_check': time}
@@ -5796,9 +5797,10 @@ class DynamicPortManager:
     def _load_config(self) -> dict:
         """Load configuration from startup_progress_config.json."""
         config_path = Path(__file__).parent / 'backend' / 'config' / 'startup_progress_config.json'
+        # Default to port 8010 to match frontend expectations
         default_config = {
-            'port': 8011,
-            'fallback_ports': [8010, 8000, 8001, 8080, 8888],
+            'port': 8010,
+            'fallback_ports': [8011, 8000, 8001, 8080, 8888],
             'host': 'localhost',
             'protocol': 'http'
         }
@@ -5809,8 +5811,8 @@ class DynamicPortManager:
                     data = json.load(f)
                     backend_config = data.get('backend_config', {})
                     return {
-                        'port': backend_config.get('port', 8011),
-                        'fallback_ports': backend_config.get('fallback_ports', [8010, 8000, 8001, 8080, 8888]),
+                        'port': backend_config.get('port', 8010),
+                        'fallback_ports': backend_config.get('fallback_ports', [8011, 8000, 8001, 8080, 8888]),
                         'host': backend_config.get('host', 'localhost'),
                         'protocol': backend_config.get('protocol', 'http')
                     }
@@ -12193,7 +12195,7 @@ except Exception as e:
                         "milestones": [
                             {"endpoint": "/health", "progress": 60, "name": "backend", "message": "Backend responding", "icon": "⚙️"}
                         ],
-                        "backend_config": {"host": "localhost", "port": 8011, "protocol": "http"},
+                        "backend_config": {"host": "localhost", "port": 8010, "protocol": "http"},
                         "loading_server": {"host": "localhost", "port": 3001, "protocol": "http", "update_endpoint": "/api/update-progress"}
                     }
 

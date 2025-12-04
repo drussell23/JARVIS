@@ -191,9 +191,9 @@
   ],
   "backend_config": {
     "host": "localhost",
-    "port": 8011,
+    "port": 8010,
     "protocol": "http",
-    "fallback_ports": [8010, 8000, 8001, 8080, 8888]
+    "fallback_ports": [8011, 8000, 8001, 8080, 8888]
   },
   "loading_server": {
     "host": "localhost",
