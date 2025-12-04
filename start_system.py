@@ -3789,7 +3789,7 @@ class AsyncSystemManager:
             return True
 
     async def kill_process_on_port(self, port: int):
-        """Kill process using a specific port, excluding IDEs"""
+        """Kill process using a specific port, excluding IDEs. Detects stuck processes."""
         if platform.system() == "Darwin":  # macOS
             # Get PIDs on port, but exclude IDE processes
             try:
@@ -3801,6 +3801,8 @@ class AsyncSystemManager:
                 for pid in pids:
                     if not pid:
                         continue
+
+                    pid_int = int(pid)
 
                     # Check if this PID belongs to an IDE
                     try:
@@ -3832,13 +3834,53 @@ class AsyncSystemManager:
                             )
                             continue
 
-                        # Kill non-IDE process
-                        subprocess.run(f"kill -9 {pid}", shell=True, capture_output=True)
+                        # Check if process is stuck (uninterruptible sleep)
+                        try:
+                            proc_state = subprocess.run(
+                                f"ps -o stat= -p {pid}",
+                                shell=True,
+                                capture_output=True,
+                                text=True,
+                            )
+                            state = proc_state.stdout.strip()
+
+                            # UE, D, U states indicate uninterruptible sleep
+                            if 'U' in state or 'D' in state:
+                                print(f"\n{Colors.FAIL}🚨 CRITICAL: Process PID {pid} is STUCK (state: {state}){Colors.ENDC}")
+                                print(f"{Colors.FAIL}   This process is in uninterruptible sleep and CANNOT be killed.{Colors.ENDC}")
+                                print(f"{Colors.FAIL}   It was likely blocked by ML operations (torch/librosa) blocking the event loop.{Colors.ENDC}")
+                                print(f"\n{Colors.YELLOW}   ⚠️  SYSTEM RESTART REQUIRED to clear this process.{Colors.ENDC}")
+                                print(f"{Colors.CYAN}   The fixes have been applied to prevent this in the future.{Colors.ENDC}")
+                                print(f"{Colors.CYAN}   After restart, ML operations will run in thread pools.{Colors.ENDC}\n")
+                                # Don't try to kill - it won't work
+                                return False
+                        except Exception as e:
+                            pass
+
+                        # Try graceful termination first
+                        subprocess.run(f"kill -15 {pid}", shell=True, capture_output=True)
+                        await asyncio.sleep(0.5)
+
+                        # Check if still running
+                        check = subprocess.run(f"ps -p {pid}", shell=True, capture_output=True)
+                        if check.returncode == 0:
+                            # Force kill
+                            subprocess.run(f"kill -9 {pid}", shell=True, capture_output=True)
+                            await asyncio.sleep(0.3)
+
+                            # Verify killed
+                            check2 = subprocess.run(f"ps -p {pid}", shell=True, capture_output=True)
+                            if check2.returncode == 0:
+                                # Process survived kill -9 - likely stuck
+                                print(f"{Colors.FAIL}⚠️ Process {pid} survived kill -9 - may be stuck{Colors.ENDC}")
+                                return False
                     except:
                         pass
 
+                return True
             except:
                 pass
+            return True
         else:  # Linux
             cmd = f"fuser -k {port}/tcp"
             try:
