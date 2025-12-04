@@ -3241,6 +3241,349 @@ class Colors:
     MAGENTA = "\033[35m"
 
 
+# =============================================================================
+# Dynamic Port Manager with Stuck Process Detection
+# =============================================================================
+
+class DynamicPortManager:
+    """
+    Dynamic Port Manager for JARVIS startup.
+
+    Provides:
+    - Dynamic port discovery from config file (no hardcoding)
+    - Stuck process detection (UE state, zombies, timeouts)
+    - Automatic port failover when primary is blocked
+    - Integration with backend self-healer
+    - Process watchdog for stuck prevention
+    """
+
+    # macOS UE (Uninterruptible Sleep) state indicators
+    UE_STATE_INDICATORS = ['disk-sleep', 'uninterruptible', 'D', 'U']
+
+    def __init__(self):
+        self.config = self._load_config()
+        self.primary_port = self.config.get('port', 8011)
+        self.fallback_ports = self.config.get('fallback_ports', [8010, 8000, 8001, 8080, 8888])
+        self.blacklisted_ports = set()  # Ports with unkillable processes
+        self.selected_port = None
+        self.port_health_cache = {}  # port -> {'healthy': bool, 'last_check': time}
+
+    def _load_config(self) -> dict:
+        """Load configuration from startup_progress_config.json."""
+        config_path = Path(__file__).parent / 'backend' / 'config' / 'startup_progress_config.json'
+        default_config = {
+            'port': 8011,
+            'fallback_ports': [8010, 8000, 8001, 8080, 8888],
+            'host': 'localhost',
+            'protocol': 'http'
+        }
+
+        try:
+            if config_path.exists():
+                with open(config_path, 'r') as f:
+                    data = json.load(f)
+                    backend_config = data.get('backend_config', {})
+                    return {
+                        'port': backend_config.get('port', 8011),
+                        'fallback_ports': backend_config.get('fallback_ports', [8010, 8000, 8001, 8080, 8888]),
+                        'host': backend_config.get('host', 'localhost'),
+                        'protocol': backend_config.get('protocol', 'http')
+                    }
+        except Exception as e:
+            logger.warning(f"Could not load port config: {e}, using defaults")
+
+        return default_config
+
+    def _is_unkillable_state(self, status: str) -> bool:
+        """Check if process status indicates an unkillable (UE) state."""
+        if not status:
+            return False
+        status_lower = status.lower()
+        return any(ind.lower() in status_lower for ind in self.UE_STATE_INDICATORS)
+
+    def _get_process_on_port(self, port: int) -> Optional[dict]:
+        """Get process information for a process listening on the given port."""
+        try:
+            import psutil
+            for conn in psutil.net_connections(kind='inet'):
+                if hasattr(conn.laddr, 'port') and conn.laddr.port == port:
+                    if conn.status == 'LISTEN' and conn.pid:
+                        try:
+                            proc = psutil.Process(conn.pid)
+                            return {
+                                'pid': conn.pid,
+                                'name': proc.name(),
+                                'status': proc.status(),
+                                'cmdline': ' '.join(proc.cmdline() or [])[:200],
+                            }
+                        except (psutil.NoSuchProcess, psutil.AccessDenied):
+                            pass
+        except Exception as e:
+            logger.debug(f"Error getting process on port {port}: {e}")
+        return None
+
+    def check_port_health_sync(self, port: int, timeout: float = 2.0) -> dict:
+        """
+        Synchronously check if a port has a healthy backend.
+
+        Returns dict with:
+        - healthy: bool
+        - error: str or None
+        - is_stuck: bool (unkillable process detected)
+        - pid: int or None
+        """
+        result = {'port': port, 'healthy': False, 'error': None, 'is_stuck': False, 'pid': None}
+
+        # First check process state
+        proc_info = self._get_process_on_port(port)
+        if proc_info:
+            result['pid'] = proc_info['pid']
+            status = proc_info.get('status', '')
+
+            if self._is_unkillable_state(status):
+                result['is_stuck'] = True
+                result['error'] = f"Process PID {proc_info['pid']} in unkillable state: {status}"
+                self.blacklisted_ports.add(port)
+                logger.warning(f"Port {port}: {result['error']}")
+                return result
+
+        # Try HTTP health check
+        import socket
+        import urllib.request
+
+        url = f"http://localhost:{port}/health"
+        try:
+            req = urllib.request.Request(url, method='GET')
+            with urllib.request.urlopen(req, timeout=timeout) as response:
+                if response.status == 200:
+                    try:
+                        data = json.loads(response.read().decode())
+                        if data.get('status') == 'healthy':
+                            result['healthy'] = True
+                            return result
+                    except:
+                        # Even without JSON, 200 OK is good
+                        result['healthy'] = True
+                        return result
+        except urllib.error.URLError as e:
+            if 'Connection refused' in str(e):
+                result['error'] = 'connection_refused'
+            else:
+                result['error'] = str(e)[:50]
+        except socket.timeout:
+            result['error'] = 'timeout'
+        except Exception as e:
+            result['error'] = str(e)[:50]
+
+        return result
+
+    async def check_port_health_async(self, port: int, timeout: float = 2.0) -> dict:
+        """Async version of port health check."""
+        result = {'port': port, 'healthy': False, 'error': None, 'is_stuck': False, 'pid': None}
+
+        # First check process state
+        proc_info = await asyncio.get_event_loop().run_in_executor(
+            None, self._get_process_on_port, port
+        )
+
+        if proc_info:
+            result['pid'] = proc_info['pid']
+            status = proc_info.get('status', '')
+
+            if self._is_unkillable_state(status):
+                result['is_stuck'] = True
+                result['error'] = f"Process PID {proc_info['pid']} in unkillable state: {status}"
+                self.blacklisted_ports.add(port)
+                return result
+
+        # Try HTTP health check with aiohttp if available
+        try:
+            import aiohttp
+            url = f"http://localhost:{port}/health"
+
+            async def _do_check():
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
+                        if resp.status == 200:
+                            try:
+                                data = await resp.json()
+                                if data.get('status') == 'healthy':
+                                    result['healthy'] = True
+                            except:
+                                result['healthy'] = True
+
+            await asyncio.wait_for(_do_check(), timeout=timeout + 0.5)
+
+        except asyncio.TimeoutError:
+            result['error'] = 'timeout'
+        except Exception as e:
+            error_name = type(e).__name__
+            if 'ClientConnector' in error_name or 'Connection refused' in str(e):
+                result['error'] = 'connection_refused'
+            else:
+                result['error'] = f'{error_name}: {str(e)[:30]}'
+
+        return result
+
+    async def discover_healthy_port_async(self) -> int:
+        """
+        Discover the best healthy port asynchronously (parallel scanning).
+
+        Returns the best available port, or falls back to primary if none healthy.
+        """
+        # Build port list: primary first, then fallbacks
+        all_ports = [self.primary_port] + [
+            p for p in self.fallback_ports if p != self.primary_port
+        ]
+
+        # Remove blacklisted ports
+        check_ports = [p for p in all_ports if p not in self.blacklisted_ports]
+
+        if not check_ports:
+            logger.warning("All ports blacklisted! Using primary as fallback")
+            check_ports = [self.primary_port]
+
+        # Parallel health checks
+        tasks = [self.check_port_health_async(port) for port in check_ports]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Find healthy ports
+        healthy_ports = []
+        stuck_ports = []
+
+        for result in results:
+            if isinstance(result, Exception):
+                continue
+            if result.get('is_stuck'):
+                stuck_ports.append(result['port'])
+            elif result.get('healthy'):
+                healthy_ports.append(result['port'])
+
+        # Log findings
+        if stuck_ports:
+            logger.warning(f"Stuck processes detected on ports: {stuck_ports}")
+
+        # Select best port
+        if healthy_ports:
+            self.selected_port = healthy_ports[0]
+            logger.info(f"Selected healthy port: {self.selected_port}")
+        else:
+            # No healthy port, find first non-stuck port for new startup
+            available = [p for p in check_ports if p not in stuck_ports]
+            self.selected_port = available[0] if available else self.primary_port
+            logger.info(f"No healthy backend found, using port {self.selected_port} for new startup")
+
+        return self.selected_port
+
+    def discover_healthy_port_sync(self) -> int:
+        """
+        Discover the best healthy port synchronously.
+
+        For use before async event loop is running.
+        """
+        all_ports = [self.primary_port] + [
+            p for p in self.fallback_ports if p != self.primary_port
+        ]
+
+        check_ports = [p for p in all_ports if p not in self.blacklisted_ports]
+
+        for port in check_ports:
+            result = self.check_port_health_sync(port, timeout=1.0)
+
+            if result.get('is_stuck'):
+                logger.warning(f"Port {port} has stuck process - skipping")
+                continue
+
+            if result.get('healthy'):
+                self.selected_port = port
+                logger.info(f"Found healthy backend on port {self.selected_port}")
+                return self.selected_port
+
+            # Port not responding but not stuck - can be used for new startup
+            if result.get('error') == 'connection_refused':
+                if self.selected_port is None:
+                    self.selected_port = port  # First available non-stuck port
+
+        if self.selected_port is None:
+            self.selected_port = self.primary_port
+
+        logger.info(f"Using port {self.selected_port} for startup")
+        return self.selected_port
+
+    def cleanup_stuck_port(self, port: int) -> bool:
+        """
+        Attempt to clean up a stuck process on a port.
+
+        Returns True if port was freed, False if process is unkillable.
+        """
+        import psutil
+
+        proc_info = self._get_process_on_port(port)
+        if not proc_info:
+            return True  # No process, port is free
+
+        pid = proc_info['pid']
+        status = proc_info.get('status', '')
+
+        # Check for unkillable state
+        if self._is_unkillable_state(status):
+            logger.error(f"Process {pid} on port {port} is in unkillable state '{status}' - requires system restart")
+            self.blacklisted_ports.add(port)
+            return False
+
+        # Try to kill the process
+        try:
+            proc = psutil.Process(pid)
+
+            # Graceful shutdown first
+            logger.info(f"Sending SIGTERM to process {pid} on port {port}")
+            proc.terminate()
+
+            try:
+                proc.wait(timeout=5.0)
+                logger.info(f"Process {pid} terminated gracefully")
+                return True
+            except psutil.TimeoutExpired:
+                pass
+
+            # Force kill
+            logger.warning(f"Process {pid} didn't terminate gracefully, sending SIGKILL")
+            proc.kill()
+
+            try:
+                proc.wait(timeout=3.0)
+                logger.info(f"Process {pid} killed with SIGKILL")
+                return True
+            except psutil.TimeoutExpired:
+                logger.error(f"Failed to kill process {pid} - may be in unkillable state")
+                self.blacklisted_ports.add(port)
+                return False
+
+        except psutil.NoSuchProcess:
+            return True  # Process already gone
+        except Exception as e:
+            logger.error(f"Error killing process {pid}: {e}")
+            return False
+
+    def get_best_port(self) -> int:
+        """Get the best available port (cached or discover)."""
+        if self.selected_port is not None:
+            return self.selected_port
+        return self.discover_healthy_port_sync()
+
+
+# Global port manager instance
+_port_manager: Optional[DynamicPortManager] = None
+
+
+def get_port_manager() -> DynamicPortManager:
+    """Get the global port manager instance."""
+    global _port_manager
+    if _port_manager is None:
+        _port_manager = DynamicPortManager()
+    return _port_manager
+
+
 class AsyncSystemManager:
     """Async system manager with integrated resource optimization and self-healing"""
 
@@ -3251,13 +3594,20 @@ class AsyncSystemManager:
         self.background_tasks = []  # Track asyncio tasks for proper cleanup
         self.backend_dir = Path("backend")
         self.frontend_dir = Path("frontend")
+
+        # Dynamic port discovery - no more hardcoding!
+        self.port_manager = get_port_manager()
+        selected_api_port = self.port_manager.get_best_port()
+
         self.ports = {
-            "main_api": 8010,  # Main backend API
+            "main_api": selected_api_port,  # Dynamically discovered port
             "websocket_router": 8001,  # TypeScript WebSocket Router
             "frontend": 3000,
             "llama_cpp": 8080,
             "event_ui": 8888,  # Event-driven UI
         }
+
+        logger.info(f"🔧 Dynamic port selection: main_api={selected_api_port}")
         self.is_m1_mac = platform.system() == "Darwin" and platform.machine() == "arm64"
         self.claude_configured = False
         self.start_time = datetime.now()
