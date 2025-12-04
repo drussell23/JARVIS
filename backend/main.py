@@ -1044,6 +1044,32 @@ async def lifespan(app: FastAPI):
     logger.info("🚀 Starting optimized JARVIS backend...")
     start_time = time.time()
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # CRITICAL: Pre-startup cleanup of stuck ML processes
+    # This prevents the "startup timeout - please check logs" issue caused by
+    # stuck processes from previous sessions blocking port 8010 or holding
+    # ML model locks.
+    # ═══════════════════════════════════════════════════════════════════════════
+    try:
+        from core.process_isolated_ml_loader import cleanup_before_startup
+
+        logger.info("🧹 Running pre-startup cleanup (stuck process detection)...")
+        cleanup_results = await cleanup_before_startup(port=8010)
+
+        if cleanup_results.get('ml_processes_cleaned', 0) > 0:
+            logger.info(f"   Cleaned {cleanup_results['ml_processes_cleaned']} stuck ML processes")
+        if cleanup_results.get('port_freed'):
+            logger.info(f"   Freed port 8010 from stuck process")
+        if cleanup_results.get('zombies_cleaned', 0) > 0:
+            logger.info(f"   Cleaned {cleanup_results['zombies_cleaned']} zombie processes")
+
+        logger.info("✅ Pre-startup cleanup complete")
+
+    except ImportError:
+        logger.debug("Process isolated ML loader not available - skipping pre-startup cleanup")
+    except Exception as e:
+        logger.warning(f"⚠️ Pre-startup cleanup failed (continuing anyway): {e}")
+
     # Start event loop watchdog to detect blocking ML operations
     try:
         from core.ml_operation_watchdog import start_event_loop_watchdog, stop_event_loop_watchdog
@@ -1072,9 +1098,7 @@ async def lifespan(app: FastAPI):
         logger.info(f"   ARM64 optimized: {dynamic_component_manager.arm64_optimizer.is_arm64}")
         logger.info("✅ Dynamic component loading enabled")
 
-    # CRITICAL: Check for code changes and clean up old instances FIRST
-    # TEMPORARILY DISABLED - causing hang
-    logger.info("⚠️ Process cleanup temporarily disabled for debugging")
+    # Note: Legacy process cleanup removed - replaced by process_isolated_ml_loader cleanup above
 
     # Run parallel imports if enabled
     if DYNAMIC_LOADING_ENABLED and dynamic_component_manager:

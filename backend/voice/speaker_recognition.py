@@ -66,11 +66,19 @@ class SpeakerRecognitionEngine:
         self.owner_profile: Optional[VoiceProfile] = None
 
     async def initialize(self):
-        """Initialize speaker recognition engine"""
+        """
+        Initialize speaker recognition engine with FULLY ASYNC model loading.
+
+        CRITICAL FIX: All ML model loading is now wrapped in asyncio.to_thread()
+        with proper timeouts to prevent blocking the event loop.
+
+        Previous bug: EncoderClassifier.from_hparams() was called synchronously,
+        blocking the event loop and causing unkillable "startup timeout" hangs.
+        """
         if self.initialized:
             return
 
-        logger.info("🎭 Initializing Speaker Recognition Engine...")
+        logger.info("🎭 Initializing Speaker Recognition Engine (async-safe)...")
 
         # 🚀 UNIFIED CACHE: Try to connect for instant recognition fast-path
         try:
@@ -96,40 +104,108 @@ class SpeakerRecognitionEngine:
         except Exception as e:
             logger.warning(f"Voice router unavailable: {e}")
 
-        # Legacy: Try to load local model as fallback
-        try:
-            # Try to use pre-trained speaker embedding model
-            # Option 1: SpeechBrain (best for speaker recognition)
-            try:
-                from speechbrain.pretrained import EncoderClassifier
-
-                # Use pre-trained x-vector model for speaker embeddings
-                model_name = "speechbrain/spkrec-xvect-voxceleb"
-                self.model = EncoderClassifier.from_hparams(
-                    source=model_name,
-                    savedir=str(Path.home() / ".jarvis" / "models" / "speaker_recognition"),
-                    run_opts={"device": self._get_optimal_device()},
-                )
-                logger.info(f"✅ Loaded SpeechBrain x-vector model: {model_name}")
-
-            except ImportError:
-                # Fallback: Use Resemblyzer (lighter weight)
-                logger.info("SpeechBrain not available, falling back to Resemblyzer")
-                from resemblyzer import VoiceEncoder
-
-                self.model = VoiceEncoder()
-                logger.info("✅ Loaded Resemblyzer voice encoder")
-
-        except Exception as e:
-            logger.warning(f"Could not load speaker recognition model: {e}")
-            logger.warning("Speaker recognition will use voice router")
-            self.model = None
+        # Load speaker recognition model ASYNCHRONOUSLY with timeout
+        # This prevents the event loop from blocking during model loading
+        await self._load_speaker_model_async()
 
         # Load existing voice profiles from database
         await self._load_profiles_from_database()
 
         self.initialized = True
         logger.info(f"✅ Speaker Recognition initialized ({len(self.profiles)} profiles loaded)")
+
+    async def _load_speaker_model_async(self, timeout: float = 45.0):
+        """
+        Load speaker recognition model asynchronously with timeout protection.
+
+        Uses asyncio.to_thread() to run synchronous PyTorch/SpeechBrain code
+        without blocking the event loop. This allows timeouts to actually work.
+
+        Args:
+            timeout: Maximum time to wait for model loading (default 45s)
+        """
+        import time
+        start_time = time.perf_counter()
+
+        def _load_speechbrain_model():
+            """Synchronous SpeechBrain model loader (runs in thread)."""
+            from speechbrain.pretrained import EncoderClassifier
+            import torch
+
+            # Limit torch threads to prevent CPU overload
+            torch.set_num_threads(2)
+
+            model_name = "speechbrain/spkrec-xvect-voxceleb"
+            save_dir = str(Path.home() / ".jarvis" / "models" / "speaker_recognition")
+            device = self._get_optimal_device()
+
+            logger.info(f"Loading SpeechBrain model in background thread: {model_name}")
+
+            model = EncoderClassifier.from_hparams(
+                source=model_name,
+                savedir=save_dir,
+                run_opts={"device": device},
+            )
+
+            logger.info(f"SpeechBrain model loaded on device: {device}")
+            return model
+
+        def _load_resemblyzer_model():
+            """Synchronous Resemblyzer loader (runs in thread)."""
+            from resemblyzer import VoiceEncoder
+            logger.info("Loading Resemblyzer voice encoder in background thread...")
+            return VoiceEncoder()
+
+        # Try SpeechBrain first (best quality)
+        try:
+            logger.info(f"Attempting to load SpeechBrain model (timeout: {timeout}s)...")
+
+            # Run in thread with timeout - THIS IS THE KEY FIX
+            # asyncio.wait_for() + asyncio.to_thread() allows proper timeout handling
+            self.model = await asyncio.wait_for(
+                asyncio.to_thread(_load_speechbrain_model),
+                timeout=timeout
+            )
+
+            elapsed = (time.perf_counter() - start_time) * 1000
+            logger.info(f"✅ SpeechBrain x-vector model loaded successfully ({elapsed:.0f}ms)")
+            return
+
+        except asyncio.TimeoutError:
+            elapsed = (time.perf_counter() - start_time) * 1000
+            logger.warning(f"⏱️ SpeechBrain model load TIMEOUT after {elapsed:.0f}ms - falling back to Resemblyzer")
+
+        except ImportError:
+            logger.info("SpeechBrain not available, falling back to Resemblyzer")
+
+        except Exception as e:
+            logger.warning(f"SpeechBrain loading failed: {e} - falling back to Resemblyzer")
+
+        # Fallback: Try Resemblyzer (lighter weight, faster to load)
+        try:
+            start_time = time.perf_counter()
+
+            self.model = await asyncio.wait_for(
+                asyncio.to_thread(_load_resemblyzer_model),
+                timeout=15.0  # Resemblyzer is much faster
+            )
+
+            elapsed = (time.perf_counter() - start_time) * 1000
+            logger.info(f"✅ Resemblyzer voice encoder loaded ({elapsed:.0f}ms)")
+            return
+
+        except asyncio.TimeoutError:
+            logger.warning("⏱️ Resemblyzer model load TIMEOUT")
+
+        except ImportError:
+            logger.warning("Resemblyzer not available")
+
+        except Exception as e:
+            logger.warning(f"Resemblyzer loading failed: {e}")
+
+        # Final fallback: No local model, use voice router only
+        logger.warning("⚠️ No speaker recognition model loaded - using voice router only")
+        self.model = None
 
     def _get_optimal_device(self) -> str:
         """Determine optimal device for speaker recognition"""

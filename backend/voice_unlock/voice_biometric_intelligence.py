@@ -433,7 +433,7 @@ class IntelligentAnnouncementGenerator:
         if result.behavioral.consecutive_failures >= 3:
             return (
                 f"Voice verification has failed {result.behavioral.consecutive_failures} times. "
-                "Please try using manual authentication instead, or wait a moment and try again."
+                "Please try using keyboard authentication instead, or wait a moment and try again."
             )
 
         if result.audio.snr_db < 10:
