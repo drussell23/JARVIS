@@ -2747,7 +2747,55 @@ except ImportError as e:
 except Exception as e:
     logger.error(f"❌ Failed to mount Voice Unlock API: {e}")
 
-# Health check endpoint
+
+# =============================================================================
+# Lightweight Health Check Endpoints (Non-blocking)
+# =============================================================================
+@app.get("/health/ping")
+async def health_ping():
+    """
+    Ultra-lightweight liveness probe - returns immediately.
+
+    Use this endpoint for health checks that need sub-millisecond response.
+    Does NOT check any services, just confirms the event loop is responsive.
+    """
+    return {"status": "ok", "message": "pong"}
+
+
+@app.get("/health/ready")
+async def health_ready():
+    """
+    Quick readiness probe - confirms key services are initialized.
+
+    Faster than full /health endpoint, checks only critical systems.
+    Use this for Kubernetes readiness probes.
+    """
+    ready = True
+    details = {}
+
+    # Check if voice unlock is initialized (fast check - no async calls)
+    if hasattr(app.state, "voice_unlock"):
+        details["voice_unlock"] = app.state.voice_unlock.get("initialized", False)
+    else:
+        details["voice_unlock"] = False
+
+    # Check if ML audio is available (fast check)
+    if hasattr(app.state, "ml_audio_state"):
+        details["ml_audio"] = True
+    else:
+        details["ml_audio"] = False
+
+    # Check if event loop is responsive (always true if we got here)
+    details["event_loop"] = True
+
+    return {
+        "status": "ready" if all(details.values()) else "degraded",
+        "ready": ready,
+        "details": details
+    }
+
+
+# Full Health check endpoint (comprehensive but slower)
 @app.get("/health")
 async def health_check():
     """Quick health check endpoint"""

@@ -447,7 +447,32 @@ class SpeakerRecognitionEngine:
             return False
 
     async def _extract_embedding(self, audio_data: bytes) -> Optional[np.ndarray]:
-        """Extract voice embedding from audio"""
+        """
+        Extract voice embedding from audio.
+
+        PERFORMANCE FIX: All CPU-intensive operations (librosa, torch, MFCC)
+        are now run in asyncio.to_thread() to prevent blocking the event loop.
+        This is critical for keeping the backend responsive during voice unlock.
+        """
+        try:
+            # Run the entire CPU-intensive extraction in a thread pool
+            # to avoid blocking the async event loop
+            return await asyncio.to_thread(
+                self._extract_embedding_sync, audio_data
+            )
+        except Exception as e:
+            logger.error(f"Failed to extract embedding: {e}")
+            return None
+
+    def _extract_embedding_sync(self, audio_data: bytes) -> Optional[np.ndarray]:
+        """
+        Synchronous embedding extraction - runs in thread pool via asyncio.to_thread().
+
+        This method performs CPU-intensive operations:
+        - librosa.load() for audio decoding
+        - torch.FloatTensor() and model.encode_batch() for ECAPA embedding
+        - librosa.feature.mfcc() for fallback embedding
+        """
         try:
             # Convert audio bytes to numpy array
             import io
@@ -468,11 +493,15 @@ class SpeakerRecognitionEngine:
 
             # Extract embedding with model
             if hasattr(self.model, "encode_batch"):
-                # SpeechBrain
+                # SpeechBrain ECAPA-TDNN
                 import torch
 
+                # Limit torch threads to prevent CPU overload
+                torch.set_num_threads(1)
+
                 audio_tensor = torch.FloatTensor(audio_array).unsqueeze(0)
-                embedding = self.model.encode_batch(audio_tensor).squeeze().cpu().numpy()
+                with torch.no_grad():  # Disable gradient computation for inference
+                    embedding = self.model.encode_batch(audio_tensor).squeeze().cpu().numpy()
             elif hasattr(self.model, "embed_utterance"):
                 # Resemblyzer
                 embedding = self.model.embed_utterance(audio_array)
@@ -486,7 +515,7 @@ class SpeakerRecognitionEngine:
             return embedding
 
         except Exception as e:
-            logger.error(f"Failed to extract embedding: {e}")
+            logger.error(f"Failed to extract embedding (sync): {e}")
             return None
 
     def _cosine_similarity(self, emb1: np.ndarray, emb2: np.ndarray) -> float:
