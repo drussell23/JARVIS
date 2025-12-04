@@ -3474,6 +3474,372 @@ class ScaleToZeroCostOptimizer:
         }
 
 
+class CacheStatisticsTracker:
+    """
+    Async-safe, self-healing cache statistics tracker with comprehensive validation.
+
+    Features:
+    - Atomic counter operations with asyncio.Lock
+    - Comprehensive consistency validation with detailed diagnostics
+    - Self-healing capability to detect and correct drift
+    - Subset relationship enforcement (expired ⊆ misses, uninitialized ⊆ misses)
+    - Event-driven statistics with timestamps for debugging
+    - Automatic anomaly detection and logging
+
+    Mathematical Invariants:
+    - total_queries == cache_hits + cache_misses (always)
+    - cache_expired <= cache_misses (expired is a subset of misses)
+    - queries_while_uninitialized <= cache_misses (uninitialized is subset of misses)
+    - cache_expired + queries_while_uninitialized <= cache_misses (disjoint subsets)
+
+    Thread Safety:
+    - All counter updates are protected by asyncio.Lock
+    - Atomic read operations via snapshot mechanism
+    - Safe for concurrent async access
+    """
+
+    __slots__ = (
+        '_lock', '_cache_hits', '_cache_misses', '_cache_expired', 
+        '_total_queries', '_queries_while_uninitialized', '_cost_saved_usd',
+        '_expired_entries_cleaned', '_cleanup_runs', '_cleanup_errors',
+        '_cost_per_inference', '_last_consistency_check', '_consistency_violations',
+        '_auto_heal_count', '_event_log', '_max_event_log_size', '_created_at'
+    )
+
+    def __init__(self, cost_per_inference: float = 0.002, max_event_log_size: int = 100):
+        """
+        Initialize the statistics tracker.
+
+        Args:
+            cost_per_inference: Cost in USD per ML inference (for savings calculation)
+            max_event_log_size: Maximum events to keep in the rolling log
+        """
+        self._lock = asyncio.Lock()
+
+        # Core counters (use underscore prefix for internal access)
+        self._cache_hits: int = 0
+        self._cache_misses: int = 0
+        self._cache_expired: int = 0
+        self._total_queries: int = 0
+        self._queries_while_uninitialized: int = 0
+        self._cost_saved_usd: float = 0.0
+
+        # Maintenance counters
+        self._expired_entries_cleaned: int = 0
+        self._cleanup_runs: int = 0
+        self._cleanup_errors: int = 0
+
+        # Configuration
+        self._cost_per_inference = cost_per_inference
+
+        # Consistency tracking
+        self._last_consistency_check: float = 0.0
+        self._consistency_violations: int = 0
+        self._auto_heal_count: int = 0
+
+        # Event log for debugging (rolling window)
+        self._event_log: List[Dict[str, Any]] = []
+        self._max_event_log_size = max_event_log_size
+        self._created_at = time.time()
+
+    def _log_event(self, event_type: str, details: Optional[Dict[str, Any]] = None):
+        """Log an event for debugging purposes (non-blocking)."""
+        event = {
+            "timestamp": time.time(),
+            "type": event_type,
+            "details": details or {},
+            "snapshot": {
+                "hits": self._cache_hits,
+                "misses": self._cache_misses,
+                "total": self._total_queries,
+            }
+        }
+        self._event_log.append(event)
+
+        # Trim log if needed (keep most recent events)
+        if len(self._event_log) > self._max_event_log_size:
+            self._event_log = self._event_log[-self._max_event_log_size:]
+
+    async def record_hit(self, add_cost_savings: bool = True) -> None:
+        """
+        Record a cache hit atomically.
+
+        Args:
+            add_cost_savings: Whether to add to cost savings (default True)
+        """
+        async with self._lock:
+            self._total_queries += 1
+            self._cache_hits += 1
+            if add_cost_savings:
+                self._cost_saved_usd += self._cost_per_inference
+            self._log_event("hit", {"cost_saved": add_cost_savings})
+
+    async def record_miss(
+        self,
+        is_expired: bool = False,
+        is_uninitialized: bool = False
+    ) -> None:
+        """
+        Record a cache miss atomically with categorization.
+
+        Args:
+            is_expired: True if miss was due to TTL expiration
+            is_uninitialized: True if miss was due to cache not being ready
+
+        Note:
+            A miss can be EITHER expired OR uninitialized, never both.
+            This is enforced by the implementation.
+        """
+        async with self._lock:
+            self._total_queries += 1
+            self._cache_misses += 1
+
+            # Categorize the miss (mutually exclusive categories)
+            if is_expired:
+                self._cache_expired += 1
+                self._log_event("miss_expired")
+            elif is_uninitialized:
+                self._queries_while_uninitialized += 1
+                self._log_event("miss_uninitialized")
+            else:
+                self._log_event("miss")
+
+    async def record_cleanup(
+        self,
+        entries_cleaned: int,
+        success: bool = True
+    ) -> None:
+        """
+        Record a cleanup operation atomically.
+
+        Args:
+            entries_cleaned: Number of entries cleaned in this run
+            success: Whether the cleanup succeeded
+        """
+        async with self._lock:
+            self._cleanup_runs += 1
+            if success:
+                self._expired_entries_cleaned += entries_cleaned
+                self._log_event("cleanup_success", {"cleaned": entries_cleaned})
+            else:
+                self._cleanup_errors += 1
+                self._log_event("cleanup_error", {"attempted": entries_cleaned})
+
+    async def record_cleanup_error(self) -> None:
+        """Record a cleanup error atomically."""
+        async with self._lock:
+            self._cleanup_errors += 1
+            self._log_event("cleanup_error")
+
+    async def get_snapshot(self) -> Dict[str, Any]:
+        """
+        Get an atomic snapshot of all statistics.
+
+        Returns:
+            Dictionary with all current statistics values
+        """
+        async with self._lock:
+            return {
+                "cache_hits": self._cache_hits,
+                "cache_misses": self._cache_misses,
+                "cache_expired": self._cache_expired,
+                "total_queries": self._total_queries,
+                "queries_while_uninitialized": self._queries_while_uninitialized,
+                "cost_saved_usd": self._cost_saved_usd,
+                "expired_entries_cleaned": self._expired_entries_cleaned,
+                "cleanup_runs": self._cleanup_runs,
+                "cleanup_errors": self._cleanup_errors,
+                "consistency_violations": self._consistency_violations,
+                "auto_heal_count": self._auto_heal_count,
+                "uptime_seconds": time.time() - self._created_at,
+            }
+
+    async def validate_consistency(self, auto_heal: bool = True) -> Dict[str, Any]:
+        """
+        Validate statistics consistency and optionally self-heal.
+
+        Mathematical Invariants Checked:
+        1. total_queries == cache_hits + cache_misses
+        2. cache_expired <= cache_misses
+        3. queries_while_uninitialized <= cache_misses
+        4. cache_expired >= 0 and all counters >= 0
+
+        Args:
+            auto_heal: If True, attempt to correct inconsistencies
+
+        Returns:
+            Detailed validation report with any issues found
+        """
+        async with self._lock:
+            self._last_consistency_check = time.time()
+
+            issues: List[Dict[str, Any]] = []
+            healed: List[str] = []
+
+            # Invariant 1: total_queries == cache_hits + cache_misses
+            expected_total = self._cache_hits + self._cache_misses
+            if self._total_queries != expected_total:
+                drift = self._total_queries - expected_total
+                issues.append({
+                    "invariant": "total_queries == hits + misses",
+                    "expected": expected_total,
+                    "actual": self._total_queries,
+                    "drift": drift,
+                })
+                if auto_heal:
+                    # Trust hits + misses as source of truth
+                    self._total_queries = expected_total
+                    self._auto_heal_count += 1
+                    healed.append(f"total_queries: {self._total_queries - drift} → {self._total_queries}")
+
+            # Invariant 2: cache_expired <= cache_misses
+            if self._cache_expired > self._cache_misses:
+                issues.append({
+                    "invariant": "expired <= misses",
+                    "expired": self._cache_expired,
+                    "misses": self._cache_misses,
+                    "overflow": self._cache_expired - self._cache_misses,
+                })
+                if auto_heal:
+                    # Cap expired at misses
+                    old_expired = self._cache_expired
+                    self._cache_expired = self._cache_misses
+                    self._auto_heal_count += 1
+                    healed.append(f"cache_expired: {old_expired} → {self._cache_expired}")
+
+            # Invariant 3: queries_while_uninitialized <= cache_misses
+            if self._queries_while_uninitialized > self._cache_misses:
+                issues.append({
+                    "invariant": "uninitialized <= misses",
+                    "uninitialized": self._queries_while_uninitialized,
+                    "misses": self._cache_misses,
+                    "overflow": self._queries_while_uninitialized - self._cache_misses,
+                })
+                if auto_heal:
+                    old_uninit = self._queries_while_uninitialized
+                    self._queries_while_uninitialized = self._cache_misses
+                    self._auto_heal_count += 1
+                    healed.append(f"queries_while_uninitialized: {old_uninit} → {self._queries_while_uninitialized}")
+
+            # Invariant 4: No negative counters
+            for name, value in [
+                ("cache_hits", self._cache_hits),
+                ("cache_misses", self._cache_misses),
+                ("cache_expired", self._cache_expired),
+                ("total_queries", self._total_queries),
+                ("queries_while_uninitialized", self._queries_while_uninitialized),
+            ]:
+                if value < 0:
+                    issues.append({
+                        "invariant": f"{name} >= 0",
+                        "actual": value,
+                    })
+                    if auto_heal:
+                        setattr(self, f"_{name}", 0)
+                        self._auto_heal_count += 1
+                        healed.append(f"{name}: {value} → 0")
+
+            # Track violations
+            if issues:
+                self._consistency_violations += 1
+                self._log_event("consistency_violation", {
+                    "issues": len(issues),
+                    "healed": len(healed),
+                })
+
+            # Calculate derived metrics
+            valid_responses = self._cache_hits + self._cache_misses
+            hit_rate = self._cache_hits / valid_responses if valid_responses > 0 else 0.0
+            potential_hits = self._cache_hits + self._cache_expired
+            expired_rate = self._cache_expired / potential_hits if potential_hits > 0 else 0.0
+
+            return {
+                "consistent": len(issues) == 0,
+                "issues": issues,
+                "healed": healed,
+                "auto_heal_enabled": auto_heal,
+                "total_violations": self._consistency_violations,
+                "total_heals": self._auto_heal_count,
+                "last_check": self._last_consistency_check,
+                # Current state after any healing
+                "current_state": {
+                    "total_queries": self._total_queries,
+                    "cache_hits": self._cache_hits,
+                    "cache_misses": self._cache_misses,
+                    "cache_expired": self._cache_expired,
+                    "queries_while_uninitialized": self._queries_while_uninitialized,
+                    "hit_rate": hit_rate,
+                    "expired_rate": expired_rate,
+                },
+            }
+
+    async def reset(self) -> None:
+        """Reset all statistics to initial state."""
+        async with self._lock:
+            self._cache_hits = 0
+            self._cache_misses = 0
+            self._cache_expired = 0
+            self._total_queries = 0
+            self._queries_while_uninitialized = 0
+            self._cost_saved_usd = 0.0
+            self._expired_entries_cleaned = 0
+            self._cleanup_runs = 0
+            self._cleanup_errors = 0
+            self._consistency_violations = 0
+            self._auto_heal_count = 0
+            self._event_log.clear()
+            self._log_event("reset")
+
+    def get_recent_events(self, count: int = 10) -> List[Dict[str, Any]]:
+        """
+        Get the most recent events for debugging.
+
+        Args:
+            count: Number of recent events to return
+
+        Returns:
+            List of recent events (most recent last)
+        """
+        return self._event_log[-count:] if self._event_log else []
+
+    # Synchronous property accessors for backwards compatibility
+    @property
+    def cache_hits(self) -> int:
+        return self._cache_hits
+
+    @property
+    def cache_misses(self) -> int:
+        return self._cache_misses
+
+    @property
+    def cache_expired(self) -> int:
+        return self._cache_expired
+
+    @property
+    def total_queries(self) -> int:
+        return self._total_queries
+
+    @property
+    def queries_while_uninitialized(self) -> int:
+        return self._queries_while_uninitialized
+
+    @property
+    def cost_saved_usd(self) -> float:
+        return self._cost_saved_usd
+
+    @property
+    def expired_entries_cleaned(self) -> int:
+        return self._expired_entries_cleaned
+
+    @property
+    def cleanup_runs(self) -> int:
+        return self._cleanup_runs
+
+    @property
+    def cleanup_errors(self) -> int:
+        return self._cleanup_errors
+
+
 class SemanticVoiceCacheManager:
     """
     Semantic Voice Caching with ChromaDB for Cost Optimization.
@@ -3507,19 +3873,11 @@ class SemanticVoiceCacheManager:
         # ChromaDB collection name
         self.collection_name = os.getenv("SEMANTIC_CACHE_COLLECTION", "jarvis_voice_embeddings")
 
-        # Statistics - comprehensive tracking for all query states
-        self.cache_hits = 0
-        self.cache_misses = 0
-        self.cache_expired = 0  # Entries that matched but were expired (TTL exceeded)
-        self.total_queries = 0  # ALL queries including when uninitialized
-        self.queries_while_uninitialized = 0  # Queries that came in before cache was ready
-        self.cost_saved_usd = 0.0
-        self.expired_entries_cleaned = 0  # Proactively cleaned expired entries
-        self.cleanup_runs = 0  # Number of cleanup cycles completed
-        self.cleanup_errors = 0  # Cleanup failures for monitoring
-
         # Cost per inference (approximate)
         self.cost_per_inference = float(os.getenv("ML_INFERENCE_COST_USD", "0.002"))
+
+        # Async-safe statistics tracker with self-healing consistency validation
+        self._stats = CacheStatisticsTracker(cost_per_inference=self.cost_per_inference)
 
         # Background cleanup settings
         self._cleanup_interval_hours = float(os.getenv("SEMANTIC_CACHE_CLEANUP_INTERVAL_HOURS", "6"))
@@ -3600,20 +3958,17 @@ class SemanticVoiceCacheManager:
             Cached result if hit, None if miss
 
         Note:
-            - total_queries is incremented FIRST to ensure consistent tracking
+            - Uses async-safe CacheStatisticsTracker for all counter updates
             - Statistics are only updated AFTER TTL validation to prevent
               counting expired entries as hits.
+            - All operations are atomic and thread-safe.
         """
-        # CRITICAL: Increment total_queries BEFORE any early returns
-        # This ensures consistent statistics regardless of cache state
-        self.total_queries += 1
-
         if not self._initialized or not self._collection:
             # Track queries that came in while cache was not ready
-            self.queries_while_uninitialized += 1
-            self.cache_misses += 1
+            # Uses atomic record_miss with is_uninitialized flag
+            await self._stats.record_miss(is_uninitialized=True)
             logger.debug(
-                f"Cache query while uninitialized (total={self.queries_while_uninitialized})"
+                f"Cache query while uninitialized (total={self._stats.queries_while_uninitialized})"
             )
             return None
 
@@ -3650,9 +4005,8 @@ class SemanticVoiceCacheManager:
                     age_hours = (current_time - cached_time) / 3600
 
                     if age_hours > self.ttl_hours:
-                        # Entry expired - track as expired, not as hit
-                        self.cache_expired += 1
-                        self.cache_misses += 1
+                        # Entry expired - track as expired miss (atomic)
+                        await self._stats.record_miss(is_expired=True)
                         logger.debug(
                             f"Cache entry expired: age={age_hours:.1f}h > TTL={self.ttl_hours}h, "
                             f"similarity={similarity:.3f}"
@@ -3666,9 +4020,8 @@ class SemanticVoiceCacheManager:
                             )
                         return None
 
-                    # Valid cache hit - NOW safe to update statistics
-                    self.cache_hits += 1
-                    self.cost_saved_usd += self.cost_per_inference
+                    # Valid cache hit - NOW safe to update statistics (atomic)
+                    await self._stats.record_hit()
 
                     logger.debug(
                         f"🎯 Cache HIT: similarity={similarity:.3f}, "
@@ -3685,13 +4038,13 @@ class SemanticVoiceCacheManager:
                         "age_hours": age_hours,
                     }
 
-            # Cache miss - no similar embedding found
-            self.cache_misses += 1
+            # Cache miss - no similar embedding found (atomic)
+            await self._stats.record_miss()
             return None
 
         except Exception as e:
             logger.error(f"Cache query failed: {e}")
-            self.cache_misses += 1
+            await self._stats.record_miss()
             return None
 
     async def _delete_expired_entry(self, entry_id: str, age_hours: float):
@@ -3699,9 +4052,10 @@ class SemanticVoiceCacheManager:
         try:
             if self._collection:
                 self._collection.delete(ids=[entry_id])
-                self.expired_entries_cleaned += 1
+                await self._stats.record_cleanup(entries_cleaned=1, success=True)
                 logger.debug(f"Cleaned expired entry {entry_id} (age={age_hours:.1f}h)")
         except Exception as e:
+            await self._stats.record_cleanup_error()
             logger.warning(f"Failed to delete expired entry {entry_id}: {e}")
 
     async def _maybe_trigger_cleanup(self):
@@ -3813,13 +4167,14 @@ class SemanticVoiceCacheManager:
                         cleaned_count += len(batch)
                     except Exception as batch_error:
                         logger.warning(f"Failed to delete batch {i//self._cleanup_batch_size}: {batch_error}")
-                        self.cleanup_errors += 1
+                        await self._stats.record_cleanup_error()
 
                     # Yield to event loop between batches
                     if i % (self._cleanup_batch_size * 10) == 0:
                         await asyncio.sleep(0)
 
-                self.expired_entries_cleaned += cleaned_count
+                # Record successful cleanup with total count (atomic)
+                await self._stats.record_cleanup(entries_cleaned=cleaned_count, success=True)
                 remaining = self._collection.count()
 
                 logger.info(
@@ -3828,13 +4183,13 @@ class SemanticVoiceCacheManager:
                     f"remaining={remaining} (TTL={self.ttl_hours}h)"
                 )
             else:
+                # Record a successful cleanup run with 0 entries
+                await self._stats.record_cleanup(entries_cleaned=0, success=True)
                 logger.debug(f"Cache cleanup: scanned {scanned_count} entries, none expired")
-
-            self.cleanup_runs += 1
 
         except Exception as e:
             logger.error(f"Cache cleanup failed: {e}")
-            self.cleanup_errors += 1
+            await self._stats.record_cleanup_error()
 
         finally:
             # Always release the lock
@@ -3931,24 +4286,27 @@ class SemanticVoiceCacheManager:
         except Exception as e:
             logger.error(f"Cache cleanup failed: {e}")
 
-    def get_statistics(self) -> Dict[str, Any]:
+    async def get_statistics(self) -> Dict[str, Any]:
         """
-        Get comprehensive cache statistics.
+        Get comprehensive cache statistics with async-safe consistency validation.
 
-        Returns accurate statistics with expired entry tracking.
+        Returns accurate statistics with expired entry tracking and self-healing.
+
+        Features:
+        - Atomic snapshot of all statistics via CacheStatisticsTracker
+        - Automatic consistency validation with self-healing
+        - Comprehensive diagnostic information
+        - Detailed breakdown of miss types (expired, uninitialized)
 
         Notes:
         - hit_rate is calculated from valid hits only (excludes expired entries)
         - total_queries includes ALL queries (even when uninitialized)
         - queries_while_uninitialized tracks queries before cache was ready
+        - stats_consistent uses comprehensive invariant checking
         """
-        # Calculate rates (excluding expired from hit calculation)
-        valid_responses = self.cache_hits + self.cache_misses
-        hit_rate = self.cache_hits / valid_responses if valid_responses > 0 else 0.0
-
-        # Expired rate shows what percentage of potential hits were expired
-        potential_hits = self.cache_hits + self.cache_expired
-        expired_rate = self.cache_expired / potential_hits if potential_hits > 0 else 0.0
+        # Get atomic snapshot and validate consistency (with auto-heal)
+        validation = await self._stats.validate_consistency(auto_heal=True)
+        current_state = validation["current_state"]
 
         # Hours since last cleanup
         hours_since_cleanup = (
@@ -3956,29 +4314,24 @@ class SemanticVoiceCacheManager:
             if self._last_cleanup_time > 0 else float('inf')
         )
 
-        # Verify statistics consistency
-        stats_consistent = (
-            self.total_queries == self.cache_hits + self.cache_misses
-        )
-
         return {
             "enabled": self.enabled,
             "initialized": self._initialized,
-            # Query statistics (comprehensive)
-            "total_queries": self.total_queries,
-            "cache_hits": self.cache_hits,
-            "cache_misses": self.cache_misses,
-            "cache_expired": self.cache_expired,
-            "queries_while_uninitialized": self.queries_while_uninitialized,
-            # Calculated rates
-            "hit_rate": hit_rate,
-            "expired_rate": expired_rate,
+            # Query statistics from atomic snapshot
+            "total_queries": current_state["total_queries"],
+            "cache_hits": current_state["cache_hits"],
+            "cache_misses": current_state["cache_misses"],
+            "cache_expired": current_state["cache_expired"],
+            "queries_while_uninitialized": current_state["queries_while_uninitialized"],
+            # Calculated rates (from validated state)
+            "hit_rate": current_state["hit_rate"],
+            "expired_rate": current_state["expired_rate"],
             # Cost tracking
-            "cost_saved_usd": self.cost_saved_usd,
+            "cost_saved_usd": self._stats.cost_saved_usd,
             "cost_per_inference": self.cost_per_inference,
             # Cache state
             "cached_entries": self._collection.count() if self._collection else 0,
-            "expired_entries_cleaned": self.expired_entries_cleaned,
+            "expired_entries_cleaned": self._stats.expired_entries_cleaned,
             # Configuration
             "ttl_hours": self.ttl_hours,
             "similarity_threshold": self.similarity_threshold,
@@ -3988,12 +4341,72 @@ class SemanticVoiceCacheManager:
             "hours_since_cleanup": hours_since_cleanup,
             "cleanup_due": hours_since_cleanup >= self._cleanup_interval_hours,
             "cleanup_in_progress": self._cleanup_in_progress,
-            "cleanup_runs": self.cleanup_runs,
-            "cleanup_errors": self.cleanup_errors,
+            "cleanup_runs": self._stats.cleanup_runs,
+            "cleanup_errors": self._stats.cleanup_errors,
             # Pagination settings
             "scan_page_size": self._scan_page_size,
             "cleanup_batch_size": self._cleanup_batch_size,
-            # Diagnostics
+            # Comprehensive diagnostics (using new tracker)
+            "stats_consistent": validation["consistent"],
+            "consistency_issues": validation["issues"],
+            "consistency_healed": validation["healed"],
+            "total_consistency_violations": validation["total_violations"],
+            "total_auto_heals": validation["total_heals"],
+        }
+
+    def get_statistics_sync(self) -> Dict[str, Any]:
+        """
+        Synchronous version of get_statistics for backwards compatibility.
+
+        Note: This version does not perform async consistency validation.
+        Use get_statistics() for full async-safe behavior with self-healing.
+        """
+        # Calculate rates from tracker properties
+        hits = self._stats.cache_hits
+        misses = self._stats.cache_misses
+        expired = self._stats.cache_expired
+
+        valid_responses = hits + misses
+        hit_rate = hits / valid_responses if valid_responses > 0 else 0.0
+
+        potential_hits = hits + expired
+        expired_rate = expired / potential_hits if potential_hits > 0 else 0.0
+
+        hours_since_cleanup = (
+            (time.time() - self._last_cleanup_time) / 3600
+            if self._last_cleanup_time > 0 else float('inf')
+        )
+
+        # Simple consistency check (sync version)
+        stats_consistent = (
+            self._stats.total_queries == hits + misses
+        )
+
+        return {
+            "enabled": self.enabled,
+            "initialized": self._initialized,
+            "total_queries": self._stats.total_queries,
+            "cache_hits": hits,
+            "cache_misses": misses,
+            "cache_expired": expired,
+            "queries_while_uninitialized": self._stats.queries_while_uninitialized,
+            "hit_rate": hit_rate,
+            "expired_rate": expired_rate,
+            "cost_saved_usd": self._stats.cost_saved_usd,
+            "cost_per_inference": self.cost_per_inference,
+            "cached_entries": self._collection.count() if self._collection else 0,
+            "expired_entries_cleaned": self._stats.expired_entries_cleaned,
+            "ttl_hours": self.ttl_hours,
+            "similarity_threshold": self.similarity_threshold,
+            "max_entries": self.max_entries,
+            "cleanup_interval_hours": self._cleanup_interval_hours,
+            "hours_since_cleanup": hours_since_cleanup,
+            "cleanup_due": hours_since_cleanup >= self._cleanup_interval_hours,
+            "cleanup_in_progress": self._cleanup_in_progress,
+            "cleanup_runs": self._stats.cleanup_runs,
+            "cleanup_errors": self._stats.cleanup_errors,
+            "scan_page_size": self._scan_page_size,
+            "cleanup_batch_size": self._cleanup_batch_size,
             "stats_consistent": stats_consistent,
         }
 
@@ -4003,8 +4416,12 @@ class SemanticVoiceCacheManager:
 
         Returns:
             Health metrics including warnings for potential issues.
+
+        Note:
+            Uses synchronous get_statistics_sync() for compatibility.
+            For full async-safe validation, use get_health_status_async().
         """
-        stats = self.get_statistics()
+        stats = self.get_statistics_sync()
         warnings = []
         errors = []
 
