@@ -30,6 +30,7 @@ import hashlib
 import json
 import logging
 import mmap
+import os
 import random
 import time
 from collections import deque, defaultdict
@@ -2138,6 +2139,148 @@ class HybridDatabaseSync:
         except Exception as e:
             logger.error(f"Failed to read profile: {e}")
             return None
+
+    async def find_owner_profile(self, hint_name: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """
+        Dynamically find the owner's voice profile using multiple fallback strategies.
+
+        This method implements robust, fuzzy name matching to find the owner profile
+        even when names don't match exactly (e.g., "Derek" vs "Derek J. Russell").
+
+        Resolution order:
+        1. Exact match on hint_name (if provided)
+        2. Read from enrollment config file (~/.jarvis/voice_enrollment.json)
+        3. Case-insensitive exact match
+        4. Partial/prefix match (first name only)
+        5. LIKE query for names containing the hint
+        6. First profile with most samples (fallback for single-user systems)
+
+        Args:
+            hint_name: Optional name hint (e.g., from VBI_OWNER_NAME env var)
+
+        Returns:
+            Voice profile dict with embedding, or None if not found
+        """
+        start_time = time.time()
+        search_names = []
+
+        # Strategy 1: Use hint_name if provided
+        if hint_name:
+            search_names.append(hint_name)
+
+        # Strategy 2: Read from enrollment config
+        try:
+            enrollment_path = os.path.expanduser('~/.jarvis/voice_enrollment.json')
+            if os.path.exists(enrollment_path):
+                with open(enrollment_path, 'r') as f:
+                    enrollment = json.load(f)
+                    config_name = enrollment.get('owner_name')
+                    if config_name and config_name not in search_names:
+                        search_names.append(config_name)
+                        logger.debug(f"📄 Found owner name in enrollment config: {config_name}")
+        except Exception as e:
+            logger.debug(f"Could not read enrollment config: {e}")
+
+        # Strategy 3: Try environment variable
+        env_name = os.getenv('VBI_OWNER_NAME')
+        if env_name and env_name not in search_names:
+            search_names.append(env_name)
+
+        # Default fallback
+        if not search_names:
+            search_names = ['Derek']  # Reasonable default for Derek's system
+
+        # Try each name with exact match first
+        for name in search_names:
+            profile = await self.read_voice_profile(name)
+            if profile and profile.get('embedding') is not None:
+                latency = (time.time() - start_time) * 1000
+                logger.info(f"✅ Found owner profile '{name}' (exact match) in {latency:.2f}ms")
+                return profile
+
+        # Strategy 4-6: Fuzzy matching via SQLite queries
+        try:
+            for name in search_names:
+                # Case-insensitive match
+                async with self.sqlite_conn.execute(
+                    "SELECT * FROM speaker_profiles WHERE LOWER(speaker_name) = LOWER(?)",
+                    (name,)
+                ) as cursor:
+                    row = await cursor.fetchone()
+                    if row:
+                        profile = self._parse_profile_row(row)
+                        if profile.get('embedding') is not None:
+                            latency = (time.time() - start_time) * 1000
+                            logger.info(f"✅ Found owner profile '{profile['name']}' (case-insensitive) in {latency:.2f}ms")
+                            return profile
+
+                # Partial/prefix match - name starts with hint (e.g., "Derek" matches "Derek J. Russell")
+                async with self.sqlite_conn.execute(
+                    "SELECT * FROM speaker_profiles WHERE speaker_name LIKE ? || '%'",
+                    (name,)
+                ) as cursor:
+                    row = await cursor.fetchone()
+                    if row:
+                        profile = self._parse_profile_row(row)
+                        if profile.get('embedding') is not None:
+                            latency = (time.time() - start_time) * 1000
+                            logger.info(f"✅ Found owner profile '{profile['name']}' (prefix match from '{name}') in {latency:.2f}ms")
+                            return profile
+
+                # LIKE query - name contains hint anywhere
+                async with self.sqlite_conn.execute(
+                    "SELECT * FROM speaker_profiles WHERE speaker_name LIKE '%' || ? || '%'",
+                    (name,)
+                ) as cursor:
+                    row = await cursor.fetchone()
+                    if row:
+                        profile = self._parse_profile_row(row)
+                        if profile.get('embedding') is not None:
+                            latency = (time.time() - start_time) * 1000
+                            logger.info(f"✅ Found owner profile '{profile['name']}' (contains '{name}') in {latency:.2f}ms")
+                            return profile
+
+            # Strategy 6: Fallback - get profile with most samples (single-user systems)
+            async with self.sqlite_conn.execute(
+                "SELECT * FROM speaker_profiles ORDER BY total_samples DESC LIMIT 1"
+            ) as cursor:
+                row = await cursor.fetchone()
+                if row:
+                    profile = self._parse_profile_row(row)
+                    if profile.get('embedding') is not None:
+                        latency = (time.time() - start_time) * 1000
+                        logger.info(f"✅ Found owner profile '{profile['name']}' (fallback: most samples) in {latency:.2f}ms")
+                        return profile
+
+        except Exception as e:
+            logger.error(f"Fuzzy profile search failed: {e}")
+
+        latency = (time.time() - start_time) * 1000
+        logger.warning(f"❌ No owner profile found after {latency:.2f}ms (tried: {search_names})")
+        return None
+
+    async def list_all_profiles(self) -> List[Dict[str, Any]]:
+        """
+        List all speaker profiles in the local database.
+
+        Returns:
+            List of profile dicts with basic info (no embeddings for efficiency)
+        """
+        profiles = []
+        try:
+            async with self.sqlite_conn.execute(
+                "SELECT speaker_id, speaker_name, total_samples, last_updated FROM speaker_profiles ORDER BY total_samples DESC"
+            ) as cursor:
+                async for row in cursor:
+                    profiles.append({
+                        'speaker_id': row[0],
+                        'speaker_name': row[1],
+                        'total_samples': row[2],
+                        'last_updated': row[3]
+                    })
+        except Exception as e:
+            logger.error(f"Failed to list profiles: {e}")
+        return profiles
 
     def _parse_profile_row(self, row: tuple) -> Dict[str, Any]:
         """Parse SQLite row into profile dict"""

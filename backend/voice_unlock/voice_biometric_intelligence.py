@@ -101,6 +101,37 @@ class VBIConfig:
         # Parallel physics checks: run anti-spoofing in parallel with verification
         self.enable_parallel_physics = os.getenv('VBI_PARALLEL_PHYSICS', 'true').lower() == 'true'
 
+    def __getattr__(self, name: str):
+        """Fallback for missing config attributes - provides sensible defaults."""
+        # Default values for common config patterns
+        defaults = {
+            # Boolean flags default to False for safety
+            'enable_': False,
+            'use_': False,
+            'allow_': False,
+            # Thresholds default to moderate values
+            'threshold': 0.75,
+            '_threshold': 0.75,
+            # Timeouts default to reasonable values
+            'timeout': 5.0,
+            '_timeout': 5.0,
+            # Counts/limits
+            'max_': 10,
+            'min_': 1,
+            'count': 0,
+            '_count': 0,
+        }
+
+        # Try to find a matching default pattern
+        for pattern, default_value in defaults.items():
+            if pattern in name.lower():
+                logger.warning(f"⚠️ VBIConfig: Unknown attribute '{name}', using default: {default_value}")
+                return default_value
+
+        # Ultimate fallback
+        logger.warning(f"⚠️ VBIConfig: Unknown attribute '{name}', returning None")
+        return None
+
 
 _config = VBIConfig()
 
@@ -585,6 +616,10 @@ class VoiceBiometricIntelligence:
         self._quantized_encoder = None
         self._quantization_available = False
 
+        # Reference embedding and owner name (loaded from database during _init_hot_cache)
+        self._reference_embedding = None
+        self._owner_name = None
+
         logger.info("VoiceBiometricIntelligence initialized with performance optimizations")
 
     async def initialize(self) -> bool:
@@ -638,31 +673,49 @@ class VoiceBiometricIntelligence:
                     logger.info(f"✅ Owner voiceprint cached in hot memory")
                     return
 
-            # Fallback: load from database using read_voice_profile
+            # Fallback: load from database using dynamic fuzzy name matching
             try:
+                import numpy as np
                 from intelligence.hybrid_database_sync import HybridDatabaseSync
                 db = HybridDatabaseSync()
                 await db.initialize()
 
-                # Get owner name from environment or use default
-                owner_name = os.getenv('VBI_OWNER_NAME', 'Derek')
+                # Get owner name hint from environment (optional)
+                owner_name_hint = os.getenv('VBI_OWNER_NAME')
 
-                # Read the owner's voice profile
-                owner_profile = await db.read_voice_profile(owner_name)
+                # Use dynamic fuzzy matching to find owner profile
+                # This handles cases like "Derek" vs "Derek J. Russell"
+                owner_profile = await db.find_owner_profile(hint_name=owner_name_hint)
+
                 if owner_profile:
-                    async with self._hot_cache_lock:
-                        self._hot_voiceprint_cache['owner'] = {
-                            'name': owner_profile.get('name', owner_name),
-                            'embedding': owner_profile.get('embedding'),
-                            'samples_count': owner_profile.get('samples_count', 0),
-                        }
-                        self._hot_cache_timestamps['owner'] = time.time()
-                    logger.info(f"✅ Owner '{owner_name}' voiceprint cached from database")
+                    actual_name = owner_profile.get('name', owner_profile.get('speaker_name', 'Unknown'))
+                    embedding = owner_profile.get('embedding')
+
+                    if embedding is not None:
+                        # Store in hot cache for sub-10ms lookups
+                        async with self._hot_cache_lock:
+                            self._hot_voiceprint_cache['owner'] = {
+                                'name': actual_name,
+                                'embedding': embedding,
+                                'samples_count': owner_profile.get('total_samples', 0),
+                            }
+                            self._hot_cache_timestamps['owner'] = time.time()
+
+                            # Also set reference embedding for verification
+                            self._reference_embedding = embedding if isinstance(embedding, np.ndarray) else np.array(embedding, dtype=np.float32)
+                            self._owner_name = actual_name
+
+                        logger.info(f"✅ Owner '{actual_name}' voiceprint cached (shape: {self._reference_embedding.shape}, samples: {owner_profile.get('total_samples', 0)})")
+                    else:
+                        logger.warning(f"Owner profile '{actual_name}' found but embedding is None")
                 else:
-                    logger.info(f"No voiceprint found for owner '{owner_name}' - hot cache disabled")
+                    logger.warning("No owner voiceprint found - hot cache disabled (voice unlock will fail)")
+                    logger.info("💡 Run voice enrollment to register your voiceprint")
 
             except Exception as e:
                 logger.warning(f"Could not load owner profile from database: {e}")
+                import traceback
+                logger.debug(traceback.format_exc())
 
         except Exception as e:
             logger.warning(f"Hot cache initialization failed: {e}")
