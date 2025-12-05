@@ -407,8 +407,8 @@ class WarningSuppressionManager:
         should_suppress, rule_desc = self._should_suppress(msg_str, category, module)
 
         if should_suppress:
-            # Track suppressed warning
-            with self._thread_lock:
+            # Track suppressed warning (use sync lock interface)
+            with self._lock:
                 self._suppressed_count[rule_desc] = self._suppressed_count.get(rule_desc, 0) + 1
             logger.debug(f"Suppressed warning ({rule_desc}): {msg_str[:100]}...")
             return
