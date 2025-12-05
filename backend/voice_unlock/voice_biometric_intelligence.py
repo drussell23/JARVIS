@@ -54,6 +54,41 @@ import random
 
 logger = logging.getLogger(__name__)
 
+# =============================================================================
+# PHYSICS-AWARE & BAYESIAN FUSION INTEGRATION (v3.0)
+# =============================================================================
+# Lazy imports to avoid circular dependencies and startup overhead
+_anti_spoofing_detector = None
+_bayesian_fusion = None
+
+def _get_anti_spoofing_detector():
+    """Lazy-load anti-spoofing detector singleton."""
+    global _anti_spoofing_detector
+    if _anti_spoofing_detector is None:
+        try:
+            from voice_unlock.core.anti_spoofing import get_anti_spoofing_detector
+            _anti_spoofing_detector = get_anti_spoofing_detector()
+            logger.info("✅ Physics-aware anti-spoofing detector loaded")
+        except ImportError as e:
+            logger.warning(f"⚠️ Anti-spoofing module not available: {e}")
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to load anti-spoofing detector: {e}")
+    return _anti_spoofing_detector
+
+def _get_bayesian_fusion():
+    """Lazy-load Bayesian fusion engine singleton."""
+    global _bayesian_fusion
+    if _bayesian_fusion is None:
+        try:
+            from voice_unlock.core.bayesian_fusion import get_bayesian_fusion
+            _bayesian_fusion = get_bayesian_fusion()
+            logger.info("✅ Bayesian confidence fusion engine loaded")
+        except ImportError as e:
+            logger.warning(f"⚠️ Bayesian fusion module not available: {e}")
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to load Bayesian fusion: {e}")
+    return _bayesian_fusion
+
 
 # =============================================================================
 # DYNAMIC CONFIGURATION
@@ -100,6 +135,42 @@ class VBIConfig:
 
         # Parallel physics checks: run anti-spoofing in parallel with verification
         self.enable_parallel_physics = os.getenv('VBI_PARALLEL_PHYSICS', 'true').lower() == 'true'
+
+        # =======================================================================
+        # PHYSICS-AWARE & BAYESIAN FUSION INTEGRATION (v3.0)
+        # =======================================================================
+
+        # Physics-aware anti-spoofing
+        self.enable_physics_spoofing = os.getenv('VBI_PHYSICS_SPOOFING', 'true').lower() == 'true'
+        self.physics_spoofing_timeout = float(os.getenv('VBI_PHYSICS_TIMEOUT', '1.5'))
+        self.physics_spoof_threshold = float(os.getenv('VBI_PHYSICS_SPOOF_THRESHOLD', '0.7'))
+
+        # VTL (Vocal Tract Length) verification
+        self.enable_vtl_verification = os.getenv('VBI_VTL_ENABLED', 'true').lower() == 'true'
+        self.vtl_deviation_threshold_cm = float(os.getenv('VBI_VTL_DEVIATION_CM', '2.0'))
+
+        # Bayesian confidence fusion
+        self.enable_bayesian_fusion = os.getenv('VBI_BAYESIAN_FUSION', 'true').lower() == 'true'
+        self.bayesian_auth_threshold = float(os.getenv('VBI_BAYESIAN_AUTH_THRESHOLD', '0.85'))
+        self.bayesian_reject_threshold = float(os.getenv('VBI_BAYESIAN_REJECT_THRESHOLD', '0.40'))
+        self.bayesian_challenge_low = float(os.getenv('VBI_BAYESIAN_CHALLENGE_LOW', '0.40'))
+        self.bayesian_challenge_high = float(os.getenv('VBI_BAYESIAN_CHALLENGE_HIGH', '0.85'))
+
+        # Bayesian evidence weights (must sum to 1.0)
+        self.bayesian_ml_weight = float(os.getenv('VBI_BAYESIAN_ML_WEIGHT', '0.40'))
+        self.bayesian_physics_weight = float(os.getenv('VBI_BAYESIAN_PHYSICS_WEIGHT', '0.30'))
+        self.bayesian_behavioral_weight = float(os.getenv('VBI_BAYESIAN_BEHAVIORAL_WEIGHT', '0.20'))
+        self.bayesian_context_weight = float(os.getenv('VBI_BAYESIAN_CONTEXT_WEIGHT', '0.10'))
+
+        # Physics detection layers (7-layer system)
+        self.enable_replay_detection = os.getenv('VBI_REPLAY_DETECTION', 'true').lower() == 'true'
+        self.enable_synthetic_detection = os.getenv('VBI_SYNTHETIC_DETECTION', 'true').lower() == 'true'
+        self.enable_liveness_detection = os.getenv('VBI_LIVENESS_DETECTION', 'true').lower() == 'true'
+        self.enable_deepfake_detection = os.getenv('VBI_DEEPFAKE_DETECTION', 'true').lower() == 'true'
+
+        # Adaptive physics learning
+        self.physics_learning_enabled = os.getenv('VBI_PHYSICS_LEARNING', 'true').lower() == 'true'
+        self.physics_baseline_samples = int(os.getenv('VBI_PHYSICS_BASELINE_SAMPLES', '10'))
 
     def __getattr__(self, name: str):
         """Fallback for missing config attributes - provides sensible defaults."""
@@ -240,6 +311,18 @@ class VerificationResult:
     # Security
     spoofing_detected: bool = False
     spoofing_reason: Optional[str] = None
+
+    # Physics-Aware Analysis (v3.0)
+    physics_analysis: Optional[Dict[str, Any]] = None
+    physics_confidence: float = 0.0
+    vtl_verified: bool = False
+    liveness_passed: bool = False
+
+    # Bayesian Fusion (v3.0)
+    bayesian_decision: Optional[str] = None  # authenticate, reject, challenge, escalate
+    bayesian_authentic_prob: float = 0.0
+    bayesian_reasoning: List[str] = field(default_factory=list)
+    dominant_factor: str = ""  # which factor most influenced decision
 
     # Metadata
     timestamp: datetime = field(default_factory=datetime.now)
@@ -1012,10 +1095,11 @@ class VoiceBiometricIntelligence:
             # Determine recognition level
             result.level = self._determine_level(result)
 
-            # Get spoofing result
+            # Get spoofing result with physics analysis
+            physics_details = None
             if physics_task and physics_task in done and not physics_task.cancelled():
                 try:
-                    spoofing_detected, spoofing_reason = physics_task.result()
+                    spoofing_detected, spoofing_reason, physics_details = physics_task.result()
                     result.spoofing_detected = spoofing_detected
                     result.spoofing_reason = spoofing_reason
                 except Exception as e:
@@ -1023,9 +1107,24 @@ class VoiceBiometricIntelligence:
                     result.spoofing_detected = False
             else:
                 # Run spoofing check synchronously if not done in parallel
-                spoofing_detected, spoofing_reason = await self._check_spoofing(audio_data, result)
+                spoofing_detected, spoofing_reason, physics_details = await self._check_spoofing(
+                    audio_data, result, context
+                )
                 result.spoofing_detected = spoofing_detected
                 result.spoofing_reason = spoofing_reason
+
+            # Store physics analysis in result for Bayesian fusion
+            if physics_details:
+                result.physics_analysis = physics_details
+                result.physics_confidence = physics_details.get('physics_confidence', 0.0)
+                result.vtl_verified = physics_details.get('vtl_verified', False)
+                result.liveness_passed = physics_details.get('liveness_passed', False)
+
+            # =================================================================
+            # BAYESIAN FUSION (v3.0) - Multi-factor authentication decision
+            # =================================================================
+            # Run Bayesian fusion after all evidence is collected
+            self._apply_bayesian_fusion(result)
 
             if result.spoofing_detected:
                 result.level = RecognitionLevel.SPOOFING
@@ -1226,15 +1325,27 @@ class VoiceBiometricIntelligence:
     async def _run_background_physics(self, audio_data: bytes, result: VerificationResult):
         """Continue physics verification in background after early exit."""
         try:
-            # Run anti-spoofing checks
-            spoofing_detected, spoofing_reason = await self._check_spoofing(audio_data, result)
+            # Run anti-spoofing checks with full physics analysis
+            spoofing_detected, spoofing_reason, physics_details = await self._check_spoofing(
+                audio_data, result
+            )
 
-            # Store results for later learning
+            # Store results for later learning and Bayesian fusion
             self._physics_results = {
                 'spoofing_detected': spoofing_detected,
                 'spoofing_reason': spoofing_reason,
+                'physics_details': physics_details,
                 'timestamp': time.time(),
             }
+
+            # Store physics analysis for future reference
+            if physics_details:
+                self._last_physics_analysis = physics_details
+                logger.debug(
+                    f"Background physics: detector={physics_details.get('detector_used')}, "
+                    f"physics_conf={physics_details.get('physics_confidence', 0):.1%}, "
+                    f"vtl_verified={physics_details.get('vtl_verified', False)}"
+                )
 
             # If spoofing detected after early exit, log security event
             if spoofing_detected:
@@ -1242,7 +1353,12 @@ class VoiceBiometricIntelligence:
                     f"⚠️ SECURITY: Spoofing detected AFTER early exit! "
                     f"Reason: {spoofing_reason}"
                 )
-                # Could trigger additional security measures here
+                # Additional security measures for post-early-exit spoofing
+                if physics_details and physics_details.get('risk_level') == 'critical':
+                    logger.error(
+                        f"🚨 CRITICAL: High-risk spoofing after early exit. "
+                        f"Type: {physics_details.get('spoof_type')}"
+                    )
 
         except Exception as e:
             logger.debug(f"Background physics failed: {e}")
@@ -1991,6 +2107,129 @@ class VoiceBiometricIntelligence:
 
         return max(0.0, min(1.0, fused))
 
+    def _apply_bayesian_fusion(self, result: VerificationResult) -> None:
+        """
+        Apply full Bayesian confidence fusion (v3.0) for multi-factor authentication.
+
+        Uses the Bayesian fusion module to combine:
+        - ML confidence (voice biometric embedding similarity)
+        - Physics confidence (VTL, RT60, Doppler analysis)
+        - Behavioral confidence (time patterns, location, device)
+        - Context confidence (environmental factors)
+
+        Updates result with Bayesian decision and reasoning.
+        """
+        if not self._config.enable_bayesian_fusion:
+            return
+
+        # Get the Bayesian fusion engine
+        bayesian = _get_bayesian_fusion()
+        if bayesian is None:
+            logger.debug("Bayesian fusion not available, skipping")
+            return
+
+        try:
+            # Gather all confidence sources
+            ml_confidence = result.voice_confidence
+            physics_confidence = result.physics_confidence
+            behavioral_confidence = result.behavioral.behavioral_confidence if result.behavioral else 0.5
+            context_confidence = self._get_context_confidence(result)
+
+            # Build details for each evidence source
+            ml_details = {
+                'speaker_name': result.speaker_name,
+                'was_cached': result.was_cached,
+                'verification_time_ms': result.verification_time_ms,
+            }
+
+            physics_details = result.physics_analysis if result.physics_analysis else {}
+
+            behavioral_details = {
+                'is_typical_time': result.behavioral.is_typical_time if result.behavioral else False,
+                'is_typical_location': result.behavioral.is_typical_location if result.behavioral else False,
+                'device_trusted': result.behavioral.device_trusted if result.behavioral else False,
+            }
+
+            context_details = {
+                'environment': result.audio.environment.value if result.audio and result.audio.environment else 'unknown',
+                'voice_quality': result.audio.voice_quality.value if result.audio and result.audio.voice_quality else 'unknown',
+                'snr_db': result.audio.snr_db if result.audio else 0.0,
+            }
+
+            # Perform Bayesian fusion
+            fusion_result = bayesian.fuse(
+                ml_confidence=ml_confidence,
+                physics_confidence=physics_confidence,
+                behavioral_confidence=behavioral_confidence,
+                context_confidence=context_confidence,
+                ml_details=ml_details,
+                physics_details=physics_details,
+                behavioral_details=behavioral_details,
+                context_details=context_details
+            )
+
+            # Update result with Bayesian analysis
+            result.bayesian_decision = fusion_result.decision.value if hasattr(fusion_result.decision, 'value') else str(fusion_result.decision)
+            result.bayesian_authentic_prob = fusion_result.posterior_authentic
+            result.bayesian_reasoning = fusion_result.reasoning if hasattr(fusion_result, 'reasoning') else []
+            result.dominant_factor = fusion_result.dominant_factor if hasattr(fusion_result, 'dominant_factor') else ""
+
+            # Log Bayesian decision
+            logger.info(
+                f"🔮 Bayesian fusion: decision={result.bayesian_decision}, "
+                f"authentic_prob={result.bayesian_authentic_prob:.1%}, "
+                f"dominant={result.dominant_factor}"
+            )
+
+            # If Bayesian says CHALLENGE or ESCALATE, adjust the result
+            if result.bayesian_decision == 'challenge':
+                logger.info("🔮 Bayesian recommends challenge verification")
+                # Don't override verified status, but note the recommendation
+            elif result.bayesian_decision == 'escalate':
+                logger.warning("🔮 Bayesian recommends escalation - unusual pattern detected")
+            elif result.bayesian_decision == 'reject' and result.verified:
+                # Bayesian strongly disagrees with ML-only verification
+                logger.warning(
+                    f"⚠️ Bayesian REJECT conflicts with ML verification. "
+                    f"ML={ml_confidence:.1%}, Bayesian authentic={result.bayesian_authentic_prob:.1%}"
+                )
+
+        except Exception as e:
+            logger.warning(f"Bayesian fusion error: {e}")
+
+    def _get_context_confidence(self, result: VerificationResult) -> float:
+        """Calculate context confidence from environmental and situational factors."""
+        context_conf = 0.5  # Baseline
+
+        # Audio environment quality
+        if result.audio:
+            if result.audio.environment in [EnvironmentQuality.EXCELLENT, EnvironmentQuality.GOOD]:
+                context_conf += 0.2
+            elif result.audio.environment == EnvironmentQuality.POOR:
+                context_conf -= 0.1
+
+            # Voice quality
+            if result.audio.voice_quality == VoiceQuality.CLEAR:
+                context_conf += 0.15
+            elif result.audio.voice_quality == VoiceQuality.MUFFLED:
+                context_conf -= 0.1
+
+            # SNR contribution
+            if result.audio.snr_db >= 20:
+                context_conf += 0.1
+            elif result.audio.snr_db < 10:
+                context_conf -= 0.15
+
+        # Physics liveness passed
+        if result.liveness_passed:
+            context_conf += 0.1
+
+        # VTL verified (biometric uniqueness)
+        if result.vtl_verified:
+            context_conf += 0.15
+
+        return max(0.0, min(1.0, context_conf))
+
     def _get_audio_quality_factor(self, result: VerificationResult) -> float:
         """
         Calculate audio quality factor (0-1) from analysis.
@@ -2084,24 +2323,149 @@ class VoiceBiometricIntelligence:
     async def _check_spoofing(
         self,
         audio_data: bytes,
-        result: VerificationResult
-    ) -> Tuple[bool, Optional[str]]:
-        """Check for replay/spoofing attacks."""
-        # Simplified spoofing detection
-        # A full implementation would use ML-based liveness detection
+        result: VerificationResult,
+        context: Optional[Dict[str, Any]] = None
+    ) -> Tuple[bool, Optional[str], Optional[Dict[str, Any]]]:
+        """
+        Physics-Aware Anti-Spoofing Detection (v3.0)
 
-        # Check for suspiciously perfect audio (might be recording)
-        if result.audio.snr_db > 35:
-            # Very high SNR might indicate a recording
-            # (real voices have some natural variation)
-            pass  # Not definitive enough to flag
+        7-layer detection system:
+        1. Replay Attack Detection - Audio fingerprint + temporal matching
+        2. Synthetic Voice Detection - Spectral analysis for TTS artifacts
+        3. Recording Playback Detection - Room acoustics + speaker detection
+        4. Voice Conversion Detection - Formant/pitch manipulation analysis
+        5. Liveness Detection - Micro-variations + breathing patterns
+        6. Deepfake Detection - Temporal inconsistencies + artifact analysis
+        7. Physics-Aware Detection - VTL, reverb, Doppler analysis
 
-        # Check for very short audio with high confidence
-        # (might be a spliced recording)
-        if result.audio.duration_ms < 500 and result.voice_confidence > 0.95:
-            return True, "suspiciously short high-confidence audio"
+        Returns:
+            Tuple of (is_spoofed, spoof_reason, physics_analysis_details)
+        """
+        physics_details: Dict[str, Any] = {
+            'detector_used': 'fallback',
+            'physics_confidence': 0.0,
+            'layers_checked': 0,
+            'vtl_verified': False,
+            'liveness_passed': False,
+            'bayesian_authentic_prob': 0.0,
+        }
 
-        return False, None
+        # Check if physics-aware spoofing is enabled
+        if not self._config.enable_physics_spoofing:
+            # Fallback to basic checks
+            if result.audio.duration_ms < 500 and result.voice_confidence > 0.95:
+                return True, "suspiciously short high-confidence audio", physics_details
+            physics_details['detector_used'] = 'disabled'
+            return False, None, physics_details
+
+        # Try to use full physics-aware anti-spoofing detector
+        detector = _get_anti_spoofing_detector()
+        if detector is None:
+            logger.debug("Anti-spoofing detector not available, using fallback checks")
+            physics_details['detector_used'] = 'fallback_unavailable'
+
+            # Enhanced fallback checks
+            suspicion_score = 0.0
+            reasons = []
+
+            # Check 1: Suspiciously perfect audio (might be recording)
+            if result.audio.snr_db > 35:
+                suspicion_score += 0.2
+                reasons.append("unusually high SNR")
+
+            # Check 2: Very short high-confidence audio (spliced recording)
+            if result.audio.duration_ms < 500 and result.voice_confidence > 0.95:
+                suspicion_score += 0.4
+                reasons.append("short duration with high confidence")
+
+            # Check 3: Unusual spectral flatness (synthetic voice indicator)
+            if hasattr(result.audio, 'spectral_flatness') and result.audio.spectral_flatness > 0.8:
+                suspicion_score += 0.3
+                reasons.append("spectral flatness suggests synthesis")
+
+            # Check 4: Missing natural micro-variations
+            if hasattr(result.audio, 'pitch_variance') and result.audio.pitch_variance < 0.01:
+                suspicion_score += 0.25
+                reasons.append("unnatural pitch stability")
+
+            physics_details['fallback_suspicion_score'] = suspicion_score
+            physics_details['fallback_reasons'] = reasons
+
+            if suspicion_score >= self._config.physics_spoof_threshold:
+                return True, "; ".join(reasons), physics_details
+            return False, None, physics_details
+
+        # Use full physics-aware detector with timeout
+        try:
+            spoof_result = await asyncio.wait_for(
+                detector.detect_spoofing_async(
+                    audio_data=audio_data,
+                    speaker_name=self._owner_name or "unknown",
+                    context=context or {},
+                    ml_confidence=result.voice_confidence,
+                    behavioral_confidence=result.behavioral.behavioral_confidence if result.behavioral else None
+                ),
+                timeout=self._config.physics_spoofing_timeout
+            )
+
+            # Extract comprehensive physics analysis
+            physics_details = {
+                'detector_used': 'physics_aware',
+                'is_spoofed': spoof_result.is_spoofed,
+                'spoof_type': spoof_result.spoof_type.value if hasattr(spoof_result.spoof_type, 'value') else str(spoof_result.spoof_type),
+                'confidence': spoof_result.confidence,
+                'risk_level': spoof_result.risk_level,
+                'physics_confidence': spoof_result.physics_confidence,
+                'bayesian_authentic_prob': spoof_result.bayesian_authentic_probability,
+                'layers_checked': detector.num_layers if hasattr(detector, 'num_layers') else 7,
+                'recommendations': spoof_result.recommendations,
+            }
+
+            # Add physics-specific analysis if available
+            if spoof_result.physics_analysis:
+                physics_analysis = spoof_result.physics_analysis
+                physics_details['vtl_verified'] = getattr(physics_analysis, 'vtl_verified', False)
+                physics_details['vtl_cm'] = getattr(physics_analysis, 'vtl_cm', None)
+                physics_details['vtl_deviation_cm'] = getattr(physics_analysis, 'vtl_deviation_cm', None)
+                physics_details['rt60_seconds'] = getattr(physics_analysis, 'rt60_seconds', None)
+                physics_details['double_reverb_detected'] = getattr(physics_analysis, 'double_reverb_detected', False)
+                physics_details['doppler_liveness'] = getattr(physics_analysis, 'doppler_liveness_score', None)
+                physics_details['liveness_passed'] = getattr(physics_analysis, 'liveness_passed', False)
+                physics_details['physics_confidence_level'] = getattr(physics_analysis, 'confidence_level', None)
+
+            # Store for later use in Bayesian fusion
+            self._last_physics_analysis = physics_details
+
+            # Determine spoofing verdict
+            if spoof_result.is_spoofed:
+                reason = f"{spoof_result.spoof_type.value if hasattr(spoof_result.spoof_type, 'value') else str(spoof_result.spoof_type)} detected"
+                if spoof_result.details:
+                    reason += f" ({spoof_result.details.get('summary', '')})"
+                return True, reason, physics_details
+
+            # Check VTL deviation if enabled
+            if self._config.enable_vtl_verification:
+                vtl_deviation = physics_details.get('vtl_deviation_cm')
+                if vtl_deviation and vtl_deviation > self._config.vtl_deviation_threshold_cm:
+                    return True, f"VTL deviation too high ({vtl_deviation:.1f}cm)", physics_details
+
+            return False, None, physics_details
+
+        except asyncio.TimeoutError:
+            logger.warning(f"Physics spoofing detection timed out after {self._config.physics_spoofing_timeout}s")
+            physics_details['detector_used'] = 'timeout'
+            physics_details['timeout_seconds'] = self._config.physics_spoofing_timeout
+            # Don't block on timeout - return no spoof detected
+            return False, None, physics_details
+
+        except Exception as e:
+            logger.warning(f"Physics spoofing detection error: {e}")
+            physics_details['detector_used'] = 'error'
+            physics_details['error'] = str(e)
+            # Fall through to basic checks on error
+            if result.audio.duration_ms < 500 and result.voice_confidence > 0.95:
+                return True, "suspiciously short high-confidence audio", physics_details
+            return False, None, physics_details
 
     def _check_learning(
         self,
