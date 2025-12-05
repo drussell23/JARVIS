@@ -246,6 +246,14 @@ class RegistryStatus:
     engines: Dict[str, EngineMetrics] = field(default_factory=dict)
     errors: List[str] = field(default_factory=list)
 
+    # Non-blocking warmup state tracking
+    is_warming_up: bool = False
+    warmup_progress: float = 0.0  # 0.0 to 1.0
+    warmup_current_engine: Optional[str] = None
+    warmup_engines_completed: int = 0
+    warmup_engines_total: int = 0
+    background_task: Optional[asyncio.Task] = None
+
     @property
     def prewarm_duration_ms(self) -> Optional[float]:
         if self.prewarm_start_time and self.prewarm_end_time:
@@ -260,6 +268,20 @@ class RegistryStatus:
     def total_count(self) -> int:
         return len(self.engines)
 
+    @property
+    def warmup_status_message(self) -> str:
+        """Human-readable warmup status for health checks."""
+        if self.prewarm_completed:
+            return "All ML models ready"
+        elif self.is_warming_up:
+            if self.warmup_current_engine:
+                return f"Warming up {self.warmup_current_engine} ({self.warmup_engines_completed}/{self.warmup_engines_total})"
+            return f"Warming up ML models ({int(self.warmup_progress * 100)}%)"
+        elif self.prewarm_started:
+            return "Prewarm started, initializing..."
+        else:
+            return "Not started"
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "is_ready": self.is_ready,
@@ -267,6 +289,11 @@ class RegistryStatus:
             "prewarm_duration_ms": self.prewarm_duration_ms,
             "engines": {k: v.to_dict() for k, v in self.engines.items()},
             "errors": self.errors,
+            # Non-blocking warmup status
+            "is_warming_up": self.is_warming_up,
+            "warmup_progress": self.warmup_progress,
+            "warmup_current_engine": self.warmup_current_engine,
+            "warmup_status": self.warmup_status_message,
         }
 
 
@@ -431,28 +458,39 @@ class ECAPATDNNWrapper(MLEngineWrapper):
         return model
 
     async def _warmup_impl(self) -> bool:
-        """Run a test embedding extraction."""
+        """Run a test embedding extraction (non-blocking via ThreadPoolExecutor)."""
+
+        def _warmup_sync() -> bool:
+            try:
+                import numpy as np
+                import torch
+
+                # Generate 1 second of test audio
+                sample_rate = 16000
+                duration = 1.0
+                t = np.linspace(0, duration, int(sample_rate * duration))
+                # Pink noise for realistic test
+                white = np.random.randn(len(t)).astype(np.float32)
+                test_audio = torch.tensor(white * 0.3).unsqueeze(0)
+
+                # Extract embedding
+                with torch.no_grad():
+                    embedding = self._engine.encode_batch(test_audio)
+
+                logger.info(f"   [{self.name}] Warmup embedding shape: {embedding.shape}")
+                return True
+
+            except Exception as e:
+                logger.warning(f"   [{self.name}] Warmup failed: {e}")
+                return False
+
         try:
-            import numpy as np
-            import torch
-
-            # Generate 1 second of test audio
-            sample_rate = 16000
-            duration = 1.0
-            t = np.linspace(0, duration, int(sample_rate * duration))
-            # Pink noise for realistic test
-            white = np.random.randn(len(t)).astype(np.float32)
-            test_audio = torch.tensor(white * 0.3).unsqueeze(0)
-
-            # Extract embedding
-            with torch.no_grad():
-                embedding = self._engine.encode_batch(test_audio)
-
-            logger.info(f"   [{self.name}] Warmup embedding shape: {embedding.shape}")
-            return True
-
+            loop = asyncio.get_running_loop()
+            with ThreadPoolExecutor(max_workers=1, thread_name_prefix="ecapa_warmup") as executor:
+                result = await loop.run_in_executor(executor, _warmup_sync)
+            return result
         except Exception as e:
-            logger.warning(f"   [{self.name}] Warmup failed: {e}")
+            logger.warning(f"   [{self.name}] Async warmup wrapper failed: {e}")
             return False
 
 
@@ -502,24 +540,35 @@ class SpeechBrainSTTWrapper(MLEngineWrapper):
         return model
 
     async def _warmup_impl(self) -> bool:
-        """Run a test transcription."""
+        """Run a test transcription (non-blocking via ThreadPoolExecutor)."""
+
+        def _warmup_sync() -> bool:
+            try:
+                import numpy as np
+                import torch
+
+                # Generate 1 second of silence (quick warmup)
+                sample_rate = 16000
+                test_audio = torch.zeros(1, sample_rate)
+
+                # Transcribe
+                with torch.no_grad():
+                    _ = self._engine.transcribe_batch(test_audio, torch.tensor([1.0]))
+
+                logger.info(f"   [{self.name}] Warmup transcription complete")
+                return True
+
+            except Exception as e:
+                logger.warning(f"   [{self.name}] Warmup failed: {e}")
+                return False
+
         try:
-            import numpy as np
-            import torch
-
-            # Generate 1 second of silence (quick warmup)
-            sample_rate = 16000
-            test_audio = torch.zeros(1, sample_rate)
-
-            # Transcribe
-            with torch.no_grad():
-                _ = self._engine.transcribe_batch(test_audio, torch.tensor([1.0]))
-
-            logger.info(f"   [{self.name}] Warmup transcription complete")
-            return True
-
+            loop = asyncio.get_running_loop()
+            with ThreadPoolExecutor(max_workers=1, thread_name_prefix="stt_warmup") as executor:
+                result = await loop.run_in_executor(executor, _warmup_sync)
+            return result
         except Exception as e:
-            logger.warning(f"   [{self.name}] Warmup failed: {e}")
+            logger.warning(f"   [{self.name}] Async warmup wrapper failed: {e}")
             return False
 
 
@@ -557,26 +606,37 @@ class WhisperWrapper(MLEngineWrapper):
         return model
 
     async def _warmup_impl(self) -> bool:
-        """Run a test transcription."""
+        """Run a test transcription (non-blocking via ThreadPoolExecutor)."""
+
+        def _warmup_sync() -> bool:
+            try:
+                import numpy as np
+
+                # Generate 1 second of silence
+                sample_rate = 16000
+                test_audio = np.zeros(sample_rate, dtype=np.float32)
+
+                # Transcribe (this warms up the model)
+                _ = self._engine.transcribe(
+                    test_audio,
+                    language="en",
+                    fp16=False,
+                )
+
+                logger.info(f"   [{self.name}] Warmup transcription complete")
+                return True
+
+            except Exception as e:
+                logger.warning(f"   [{self.name}] Warmup failed: {e}")
+                return False
+
         try:
-            import numpy as np
-
-            # Generate 1 second of silence
-            sample_rate = 16000
-            test_audio = np.zeros(sample_rate, dtype=np.float32)
-
-            # Transcribe (this warms up the model)
-            _ = self._engine.transcribe(
-                test_audio,
-                language="en",
-                fp16=False,
-            )
-
-            logger.info(f"   [{self.name}] Warmup transcription complete")
-            return True
-
+            loop = asyncio.get_running_loop()
+            with ThreadPoolExecutor(max_workers=1, thread_name_prefix="whisper_warmup") as executor:
+                result = await loop.run_in_executor(executor, _warmup_sync)
+            return result
         except Exception as e:
-            logger.warning(f"   [{self.name}] Warmup failed: {e}")
+            logger.warning(f"   [{self.name}] Async warmup wrapper failed: {e}")
             return False
 
 
@@ -857,12 +917,41 @@ class MLEngineRegistry:
         return self._status
 
     async def _prewarm_parallel(self, timeout: float):
-        """Load all engines in parallel."""
+        """Load all engines in parallel with progress tracking."""
         logger.info(f"🔄 Loading {len(self._engines)} engines in PARALLEL...")
+
+        # Initialize progress tracking
+        total_engines = len(self._engines)
+        self._status.warmup_engines_total = total_engines
+        self._status.warmup_engines_completed = 0
+        self._status.warmup_progress = 0.0
+        self._status.warmup_current_engine = "parallel_loading"
+
+        completed_count = 0
+        completed_lock = asyncio.Lock()
+
+        async def load_with_progress(name: str, engine):
+            """Load an engine and update progress on completion."""
+            nonlocal completed_count
+            try:
+                result = await engine.load()
+                async with completed_lock:
+                    completed_count += 1
+                    self._status.warmup_engines_completed = completed_count
+                    self._status.warmup_progress = completed_count / total_engines
+                    logger.info(f"   ✅ {name} loaded ({completed_count}/{total_engines})")
+                return result
+            except Exception as e:
+                async with completed_lock:
+                    completed_count += 1
+                    self._status.warmup_engines_completed = completed_count
+                    self._status.warmup_progress = completed_count / total_engines
+                logger.error(f"   ❌ {name} failed ({completed_count}/{total_engines}): {e}")
+                raise
 
         # Create tasks for all engines
         tasks = {
-            name: asyncio.create_task(engine.load())
+            name: asyncio.create_task(load_with_progress(name, engine))
             for name, engine in self._engines.items()
         }
 
@@ -876,7 +965,6 @@ class MLEngineRegistry:
             # Process results
             for (name, _), result in zip(tasks.items(), results):
                 if isinstance(result, Exception):
-                    logger.error(f"❌ {name} failed: {result}")
                     self._status.errors.append(f"{name}: {result}")
                 elif not result:
                     self._status.errors.append(f"{name}: load returned False")
@@ -891,16 +979,30 @@ class MLEngineRegistry:
                     task.cancel()
                     logger.warning(f"   Cancelled: {name}")
 
+        # Final progress update
+        self._status.warmup_current_engine = None
+        self._status.warmup_progress = 1.0
+
     async def _prewarm_sequential(self, timeout: float):
-        """Load engines one by one."""
+        """Load engines one by one with progress tracking."""
         logger.info(f"🔄 Loading {len(self._engines)} engines SEQUENTIALLY...")
 
+        # Initialize progress tracking
+        total_engines = len(self._engines)
+        self._status.warmup_engines_total = total_engines
+        self._status.warmup_engines_completed = 0
+        self._status.warmup_progress = 0.0
+
         remaining_timeout = timeout
+        completed = 0
 
         for name, engine in self._engines.items():
             if remaining_timeout <= 0:
                 logger.warning(f"⏱️ No time remaining for {name}")
                 break
+
+            # Update current engine being loaded
+            self._status.warmup_current_engine = name
 
             start = time.time()
 
@@ -908,12 +1010,269 @@ class MLEngineRegistry:
                 success = await engine.load(timeout=remaining_timeout)
                 if not success:
                     self._status.errors.append(f"{name}: load failed")
+                    logger.warning(f"   ⚠️ {name} load returned False")
+                else:
+                    logger.info(f"   ✅ {name} loaded ({completed + 1}/{total_engines})")
             except Exception as e:
-                logger.error(f"❌ {name} failed: {e}")
+                logger.error(f"   ❌ {name} failed ({completed + 1}/{total_engines}): {e}")
                 self._status.errors.append(f"{name}: {e}")
 
             elapsed = time.time() - start
             remaining_timeout -= elapsed
+
+            # Update progress after each engine
+            completed += 1
+            self._status.warmup_engines_completed = completed
+            self._status.warmup_progress = completed / total_engines
+
+        # Final progress update
+        self._status.warmup_current_engine = None
+        self._status.warmup_progress = 1.0
+
+    # =========================================================================
+    # NON-BLOCKING PREWARM METHODS
+    # =========================================================================
+
+    @property
+    def is_warming_up(self) -> bool:
+        """Check if prewarm is currently in progress."""
+        return self._status.is_warming_up
+
+    @property
+    def warmup_progress(self) -> float:
+        """Get warmup progress (0.0 to 1.0)."""
+        return self._status.warmup_progress
+
+    @property
+    def warmup_status(self) -> Dict[str, Any]:
+        """Get detailed warmup status for health checks."""
+        return {
+            "is_warming_up": self._status.is_warming_up,
+            "is_ready": self.is_ready,
+            "progress": self._status.warmup_progress,
+            "current_engine": self._status.warmup_current_engine,
+            "engines_completed": self._status.warmup_engines_completed,
+            "engines_total": self._status.warmup_engines_total,
+            "status_message": self._status.warmup_status_message,
+            "prewarm_started": self._status.prewarm_started,
+            "prewarm_completed": self._status.prewarm_completed,
+        }
+
+    def prewarm_background(
+        self,
+        parallel: bool = True,
+        timeout: float = MLConfig.PREWARM_TIMEOUT,
+        startup_decision: Optional[Any] = None,
+        on_complete: Optional[Callable[[RegistryStatus], None]] = None,
+    ) -> asyncio.Task:
+        """
+        Launch ML model prewarm as a BACKGROUND TASK.
+
+        This method returns IMMEDIATELY and does NOT block FastAPI startup.
+        The prewarm runs in the background while the server accepts requests.
+
+        Use this method instead of prewarm_all_blocking() in main.py lifespan
+        to ensure FastAPI can respond to health checks during model loading.
+
+        Args:
+            parallel: Load engines in parallel (faster, more memory)
+            timeout: Total timeout for all engines
+            startup_decision: Optional StartupDecision from MemoryAwareStartup
+            on_complete: Optional callback when prewarm completes
+
+        Returns:
+            asyncio.Task that can be awaited later if needed
+
+        Example:
+            # In main.py lifespan:
+            prewarm_task = registry.prewarm_background()
+            # FastAPI starts immediately, models load in background
+            # Optional: await prewarm_task later if you need to wait
+        """
+        async def _prewarm_wrapper():
+            """Wrapper that handles progress tracking and callbacks."""
+            try:
+                # Set warming up state
+                self._status.is_warming_up = True
+                self._status.warmup_engines_total = len(self._engines)
+                self._status.warmup_engines_completed = 0
+                self._status.warmup_progress = 0.0
+
+                logger.info("=" * 70)
+                logger.info("🚀 STARTING BACKGROUND ML PREWARM (NON-BLOCKING)")
+                logger.info("=" * 70)
+                logger.info(f"   FastAPI will continue accepting requests during warmup")
+                logger.info(f"   Engines to load: {list(self._engines.keys())}")
+                logger.info("=" * 70)
+
+                # Run the actual prewarm
+                result = await self.prewarm_all_blocking(
+                    parallel=parallel,
+                    timeout=timeout,
+                    startup_decision=startup_decision,
+                )
+
+                # Update state when complete
+                self._status.is_warming_up = False
+                self._status.warmup_progress = 1.0
+                self._status.warmup_current_engine = None
+
+                logger.info("=" * 70)
+                logger.info("✅ BACKGROUND PREWARM COMPLETE")
+                logger.info(f"   Ready: {self.is_ready}")
+                logger.info(f"   Engines: {result.ready_count}/{result.total_count}")
+                if result.prewarm_duration_ms:
+                    logger.info(f"   Duration: {result.prewarm_duration_ms:.0f}ms")
+                logger.info("=" * 70)
+
+                # Call completion callback if provided
+                if on_complete:
+                    try:
+                        on_complete(result)
+                    except Exception as e:
+                        logger.warning(f"Prewarm completion callback failed: {e}")
+
+                return result
+
+            except Exception as e:
+                self._status.is_warming_up = False
+                self._status.errors.append(f"Background prewarm failed: {e}")
+                logger.error(f"❌ Background prewarm failed: {e}")
+                logger.error(traceback.format_exc())
+                raise
+
+        # Create and store the background task
+        task = asyncio.create_task(_prewarm_wrapper())
+        self._status.background_task = task
+
+        logger.info("🔄 Background prewarm task created - FastAPI continues running")
+        return task
+
+    async def prewarm_with_progress(
+        self,
+        parallel: bool = True,
+        timeout: float = MLConfig.PREWARM_TIMEOUT,
+        startup_decision: Optional[Any] = None,
+    ) -> RegistryStatus:
+        """
+        Prewarm all engines with detailed progress tracking.
+
+        Similar to prewarm_all_blocking but with per-engine progress updates.
+        This is useful for showing progress in a UI or status endpoint.
+
+        Args:
+            parallel: Load engines in parallel (faster, more memory)
+            timeout: Total timeout for all engines
+            startup_decision: Optional StartupDecision from MemoryAwareStartup
+
+        Returns:
+            RegistryStatus with loading results
+        """
+        self._status.is_warming_up = True
+        self._status.warmup_engines_total = len(self._engines)
+        self._status.warmup_engines_completed = 0
+        self._status.warmup_progress = 0.0
+
+        try:
+            if parallel:
+                # Load engines in parallel with progress tracking
+                await self._prewarm_parallel_with_progress(timeout)
+            else:
+                # Load sequentially with progress tracking
+                await self._prewarm_sequential_with_progress(timeout)
+
+            # Run the standard prewarm for any remaining setup
+            return await self.prewarm_all_blocking(
+                parallel=False,  # Don't re-load
+                timeout=timeout,
+                startup_decision=startup_decision,
+            )
+
+        finally:
+            self._status.is_warming_up = False
+            self._status.warmup_progress = 1.0
+
+    async def _prewarm_parallel_with_progress(self, timeout: float):
+        """Load all engines in parallel with progress tracking."""
+        logger.info(f"🔄 Loading {len(self._engines)} engines in PARALLEL with progress tracking...")
+
+        async def load_with_progress(name: str, engine: MLEngineWrapper):
+            """Load a single engine and update progress."""
+            self._status.warmup_current_engine = name
+            try:
+                result = await engine.load()
+                self._status.warmup_engines_completed += 1
+                self._status.warmup_progress = (
+                    self._status.warmup_engines_completed / self._status.warmup_engines_total
+                )
+                logger.info(f"   ✅ {name} loaded ({self._status.warmup_engines_completed}/{self._status.warmup_engines_total})")
+                return result
+            except Exception as e:
+                self._status.warmup_engines_completed += 1
+                self._status.warmup_progress = (
+                    self._status.warmup_engines_completed / self._status.warmup_engines_total
+                )
+                logger.error(f"   ❌ {name} failed: {e}")
+                return False
+
+        # Create tasks for all engines
+        tasks = [
+            asyncio.create_task(load_with_progress(name, engine))
+            for name, engine in self._engines.items()
+        ]
+
+        # Wait for all with timeout
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*tasks, return_exceptions=True),
+                timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            logger.error(f"⏱️ Parallel prewarm with progress timeout after {timeout}s")
+            # Cancel remaining tasks
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+
+    async def _prewarm_sequential_with_progress(self, timeout: float):
+        """Load engines sequentially with progress tracking."""
+        logger.info(f"🔄 Loading {len(self._engines)} engines SEQUENTIALLY with progress tracking...")
+
+        remaining_timeout = timeout
+
+        for i, (name, engine) in enumerate(self._engines.items()):
+            if remaining_timeout <= 0:
+                logger.warning(f"⏱️ No time remaining for {name}")
+                break
+
+            self._status.warmup_current_engine = name
+            self._status.warmup_progress = i / self._status.warmup_engines_total
+
+            start = time.time()
+
+            try:
+                await engine.load(timeout=remaining_timeout)
+                logger.info(f"   ✅ {name} loaded ({i + 1}/{self._status.warmup_engines_total})")
+            except Exception as e:
+                logger.error(f"   ❌ {name} failed: {e}")
+
+            self._status.warmup_engines_completed = i + 1
+            elapsed = time.time() - start
+            remaining_timeout -= elapsed
+
+    async def cancel_background_prewarm(self) -> bool:
+        """
+        Cancel the background prewarm task if running.
+
+        Returns:
+            True if task was cancelled, False if not running
+        """
+        if self._status.background_task and not self._status.background_task.done():
+            self._status.background_task.cancel()
+            self._status.is_warming_up = False
+            logger.info("🛑 Background prewarm cancelled")
+            return True
+        return False
 
     async def shutdown(self):
         """Gracefully shutdown all engines."""
@@ -1228,6 +1587,90 @@ async def prewarm_voice_unlock_models_blocking() -> RegistryStatus:
     """
     registry = await get_ml_registry()
     return await registry.prewarm_all_blocking()
+
+
+def prewarm_voice_unlock_models_background(
+    startup_decision: Optional[Any] = None,
+    on_complete: Optional[Callable[[RegistryStatus], None]] = None,
+) -> asyncio.Task:
+    """
+    Launch voice unlock model prewarm as a BACKGROUND TASK (non-blocking).
+
+    This function returns IMMEDIATELY and does NOT block FastAPI startup.
+    Models load in the background while the server accepts requests.
+
+    Use this instead of prewarm_voice_unlock_models_blocking() in main.py
+    to ensure FastAPI can respond to health checks during model loading.
+
+    Args:
+        startup_decision: Optional StartupDecision from MemoryAwareStartup
+        on_complete: Optional callback when prewarm completes
+
+    Returns:
+        asyncio.Task that can be awaited later if needed
+
+    Example:
+        # In main.py lifespan:
+        prewarm_task = prewarm_voice_unlock_models_background()
+        # FastAPI starts immediately, models load in background
+        # The task runs async, no blocking
+    """
+    global _registry
+
+    # Get or create registry synchronously (must already be initialized)
+    registry = _registry
+    if registry is None:
+        # Create synchronously for background launch
+        registry = MLEngineRegistry()
+        _registry = registry
+
+    # Launch background prewarm
+    return registry.prewarm_background(
+        parallel=True,
+        startup_decision=startup_decision,
+        on_complete=on_complete,
+    )
+
+
+def get_ml_warmup_status() -> Dict[str, Any]:
+    """
+    Get current ML warmup status for health checks.
+
+    Returns dict with:
+    - is_warming_up: True if prewarm is in progress
+    - is_ready: True if all critical engines are ready
+    - progress: 0.0 to 1.0 warmup progress
+    - current_engine: Name of engine currently loading
+    - status_message: Human-readable status string
+
+    Example:
+        status = get_ml_warmup_status()
+        if status["is_warming_up"]:
+            return {"status": "warming_up", "progress": status["progress"]}
+    """
+    if _registry is None:
+        return {
+            "is_warming_up": False,
+            "is_ready": False,
+            "progress": 0.0,
+            "current_engine": None,
+            "status_message": "ML Registry not initialized",
+            "engines_completed": 0,
+            "engines_total": 0,
+        }
+
+    return _registry.warmup_status
+
+
+def is_ml_warming_up() -> bool:
+    """
+    Quick check if ML models are currently warming up.
+
+    Use this in health checks to return appropriate status during warmup.
+    """
+    if _registry is None:
+        return False
+    return _registry.is_warming_up
 
 
 def is_voice_unlock_ready() -> bool:

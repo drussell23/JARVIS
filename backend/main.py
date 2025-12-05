@@ -1278,16 +1278,24 @@ async def lifespan(app: FastAPI):
 
     # ═══════════════════════════════════════════════════════════════
     # ML ENGINE REGISTRY - Handles both local and cloud routing
-    # Now passes startup_decision to registry for intelligent routing
+    # Now uses NON-BLOCKING prewarm to allow FastAPI to respond during model loading
     # ═══════════════════════════════════════════════════════════════
+    ml_prewarm_task = None  # Store task for potential cleanup
     try:
         logger.info("🔥 Initializing ML Engine Registry (Hybrid Local/Cloud)...")
 
-        # Use the new blocking ML Engine Registry for proper singleton pattern
-        # The registry now handles cloud routing internally based on startup_decision
-        from voice_unlock.ml_engine_registry import (
-            get_ml_registry,
-        )
+        # Use the ML Engine Registry with non-blocking prewarm
+        # Try multiple import paths for compatibility with different startup methods
+        try:
+            from backend.voice_unlock.ml_engine_registry import (
+                get_ml_registry,
+                get_ml_warmup_status,
+            )
+        except ImportError:
+            from voice_unlock.ml_engine_registry import (
+                get_ml_registry,
+                get_ml_warmup_status,
+            )
 
         # Get registry and pass startup_decision for intelligent routing
         registry = await get_ml_registry()
@@ -1297,33 +1305,48 @@ async def lifespan(app: FastAPI):
             logger.info("☁️  Cloud-first mode detected - registry will route to GCP")
             logger.info(f"   Reason: {startup_decision.reason if startup_decision else 'Low RAM'}")
 
-        # BLOCKING prewarm - registry decides local vs cloud based on startup_decision
-        # If cloud-first, it activates cloud routing and marks as ready immediately
-        # If local mode, it loads all engines and blocks until ready
-        prewarm_status = await registry.prewarm_all_blocking(
-            startup_decision=startup_decision
+        # ═══════════════════════════════════════════════════════════════
+        # NON-BLOCKING PREWARM - FastAPI can respond to health checks!
+        # ═══════════════════════════════════════════════════════════════
+        # This launches prewarm as a background task and returns immediately
+        # Models load in the background while FastAPI starts accepting requests
+        # Health checks will show "warming_up" status until models are ready
+        def on_prewarm_complete(status):
+            """Callback when prewarm finishes."""
+            if status.is_ready:
+                if registry.is_using_cloud:
+                    logger.info("✅ BACKGROUND ML PREWARM COMPLETE (CLOUD MODE)")
+                    logger.info(f"   → Cloud endpoint: {registry.cloud_endpoint}")
+                else:
+                    duration_ms = status.prewarm_duration_ms or 0
+                    logger.info(f"✅ BACKGROUND ML PREWARM COMPLETE in {duration_ms:.0f}ms (LOCAL MODE)")
+                    logger.info(f"   → {status.ready_count}/{status.total_count} engines ready")
+            else:
+                logger.warning(f"⚠️ BACKGROUND ML PREWARM PARTIAL: {status.ready_count}/{status.total_count} ready")
+
+        # Launch background prewarm - THIS RETURNS IMMEDIATELY!
+        ml_prewarm_task = registry.prewarm_background(
+            parallel=True,
+            startup_decision=startup_decision,
+            on_complete=on_prewarm_complete,
         )
 
-        if prewarm_status.is_ready:
-            if registry.is_using_cloud:
-                logger.info("   ✅ ML Registry ready (CLOUD MODE)")
-                logger.info(f"   → Cloud endpoint: {registry.cloud_endpoint}")
-                logger.info("   → Voice unlock will use GCP - instant response!")
-            else:
-                duration_ms = prewarm_status.prewarm_duration_ms or 0
-                logger.info(f"   ✅ ML prewarm complete in {duration_ms:.0f}ms (LOCAL MODE)")
-                logger.info(f"   → {prewarm_status.ready_count}/{prewarm_status.total_count} engines ready")
-                logger.info("   → Voice unlock will be INSTANT - no runtime model loading!")
-        else:
-            logger.warning(f"   ⚠️ ML prewarm partial: {prewarm_status.ready_count}/{prewarm_status.total_count} ready")
-            logger.warning(f"   → Errors: {prewarm_status.errors}")
+        logger.info("🔄 ML prewarm launched as BACKGROUND TASK")
+        logger.info("   → FastAPI will continue accepting requests during warmup")
+        logger.info("   → Health checks will show warmup progress")
+        logger.info("   → Voice unlock requests will wait for models automatically")
 
     except ImportError as e:
-        logger.debug(f"ML Engine Registry not available: {e}")
+        logger.info(f"⚠️ ML Engine Registry import failed: {e}")
+        import traceback
+        logger.info(f"   Traceback: {traceback.format_exc()}")
         # Fallback to legacy prewarmer if registry not available
         if not should_skip_ml_prewarm:
             try:
-                from voice_unlock.ml_model_prewarmer import prewarm_voice_unlock_models_background
+                try:
+                    from backend.voice_unlock.ml_model_prewarmer import prewarm_voice_unlock_models_background
+                except ImportError:
+                    from voice_unlock.ml_model_prewarmer import prewarm_voice_unlock_models_background
                 await prewarm_voice_unlock_models_background()
                 logger.info("   → Using legacy background prewarmer")
             except Exception:
@@ -2939,9 +2962,35 @@ async def health_ready():
 
     Faster than full /health endpoint, checks only critical systems.
     Use this for Kubernetes readiness probes.
+
+    During ML warmup, returns "warming_up" status with progress info.
+    This allows the frontend to show appropriate loading state.
     """
     ready = True
     details = {}
+
+    # Check ML Engine Registry warmup status (most important for voice unlock)
+    ml_warmup_info = {}
+    try:
+        from voice_unlock.ml_engine_registry import get_ml_warmup_status, is_voice_unlock_ready
+        ml_warmup_info = get_ml_warmup_status()
+        details["ml_warmup"] = ml_warmup_info
+
+        # If ML is warming up, report that status
+        if ml_warmup_info.get("is_warming_up"):
+            details["ml_models"] = "warming_up"
+            details["ml_progress"] = ml_warmup_info.get("progress", 0.0)
+            details["ml_current_engine"] = ml_warmup_info.get("current_engine")
+        elif ml_warmup_info.get("is_ready"):
+            details["ml_models"] = "ready"
+        else:
+            details["ml_models"] = "not_started"
+    except ImportError:
+        details["ml_warmup"] = {"status": "not_available"}
+        details["ml_models"] = "not_available"
+    except Exception as e:
+        details["ml_warmup"] = {"error": str(e)}
+        details["ml_models"] = "error"
 
     # Check if voice unlock is initialized (fast check - no async calls)
     if hasattr(app.state, "voice_unlock"):
@@ -2958,8 +3007,17 @@ async def health_ready():
     # Check if event loop is responsive (always true if we got here)
     details["event_loop"] = True
 
+    # Determine overall status
+    if ml_warmup_info.get("is_warming_up"):
+        status = "warming_up"
+        ready = True  # Backend is ready, just warming models
+    elif all(v for k, v in details.items() if k not in ["ml_warmup", "ml_models", "ml_progress", "ml_current_engine"]):
+        status = "ready"
+    else:
+        status = "degraded"
+
     return {
-        "status": "ready" if all(details.values()) else "degraded",
+        "status": status,
         "ready": ready,
         "details": details
     }
