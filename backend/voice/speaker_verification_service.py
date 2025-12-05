@@ -4487,16 +4487,11 @@ class SpeakerVerificationService:
         else:
             logger.error("❌ AUDIO DEBUG: No audio data received!")
 
-        # Convert audio to float32 for processing
-        if audio_data and len(audio_data) > 0:
-            try:
-                # Convert int16 PCM to float32 for the engine
-                audio_int16 = np.frombuffer(audio_data, dtype=np.int16)
-                audio_float32 = audio_int16.astype(np.float32) / 32768.0
-                audio_data = audio_float32.tobytes()
-                logger.info(f"🎤 AUDIO DEBUG: Converted {len(audio_int16)} int16 samples to float32")
-            except Exception as e:
-                logger.info(f"🎤 AUDIO DEBUG: Keeping original format: {e}")
+        # NOTE: Do NOT convert int16 to float32 bytes here!
+        # The SpeechBrain engine expects int16 PCM or standard audio formats with headers.
+        # Converting to float32 bytes strips headers and causes audio decoding to fail.
+        # The engine's _audio_bytes_to_tensor() handles format conversion internally.
+        logger.info(f"🎤 AUDIO DEBUG: Passing {len(audio_data) if audio_data else 0} bytes to engine (int16 PCM format preserved)")
 
         # 🚀 UNIFIED CACHE FAST-PATH: Try instant recognition before expensive SpeechBrain verification
         # This provides ~1ms matching vs 200-500ms for full model inference
