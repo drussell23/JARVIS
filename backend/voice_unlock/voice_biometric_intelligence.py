@@ -1594,18 +1594,33 @@ class VoiceBiometricIntelligence:
                         cache_result.similarity,
                         True  # Was cached
                     )
+                elif cache_result and cache_result.similarity >= 0.40:
+                    # CRITICAL FIX: Return partial similarity >= 40% (unlock threshold)
+                    # This prevents falling through to speaker engine which returns 0%
+                    # The 40% threshold is the minimum for unlock consideration
+                    logger.info(
+                        f"📊 Unified cache PARTIAL match: {cache_result.speaker_name} "
+                        f"({cache_result.similarity:.1%}) - returning for progressive confidence"
+                    )
+                    diagnostics['cache_similarity'] = cache_result.similarity
+                    diagnostics['cache_match_type'] = cache_result.match_type
+                    return (
+                        cache_result.speaker_name,
+                        cache_result.similarity,
+                        True  # Was cached (partial match)
+                    )
                 else:
                     similarity = cache_result.similarity if cache_result else 0
                     match_type = cache_result.match_type if cache_result else "none"
                     diagnostics['cache_similarity'] = similarity
                     diagnostics['cache_match_type'] = match_type
 
-                    # If we got a non-zero similarity, log for debugging
+                    # If we got a non-zero similarity (but < 40%), log for debugging
                     if similarity > 0:
-                        diagnostics['failure_reasons'].append(f'below_threshold_{similarity:.0%}')
+                        diagnostics['failure_reasons'].append(f'below_unlock_threshold_{similarity:.0%}')
                         logger.info(
-                            f"📊 Unified cache partial match: similarity={similarity:.1%}, "
-                            f"type={match_type}, threshold needed=75%"
+                            f"📊 Unified cache low match: similarity={similarity:.1%}, "
+                            f"type={match_type} (below 40% unlock threshold)"
                         )
                     else:
                         diagnostics['failure_reasons'].append('zero_similarity')
