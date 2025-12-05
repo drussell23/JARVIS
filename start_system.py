@@ -14315,25 +14315,736 @@ async def main():
         return 0
 
 
+# ============================================================================
+# ADVANCED STARTUP BOOTSTRAPPER - Dynamic, Async, Robust, Self-Healing
+# ============================================================================
+
+class AdvancedStartupBootstrapper:
+    """
+    Advanced Startup Bootstrapper for JARVIS AI System.
+
+    Features:
+    - 🔍 Dynamic path discovery (zero hardcoding)
+    - ⚡ Async parallel initialization
+    - 🌍 Multi-environment detection (dev/prod/test/ci)
+    - 📁 Configuration layering (file → env → CLI)
+    - 🏥 Health checks and validation
+    - 🔄 Self-healing with automatic recovery
+    - 📊 Comprehensive telemetry and logging
+    - 🛡️ Graceful degradation on failures
+    - 🧹 Automatic cleanup on exit
+    """
+
+    # Environment detection patterns
+    ENV_PATTERNS = {
+        'production': ['prod', 'production', 'prd'],
+        'staging': ['staging', 'stg', 'stage'],
+        'development': ['dev', 'development', 'local'],
+        'test': ['test', 'testing', 'ci', 'qa'],
+    }
+
+    # Required directories for validation
+    REQUIRED_DIRS = ['backend', 'frontend']
+    OPTIONAL_DIRS = ['core', 'api', 'intelligence', 'vision', 'voice']
+
+    # Config file search paths (relative to project root)
+    CONFIG_PATHS = [
+        'backend/config/startup_progress_config.json',
+        'config/startup.json',
+        '.jarvis/config.json',
+        'jarvis.config.json',
+    ]
+
+    def __init__(self):
+        """Initialize the bootstrapper with dynamic discovery."""
+        self._start_time = time.time()
+        self._initialized = False
+        self._paths: Dict[str, Path] = {}
+        self._config: Dict[str, Any] = {}
+        self._environment: str = 'development'
+        self._health_status: Dict[str, Any] = {}
+        self._recovery_attempts: int = 0
+        self._max_recovery_attempts: int = 3
+        self._telemetry: Dict[str, Any] = {'events': [], 'timings': {}}
+        self._cleanup_handlers: List[Callable] = []
+        self._interrupt_count: int = 0
+        self._last_interrupt_time: float = 0
+        self._hybrid_coordinator: Optional[Any] = None
+        self._lock = asyncio.Lock() if hasattr(asyncio, 'Lock') else None
+
+        # Discover paths immediately (sync, required for early setup)
+        self._discover_paths()
+
+    def _discover_paths(self) -> None:
+        """
+        Dynamically discover all required paths.
+        Zero hardcoding - works from any invocation location.
+        """
+        # Method 1: Script location (most reliable)
+        script_path = Path(__file__).resolve()
+        script_dir = script_path.parent
+
+        # Method 2: Current working directory
+        cwd = Path.cwd().resolve()
+
+        # Method 3: Environment variable override
+        env_root = os.environ.get('JARVIS_ROOT')
+
+        # Determine project root by checking for marker files/dirs
+        candidate_roots = [script_dir, cwd]
+        if env_root:
+            candidate_roots.insert(0, Path(env_root).resolve())
+
+        project_root = None
+        for candidate in candidate_roots:
+            if self._is_project_root(candidate):
+                project_root = candidate
+                break
+            # Check parent directories
+            for parent in candidate.parents:
+                if self._is_project_root(parent):
+                    project_root = parent
+                    break
+            if project_root:
+                break
+
+        if not project_root:
+            # Fallback to script directory
+            project_root = script_dir
+
+        # Store discovered paths
+        self._paths = {
+            'project_root': project_root,
+            'script': script_path,
+            'backend': project_root / 'backend',
+            'frontend': project_root / 'frontend',
+            'config': project_root / 'backend' / 'config',
+            'logs': project_root / 'backend' / 'logs',
+            'venv': project_root / 'backend' / 'venv',
+            'core': project_root / 'backend' / 'core',
+            'api': project_root / 'backend' / 'api',
+            'intelligence': project_root / 'backend' / 'intelligence',
+            'temp': Path(tempfile.gettempdir()),
+            'home': Path.home(),
+            'jarvis_home': Path.home() / '.jarvis',
+        }
+
+        # Discover Python executable
+        self._paths['python'] = self._discover_python()
+
+        # Discover virtual environment
+        self._paths['venv_python'] = self._discover_venv_python()
+
+    def _is_project_root(self, path: Path) -> bool:
+        """Check if path is the JARVIS project root."""
+        markers = [
+            path / 'backend' / 'main.py',
+            path / 'start_system.py',
+            path / 'frontend' / 'package.json',
+        ]
+        return any(m.exists() for m in markers)
+
+    def _discover_python(self) -> Path:
+        """Discover the best Python executable to use."""
+        candidates = [
+            self._paths.get('venv', Path()) / 'bin' / 'python3',
+            self._paths.get('venv', Path()) / 'bin' / 'python',
+            Path(sys.executable),
+            Path('/usr/bin/python3'),
+            Path('/usr/local/bin/python3'),
+        ]
+
+        for candidate in candidates:
+            if candidate.exists() and os.access(candidate, os.X_OK):
+                return candidate
+
+        return Path(sys.executable)
+
+    def _discover_venv_python(self) -> Optional[Path]:
+        """Discover virtual environment Python."""
+        venv_paths = [
+            self._paths['backend'] / 'venv' / 'bin' / 'python3',
+            self._paths['backend'] / 'venv' / 'bin' / 'python',
+            self._paths['project_root'] / 'venv' / 'bin' / 'python3',
+            self._paths['project_root'] / '.venv' / 'bin' / 'python3',
+        ]
+
+        for venv_python in venv_paths:
+            if venv_python.exists():
+                return venv_python
+
+        return None
+
+    def _detect_environment(self) -> str:
+        """
+        Detect the current runtime environment.
+        Priority: CLI arg → ENV var → git branch → default
+        """
+        # Check environment variable
+        env_var = os.environ.get('JARVIS_ENV', '').lower()
+        for env_name, patterns in self.ENV_PATTERNS.items():
+            if env_var in patterns:
+                return env_name
+
+        # Check git branch
+        try:
+            result = subprocess.run(
+                ['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
+                capture_output=True, text=True, timeout=5,
+                cwd=self._paths['project_root']
+            )
+            if result.returncode == 0:
+                branch = result.stdout.strip().lower()
+                if 'prod' in branch or 'main' == branch or 'master' == branch:
+                    return 'production'
+                elif 'stag' in branch:
+                    return 'staging'
+                elif 'test' in branch or 'ci' in branch:
+                    return 'test'
+        except Exception:
+            pass
+
+        # Check for CI environment
+        ci_indicators = ['CI', 'GITHUB_ACTIONS', 'GITLAB_CI', 'JENKINS_URL', 'TRAVIS']
+        if any(os.environ.get(ci) for ci in ci_indicators):
+            return 'test'
+
+        return 'development'
+
+    async def _load_config_async(self) -> Dict[str, Any]:
+        """
+        Load configuration with layering: file → env → runtime.
+        Fully async for non-blocking I/O.
+        """
+        config = self._get_default_config()
+
+        # Layer 1: File-based config
+        for config_path_str in self.CONFIG_PATHS:
+            config_path = self._paths['project_root'] / config_path_str
+            if config_path.exists():
+                try:
+                    async with asyncio.Lock():
+                        content = await asyncio.to_thread(config_path.read_text)
+                        file_config = json.loads(content)
+                        config = self._merge_config(config, file_config)
+                        self._log_event('config_loaded', {'source': str(config_path)})
+                        break
+                except Exception as e:
+                    self._log_event('config_error', {'source': str(config_path), 'error': str(e)})
+
+        # Layer 2: Environment variables
+        env_overrides = self._get_env_overrides()
+        config = self._merge_config(config, env_overrides)
+
+        # Layer 3: Runtime detection
+        config['environment'] = self._environment
+        config['paths'] = {k: str(v) for k, v in self._paths.items()}
+
+        return config
+
+    def _get_default_config(self) -> Dict[str, Any]:
+        """Get default configuration values."""
+        return {
+            'backend': {
+                'host': '0.0.0.0',
+                'port': 8010,
+                'fallback_ports': [8011, 8000, 8001, 8080, 8888],
+                'workers': 1,
+                'timeout': 300,
+            },
+            'frontend': {
+                'port': 3000,
+                'fallback_ports': [3001, 3002, 3003],
+            },
+            'startup': {
+                'parallel_init': True,
+                'health_check_timeout': 30,
+                'max_recovery_attempts': 3,
+                'graceful_shutdown_timeout': 10,
+            },
+            'features': {
+                'voice_unlock': True,
+                'vision': True,
+                'autonomous': True,
+                'cloud_sql': True,
+            },
+            'logging': {
+                'level': 'INFO',
+                'format': '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+                'file': 'jarvis_startup.log',
+            },
+        }
+
+    def _get_env_overrides(self) -> Dict[str, Any]:
+        """Extract configuration overrides from environment variables."""
+        overrides = {}
+
+        env_mappings = {
+            'JARVIS_BACKEND_PORT': ('backend', 'port', int),
+            'JARVIS_FRONTEND_PORT': ('frontend', 'port', int),
+            'JARVIS_HOST': ('backend', 'host', str),
+            'JARVIS_WORKERS': ('backend', 'workers', int),
+            'JARVIS_LOG_LEVEL': ('logging', 'level', str),
+            'JARVIS_PARALLEL_INIT': ('startup', 'parallel_init', lambda x: x.lower() == 'true'),
+            'JARVIS_VOICE_UNLOCK': ('features', 'voice_unlock', lambda x: x.lower() == 'true'),
+            'JARVIS_VISION': ('features', 'vision', lambda x: x.lower() == 'true'),
+            'JARVIS_AUTONOMOUS': ('features', 'autonomous', lambda x: x.lower() == 'true'),
+        }
+
+        for env_key, (section, key, converter) in env_mappings.items():
+            value = os.environ.get(env_key)
+            if value is not None:
+                if section not in overrides:
+                    overrides[section] = {}
+                try:
+                    overrides[section][key] = converter(value)
+                except (ValueError, TypeError):
+                    pass
+
+        return overrides
+
+    def _merge_config(self, base: Dict, overlay: Dict) -> Dict:
+        """Deep merge configuration dictionaries."""
+        result = base.copy()
+        for key, value in overlay.items():
+            if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+                result[key] = self._merge_config(result[key], value)
+            else:
+                result[key] = value
+        return result
+
+    def setup_python_path(self) -> None:
+        """
+        Configure Python path for imports.
+        Ensures both project root and backend are in sys.path.
+        """
+        paths_to_add = [
+            self._paths['project_root'],
+            self._paths['backend'],
+        ]
+
+        for path in paths_to_add:
+            path_str = str(path)
+            if path_str not in sys.path:
+                sys.path.insert(0, path_str)
+
+        # Set environment variable for subprocesses
+        existing_pythonpath = os.environ.get('PYTHONPATH', '')
+        new_paths = ':'.join(str(p) for p in paths_to_add)
+        os.environ['PYTHONPATH'] = f"{new_paths}:{existing_pythonpath}" if existing_pythonpath else new_paths
+
+        self._log_event('pythonpath_configured', {
+            'paths': [str(p) for p in paths_to_add],
+            'sys_path_length': len(sys.path),
+        })
+
+    def setup_working_directory(self) -> None:
+        """Change to project root directory."""
+        project_root = self._paths['project_root']
+        if Path.cwd() != project_root:
+            os.chdir(project_root)
+            self._log_event('cwd_changed', {'new_cwd': str(project_root)})
+
+    async def validate_environment(self) -> Dict[str, Any]:
+        """
+        Validate the runtime environment asynchronously.
+        Returns validation results with issues and warnings.
+        """
+        results = {
+            'valid': True,
+            'issues': [],
+            'warnings': [],
+            'checks': {},
+        }
+
+        # Parallel validation checks
+        checks = await asyncio.gather(
+            self._check_directories(),
+            self._check_python_version(),
+            self._check_dependencies(),
+            self._check_ports(),
+            self._check_permissions(),
+            return_exceptions=True
+        )
+
+        check_names = ['directories', 'python_version', 'dependencies', 'ports', 'permissions']
+
+        for name, result in zip(check_names, checks):
+            if isinstance(result, Exception):
+                results['issues'].append(f"{name}: {str(result)}")
+                results['checks'][name] = {'status': 'error', 'error': str(result)}
+                results['valid'] = False
+            else:
+                results['checks'][name] = result
+                if not result.get('valid', True):
+                    results['valid'] = False
+                    results['issues'].extend(result.get('issues', []))
+                results['warnings'].extend(result.get('warnings', []))
+
+        self._health_status['validation'] = results
+        return results
+
+    async def _check_directories(self) -> Dict[str, Any]:
+        """Check required directories exist."""
+        result = {'valid': True, 'issues': [], 'warnings': [], 'found': [], 'missing': []}
+
+        for dir_name in self.REQUIRED_DIRS:
+            dir_path = self._paths['project_root'] / dir_name
+            if dir_path.exists():
+                result['found'].append(dir_name)
+            else:
+                result['missing'].append(dir_name)
+                result['issues'].append(f"Required directory missing: {dir_name}")
+                result['valid'] = False
+
+        for dir_name in self.OPTIONAL_DIRS:
+            dir_path = self._paths['backend'] / dir_name
+            if not dir_path.exists():
+                result['warnings'].append(f"Optional directory missing: backend/{dir_name}")
+
+        return result
+
+    async def _check_python_version(self) -> Dict[str, Any]:
+        """Check Python version compatibility."""
+        result = {'valid': True, 'issues': [], 'warnings': []}
+
+        version = sys.version_info
+        result['version'] = f"{version.major}.{version.minor}.{version.micro}"
+
+        if version.major < 3:
+            result['valid'] = False
+            result['issues'].append("Python 3 required")
+        elif version.minor < 9:
+            result['warnings'].append(f"Python 3.9+ recommended (found {result['version']})")
+
+        return result
+
+    async def _check_dependencies(self) -> Dict[str, Any]:
+        """Check critical dependencies are available."""
+        result = {'valid': True, 'issues': [], 'warnings': [], 'available': [], 'missing': []}
+
+        critical_modules = ['asyncio', 'json', 'pathlib', 'subprocess']
+        optional_modules = ['psutil', 'aiohttp', 'uvicorn', 'fastapi']
+
+        for module in critical_modules:
+            try:
+                __import__(module)
+                result['available'].append(module)
+            except ImportError:
+                result['missing'].append(module)
+                result['issues'].append(f"Critical module missing: {module}")
+                result['valid'] = False
+
+        for module in optional_modules:
+            try:
+                __import__(module)
+                result['available'].append(module)
+            except ImportError:
+                result['warnings'].append(f"Optional module not available: {module}")
+
+        return result
+
+    async def _check_ports(self) -> Dict[str, Any]:
+        """Check if required ports are available."""
+        result = {'valid': True, 'issues': [], 'warnings': [], 'available': [], 'in_use': []}
+
+        ports_to_check = [
+            self._config.get('backend', {}).get('port', 8010),
+            self._config.get('frontend', {}).get('port', 3000),
+        ]
+
+        for port in ports_to_check:
+            try:
+                # Use asyncio subprocess for non-blocking check
+                proc = await asyncio.create_subprocess_exec(
+                    'lsof', '-i', f':{port}',
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+
+                if stdout.strip():
+                    result['in_use'].append(port)
+                    result['warnings'].append(f"Port {port} is in use")
+                else:
+                    result['available'].append(port)
+            except Exception:
+                # Assume available if we can't check
+                result['available'].append(port)
+
+        return result
+
+    async def _check_permissions(self) -> Dict[str, Any]:
+        """Check file system permissions."""
+        result = {'valid': True, 'issues': [], 'warnings': []}
+
+        # Check write permissions for log directory
+        log_dir = self._paths['logs']
+        if log_dir.exists():
+            if not os.access(log_dir, os.W_OK):
+                result['warnings'].append(f"No write permission for logs directory: {log_dir}")
+        else:
+            try:
+                log_dir.mkdir(parents=True, exist_ok=True)
+            except PermissionError:
+                result['issues'].append(f"Cannot create logs directory: {log_dir}")
+                result['valid'] = False
+
+        # Check temp directory
+        temp_dir = self._paths['temp']
+        if not os.access(temp_dir, os.W_OK):
+            result['issues'].append(f"No write permission for temp directory: {temp_dir}")
+            result['valid'] = False
+
+        return result
+
+    async def initialize(self) -> bool:
+        """
+        Full async initialization sequence.
+        Returns True if initialization succeeded.
+        """
+        try:
+            self._log_event('init_started')
+
+            # Phase 1: Environment setup (sync, must happen first)
+            self.setup_working_directory()
+            self.setup_python_path()
+            self._environment = self._detect_environment()
+
+            # Phase 2: Load configuration (async)
+            self._config = await self._load_config_async()
+
+            # Phase 3: Validate environment (async, parallel)
+            validation = await self.validate_environment()
+            if not validation['valid']:
+                # Attempt recovery
+                if not await self._attempt_recovery(validation):
+                    self._log_event('init_failed', {'reason': 'validation_failed', 'issues': validation['issues']})
+                    return False
+
+            # Phase 4: Setup logging
+            self._setup_logging()
+
+            # Phase 5: Register cleanup handlers
+            self._register_cleanup_handlers()
+
+            # Phase 6: Install signal handlers
+            self._install_signal_handlers()
+
+            self._initialized = True
+            init_time = time.time() - self._start_time
+            self._telemetry['timings']['initialization'] = init_time
+            self._log_event('init_completed', {'duration_ms': int(init_time * 1000)})
+
+            return True
+
+        except Exception as e:
+            self._log_event('init_error', {'error': str(e), 'traceback': traceback.format_exc()})
+            return False
+
+    async def _attempt_recovery(self, validation: Dict[str, Any]) -> bool:
+        """
+        Attempt to recover from validation failures.
+        Implements self-healing logic.
+        """
+        if self._recovery_attempts >= self._max_recovery_attempts:
+            return False
+
+        self._recovery_attempts += 1
+        self._log_event('recovery_attempt', {'attempt': self._recovery_attempts})
+
+        recovered = True
+
+        for issue in validation['issues']:
+            if 'directory missing' in issue.lower():
+                # Try to create missing directories
+                for dir_name in validation['checks'].get('directories', {}).get('missing', []):
+                    try:
+                        dir_path = self._paths['project_root'] / dir_name
+                        dir_path.mkdir(parents=True, exist_ok=True)
+                        self._log_event('directory_created', {'path': str(dir_path)})
+                    except Exception as e:
+                        self._log_event('directory_create_failed', {'path': dir_name, 'error': str(e)})
+                        recovered = False
+
+            elif 'port' in issue.lower() and 'in use' in issue.lower():
+                # Try fallback ports
+                self._log_event('port_fallback_initiated')
+                # Actual port fallback is handled by DynamicPortManager
+
+        return recovered
+
+    def _setup_logging(self) -> None:
+        """Configure logging based on environment and config."""
+        log_config = self._config.get('logging', {})
+        log_level = getattr(logging, log_config.get('level', 'INFO').upper(), logging.INFO)
+
+        # Adjust for environment
+        if self._environment == 'development':
+            log_level = logging.DEBUG
+        elif self._environment == 'production':
+            log_level = logging.WARNING
+
+        log_format = log_config.get('format', '%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+        handlers = [logging.StreamHandler()]
+
+        # Add file handler if log directory is writable
+        log_file = self._paths['logs'] / log_config.get('file', 'jarvis_startup.log')
+        try:
+            handlers.append(logging.FileHandler(log_file))
+        except Exception:
+            pass
+
+        logging.basicConfig(level=log_level, format=log_format, handlers=handlers, force=True)
+
+    def _register_cleanup_handlers(self) -> None:
+        """Register cleanup handlers for graceful shutdown."""
+        import atexit
+
+        def cleanup():
+            self._perform_cleanup()
+
+        atexit.register(cleanup)
+        self._cleanup_handlers.append(cleanup)
+
+    def _install_signal_handlers(self) -> None:
+        """Install signal handlers for graceful shutdown."""
+        def force_exit_handler(signum, frame):
+            current_time = time.time()
+
+            # Reset count if more than 2 seconds since last interrupt
+            if current_time - self._last_interrupt_time > 2.0:
+                self._interrupt_count = 0
+
+            self._interrupt_count += 1
+            self._last_interrupt_time = current_time
+
+            if self._interrupt_count >= 2:
+                print(f"\n\r{Colors.RED}⚡ Force exit (double Ctrl+C){Colors.ENDC}")
+                sys.stdout.flush()
+                os._exit(130)
+            else:
+                print(f"\n\r{Colors.YELLOW}⏳ Shutting down... (Ctrl+C again to force quit){Colors.ENDC}")
+                sys.stdout.flush()
+                raise KeyboardInterrupt
+
+        signal.signal(signal.SIGINT, force_exit_handler)
+
+    def _perform_cleanup(self) -> None:
+        """Perform cleanup operations."""
+        self._log_event('cleanup_started')
+
+        # Clean up PID file
+        pid_file = self._paths['temp'] / 'jarvis.pid'
+        try:
+            if pid_file.exists():
+                current_pid = os.getpid()
+                file_pid = int(pid_file.read_text().strip())
+                if file_pid == current_pid:
+                    pid_file.unlink()
+        except Exception as e:
+            logger.warning(f"PID cleanup error: {e}")
+
+        self._log_event('cleanup_completed')
+
+    def _log_event(self, event: str, data: Optional[Dict] = None) -> None:
+        """Log a telemetry event."""
+        event_data = {
+            'event': event,
+            'timestamp': time.time(),
+            'data': data or {},
+        }
+        self._telemetry['events'].append(event_data)
+
+        # Also log to standard logger
+        logger.debug(f"Startup event: {event} - {data}")
+
+    async def run(self) -> int:
+        """
+        Main entry point for running JARVIS.
+        Returns exit code.
+        """
+        if not self._initialized:
+            if not await self.initialize():
+                print(f"{Colors.FAIL}❌ Initialization failed{Colors.ENDC}")
+                return 1
+
+        # Print startup banner
+        self._print_banner()
+
+        # Run the main async function
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
+        try:
+            return await main()
+        except asyncio.CancelledError:
+            logger.info("Main event loop cancelled")
+            return 0
+        except Exception as e:
+            logger.exception(f"Fatal error: {e}")
+            return 1
+
+    def _print_banner(self) -> None:
+        """Print startup banner with discovered configuration."""
+        print(f"\n{Colors.CYAN}{'═' * 70}{Colors.ENDC}")
+        print(f"{Colors.HEADER}  🚀 JARVIS Advanced Startup Bootstrapper{Colors.ENDC}")
+        print(f"{Colors.CYAN}{'═' * 70}{Colors.ENDC}")
+        print(f"  {Colors.GREEN}Environment:{Colors.ENDC} {self._environment}")
+        print(f"  {Colors.GREEN}Project Root:{Colors.ENDC} {self._paths['project_root']}")
+        print(f"  {Colors.GREEN}Backend Port:{Colors.ENDC} {self._config.get('backend', {}).get('port', 8010)}")
+        print(f"  {Colors.GREEN}Frontend Port:{Colors.ENDC} {self._config.get('frontend', {}).get('port', 3000)}")
+        print(f"  {Colors.GREEN}Python:{Colors.ENDC} {self._paths.get('venv_python') or sys.executable}")
+        print(f"  {Colors.GREEN}Init Time:{Colors.ENDC} {self._telemetry['timings'].get('initialization', 0)*1000:.0f}ms")
+        print(f"{Colors.CYAN}{'═' * 70}{Colors.ENDC}\n")
+
+    def get_config(self) -> Dict[str, Any]:
+        """Get the loaded configuration."""
+        return self._config.copy()
+
+    def get_paths(self) -> Dict[str, Path]:
+        """Get discovered paths."""
+        return self._paths.copy()
+
+    def get_telemetry(self) -> Dict[str, Any]:
+        """Get telemetry data."""
+        return self._telemetry.copy()
+
+
+# Global bootstrapper instance
+_bootstrapper: Optional[AdvancedStartupBootstrapper] = None
+
+
+def get_bootstrapper() -> AdvancedStartupBootstrapper:
+    """Get or create the global bootstrapper instance."""
+    global _bootstrapper
+    if _bootstrapper is None:
+        _bootstrapper = AdvancedStartupBootstrapper()
+    return _bootstrapper
+
+
+async def _bootstrap_and_run() -> int:
+    """Bootstrap and run JARVIS."""
+    bootstrapper = get_bootstrapper()
+    return await bootstrapper.run()
+
+
 if __name__ == "__main__":
     # ============================================================================
-    # ROBUST STARTUP: Ensure script works from any location
+    # ADVANCED STARTUP ENTRY POINT
     # ============================================================================
-    # Always change to the script's directory so relative paths work correctly
-    _script_dir = Path(__file__).parent.resolve()
-    os.chdir(_script_dir)
+    # Create and initialize the advanced bootstrapper
+    _bootstrapper = AdvancedStartupBootstrapper()
 
-    # Ensure PYTHONPATH includes both project root and backend for imports
-    if str(_script_dir) not in sys.path:
-        sys.path.insert(0, str(_script_dir))
-    _backend_dir = _script_dir / "backend"
-    if _backend_dir.exists() and str(_backend_dir) not in sys.path:
-        sys.path.insert(0, str(_backend_dir))
+    # Synchronous early setup (required before async)
+    _bootstrapper.setup_working_directory()
+    _bootstrapper.setup_python_path()
 
-    # Set PYTHONPATH environment variable for subprocesses
-    os.environ["PYTHONPATH"] = f"{_script_dir}:{_backend_dir}:{os.environ.get('PYTHONPATH', '')}"
-
-    # Global to track if we successfully initialized (for cleanup)
+    # Global tracking variables (for cleanup compatibility)
     _jarvis_initialized = False
     _hybrid_coordinator = None
 
