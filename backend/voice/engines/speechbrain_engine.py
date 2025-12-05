@@ -80,6 +80,61 @@ if not hasattr(torchaudio, 'list_audio_backends'):
     torchaudio.list_audio_backends = _list_audio_backends_compat
     logger.info(f"✅ Compatibility patch applied - detected backends: {torchaudio.list_audio_backends()}")
 
+# ============================================================================
+# HUGGINGFACE_HUB 1.0+ COMPATIBILITY PATCH
+# ============================================================================
+# The `use_auth_token` parameter was removed in huggingface_hub 1.0+
+# SpeechBrain may still use the old parameter name, causing initialization failures
+# We patch both huggingface_hub AND speechbrain.utils.fetching to ensure coverage
+
+def _create_auth_token_wrapper(original_func):
+    """Create a wrapper that converts use_auth_token to token."""
+    from functools import wraps
+
+    @wraps(original_func)
+    def wrapper(*args, **kwargs):
+        if 'use_auth_token' in kwargs:
+            auth_token = kwargs.pop('use_auth_token')
+            if auth_token is not None and 'token' not in kwargs:
+                kwargs['token'] = auth_token
+        return original_func(*args, **kwargs)
+    return wrapper
+
+try:
+    import huggingface_hub
+
+    _hf_version = getattr(huggingface_hub, '__version__', '0.0.0')
+    _hf_major = int(_hf_version.split('.')[0])
+
+    if _hf_major >= 1:
+        # Store original functions before any patching
+        _original_hf_hub_download = huggingface_hub.hf_hub_download
+        _original_snapshot_download = getattr(huggingface_hub, 'snapshot_download', None)
+
+        # Create patched versions
+        _patched_hf_hub_download = _create_auth_token_wrapper(_original_hf_hub_download)
+        _patched_snapshot_download = _create_auth_token_wrapper(_original_snapshot_download) if _original_snapshot_download else None
+
+        # Patch huggingface_hub module
+        huggingface_hub.hf_hub_download = _patched_hf_hub_download
+        if _patched_snapshot_download:
+            huggingface_hub.snapshot_download = _patched_snapshot_download
+
+        # Also patch speechbrain.utils.fetching which imports these directly
+        try:
+            import speechbrain.utils.fetching as sb_fetching
+            if hasattr(sb_fetching, 'hf_hub_download'):
+                sb_fetching.hf_hub_download = _patched_hf_hub_download
+            if hasattr(sb_fetching, 'snapshot_download') and _patched_snapshot_download:
+                sb_fetching.snapshot_download = _patched_snapshot_download
+            logger.info(f"🔧 Applied huggingface_hub {_hf_version} compatibility patch (use_auth_token → token)")
+        except ImportError:
+            # SpeechBrain not installed or different structure
+            logger.info(f"🔧 Applied huggingface_hub {_hf_version} compatibility patch (speechbrain not yet loaded)")
+
+except Exception as e:
+    logger.warning(f"⚠️ Could not apply huggingface_hub compatibility patch: {e}")
+
 
 @dataclass
 class StreamingChunk:
@@ -722,14 +777,21 @@ class SpeechBrainEngine(BaseSTTEngine):
 
                     logger.info(f"   Loading from thread: {threading.current_thread().name}")
 
-                    model = EncoderClassifier.from_hparams(
-                        source="speechbrain/spkrec-ecapa-voxceleb",
-                        savedir=str(self.cache_dir / "speaker_encoder"),
-                        run_opts=run_opts,
-                    )
-
-                    logger.info("   ✅ Model loaded successfully in dedicated thread")
-                    return model
+                    # Try standard from_hparams first
+                    try:
+                        model = EncoderClassifier.from_hparams(
+                            source="speechbrain/spkrec-ecapa-voxceleb",
+                            savedir=str(self.cache_dir / "speaker_encoder"),
+                            run_opts=run_opts,
+                        )
+                        logger.info("   ✅ Model loaded successfully in dedicated thread")
+                        return model
+                    except Exception as e:
+                        if "custom.py" in str(e) or "Entry Not Found" in str(e):
+                            logger.warning(f"   ⚠️ Standard loading failed (missing custom.py), using fallback loader...")
+                            return self._load_ecapa_fallback(run_opts)
+                        else:
+                            raise
 
                 finally:
                     # Restore environment
@@ -799,6 +861,88 @@ class SpeechBrainEngine(BaseSTTEngine):
                     "   3. Or upgrade to PyTorch 2.12+ when available (fix expected)\n"
                 )
             raise
+
+    def _load_ecapa_fallback(self, run_opts: dict):
+        """Fallback loader for ECAPA-TDNN when custom.py is missing.
+
+        SpeechBrain 1.0+ requires custom.py in model repos, but older models
+        don't have this file. This fallback downloads checkpoints directly
+        and loads the model using SpeechBrain's lower-level APIs.
+
+        Args:
+            run_opts: Dictionary with device and other runtime options
+
+        Returns:
+            Loaded EncoderClassifier model
+        """
+        import os
+        from pathlib import Path
+        import huggingface_hub
+
+        logger.info("   📥 Downloading model files directly...")
+
+        save_dir = Path(self.cache_dir) / "speaker_encoder"
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+        # Download required files from HuggingFace
+        repo_id = "speechbrain/spkrec-ecapa-voxceleb"
+        required_files = [
+            "embedding_model.ckpt",
+            "mean_var_norm_emb.ckpt",
+            "classifier.ckpt",
+            "hyperparams.yaml",
+            "label_encoder.txt",
+        ]
+
+        for filename in required_files:
+            local_path = save_dir / filename
+            if not local_path.exists():
+                logger.info(f"   Downloading {filename}...")
+                huggingface_hub.hf_hub_download(
+                    repo_id=repo_id,
+                    filename=filename,
+                    local_dir=str(save_dir),
+                    local_dir_use_symlinks=False,
+                )
+
+        # Patch hyperparams.yaml to use local paths instead of HuggingFace
+        hyperparams_path = save_dir / "hyperparams.yaml"
+        hyperparams_patched = save_dir / "hyperparams_local.yaml"
+        if not hyperparams_patched.exists():
+            logger.info("   Patching hyperparams.yaml for local loading...")
+            content = hyperparams_path.read_text()
+            # Replace the pretrained_path with local directory
+            content = content.replace(
+                "pretrained_path: speechbrain/spkrec-ecapa-voxceleb",
+                f"pretrained_path: {save_dir}"
+            )
+            hyperparams_patched.write_text(content)
+
+        # Create a minimal custom.py for SpeechBrain 1.0 compatibility
+        custom_py_path = save_dir / "custom.py"
+        if not custom_py_path.exists():
+            logger.info("   Creating SpeechBrain 1.0 compatibility module...")
+            custom_py_content = '''"""Auto-generated custom.py for SpeechBrain 1.0 compatibility."""
+from speechbrain.inference.speaker import EncoderClassifier
+
+# Re-export EncoderClassifier for from_hparams to find
+__all__ = ["EncoderClassifier"]
+'''
+            custom_py_path.write_text(custom_py_content)
+
+        # Now try loading with the local directory and patched hyperparams
+        logger.info("   Loading model from local directory...")
+        from speechbrain.inference.speaker import EncoderClassifier
+
+        model = EncoderClassifier.from_hparams(
+            source=str(save_dir),
+            savedir=str(save_dir),
+            hparams_file=str(hyperparams_patched),
+            run_opts=run_opts,
+        )
+
+        logger.info("   ✅ Model loaded via fallback method")
+        return model
 
     def _get_optimal_device(self) -> str:
         """Determine optimal device for inference.
