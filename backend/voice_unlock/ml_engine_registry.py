@@ -593,6 +593,12 @@ class MLEngineRegistry:
     - All engines are prewarmed at startup (blocking)
     - No HuggingFace fetches happen during runtime
     - Requests are blocked until engines are ready
+
+    Hybrid Cloud Integration:
+    - Checks memory pressure before loading local engines
+    - Automatically routes to GCP when RAM is constrained
+    - Integrates with MemoryAwareStartup for coordinated decisions
+    - Provides cloud fallback for speaker verification
     """
 
     _instance: Optional["MLEngineRegistry"] = None
@@ -616,11 +622,19 @@ class MLEngineRegistry:
         self._ready_event = asyncio.Event()
         self._shutdown_event = asyncio.Event()
 
+        # Hybrid Cloud State
+        self._use_cloud: bool = False
+        self._cloud_endpoint: Optional[str] = None
+        self._startup_decision: Optional[Any] = None  # StartupDecision from MemoryAwareStartup
+        self._memory_pressure_at_init: Tuple[bool, float, str] = (False, 0.0, "Not checked")
+        self._cloud_fallback_enabled: bool = MLConfig.CLOUD_FALLBACK_ENABLED
+
         # Register available engines based on config
         self._register_engines()
 
         logger.info(f"🔧 MLEngineRegistry initialized with {len(self._engines)} engines")
         logger.info(f"   Config: {MLConfig.to_dict()}")
+        logger.info(f"   Cloud fallback enabled: {self._cloud_fallback_enabled}")
 
     def _register_engines(self):
         """Register all enabled engines."""
@@ -702,7 +716,8 @@ class MLEngineRegistry:
     async def prewarm_all_blocking(
         self,
         parallel: bool = True,
-        timeout: float = MLConfig.PREWARM_TIMEOUT
+        timeout: float = MLConfig.PREWARM_TIMEOUT,
+        startup_decision: Optional[Any] = None,
     ) -> RegistryStatus:
         """
         Prewarm ALL engines BLOCKING until complete.
@@ -710,9 +725,16 @@ class MLEngineRegistry:
         This should be called at startup BEFORE accepting any requests.
         Unlike background prewarming, this BLOCKS until all models are loaded.
 
+        HYBRID CLOUD INTEGRATION:
+        - Checks memory pressure before loading
+        - Uses startup_decision from MemoryAwareStartup if provided
+        - Skips local loading and routes to cloud if RAM is low
+        - Falls back to cloud if local loading fails
+
         Args:
             parallel: Load engines in parallel (faster, more memory)
             timeout: Total timeout for all engines
+            startup_decision: Optional StartupDecision from MemoryAwareStartup
 
         Returns:
             RegistryStatus with loading results
@@ -729,9 +751,66 @@ class MLEngineRegistry:
         self._status.prewarm_started = True
         self._status.prewarm_start_time = time.time()
 
+        # =======================================================================
+        # HYBRID CLOUD DECISION LOGIC
+        # =======================================================================
+        self._startup_decision = startup_decision
+
+        # Check if we should use cloud based on startup decision
+        if startup_decision is not None:
+            # Use decision from MemoryAwareStartup
+            if hasattr(startup_decision, 'use_cloud_ml') and startup_decision.use_cloud_ml:
+                logger.info("=" * 70)
+                logger.info("☁️  ML ENGINE REGISTRY: CLOUD-FIRST MODE")
+                logger.info("=" * 70)
+                logger.info(f"   Reason: {getattr(startup_decision, 'reason', 'StartupDecision requires cloud')}")
+                logger.info(f"   Skip local Whisper: {getattr(startup_decision, 'skip_local_whisper', True)}")
+                logger.info(f"   Skip local ECAPA: {getattr(startup_decision, 'skip_local_ecapa', True)}")
+                logger.info("=" * 70)
+
+                self._use_cloud = True
+                await self._activate_cloud_routing()
+
+                # Mark as ready (cloud is ready immediately)
+                self._status.prewarm_completed = True
+                self._status.prewarm_end_time = time.time()
+                self._status.is_ready = True
+                self._ready_event.set()
+
+                logger.info("✅ Cloud ML backend configured - voice unlock ready!")
+                return self._status
+
+        # Check memory pressure directly if no startup decision
+        use_cloud, available_ram, reason = MLConfig.check_memory_pressure()
+        self._memory_pressure_at_init = (use_cloud, available_ram, reason)
+
+        if use_cloud and not MLConfig.CLOUD_FIRST_MODE:
+            logger.info("=" * 70)
+            logger.info("☁️  ML ENGINE REGISTRY: AUTO CLOUD MODE (Memory Pressure)")
+            logger.info("=" * 70)
+            logger.info(f"   Available RAM: {available_ram:.1f}GB")
+            logger.info(f"   Reason: {reason}")
+            logger.info(f"   Action: Routing ML to cloud instead of local loading")
+            logger.info("=" * 70)
+
+            self._use_cloud = True
+            await self._activate_cloud_routing()
+
+            self._status.prewarm_completed = True
+            self._status.prewarm_end_time = time.time()
+            self._status.is_ready = True
+            self._ready_event.set()
+
+            logger.info("✅ Cloud ML backend configured - voice unlock ready!")
+            return self._status
+
+        # =======================================================================
+        # LOCAL PREWARM (Sufficient RAM)
+        # =======================================================================
         logger.info("=" * 70)
-        logger.info("🚀 STARTING ML ENGINE PREWARM (BLOCKING)")
+        logger.info("🚀 STARTING ML ENGINE PREWARM (BLOCKING - LOCAL)")
         logger.info("=" * 70)
+        logger.info(f"   Available RAM: {available_ram:.1f}GB")
         logger.info(f"   Engines to load: {list(self._engines.keys())}")
         logger.info(f"   Parallel loading: {parallel}")
         logger.info(f"   Timeout: {timeout}s")
@@ -849,6 +928,261 @@ class MLEngineRegistry:
 
         logger.info("✅ ML Engine Registry shutdown complete")
 
+    # =========================================================================
+    # HYBRID CLOUD ROUTING METHODS
+    # =========================================================================
+
+    @property
+    def is_using_cloud(self) -> bool:
+        """Check if registry is routing to cloud."""
+        return self._use_cloud
+
+    @property
+    def cloud_endpoint(self) -> Optional[str]:
+        """Get the current cloud endpoint URL."""
+        return self._cloud_endpoint
+
+    async def _activate_cloud_routing(self) -> bool:
+        """
+        Activate cloud routing for ML operations.
+
+        This configures the registry to route speaker verification
+        and other ML operations to GCP instead of local processing.
+
+        Returns:
+            True if cloud routing was successfully activated
+        """
+        try:
+            # Try to get cloud endpoint from MemoryAwareStartup
+            try:
+                from core.memory_aware_startup import get_startup_manager
+                startup_manager = await get_startup_manager()
+
+                if startup_manager.is_cloud_ml_active:
+                    # Get endpoint from active cloud backend
+                    endpoint = await startup_manager.get_ml_endpoint("speaker_verify")
+                    self._cloud_endpoint = endpoint
+                    logger.info(f"   Cloud endpoint from MemoryAwareStartup: {endpoint}")
+                else:
+                    # Activate cloud backend
+                    if self._startup_decision:
+                        result = await startup_manager.activate_cloud_ml_backend()
+                        if result.get("success"):
+                            self._cloud_endpoint = f"http://{result.get('ip')}:8010/api/ml"
+                            logger.info(f"   Cloud backend activated: {self._cloud_endpoint}")
+            except ImportError:
+                logger.debug("MemoryAwareStartup not available")
+
+            # Fallback: Use environment variable or default GCP endpoint
+            if not self._cloud_endpoint:
+                gcp_project = os.getenv("GCP_PROJECT_ID", "jarvis-473803")
+                gcp_region = os.getenv("GCP_REGION", "us-central1")
+
+                # Try Cloud Run endpoint first, then Compute Engine fallback
+                self._cloud_endpoint = os.getenv(
+                    "JARVIS_CLOUD_ML_ENDPOINT",
+                    f"https://jarvis-ml-{gcp_project}.{gcp_region}.run.app/api/ml"
+                )
+                logger.info(f"   Using fallback cloud endpoint: {self._cloud_endpoint}")
+
+            self._use_cloud = True
+            logger.info("☁️  Cloud routing activated for ML operations")
+            return True
+
+        except Exception as e:
+            logger.error(f"❌ Failed to activate cloud routing: {e}")
+            self._use_cloud = False
+            return False
+
+    async def extract_speaker_embedding_cloud(
+        self,
+        audio_data: bytes,
+        timeout: float = 30.0
+    ) -> Optional[Any]:
+        """
+        Extract speaker embedding using cloud backend.
+
+        Args:
+            audio_data: Raw audio bytes (16kHz, mono, float32)
+            timeout: Request timeout in seconds
+
+        Returns:
+            Embedding tensor or None if failed
+        """
+        if not self._cloud_endpoint:
+            logger.error("Cloud endpoint not configured")
+            return None
+
+        try:
+            import aiohttp
+            import base64
+            import numpy as np
+
+            # Encode audio as base64
+            audio_b64 = base64.b64encode(audio_data).decode('utf-8')
+
+            endpoint = f"{self._cloud_endpoint}/speaker_embedding"
+            payload = {
+                "audio_data": audio_b64,
+                "sample_rate": 16000,
+                "format": "float32",
+            }
+
+            logger.debug(f"Sending speaker embedding request to cloud: {endpoint}")
+
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    endpoint,
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=timeout),
+                ) as response:
+                    if response.status == 200:
+                        result = await response.json()
+
+                        if result.get("success") and result.get("embedding"):
+                            # Convert embedding back to numpy/tensor
+                            embedding_list = result["embedding"]
+                            embedding = np.array(embedding_list, dtype=np.float32)
+
+                            import torch
+                            embedding_tensor = torch.tensor(embedding).unsqueeze(0)
+
+                            logger.debug(f"Cloud embedding received: shape {embedding_tensor.shape}")
+                            return embedding_tensor
+                        else:
+                            logger.error(f"Cloud embedding failed: {result.get('error')}")
+                            return None
+                    else:
+                        error_text = await response.text()
+                        logger.error(f"Cloud embedding request failed ({response.status}): {error_text}")
+                        return None
+
+        except ImportError:
+            logger.error("aiohttp not available for cloud requests")
+            return None
+        except asyncio.TimeoutError:
+            logger.error(f"Cloud embedding request timed out ({timeout}s)")
+            return None
+        except Exception as e:
+            logger.error(f"Cloud embedding request failed: {e}")
+            return None
+
+    async def verify_speaker_cloud(
+        self,
+        audio_data: bytes,
+        reference_embedding: Any,
+        timeout: float = 30.0
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Verify speaker using cloud backend.
+
+        Args:
+            audio_data: Raw audio bytes (16kHz, mono, float32)
+            reference_embedding: Reference embedding to compare against
+            timeout: Request timeout in seconds
+
+        Returns:
+            Dict with verification result or None if failed
+        """
+        if not self._cloud_endpoint:
+            logger.error("Cloud endpoint not configured")
+            return None
+
+        try:
+            import aiohttp
+            import base64
+            import numpy as np
+
+            # Encode audio as base64
+            audio_b64 = base64.b64encode(audio_data).decode('utf-8')
+
+            # Convert reference embedding to list
+            if hasattr(reference_embedding, 'cpu'):
+                ref_list = reference_embedding.cpu().numpy().tolist()
+            elif hasattr(reference_embedding, 'tolist'):
+                ref_list = reference_embedding.tolist()
+            else:
+                ref_list = list(reference_embedding)
+
+            endpoint = f"{self._cloud_endpoint}/verify_speaker"
+            payload = {
+                "audio_data": audio_b64,
+                "reference_embedding": ref_list,
+                "sample_rate": 16000,
+                "format": "float32",
+            }
+
+            logger.debug(f"Sending speaker verification request to cloud: {endpoint}")
+
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    endpoint,
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=timeout),
+                ) as response:
+                    if response.status == 200:
+                        result = await response.json()
+                        logger.debug(f"Cloud verification result: {result}")
+                        return result
+                    else:
+                        error_text = await response.text()
+                        logger.error(f"Cloud verification failed ({response.status}): {error_text}")
+                        return None
+
+        except ImportError:
+            logger.error("aiohttp not available for cloud requests")
+            return None
+        except asyncio.TimeoutError:
+            logger.error(f"Cloud verification request timed out ({timeout}s)")
+            return None
+        except Exception as e:
+            logger.error(f"Cloud verification request failed: {e}")
+            return None
+
+    def set_cloud_endpoint(self, endpoint: str) -> None:
+        """
+        Manually set the cloud endpoint.
+
+        Args:
+            endpoint: Cloud ML API endpoint URL
+        """
+        self._cloud_endpoint = endpoint
+        self._use_cloud = True
+        logger.info(f"☁️  Cloud endpoint set to: {endpoint}")
+
+    async def switch_to_cloud(self, reason: str = "Manual switch") -> bool:
+        """
+        Switch from local to cloud processing.
+
+        Args:
+            reason: Reason for switching to cloud
+
+        Returns:
+            True if switch was successful
+        """
+        logger.info(f"☁️  Switching to cloud ML: {reason}")
+        return await self._activate_cloud_routing()
+
+    async def switch_to_local(self, reason: str = "Manual switch") -> bool:
+        """
+        Switch from cloud to local processing.
+
+        Requires local engines to be loaded.
+
+        Args:
+            reason: Reason for switching to local
+
+        Returns:
+            True if switch was successful
+        """
+        if not self.is_ready:
+            logger.warning("Cannot switch to local - engines not loaded")
+            return False
+
+        logger.info(f"🏠 Switching to local ML: {reason}")
+        self._use_cloud = False
+        return True
+
 
 # =============================================================================
 # GLOBAL ACCESS FUNCTIONS
@@ -945,31 +1279,101 @@ def require_ml_ready(timeout: float = 30.0):
 
 
 # =============================================================================
-# SPEAKER EMBEDDING FUNCTIONS - Use singleton ECAPA-TDNN engine
+# SPEAKER EMBEDDING FUNCTIONS - Hybrid Local/Cloud with Automatic Fallback
 # =============================================================================
 
-async def extract_speaker_embedding(audio_data: bytes) -> Optional[Any]:
+async def extract_speaker_embedding(
+    audio_data: bytes,
+    prefer_cloud: Optional[bool] = None,
+    fallback_enabled: bool = True,
+) -> Optional[Any]:
     """
-    Extract speaker embedding using the singleton ECAPA-TDNN engine.
+    Extract speaker embedding using the best available method.
 
-    This function provides a simple interface for speaker verification
-    that uses the centrally managed ECAPA-TDNN engine.
+    HYBRID CLOUD INTEGRATION:
+    - Automatically routes to cloud if memory pressure is high
+    - Falls back to cloud if local extraction fails
+    - Can be forced to cloud or local via prefer_cloud parameter
 
     Args:
         audio_data: Raw audio bytes (16kHz, mono, float32)
+        prefer_cloud: Force cloud (True), force local (False), or auto (None)
+        fallback_enabled: Allow fallback to cloud if local fails
 
     Returns:
-        Embedding tensor or None if not ready
+        Embedding tensor or None if all methods fail
     """
-    if not is_voice_unlock_ready():
-        logger.warning("ECAPA-TDNN not ready, waiting...")
+    registry = await get_ml_registry()
+
+    # Determine routing: cloud, local, or auto
+    use_cloud = prefer_cloud if prefer_cloud is not None else registry.is_using_cloud
+
+    # ==========================================================================
+    # CLOUD EXTRACTION PATH
+    # ==========================================================================
+    if use_cloud:
+        logger.debug("Using cloud for speaker embedding extraction")
+
+        embedding = await registry.extract_speaker_embedding_cloud(audio_data)
+
+        if embedding is not None:
+            logger.debug(f"Cloud embedding extracted: shape {embedding.shape}")
+            return embedding
+
+        # Cloud failed - try local if fallback enabled and local is ready
+        if fallback_enabled and registry.is_ready:
+            logger.warning("Cloud extraction failed, falling back to local")
+            return await _extract_local_embedding(registry, audio_data)
+
+        logger.error("Cloud extraction failed and fallback not available")
+        return None
+
+    # ==========================================================================
+    # LOCAL EXTRACTION PATH
+    # ==========================================================================
+    if not registry.is_ready:
+        logger.warning("Local ECAPA-TDNN not ready, waiting...")
         ready = await wait_for_voice_unlock_ready(timeout=30.0)
+
         if not ready:
-            logger.error("ECAPA-TDNN not ready after timeout")
+            # Local not ready - try cloud fallback
+            if fallback_enabled and registry.cloud_endpoint:
+                logger.warning("Local engines not ready, falling back to cloud")
+                return await registry.extract_speaker_embedding_cloud(audio_data)
+
+            logger.error("Local engines not ready and no cloud fallback")
             return None
 
+    embedding = await _extract_local_embedding(registry, audio_data)
+
+    if embedding is not None:
+        return embedding
+
+    # Local extraction failed - try cloud fallback
+    if fallback_enabled and MLConfig.CLOUD_FALLBACK_ENABLED:
+        logger.warning("Local extraction failed, attempting cloud fallback")
+
+        # Activate cloud if not already active
+        if not registry.cloud_endpoint:
+            await registry._activate_cloud_routing()
+
+        if registry.cloud_endpoint:
+            return await registry.extract_speaker_embedding_cloud(audio_data)
+
+    logger.error("Speaker embedding extraction failed (local and cloud)")
+    return None
+
+
+async def _extract_local_embedding(
+    registry: MLEngineRegistry,
+    audio_data: bytes
+) -> Optional[Any]:
+    """
+    Extract embedding using local ECAPA-TDNN engine.
+
+    Internal helper function for local extraction.
+    """
     try:
-        registry = await get_ml_registry()
         ecapa_engine = registry.get_engine("ecapa_tdnn")
 
         if ecapa_engine is None:
@@ -988,11 +1392,15 @@ async def extract_speaker_embedding(audio_data: bytes) -> Optional[Any]:
         with torch.no_grad():
             embedding = ecapa_engine.encode_batch(audio_tensor)
 
-        logger.debug(f"Extracted embedding shape: {embedding.shape}")
+        logger.debug(f"Local embedding extracted: shape {embedding.shape}")
         return embedding
 
+    except RuntimeError as e:
+        # Engine not loaded
+        logger.warning(f"ECAPA-TDNN engine error: {e}")
+        return None
     except Exception as e:
-        logger.error(f"Speaker embedding extraction failed: {e}")
+        logger.error(f"Local speaker embedding extraction failed: {e}")
         return None
 
 
@@ -1028,4 +1436,179 @@ async def get_ecapa_encoder_async() -> Optional[Any]:
         registry = await get_ml_registry()
         return registry.get_engine("ecapa_tdnn")
     except RuntimeError:
+        return None
+
+
+# =============================================================================
+# CLOUD ROUTING HELPER FUNCTIONS
+# =============================================================================
+
+def is_using_cloud_ml() -> bool:
+    """
+    Check if the registry is currently routing to cloud.
+
+    Returns:
+        True if using cloud for ML operations
+    """
+    if _registry is None:
+        return False
+    return _registry.is_using_cloud
+
+
+def get_cloud_endpoint() -> Optional[str]:
+    """
+    Get the current cloud ML endpoint.
+
+    Returns:
+        Cloud endpoint URL or None if not configured
+    """
+    if _registry is None:
+        return None
+    return _registry.cloud_endpoint
+
+
+async def switch_to_cloud_ml(reason: str = "Manual switch") -> bool:
+    """
+    Switch ML operations to cloud.
+
+    Args:
+        reason: Reason for the switch
+
+    Returns:
+        True if switch was successful
+    """
+    registry = await get_ml_registry()
+    return await registry.switch_to_cloud(reason)
+
+
+async def switch_to_local_ml(reason: str = "Manual switch") -> bool:
+    """
+    Switch ML operations to local.
+
+    Args:
+        reason: Reason for the switch
+
+    Returns:
+        True if switch was successful
+    """
+    registry = await get_ml_registry()
+    return await registry.switch_to_local(reason)
+
+
+def get_ml_routing_status() -> Dict[str, Any]:
+    """
+    Get comprehensive ML routing status.
+
+    Returns:
+        Dict with routing status information
+    """
+    if _registry is None:
+        return {
+            "initialized": False,
+            "is_ready": False,
+            "using_cloud": False,
+            "cloud_endpoint": None,
+            "local_engines": {},
+            "memory_pressure": MLConfig.check_memory_pressure(),
+        }
+
+    use_cloud, available_ram, reason = MLConfig.check_memory_pressure()
+
+    return {
+        "initialized": True,
+        "is_ready": _registry.is_ready,
+        "using_cloud": _registry.is_using_cloud,
+        "cloud_endpoint": _registry.cloud_endpoint,
+        "cloud_fallback_enabled": _registry._cloud_fallback_enabled,
+        "local_engines": {
+            name: {
+                "loaded": engine.is_loaded,
+                "state": engine.metrics.state.name,
+                "load_time_ms": engine.metrics.load_duration_ms,
+            }
+            for name, engine in _registry._engines.items()
+        },
+        "memory_pressure": {
+            "should_use_cloud": use_cloud,
+            "available_ram_gb": available_ram,
+            "reason": reason,
+        },
+        "config": {
+            "cloud_first_mode": MLConfig.CLOUD_FIRST_MODE,
+            "ram_threshold_local": MLConfig.RAM_THRESHOLD_LOCAL,
+            "ram_threshold_cloud": MLConfig.RAM_THRESHOLD_CLOUD,
+        },
+    }
+
+
+async def verify_speaker_with_best_method(
+    audio_data: bytes,
+    reference_embedding: Any,
+    timeout: float = 30.0,
+) -> Optional[Dict[str, Any]]:
+    """
+    Verify speaker using the best available method (local or cloud).
+
+    Automatically routes to local or cloud based on registry state.
+
+    Args:
+        audio_data: Raw audio bytes
+        reference_embedding: Reference embedding to compare against
+        timeout: Request timeout
+
+    Returns:
+        Dict with verification result or None if failed
+    """
+    registry = await get_ml_registry()
+
+    if registry.is_using_cloud:
+        # Use cloud verification
+        return await registry.verify_speaker_cloud(
+            audio_data, reference_embedding, timeout
+        )
+
+    # Use local verification
+    try:
+        embedding = await extract_speaker_embedding(audio_data)
+        if embedding is None:
+            return None
+
+        # Calculate cosine similarity
+        import torch
+        import torch.nn.functional as F
+
+        if hasattr(reference_embedding, 'cpu'):
+            ref = reference_embedding
+        else:
+            ref = torch.tensor(reference_embedding)
+
+        # Ensure same shape
+        if embedding.dim() == 3:
+            embedding = embedding.squeeze(0)
+        if ref.dim() == 3:
+            ref = ref.squeeze(0)
+
+        # Calculate cosine similarity
+        similarity = F.cosine_similarity(
+            embedding.view(1, -1),
+            ref.view(1, -1)
+        ).item()
+
+        return {
+            "success": True,
+            "similarity": similarity,
+            "verified": similarity > 0.7,  # Default threshold
+            "method": "local",
+        }
+
+    except Exception as e:
+        logger.error(f"Local speaker verification failed: {e}")
+
+        # Try cloud fallback
+        if registry._cloud_fallback_enabled and registry.cloud_endpoint:
+            logger.info("Falling back to cloud verification")
+            return await registry.verify_speaker_cloud(
+                audio_data, reference_embedding, timeout
+            )
+
         return None

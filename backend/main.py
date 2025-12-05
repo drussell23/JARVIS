@@ -1276,47 +1276,60 @@ async def lifespan(app: FastAPI):
         (startup_decision.skip_local_whisper or startup_decision.skip_local_ecapa)
     )
 
-    if should_skip_ml_prewarm:
-        logger.info("⏭️  Skipping local ML model prewarming (cloud-first mode)")
-        logger.info(f"   Reason: {startup_decision.reason if startup_decision else 'Low RAM'}")
-        logger.info("   Voice recognition will use GCP ML backend")
-    else:
-        try:
-            logger.info("🔥 Prewarming Voice Unlock ML models (Whisper + ECAPA-TDNN)...")
+    # ═══════════════════════════════════════════════════════════════
+    # ML ENGINE REGISTRY - Handles both local and cloud routing
+    # Now passes startup_decision to registry for intelligent routing
+    # ═══════════════════════════════════════════════════════════════
+    try:
+        logger.info("🔥 Initializing ML Engine Registry (Hybrid Local/Cloud)...")
 
-            # Use the new blocking ML Engine Registry for proper singleton pattern
-            # This BLOCKS startup until all models are loaded - preventing runtime hangs
-            from voice_unlock.ml_engine_registry import (
-                prewarm_voice_unlock_models_blocking,
-                get_ml_registry,
-            )
+        # Use the new blocking ML Engine Registry for proper singleton pattern
+        # The registry now handles cloud routing internally based on startup_decision
+        from voice_unlock.ml_engine_registry import (
+            get_ml_registry,
+        )
 
-            # Get registry status for logging
-            registry = await get_ml_registry()
-            logger.info(f"   → ML Engine Registry initialized with engines: {list(registry._engines.keys())}")
+        # Get registry and pass startup_decision for intelligent routing
+        registry = await get_ml_registry()
+        logger.info(f"   → ML Engine Registry initialized with engines: {list(registry._engines.keys())}")
 
-            # BLOCKING prewarm - ensures models are ready before accepting requests
-            prewarm_status = await prewarm_voice_unlock_models_blocking()
+        if should_skip_ml_prewarm:
+            logger.info("☁️  Cloud-first mode detected - registry will route to GCP")
+            logger.info(f"   Reason: {startup_decision.reason if startup_decision else 'Low RAM'}")
 
-            if prewarm_status.is_ready:
-                logger.info(f"   ✅ ML prewarm complete in {prewarm_status.prewarm_duration_ms:.0f}ms")
+        # BLOCKING prewarm - registry decides local vs cloud based on startup_decision
+        # If cloud-first, it activates cloud routing and marks as ready immediately
+        # If local mode, it loads all engines and blocks until ready
+        prewarm_status = await registry.prewarm_all_blocking(
+            startup_decision=startup_decision
+        )
+
+        if prewarm_status.is_ready:
+            if registry.is_using_cloud:
+                logger.info("   ✅ ML Registry ready (CLOUD MODE)")
+                logger.info(f"   → Cloud endpoint: {registry.cloud_endpoint}")
+                logger.info("   → Voice unlock will use GCP - instant response!")
+            else:
+                duration_ms = prewarm_status.prewarm_duration_ms or 0
+                logger.info(f"   ✅ ML prewarm complete in {duration_ms:.0f}ms (LOCAL MODE)")
                 logger.info(f"   → {prewarm_status.ready_count}/{prewarm_status.total_count} engines ready")
                 logger.info("   → Voice unlock will be INSTANT - no runtime model loading!")
-            else:
-                logger.warning(f"   ⚠️ ML prewarm partial: {prewarm_status.ready_count}/{prewarm_status.total_count} ready")
-                logger.warning(f"   → Errors: {prewarm_status.errors}")
+        else:
+            logger.warning(f"   ⚠️ ML prewarm partial: {prewarm_status.ready_count}/{prewarm_status.total_count} ready")
+            logger.warning(f"   → Errors: {prewarm_status.errors}")
 
-        except ImportError as e:
-            logger.debug(f"ML Engine Registry not available: {e}")
-            # Fallback to legacy prewarmer if registry not available
+    except ImportError as e:
+        logger.debug(f"ML Engine Registry not available: {e}")
+        # Fallback to legacy prewarmer if registry not available
+        if not should_skip_ml_prewarm:
             try:
                 from voice_unlock.ml_model_prewarmer import prewarm_voice_unlock_models_background
                 await prewarm_voice_unlock_models_background()
                 logger.info("   → Using legacy background prewarmer")
             except Exception:
                 pass
-        except Exception as e:
-            logger.warning(f"⚠️ ML model prewarming skipped: {e}")
+    except Exception as e:
+        logger.warning(f"⚠️ ML Engine Registry initialization error: {e}")
 
     # ═══════════════════════════════════════════════════════════════
     # NEURAL MESH INITIALIZATION (Multi-Agent Collaboration System)
