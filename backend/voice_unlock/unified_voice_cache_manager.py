@@ -1515,6 +1515,11 @@ class UnifiedVoiceCacheManager:
 
         CRITICAL: PyTorch operations run in thread pool to avoid blocking!
 
+        Fallback paths (in order):
+        1. Direct ECAPA encoder (if loaded)
+        2. Parallel model loader cache
+        3. Speaker Verification Service's engine (RECOMMENDED - most reliable)
+
         Args:
             audio_data: Audio waveform (numpy array or tensor)
             sample_rate: Audio sample rate (default 16kHz)
@@ -1527,25 +1532,40 @@ class UnifiedVoiceCacheManager:
 
         try:
             encoder = self.get_ecapa_encoder()
-            if encoder is None:
-                logger.warning("ECAPA encoder not available for embedding extraction")
-                return None
 
-            # Run CPU-intensive PyTorch operations in thread pool to avoid blocking
-            embedding_np = await asyncio.to_thread(
-                self._extract_embedding_sync,
-                encoder,
-                audio_data
-            )
+            # If encoder is available via primary paths, use it
+            if encoder is not None:
+                # Run CPU-intensive PyTorch operations in thread pool to avoid blocking
+                embedding_np = await asyncio.to_thread(
+                    self._extract_embedding_sync,
+                    encoder,
+                    audio_data
+                )
 
-            if embedding_np is not None:
-                # Normalize (fast numpy operation)
-                embedding_np = self._normalize_embedding(embedding_np)
+                if embedding_np is not None:
+                    # Normalize (fast numpy operation)
+                    embedding_np = self._normalize_embedding(embedding_np)
 
-                extract_time_ms = (time.time() - start_time) * 1000
-                logger.debug(f"Extracted embedding in {extract_time_ms:.1f}ms (async)")
+                    extract_time_ms = (time.time() - start_time) * 1000
+                    logger.debug(f"Extracted embedding in {extract_time_ms:.1f}ms (async)")
+                    return embedding_np
 
-            return embedding_np
+            # Fallback: Use ML Registry's extract_speaker_embedding
+            # This is the most reliable path as it accesses the Speaker Verification Service singleton
+            logger.debug("Primary encoder unavailable, trying ML Registry fallback...")
+            try:
+                from voice_unlock.ml_engine_registry import extract_speaker_embedding as ml_extract
+                embedding = await ml_extract(audio_data)
+                if embedding is not None:
+                    embedding_np = self._normalize_embedding(embedding.flatten())
+                    extract_time_ms = (time.time() - start_time) * 1000
+                    logger.debug(f"Extracted embedding via ML Registry fallback in {extract_time_ms:.1f}ms")
+                    return embedding_np
+            except Exception as e:
+                logger.debug(f"ML Registry fallback failed: {e}")
+
+            logger.warning("ECAPA encoder not available from any source for embedding extraction")
+            return None
 
         except Exception as e:
             logger.error(f"Embedding extraction failed: {e}")

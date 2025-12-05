@@ -732,6 +732,37 @@ class MLEngineRegistry:
         return ecapa_ready and stt_ready
 
     @property
+    def is_voice_unlock_ready(self) -> bool:
+        """Check if voice unlock (speaker verification) is ready.
+
+        This only requires ECAPA-TDNN, not STT engines.
+        Use this for speaker embedding extraction and voice verification.
+
+        Checks multiple paths for ECAPA availability:
+        1. ML Registry's internal engine
+        2. SpeechBrain engine's speaker encoder (external singleton)
+        """
+        # Check 1: ML Registry's internal ECAPA engine
+        if self._engines.get("ecapa_tdnn") and self._engines["ecapa_tdnn"].is_loaded:
+            return True
+
+        # Check 2: Speaker Verification Service's encoder (singleton)
+        try:
+            from voice.speaker_verification_service import _speaker_verification_service
+            if _speaker_verification_service is not None:
+                engine = _speaker_verification_service.speechbrain_engine
+                if engine and engine.speaker_encoder is not None:
+                    return True
+        except Exception:
+            pass
+
+        # Check 3: If ECAPA is disabled, we're "ready" (will use cloud/fallback)
+        if not MLConfig.ENABLE_ECAPA:
+            return True
+
+        return False
+
+    @property
     def status(self) -> RegistryStatus:
         """Get current registry status."""
         self._status.is_ready = self.is_ready
@@ -1690,12 +1721,28 @@ def is_voice_unlock_ready() -> bool:
 
 async def wait_for_voice_unlock_ready(timeout: float = 60.0) -> bool:
     """
-    Wait for voice unlock models to be ready.
+    Wait for voice unlock models (ECAPA-TDNN only) to be ready.
+
+    This is different from wait_until_ready() which waits for ALL engines.
+    Voice unlock only needs ECAPA-TDNN, not STT engines.
 
     Returns True if ready, False if timeout.
     """
     registry = await get_ml_registry()
-    return await registry.wait_until_ready(timeout)
+
+    # Check if already ready
+    if registry.is_voice_unlock_ready:
+        return True
+
+    # Poll with timeout
+    start_time = asyncio.get_event_loop().time()
+    while asyncio.get_event_loop().time() - start_time < timeout:
+        if registry.is_voice_unlock_ready:
+            return True
+        await asyncio.sleep(0.1)
+
+    logger.warning(f"⏱️ Timeout waiting for voice unlock engines ({timeout}s)")
+    return False
 
 
 # =============================================================================
@@ -1768,7 +1815,7 @@ async def extract_speaker_embedding(
             return embedding
 
         # Cloud failed - try local if fallback enabled and local is ready
-        if fallback_enabled and registry.is_ready:
+        if fallback_enabled and registry.is_voice_unlock_ready:
             logger.warning("Cloud extraction failed, falling back to local")
             return await _extract_local_embedding(registry, audio_data)
 
@@ -1778,7 +1825,7 @@ async def extract_speaker_embedding(
     # ==========================================================================
     # LOCAL EXTRACTION PATH
     # ==========================================================================
-    if not registry.is_ready:
+    if not registry.is_voice_unlock_ready:
         logger.warning("Local ECAPA-TDNN not ready, waiting...")
         ready = await wait_for_voice_unlock_ready(timeout=30.0)
 
@@ -1819,36 +1866,46 @@ async def _extract_local_embedding(
     Extract embedding using local ECAPA-TDNN engine.
 
     Internal helper function for local extraction.
+    Tries multiple paths:
+    1. ML Registry's internal engine
+    2. SpeechBrain engine's speaker encoder (external singleton)
     """
+    import numpy as np
+
+    # Path 1: Try ML Registry's internal engine
     try:
         ecapa_engine = registry.get_engine("ecapa_tdnn")
+        if ecapa_engine is not None:
+            import torch
+            # Audio should be float32, 16kHz, mono
+            audio_array = np.frombuffer(audio_data, dtype=np.float32)
+            audio_tensor = torch.tensor(audio_array).unsqueeze(0)
 
-        if ecapa_engine is None:
-            logger.error("ECAPA-TDNN engine is None")
-            return None
+            with torch.no_grad():
+                embedding = ecapa_engine.encode_batch(audio_tensor)
 
-        # Convert audio bytes to tensor
-        import torch
-        import numpy as np
-
-        # Audio should be float32, 16kHz, mono
-        audio_array = np.frombuffer(audio_data, dtype=np.float32)
-        audio_tensor = torch.tensor(audio_array).unsqueeze(0)
-
-        # Extract embedding using the singleton engine
-        with torch.no_grad():
-            embedding = ecapa_engine.encode_batch(audio_tensor)
-
-        logger.debug(f"Local embedding extracted: shape {embedding.shape}")
-        return embedding
-
-    except RuntimeError as e:
-        # Engine not loaded
-        logger.warning(f"ECAPA-TDNN engine error: {e}")
-        return None
+            logger.debug(f"Local embedding extracted via ML Registry: shape {embedding.shape}")
+            return embedding
+    except RuntimeError:
+        pass  # Engine not loaded in registry, try fallback
     except Exception as e:
-        logger.error(f"Local speaker embedding extraction failed: {e}")
-        return None
+        logger.debug(f"ML Registry extraction failed: {e}")
+
+    # Path 2: Try Speaker Verification Service's engine
+    try:
+        from voice.speaker_verification_service import get_speaker_verification_service
+        svc = await get_speaker_verification_service()
+        if svc and svc.speechbrain_engine and svc.speechbrain_engine.speaker_encoder is not None:
+            # Use the service's engine to extract embedding
+            embedding = await svc.speechbrain_engine.extract_speaker_embedding(audio_data)
+            if embedding is not None:
+                logger.debug(f"Local embedding extracted via Speaker Verification Service: shape {embedding.shape}")
+                return embedding
+    except Exception as e:
+        logger.debug(f"Speaker Verification Service extraction failed: {e}")
+
+    logger.error("Local speaker embedding extraction failed (all paths)")
+    return None
 
 
 def get_ecapa_encoder_sync() -> Optional[Any]:
