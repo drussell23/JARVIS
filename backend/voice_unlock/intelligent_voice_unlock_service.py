@@ -933,8 +933,10 @@ class IntelligentVoiceUnlockService:
                     )
 
                     # Voice is verified - proceed directly to unlock (skip redundant verification)
-                    if vbi_result.was_cached or vbi_result.confidence >= 0.85:
-                        # High confidence - proceed directly
+                    # Use 40% threshold (unlock threshold) since VBI already verified the speaker
+                    # This prevents falling through to parallel verification that may return 0%
+                    if vbi_result.was_cached or vbi_result.confidence >= 0.40: # 0.40 is the unlock threshold 
+                        # Verified above unlock threshold - proceed directly
                         unlock_result = await asyncio.wait_for(
                             self._perform_unlock(
                                 vbi_result.speaker_name, {}, {}, attempt_id=None
