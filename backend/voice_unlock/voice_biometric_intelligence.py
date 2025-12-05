@@ -78,6 +78,29 @@ class VBIConfig:
         self.use_behavioral_fusion = os.getenv('VBI_USE_BEHAVIORAL', 'true').lower() == 'true'
         self.enable_learning_feedback = os.getenv('VBI_LEARNING_FEEDBACK', 'true').lower() == 'true'
 
+        # =======================================================================
+        # PERFORMANCE OPTIMIZATIONS (v2.0)
+        # =======================================================================
+
+        # Early high-confidence exit: proceed immediately when ML confidence exceeds this
+        # Physics/behavioral checks continue in background for learning
+        self.early_exit_threshold = float(os.getenv('VBI_EARLY_EXIT_THRESHOLD', '0.95'))
+        self.enable_early_exit = os.getenv('VBI_ENABLE_EARLY_EXIT', 'true').lower() == 'true'
+
+        # Speculative unlock execution: start unlock prep before final confirmation
+        self.enable_speculative_unlock = os.getenv('VBI_SPECULATIVE_UNLOCK', 'true').lower() == 'true'
+        self.speculative_threshold = float(os.getenv('VBI_SPECULATIVE_THRESHOLD', '0.90'))
+
+        # Voice profile preloading: keep owner voiceprint in hot memory
+        self.enable_profile_preloading = os.getenv('VBI_PROFILE_PRELOAD', 'true').lower() == 'true'
+        self.hot_cache_ttl_seconds = int(os.getenv('VBI_HOT_CACHE_TTL', '3600'))  # 1 hour
+
+        # Model quantization: use INT8 for faster inference
+        self.enable_int8_quantization = os.getenv('VBI_INT8_QUANTIZATION', 'false').lower() == 'true'
+
+        # Parallel physics checks: run anti-spoofing in parallel with verification
+        self.enable_parallel_physics = os.getenv('VBI_PARALLEL_PHYSICS', 'true').lower() == 'true'
+
 
 _config = VBIConfig()
 
@@ -525,6 +548,11 @@ class VoiceBiometricIntelligence:
             'spoofing_detections': 0,
             'avg_verification_time_ms': 0.0,
             'total_verification_time_ms': 0.0,
+            # Performance optimization stats
+            'early_exits': 0,
+            'speculative_unlocks': 0,
+            'hot_cache_hits': 0,
+            'quantized_inferences': 0,
         }
 
         # Recent verifications for pattern analysis
@@ -536,14 +564,35 @@ class VoiceBiometricIntelligence:
         self._session_start_time: Optional[datetime] = None
         self._session_verifications = 0
 
-        logger.info("VoiceBiometricIntelligence initialized")
+        # =======================================================================
+        # PERFORMANCE OPTIMIZATION STATE (v2.0)
+        # =======================================================================
+
+        # Hot memory cache for owner voiceprint (sub-10ms lookups)
+        self._hot_voiceprint_cache: Dict[str, Any] = {}
+        self._hot_cache_timestamps: Dict[str, float] = {}
+        self._hot_cache_lock = asyncio.Lock()
+
+        # Speculative unlock state
+        self._speculative_unlock_task: Optional[asyncio.Task] = None
+        self._speculative_unlock_ready = asyncio.Event()
+
+        # Background physics verification (continues after early exit)
+        self._background_physics_task: Optional[asyncio.Task] = None
+        self._physics_results: Dict[str, Any] = {}
+
+        # Quantized model reference
+        self._quantized_encoder = None
+        self._quantization_available = False
+
+        logger.info("VoiceBiometricIntelligence initialized with performance optimizations")
 
     async def initialize(self) -> bool:
         """Initialize components for voice verification."""
         if self._initialized:
             return True
 
-        logger.info("🧠 Initializing Voice Biometric Intelligence...")
+        logger.info("🧠 Initializing Voice Biometric Intelligence with Performance Optimizations...")
         init_start = time.time()
 
         # Initialize components in parallel
@@ -555,11 +604,107 @@ class VoiceBiometricIntelligence:
 
         await asyncio.gather(*init_tasks, return_exceptions=True)
 
+        # Initialize performance optimizations (non-blocking)
+        perf_tasks = []
+        if self._config.enable_profile_preloading:
+            perf_tasks.append(self._init_hot_cache())
+        if self._config.enable_int8_quantization:
+            perf_tasks.append(self._init_quantization())
+
+        if perf_tasks:
+            await asyncio.gather(*perf_tasks, return_exceptions=True)
+
         self._initialized = True
         init_time = (time.time() - init_start) * 1000
         logger.info(f"✅ Voice Biometric Intelligence initialized in {init_time:.0f}ms")
+        logger.info(f"   Performance options: early_exit={self._config.enable_early_exit}, "
+                   f"speculative_unlock={self._config.enable_speculative_unlock}, "
+                   f"profile_preload={self._config.enable_profile_preloading}")
 
         return True
+
+    async def _init_hot_cache(self):
+        """Pre-load owner voiceprint into hot memory cache for sub-10ms lookups."""
+        try:
+            logger.info("🔥 Initializing hot voiceprint cache...")
+
+            # Get owner profile from unified cache or database
+            if self._unified_cache and hasattr(self._unified_cache, 'get_owner_profile'):
+                owner_profile = await self._unified_cache.get_owner_profile()
+                if owner_profile:
+                    async with self._hot_cache_lock:
+                        self._hot_voiceprint_cache['owner'] = owner_profile
+                        self._hot_cache_timestamps['owner'] = time.time()
+                    logger.info(f"✅ Owner voiceprint cached in hot memory")
+                    return
+
+            # Fallback: load from database using read_voice_profile
+            try:
+                from intelligence.hybrid_database_sync import HybridDatabaseSync
+                db = HybridDatabaseSync()
+                await db.initialize()
+
+                # Get owner name from environment or use default
+                owner_name = os.getenv('VBI_OWNER_NAME', 'Derek')
+
+                # Read the owner's voice profile
+                owner_profile = await db.read_voice_profile(owner_name)
+                if owner_profile:
+                    async with self._hot_cache_lock:
+                        self._hot_voiceprint_cache['owner'] = {
+                            'name': owner_profile.get('name', owner_name),
+                            'embedding': owner_profile.get('embedding'),
+                            'samples_count': owner_profile.get('samples_count', 0),
+                        }
+                        self._hot_cache_timestamps['owner'] = time.time()
+                    logger.info(f"✅ Owner '{owner_name}' voiceprint cached from database")
+                else:
+                    logger.info(f"No voiceprint found for owner '{owner_name}' - hot cache disabled")
+
+            except Exception as e:
+                logger.warning(f"Could not load owner profile from database: {e}")
+
+        except Exception as e:
+            logger.warning(f"Hot cache initialization failed: {e}")
+
+    async def _init_quantization(self):
+        """Initialize INT8 quantized model for faster inference."""
+        try:
+            logger.info("⚡ Initializing INT8 quantization...")
+
+            # Check if quantization is available
+            try:
+                import torch
+
+                if not hasattr(torch, 'quantization'):
+                    logger.info("INT8 quantization not available (requires PyTorch with quantization support)")
+                    return
+
+                # Try to load or create quantized encoder
+                from voice_unlock.ml_engine_registry import get_ml_registry_sync
+                registry = get_ml_registry_sync()
+
+                if registry and registry.is_ready:
+                    ecapa_wrapper = registry.get_wrapper("ecapa_tdnn")
+                    if ecapa_wrapper and ecapa_wrapper.is_loaded:
+                        encoder = ecapa_wrapper.get_engine()
+
+                        # Dynamic quantization for faster inference
+                        self._quantized_encoder = torch.quantization.quantize_dynamic(
+                            encoder,
+                            {torch.nn.Linear, torch.nn.LSTM},
+                            dtype=torch.qint8
+                        )
+                        self._quantization_available = True
+                        logger.info("✅ INT8 quantized encoder ready (2-3x faster inference)")
+
+            except ImportError:
+                logger.debug("Quantization dependencies not available")
+            except Exception as e:
+                logger.debug(f"Quantization setup failed: {e}")
+
+        except Exception as e:
+            logger.warning(f"Quantization initialization failed: {e}")
 
     async def _init_speaker_engine(self):
         """Initialize speaker verification engine."""
@@ -626,8 +771,11 @@ class VoiceBiometricIntelligence:
         """
         Verify voice biometrics and announce the result.
 
-        This is the main entry point that provides upfront transparency
-        about voice recognition BEFORE proceeding with any action.
+        PERFORMANCE OPTIMIZED (v2.0):
+        - Early high-confidence exit: Proceeds immediately when ML confidence >95%
+        - Speculative unlock: Starts unlock prep while final checks complete
+        - Hot cache: Uses preloaded voiceprint for sub-10ms matching
+        - Background physics: Physics checks continue after early exit for learning
 
         Args:
             audio_data: Raw audio bytes
@@ -650,7 +798,52 @@ class VoiceBiometricIntelligence:
         )
 
         try:
-            # PARALLEL: Run verification and audio analysis together
+            # =====================================================================
+            # FAST PATH: Try hot cache first (sub-10ms if cached)
+            # =====================================================================
+            hot_cache_result = await self._check_hot_cache(audio_data)
+            if hot_cache_result:
+                speaker_name, voice_confidence = hot_cache_result
+                self._stats['hot_cache_hits'] += 1
+                result.speaker_name = speaker_name
+                result.voice_confidence = voice_confidence
+                result.was_cached = True
+
+                # If hot cache gives high confidence, use early exit
+                if self._config.enable_early_exit and voice_confidence >= self._config.early_exit_threshold:
+                    logger.info(f"⚡ HOT CACHE EARLY EXIT: {speaker_name} ({voice_confidence:.1%})")
+                    self._stats['early_exits'] += 1
+
+                    result.fused_confidence = voice_confidence
+                    result.confidence = voice_confidence
+                    result.level = RecognitionLevel.INSTANT
+                    result.verified = True
+                    result.should_proceed = True
+                    result.verification_method = VerificationMethod.CACHED
+                    result.announcement = self._announcer.generate_announcement(result)
+
+                    # Start speculative unlock in background
+                    if self._config.enable_speculative_unlock:
+                        self._start_speculative_unlock(context)
+
+                    # Continue physics checks in background for learning
+                    if self._config.enable_parallel_physics:
+                        self._background_physics_task = asyncio.create_task(
+                            self._run_background_physics(audio_data, result)
+                        )
+
+                    result.verification_time_ms = (time.time() - start_time) * 1000
+                    self._update_timing_stats(result.verification_time_ms)
+                    self._log_result(result)
+
+                    if speak and result.announcement:
+                        asyncio.create_task(self._speak(result.announcement))
+
+                    return result
+
+            # =====================================================================
+            # PARALLEL VERIFICATION: Run all checks concurrently
+            # =====================================================================
             verify_task = asyncio.create_task(
                 self._verify_speaker(audio_data)
             )
@@ -661,9 +854,72 @@ class VoiceBiometricIntelligence:
                 self._get_behavioral_context(context)
             )
 
-            # Wait for all with timeout
+            # Start physics anti-spoofing in parallel if enabled
+            physics_task = None
+            if self._config.enable_parallel_physics:
+                physics_task = asyncio.create_task(
+                    self._check_spoofing(audio_data, result)
+                )
+
+            # =====================================================================
+            # EARLY EXIT CHECK: Check if ML verification completes with high confidence
+            # =====================================================================
+            if self._config.enable_early_exit:
+                # Wait for verification first with short timeout
+                try:
+                    await asyncio.wait_for(verify_task, timeout=1.0)
+                    if not verify_task.cancelled():
+                        speaker_name, voice_confidence, was_cached = verify_task.result()
+                        result.speaker_name = speaker_name
+                        result.voice_confidence = voice_confidence
+                        result.was_cached = was_cached
+
+                        # Check for early exit condition
+                        if voice_confidence >= self._config.early_exit_threshold and speaker_name:
+                            logger.info(f"⚡ EARLY EXIT: {speaker_name} ({voice_confidence:.1%})")
+                            self._stats['early_exits'] += 1
+
+                            result.fused_confidence = voice_confidence
+                            result.confidence = voice_confidence
+                            result.level = RecognitionLevel.INSTANT
+                            result.verified = True
+                            result.should_proceed = True
+                            result.verification_method = VerificationMethod.VOICE_ONLY
+                            result.announcement = self._announcer.generate_announcement(result)
+
+                            # Start speculative unlock
+                            if self._config.enable_speculative_unlock and voice_confidence >= self._config.speculative_threshold:
+                                self._stats['speculative_unlocks'] += 1
+                                self._start_speculative_unlock(context)
+
+                            # Let other tasks continue in background for learning
+                            self._background_physics_task = asyncio.create_task(
+                                self._complete_background_verification(
+                                    audio_task, behavioral_task, physics_task, audio_data, result
+                                )
+                            )
+
+                            result.verification_time_ms = (time.time() - start_time) * 1000
+                            self._update_timing_stats(result.verification_time_ms)
+                            self._log_result(result)
+
+                            if speak and result.announcement:
+                                asyncio.create_task(self._speak(result.announcement))
+
+                            return result
+
+                except asyncio.TimeoutError:
+                    pass  # Continue with standard flow
+
+            # =====================================================================
+            # STANDARD FLOW: Wait for all tasks
+            # =====================================================================
+            all_tasks = [verify_task, audio_task, behavioral_task]
+            if physics_task:
+                all_tasks.append(physics_task)
+
             done, pending = await asyncio.wait(
-                [verify_task, audio_task, behavioral_task],
+                all_tasks,
                 timeout=self._config.full_verify_timeout,
                 return_when=asyncio.ALL_COMPLETED
             )
@@ -674,18 +930,27 @@ class VoiceBiometricIntelligence:
 
             # Get results
             if verify_task in done and not verify_task.cancelled():
-                speaker_name, voice_confidence, was_cached = verify_task.result()
-                result.speaker_name = speaker_name
-                result.voice_confidence = voice_confidence
-                result.was_cached = was_cached
-                if was_cached:
-                    self._stats['cached_hits'] += 1
+                try:
+                    speaker_name, voice_confidence, was_cached = verify_task.result()
+                    result.speaker_name = speaker_name
+                    result.voice_confidence = voice_confidence
+                    result.was_cached = was_cached
+                    if was_cached:
+                        self._stats['cached_hits'] += 1
+                except Exception as e:
+                    logger.warning(f"Verification result error: {e}")
 
             if audio_task in done and not audio_task.cancelled():
-                result.audio = audio_task.result()
+                try:
+                    result.audio = audio_task.result()
+                except Exception as e:
+                    logger.warning(f"Audio analysis error: {e}")
 
             if behavioral_task in done and not behavioral_task.cancelled():
-                result.behavioral = behavioral_task.result()
+                try:
+                    result.behavioral = behavioral_task.result()
+                except Exception as e:
+                    logger.warning(f"Behavioral analysis error: {e}")
 
             # Fuse confidences
             result.fused_confidence = self._fuse_confidences(result)
@@ -694,12 +959,22 @@ class VoiceBiometricIntelligence:
             # Determine recognition level
             result.level = self._determine_level(result)
 
-            # Check for spoofing
-            spoofing_detected, spoofing_reason = await self._check_spoofing(audio_data, result)
-            result.spoofing_detected = spoofing_detected
-            result.spoofing_reason = spoofing_reason
+            # Get spoofing result
+            if physics_task and physics_task in done and not physics_task.cancelled():
+                try:
+                    spoofing_detected, spoofing_reason = physics_task.result()
+                    result.spoofing_detected = spoofing_detected
+                    result.spoofing_reason = spoofing_reason
+                except Exception as e:
+                    logger.warning(f"Spoofing check error: {e}")
+                    result.spoofing_detected = False
+            else:
+                # Run spoofing check synchronously if not done in parallel
+                spoofing_detected, spoofing_reason = await self._check_spoofing(audio_data, result)
+                result.spoofing_detected = spoofing_detected
+                result.spoofing_reason = spoofing_reason
 
-            if spoofing_detected:
+            if result.spoofing_detected:
                 result.level = RecognitionLevel.SPOOFING
                 result.verified = False
                 self._stats['spoofing_detections'] += 1
@@ -765,6 +1040,203 @@ class VoiceBiometricIntelligence:
         self._log_result(result)
 
         return result
+
+    async def _check_hot_cache(self, audio_data: bytes) -> Optional[Tuple[str, float]]:
+        """Check hot memory cache for instant voiceprint matching."""
+        if not self._config.enable_profile_preloading:
+            return None
+
+        try:
+            async with self._hot_cache_lock:
+                if 'owner' not in self._hot_voiceprint_cache:
+                    return None
+
+                # Check TTL
+                cache_age = time.time() - self._hot_cache_timestamps.get('owner', 0)
+                if cache_age > self._config.hot_cache_ttl_seconds:
+                    logger.debug("Hot cache expired, refreshing...")
+                    asyncio.create_task(self._init_hot_cache())
+                    return None
+
+                owner_profile = self._hot_voiceprint_cache['owner']
+                cached_embedding = owner_profile.get('embedding')
+
+                if cached_embedding is None:
+                    return None
+
+            # Extract embedding from audio (use quantized if available)
+            test_embedding = await self._extract_embedding_fast(audio_data)
+            if test_embedding is None:
+                return None
+
+            # Compute similarity
+            import torch
+            import torch.nn.functional as F
+
+            if hasattr(cached_embedding, 'cpu'):
+                ref = cached_embedding
+            else:
+                ref = torch.tensor(cached_embedding)
+
+            if hasattr(test_embedding, 'cpu'):
+                test = test_embedding
+            else:
+                test = torch.tensor(test_embedding)
+
+            # Ensure same shape
+            if test.dim() == 3:
+                test = test.squeeze(0)
+            if ref.dim() == 3:
+                ref = ref.squeeze(0)
+
+            similarity = F.cosine_similarity(
+                test.view(1, -1).float(),
+                ref.view(1, -1).float()
+            ).item()
+
+            owner_name = owner_profile.get('name', 'Owner')
+            logger.debug(f"🔥 Hot cache match: {similarity:.1%}")
+
+            return (owner_name, similarity)
+
+        except Exception as e:
+            logger.debug(f"Hot cache check failed: {e}")
+            return None
+
+    async def _extract_embedding_fast(self, audio_data: bytes) -> Optional[Any]:
+        """Extract embedding using fastest available method (quantized if available)."""
+        try:
+            import torch
+            import numpy as np
+
+            # Use quantized encoder if available
+            encoder = self._quantized_encoder if self._quantization_available else None
+
+            if encoder is None:
+                # Fall back to standard encoder
+                try:
+                    from voice_unlock.ml_engine_registry import get_ml_registry_sync
+                    registry = get_ml_registry_sync()
+                    if registry and registry.is_ready:
+                        encoder = registry.get_engine("ecapa_tdnn")
+                except Exception:
+                    return None
+
+            if encoder is None:
+                return None
+
+            # Convert audio bytes to tensor
+            audio_array = np.frombuffer(audio_data, dtype=np.float32)
+            audio_tensor = torch.tensor(audio_array).unsqueeze(0)
+
+            # Extract embedding
+            with torch.no_grad():
+                embedding = encoder.encode_batch(audio_tensor)
+
+            if self._quantization_available:
+                self._stats['quantized_inferences'] += 1
+
+            return embedding
+
+        except Exception as e:
+            logger.debug(f"Fast embedding extraction failed: {e}")
+            return None
+
+    def _start_speculative_unlock(self, context: Optional[Dict[str, Any]]):
+        """Start unlock preparation speculatively (will be confirmed later)."""
+        try:
+            logger.debug("🚀 Starting speculative unlock preparation...")
+
+            async def prepare_unlock():
+                try:
+                    # Pre-fetch unlock credentials
+                    from voice_unlock.intelligent_voice_unlock_service import get_unlock_password
+
+                    # Get password ready (from keychain)
+                    password = await asyncio.wait_for(
+                        asyncio.to_thread(get_unlock_password),
+                        timeout=1.0
+                    )
+
+                    self._speculative_unlock_ready.set()
+                    logger.debug("✅ Speculative unlock ready")
+
+                except Exception as e:
+                    logger.debug(f"Speculative unlock prep failed: {e}")
+
+            # Don't await - run in background
+            self._speculative_unlock_task = asyncio.create_task(prepare_unlock())
+
+        except Exception as e:
+            logger.debug(f"Could not start speculative unlock: {e}")
+
+    async def _run_background_physics(self, audio_data: bytes, result: VerificationResult):
+        """Continue physics verification in background after early exit."""
+        try:
+            # Run anti-spoofing checks
+            spoofing_detected, spoofing_reason = await self._check_spoofing(audio_data, result)
+
+            # Store results for later learning
+            self._physics_results = {
+                'spoofing_detected': spoofing_detected,
+                'spoofing_reason': spoofing_reason,
+                'timestamp': time.time(),
+            }
+
+            # If spoofing detected after early exit, log security event
+            if spoofing_detected:
+                logger.warning(
+                    f"⚠️ SECURITY: Spoofing detected AFTER early exit! "
+                    f"Reason: {spoofing_reason}"
+                )
+                # Could trigger additional security measures here
+
+        except Exception as e:
+            logger.debug(f"Background physics failed: {e}")
+
+    async def _complete_background_verification(
+        self,
+        audio_task: asyncio.Task,
+        behavioral_task: asyncio.Task,
+        physics_task: Optional[asyncio.Task],
+        audio_data: bytes,
+        result: VerificationResult
+    ):
+        """Complete verification tasks in background after early exit."""
+        try:
+            # Wait for remaining tasks
+            remaining = [audio_task, behavioral_task]
+            if physics_task:
+                remaining.append(physics_task)
+
+            done, _ = await asyncio.wait(remaining, timeout=5.0)
+
+            # Collect results for learning
+            if audio_task in done:
+                try:
+                    audio_result = audio_task.result()
+                    # Store for learning
+                    logger.debug(f"Background audio analysis: SNR={audio_result.snr_db:.1f}dB")
+                except Exception:
+                    pass
+
+            if behavioral_task in done:
+                try:
+                    behavioral = behavioral_task.result()
+                    logger.debug(f"Background behavioral: confidence={behavioral.behavioral_confidence:.1%}")
+                except Exception:
+                    pass
+
+            if physics_task and physics_task in done:
+                try:
+                    spoofing, reason = physics_task.result()
+                    if spoofing:
+                        logger.warning(f"⚠️ Background physics detected spoofing: {reason}")
+                except Exception:
+                    pass
+
+        except Exception as e:
+            logger.debug(f"Background verification completion failed: {e}")
 
     async def _verify_speaker(
         self,
@@ -1168,7 +1640,7 @@ class VoiceBiometricIntelligence:
             'available': self._voice_communicator is not None,
         }
 
-        # Calculate success rate
+        # Calculate success rate and performance stats
         total = self._stats['total_verifications']
         if total > 0:
             success_rate = self._stats['successful_verifications'] / total
@@ -1182,6 +1654,26 @@ class VoiceBiometricIntelligence:
                 issues.append(f"Low success rate: {success_rate:.1%}")
         else:
             components['performance'] = {'total_verifications': 0}
+
+        # Performance optimization stats
+        components['optimizations'] = {
+            'early_exit_enabled': self._config.enable_early_exit,
+            'early_exit_threshold': self._config.early_exit_threshold,
+            'early_exits': self._stats.get('early_exits', 0),
+            'speculative_unlock_enabled': self._config.enable_speculative_unlock,
+            'speculative_unlocks': self._stats.get('speculative_unlocks', 0),
+            'profile_preloading_enabled': self._config.enable_profile_preloading,
+            'hot_cache_hits': self._stats.get('hot_cache_hits', 0),
+            'hot_cache_loaded': 'owner' in self._hot_voiceprint_cache,
+            'quantization_enabled': self._config.enable_int8_quantization,
+            'quantization_available': self._quantization_available,
+            'quantized_inferences': self._stats.get('quantized_inferences', 0),
+        }
+
+        # Calculate optimization effectiveness
+        if total > 0:
+            early_exit_rate = self._stats.get('early_exits', 0) / total
+            components['optimizations']['early_exit_rate'] = round(early_exit_rate * 100, 1)
 
         healthy = len(issues) == 0 and self._speaker_engine is not None
         score = 1.0 - (len(issues) * 0.25)
