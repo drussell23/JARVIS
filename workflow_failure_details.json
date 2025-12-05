@@ -1,12 +1,12 @@
 {
-  "workflow_name": "JARVIS Postman API Tests",
-  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/19958107091",
-  "branch": "main",
-  "commit_sha": "b2f130b",
-  "run_number": 55,
+  "workflow_name": "PR Automation & Validation",
+  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/19958201049",
+  "branch": "fix/ci/jarvis-postman-api-tests-run55-20251205-091130",
+  "commit_sha": "58e35bb",
+  "run_number": 695,
   "failed_count": 1,
-  "fix_branch": "fix/ci/jarvis-postman-api-tests-run55-20251205-091130",
-  "pr_title": "\ud83d\udea8 Fix CI/CD: JARVIS Postman API Tests (Run #55)",
+  "fix_branch": "fix/ci/pr-automation-validation-run695-20251205-091317",
+  "pr_title": "\ud83d\udea8 Fix CI/CD: PR Automation & Validation (Run #695)",
   "analyses": [
     {
       "error_patterns": [
@@ -14,70 +14,41 @@
           "pattern": "ERROR|Error|error",
           "matches": [
             {
-              "line_number": 84,
-              "content": "2025-12-05T09:10:27.3544481Z npm error code E500",
+              "line_number": 25,
+              "content": "2025-12-05T09:12:05.7684909Z   subjectPatternError: The PR title must start with a capital letter.",
               "severity": "high",
               "emoji": "\u274c"
             },
             {
-              "line_number": 85,
-              "content": "2025-12-05T09:10:27.3545251Z npm error 500 Internal Server Error - GET https://registry.npmjs.org/newman",
+              "line_number": 37,
+              "content": "2025-12-05T09:12:06.2709903Z ##[error]No release type found in pull request title \"\ud83d\udea8 Fix CI/CD: JARVIS Postman API Tests (Run #55)\". Add a prefix to indicate what kind of release this pull request corresponds to. For reference, see https://www.conventionalcommits.org/",
               "severity": "high",
               "emoji": "\u274c"
-            },
-            {
-              "line_number": 86,
-              "content": "2025-12-05T09:10:27.3547720Z npm error A complete log of this run can be found in: /home/runner/.npm/_logs/2025-12-05T09_08_05_484Z-debug-0.log",
-              "severity": "high",
-              "emoji": "\u274c"
-            },
-            {
-              "line_number": 87,
-              "content": "2025-12-05T09:10:27.3608153Z ##[error]Process completed with exit code 1.",
-              "severity": "high",
-              "emoji": "\u274c"
-            }
-          ],
-          "count": 4
-        },
-        {
-          "pattern": "FAIL|Failed|failed",
-          "matches": [
-            {
-              "line_number": 97,
-              "content": "2025-12-05T09:10:27.5130819Z ##[warning]The process '/usr/bin/git' failed with exit code 128",
-              "severity": "high",
-              "emoji": "\ud83d\udca5"
-            }
-          ],
-          "count": 1
-        },
-        {
-          "pattern": "WARN|Warning|warning",
-          "matches": [
-            {
-              "line_number": 19,
-              "content": "2025-12-05T09:08:01.0362674Z hint: to use in all of your new repositories, which will suppress this warning,",
-              "severity": "medium",
-              "emoji": "\u26a0\ufe0f"
-            },
-            {
-              "line_number": 97,
-              "content": "2025-12-05T09:10:27.5130819Z ##[warning]The process '/usr/bin/git' failed with exit code 128",
-              "severity": "medium",
-              "emoji": "\u26a0\ufe0f"
             }
           ],
           "count": 2
+        },
+        {
+          "pattern": "timeout|timed out",
+          "matches": [
+            {
+              "line_number": 29,
+              "content": "- fix: Resolve database connection timeout",
+              "severity": "medium",
+              "emoji": "\u23f1\ufe0f"
+            }
+          ],
+          "count": 1
         }
       ],
       "suggested_fixes": [
-        "Review the logs above for specific error messages"
+        "Consider increasing timeout values or optimizing slow operations",
+        "Check service availability and network connectivity"
       ],
       "severity": "high",
-      "category": "permission_error",
+      "category": "timeout",
       "similar_failures": []
     }
   ],
-  "timestamp": "2025-12-05T09:11:30.955598"
+  "timestamp": "2025-12-05T09:13:17.291506"
 }
