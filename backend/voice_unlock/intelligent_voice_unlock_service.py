@@ -788,9 +788,21 @@ class IntelligentVoiceUnlockService:
             self.ml_engine = None
 
     async def _load_owner_profile(self):
-        """Load or create owner profile"""
-        if not self.learning_db or not self.speaker_engine:
-            logger.warning("Cannot load owner profile - dependencies not available")
+        """Load or create owner profile.
+
+        Note: This runs in parallel with other initialization tasks.
+        We wait for learning_db with retry logic since it may not be ready yet.
+        speaker_engine.owner_profile is set later (not critical for profile loading).
+        """
+        # Wait for learning_db with retry (parallel initialization race condition fix)
+        max_retries = 10
+        for attempt in range(max_retries):
+            if self.learning_db:
+                break
+            await asyncio.sleep(0.1)  # 100ms backoff
+
+        if not self.learning_db:
+            logger.warning("Cannot load owner profile - learning_db not initialized after retries")
             return
 
         try:
@@ -802,12 +814,17 @@ class IntelligentVoiceUnlockService:
                 if profile.get("is_primary_user"):
                     self.owner_profile = profile
                     logger.info(f"👑 Owner profile loaded: {profile['speaker_name']}")
-
-                    # Also set in speaker engine
-                    self.speaker_engine.owner_profile = self.speaker_engine.profiles.get(
-                        profile["speaker_name"]
-                    )
                     break
+
+            # Set speaker_engine.owner_profile if available (non-blocking)
+            if self.owner_profile and self.speaker_engine:
+                try:
+                    if hasattr(self.speaker_engine, 'profiles'):
+                        self.speaker_engine.owner_profile = self.speaker_engine.profiles.get(
+                            self.owner_profile["speaker_name"]
+                        )
+                except Exception as e:
+                    logger.debug(f"Could not set speaker_engine.owner_profile: {e}")
 
             if not self.owner_profile:
                 logger.warning(
