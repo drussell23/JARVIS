@@ -4535,6 +4535,38 @@ class SpeakerVerificationService:
                         "verification_time_ms": verify_time_ms,
                     }
 
+                # UNLOCK-THRESHOLD MATCH: If similarity >= 40% (unlock threshold), use cache result
+                # This avoids falling through to potentially broken SpeechBrain path
+                elif cache_result.similarity >= 0.40:
+                    unified_cache_hit = True
+                    self._unified_cache_hits += 1
+
+                    verify_end = time_module.perf_counter()
+                    verify_time_ms = (verify_end - verify_start) * 1000
+
+                    # Determine verification based on unlock threshold
+                    is_verified = cache_result.similarity >= 0.40
+
+                    logger.info(
+                        f"🔐 UNIFIED CACHE UNLOCK MATCH: {cache_result.speaker_name} "
+                        f"(similarity={cache_result.similarity:.2%}, verified={is_verified}, "
+                        f"verified in {verify_time_ms:.1f}ms)"
+                    )
+
+                    # Get profile for additional metadata
+                    profile = self.speaker_profiles.get(cache_result.speaker_name, {})
+
+                    return {
+                        "verified": is_verified,
+                        "confidence": cache_result.similarity,
+                        "speaker_name": cache_result.speaker_name,
+                        "is_owner": profile.get("is_primary_user", True),
+                        "security_level": profile.get("security_level", "standard"),
+                        "match_source": "unified_cache_unlock_path",
+                        "match_type": cache_result.match_type,
+                        "verification_time_ms": verify_time_ms,
+                    }
+
             except asyncio.TimeoutError:
                 self._unified_cache_misses += 1
                 logger.debug("⏱️ Unified cache fast-path timed out, using standard SpeechBrain path")
