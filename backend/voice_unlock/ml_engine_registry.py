@@ -866,14 +866,46 @@ class MLEngineRegistry:
                 self._use_cloud = True
                 await self._activate_cloud_routing()
 
-                # Mark as ready (cloud is ready immediately)
-                self._status.prewarm_completed = True
-                self._status.prewarm_end_time = time.time()
-                self._status.is_ready = True
-                self._ready_event.set()
+                # CRITICAL FIX: Verify cloud backend is actually ready before marking as ready
+                cloud_ready, cloud_reason = await self._verify_cloud_backend_ready()
 
-                logger.info("✅ Cloud ML backend configured - voice unlock ready!")
-                return self._status
+                if cloud_ready:
+                    # Cloud verified - mark as ready
+                    self._status.prewarm_completed = True
+                    self._status.prewarm_end_time = time.time()
+                    self._status.is_ready = True
+                    self._ready_event.set()
+                    logger.info("✅ Cloud ML backend VERIFIED - voice unlock ready!")
+                    return self._status
+                else:
+                    # Cloud failed - attempt local fallback
+                    logger.warning(f"⚠️ Cloud backend not available: {cloud_reason}")
+                    fallback_enabled = os.getenv("JARVIS_ECAPA_CLOUD_FALLBACK_ENABLED", "true").lower() == "true"
+
+                    if fallback_enabled:
+                        fallback_success = await self._fallback_to_local_ecapa(cloud_reason)
+                        if fallback_success:
+                            self._status.prewarm_completed = True
+                            self._status.prewarm_end_time = time.time()
+                            self._status.is_ready = True
+                            self._ready_event.set()
+                            logger.info("✅ Local ECAPA fallback successful - voice unlock ready!")
+                            return self._status
+                        else:
+                            logger.error("❌ Both cloud and local ECAPA unavailable!")
+                            self._status.errors.append(f"Cloud failed: {cloud_reason}, Local fallback also failed")
+                    else:
+                        logger.error("❌ Cloud unavailable and fallback disabled!")
+                        self._status.errors.append(f"Cloud failed: {cloud_reason}, Fallback disabled")
+
+                    # Mark as NOT ready - voice unlock will fail clearly
+                    self._status.prewarm_completed = True
+                    self._status.prewarm_end_time = time.time()
+                    self._status.is_ready = False
+                    logger.error("=" * 70)
+                    logger.error("❌ ECAPA ENCODER UNAVAILABLE - Voice unlock will NOT work!")
+                    logger.error("=" * 70)
+                    return self._status
 
         # Check memory pressure directly if no startup decision
         use_cloud, available_ram, reason = MLConfig.check_memory_pressure()
@@ -891,13 +923,34 @@ class MLEngineRegistry:
             self._use_cloud = True
             await self._activate_cloud_routing()
 
-            self._status.prewarm_completed = True
-            self._status.prewarm_end_time = time.time()
-            self._status.is_ready = True
-            self._ready_event.set()
+            # CRITICAL FIX: Verify cloud backend is actually ready before marking as ready
+            cloud_ready, cloud_reason = await self._verify_cloud_backend_ready()
 
-            logger.info("✅ Cloud ML backend configured - voice unlock ready!")
-            return self._status
+            if cloud_ready:
+                self._status.prewarm_completed = True
+                self._status.prewarm_end_time = time.time()
+                self._status.is_ready = True
+                self._ready_event.set()
+                logger.info("✅ Cloud ML backend VERIFIED - voice unlock ready!")
+                return self._status
+            else:
+                # Cloud failed - attempt local fallback despite memory pressure
+                logger.warning(f"⚠️ Cloud backend not available: {cloud_reason}")
+                fallback_enabled = os.getenv("JARVIS_ECAPA_CLOUD_FALLBACK_ENABLED", "true").lower() == "true"
+
+                if fallback_enabled:
+                    logger.warning("⚠️ Attempting local ECAPA despite memory pressure...")
+                    fallback_success = await self._fallback_to_local_ecapa(cloud_reason)
+                    if fallback_success:
+                        self._status.prewarm_completed = True
+                        self._status.prewarm_end_time = time.time()
+                        self._status.is_ready = True
+                        self._ready_event.set()
+                        logger.info("✅ Local ECAPA fallback successful - voice unlock ready!")
+                        return self._status
+
+                # Both failed - continue to local prewarm as last resort
+                logger.warning("🔄 Cloud and quick fallback failed - attempting full local prewarm...")
 
         # =======================================================================
         # LOCAL PREWARM (Sufficient RAM)
@@ -1387,6 +1440,180 @@ class MLEngineRegistry:
             logger.error(f"❌ Failed to activate cloud routing: {e}")
             self._use_cloud = False
             return False
+
+    async def _verify_cloud_backend_ready(
+        self,
+        timeout: float = None,
+        retry_count: int = None
+    ) -> Tuple[bool, str]:
+        """
+        Verify that the cloud backend is actually reachable and working.
+
+        This is CRITICAL: We must verify the cloud endpoint works BEFORE
+        marking the registry as ready. Otherwise, voice unlock fails with 0% confidence.
+
+        Args:
+            timeout: Request timeout in seconds (default from env JARVIS_ECAPA_CLOUD_TIMEOUT)
+            retry_count: Number of retry attempts (default from env JARVIS_ECAPA_CLOUD_RETRIES)
+
+        Returns:
+            Tuple of (is_ready: bool, reason: str)
+        """
+        # Dynamic configuration from environment
+        timeout = timeout or float(os.getenv("JARVIS_ECAPA_CLOUD_TIMEOUT", "10.0"))
+        retry_count = retry_count or int(os.getenv("JARVIS_ECAPA_CLOUD_RETRIES", "3"))
+        fallback_enabled = os.getenv("JARVIS_ECAPA_CLOUD_FALLBACK_ENABLED", "true").lower() == "true"
+
+        if not self._cloud_endpoint:
+            return False, "Cloud endpoint not configured"
+
+        logger.info(f"🔍 Verifying cloud backend: {self._cloud_endpoint}")
+
+        import aiohttp
+
+        # Health check endpoint
+        health_endpoint = f"{self._cloud_endpoint.rstrip('/')}/health"
+
+        for attempt in range(1, retry_count + 1):
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        health_endpoint,
+                        timeout=aiohttp.ClientTimeout(total=timeout),
+                        headers={"Accept": "application/json"}
+                    ) as response:
+                        if response.status == 200:
+                            try:
+                                data = await response.json()
+                                # Check for specific readiness indicators
+                                if data.get("ecapa_ready", True) and data.get("status") in ("healthy", "ready", "ok", None):
+                                    logger.info(f"✅ Cloud backend verified: {data}")
+                                    self._cloud_verified = True
+                                    self._cloud_last_verified = time.time()
+                                    return True, "Cloud backend healthy and ECAPA ready"
+                                else:
+                                    reason = f"Cloud responded but not ready: {data}"
+                                    logger.warning(f"⚠️ {reason}")
+                            except Exception:
+                                # JSON parse failed but HTTP 200 - assume healthy
+                                logger.info("✅ Cloud backend responded (non-JSON)")
+                                self._cloud_verified = True
+                                self._cloud_last_verified = time.time()
+                                return True, "Cloud backend responding"
+                        else:
+                            reason = f"Cloud returned HTTP {response.status}"
+                            logger.warning(f"⚠️ Attempt {attempt}/{retry_count}: {reason}")
+
+            except asyncio.TimeoutError:
+                reason = f"Cloud health check timed out after {timeout}s"
+                logger.warning(f"⏱️ Attempt {attempt}/{retry_count}: {reason}")
+            except aiohttp.ClientError as e:
+                reason = f"Cloud connection error: {e}"
+                logger.warning(f"🔌 Attempt {attempt}/{retry_count}: {reason}")
+            except Exception as e:
+                reason = f"Cloud verification error: {e}"
+                logger.warning(f"❌ Attempt {attempt}/{retry_count}: {reason}")
+
+            # Exponential backoff between retries
+            if attempt < retry_count:
+                backoff = min(2 ** (attempt - 1), 5)
+                logger.info(f"   Retrying in {backoff}s...")
+                await asyncio.sleep(backoff)
+
+        # All retries exhausted
+        self._cloud_verified = False
+        logger.error(f"❌ Cloud backend verification FAILED after {retry_count} attempts")
+        logger.error(f"   Last error: {reason}")
+
+        if fallback_enabled:
+            logger.warning("🔄 Cloud verification failed - fallback to local ECAPA enabled")
+
+        return False, reason
+
+    async def _fallback_to_local_ecapa(self, reason: str) -> bool:
+        """
+        Fallback to local ECAPA loading when cloud is unavailable.
+
+        Args:
+            reason: Why we're falling back (for logging)
+
+        Returns:
+            True if local ECAPA was successfully loaded
+        """
+        logger.warning("=" * 70)
+        logger.warning("🔄 CLOUD FALLBACK: Attempting local ECAPA load")
+        logger.warning("=" * 70)
+        logger.warning(f"   Reason: {reason}")
+        logger.warning("   Warning: This may cause memory pressure!")
+        logger.warning("=" * 70)
+
+        # Disable cloud mode
+        self._use_cloud = False
+        self._cloud_verified = False
+
+        # Check if ECAPA engine is registered
+        if "ecapa_tdnn" not in self._engines:
+            logger.error("❌ ECAPA engine not registered - cannot fallback")
+            return False
+
+        ecapa_engine = self._engines["ecapa_tdnn"]
+
+        # Attempt to load ECAPA locally
+        try:
+            timeout = float(os.getenv("JARVIS_ECAPA_LOCAL_TIMEOUT", "60.0"))
+            success = await ecapa_engine.load(timeout=timeout)
+
+            if success:
+                logger.info("✅ Local ECAPA loaded successfully as fallback")
+                return True
+            else:
+                logger.error(f"❌ Local ECAPA load failed: {ecapa_engine.metrics.last_error}")
+                return False
+
+        except Exception as e:
+            logger.error(f"❌ Local ECAPA fallback exception: {e}")
+            return False
+
+    def get_ecapa_status(self) -> Dict[str, Any]:
+        """
+        Get detailed ECAPA encoder availability status.
+
+        Returns:
+            Dict with availability information from all sources
+        """
+        status = {
+            "available": False,
+            "source": None,
+            "cloud_mode": self._use_cloud,
+            "cloud_verified": getattr(self, "_cloud_verified", False),
+            "cloud_endpoint": self._cloud_endpoint,
+            "local_loaded": False,
+            "local_error": None,
+            "diagnostics": {}
+        }
+
+        # Check local ECAPA
+        if "ecapa_tdnn" in self._engines:
+            ecapa = self._engines["ecapa_tdnn"]
+            status["local_loaded"] = ecapa.is_loaded
+            status["local_error"] = ecapa.metrics.last_error
+            status["diagnostics"]["local_state"] = ecapa.metrics.state.name
+
+            if ecapa.is_loaded:
+                status["available"] = True
+                status["source"] = "local"
+
+        # Check cloud
+        if self._use_cloud and getattr(self, "_cloud_verified", False):
+            status["available"] = True
+            status["source"] = "cloud" if not status["local_loaded"] else "local_preferred"
+            status["diagnostics"]["cloud_last_verified"] = getattr(self, "_cloud_last_verified", None)
+
+        # Final determination
+        if not status["available"]:
+            status["error"] = "No ECAPA encoder available (local not loaded, cloud not verified)"
+
+        return status
 
     async def extract_speaker_embedding_cloud(
         self,

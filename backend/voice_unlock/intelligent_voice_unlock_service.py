@@ -689,6 +689,10 @@ class IntelligentVoiceUnlockService:
         self.initialized = True
         logger.info(f"✅ Intelligent Voice Unlock Service initialized in {init_time:.0f}ms")
 
+        # CRITICAL FIX: Validate ECAPA encoder availability AFTER initialization
+        # This prevents the 0% confidence bug when encoder fails to load silently
+        await self._validate_ecapa_availability()
+
     async def _initialize_stt(self):
         """
         Initialize Hybrid STT Router with model prewarming.
@@ -858,6 +862,181 @@ class IntelligentVoiceUnlockService:
 
         except Exception as e:
             logger.error(f"Failed to load owner password: {e}")
+
+    async def _validate_ecapa_availability(self) -> None:
+        """
+        Validate ECAPA encoder availability from all sources.
+
+        CRITICAL FIX: This prevents the 0% confidence bug that occurs when
+        the ECAPA encoder fails to load silently. We check ALL encoder sources
+        and provide clear diagnostics if none are available.
+
+        Sources checked (in order):
+        1. Unified Voice Cache
+        2. ML Engine Registry
+        3. Speaker Verification Service
+
+        If no encoder is available, the service marks itself as DEGRADED
+        (not failed) and logs clear error messages.
+        """
+        logger.info("🔍 Validating ECAPA encoder availability...")
+
+        ecapa_available = False
+        ecapa_source = None
+        diagnostics = {}
+
+        # Check 1: Unified Voice Cache
+        if self.unified_cache:
+            try:
+                cache_status = self.unified_cache.get_encoder_status()
+                diagnostics["unified_cache"] = cache_status
+                if cache_status.get("available"):
+                    ecapa_available = True
+                    ecapa_source = f"unified_cache ({cache_status.get('source', 'unknown')})"
+                    logger.info(f"✅ ECAPA available via Unified Cache: {cache_status.get('source')}")
+            except Exception as e:
+                diagnostics["unified_cache_error"] = str(e)
+                logger.debug(f"Unified cache check failed: {e}")
+
+        # Check 2: ML Engine Registry
+        if not ecapa_available:
+            try:
+                from voice_unlock.ml_engine_registry import get_ml_registry_sync
+
+                registry = get_ml_registry_sync()
+                if registry:
+                    registry_status = registry.get_ecapa_status()
+                    diagnostics["ml_registry"] = registry_status
+                    if registry_status.get("available"):
+                        ecapa_available = True
+                        ecapa_source = f"ml_registry ({registry_status.get('source', 'unknown')})"
+                        logger.info(f"✅ ECAPA available via ML Registry: {registry_status.get('source')}")
+            except ImportError:
+                diagnostics["ml_registry"] = "module not available"
+            except Exception as e:
+                diagnostics["ml_registry_error"] = str(e)
+                logger.debug(f"ML Registry check failed: {e}")
+
+        # Check 3: Speaker Verification Service
+        if not ecapa_available and self.speaker_engine:
+            try:
+                if hasattr(self.speaker_engine, "speechbrain_engine"):
+                    engine = self.speaker_engine.speechbrain_engine
+                    if engine and hasattr(engine, "speaker_encoder") and engine.speaker_encoder:
+                        ecapa_available = True
+                        ecapa_source = "speaker_engine.speechbrain_engine"
+                        logger.info("✅ ECAPA available via Speaker Verification Service")
+                        diagnostics["speaker_engine"] = "available"
+                    else:
+                        diagnostics["speaker_engine"] = "encoder not loaded"
+                else:
+                    diagnostics["speaker_engine"] = "no speechbrain_engine attribute"
+            except Exception as e:
+                diagnostics["speaker_engine_error"] = str(e)
+
+        # Store diagnostics for later queries
+        self._ecapa_diagnostics = {
+            "available": ecapa_available,
+            "source": ecapa_source,
+            "details": diagnostics,
+            "checked_at": datetime.now().isoformat()
+        }
+
+        # Log result
+        if ecapa_available:
+            logger.info(f"✅ ECAPA VALIDATION PASSED: {ecapa_source}")
+            self._ecapa_available = True
+        else:
+            logger.error("=" * 70)
+            logger.error("❌ ECAPA ENCODER NOT AVAILABLE - Voice verification will FAIL!")
+            logger.error("=" * 70)
+            logger.error("   No encoder found from any source:")
+            for source, status in diagnostics.items():
+                logger.error(f"   - {source}: {status}")
+            logger.error("")
+            logger.error("   Voice unlock commands will return 0% confidence!")
+            logger.error("   To fix: Check ML model loading, cloud backend, or restart.")
+            logger.error("=" * 70)
+            self._ecapa_available = False
+
+            # Mark service as degraded but not failed
+            # This allows other features to work while voice biometrics is unavailable
+            self._degraded_mode = True
+            self._degraded_reason = "ECAPA encoder unavailable"
+
+    def get_encoder_diagnostics(self) -> Dict[str, Any]:
+        """
+        Get detailed ECAPA encoder diagnostics.
+
+        Returns comprehensive status for troubleshooting voice verification failures.
+        """
+        base_diagnostics = getattr(self, "_ecapa_diagnostics", {
+            "available": False,
+            "source": None,
+            "details": {},
+            "checked_at": None
+        })
+
+        # Add runtime status
+        runtime_status = {
+            "ecapa_available": getattr(self, "_ecapa_available", False),
+            "degraded_mode": getattr(self, "_degraded_mode", False),
+            "degraded_reason": getattr(self, "_degraded_reason", None),
+            "service_initialized": self.initialized,
+        }
+
+        # Check current availability (may have changed since init)
+        current_status = {}
+        if self.unified_cache:
+            try:
+                current_status["unified_cache"] = self.unified_cache.get_encoder_status()
+            except Exception as e:
+                current_status["unified_cache_error"] = str(e)
+
+        try:
+            from voice_unlock.ml_engine_registry import get_ml_registry_sync
+            registry = get_ml_registry_sync()
+            if registry:
+                current_status["ml_registry"] = registry.get_ecapa_status()
+        except Exception as e:
+            current_status["ml_registry_error"] = str(e)
+
+        return {
+            "init_check": base_diagnostics,
+            "runtime": runtime_status,
+            "current_status": current_status,
+            "recommendation": self._get_ecapa_fix_recommendation()
+        }
+
+    def _get_ecapa_fix_recommendation(self) -> str:
+        """Get a human-readable fix recommendation for ECAPA issues."""
+        if getattr(self, "_ecapa_available", False):
+            return "ECAPA is working correctly."
+
+        # Analyze the issue and provide specific advice
+        diagnostics = getattr(self, "_ecapa_diagnostics", {}).get("details", {})
+
+        if "ml_registry" in diagnostics:
+            registry_status = diagnostics["ml_registry"]
+            if isinstance(registry_status, dict):
+                if registry_status.get("cloud_mode") and not registry_status.get("cloud_verified"):
+                    return (
+                        "Cloud mode is active but cloud backend is not reachable. "
+                        "Check network connectivity or set JARVIS_ECAPA_CLOUD_FALLBACK_ENABLED=true "
+                        "to allow local ECAPA fallback."
+                    )
+                if registry_status.get("local_error"):
+                    return (
+                        f"Local ECAPA load failed: {registry_status.get('local_error')}. "
+                        "Check available RAM and SpeechBrain installation."
+                    )
+
+        return (
+            "ECAPA encoder unavailable from all sources. Try: "
+            "1) Restart the service to reload ML models, "
+            "2) Check cloud ML backend availability, "
+            "3) Verify SpeechBrain is installed correctly."
+        )
 
     async def process_voice_unlock_command(
         self, audio_data, context: Optional[Dict[str, Any]] = None
@@ -2104,8 +2283,24 @@ class IntelligentVoiceUnlockService:
         return wav_bytes
 
     async def _identify_speaker(self, audio_data: bytes) -> Tuple[Optional[str], float]:
-        """Identify speaker from audio with VAD preprocessing for speed"""
+        """
+        Identify speaker from audio with VAD preprocessing for speed.
+
+        ENHANCED v2.0: Pre-flight ECAPA check with specific error messages.
+        """
+        # Pre-flight check: Verify speaker engine is available
         if not self.speaker_engine:
+            logger.error("❌ Speaker identification failed: speaker_engine not initialized")
+            return None, 0.0
+
+        # Pre-flight check: Verify ECAPA is available (prevents 0% confidence bug)
+        if hasattr(self, '_ecapa_available') and not self._ecapa_available:
+            logger.error("=" * 60)
+            logger.error("❌ SPEAKER IDENTIFICATION BLOCKED: ECAPA encoder unavailable!")
+            logger.error("=" * 60)
+            logger.error("   This is why voice verification returns 0% confidence.")
+            logger.error(f"   Recommendation: {self._get_ecapa_fix_recommendation()}")
+            logger.error("=" * 60)
             return None, 0.0
 
         try:
@@ -2115,14 +2310,40 @@ class IntelligentVoiceUnlockService:
             # New SpeakerVerificationService
             if hasattr(self.speaker_engine, "verify_speaker"):
                 result = await self.speaker_engine.verify_speaker(filtered_audio)
-                return result.get("speaker_name"), result.get("confidence", 0.0)
 
-            # Legacy speaker verification service - returns (speaker_name, confidence) 
-            speaker_name, confidence = await self.speaker_engine.identify_speaker(filtered_audio) # Returns (speaker_name, confidence) 
-            return speaker_name, confidence # Returns (speaker_name, confidence)
+                # Check for verification failure with 0% confidence
+                confidence = result.get("confidence", 0.0)
+                speaker_name = result.get("speaker_name")
+
+                if confidence == 0.0 and speaker_name is None:
+                    # This is the 0% confidence bug - log detailed diagnostics
+                    logger.warning("⚠️ Speaker verification returned 0% confidence")
+                    logger.warning("   Possible causes:")
+                    logger.warning("   1. ECAPA encoder failed to extract embedding")
+                    logger.warning("   2. Audio quality too poor for analysis")
+                    logger.warning("   3. No matching voice profile found")
+
+                    # Check encoder status for more details
+                    if self.unified_cache:
+                        try:
+                            cache_status = self.unified_cache.get_encoder_status()
+                            if not cache_status.get("available"):
+                                logger.error("   ❌ ROOT CAUSE: Unified cache encoder not available!")
+                                logger.error(f"      Details: {cache_status.get('failure_reasons', [])}")
+                        except Exception as e:
+                            logger.debug(f"Could not check cache status: {e}")
+
+                return speaker_name, confidence
+
+            # Legacy speaker verification service - returns (speaker_name, confidence)
+            speaker_name, confidence = await self.speaker_engine.identify_speaker(filtered_audio)
+            return speaker_name, confidence
+
         except Exception as e:
-            logger.error(f"Speaker identification failed: {e}")
-            return None, 0.0 # Returns (speaker_name, confidence) 
+            logger.error(f"Speaker identification failed with exception: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            return None, 0.0 
 
     async def _get_speaker_confidence(self, audio_data: bytes, speaker_name: str) -> float:
         """Get confidence score for identified speaker with VAD preprocessing"""

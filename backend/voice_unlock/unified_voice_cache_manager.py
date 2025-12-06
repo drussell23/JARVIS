@@ -1309,14 +1309,72 @@ class UnifiedVoiceCacheManager:
         2. Model caching to prevent redundant loading
         3. Fast embedding computation for voice matching
 
-        ENHANCED: Includes retry logic and fallback mechanisms.
+        ENHANCED v2.0: Smart cloud-aware loading with proper fallback orchestration.
+
+        Flow:
+        1. Check ML Registry cloud status
+        2. If cloud mode: verify cloud extraction works, skip local load
+        3. If local mode: attempt local load with retries
+        4. If both fail: clear error with diagnostics
 
         Returns:
-            True if models are ready (or fallback available)
+            True if models are ready (local or cloud)
         """
         self._state = CacheState.LOADING_MODELS
-        max_retries = 2
+        max_retries = int(os.getenv("JARVIS_ECAPA_LOAD_RETRIES", "2"))
 
+        # Track failure reasons for diagnostics
+        failure_reasons = []
+
+        # =========================================================================
+        # STEP 1: Check ML Registry cloud status
+        # =========================================================================
+        try:
+            from voice_unlock.ml_engine_registry import get_ml_registry_sync, is_using_cloud_ml
+
+            registry = get_ml_registry_sync()
+
+            if registry is not None:
+                # Check if registry is using cloud mode
+                if registry.is_using_cloud:
+                    logger.info("☁️ ML Registry in cloud mode - checking cloud ECAPA availability...")
+
+                    # Verify cloud is actually verified and ready
+                    if getattr(registry, "_cloud_verified", False):
+                        logger.info("✅ Cloud ECAPA verified via ML Registry - skipping local load")
+                        self._stats.models_loaded = True
+                        self._using_cloud_ecapa = True
+                        return True
+                    else:
+                        # Cloud mode but not verified - this is the root cause bug!
+                        logger.warning("⚠️ ML Registry in cloud mode but cloud NOT verified!")
+                        failure_reasons.append("Cloud mode active but cloud backend not verified")
+
+                        # Check if registry has a working local fallback
+                        ecapa_status = registry.get_ecapa_status()
+                        if ecapa_status.get("local_loaded"):
+                            logger.info("✅ Using local ECAPA from ML Registry (cloud fallback)")
+                            self._stats.models_loaded = True
+                            self._using_cloud_ecapa = False
+                            return True
+
+                # Check if local ECAPA is loaded in registry
+                ecapa_status = registry.get_ecapa_status()
+                if ecapa_status.get("available"):
+                    logger.info(f"✅ ECAPA available via ML Registry (source: {ecapa_status.get('source')})")
+                    self._stats.models_loaded = True
+                    self._using_cloud_ecapa = ecapa_status.get("source") == "cloud"
+                    return True
+
+        except ImportError:
+            logger.debug("ML Engine Registry not available - using local loading")
+        except Exception as e:
+            logger.warning(f"⚠️ ML Registry check failed: {e}")
+            failure_reasons.append(f"ML Registry check failed: {e}")
+
+        # =========================================================================
+        # STEP 2: Try parallel model loader (standard path)
+        # =========================================================================
         try:
             from voice.parallel_model_loader import get_model_loader
 
@@ -1338,7 +1396,7 @@ class UnifiedVoiceCacheManager:
                     result = await self._model_loader.load_model(
                         model_name="ecapa_encoder",
                         load_func=self._create_ecapa_loader(),
-                        timeout=60.0,  # Allow time for first-time model download
+                        timeout=float(os.getenv("JARVIS_ECAPA_LOCAL_TIMEOUT", "60.0")),
                         use_cache=True,
                     )
                     if result.success:
@@ -1352,6 +1410,7 @@ class UnifiedVoiceCacheManager:
                         logger.warning(
                             f"⚠️ ECAPA-TDNN load attempt {attempt + 1} failed: {result.error}"
                         )
+                        failure_reasons.append(f"Parallel loader attempt {attempt + 1}: {result.error}")
                         if attempt < max_retries - 1:
                             await asyncio.sleep(0.5)  # Brief pause before retry
 
@@ -1359,6 +1418,7 @@ class UnifiedVoiceCacheManager:
                     logger.warning(
                         f"⏱️ ECAPA-TDNN load attempt {attempt + 1} timed out"
                     )
+                    failure_reasons.append(f"Parallel loader attempt {attempt + 1}: Timeout")
                     if attempt < max_retries - 1:
                         await asyncio.sleep(0.5)
 
@@ -1366,6 +1426,7 @@ class UnifiedVoiceCacheManager:
                     logger.warning(
                         f"⚠️ ECAPA-TDNN load attempt {attempt + 1} error: {load_err}"
                     )
+                    failure_reasons.append(f"Parallel loader attempt {attempt + 1}: {load_err}")
                     if attempt < max_retries - 1:
                         await asyncio.sleep(0.5)
 
@@ -1381,25 +1442,11 @@ class UnifiedVoiceCacheManager:
                     return True
             except Exception as direct_err:
                 logger.warning(f"⚠️ Direct ECAPA load failed: {direct_err}")
-
-            # ECAPA unavailable - check if we have preloaded embeddings as fallback
-            if len(self._preloaded_profiles) > 0:
-                logger.warning(
-                    f"⚠️ ECAPA-TDNN not available. Using {len(self._preloaded_profiles)} "
-                    f"preloaded embeddings for matching only (no real-time extraction)"
-                )
-                self._stats.models_loaded = False
-                return True  # Can still function with preloaded embeddings
-            else:
-                logger.error(
-                    "❌ ECAPA-TDNN not available AND no preloaded embeddings. "
-                    "Voice verification will fail!"
-                )
-                self._stats.models_loaded = False
-                return False
+                failure_reasons.append(f"Direct load: {direct_err}")
 
         except ImportError as e:
             logger.warning(f"⚠️ ParallelModelLoader not available: {e}")
+            failure_reasons.append(f"ParallelModelLoader import: {e}")
             # Try direct loading
             try:
                 encoder = await self._load_ecapa_directly()
@@ -1409,13 +1456,94 @@ class UnifiedVoiceCacheManager:
                     self._direct_ecapa_encoder = encoder
                     logger.info("✅ ECAPA-TDNN loaded directly (no parallel loader)")
                     return True
-            except Exception:
-                pass
-            return len(self._preloaded_profiles) > 0
+            except Exception as direct_err:
+                failure_reasons.append(f"Direct load fallback: {direct_err}")
 
         except Exception as e:
             logger.warning(f"⚠️ Model loader error: {e}")
-            return len(self._preloaded_profiles) > 0
+            failure_reasons.append(f"Model loader: {e}")
+
+        # =========================================================================
+        # STEP 3: Fallback to preloaded embeddings (matching only, no extraction)
+        # =========================================================================
+        if len(self._preloaded_profiles) > 0:
+            logger.warning(
+                f"⚠️ ECAPA-TDNN not available. Using {len(self._preloaded_profiles)} "
+                f"preloaded embeddings for matching only (no real-time extraction)"
+            )
+            logger.warning(f"   Failure reasons: {failure_reasons}")
+            self._stats.models_loaded = False
+            self._encoder_failure_reasons = failure_reasons
+            return True  # Can still function with preloaded embeddings
+
+        # =========================================================================
+        # STEP 4: Complete failure - log diagnostics
+        # =========================================================================
+        logger.error("=" * 70)
+        logger.error("❌ ECAPA-TDNN ENCODER UNAVAILABLE - Voice verification will FAIL!")
+        logger.error("=" * 70)
+        logger.error("   Failure chain:")
+        for i, reason in enumerate(failure_reasons, 1):
+            logger.error(f"   {i}. {reason}")
+        logger.error("   No preloaded embeddings available as fallback")
+        logger.error("=" * 70)
+
+        self._stats.models_loaded = False
+        self._encoder_failure_reasons = failure_reasons
+        return False
+
+    def get_encoder_status(self) -> Dict[str, Any]:
+        """
+        Get detailed ECAPA encoder availability status from all sources.
+
+        Returns comprehensive diagnostics for troubleshooting.
+        """
+        status = {
+            "available": False,
+            "source": None,
+            "models_loaded": self._stats.models_loaded,
+            "using_cloud": getattr(self, "_using_cloud_ecapa", False),
+            "preloaded_profiles": len(self._preloaded_profiles),
+            "failure_reasons": getattr(self, "_encoder_failure_reasons", []),
+            "diagnostics": {}
+        }
+
+        # Check parallel model loader
+        if self._model_loader is not None:
+            try:
+                if self._model_loader.is_cached("ecapa_encoder"):
+                    status["available"] = True
+                    status["source"] = "parallel_loader"
+                    status["diagnostics"]["parallel_loader"] = "cached"
+            except Exception as e:
+                status["diagnostics"]["parallel_loader_error"] = str(e)
+
+        # Check direct encoder
+        if hasattr(self, "_direct_ecapa_encoder") and self._direct_ecapa_encoder is not None:
+            status["available"] = True
+            status["source"] = "direct_encoder"
+            status["diagnostics"]["direct_encoder"] = "loaded"
+
+        # Check ML Registry
+        try:
+            from voice_unlock.ml_engine_registry import get_ml_registry_sync
+            registry = get_ml_registry_sync()
+            if registry:
+                ecapa_status = registry.get_ecapa_status()
+                status["diagnostics"]["ml_registry"] = ecapa_status
+                if ecapa_status.get("available") and not status["available"]:
+                    status["available"] = True
+                    status["source"] = f"ml_registry ({ecapa_status.get('source')})"
+        except Exception as e:
+            status["diagnostics"]["ml_registry_error"] = str(e)
+
+        # Final determination
+        if status["available"]:
+            status["failure_reasons"] = []  # Clear failure reasons if now available
+        elif not status["failure_reasons"]:
+            status["failure_reasons"] = ["Unknown - no encoder source available"]
+
+        return status
 
     async def _load_ecapa_directly(self):
         """
@@ -1510,15 +1638,14 @@ class UnifiedVoiceCacheManager:
         """
         Extract voice embedding from audio using the cached ECAPA-TDNN model.
 
-        This is the FAST PATH for new audio - uses the model from the
-        parallel loader's cache instead of loading a new model.
-
-        CRITICAL: PyTorch operations run in thread pool to avoid blocking!
+        ENHANCED v2.0: Smart fallback orchestration with cloud support.
 
         Fallback paths (in order):
-        1. Direct ECAPA encoder (if loaded)
-        2. Parallel model loader cache
-        3. Speaker Verification Service's engine (RECOMMENDED - most reliable)
+        1. Cloud extraction (if cloud mode active and verified)
+        2. Direct ECAPA encoder (if loaded locally)
+        3. Parallel model loader cache
+        4. ML Registry's extract_speaker_embedding
+        5. Speaker Verification Service's engine
 
         Args:
             audio_data: Audio waveform (numpy array or tensor)
@@ -1527,48 +1654,150 @@ class UnifiedVoiceCacheManager:
         Returns:
             192-dimensional embedding or None if extraction fails
         """
-        import time
-        start_time = time.time()
+        import time as time_module
+        start_time = time_module.time()
+
+        # Track extraction attempts for diagnostics
+        attempts = []
 
         try:
+            # =====================================================================
+            # PATH 1: Cloud extraction (if cloud mode active)
+            # =====================================================================
+            if getattr(self, "_using_cloud_ecapa", False):
+                try:
+                    from voice_unlock.ml_engine_registry import get_ml_registry_sync
+
+                    registry = get_ml_registry_sync()
+                    if registry and getattr(registry, "_cloud_verified", False):
+                        # Normalize audio data to bytes if needed
+                        audio_bytes = normalize_audio_data(audio_data)
+                        if audio_bytes:
+                            embedding = await registry.extract_speaker_embedding_cloud(audio_bytes)
+                            if embedding is not None:
+                                embedding_np = self._normalize_embedding(embedding.flatten())
+                                extract_time_ms = (time_module.time() - start_time) * 1000
+                                logger.debug(f"☁️ Extracted embedding via CLOUD in {extract_time_ms:.1f}ms")
+                                return embedding_np
+                            else:
+                                attempts.append("Cloud: extraction returned None")
+                        else:
+                            attempts.append("Cloud: audio normalization failed")
+                    else:
+                        attempts.append("Cloud: registry not verified")
+                except Exception as e:
+                    attempts.append(f"Cloud: {e}")
+                    logger.debug(f"Cloud extraction failed: {e}")
+
+            # =====================================================================
+            # PATH 2: Local encoder (direct or cached)
+            # =====================================================================
             encoder = self.get_ecapa_encoder()
 
-            # If encoder is available via primary paths, use it
             if encoder is not None:
-                # Run CPU-intensive PyTorch operations in thread pool to avoid blocking
-                embedding_np = await asyncio.to_thread(
-                    self._extract_embedding_sync,
-                    encoder,
-                    audio_data
-                )
+                try:
+                    # Run CPU-intensive PyTorch operations in thread pool to avoid blocking
+                    embedding_np = await asyncio.to_thread(
+                        self._extract_embedding_sync,
+                        encoder,
+                        audio_data
+                    )
 
-                if embedding_np is not None:
-                    # Normalize (fast numpy operation)
-                    embedding_np = self._normalize_embedding(embedding_np)
+                    if embedding_np is not None:
+                        # Normalize (fast numpy operation)
+                        embedding_np = self._normalize_embedding(embedding_np)
 
-                    extract_time_ms = (time.time() - start_time) * 1000
-                    logger.debug(f"Extracted embedding in {extract_time_ms:.1f}ms (async)")
-                    return embedding_np
+                        extract_time_ms = (time_module.time() - start_time) * 1000
+                        logger.debug(f"Extracted embedding in {extract_time_ms:.1f}ms (local)")
+                        return embedding_np
+                    else:
+                        attempts.append("Local encoder: extraction returned None")
+                except Exception as e:
+                    attempts.append(f"Local encoder: {e}")
+                    logger.warning(f"Local encoder extraction failed: {e}")
+            else:
+                attempts.append("Local encoder: not available")
 
-            # Fallback: Use ML Registry's extract_speaker_embedding
-            # This is the most reliable path as it accesses the Speaker Verification Service singleton
+            # =====================================================================
+            # PATH 3: ML Registry fallback
+            # =====================================================================
             logger.debug("Primary encoder unavailable, trying ML Registry fallback...")
             try:
                 from voice_unlock.ml_engine_registry import extract_speaker_embedding as ml_extract
-                embedding = await ml_extract(audio_data)
-                if embedding is not None:
-                    embedding_np = self._normalize_embedding(embedding.flatten())
-                    extract_time_ms = (time.time() - start_time) * 1000
-                    logger.debug(f"Extracted embedding via ML Registry fallback in {extract_time_ms:.1f}ms")
-                    return embedding_np
+
+                # Normalize audio data to bytes
+                audio_bytes = normalize_audio_data(audio_data)
+                if audio_bytes:
+                    embedding = await ml_extract(audio_bytes)
+                    if embedding is not None:
+                        embedding_np = self._normalize_embedding(embedding.flatten())
+                        extract_time_ms = (time_module.time() - start_time) * 1000
+                        logger.debug(f"Extracted embedding via ML Registry in {extract_time_ms:.1f}ms")
+                        return embedding_np
+                    else:
+                        attempts.append("ML Registry: extraction returned None")
+                else:
+                    attempts.append("ML Registry: audio normalization failed")
+            except ImportError:
+                attempts.append("ML Registry: module not available")
             except Exception as e:
+                attempts.append(f"ML Registry: {e}")
                 logger.debug(f"ML Registry fallback failed: {e}")
 
-            logger.warning("ECAPA encoder not available from any source for embedding extraction")
+            # =====================================================================
+            # PATH 4: Speaker Verification Service engine (last resort)
+            # =====================================================================
+            logger.debug("Trying Speaker Verification Service fallback...")
+            try:
+                from voice.speaker_verification_service import get_speaker_verification_service
+
+                svc = await get_speaker_verification_service()
+                if svc and svc.speechbrain_engine:
+                    audio_bytes = normalize_audio_data(audio_data)
+                    if audio_bytes:
+                        embedding = await svc.speechbrain_engine.extract_speaker_embedding(audio_bytes)
+                        if embedding is not None:
+                            embedding_np = self._normalize_embedding(embedding.flatten())
+                            extract_time_ms = (time_module.time() - start_time) * 1000
+                            logger.debug(f"Extracted embedding via Speaker Service in {extract_time_ms:.1f}ms")
+                            return embedding_np
+                        else:
+                            attempts.append("Speaker Service: extraction returned None")
+                    else:
+                        attempts.append("Speaker Service: audio normalization failed")
+                else:
+                    attempts.append("Speaker Service: engine not available")
+            except ImportError:
+                attempts.append("Speaker Service: module not available")
+            except Exception as e:
+                attempts.append(f"Speaker Service: {e}")
+                logger.debug(f"Speaker Service fallback failed: {e}")
+
+            # =====================================================================
+            # ALL PATHS FAILED - Log detailed diagnostics
+            # =====================================================================
+            logger.error("=" * 60)
+            logger.error("❌ EMBEDDING EXTRACTION FAILED - All paths exhausted!")
+            logger.error("=" * 60)
+            logger.error("   Attempts:")
+            for i, attempt in enumerate(attempts, 1):
+                logger.error(f"   {i}. {attempt}")
+            logger.error("   This will cause 0% confidence in voice verification!")
+            logger.error("=" * 60)
+
+            # Store failure reasons for diagnostics
+            self._last_extraction_failure = {
+                "timestamp": time_module.time(),
+                "attempts": attempts,
+                "audio_size": len(audio_data) if audio_data else 0
+            }
+
             return None
 
         except Exception as e:
-            logger.error(f"Embedding extraction failed: {e}")
+            logger.error(f"Embedding extraction critical error: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return None
 
     def _extract_embedding_sync(self, encoder, audio_data) -> Optional[np.ndarray]:
