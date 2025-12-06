@@ -3,15 +3,22 @@
 #
 # Production-ready container for ECAPA-TDNN speaker embedding service.
 # Optimized for GCP Cloud Run with:
-# - Multi-stage build for minimal image size
+# - Multi-stage build for minimal image size (~2GB)
 # - Pre-downloaded model weights
 # - Health check integration
 # - Non-root user for security
+# - Compatible with CloudECAPAClient v18.2.0
 #
 # Build: docker build -t ecapa-cloud-service .
 # Run:   docker run -p 8010:8010 ecapa-cloud-service
 #
-# v18.0.0
+# Local Development:
+#   docker-compose up -d
+#
+# GCP Deployment:
+#   ./deploy_cloud_run.sh
+#
+# v18.2.0
 
 # =============================================================================
 # Stage 1: Build dependencies

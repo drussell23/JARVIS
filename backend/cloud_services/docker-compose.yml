@@ -1,0 +1,88 @@
+# ECAPA Cloud Services - Local Development Docker Compose
+# ========================================================
+#
+# This docker-compose file runs the ECAPA cloud service locally for development.
+# It mimics the GCP Cloud Run environment for testing before deployment.
+#
+# Usage:
+#   docker-compose up -d          # Start in background
+#   docker-compose up              # Start with logs
+#   docker-compose down            # Stop and remove
+#   docker-compose logs -f ecapa   # Follow logs
+#
+# Test:
+#   curl http://localhost:8010/health
+#   curl http://localhost:8010/status
+#
+# v18.2.0
+
+version: '3.8'
+
+services:
+  ecapa:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: jarvis-ecapa-cloud
+    ports:
+      - "8010:8010"
+    environment:
+      # Model configuration
+      - ECAPA_MODEL_PATH=speechbrain/spkrec-ecapa-voxceleb
+      - ECAPA_CACHE_DIR=/opt/ecapa_cache
+      - ECAPA_DEVICE=cpu
+      - ECAPA_WARMUP_ON_START=true
+
+      # Performance tuning
+      - ECAPA_BATCH_SIZE=8
+      - ECAPA_CACHE_TTL=3600
+      - ECAPA_CACHE_MAX_SIZE=1000
+      - ECAPA_REQUEST_TIMEOUT=30.0
+
+      # Circuit breaker
+      - ECAPA_CB_FAILURES=5
+      - ECAPA_CB_RECOVERY=30.0
+
+      # Server
+      - PORT=8010
+      - LOG_LEVEL=INFO
+
+    volumes:
+      # Persist model cache between restarts
+      - ecapa-cache:/opt/ecapa_cache
+      # Share models with host for faster rebuilds (optional)
+      # - ~/.cache/jarvis/speechbrain:/opt/ecapa_cache
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8010/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+    restart: unless-stopped
+
+    # Resource limits (mimics Cloud Run)
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 4G
+        reservations:
+          cpus: '0.5'
+          memory: 1G
+
+    # Logging configuration
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  ecapa-cache:
+    name: jarvis-ecapa-cache
+
+networks:
+  default:
+    name: jarvis-network
