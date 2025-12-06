@@ -245,13 +245,15 @@ class CloudECAPAClientConfig:
     ]
 
     # Fallback endpoint construction
+    # Note: Cloud Run URLs use project NUMBER, not project ID
     GCP_PROJECT = os.getenv("GCP_PROJECT_ID", "jarvis-473803")
+    GCP_PROJECT_NUMBER = os.getenv("GCP_PROJECT_NUMBER", "888774109345")
     GCP_REGION = os.getenv("GCP_REGION", "us-central1")
 
-    # Primary endpoint
+    # Primary endpoint - uses project number for Cloud Run URL
     PRIMARY_ENDPOINT = os.getenv(
         "JARVIS_CLOUD_ML_ENDPOINT",
-        f"https://jarvis-ml-{GCP_PROJECT}.{GCP_REGION}.run.app/api/ml"
+        f"https://jarvis-ml-{GCP_PROJECT_NUMBER}.{GCP_REGION}.run.app/api/ml"
     )
 
     # Timeouts
@@ -290,8 +292,8 @@ class CloudECAPAClientConfig:
         if cls.PRIMARY_ENDPOINT and cls.PRIMARY_ENDPOINT not in endpoints:
             endpoints.append(cls.PRIMARY_ENDPOINT)
 
-        # Add Cloud Run default
-        cloud_run_default = f"https://jarvis-ml-{cls.GCP_PROJECT}.{cls.GCP_REGION}.run.app/api/ml"
+        # Add Cloud Run default (uses project number for URL)
+        cloud_run_default = f"https://jarvis-ml-{cls.GCP_PROJECT_NUMBER}.{cls.GCP_REGION}.run.app/api/ml"
         if cloud_run_default not in endpoints:
             endpoints.append(cloud_run_default)
 

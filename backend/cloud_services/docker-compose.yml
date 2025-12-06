@@ -5,33 +5,40 @@
 # It mimics the GCP Cloud Run environment for testing before deployment.
 #
 # Usage:
-#   docker-compose up -d          # Start in background
-#   docker-compose up              # Start with logs
-#   docker-compose down            # Stop and remove
-#   docker-compose logs -f ecapa   # Follow logs
+#   docker compose up -d           # Start in background
+#   docker compose up              # Start with logs
+#   docker compose down            # Stop and remove
+#   docker compose logs -f ecapa   # Follow logs
 #
 # Test:
 #   curl http://localhost:8010/health
 #   curl http://localhost:8010/status
 #
-# v18.2.0
-
-version: '3.8'
+# v18.3.0 - Updated for robust entrypoint script
 
 services:
   ecapa:
     build:
       context: .
       dockerfile: Dockerfile
+    image: ecapa-local:latest
     container_name: jarvis-ecapa-cloud
     ports:
       - "8010:8010"
     environment:
       # Model configuration
       - ECAPA_MODEL_PATH=speechbrain/spkrec-ecapa-voxceleb
-      - ECAPA_CACHE_DIR=/opt/ecapa_cache
+      - ECAPA_CACHE_DIR=/tmp/ecapa_cache
+      - ECAPA_SOURCE_CACHE=/opt/ecapa_cache
       - ECAPA_DEVICE=cpu
       - ECAPA_WARMUP_ON_START=true
+
+      # Cache directories (writable at runtime)
+      - HF_HOME=/tmp/ecapa_cache/huggingface
+      - TRANSFORMERS_CACHE=/tmp/ecapa_cache/transformers
+      - TORCH_HOME=/tmp/ecapa_cache/torch
+      - XDG_CACHE_HOME=/tmp/ecapa_cache
+      - SPEECHBRAIN_CACHE=/tmp/ecapa_cache
 
       # Performance tuning
       - ECAPA_BATCH_SIZE=8
@@ -46,31 +53,30 @@ services:
       # Server
       - PORT=8010
       - LOG_LEVEL=INFO
+      - DEBUG=false
 
     volumes:
-      # Persist model cache between restarts
-      - ecapa-cache:/opt/ecapa_cache
-      # Share models with host for faster rebuilds (optional)
-      # - ~/.cache/jarvis/speechbrain:/opt/ecapa_cache
+      # Persist runtime cache between restarts (faster cold starts)
+      - ecapa-runtime-cache:/tmp/ecapa_cache
 
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8010/health"]
       interval: 30s
-      timeout: 10s
+      timeout: 15s
       retries: 3
-      start_period: 60s
+      start_period: 120s
 
     restart: unless-stopped
 
-    # Resource limits (mimics Cloud Run)
+    # Resource limits (mimics Cloud Run 4Gi/2 CPU)
     deploy:
       resources:
         limits:
           cpus: '2.0'
           memory: 4G
         reservations:
-          cpus: '0.5'
-          memory: 1G
+          cpus: '1.0'
+          memory: 2G
 
     # Logging configuration
     logging:
@@ -80,8 +86,8 @@ services:
         max-file: "3"
 
 volumes:
-  ecapa-cache:
-    name: jarvis-ecapa-cache
+  ecapa-runtime-cache:
+    name: jarvis-ecapa-runtime-cache
 
 networks:
   default:

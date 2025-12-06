@@ -13136,7 +13136,7 @@ async def ensure_docker_ecapa_service(force_rebuild: bool = False) -> dict:
         if force_rebuild:
             print(f"  {Colors.CYAN}→ Building Docker image (this may take a few minutes)...{Colors.ENDC}")
             build_result = subprocess.run(
-                ["docker-compose", "build"],
+                ["docker", "compose", "build"],  # Docker Compose v2 syntax
                 capture_output=True,
                 text=True,
                 timeout=600,  # 10 minute timeout for build
@@ -13149,9 +13149,9 @@ async def ensure_docker_ecapa_service(force_rebuild: bool = False) -> dict:
                 return result
             print(f"  {Colors.GREEN}✓ Docker image built{Colors.ENDC}")
 
-        # Start container in detached mode
+        # Start container in detached mode (Docker Compose v2 syntax)
         start_result = subprocess.run(
-            ["docker-compose", "up", "-d"],
+            ["docker", "compose", "up", "-d"],
             capture_output=True,
             text=True,
             timeout=300,  # 5 minute timeout for start
@@ -13225,8 +13225,9 @@ async def stop_docker_ecapa_service() -> bool:
     cloud_services_dir = Path(__file__).parent / "backend" / "cloud_services"
 
     try:
+        # Docker Compose v2 syntax
         stop_result = subprocess.run(
-            ["docker-compose", "down"],
+            ["docker", "compose", "down"],
             capture_output=True,
             text=True,
             timeout=60,
@@ -13793,9 +13794,11 @@ async def main():
     prefer_cloud = os.getenv("JARVIS_PREFER_CLOUD_RUN", "true").lower() == "true"
 
     # Get Cloud Run endpoint from environment
+    # Note: Cloud Run URLs use project NUMBER (888774109345), not project ID (jarvis-473803)
+    gcp_project_number = os.getenv("GCP_PROJECT_NUMBER", "888774109345")
     cloud_run_endpoint = os.getenv(
         "JARVIS_CLOUD_ML_ENDPOINT",
-        "https://jarvis-ml-jarvis-473803.us-central1.run.app/api/ml"
+        f"https://jarvis-ml-{gcp_project_number}.us-central1.run.app/api/ml"
     )
 
     # ─────────────────────────────────────────────────────────────────────────

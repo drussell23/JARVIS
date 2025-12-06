@@ -385,11 +385,21 @@ class ECAPAModelManager:
         test_audio = np.zeros(16000, dtype=np.float32)
 
         try:
-            _ = await self.extract_embedding(test_audio)
+            # Run warmup synchronously to avoid thread pool executor issues during startup
+            logger.info("Warmup: Converting audio to tensor...")
+            audio_tensor = torch.tensor(test_audio).unsqueeze(0)
+
+            logger.info("Warmup: Running encode_batch (this may take 30-60s on first run)...")
+            with torch.no_grad():
+                embedding = self.model.encode_batch(audio_tensor).squeeze().cpu().numpy()
+
+            logger.info(f"Warmup: Got embedding shape {embedding.shape}")
             self.warmup_time_ms = (time.time() - start_time) * 1000
-            logger.info(f"Warmup completed in {self.warmup_time_ms:.0f}ms")
+            logger.info(f"Warmup completed successfully in {self.warmup_time_ms:.0f}ms")
         except Exception as e:
             logger.warning(f"Warmup inference failed (non-critical): {e}")
+            import traceback
+            logger.warning(traceback.format_exc())
 
     async def extract_embedding(
         self,
@@ -441,7 +451,7 @@ class ECAPAModelManager:
             audio_tensor = torch.tensor(audio_data).unsqueeze(0)
 
             # Run in thread pool to avoid blocking
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             embedding = await loop.run_in_executor(
                 None,
                 lambda: self.model.encode_batch(audio_tensor).squeeze().cpu().numpy()

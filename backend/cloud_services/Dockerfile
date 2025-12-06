@@ -18,7 +18,7 @@
 # GCP Deployment:
 #   ./deploy_cloud_run.sh
 #
-# v18.2.0
+# v18.3.0 - Robust entrypoint script with fallback cache handling
 
 # =============================================================================
 # Stage 1: Build dependencies
@@ -81,11 +81,13 @@ WORKDIR /app
 # Copy application code
 COPY ecapa_cloud_service.py .
 COPY __init__.py .
+COPY entrypoint.sh .
 
-# Set ownership and permissions for cache files
+# Set ownership and permissions
 # Note: 775 ensures ecapa user/group can write; speechbrain needs write access for lock files
 RUN chown -R ecapa:ecapa /app /opt/ecapa_cache && \
-    chmod -R 775 /opt/ecapa_cache
+    chmod -R 775 /opt/ecapa_cache && \
+    chmod +x /app/entrypoint.sh
 
 # Switch to non-root user
 USER ecapa
@@ -99,12 +101,19 @@ ENV ECAPA_DEVICE="cpu"
 ENV ECAPA_WARMUP_ON_START="true"
 ENV PORT="8010"
 
+# Additional cache environment variables for various libraries
+ENV HF_HOME="/tmp/ecapa_cache/huggingface"
+ENV TRANSFORMERS_CACHE="/tmp/ecapa_cache/transformers"
+ENV TORCH_HOME="/tmp/ecapa_cache/torch"
+ENV XDG_CACHE_HOME="/tmp/ecapa_cache"
+ENV SPEECHBRAIN_CACHE="/tmp/ecapa_cache"
+
 # Expose port
 EXPOSE 8010
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+# Health check (increased start period for model loading)
+HEALTHCHECK --interval=30s --timeout=15s --start-period=120s --retries=3 \
     CMD curl -f http://localhost:8010/health || exit 1
 
-# Startup: Copy pre-downloaded cache to writable /tmp with full permissions, then run service
-CMD cp -r /opt/ecapa_cache /tmp/ecapa_cache && chmod -R 777 /tmp/ecapa_cache && python ecapa_cloud_service.py
+# Use robust entrypoint script
+ENTRYPOINT ["/app/entrypoint.sh"]

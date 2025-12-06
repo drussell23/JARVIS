@@ -1422,13 +1422,14 @@ class MLEngineRegistry:
 
             # Fallback: Use environment variable or default GCP endpoint
             if not self._cloud_endpoint:
-                gcp_project = os.getenv("GCP_PROJECT_ID", "jarvis-473803")
+                # Note: Cloud Run URLs use project NUMBER, not project ID
+                gcp_project_number = os.getenv("GCP_PROJECT_NUMBER", "888774109345")
                 gcp_region = os.getenv("GCP_REGION", "us-central1")
 
-                # Try Cloud Run endpoint first, then Compute Engine fallback
+                # Try Cloud Run endpoint first (uses project number for URL)
                 self._cloud_endpoint = os.getenv(
                     "JARVIS_CLOUD_ML_ENDPOINT",
-                    f"https://jarvis-ml-{gcp_project}.{gcp_region}.run.app/api/ml"
+                    f"https://jarvis-ml-{gcp_project_number}.{gcp_region}.run.app/api/ml"
                 )
                 logger.info(f"   Using fallback cloud endpoint: {self._cloud_endpoint}")
 
