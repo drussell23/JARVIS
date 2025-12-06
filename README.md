@@ -5807,9 +5807,11 @@ The Cloud ECAPA Client automatically reads these environment variables during in
 
 ```python
 # In CloudECAPAClient.initialize()
+# Note: Cloud Run URLs use project NUMBER (888774109345), not project ID (jarvis-473803)
+gcp_project_number = os.getenv("GCP_PROJECT_NUMBER", "888774109345")
 cloud_ml_endpoint = os.getenv(
     "JARVIS_CLOUD_ML_ENDPOINT",
-    "https://jarvis-ml-jarvis-473803.us-central1.run.app/api/ml"
+    f"https://jarvis-ml-{gcp_project_number}.us-central1.run.app/api/ml"
 )
 
 backend_type = os.getenv("JARVIS_ECAPA_BACKEND", "cloud_run")
@@ -6076,6 +6078,83 @@ services:
 3. **Health Check**: Robust health check with 120s start period for model loading
 4. **Runtime Cache**: Writable `/tmp/ecapa_cache` for runtime model downloads
 
+#### 🔄 Recent Updates (v19.0.0)
+
+**Docker Compose v2 Syntax:**
+
+All Docker commands have been updated to use Docker Compose v2 syntax (`docker compose` instead of `docker-compose`):
+
+| Old Syntax | New Syntax (v2) |
+|-----------|-----------------|
+| `docker-compose build` | `docker compose build` |
+| `docker-compose up -d` | `docker compose up -d` |
+| `docker-compose down` | `docker compose down` |
+| `docker-compose logs` | `docker compose logs` |
+
+**Why the Change:**
+- Docker Compose v2 is now the default in Docker Desktop
+- Integrated as a Docker CLI plugin (no separate binary)
+- Better compatibility with modern Docker installations
+- Consistent with Docker's recommended practices
+
+**Files Updated:**
+- `start_system.py`: `ensure_docker_ecapa_service()` and `stop_docker_ecapa_service()` functions
+- All orchestrator commands use `docker compose` syntax
+- Health check commands use v2 syntax
+
+**Cloud Run Endpoint Fix:**
+
+**Important:** Cloud Run URLs use **project NUMBER** (e.g., `888774109345`), not project ID (e.g., `jarvis-473803`).
+
+| Component | Before (Incorrect) | After (Correct) |
+|-----------|-------------------|-----------------|
+| **Cloud Run URL** | `jarvis-ml-jarvis-473803.us-central1.run.app` | `jarvis-ml-888774109345.us-central1.run.app` |
+| **Endpoint Construction** | Hardcoded project ID | Dynamic project NUMBER from env var |
+
+**Environment Variable Added:**
+
+```bash
+# GCP Project Number (used for Cloud Run URL construction)
+GCP_PROJECT_NUMBER=888774109345  # Default value
+```
+
+**Files Updated:**
+- `start_system.py`: Cloud Run endpoint construction (lines 13795-13801)
+- `backend/voice_unlock/cloud_ecapa_client.py`: Endpoint initialization
+- `backend/voice_unlock/ml_engine_registry.py`: Fallback endpoint
+
+**Code Example:**
+
+```python
+# Old (incorrect):
+cloud_run_endpoint = "https://jarvis-ml-jarvis-473803.us-central1.run.app/api/ml"
+
+# New (correct):
+gcp_project_number = os.getenv("GCP_PROJECT_NUMBER", "888774109345")
+cloud_run_endpoint = f"https://jarvis-ml-{gcp_project_number}.us-central1.run.app/api/ml"
+```
+
+**Verification:**
+
+```bash
+# Check Cloud Run endpoint (should use project NUMBER)
+echo $JARVIS_CLOUD_ML_ENDPOINT
+# Expected: https://jarvis-ml-888774109345.us-central1.run.app/api/ml
+
+# Test endpoint
+curl https://jarvis-ml-888774109345.us-central1.run.app/health
+
+# Check project number environment variable
+echo $GCP_PROJECT_NUMBER
+# Expected: 888774109345
+```
+
+**Why This Matters:**
+- Cloud Run URLs require the **numeric project number**, not the alphanumeric project ID
+- Using the wrong identifier causes connection failures
+- The fix ensures correct URL construction across all components
+- Environment variable allows easy configuration per deployment
+
 #### 🚀 Running the Service Locally
 
 **Quick Start:**
@@ -6229,10 +6308,10 @@ Docker Container Startup Flow:
 │   └─ If running → Use existing container
 │
 ├─ 5. Build Docker image (if needed or --docker-rebuild)
-│   └─ "docker-compose build" (timeout: 10 min)
+│   └─ "docker compose build" (timeout: 10 min)  # Docker Compose v2 syntax
 │
 ├─ 6. Start container
-│   └─ "docker-compose up -d" (timeout: 5 min)
+│   └─ "docker compose up -d" (timeout: 5 min)  # Docker Compose v2 syntax
 │
 ├─ 7. Wait for health check
 │   └─ Poll http://localhost:8010/health every 5s
@@ -6495,16 +6574,26 @@ docker compose exec ecapa find /opt/ecapa_cache -type f
 ```bash
 # Start container manually (bypass orchestrator)
 cd backend/cloud_services
-docker compose up -d
+docker compose up -d  # Docker Compose v2 syntax
 
 # Stop container manually
-docker compose down
+docker compose down  # Docker Compose v2 syntax
 
 # Rebuild image manually
-docker compose build --no-cache
+docker compose build --no-cache  # Docker Compose v2 syntax
 
 # Force recreate container
-docker compose up -d --force-recreate
+docker compose up -d --force-recreate  # Docker Compose v2 syntax
+```
+
+**Note:** All Docker Compose commands use v2 syntax (`docker compose` instead of `docker-compose`). Ensure Docker Compose v2 is installed:
+
+```bash
+# Check Docker Compose version
+docker compose version
+
+# If not available, update Docker Desktop or install Docker Compose v2
+# Docker Desktop automatically includes Docker Compose v2
 ```
 
 ### 🛠️ Troubleshooting
@@ -6548,9 +6637,9 @@ ps aux | grep -i docker
 # Check docker-compose.yml exists
 ls backend/cloud_services/docker-compose.yml
 
-# Check Docker logs
+# Check Docker logs (Docker Compose v2 syntax)
 cd backend/cloud_services
-docker-compose logs jarvis-ecapa-cloud
+docker compose logs jarvis-ecapa-cloud
 
 # Check port conflict
 lsof -i :8010
@@ -6559,9 +6648,15 @@ lsof -i :8010
 **Solutions:**
 1. Verify `docker-compose.yml` exists at `backend/cloud_services/docker-compose.yml`
 2. Check port 8010 is not in use: `lsof -i :8010`
-3. Check Docker logs: `docker-compose logs jarvis-ecapa-cloud`
-4. Try manual start: `cd backend/cloud_services && docker-compose up -d`
+3. Check Docker logs: `docker compose logs jarvis-ecapa-cloud` (Docker Compose v2 syntax)
+4. Try manual start: `cd backend/cloud_services && docker compose up -d` (v2 syntax)
 5. Rebuild image: `python start_system.py --restart --docker-rebuild`
+6. **Verify Docker Compose version**: 
+   ```bash
+   docker compose version
+   # Should show: Docker Compose version v2.x.x
+   # If not available, update Docker Desktop or install Docker Compose v2
+   ```
 
 **Problem: Cloud Run probe times out**
 
@@ -6573,7 +6668,7 @@ lsof -i :8010
 **Diagnosis:**
 ```bash
 # Test Cloud Run endpoint manually
-curl https://jarvis-ml-jarvis-473803.us-central1.run.app/health
+curl https://jarvis-ml-888774109345.us-central1.run.app/health
 
 # Check network connectivity
 ping 8.8.8.8
@@ -7455,19 +7550,46 @@ gcloud run deploy jarvis-ml \
 JARVIS_ECAPA_MODEL="speechbrain/spkrec-ecapa-voxceleb"  # Model ID
 JARVIS_ECAPA_CACHE_DIR="/tmp/models"                     # Model cache
 JARVIS_LOG_LEVEL="INFO"                                  # Logging level
+
+# GCP Project Number (REQUIRED for endpoint construction)
+# Note: Use project NUMBER (numeric), not project ID (alphanumeric)
+GCP_PROJECT_NUMBER="888774109345"  # Your GCP project number
 ```
 
 **Service URL:**
 
-After deployment, the service URL is available:
+After deployment, the service URL uses your **project NUMBER** (not project ID):
 ```
-https://jarvis-ml-{PROJECT_ID}.us-central1.run.app
+https://jarvis-ml-{PROJECT_NUMBER}.us-central1.run.app
 ```
 
-Update your environment:
+**How to Find Your Project Number:**
+
 ```bash
-export JARVIS_CLOUD_ML_ENDPOINT="https://jarvis-ml-888774109345.us-central1.run.app/api/ml"
+# Get project number from GCP
+gcloud projects describe $(gcloud config get-value project) --format="value(projectNumber)"
+
+# Or get project number from project ID
+gcloud projects describe jarvis-473803 --format="value(projectNumber)"
+# Output: 888774109345
 ```
+
+**Update Your Environment:**
+
+```bash
+# Set project number
+export GCP_PROJECT_NUMBER="888774109345"
+
+# Set Cloud Run endpoint (will use project number)
+export JARVIS_CLOUD_ML_ENDPOINT="https://jarvis-ml-${GCP_PROJECT_NUMBER}.us-central1.run.app/api/ml"
+# Result: https://jarvis-ml-888774109345.us-central1.run.app/api/ml
+```
+
+**Important Notes:**
+- Cloud Run URLs require the **numeric project number**, not the alphanumeric project ID
+- The orchestrator automatically constructs the URL using `GCP_PROJECT_NUMBER`
+- Default value is `888774109345` if not set
+- Ensure `GCP_PROJECT_NUMBER` matches your actual GCP project number
 
 ### 📈 Monitoring & Observability
 
