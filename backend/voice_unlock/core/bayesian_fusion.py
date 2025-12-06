@@ -1,8 +1,16 @@
 """
-Bayesian Confidence Fusion for Physics-Aware Voice Authentication v2.5
+Bayesian Confidence Fusion for Physics-Aware Voice Authentication v2.6
 
 This module implements Bayesian probability fusion for combining multiple
-evidence sources in voice authentication decisions:
+evidence sources in voice authentication decisions.
+
+v2.6 Enhancements:
+- Adaptive exclusion of unavailable evidence (confidence <= MIN_VALID_CONFIDENCE)
+- Weight renormalization when sources are excluded
+- Dynamic threshold adjustment based on available evidence
+- Graceful degradation mode with comprehensive diagnostics
+
+Evidence sources:
 
 - ML confidence (voice biometric embedding similarity)
 - Physics confidence (VTL, RT60, Doppler analysis)
@@ -66,6 +74,22 @@ class BayesianFusionConfig:
     MIN_PRIOR = float(os.getenv("BAYESIAN_MIN_PRIOR", "0.05"))
     MAX_PRIOR = float(os.getenv("BAYESIAN_MAX_PRIOR", "0.95"))
 
+    # Adaptive Exclusion Configuration (v2.6)
+    # Minimum valid confidence - below this, evidence is considered unavailable
+    MIN_VALID_CONFIDENCE = float(os.getenv("BAYESIAN_MIN_VALID_CONFIDENCE", "0.02"))
+
+    # Enable adaptive exclusion of unavailable evidence sources
+    ADAPTIVE_EXCLUSION_ENABLED = os.getenv("BAYESIAN_ADAPTIVE_EXCLUSION", "true").lower() == "true"
+
+    # Threshold adjustment when ML is unavailable (reduce requirement)
+    ML_UNAVAILABLE_THRESHOLD_REDUCTION = float(os.getenv("BAYESIAN_ML_UNAVAILABLE_REDUCTION", "0.10"))
+
+    # Minimum sources required for authentication (graceful degradation)
+    MIN_SOURCES_FOR_AUTH = int(os.getenv("BAYESIAN_MIN_SOURCES", "2"))
+
+    # Weight redistribution strategy: "proportional" or "equal"
+    WEIGHT_REDISTRIBUTION = os.getenv("BAYESIAN_WEIGHT_REDISTRIBUTION", "proportional")
+
 
 class DecisionType(str, Enum):
     """Authentication decision types."""
@@ -87,6 +111,16 @@ class EvidenceScore:
 
 
 @dataclass
+class ExcludedEvidence:
+    """Information about excluded evidence sources."""
+    source: str
+    original_confidence: float
+    original_weight: float
+    reason: str
+    timestamp: datetime = field(default_factory=datetime.utcnow)
+
+
+@dataclass
 class FusionResult:
     """Result of Bayesian confidence fusion."""
     posterior_authentic: float  # P(authentic|evidence)
@@ -94,9 +128,13 @@ class FusionResult:
     decision: DecisionType
     confidence: float  # Overall confidence in decision
     evidence_scores: List[EvidenceScore] = field(default_factory=list)
+    excluded_evidence: List[ExcludedEvidence] = field(default_factory=list)
     reasoning: List[str] = field(default_factory=list)
     dominant_factor: str = ""  # Which factor most influenced decision
     uncertainty: float = 0.0  # Shannon entropy of posterior
+    effective_threshold: float = 0.0  # Actual threshold used (may be adjusted)
+    degradation_mode: bool = False  # True if operating with reduced evidence
+    available_sources: int = 0  # Number of valid evidence sources used
     details: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -167,67 +205,75 @@ class BayesianConfidenceFusion:
         context_details: Optional[Dict[str, Any]] = None
     ) -> FusionResult:
         """
-        Fuse multiple evidence sources using Bayesian inference.
+        Fuse multiple evidence sources using Bayesian inference with adaptive exclusion.
+
+        v2.6 Enhancement: Automatically excludes unavailable evidence sources
+        (confidence <= MIN_VALID_CONFIDENCE) and renormalizes weights.
 
         Args:
-            ml_confidence: ML model confidence (0-1)
+            ml_confidence: ML model confidence (0-1), None or <= 0.02 means unavailable
             physics_confidence: Physics analysis confidence (0-1)
             behavioral_confidence: Behavioral pattern confidence (0-1)
             context_confidence: Contextual factors confidence (0-1)
             *_details: Optional details for each evidence source
 
         Returns:
-            FusionResult with posterior probabilities and decision
+            FusionResult with posterior probabilities, decision, and degradation info
         """
         self._fusion_count += 1
-        evidence_scores = []
+        raw_evidence = []
+        excluded_evidence = []
         reasoning = []
 
-        # Collect evidence
-        if ml_confidence is not None:
-            evidence_scores.append(EvidenceScore(
-                source="ml",
-                confidence=ml_confidence,
-                weight=self.ml_weight,
-                details=ml_details or {}
-            ))
-            reasoning.append(f"ML confidence: {ml_confidence:.1%}")
+        # Build raw evidence list with all provided sources
+        evidence_map = [
+            ("ml", ml_confidence, self.ml_weight, ml_details),
+            ("physics", physics_confidence, self.physics_weight, physics_details),
+            ("behavioral", behavioral_confidence, self.behavioral_weight, behavioral_details),
+            ("context", context_confidence, self.context_weight, context_details),
+        ]
 
-        if physics_confidence is not None:
-            evidence_scores.append(EvidenceScore(
-                source="physics",
-                confidence=physics_confidence,
-                weight=self.physics_weight,
-                details=physics_details or {}
-            ))
-            reasoning.append(f"Physics confidence: {physics_confidence:.1%}")
+        for source, conf, weight, details in evidence_map:
+            if conf is not None:
+                raw_evidence.append(EvidenceScore(
+                    source=source,
+                    confidence=conf,
+                    weight=weight,
+                    details=details or {}
+                ))
 
-        if behavioral_confidence is not None:
-            evidence_scores.append(EvidenceScore(
-                source="behavioral",
-                confidence=behavioral_confidence,
-                weight=self.behavioral_weight,
-                details=behavioral_details or {}
-            ))
-            reasoning.append(f"Behavioral confidence: {behavioral_confidence:.1%}")
+        # Adaptive exclusion: filter out unavailable evidence sources
+        valid_evidence, excluded = self._filter_and_renormalize(raw_evidence)
 
-        if context_confidence is not None:
-            evidence_scores.append(EvidenceScore(
-                source="context",
-                confidence=context_confidence,
-                weight=self.context_weight,
-                details=context_details or {}
-            ))
-            reasoning.append(f"Context confidence: {context_confidence:.1%}")
+        excluded_evidence = excluded
 
-        # Compute posteriors
-        posterior_authentic, posterior_spoof = self._compute_posteriors(evidence_scores)
+        # Track degradation mode
+        ml_unavailable = any(e.source == "ml" for e in excluded_evidence)
+        degradation_mode = len(excluded_evidence) > 0
 
-        # Determine dominant factor
-        dominant_factor = self._find_dominant_factor(evidence_scores)
+        # Build reasoning for included evidence
+        for evidence in valid_evidence:
+            reasoning.append(f"{evidence.source.upper()} confidence: {evidence.confidence:.1%} (weight: {evidence.weight:.1%})")
 
-        # Make decision
-        decision = self._make_decision(posterior_authentic, posterior_spoof, evidence_scores)
+        # Add reasoning for excluded evidence
+        for excluded in excluded_evidence:
+            reasoning.append(f"⚠️ {excluded.source.upper()} EXCLUDED: {excluded.reason}")
+
+        # Compute adaptive threshold
+        effective_threshold = self._compute_adaptive_threshold(
+            valid_evidence, ml_unavailable
+        )
+
+        # Compute posteriors with valid evidence only
+        posterior_authentic, posterior_spoof = self._compute_posteriors(valid_evidence)
+
+        # Determine dominant factor from valid evidence
+        dominant_factor = self._find_dominant_factor(valid_evidence)
+
+        # Make decision with adaptive threshold
+        decision = self._make_decision_adaptive(
+            posterior_authentic, posterior_spoof, valid_evidence, effective_threshold
+        )
 
         # Compute uncertainty (Shannon entropy)
         uncertainty = self._compute_uncertainty(posterior_authentic, posterior_spoof)
@@ -235,12 +281,18 @@ class BayesianConfidenceFusion:
         # Overall confidence in the decision
         confidence = max(posterior_authentic, posterior_spoof)
 
-        # Add reasoning for decision
+        # Add decision reasoning
         if decision == DecisionType.AUTHENTICATE:
-            reasoning.append(
-                f"Decision: AUTHENTICATE (posterior={posterior_authentic:.1%}, "
-                f"threshold={self.config.AUTHENTICATE_THRESHOLD:.1%})"
-            )
+            if degradation_mode:
+                reasoning.append(
+                    f"Decision: AUTHENTICATE in degradation mode "
+                    f"(posterior={posterior_authentic:.1%}, adjusted_threshold={effective_threshold:.1%})"
+                )
+            else:
+                reasoning.append(
+                    f"Decision: AUTHENTICATE (posterior={posterior_authentic:.1%}, "
+                    f"threshold={effective_threshold:.1%})"
+                )
         elif decision == DecisionType.REJECT:
             reasoning.append(
                 f"Decision: REJECT (posterior={posterior_authentic:.1%}, "
@@ -249,40 +301,161 @@ class BayesianConfidenceFusion:
         elif decision == DecisionType.CHALLENGE:
             reasoning.append(
                 f"Decision: CHALLENGE (posterior={posterior_authentic:.1%} in range "
-                f"{self.config.CHALLENGE_RANGE[0]:.1%}-{self.config.CHALLENGE_RANGE[1]:.1%})"
+                f"{self.config.REJECT_THRESHOLD:.1%}-{effective_threshold:.1%})"
             )
         else:
-            reasoning.append(f"Decision: ESCALATE (unusual pattern detected)")
+            reasoning.append(f"Decision: ESCALATE (unusual pattern or insufficient sources)")
 
         result = FusionResult(
             posterior_authentic=posterior_authentic,
             posterior_spoof=posterior_spoof,
             decision=decision,
             confidence=confidence,
-            evidence_scores=evidence_scores,
+            evidence_scores=valid_evidence,
+            excluded_evidence=excluded_evidence,
             reasoning=reasoning,
             dominant_factor=dominant_factor,
             uncertainty=uncertainty,
+            effective_threshold=effective_threshold,
+            degradation_mode=degradation_mode,
+            available_sources=len(valid_evidence),
             details={
                 "prior_authentic": self._prior_authentic,
                 "prior_spoof": self._prior_spoof,
                 "fusion_id": self._fusion_count,
-                "weights": {
+                "original_weights": {
                     "ml": self.ml_weight,
                     "physics": self.physics_weight,
                     "behavioral": self.behavioral_weight,
                     "context": self.context_weight
-                }
+                },
+                "effective_weights": {e.source: e.weight for e in valid_evidence},
+                "ml_unavailable": ml_unavailable,
+                "adaptive_exclusion_enabled": self.config.ADAPTIVE_EXCLUSION_ENABLED
             }
         )
 
-        logger.debug(
+        logger.info(
             f"Bayesian fusion #{self._fusion_count}: "
             f"P(auth)={posterior_authentic:.3f}, decision={decision.value}, "
-            f"dominant={dominant_factor}"
+            f"dominant={dominant_factor}, sources={len(valid_evidence)}/{len(raw_evidence)}, "
+            f"degradation={degradation_mode}"
         )
 
         return result
+
+    def _filter_and_renormalize(
+        self, evidence_scores: List[EvidenceScore]
+    ) -> Tuple[List[EvidenceScore], List[ExcludedEvidence]]:
+        """
+        Filter out unavailable evidence and renormalize weights.
+
+        Evidence with confidence <= MIN_VALID_CONFIDENCE is considered unavailable.
+        Weights are redistributed proportionally or equally based on config.
+
+        Returns:
+            Tuple of (valid_evidence, excluded_evidence)
+        """
+        if not self.config.ADAPTIVE_EXCLUSION_ENABLED:
+            # No filtering - use all evidence as-is
+            return evidence_scores, []
+
+        valid = []
+        excluded = []
+        min_conf = self.config.MIN_VALID_CONFIDENCE
+
+        for evidence in evidence_scores:
+            if evidence.confidence is None or evidence.confidence <= min_conf:
+                reason = "unavailable" if evidence.confidence is None else f"below threshold ({evidence.confidence:.3f} <= {min_conf})"
+                excluded.append(ExcludedEvidence(
+                    source=evidence.source,
+                    original_confidence=evidence.confidence or 0.0,
+                    original_weight=evidence.weight,
+                    reason=reason
+                ))
+            else:
+                valid.append(evidence)
+
+        # Renormalize weights if we have valid evidence
+        if valid and excluded:
+            total_valid_weight = sum(e.weight for e in valid)
+
+            if self.config.WEIGHT_REDISTRIBUTION == "proportional" and total_valid_weight > 0:
+                # Proportional: scale up weights to sum to 1.0
+                scale_factor = 1.0 / total_valid_weight
+                for e in valid:
+                    e.weight = e.weight * scale_factor
+            else:
+                # Equal: distribute weight equally among valid sources
+                equal_weight = 1.0 / len(valid)
+                for e in valid:
+                    e.weight = equal_weight
+
+            logger.debug(
+                f"Weight renormalization: excluded={[e.source for e in excluded]}, "
+                f"new_weights={{e.source: e.weight for e in valid}}"
+            )
+
+        return valid, excluded
+
+    def _compute_adaptive_threshold(
+        self, valid_evidence: List[EvidenceScore], ml_unavailable: bool
+    ) -> float:
+        """
+        Compute adaptive authentication threshold based on available evidence.
+
+        When ML is unavailable, we lower the threshold since we have less information.
+        When fewer sources are available, we also adjust accordingly.
+
+        Returns:
+            Adjusted threshold for authentication
+        """
+        base_threshold = self.config.AUTHENTICATE_THRESHOLD
+
+        # Reduce threshold when ML is unavailable
+        if ml_unavailable:
+            base_threshold -= self.config.ML_UNAVAILABLE_THRESHOLD_REDUCTION
+
+        # Further adjust based on number of sources
+        source_count = len(valid_evidence)
+        if source_count == 1:
+            # Single source: be more lenient but still require high confidence
+            base_threshold = max(0.70, base_threshold - 0.05)
+        elif source_count == 2:
+            # Two sources: slight reduction
+            base_threshold = max(0.72, base_threshold - 0.03)
+
+        # Clamp to valid range
+        return max(0.50, min(0.95, base_threshold))
+
+    def _make_decision_adaptive(
+        self,
+        posterior_authentic: float,
+        posterior_spoof: float,
+        evidence_scores: List[EvidenceScore],
+        effective_threshold: float
+    ) -> DecisionType:
+        """Make authentication decision with adaptive threshold and source count check."""
+
+        # Check minimum sources requirement
+        if len(evidence_scores) < self.config.MIN_SOURCES_FOR_AUTH:
+            logger.warning(
+                f"Insufficient evidence sources: {len(evidence_scores)} < "
+                f"{self.config.MIN_SOURCES_FOR_AUTH} required"
+            )
+            return DecisionType.ESCALATE
+
+        # Check for unusual patterns that warrant escalation
+        if self._detect_anomaly(evidence_scores):
+            return DecisionType.ESCALATE
+
+        # Standard threshold-based decision with adaptive threshold
+        if posterior_authentic >= effective_threshold:
+            return DecisionType.AUTHENTICATE
+        elif posterior_authentic < self.config.REJECT_THRESHOLD:
+            return DecisionType.REJECT
+        else:
+            return DecisionType.CHALLENGE
 
     def _compute_posteriors(
         self,
@@ -474,8 +647,9 @@ class BayesianConfidenceFusion:
             )
 
     def get_statistics(self) -> Dict[str, Any]:
-        """Get fusion engine statistics."""
+        """Get fusion engine statistics including adaptive configuration."""
         return {
+            "version": "2.6",
             "fusion_count": self._fusion_count,
             "total_authentic": self._total_authentic,
             "total_spoof": self._total_spoof,
@@ -491,6 +665,13 @@ class BayesianConfidenceFusion:
                 "authenticate": self.config.AUTHENTICATE_THRESHOLD,
                 "reject": self.config.REJECT_THRESHOLD,
                 "challenge_range": self.config.CHALLENGE_RANGE
+            },
+            "adaptive_config": {
+                "exclusion_enabled": self.config.ADAPTIVE_EXCLUSION_ENABLED,
+                "min_valid_confidence": self.config.MIN_VALID_CONFIDENCE,
+                "ml_unavailable_threshold_reduction": self.config.ML_UNAVAILABLE_THRESHOLD_REDUCTION,
+                "min_sources_for_auth": self.config.MIN_SOURCES_FOR_AUTH,
+                "weight_redistribution": self.config.WEIGHT_REDISTRIBUTION
             },
             "learning_enabled": self.config.LEARNING_ENABLED
         }

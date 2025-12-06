@@ -1038,6 +1038,89 @@ class IntelligentVoiceUnlockService:
             "3) Verify SpeechBrain is installed correctly."
         )
 
+    async def _try_on_demand_ecapa_load(self) -> bool:
+        """
+        Attempt to load ECAPA encoder on-demand if not available at init.
+
+        This implements graceful degradation - instead of hard failing at
+        startup, we try to load ECAPA when actually needed for voice unlock.
+
+        Returns:
+            True if ECAPA became available, False otherwise.
+        """
+        logger.info("🔄 Attempting on-demand ECAPA load...")
+
+        # Try 1: ML Engine Registry (async loading)
+        try:
+            from voice_unlock.ml_engine_registry import get_ml_registry, ensure_ecapa_available
+
+            # Try module-level function first (most robust)
+            success = await ensure_ecapa_available()
+            if success:
+                self._ecapa_available = True
+                self._degraded_mode = False
+                logger.info("✅ On-demand ECAPA load SUCCESS via ensure_ecapa_available()")
+                return True
+
+            # Fallback to registry
+            registry = await get_ml_registry()
+            if registry:
+                registry_status = registry.get_ecapa_status()
+                if registry_status.get("available"):
+                    self._ecapa_available = True
+                    self._degraded_mode = False
+                    logger.info(f"✅ On-demand ECAPA load SUCCESS via ML Registry: {registry_status.get('source')}")
+                    return True
+
+        except Exception as e:
+            logger.debug(f"On-demand ECAPA load via ML Registry failed: {e}")
+
+        # Try 2: Unified Voice Cache
+        if self.unified_cache:
+            try:
+                cache_status = self.unified_cache.get_encoder_status()
+                if cache_status.get("available"):
+                    self._ecapa_available = True
+                    self._degraded_mode = False
+                    logger.info(f"✅ On-demand ECAPA load SUCCESS via Unified Cache: {cache_status.get('source')}")
+                    return True
+            except Exception as e:
+                logger.debug(f"On-demand ECAPA load via Unified Cache failed: {e}")
+
+        # Try 3: Direct SpeechBrain load (last resort, slow but reliable)
+        try:
+            from voice_unlock.ml_engine_registry import get_ml_registry_sync
+
+            registry = get_ml_registry_sync(auto_create=True)
+            if registry:
+                # Force local load attempt
+                import asyncio
+                loop = asyncio.get_event_loop()
+
+                # Try to load ECAPA with 10s timeout
+                try:
+                    async def load_with_timeout():
+                        # Trigger local ECAPA loading
+                        from voice_unlock.ml_engine_registry import _load_ecapa_local
+                        return await asyncio.to_thread(_load_ecapa_local)
+
+                    result = await asyncio.wait_for(load_with_timeout(), timeout=10.0)
+                    if result:
+                        self._ecapa_available = True
+                        self._degraded_mode = False
+                        logger.info("✅ On-demand ECAPA load SUCCESS via direct SpeechBrain load")
+                        return True
+                except asyncio.TimeoutError:
+                    logger.warning("⚠️ On-demand ECAPA load timed out after 10s")
+                except Exception as e:
+                    logger.debug(f"Direct SpeechBrain load failed: {e}")
+
+        except Exception as e:
+            logger.debug(f"On-demand ECAPA load via direct SpeechBrain failed: {e}")
+
+        logger.warning("❌ On-demand ECAPA load FAILED - continuing in degraded mode")
+        return False
+
     async def process_voice_unlock_command(
         self, audio_data, context: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
@@ -1536,17 +1619,25 @@ class IntelligentVoiceUnlockService:
             speaker_confidence = 0.0
             logger.warning("⚠️ No speaker identification from parallel or STT")
 
+        # Handle None confidence gracefully (ML unavailable = degraded mode)
+        confidence_display = speaker_confidence if speaker_confidence is not None else 0.0
         stage_speaker_id.complete(
             success=speaker_identified is not None,
             algorithm_used="SpeechBrain speaker recognition (parallel)",
-            confidence_score=speaker_confidence if speaker_identified else 0,
-            metadata={'speaker_name': speaker_identified, 'from_parallel': True}
+            confidence_score=confidence_display if speaker_identified else 0,
+            metadata={'speaker_name': speaker_identified, 'from_parallel': True, 'ml_unavailable': speaker_confidence is None}
         )
         stages.append(stage_speaker_id)
 
-        logger.info(
-            f"🔐 Speaker identified: {speaker_identified} (confidence: {speaker_confidence:.2f})"
-        )
+        if speaker_confidence is None:
+            logger.warning(
+                f"⚠️ Speaker identification running in DEGRADED MODE (ML unavailable) - "
+                f"using physics/behavioral/context only"
+            )
+        else:
+            logger.info(
+                f"🔐 Speaker identified: {speaker_identified} (confidence: {speaker_confidence:.2f})"
+            )
 
         # Stage 5: Owner Verification
         stage_owner_check = metrics_logger.create_stage(
@@ -2282,26 +2373,34 @@ class IntelligentVoiceUnlockService:
         logger.info(f"✅ VAD preprocessed audio: {len(audio_data)} → {len(wav_bytes)} bytes")
         return wav_bytes
 
-    async def _identify_speaker(self, audio_data: bytes) -> Tuple[Optional[str], float]:
+    async def _identify_speaker(self, audio_data: bytes) -> Tuple[Optional[str], Optional[float]]:
         """
         Identify speaker from audio with VAD preprocessing for speed.
 
-        ENHANCED v2.0: Pre-flight ECAPA check with specific error messages.
+        ENHANCED v2.1: Graceful degradation with on-demand ECAPA loading.
+        Instead of hard failure, tries to load ECAPA on-demand and returns
+        None confidence (not 0.0) to enable proper Bayesian fusion handling.
         """
         # Pre-flight check: Verify speaker engine is available
         if not self.speaker_engine:
             logger.error("❌ Speaker identification failed: speaker_engine not initialized")
-            return None, 0.0
+            # Return None, None to indicate ML is unavailable (not failed with 0.0)
+            return None, None
 
-        # Pre-flight check: Verify ECAPA is available (prevents 0% confidence bug)
+        # Graceful degradation: Try on-demand ECAPA loading if not available
         if hasattr(self, '_ecapa_available') and not self._ecapa_available:
-            logger.error("=" * 60)
-            logger.error("❌ SPEAKER IDENTIFICATION BLOCKED: ECAPA encoder unavailable!")
-            logger.error("=" * 60)
-            logger.error("   This is why voice verification returns 0% confidence.")
-            logger.error(f"   Recommendation: {self._get_ecapa_fix_recommendation()}")
-            logger.error("=" * 60)
-            return None, 0.0
+            logger.warning("⚠️ ECAPA not available at init - attempting on-demand load...")
+            await self._try_on_demand_ecapa_load()
+
+        # Check again after on-demand load attempt
+        if hasattr(self, '_ecapa_available') and not self._ecapa_available:
+            logger.warning("=" * 60)
+            logger.warning("⚠️ SPEAKER IDENTIFICATION: ECAPA encoder still unavailable")
+            logger.warning("   Operating in DEGRADED MODE (physics/behavioral only)")
+            logger.warning(f"   Recommendation: {self._get_ecapa_fix_recommendation()}")
+            logger.warning("=" * 60)
+            # Return None, None - Bayesian fusion will exclude ML and renormalize weights
+            return None, None
 
         try:
             # Apply VAD filtering to speed up speaker verification (unlock mode = 2s max)
