@@ -1215,6 +1215,13 @@ Potential failure points:
 4. **Circular Import**: Module import order issues
 5. **Missing Dependency**: Required service not started
 
+**Detailed Flow Diagram & Troubleshooting:**
+For comprehensive debugging of the 0.0% confidence error, see [docs/VOICE_UNLOCK_FLOW_DIAGRAM.md](docs/VOICE_UNLOCK_FLOW_DIAGRAM.md) which includes:
+- Complete 9-step authentication flow diagram
+- 16 identified failure points with root cause analysis
+- Diagnostic commands to test each component
+- Common failure scenarios and fixes
+
 ### Current Workaround
 
 The voice unlock component is not initializing, but the rest of JARVIS works:
@@ -11901,6 +11908,12 @@ See [postman/README.md](postman/README.md) for complete documentation.
   - Best practices
 
 **Voice Biometric Authentication:**
+- [docs/VOICE_UNLOCK_FLOW_DIAGRAM.md](docs/VOICE_UNLOCK_FLOW_DIAGRAM.md) - Voice unlock authentication flow diagram
+  - Complete 9-step flow diagram from "unlock my screen" to screen unlock
+  - 16 identified failure points with root cause analysis
+  - Diagnostic commands and troubleshooting checklist
+  - File cross-reference table for debugging
+  - Common failure scenarios and fixes
 - [docs/Voice-Biometric-Authentication-Debugging-Guide.md](docs/Voice-Biometric-Authentication-Debugging-Guide.md) - Comprehensive voice authentication guide
   - Complete debugging journey and solutions
   - Architecture overview and technology stack
