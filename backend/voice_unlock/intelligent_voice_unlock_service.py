@@ -1040,86 +1040,178 @@ class IntelligentVoiceUnlockService:
 
     async def _try_on_demand_ecapa_load(self) -> bool:
         """
-        Attempt to load ECAPA encoder on-demand if not available at init.
+        Attempt to load ECAPA encoder on-demand with HYBRID CLOUD INTEGRATION.
 
-        This implements graceful degradation - instead of hard failing at
-        startup, we try to load ECAPA when actually needed for voice unlock.
+        This implements graceful degradation with intelligent routing:
+        1. Check memory pressure first
+        2. If memory is low → use cloud ECAPA (offloads ~2GB RAM)
+        3. If memory is sufficient → try local ECAPA
+        4. Fallback chain: cloud → local → degraded mode
 
         Returns:
-            True if ECAPA became available, False otherwise.
+            True if ECAPA became available (via cloud or local), False otherwise.
         """
-        logger.info("🔄 Attempting on-demand ECAPA load...")
+        logger.info("🔄 Attempting on-demand ECAPA load with hybrid cloud routing...")
 
-        # Try 1: ML Engine Registry (async loading)
+        # =======================================================================
+        # STEP 1: Check memory pressure to decide routing strategy
+        # =======================================================================
         try:
-            from voice_unlock.ml_engine_registry import get_ml_registry, ensure_ecapa_available
+            from voice_unlock.ml_engine_registry import MLConfig
 
-            # Try module-level function first (most robust)
-            success = await ensure_ecapa_available()
+            use_cloud, available_ram, reason = MLConfig.check_memory_pressure()
+            logger.info(f"   Memory check: {reason}")
+
+            if use_cloud or available_ram < 6.0:
+                logger.info(f"   🌐 CLOUD-FIRST MODE: RAM={available_ram:.1f}GB - routing to GCP")
+                cloud_success = await self._try_cloud_ecapa()
+                if cloud_success:
+                    return True
+                logger.warning("   Cloud ECAPA unavailable, trying local as fallback...")
+            else:
+                logger.info(f"   💻 LOCAL-FIRST MODE: RAM={available_ram:.1f}GB - sufficient for local")
+
+        except Exception as e:
+            logger.warning(f"   Memory check failed: {e} - defaulting to cloud-first")
+            cloud_success = await self._try_cloud_ecapa()
+            if cloud_success:
+                return True
+
+        # =======================================================================
+        # STEP 2: Try ML Engine Registry (handles both cloud and local)
+        # =======================================================================
+        try:
+            from voice_unlock.ml_engine_registry import ensure_ecapa_available
+
+            # ensure_ecapa_available has built-in hybrid cloud support
+            result = await ensure_ecapa_available(timeout=30.0, allow_cloud=True)
+            if isinstance(result, tuple):
+                success, message, _ = result
+            else:
+                success = result
+
             if success:
                 self._ecapa_available = True
                 self._degraded_mode = False
-                logger.info("✅ On-demand ECAPA load SUCCESS via ensure_ecapa_available()")
+                logger.info(f"✅ On-demand ECAPA SUCCESS via ensure_ecapa_available()")
                 return True
 
-            # Fallback to registry
-            registry = await get_ml_registry()
-            if registry:
-                registry_status = registry.get_ecapa_status()
-                if registry_status.get("available"):
-                    self._ecapa_available = True
-                    self._degraded_mode = False
-                    logger.info(f"✅ On-demand ECAPA load SUCCESS via ML Registry: {registry_status.get('source')}")
-                    return True
-
         except Exception as e:
-            logger.debug(f"On-demand ECAPA load via ML Registry failed: {e}")
+            logger.warning(f"   ensure_ecapa_available failed: {e}")
 
-        # Try 2: Unified Voice Cache
+        # =======================================================================
+        # STEP 3: Try Unified Voice Cache (may have cloud connection)
+        # =======================================================================
         if self.unified_cache:
             try:
                 cache_status = self.unified_cache.get_encoder_status()
                 if cache_status.get("available"):
                     self._ecapa_available = True
                     self._degraded_mode = False
-                    logger.info(f"✅ On-demand ECAPA load SUCCESS via Unified Cache: {cache_status.get('source')}")
+                    source = cache_status.get('source', 'unknown')
+                    logger.info(f"✅ On-demand ECAPA SUCCESS via Unified Cache: {source}")
                     return True
             except Exception as e:
-                logger.debug(f"On-demand ECAPA load via Unified Cache failed: {e}")
+                logger.debug(f"   Unified Cache check failed: {e}")
 
-        # Try 3: Direct SpeechBrain load (last resort, slow but reliable)
-        try:
-            from voice_unlock.ml_engine_registry import get_ml_registry_sync
-
-            registry = get_ml_registry_sync(auto_create=True)
-            if registry:
-                # Force local load attempt
-                import asyncio
-                loop = asyncio.get_event_loop()
-
-                # Try to load ECAPA with 10s timeout
-                try:
-                    async def load_with_timeout():
-                        # Trigger local ECAPA loading
-                        from voice_unlock.ml_engine_registry import _load_ecapa_local
-                        return await asyncio.to_thread(_load_ecapa_local)
-
-                    result = await asyncio.wait_for(load_with_timeout(), timeout=10.0)
-                    if result:
-                        self._ecapa_available = True
-                        self._degraded_mode = False
-                        logger.info("✅ On-demand ECAPA load SUCCESS via direct SpeechBrain load")
-                        return True
-                except asyncio.TimeoutError:
-                    logger.warning("⚠️ On-demand ECAPA load timed out after 10s")
-                except Exception as e:
-                    logger.debug(f"Direct SpeechBrain load failed: {e}")
-
-        except Exception as e:
-            logger.debug(f"On-demand ECAPA load via direct SpeechBrain failed: {e}")
+        # =======================================================================
+        # STEP 4: Final cloud attempt if not already tried
+        # =======================================================================
+        logger.info("   Attempting final cloud fallback...")
+        if await self._try_cloud_ecapa():
+            return True
 
         logger.warning("❌ On-demand ECAPA load FAILED - continuing in degraded mode")
+        logger.warning("   Voice unlock will use physics/behavioral/context only")
         return False
+
+    async def _try_cloud_ecapa(self) -> bool:
+        """
+        Attempt to verify cloud ECAPA is available using the robust cloud client.
+
+        This offloads ECAPA processing to GCP, avoiding local memory pressure.
+        Uses CloudECAPAClient with circuit breaker, retries, and caching.
+
+        Priority order:
+        1. CloudECAPAClient (new robust client with full features)
+        2. ML Engine Registry verify_cloud_ecapa (legacy)
+
+        Returns:
+            True if cloud ECAPA is available and verified
+        """
+        # =====================================================================
+        # Method 1: Try the new robust CloudECAPAClient first
+        # =====================================================================
+        try:
+            from voice_unlock.cloud_ecapa_client import get_cloud_ecapa_client
+
+            logger.info("   🌐 Trying CloudECAPAClient (robust client)...")
+
+            client = await get_cloud_ecapa_client()
+            status = client.get_status()
+
+            if status.get("ready"):
+                # Client is ready - test with a small audio sample
+                import numpy as np
+                test_audio = np.zeros(1600, dtype=np.float32)  # 100ms silence
+
+                embedding = await client.extract_embedding(
+                    test_audio.tobytes(),
+                    sample_rate=16000,
+                    format="float32"
+                )
+
+                if embedding is not None and len(embedding) == 192:
+                    self._ecapa_available = True
+                    self._ecapa_source = "cloud"
+                    self._cloud_client = client  # Store reference for later use
+                    self._degraded_mode = False
+                    endpoint = status.get("healthy_endpoint", "unknown")
+                    logger.info(f"✅ Cloud ECAPA verified via CloudECAPAClient: {endpoint}")
+                    return True
+                else:
+                    logger.warning(f"   CloudECAPAClient extraction returned invalid embedding")
+            else:
+                logger.debug(f"   CloudECAPAClient not ready: {status}")
+
+        except ImportError:
+            logger.debug("   CloudECAPAClient not available (import failed)")
+        except Exception as e:
+            logger.debug(f"   CloudECAPAClient failed: {e}")
+
+        # =====================================================================
+        # Method 2: Fallback to ML Engine Registry (legacy method)
+        # =====================================================================
+        try:
+            from voice_unlock.ml_engine_registry import get_ml_registry
+
+            logger.info("   🔄 Trying ML Engine Registry (legacy cloud verification)...")
+
+            registry = await get_ml_registry()
+            if registry is None:
+                return False
+
+            # Check if cloud is configured
+            cloud_endpoint = os.getenv("JARVIS_CLOUD_ML_ENDPOINT")
+            if not cloud_endpoint:
+                logger.debug("   Cloud ECAPA not configured (JARVIS_CLOUD_ML_ENDPOINT not set)")
+                return False
+
+            # Verify cloud ECAPA with extraction test
+            cloud_verified, reason = await registry._verify_cloud_backend_ready(test_extraction=True)
+            if cloud_verified:
+                self._ecapa_available = True
+                self._ecapa_source = "cloud"
+                self._degraded_mode = False
+                logger.info(f"✅ Cloud ECAPA verified via ML Registry: {cloud_endpoint}")
+                return True
+
+            logger.debug("   ML Registry cloud verification failed")
+            return False
+
+        except Exception as e:
+            logger.debug(f"   ML Registry cloud attempt failed: {e}")
+            return False
 
     async def process_voice_unlock_command(
         self, audio_data, context: Optional[Dict[str, Any]] = None
