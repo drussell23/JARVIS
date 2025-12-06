@@ -8,13 +8,18 @@ uvicorn[standard]>=0.24.0
 pydantic>=2.0.0
 
 # ML/Audio processing
-torch>=2.0.0
-torchaudio>=2.0.0
-speechbrain>=1.0.0
-numpy>=1.24.0
+# Pinned versions for compatibility:
+# - torchaudio 2.2+ removed list_audio_backends() that speechbrain uses
+# - huggingface_hub 0.22+ removed use_auth_token that speechbrain 1.0.0 uses
+torch==2.1.2
+torchaudio==2.1.2
+speechbrain==1.0.0
+huggingface_hub>=0.20.0,<0.22.0
+numpy>=1.24.0,<2.0.0
 
-# HTTP client (for health checks)
+# HTTP client (for health checks and speechbrain model fetching)
 aiohttp>=3.9.0
+requests>=2.31.0
 
 # Monitoring (optional)
 prometheus-client>=0.19.0

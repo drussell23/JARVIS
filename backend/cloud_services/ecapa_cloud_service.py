@@ -51,6 +51,16 @@ import traceback
 
 import numpy as np
 
+# Pre-import heavy ML libraries at module load time to avoid thread pool issues
+# This happens once when the container starts, before any requests
+print(">>> Pre-importing torch at module level...", flush=True)
+import torch
+print(f">>> torch {torch.__version__} imported successfully", flush=True)
+
+print(">>> Pre-importing speechbrain at module level...", flush=True)
+from speechbrain.inference.speaker import EncoderClassifier
+print(">>> speechbrain imported successfully", flush=True)
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -333,15 +343,20 @@ class ECAPAModelManager:
 
     async def _load_model(self):
         """Load the ECAPA-TDNN model (runs in thread pool)."""
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, self._load_model_sync)
+        logger.info("Starting model load in thread pool...")
+        try:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, self._load_model_sync)
+            logger.info("Thread pool model load completed")
+        except Exception as e:
+            logger.error(f"Thread pool model load failed: {e}")
+            raise
 
     def _load_model_sync(self):
-        """Synchronous model loading."""
-        import torch
-        from speechbrain.inference.speaker import EncoderClassifier
+        """Synchronous model loading. torch/speechbrain already imported at module level."""
+        logger.info("_load_model_sync: Function entered")
 
-        # Set device
+        # Set device (torch already imported at module level)
         if self.device == "mps" and torch.backends.mps.is_available():
             device = "mps"
         elif self.device == "cuda" and torch.cuda.is_available():
@@ -349,7 +364,7 @@ class ECAPAModelManager:
         else:
             device = "cpu"
 
-        logger.info(f"Loading ECAPA-TDNN on {device}...")
+        logger.info(f"Loading ECAPA-TDNN model on {device}...")
 
         self.model = EncoderClassifier.from_hparams(
             source=self.model_path,
@@ -596,8 +611,18 @@ if FASTAPI_AVAILABLE:
         logger.info("Starting ECAPA Cloud Service...")
         manager = get_model_manager()
 
-        # Start initialization in background
-        asyncio.create_task(manager.initialize())
+        # Start initialization in background with exception handling
+        async def init_with_logging():
+            try:
+                logger.info("Background initialization task starting...")
+                result = await manager.initialize()
+                logger.info(f"Background initialization completed: {result}")
+            except Exception as e:
+                logger.error(f"Background initialization failed: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+
+        asyncio.create_task(init_with_logging())
 
     @app.get("/health")
     async def health_check():

@@ -82,8 +82,9 @@ WORKDIR /app
 COPY ecapa_cloud_service.py .
 COPY __init__.py .
 
-# Set ownership
-RUN chown -R ecapa:ecapa /app /opt/ecapa_cache
+# Set ownership and permissions for cache files
+RUN chown -R ecapa:ecapa /app /opt/ecapa_cache && \
+    chmod -R 755 /opt/ecapa_cache
 
 # Switch to non-root user
 USER ecapa
