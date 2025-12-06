@@ -5514,6 +5514,10 @@ class JARVISLearningDatabase:
         INCLUDES: All acoustic features for BEAST MODE verification.
         """
         try:
+            # Guard against uninitialized database
+            if not self.db:
+                logger.warning("Database not initialized yet - returning empty profiles")
+                return []
             async with self.db.cursor() as cursor:
                 await cursor.execute(
                     """

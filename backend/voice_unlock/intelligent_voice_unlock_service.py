@@ -784,7 +784,7 @@ class IntelligentVoiceUnlockService:
         try:
             from voice_unlock.continuous_learning_engine import get_learning_engine
 
-            self.ml_engine = get_learning_engine()
+            self.ml_engine = await get_learning_engine()
             await self.ml_engine.initialize()
             logger.info("✅ 🤖 ML Continuous Learning Engine connected")
         except Exception as e:
