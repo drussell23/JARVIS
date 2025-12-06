@@ -4443,6 +4443,212 @@ class SpeakerVerificationService:
                 except Exception:
                     pass
 
+    # ============================================================================
+    # ROBUST AUDIO FORMAT CONVERSION v3.0
+    # ============================================================================
+    # This method handles the critical task of converting browser audio (WebM/Opus)
+    # to raw PCM suitable for ECAPA-TDNN speaker verification.
+    # Uses ALL 4 converter functions for maximum robustness:
+    # - AudioConverterConfig: Dynamic configuration from environment
+    # - prepare_audio_for_stt_async: Native async conversion (primary)
+    # - prepare_audio_with_analysis: Detailed quality metrics
+    # - prepare_audio_for_stt: Sync fallback for thread pool execution
+    # ============================================================================
+
+    async def _convert_audio_for_verification(
+        self,
+        audio_data: bytes,
+        use_analysis: bool = True,
+        max_retries: int = 2,
+    ) -> bytes:
+        """
+        Convert audio from any browser format to PCM for speaker verification.
+
+        This is a multi-strategy, async-first conversion pipeline with:
+        - Dynamic configuration via AudioConverterConfig
+        - Primary async path with prepare_audio_for_stt_async
+        - Quality analysis via prepare_audio_with_analysis
+        - Sync fallback via prepare_audio_for_stt in thread pool
+        - Graceful degradation and retry logic
+
+        Args:
+            audio_data: Raw audio bytes (potentially WebM/Opus/MP3/etc.)
+            use_analysis: Whether to perform quality analysis (slower but logs more)
+            max_retries: Number of retry attempts on failure
+
+        Returns:
+            PCM audio bytes (16kHz, mono, 16-bit) ready for ECAPA-TDNN
+        """
+        import time as time_module
+        convert_start = time_module.perf_counter()
+
+        # Handle edge cases
+        if audio_data is None or len(audio_data) == 0:
+            logger.warning("⚠️ Audio conversion: Empty or None audio data received")
+            return b''
+
+        original_size = len(audio_data)
+        logger.info(f"🔄 Starting audio conversion: {original_size} bytes input")
+
+        # Create dynamic config from environment
+        config = AudioConverterConfig.from_env()
+        logger.debug(f"   Config: {config.target_sample_rate}Hz, {config.target_channels}ch, {config.target_bit_depth}bit")
+
+        pcm_audio: bytes = b''
+        conversion_method = "unknown"
+        analysis_info = {}
+
+        # ========================================================================
+        # STRATEGY 1: Async conversion with quality analysis (preferred)
+        # Uses prepare_audio_with_analysis for detailed quality metrics
+        # ========================================================================
+        if use_analysis:
+            for attempt in range(max_retries + 1):
+                try:
+                    # Run sync analysis in thread pool to avoid blocking
+                    loop = asyncio.get_event_loop()
+                    result = await loop.run_in_executor(
+                        None,  # Use default executor
+                        prepare_audio_with_analysis,
+                        audio_data
+                    )
+
+                    if isinstance(result, tuple) and len(result) == 2:
+                        pcm_audio, audio_analysis = result
+
+                        # Log quality metrics
+                        if hasattr(audio_analysis, 'duration_ms'):
+                            analysis_info = {
+                                'duration_ms': audio_analysis.duration_ms,
+                                'sample_rate': audio_analysis.sample_rate,
+                                'peak_db': audio_analysis.peak_db,
+                                'rms_db': audio_analysis.rms_db,
+                                'estimated_snr_db': audio_analysis.estimated_snr_db,
+                                'silence_ratio': audio_analysis.silence_ratio,
+                                'is_valid': audio_analysis.is_valid,
+                                'issues': audio_analysis.issues if hasattr(audio_analysis, 'issues') else [],
+                            }
+
+                            logger.info(
+                                f"   📊 Audio Analysis: {audio_analysis.duration_ms:.0f}ms, "
+                                f"SNR={audio_analysis.estimated_snr_db:.1f}dB, "
+                                f"silence={audio_analysis.silence_ratio*100:.1f}%, "
+                                f"valid={audio_analysis.is_valid}"
+                            )
+
+                            # Warn on quality issues
+                            if audio_analysis.issues:
+                                for issue in audio_analysis.issues:
+                                    logger.warning(f"   ⚠️ Audio issue: {issue}")
+
+                        if pcm_audio and len(pcm_audio) > 0:
+                            conversion_method = "analysis_async"
+                            break
+                    else:
+                        logger.warning(f"   ⚠️ Analysis returned unexpected result type")
+
+                except asyncio.TimeoutError:
+                    logger.warning(f"   ⚠️ Analysis timeout (attempt {attempt + 1}/{max_retries + 1})")
+                except Exception as e:
+                    logger.warning(f"   ⚠️ Analysis failed (attempt {attempt + 1}/{max_retries + 1}): {e}")
+
+        # ========================================================================
+        # STRATEGY 2: Native async conversion (fast, no analysis)
+        # Uses prepare_audio_for_stt_async for pure async operation
+        # ========================================================================
+        if not pcm_audio or len(pcm_audio) == 0:
+            logger.info("   🔄 Trying native async conversion...")
+            for attempt in range(max_retries + 1):
+                try:
+                    pcm_audio = await asyncio.wait_for(
+                        prepare_audio_for_stt_async(audio_data),
+                        timeout=float(config.transcoding_timeout_seconds)
+                    )
+
+                    if pcm_audio and len(pcm_audio) > 0:
+                        conversion_method = "native_async"
+                        break
+
+                except asyncio.TimeoutError:
+                    logger.warning(f"   ⚠️ Async conversion timeout (attempt {attempt + 1}/{max_retries + 1})")
+                except Exception as e:
+                    logger.warning(f"   ⚠️ Async conversion failed (attempt {attempt + 1}/{max_retries + 1}): {e}")
+
+        # ========================================================================
+        # STRATEGY 3: Sync fallback in thread pool (most robust)
+        # Uses prepare_audio_for_stt for maximum compatibility
+        # ========================================================================
+        if not pcm_audio or len(pcm_audio) == 0:
+            logger.info("   🔄 Falling back to sync conversion in thread pool...")
+            for attempt in range(max_retries + 1):
+                try:
+                    loop = asyncio.get_event_loop()
+                    pcm_audio = await asyncio.wait_for(
+                        loop.run_in_executor(
+                            None,
+                            prepare_audio_for_stt,
+                            audio_data
+                        ),
+                        timeout=float(config.transcoding_timeout_seconds)
+                    )
+
+                    if pcm_audio and len(pcm_audio) > 0:
+                        conversion_method = "sync_fallback"
+                        break
+
+                except asyncio.TimeoutError:
+                    logger.warning(f"   ⚠️ Sync fallback timeout (attempt {attempt + 1}/{max_retries + 1})")
+                except Exception as e:
+                    logger.warning(f"   ⚠️ Sync fallback failed (attempt {attempt + 1}/{max_retries + 1}): {e}")
+
+        # ========================================================================
+        # FINAL RESULT
+        # ========================================================================
+        convert_end = time_module.perf_counter()
+        convert_time_ms = (convert_end - convert_start) * 1000
+
+        if pcm_audio and len(pcm_audio) > 0:
+            # Calculate conversion ratio for compression detection
+            conversion_ratio = len(pcm_audio) / original_size if original_size > 0 else 0
+
+            logger.info(
+                f"   ✅ Audio converted: {original_size} → {len(pcm_audio)} bytes "
+                f"(ratio={conversion_ratio:.2f}x, method={conversion_method}, "
+                f"time={convert_time_ms:.1f}ms)"
+            )
+
+            # Detect format and log for debugging
+            format_hints = {
+                b'\x1a\x45\xdf\xa3': 'WebM/Matroska',
+                b'OggS': 'Ogg/Opus',
+                b'\xff\xfb': 'MP3',
+                b'\xff\xfa': 'MP3',
+                b'RIFF': 'WAV',
+                b'fLaC': 'FLAC',
+            }
+            detected_format = 'PCM/Unknown'
+            for sig, fmt in format_hints.items():
+                if audio_data[:len(sig)] == sig:
+                    detected_format = fmt
+                    break
+
+            logger.debug(f"   📦 Detected input format: {detected_format}")
+
+            return pcm_audio
+        else:
+            logger.error(
+                f"   ❌ Audio conversion FAILED: All strategies exhausted "
+                f"(original={original_size} bytes, time={convert_time_ms:.1f}ms)"
+            )
+
+            # Return empty bytes as per config (safer than returning compressed data)
+            if config.return_empty_on_failure:
+                return b''
+            else:
+                # Fallback: return original data (may cause issues downstream)
+                logger.warning("   ⚠️ Returning original audio data (may not be PCM!)")
+                return audio_data
+
     async def verify_speaker(self, audio_data: bytes, speaker_name: Optional[str] = None) -> dict:
         """
         Verify speaker from audio with adaptive learning
@@ -4469,66 +4675,36 @@ class SpeakerVerificationService:
             await self.initialize()
 
         # ============================================================================
-        # CRITICAL FIX: Audio Format Conversion (v2.0)
+        # ROBUST AUDIO FORMAT CONVERSION (v3.0) - Uses all converter capabilities
         # ============================================================================
         # Browser sends WebM/Opus compressed audio, but ECAPA-TDNN expects raw PCM.
-        # Without this conversion, compressed bytes are interpreted as garbage samples,
-        # resulting in 0% verification confidence.
+        # This conversion pipeline is:
+        # - Async-first with sync fallback
+        # - Configurable via AudioConverterConfig
+        # - Multi-strategy with graceful degradation
+        # - Quality-aware with SNR analysis
         # ============================================================================
-        original_size = len(audio_data) if audio_data is not None else 0
-        if audio_data is not None and len(audio_data) > 0:
-            try:
-                # Use async conversion for non-blocking operation
-                loop = asyncio.get_event_loop()
-                converted_audio, analysis = await loop.run_in_executor(
-                    get_verification_executor(),
-                    prepare_audio_with_analysis,
-                    audio_data,
-                    16000,  # target_sample_rate
-                )
-
-                if converted_audio is not None and len(converted_audio) > 0:
-                    conversion_ratio = len(converted_audio) / original_size if original_size > 0 else 0
-                    logger.info(
-                        f"🎤 AUDIO CONVERTED: {original_size} → {len(converted_audio)} bytes "
-                        f"(ratio: {conversion_ratio:.2f}x, format: {analysis.detected_format.value if analysis else 'unknown'}, "
-                        f"SNR: {analysis.snr_db:.1f}dB)" if analysis else ""
-                    )
-                    audio_data = converted_audio
-                else:
-                    logger.warning(f"⚠️ Audio conversion returned empty result, using original")
-            except Exception as e:
-                logger.warning(f"⚠️ Audio format conversion failed: {e}, using original audio")
+        audio_data = await self._convert_audio_for_verification(audio_data)
 
         # Debug audio data (reduced logging for speed)
-        # Use proper None check for numpy arrays (avoids "ambiguous truth value" error)
         audio_size = len(audio_data) if audio_data is not None and len(audio_data) > 0 else 0
         logger.info(f"🎤 Verifying speaker from {audio_size} bytes of audio...")
         if audio_data is not None and len(audio_data) > 0:
-            # Check if audio is not silent
+            # Quick energy check to detect silence
             import numpy as np
-            # After conversion, audio should be int16 PCM
             try:
-                # Try int16 first (expected after conversion)
                 audio_array = np.frombuffer(audio_data[:min(2000, len(audio_data))], dtype=np.int16)
-                audio_array = audio_array.astype(np.float32) / 32768.0  # Convert to float32 normalized
-                logger.info(f"🎤 AUDIO DEBUG: Detected int16 PCM format (post-conversion)")
-            except:
-                # Fallback to float32 if that fails
-                audio_array = np.frombuffer(audio_data[:min(1000, len(audio_data))], dtype=np.float32, count=-1)
-                logger.info(f"🎤 AUDIO DEBUG: Using float32 format")
-
-            if len(audio_array) > 0:
-                audio_energy = np.mean(np.abs(audio_array))
-                logger.info(f"🎤 AUDIO DEBUG: Energy level = {audio_energy:.6f}")
-                if audio_energy < 0.0001:
-                    logger.warning("⚠️ AUDIO DEBUG: Audio appears to be silent!")
+                audio_array = audio_array.astype(np.float32) / 32768.0
+                if len(audio_array) > 0:
+                    audio_energy = np.mean(np.abs(audio_array))
+                    if audio_energy < 0.0001:
+                        logger.warning("⚠️ AUDIO DEBUG: Audio appears to be silent!")
+                    else:
+                        logger.debug(f"🎤 Audio energy: {audio_energy:.6f}")
+            except Exception:
+                pass  # Non-critical debug check
         else:
             logger.error("❌ AUDIO DEBUG: No audio data received!")
-
-        # Audio is now converted to int16 PCM format by the audio format converter
-        # The SpeechBrain engine expects int16 PCM or standard audio formats with headers.
-        logger.info(f"🎤 AUDIO DEBUG: Passing {len(audio_data) if audio_data is not None and len(audio_data) > 0 else 0} bytes to engine (converted to int16 PCM)")
 
         # 🚀 UNIFIED CACHE FAST-PATH: Try instant recognition before expensive SpeechBrain verification
         # This provides ~1ms matching vs 200-500ms for full model inference
