@@ -101,6 +101,18 @@ except ImportError:
     GCP_VM_MANAGER_AVAILABLE = False
     logger.debug("GCPVMManager not available")
 
+# CloudECAPAClient v18.2.0 - Hybrid cloud ECAPA backend with Spot VM support
+try:
+    from voice_unlock.cloud_ecapa_client import (
+        CloudECAPAClient,
+        get_cloud_ecapa_client,
+        BackendType as ECAPABackendType,
+    )
+    CLOUD_ECAPA_CLIENT_AVAILABLE = True
+except ImportError:
+    CLOUD_ECAPA_CLIENT_AVAILABLE = False
+    logger.debug("CloudECAPAClient not available")
+
 # MemoryAwareStartup - startup decision
 try:
     from core.memory_aware_startup import (
@@ -244,12 +256,18 @@ class CloudMLRouter:
         # Shutdown callbacks
         self._shutdown_callbacks: List[Callable] = []
 
-        logger.info("CloudMLRouter initialized (v17.9.0 - Scale-to-Zero + Helicone Caching)")
+        # ================================================================
+        # CloudECAPAClient v18.2.0 Integration
+        # ================================================================
+        self._cloud_ecapa_client: Optional[CloudECAPAClient] = None if not CLOUD_ECAPA_CLIENT_AVAILABLE else None
+
+        logger.info("CloudMLRouter initialized (v17.9.1 - CloudECAPAClient v18.2.0 Integration)")
         logger.info(f"  HybridBackendClient: {'✅' if HYBRID_CLIENT_AVAILABLE else '❌'}")
         logger.info(f"  HybridRouter: {'✅' if HYBRID_ROUTER_AVAILABLE else '❌'}")
         logger.info(f"  IntelligentGCPOptimizer: {'✅' if GCP_OPTIMIZER_AVAILABLE else '❌'}")
         logger.info(f"  GCPVMManager: {'✅' if GCP_VM_MANAGER_AVAILABLE else '❌'}")
         logger.info(f"  MemoryAwareStartup: {'✅' if MEMORY_AWARE_AVAILABLE else '❌'}")
+        logger.info(f"  CloudECAPAClient: {'✅' if CLOUD_ECAPA_CLIENT_AVAILABLE else '❌'}")
         logger.info(f"  Scale-to-Zero: {'✅' if self._scale_to_zero_enabled else '❌'} ({self._idle_shutdown_minutes}min idle)")
         logger.info(f"  Semantic Cache: {'✅' if self._cache_enabled else '❌'} (TTL={self._cache_ttl}s)")
 
@@ -609,9 +627,62 @@ class CloudMLRouter:
         )
 
     async def _process_cloud(self, request: MLRequest) -> MLResponse:
-        """Process request on GCP cloud using HybridBackendClient"""
+        """
+        Process request on cloud using CloudECAPAClient v18.2.0 or fallback to legacy GCP.
+
+        CloudECAPAClient v18.2.0 provides:
+        - Multi-backend support: Cloud Run → Spot VM → Local fallback
+        - Intelligent routing based on memory pressure and cost
+        - Per-backend cost tracking with daily budget enforcement
+        """
         start_time = time.time()
 
+        # ================================================================
+        # PRIORITY: Use CloudECAPAClient v18.2.0 for embedding extraction
+        # This provides superior routing with Spot VM support and cost tracking
+        # ================================================================
+        if self._cloud_ecapa_client and request.operation == MLOperation.EMBEDDING_EXTRACTION:
+            try:
+                # Use CloudECAPAClient for ECAPA embedding extraction
+                embedding = await self._cloud_ecapa_client.extract_embedding(
+                    audio_data=request.audio_data,
+                    sample_rate=request.sample_rate,
+                )
+
+                processing_time = (time.time() - start_time) * 1000
+
+                if embedding is not None:
+                    # Get cost from CloudECAPAClient
+                    stats = self._cloud_ecapa_client.get_stats()
+                    cost = stats.get("last_request_cost_usd", 0.0001)
+
+                    # Update average latency
+                    n = self._stats["cloud_requests"] + 1
+                    self._stats["avg_cloud_latency_ms"] = (
+                        (self._stats["avg_cloud_latency_ms"] * (n - 1) + processing_time) / n
+                    )
+
+                    return MLResponse(
+                        success=True,
+                        backend_used=MLBackend.GCP_CLOUD,
+                        operation=request.operation,
+                        result={
+                            "embedding": embedding.tolist() if hasattr(embedding, 'tolist') else list(embedding),
+                            "dimensions": len(embedding) if embedding is not None else 0,
+                            "backend": stats.get("last_backend", "cloud_ecapa"),
+                        },
+                        processing_time_ms=processing_time,
+                        cost_usd=cost,
+                        request_id=request.request_id,
+                    )
+                else:
+                    logger.warning("CloudECAPAClient returned None embedding, falling back to legacy")
+            except Exception as e:
+                logger.warning(f"CloudECAPAClient failed: {e}, falling back to legacy GCP")
+
+        # ================================================================
+        # FALLBACK: Legacy GCP processing (VM-based or direct HTTP)
+        # ================================================================
         # Ensure GCP endpoint is available
         if not self._gcp_ml_endpoint:
             await self._create_gcp_vm_on_demand()
@@ -774,13 +845,14 @@ class CloudMLRouter:
         total_requests = self._stats["total_requests"]
         cache_efficiency = self._stats["cache_hits"] / max(1, total_requests)
 
-        return {
+        base_stats = {
             **self._stats,
             "current_backend": self._current_backend.value,
             "gcp_endpoint": self._gcp_ml_endpoint or "not configured",
             "cache_size": len(self._cache),
             "hybrid_client_available": HYBRID_CLIENT_AVAILABLE,
             "gcp_optimizer_available": GCP_OPTIMIZER_AVAILABLE,
+            "cloud_ecapa_client_available": CLOUD_ECAPA_CLIENT_AVAILABLE,
             "startup_mode": self._startup_decision.mode.value if self._startup_decision else "unknown",
             # Scale-to-zero stats
             "scale_to_zero_enabled": self._scale_to_zero_enabled,
@@ -794,6 +866,31 @@ class CloudMLRouter:
             "total_embeddings_cached": self._total_embeddings_cached,
             "estimated_monthly_savings": round(self._stats["total_cost_saved_usd"] * 30, 4),
         }
+
+        # Include CloudECAPAClient stats if available
+        if self._cloud_ecapa_client:
+            try:
+                ecapa_stats = self._cloud_ecapa_client.get_stats()
+                base_stats["cloud_ecapa_client"] = {
+                    "connected": True,
+                    "version": ecapa_stats.get("version", "18.2.0"),
+                    "backend": ecapa_stats.get("current_backend", "unknown"),
+                    "total_requests": ecapa_stats.get("total_requests", 0),
+                    "cloud_run_requests": ecapa_stats.get("cloud_run_requests", 0),
+                    "spot_vm_requests": ecapa_stats.get("spot_vm_requests", 0),
+                    "local_requests": ecapa_stats.get("local_requests", 0),
+                    "cache_hits": ecapa_stats.get("cache_hits", 0),
+                    "total_cost_usd": ecapa_stats.get("total_cost_usd", 0.0),
+                }
+            except Exception as e:
+                base_stats["cloud_ecapa_client"] = {
+                    "connected": False,
+                    "error": str(e),
+                }
+        else:
+            base_stats["cloud_ecapa_client"] = {"connected": False}
+
+        return base_stats
 
     async def cleanup(self):
         """Cleanup resources including scale-to-zero and active VMs"""

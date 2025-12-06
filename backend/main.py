@@ -1124,6 +1124,63 @@ async def lifespan(app: FastAPI):
         except Exception as router_e:
             logger.warning(f"⚠️  CloudMLRouter initialization failed: {router_e}")
 
+        # ═══════════════════════════════════════════════════════════════════════════
+        # CLOUD ECAPA CLIENT v18.2.0 - Hybrid Cloud ML Backend Integration
+        # ═══════════════════════════════════════════════════════════════════════════
+        # This integrates the advanced CloudECAPAClient with:
+        # - Multi-backend support: Cloud Run → Spot VM → Local fallback
+        # - Intelligent routing based on memory pressure and cost
+        # - Per-backend cost tracking with daily budget enforcement
+        # - Auto-scaling Spot VMs with idle timeout
+        # ═══════════════════════════════════════════════════════════════════════════
+        cloud_ecapa_client = None
+        try:
+            # Check if cloud ECAPA was already initialized by start_system.py
+            cloud_ecapa_pre_initialized = os.getenv("CLOUD_ECAPA_INITIALIZED", "false").lower() == "true"
+
+            if cloud_ecapa_pre_initialized:
+                logger.info("☁️  CloudECAPAClient v18.2.0 - Pre-initialized by start_system.py")
+                logger.info(f"   → Backend: {os.getenv('CLOUD_ECAPA_BACKEND', 'unknown')}")
+            else:
+                # Initialize CloudECAPAClient if not already done
+                logger.info("☁️  Initializing CloudECAPAClient v18.2.0...")
+
+            from voice_unlock.cloud_ecapa_client import get_cloud_ecapa_client, CloudECAPAClient
+
+            cloud_ecapa_client = await get_cloud_ecapa_client()
+
+            if cloud_ecapa_client:
+                # Check if already initialized
+                if not cloud_ecapa_pre_initialized:
+                    init_result = await cloud_ecapa_client.initialize()
+                    if init_result.get("success"):
+                        logger.info(f"✅ CloudECAPAClient ready (backend: {init_result.get('backend', 'unknown')})")
+                    else:
+                        logger.warning(f"⚠️  CloudECAPAClient init issue: {init_result.get('error')}")
+
+                # Store in app state for runtime access
+                app.state.cloud_ecapa_client = cloud_ecapa_client
+
+                # Get current status
+                status = cloud_ecapa_client.get_status()
+                logger.info(f"   → Cloud Run healthy: {status.get('cloud_run_healthy', False)}")
+                logger.info(f"   → Spot VM enabled: {status.get('spot_vm_enabled', False)}")
+                logger.info(f"   → Cache enabled: {status.get('cache_enabled', True)}")
+
+                # If CloudMLRouter exists, connect it to CloudECAPAClient
+                if cloud_ml_router:
+                    cloud_ml_router._cloud_ecapa_client = cloud_ecapa_client
+                    logger.info("   → Linked to CloudMLRouter for unified routing")
+            else:
+                logger.warning("⚠️  CloudECAPAClient not available - using local fallback")
+
+        except ImportError as e:
+            logger.debug(f"CloudECAPAClient import not available: {e}")
+            logger.info("   → Voice unlock will use local ECAPA encoder")
+        except Exception as e:
+            logger.warning(f"⚠️  CloudECAPAClient initialization error: {e}")
+            logger.info("   → Voice unlock will fallback to local processing")
+
     except ImportError:
         logger.debug("Memory-aware startup not available - using defaults")
     except Exception as e:

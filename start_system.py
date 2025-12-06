@@ -13523,6 +13523,79 @@ async def main():
 
     print(f"{Colors.CYAN}{'='*60}{Colors.ENDC}\n")
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # CLOUD ECAPA CLIENT v18.2.0 - Hybrid Cloud ML Backend with Spot VM Support
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Architecture: Cloud Run (primary) → Spot VM (fallback) → Local (emergency)
+    # Cost: Cloud Run ~$0.05/hr, Spot VM ~$0.029/hr (96% cheaper than regular)
+    # Features: Auto-scaling, intelligent backend selection, cost tracking
+    # ═══════════════════════════════════════════════════════════════════════════
+    print(f"\n{Colors.CYAN}{'='*60}{Colors.ENDC}")
+    print(f"{Colors.CYAN}☁️  Cloud ECAPA Backend Initialization (v18.2.0){Colors.ENDC}")
+    print(f"{Colors.CYAN}{'='*60}{Colors.ENDC}")
+
+    cloud_ecapa_client = None
+    cloud_ecapa_status = {"initialized": False, "backend": None, "error": None}
+
+    try:
+        from voice_unlock.cloud_ecapa_client import CloudECAPAClient, get_cloud_ecapa_client
+
+        # Get cloud ML endpoint from environment (dynamic, no hardcoding)
+        cloud_ml_endpoint = os.getenv(
+            "JARVIS_CLOUD_ML_ENDPOINT",
+            "https://jarvis-ml-jarvis-473803.us-central1.run.app/api/ml"
+        )
+
+        # Check if cloud backend is enabled
+        cloud_enabled = os.getenv("JARVIS_PREFER_CLOUD_RUN", "true").lower() == "true"
+
+        if cloud_enabled:
+            print(f"{Colors.CYAN}   Initializing CloudECAPAClient v18.2.0...{Colors.ENDC}")
+            print(f"{Colors.CYAN}   Primary endpoint: {cloud_ml_endpoint}{Colors.ENDC}")
+
+            # Create and initialize the client
+            cloud_ecapa_client = await get_cloud_ecapa_client()
+
+            if cloud_ecapa_client:
+                # Initialize with health check and backend verification
+                init_result = await cloud_ecapa_client.initialize()
+
+                if init_result.get("success"):
+                    cloud_ecapa_status["initialized"] = True
+                    cloud_ecapa_status["backend"] = init_result.get("backend", "cloud_run")
+
+                    print(f"{Colors.GREEN}   ✅ CloudECAPAClient initialized successfully{Colors.ENDC}")
+                    print(f"{Colors.GREEN}   → Backend: {cloud_ecapa_status['backend']}{Colors.ENDC}")
+                    print(f"{Colors.GREEN}   → Cloud Run: {'Available' if init_result.get('cloud_run_healthy') else 'Unavailable'}{Colors.ENDC}")
+                    print(f"{Colors.GREEN}   → Spot VM: {'Enabled' if init_result.get('spot_vm_enabled') else 'Disabled'}{Colors.ENDC}")
+
+                    # Store in environment for main.py to pick up
+                    os.environ["CLOUD_ECAPA_INITIALIZED"] = "true"
+                    os.environ["CLOUD_ECAPA_BACKEND"] = cloud_ecapa_status["backend"]
+                else:
+                    error_msg = init_result.get("error", "Unknown initialization error")
+                    cloud_ecapa_status["error"] = error_msg
+                    print(f"{Colors.YELLOW}   ⚠️  CloudECAPAClient initialization issue: {error_msg}{Colors.ENDC}")
+                    print(f"{Colors.YELLOW}   → Will fallback to local ECAPA on demand{Colors.ENDC}")
+            else:
+                print(f"{Colors.YELLOW}   ⚠️  CloudECAPAClient could not be created{Colors.ENDC}")
+                print(f"{Colors.YELLOW}   → Voice unlock will use local processing{Colors.ENDC}")
+        else:
+            print(f"{Colors.CYAN}   Cloud ECAPA disabled (JARVIS_PREFER_CLOUD_RUN=false){Colors.ENDC}")
+            print(f"{Colors.CYAN}   → Voice unlock will use local ECAPA encoder{Colors.ENDC}")
+
+    except ImportError as e:
+        print(f"{Colors.YELLOW}   ⚠️  CloudECAPAClient import failed: {e}{Colors.ENDC}")
+        print(f"{Colors.YELLOW}   → Voice unlock will fallback to local processing{Colors.ENDC}")
+        cloud_ecapa_status["error"] = str(e)
+
+    except Exception as e:
+        print(f"{Colors.FAIL}   ❌ CloudECAPAClient error: {e}{Colors.ENDC}")
+        print(f"{Colors.YELLOW}   → Voice unlock will fallback to local processing{Colors.ENDC}")
+        cloud_ecapa_status["error"] = str(e)
+
+    print(f"{Colors.CYAN}{'='*60}{Colors.ENDC}\n")
+
     # CRITICAL: Bootstrap voice profiles to SQLite cache for offline authentication
     if proxy_started:
         print(f"\n{Colors.CYAN}{'='*60}{Colors.ENDC}")
