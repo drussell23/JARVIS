@@ -1659,6 +1659,7 @@ class UnifiedVoiceCacheManager:
         Get the cached ECAPA-TDNN encoder from the parallel model loader.
 
         ENHANCED: Checks both parallel loader cache and direct encoder fallback.
+        NOTE: This is a sync method - use ensure_encoder_available() for async loading.
 
         Returns:
             Encoder model if available, None otherwise
@@ -1673,8 +1674,113 @@ class UnifiedVoiceCacheManager:
             if encoder is not None:
                 return encoder
 
-        logger.debug("ECAPA encoder not available from any source")
+        # Check ML Registry as final sync fallback
+        try:
+            from voice_unlock.ml_engine_registry import get_ml_registry_sync
+            registry = get_ml_registry_sync(auto_create=False)  # Don't create here, sync check only
+            if registry:
+                ecapa_wrapper = registry.get_wrapper("ecapa_tdnn")
+                if ecapa_wrapper and ecapa_wrapper.is_loaded:
+                    return ecapa_wrapper.get_engine()
+        except Exception:
+            pass
+
+        logger.debug("ECAPA encoder not available from any source (sync check)")
         return None
+
+    async def ensure_encoder_available(
+        self,
+        timeout: float = None,
+        trigger_load: bool = True,
+    ) -> Tuple[bool, Optional[Any], str]:
+        """
+        CRITICAL FIX v3.0: Ensure ECAPA encoder is available with on-demand loading.
+
+        This method MUST be called before any voice verification to guarantee
+        that ECAPA is available. It will trigger loading if necessary.
+
+        Orchestration Flow:
+        1. Check if encoder already available (fast path)
+        2. If not, call ensure_ecapa_available() to trigger loading
+        3. Wait for encoder to be ready
+        4. Store encoder reference for fast subsequent access
+
+        Args:
+            timeout: Max seconds to wait (default from env or 45s)
+            trigger_load: If True, trigger loading if encoder not available
+
+        Returns:
+            Tuple[success, encoder, message]:
+            - success: True if encoder is available
+            - encoder: The ECAPA encoder (or None for cloud mode)
+            - message: Status/error message for diagnostics
+
+        Usage:
+            success, encoder, msg = await cache.ensure_encoder_available()
+            if not success:
+                return {"error": f"ECAPA unavailable: {msg}"}
+        """
+        import time as time_module
+
+        # Get timeout from env or default
+        if timeout is None:
+            timeout = float(os.getenv("JARVIS_ECAPA_ENSURE_TIMEOUT", "45.0"))
+
+        start_time = time_module.time()
+
+        # Fast path: check if already available
+        encoder = self.get_ecapa_encoder()
+        if encoder is not None:
+            return True, encoder, "ECAPA encoder available (cached)"
+
+        # Check if we're in cloud mode with verified backend
+        if getattr(self, "_using_cloud_ecapa", False):
+            try:
+                from voice_unlock.ml_engine_registry import get_ml_registry_sync
+                registry = get_ml_registry_sync(auto_create=True)
+                if registry and getattr(registry, "_cloud_verified", False):
+                    return True, None, "Cloud ECAPA available (verified)"
+            except Exception as e:
+                logger.warning(f"Cloud mode check failed: {e}")
+
+        if not trigger_load:
+            return False, None, "ECAPA encoder not available and loading disabled"
+
+        # Trigger loading via ensure_ecapa_available()
+        logger.info("🔄 [ENSURE_ENCODER] Triggering ECAPA on-demand loading...")
+
+        try:
+            from voice_unlock.ml_engine_registry import ensure_ecapa_available
+
+            success, message, loaded_encoder = await ensure_ecapa_available(
+                timeout=timeout,
+                allow_cloud=True,
+            )
+
+            if success:
+                elapsed = time_module.time() - start_time
+                logger.info(f"✅ [ENSURE_ENCODER] ECAPA available in {elapsed:.1f}s: {message}")
+
+                # Store encoder reference for fast access
+                if loaded_encoder is not None:
+                    self._direct_ecapa_encoder = loaded_encoder
+                    self._stats.models_loaded = True
+                    self._using_cloud_ecapa = False
+                else:
+                    # Cloud mode
+                    self._using_cloud_ecapa = True
+                    self._stats.models_loaded = True
+
+                return True, loaded_encoder, message
+            else:
+                return False, None, f"ECAPA loading failed: {message}"
+
+        except ImportError as ie:
+            logger.error(f"[ENSURE_ENCODER] ensure_ecapa_available not available: {ie}")
+            return False, None, f"Import error: {ie}"
+        except Exception as e:
+            logger.error(f"[ENSURE_ENCODER] Unexpected error: {e}")
+            return False, None, f"Error: {e}"
 
     async def extract_embedding(
         self,
@@ -1684,14 +1790,17 @@ class UnifiedVoiceCacheManager:
         """
         Extract voice embedding from audio using the cached ECAPA-TDNN model.
 
-        ENHANCED v2.0: Smart fallback orchestration with cloud support.
+        ENHANCED v3.0: GUARANTEED encoder availability with on-demand loading.
 
-        Fallback paths (in order):
+        CRITICAL FIX: This method now ALWAYS ensures the encoder is available
+        before attempting extraction. This prevents 0% confidence errors.
+
+        Orchestration flow:
+        0. ENSURE encoder is loaded (on-demand loading if necessary)
         1. Cloud extraction (if cloud mode active and verified)
         2. Direct ECAPA encoder (if loaded locally)
-        3. Parallel model loader cache
-        4. ML Registry's extract_speaker_embedding
-        5. Speaker Verification Service's engine
+        3. ML Registry's extract_speaker_embedding
+        4. Speaker Verification Service's engine
 
         Args:
             audio_data: Audio waveform (numpy array or tensor)
@@ -1707,6 +1816,25 @@ class UnifiedVoiceCacheManager:
         attempts = []
 
         try:
+            # =====================================================================
+            # STEP 0: CRITICAL - ENSURE ENCODER IS AVAILABLE (ON-DEMAND LOADING)
+            # =====================================================================
+            # This is the key fix for 0% confidence - we MUST have an encoder
+            encoder_available, encoder, encoder_status = await self.ensure_encoder_available(
+                timeout=30.0,  # Allow up to 30s for first-time model loading
+                trigger_load=True,  # Force loading if not available
+            )
+
+            if encoder_available:
+                logger.debug(f"✅ Encoder guaranteed available: {encoder_status}")
+                # Cache the encoder for immediate use
+                if encoder is not None and not hasattr(self, '_direct_ecapa_encoder'):
+                    self._direct_ecapa_encoder = encoder
+            else:
+                # Still continue with fallback paths - they might work
+                logger.warning(f"⚠️ Encoder ensure failed: {encoder_status}")
+                attempts.append(f"Step 0 ensure_encoder: {encoder_status}")
+
             # =====================================================================
             # PATH 1: Cloud extraction (if cloud mode active)
             # =====================================================================
