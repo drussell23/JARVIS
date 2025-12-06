@@ -83,15 +83,18 @@ COPY ecapa_cloud_service.py .
 COPY __init__.py .
 
 # Set ownership and permissions for cache files
+# Note: 775 ensures ecapa user/group can write; speechbrain needs write access for lock files
 RUN chown -R ecapa:ecapa /app /opt/ecapa_cache && \
-    chmod -R 755 /opt/ecapa_cache
+    chmod -R 775 /opt/ecapa_cache
 
 # Switch to non-root user
 USER ecapa
 
 # Environment variables
+# Use /tmp for runtime cache (writable), pre-downloaded cache is at /opt/ecapa_cache
 ENV ECAPA_MODEL_PATH="speechbrain/spkrec-ecapa-voxceleb"
-ENV ECAPA_CACHE_DIR="/opt/ecapa_cache"
+ENV ECAPA_CACHE_DIR="/tmp/ecapa_cache"
+ENV ECAPA_SOURCE_CACHE="/opt/ecapa_cache"
 ENV ECAPA_DEVICE="cpu"
 ENV ECAPA_WARMUP_ON_START="true"
 ENV PORT="8010"
@@ -103,5 +106,5 @@ EXPOSE 8010
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD curl -f http://localhost:8010/health || exit 1
 
-# Run the service
-CMD ["python", "ecapa_cloud_service.py"]
+# Startup: Copy pre-downloaded cache to writable /tmp with full permissions, then run service
+CMD cp -r /opt/ecapa_cache /tmp/ecapa_cache && chmod -R 777 /tmp/ecapa_cache && python ecapa_cloud_service.py
