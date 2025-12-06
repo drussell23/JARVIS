@@ -144,6 +144,12 @@ except ImportError as e:
 from intelligence.learning_database import JARVISLearningDatabase
 from voice.engines.speechbrain_engine import SpeechBrainEngine
 from voice.stt_config import ModelConfig, STTEngine
+from voice.audio_format_converter import (
+    prepare_audio_for_stt,
+    prepare_audio_for_stt_async,
+    prepare_audio_with_analysis,
+    AudioConverterConfig,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -4462,6 +4468,38 @@ class SpeakerVerificationService:
         if not self.initialized:
             await self.initialize()
 
+        # ============================================================================
+        # CRITICAL FIX: Audio Format Conversion (v2.0)
+        # ============================================================================
+        # Browser sends WebM/Opus compressed audio, but ECAPA-TDNN expects raw PCM.
+        # Without this conversion, compressed bytes are interpreted as garbage samples,
+        # resulting in 0% verification confidence.
+        # ============================================================================
+        original_size = len(audio_data) if audio_data is not None else 0
+        if audio_data is not None and len(audio_data) > 0:
+            try:
+                # Use async conversion for non-blocking operation
+                loop = asyncio.get_event_loop()
+                converted_audio, analysis = await loop.run_in_executor(
+                    get_verification_executor(),
+                    prepare_audio_with_analysis,
+                    audio_data,
+                    16000,  # target_sample_rate
+                )
+
+                if converted_audio is not None and len(converted_audio) > 0:
+                    conversion_ratio = len(converted_audio) / original_size if original_size > 0 else 0
+                    logger.info(
+                        f"🎤 AUDIO CONVERTED: {original_size} → {len(converted_audio)} bytes "
+                        f"(ratio: {conversion_ratio:.2f}x, format: {analysis.detected_format.value if analysis else 'unknown'}, "
+                        f"SNR: {analysis.snr_db:.1f}dB)" if analysis else ""
+                    )
+                    audio_data = converted_audio
+                else:
+                    logger.warning(f"⚠️ Audio conversion returned empty result, using original")
+            except Exception as e:
+                logger.warning(f"⚠️ Audio format conversion failed: {e}, using original audio")
+
         # Debug audio data (reduced logging for speed)
         # Use proper None check for numpy arrays (avoids "ambiguous truth value" error)
         audio_size = len(audio_data) if audio_data is not None and len(audio_data) > 0 else 0
@@ -4469,12 +4507,12 @@ class SpeakerVerificationService:
         if audio_data is not None and len(audio_data) > 0:
             # Check if audio is not silent
             import numpy as np
-            # JARVIS sends int16 PCM audio, not float32
+            # After conversion, audio should be int16 PCM
             try:
-                # Try int16 first (JARVIS format)
+                # Try int16 first (expected after conversion)
                 audio_array = np.frombuffer(audio_data[:min(2000, len(audio_data))], dtype=np.int16)
                 audio_array = audio_array.astype(np.float32) / 32768.0  # Convert to float32 normalized
-                logger.info(f"🎤 AUDIO DEBUG: Detected int16 PCM format")
+                logger.info(f"🎤 AUDIO DEBUG: Detected int16 PCM format (post-conversion)")
             except:
                 # Fallback to float32 if that fails
                 audio_array = np.frombuffer(audio_data[:min(1000, len(audio_data))], dtype=np.float32, count=-1)
@@ -4488,11 +4526,9 @@ class SpeakerVerificationService:
         else:
             logger.error("❌ AUDIO DEBUG: No audio data received!")
 
-        # NOTE: Do NOT convert int16 to float32 bytes here!
+        # Audio is now converted to int16 PCM format by the audio format converter
         # The SpeechBrain engine expects int16 PCM or standard audio formats with headers.
-        # Converting to float32 bytes strips headers and causes audio decoding to fail.
-        # The engine's _audio_bytes_to_tensor() handles format conversion internally.
-        logger.info(f"🎤 AUDIO DEBUG: Passing {len(audio_data) if audio_data is not None and len(audio_data) > 0 else 0} bytes to engine (int16 PCM format preserved)")
+        logger.info(f"🎤 AUDIO DEBUG: Passing {len(audio_data) if audio_data is not None and len(audio_data) > 0 else 0} bytes to engine (converted to int16 PCM)")
 
         # 🚀 UNIFIED CACHE FAST-PATH: Try instant recognition before expensive SpeechBrain verification
         # This provides ~1ms matching vs 200-500ms for full model inference
