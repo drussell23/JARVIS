@@ -4627,8 +4627,14 @@ class SpeakerVerificationService:
                 b'fLaC': 'FLAC',
             }
             detected_format = 'PCM/Unknown'
+            # Handle both bytes and numpy arrays for format detection
+            audio_bytes_for_detection = audio_data
+            if hasattr(audio_data, 'tobytes'):  # numpy array
+                audio_bytes_for_detection = audio_data.tobytes()
+            elif not isinstance(audio_data, bytes):
+                audio_bytes_for_detection = bytes(audio_data)
             for sig, fmt in format_hints.items():
-                if audio_data[:len(sig)] == sig:
+                if len(audio_bytes_for_detection) >= len(sig) and audio_bytes_for_detection[:len(sig)] == sig:
                     detected_format = fmt
                     break
 
