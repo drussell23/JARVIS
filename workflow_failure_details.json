@@ -1,12 +1,12 @@
 {
-  "workflow_name": "\ud83c\udfa8 Advanced Auto-Diagram Generator",
-  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/19984116379",
-  "branch": "cursor/investigate-voice-authentication-system-integration-gemini-3-pro-preview-e56d",
-  "commit_sha": "7809431",
-  "run_number": 77,
+  "workflow_name": "PR Automation & Validation",
+  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/19984146727",
+  "branch": "fix/ci/advanced-auto-diagram-generator-run77-20251206-054512",
+  "commit_sha": "7944a7f",
+  "run_number": 701,
   "failed_count": 1,
-  "fix_branch": "fix/ci/advanced-auto-diagram-generator-run77-20251206-054512",
-  "pr_title": "\ud83d\udea8 Fix CI/CD: \ud83c\udfa8 Advanced Auto-Diagram Generator (Run #77)",
+  "fix_branch": "fix/ci/pr-automation-validation-run701-20251206-054704",
+  "pr_title": "\ud83d\udea8 Fix CI/CD: PR Automation & Validation (Run #701)",
   "analyses": [
     {
       "error_patterns": [
@@ -14,14 +14,14 @@
           "pattern": "ERROR|Error|error",
           "matches": [
             {
-              "line_number": 82,
-              "content": "2025-12-06T05:43:43.3666979Z ##[error]Unable to process file command 'output' successfully.",
+              "line_number": 25,
+              "content": "2025-12-06T05:45:43.7176031Z   subjectPatternError: The PR title must start with a capital letter.",
               "severity": "high",
               "emoji": "\u274c"
             },
             {
-              "line_number": 83,
-              "content": "2025-12-06T05:43:43.3675185Z ##[error]Invalid format '  \"PAVA_VIBA_INTEGRATION_ANALYSIS.md\"'",
+              "line_number": 37,
+              "content": "2025-12-06T05:45:44.2372908Z ##[error]No release type found in pull request title \"\ud83d\udea8 Fix CI/CD: \ud83c\udfa8 Advanced Auto-Diagram Generator (Run #77)\". Add a prefix to indicate what kind of release this pull request corresponds to. For reference, see https://www.conventionalcommits.org/",
               "severity": "high",
               "emoji": "\u274c"
             }
@@ -29,43 +29,26 @@
           "count": 2
         },
         {
-          "pattern": "FAIL|Failed|failed",
+          "pattern": "timeout|timed out",
           "matches": [
             {
-              "line_number": 68,
-              "content": "2025-12-06T05:43:42.5169522Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}",
-              "severity": "high",
-              "emoji": "\ud83d\udca5"
-            },
-            {
-              "line_number": 93,
-              "content": "2025-12-06T05:43:43.5253160Z ##[warning]The process '/usr/bin/git' failed with exit code 128",
-              "severity": "high",
-              "emoji": "\ud83d\udca5"
-            }
-          ],
-          "count": 2
-        },
-        {
-          "pattern": "WARN|Warning|warning",
-          "matches": [
-            {
-              "line_number": 93,
-              "content": "2025-12-06T05:43:43.5253160Z ##[warning]The process '/usr/bin/git' failed with exit code 128",
+              "line_number": 29,
+              "content": "- fix: Resolve database connection timeout",
               "severity": "medium",
-              "emoji": "\u26a0\ufe0f"
+              "emoji": "\u23f1\ufe0f"
             }
           ],
           "count": 1
         }
       ],
       "suggested_fixes": [
-        "Review the logs above for specific error messages"
+        "Consider increasing timeout values or optimizing slow operations",
+        "Check service availability and network connectivity"
       ],
       "severity": "high",
-      "category": "permission_error",
+      "category": "timeout",
       "similar_failures": []
     }
   ],
-  "timestamp": "2025-12-06T05:45:12.136379"
+  "timestamp": "2025-12-06T05:47:04.118547"
 }
