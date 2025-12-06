@@ -13876,21 +13876,38 @@ async def main():
             import time
 
             # Quick health check with timeout
-            start_time = time.time()
             timeout = aiohttp.ClientTimeout(total=10)
 
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                # Try health endpoint
-                health_url = cloud_run_endpoint.replace("/api/ml", "/health")
-                async with session.get(health_url) as response:
-                    latency = (time.time() - start_time) * 1000
+                # Try multiple possible health endpoints
+                base_url = cloud_run_endpoint.replace("/api/ml", "")
+                health_paths = ["/health", "/api/ml/health", "/status", "/api/ml/status", "/"]
 
-                    if response.status == 200:
+                for path in health_paths:
+                    try:
+                        start_time = time.time()
+                        health_url = f"{base_url}{path}"
+                        async with session.get(health_url) as response:
+                            latency = (time.time() - start_time) * 1000
+
+                            if response.status == 200:
+                                result["available"] = True
+                                result["healthy"] = True
+                                result["latency_ms"] = latency
+                                return result
+                    except:
+                        continue
+
+                # If none of the health paths work, try the main endpoint
+                start_time = time.time()
+                async with session.get(cloud_run_endpoint) as response:
+                    latency = (time.time() - start_time) * 1000
+                    if response.status in [200, 404, 405]:  # Server is responding
                         result["available"] = True
-                        result["healthy"] = True
                         result["latency_ms"] = latency
+                        result["error"] = "Endpoint responding but no health check"
                     else:
-                        result["error"] = f"Health check returned {response.status}"
+                        result["error"] = f"Endpoint returned {response.status}"
 
         except asyncio.TimeoutError:
             result["error"] = "Cloud Run health check timed out"
@@ -14111,24 +14128,25 @@ async def main():
 
             if cloud_ecapa_client:
                 # Initialize with health check and backend verification
-                init_result = await cloud_ecapa_client.initialize()
+                # Note: initialize() returns a bool, not a dict
+                init_success = await cloud_ecapa_client.initialize()
 
-                if init_result.get("success"):
+                if init_success:
                     cloud_ecapa_status["initialized"] = True
-                    cloud_ecapa_status["backend"] = init_result.get("backend", "cloud_run")
+                    # Get backend info from client state
+                    selected_backend_name = os.getenv("JARVIS_ECAPA_BACKEND", "cloud_run")
+                    cloud_ecapa_status["backend"] = selected_backend_name
 
                     print(f"{Colors.GREEN}   ✅ CloudECAPAClient initialized successfully{Colors.ENDC}")
                     print(f"{Colors.GREEN}   → Backend: {cloud_ecapa_status['backend']}{Colors.ENDC}")
-                    print(f"{Colors.GREEN}   → Cloud Run: {'Available' if init_result.get('cloud_run_healthy') else 'Unavailable'}{Colors.ENDC}")
-                    print(f"{Colors.GREEN}   → Spot VM: {'Enabled' if init_result.get('spot_vm_enabled') else 'Disabled'}{Colors.ENDC}")
+                    print(f"{Colors.GREEN}   → Endpoints configured: {len(cloud_ecapa_client._endpoints) if hasattr(cloud_ecapa_client, '_endpoints') else 'N/A'}{Colors.ENDC}")
 
                     # Store in environment for main.py to pick up
                     os.environ["CLOUD_ECAPA_INITIALIZED"] = "true"
                     os.environ["CLOUD_ECAPA_BACKEND"] = cloud_ecapa_status["backend"]
                 else:
-                    error_msg = init_result.get("error", "Unknown initialization error")
-                    cloud_ecapa_status["error"] = error_msg
-                    print(f"{Colors.YELLOW}   ⚠️  CloudECAPAClient initialization issue: {error_msg}{Colors.ENDC}")
+                    cloud_ecapa_status["error"] = "Initialization returned False"
+                    print(f"{Colors.YELLOW}   ⚠️  CloudECAPAClient initialization issue{Colors.ENDC}")
                     print(f"{Colors.YELLOW}   → Will fallback to local ECAPA on demand{Colors.ENDC}")
             else:
                 print(f"{Colors.YELLOW}   ⚠️  CloudECAPAClient could not be created{Colors.ENDC}")
