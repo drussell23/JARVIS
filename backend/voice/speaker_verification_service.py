@@ -20,6 +20,7 @@ Enhanced Version: 2.1.0 - Async Optimized (Non-Blocking)
 
 import asyncio
 import logging
+import os
 import threading
 import hashlib
 import time
@@ -198,6 +199,7 @@ try:
         get_ecapa_encoder_async,
         is_voice_unlock_ready,
         extract_speaker_embedding as registry_extract_embedding,
+        ensure_ecapa_available,  # CRITICAL: Proactive ECAPA loading
     )
     ML_REGISTRY_AVAILABLE = True
     logger.info("ML Engine Registry available - using singleton ECAPA-TDNN")
@@ -207,6 +209,7 @@ except ImportError:
     get_ecapa_encoder_async = None
     is_voice_unlock_ready = lambda: True
     registry_extract_embedding = None
+    ensure_ecapa_available = None  # Fallback
     logger.info("ML Engine Registry not available - using local engine instance")
 
 
@@ -2298,6 +2301,11 @@ class SpeakerVerificationService:
         self.confidence_history_window = 20  # Use last 20 attempts for normalization
         self.confidence_stats = {}  # Store mean/std for normalization
 
+        # ECAPA Registry Integration (set by initialize_fast())
+        self._use_registry_encoder = False  # Will be set True if ECAPA loads successfully
+        self._ecapa_load_source = None  # 'local' or 'cloud'
+        self._ecapa_load_message = None  # Status message from ECAPA loading
+
         # CONTINUOUS LEARNING SYSTEM
         # Store all voice interactions for ML training
         self.continuous_learning_enabled = True
@@ -2370,6 +2378,8 @@ class SpeakerVerificationService:
 
         Loads profiles immediately, defers SpeechBrain loading to background.
         JARVIS starts fast (~2s), encoder ready in ~10s total.
+
+        CRITICAL FIX: Also triggers ECAPA loading from ML Engine Registry!
         """
         if self.initialized:
             return
@@ -2380,6 +2390,45 @@ class SpeakerVerificationService:
         if self.learning_db is None:
             from intelligence.learning_database import get_learning_database
             self.learning_db = await get_learning_database()
+
+        # ========================================================================
+        # CRITICAL FIX: Ensure ECAPA is loaded from ML Engine Registry!
+        # This was missing and caused voice verification to return 0% confidence
+        # because the ECAPA encoder never got loaded.
+        # ========================================================================
+        if ML_REGISTRY_AVAILABLE and ensure_ecapa_available is not None:
+            logger.info("🔄 [FAST-INIT] Triggering ECAPA loading from ML Engine Registry...")
+            try:
+                # Start ECAPA loading as background task to keep init fast
+                # but ensure it gets loaded before first verification attempt
+                ecapa_load_timeout = float(os.environ.get("ECAPA_LOAD_TIMEOUT", "60.0"))
+                ecapa_allow_cloud = os.environ.get("ECAPA_ALLOW_CLOUD", "true").lower() == "true"
+
+                # Use asyncio.create_task to load in background, but also await briefly
+                # to ensure the loading has at least started
+                success, message, encoder = await ensure_ecapa_available(
+                    timeout=ecapa_load_timeout,
+                    allow_cloud=ecapa_allow_cloud,
+                )
+
+                if success:
+                    self._use_registry_encoder = True
+                    self._ecapa_load_message = message
+
+                    if encoder is not None:
+                        self._ecapa_load_source = "local"
+                        logger.info(f"✅ [FAST-INIT] ECAPA loaded LOCALLY: {message}")
+                    else:
+                        self._ecapa_load_source = "cloud"
+                        logger.info(f"✅ [FAST-INIT] ECAPA available via CLOUD: {message}")
+                else:
+                    logger.warning(f"⚠️ [FAST-INIT] ECAPA not available: {message}")
+                    # Will fall back to SpeechBrain encoder
+            except Exception as e:
+                logger.warning(f"⚠️ [FAST-INIT] ECAPA loading error: {e}")
+                # Continue without ECAPA - will use SpeechBrain fallback
+        else:
+            logger.info("ℹ️ [FAST-INIT] ML Registry not available - using SpeechBrain encoder")
 
         # Create SpeechBrain engine but DON'T initialize it yet (deferred to background)
         model_config = ModelConfig(
@@ -2401,11 +2450,12 @@ class SpeakerVerificationService:
         await self._load_speaker_profiles()
 
         self.initialized = True
+        ecapa_status = "ECAPA ready" if self._use_registry_encoder else "SpeechBrain fallback"
         logger.info(
-            f"✅ Speaker Verification Service ready - {len(self.speaker_profiles)} profiles loaded (encoder loading in background)"
+            f"✅ Speaker Verification Service ready - {len(self.speaker_profiles)} profiles loaded ({ecapa_status})"
         )
 
-        # Start background initialization of SpeechBrain engine
+        # Start background initialization of SpeechBrain engine (as fallback)
         logger.info("🔄 Loading SpeechBrain encoder in background thread...")
         self._start_background_preload()
 
@@ -2821,20 +2871,101 @@ class SpeakerVerificationService:
         )
 
         # =====================================================================
-        # ML ENGINE REGISTRY INTEGRATION
-        # If the global registry has already loaded ECAPA-TDNN, use that
-        # instead of creating a duplicate engine instance
+        # ML ENGINE REGISTRY INTEGRATION (v3.0 - Proactive ECAPA Loading)
+        # CRITICAL FIX: Don't just check if ECAPA is ready - proactively load it!
+        # This ensures ECAPA is available at startup, not just when first needed.
         # =====================================================================
         self._use_registry_encoder = False
+        self._ecapa_load_source = None  # Track whether local or cloud
+        self._ecapa_load_message = None  # Track load result message
 
-        if ML_REGISTRY_AVAILABLE and is_voice_unlock_ready():
+        # Dynamic configuration from environment (no hardcoding)
+        ecapa_load_timeout = float(os.environ.get("ECAPA_LOAD_TIMEOUT", "60.0"))
+        ecapa_allow_cloud = os.environ.get("ECAPA_ALLOW_CLOUD", "true").lower() == "true"
+        ecapa_retry_attempts = int(os.environ.get("ECAPA_RETRY_ATTEMPTS", "3"))
+        ecapa_retry_delay = float(os.environ.get("ECAPA_RETRY_DELAY", "2.0"))
+
+        if ML_REGISTRY_AVAILABLE and ensure_ecapa_available is not None:
+            logger.info("🔄 [INIT] ML Engine Registry available - proactively loading ECAPA...")
+
+            ecapa_loaded = False
+            last_error = None
+
+            # Retry loop with exponential backoff
+            for attempt in range(1, ecapa_retry_attempts + 1):
+                try:
+                    logger.info(f"🔄 [INIT] ECAPA load attempt {attempt}/{ecapa_retry_attempts}...")
+
+                    # Proactively ensure ECAPA is loaded (local or cloud)
+                    success, message, encoder = await ensure_ecapa_available(
+                        timeout=ecapa_load_timeout,
+                        allow_cloud=ecapa_allow_cloud,
+                    )
+
+                    if success:
+                        self._use_registry_encoder = True
+                        self._ecapa_load_message = message
+
+                        # Determine source (local vs cloud)
+                        if encoder is not None:
+                            self._ecapa_load_source = "local"
+                            logger.info(f"✅ [INIT] ECAPA loaded LOCALLY: {message}")
+                        else:
+                            self._ecapa_load_source = "cloud"
+                            logger.info(f"✅ [INIT] ECAPA available via CLOUD: {message}")
+
+                        ecapa_loaded = True
+                        break
+                    else:
+                        last_error = message
+                        logger.warning(f"⚠️ [INIT] ECAPA load attempt {attempt} failed: {message}")
+
+                        if attempt < ecapa_retry_attempts:
+                            # Exponential backoff with jitter
+                            import random
+                            delay = ecapa_retry_delay * (2 ** (attempt - 1)) + random.uniform(0, 1)
+                            logger.info(f"⏳ [INIT] Retrying in {delay:.1f}s...")
+                            await asyncio.sleep(delay)
+
+                except asyncio.TimeoutError:
+                    last_error = f"Timeout after {ecapa_load_timeout}s"
+                    logger.warning(f"⚠️ [INIT] ECAPA load attempt {attempt} timed out")
+                except Exception as e:
+                    last_error = str(e)
+                    logger.warning(f"⚠️ [INIT] ECAPA load attempt {attempt} error: {e}")
+
+                    if attempt < ecapa_retry_attempts:
+                        import random
+                        delay = ecapa_retry_delay * (2 ** (attempt - 1)) + random.uniform(0, 1)
+                        await asyncio.sleep(delay)
+
+            if ecapa_loaded:
+                # ECAPA is ready - use registry encoder
+                # Still create SpeechBrain engine for other features (ASR, etc)
+                # but skip the encoder preload since registry already has it
+                self.speechbrain_engine = SpeechBrainEngine(model_config)
+                await self.speechbrain_engine.initialize()
+                # Load speaker profiles
+                await self._load_speaker_profiles()
+                logger.info(
+                    f"✅ [INIT] Using registry ECAPA-TDNN ({self._ecapa_load_source}) - "
+                    f"unlock will be instant!"
+                )
+            else:
+                # All retry attempts failed - fall through to fallback
+                logger.warning(
+                    f"⚠️ [INIT] ECAPA not available after {ecapa_retry_attempts} attempts: "
+                    f"{last_error}. Falling back to local engine..."
+                )
+                # Don't set _use_registry_encoder - will use fallback below
+        elif ML_REGISTRY_AVAILABLE and is_voice_unlock_ready():
+            # Fallback: Registry available but ensure_ecapa_available not imported
+            # (shouldn't happen, but handle gracefully)
             logger.info("✅ ML Engine Registry has ECAPA-TDNN loaded - using singleton!")
             self._use_registry_encoder = True
-            # Still create SpeechBrain engine for other features (ASR, etc)
-            # but skip the encoder preload since registry already has it
+            self._ecapa_load_source = "registry"
             self.speechbrain_engine = SpeechBrainEngine(model_config)
             await self.speechbrain_engine.initialize()
-            # Load speaker profiles
             await self._load_speaker_profiles()
             logger.info("✅ Using registry ECAPA-TDNN - unlock will be instant!")
         else:
