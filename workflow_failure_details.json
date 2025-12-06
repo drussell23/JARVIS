@@ -1,12 +1,12 @@
 {
   "workflow_name": "PR Automation & Validation",
-  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/19984116355",
-  "branch": "cursor/investigate-voice-authentication-system-integration-gemini-3-pro-preview-e56d",
-  "commit_sha": "7809431",
-  "run_number": 697,
+  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/19984148936",
+  "branch": "fix/ci/pr-automation-validation-run697-20251206-054523",
+  "commit_sha": "79628eb",
+  "run_number": 702,
   "failed_count": 1,
-  "fix_branch": "fix/ci/pr-automation-validation-run697-20251206-054523",
-  "pr_title": "\ud83d\udea8 Fix CI/CD: PR Automation & Validation (Run #697)",
+  "fix_branch": "fix/ci/pr-automation-validation-run702-20251206-054702",
+  "pr_title": "\ud83d\udea8 Fix CI/CD: PR Automation & Validation (Run #702)",
   "analyses": [
     {
       "error_patterns": [
@@ -15,13 +15,13 @@
           "matches": [
             {
               "line_number": 25,
-              "content": "2025-12-06T05:43:49.0801342Z   subjectPatternError: The PR title must start with a capital letter.",
+              "content": "2025-12-06T05:45:50.9233389Z   subjectPatternError: The PR title must start with a capital letter.",
               "severity": "high",
               "emoji": "\u274c"
             },
             {
               "line_number": 37,
-              "content": "2025-12-06T05:43:49.6480146Z ##[error]No release type found in pull request title \"Investigate voice authentication system integration\". Add a prefix to indicate what kind of release this pull request corresponds to. For reference, see https://www.conventionalcommits.org/",
+              "content": "2025-12-06T05:45:51.4482303Z ##[error]No release type found in pull request title \"\ud83d\udea8 Fix CI/CD: PR Automation & Validation (Run #697)\". Add a prefix to indicate what kind of release this pull request corresponds to. For reference, see https://www.conventionalcommits.org/",
               "severity": "high",
               "emoji": "\u274c"
             }
@@ -50,5 +50,5 @@
       "similar_failures": []
     }
   ],
-  "timestamp": "2025-12-06T05:45:23.626113"
+  "timestamp": "2025-12-06T05:47:02.611730"
 }
