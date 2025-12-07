@@ -5013,10 +5013,19 @@ class SpeakerVerificationService:
                     logger.info(f"  📊 Profile created: {profile.get('created_at', 'unknown')}")
                     logger.info(f"  📊 Profile embedding dim: {profile.get('embedding_dimension', 'unknown')}")
 
+                # CRITICAL FIX: Pre-extract embedding using registry/cloud ECAPA
+                # This ensures we use the cloud service when available instead of local only
+                pre_extracted_embedding = await self._extract_speaker_embedding(audio_data)
+                if pre_extracted_embedding is not None:
+                    logger.info(f"  ✅ Pre-extracted embedding via {'registry/cloud' if self._use_registry_encoder else 'local'}")
+                else:
+                    logger.warning(f"  ⚠️ Pre-extraction failed, will use local fallback")
+
                 is_verified, confidence = await self.speechbrain_engine.verify_speaker(
                     audio_data, known_embedding, threshold=adaptive_threshold,
                     speaker_name=speaker_name, transcription="",
-                    enrolled_profile=profile  # Pass full profile with acoustic features
+                    enrolled_profile=profile,  # Pass full profile with acoustic features
+                    test_embedding=pre_extracted_embedding  # Use pre-extracted from registry/cloud!
                 )
 
                 if self.debug_mode:
@@ -5121,13 +5130,20 @@ class SpeakerVerificationService:
             best_match = None
             best_confidence = 0.0
 
+            # CRITICAL FIX: Pre-extract embedding ONCE using registry/cloud ECAPA
+            # Then reuse for all profile comparisons (efficient!)
+            pre_extracted_embedding = await self._extract_speaker_embedding(audio_data)
+            if pre_extracted_embedding is not None:
+                logger.info(f"✅ Pre-extracted embedding for profile scan via {'registry/cloud' if self._use_registry_encoder else 'local'}")
+
             for profile_name, profile in self.speaker_profiles.items():
                 known_embedding = profile["embedding"]
                 profile_threshold = profile.get("threshold", self.verification_threshold)
                 is_verified, confidence = await self.speechbrain_engine.verify_speaker(
                     audio_data, known_embedding, threshold=profile_threshold,
                     speaker_name=profile_name, transcription="",
-                    enrolled_profile=profile  # Pass full profile with acoustic features
+                    enrolled_profile=profile,  # Pass full profile with acoustic features
+                    test_embedding=pre_extracted_embedding  # Reuse pre-extracted embedding!
                 )
 
                 if confidence > best_confidence:

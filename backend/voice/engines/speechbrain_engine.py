@@ -2121,7 +2121,8 @@ __all__ = ["EncoderDecoderASR"]
     async def verify_speaker(
         self, audio_data: bytes, known_embedding: np.ndarray, threshold: float = 0.25,
         speaker_name: str = "Unknown", transcription: str = "",
-        enrolled_profile: dict = None
+        enrolled_profile: dict = None,
+        test_embedding: np.ndarray = None
     ) -> tuple:
         """
         🎯 BEAST MODE speaker verification with advanced biometric analysis.
@@ -2141,6 +2142,9 @@ __all__ = ["EncoderDecoderASR"]
             threshold: Base similarity threshold (adaptive system may adjust)
             speaker_name: Name of enrolled speaker
             transcription: Optional transcription of spoken content
+            test_embedding: Optional pre-extracted embedding (from registry/cloud)
+                           If provided, skips local embedding extraction.
+                           This enables cloud ECAPA integration!
 
         Returns:
             Tuple of (is_verified: bool, confidence: float)
@@ -2160,9 +2164,12 @@ __all__ = ["EncoderDecoderASR"]
             audio_tensor, sample_rate = await self._audio_bytes_to_tensor(audio_data)
             logger.info(f"   ✅ Audio loaded: {len(audio_tensor)} samples at {sample_rate}Hz")
 
-            # Extract test embedding
-            logger.info("   📊 Extracting test embedding...")
-            test_embedding = await self.extract_speaker_embedding(audio_data)
+            # Extract test embedding - use pre-extracted if available (from registry/cloud)
+            if test_embedding is not None:
+                logger.info("   📊 Using PRE-EXTRACTED embedding (from registry/cloud)")
+            else:
+                logger.info("   📊 Extracting test embedding locally...")
+                test_embedding = await self.extract_speaker_embedding(audio_data)
             test_norm = np.linalg.norm(test_embedding)
             logger.info(f"   ✅ Test embedding: shape={test_embedding.shape}, norm={test_norm:.4f}")
 

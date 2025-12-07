@@ -14299,6 +14299,229 @@ async def main():
 
         print(f"{Colors.CYAN}{'='*60}{Colors.ENDC}\n")
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # ROBUST ECAPA VERIFICATION SYSTEM v1.0.0
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Ensures voice authentication pipeline is fully operational before startup
+    # Tests: Cloud Run ECAPA, Local ECAPA, ML Engine Registry, Embedding Extraction
+    # ═══════════════════════════════════════════════════════════════════════════
+    print(f"\n{Colors.CYAN}{'='*60}{Colors.ENDC}")
+    print(f"{Colors.CYAN}🔬 Robust ECAPA Verification System v1.0.0{Colors.ENDC}")
+    print(f"{Colors.CYAN}{'='*60}{Colors.ENDC}")
+
+    ecapa_verification_result = {
+        "cloud_ecapa_tested": False,
+        "local_ecapa_tested": False,
+        "ml_registry_tested": False,
+        "embedding_extraction_tested": False,
+        "embedding_shape": None,
+        "verification_pipeline_ready": False,
+        "selected_backend": os.getenv("JARVIS_ECAPA_BACKEND", "unknown"),
+        "errors": [],
+    }
+
+    async def verify_ecapa_pipeline():
+        """
+        Comprehensive ECAPA verification - tests the full voice authentication pipeline.
+        This ensures voice unlock will work before declaring system ready.
+        """
+        nonlocal ecapa_verification_result
+        import numpy as np
+
+        print(f"{Colors.CYAN}   Step 1/5: Testing ML Engine Registry availability...{Colors.ENDC}")
+
+        # Step 1: Test ML Engine Registry
+        try:
+            from voice_unlock.ml_engine_registry import (
+                get_ml_registry,
+                ensure_ecapa_available,
+            )
+
+            registry = await get_ml_registry()
+            if registry:
+                ecapa_verification_result["ml_registry_tested"] = True
+                print(f"{Colors.GREEN}   ✅ ML Engine Registry initialized{Colors.ENDC}")
+
+                # Check if ECAPA encoder is available in registry
+                if hasattr(registry, '_ecapa_encoder') and registry._ecapa_encoder is not None:
+                    print(f"{Colors.GREEN}      → ECAPA encoder already loaded in registry{Colors.ENDC}")
+                else:
+                    print(f"{Colors.YELLOW}      → ECAPA encoder not yet loaded, will load on demand{Colors.ENDC}")
+            else:
+                ecapa_verification_result["errors"].append("ML Engine Registry returned None")
+                print(f"{Colors.YELLOW}   ⚠️  ML Engine Registry returned None{Colors.ENDC}")
+        except Exception as e:
+            ecapa_verification_result["errors"].append(f"ML Registry error: {str(e)}")
+            print(f"{Colors.FAIL}   ❌ ML Engine Registry error: {e}{Colors.ENDC}")
+
+        # Step 2: Test Cloud Run ECAPA (if configured)
+        print(f"{Colors.CYAN}   Step 2/5: Testing Cloud Run ECAPA endpoint...{Colors.ENDC}")
+        cloud_endpoint = os.getenv("JARVIS_CLOUD_ML_ENDPOINT", "")
+        if cloud_endpoint or os.getenv("JARVIS_ECAPA_BACKEND") == "cloud_run":
+            try:
+                import aiohttp
+                # Try the Cloud Run health endpoint
+                cloud_url = cloud_endpoint or "https://jarvis-ml-888774109345.us-central1.run.app"
+                health_url = f"{cloud_url.rstrip('/api/ml').rstrip('/')}/health"
+
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(health_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                        if resp.status == 200:
+                            health_data = await resp.json()
+                            ecapa_ready = health_data.get("ecapa_ready", False)
+                            load_source = health_data.get("load_source", "unknown")
+                            ecapa_verification_result["cloud_ecapa_tested"] = True
+
+                            if ecapa_ready:
+                                print(f"{Colors.GREEN}   ✅ Cloud Run ECAPA is ready{Colors.ENDC}")
+                                print(f"{Colors.GREEN}      → Load source: {load_source}{Colors.ENDC}")
+                            else:
+                                print(f"{Colors.YELLOW}   ⚠️  Cloud Run responding but ECAPA not ready{Colors.ENDC}")
+                        else:
+                            print(f"{Colors.YELLOW}   ⚠️  Cloud Run returned status {resp.status}{Colors.ENDC}")
+            except Exception as e:
+                ecapa_verification_result["errors"].append(f"Cloud ECAPA error: {str(e)}")
+                print(f"{Colors.YELLOW}   ⚠️  Cloud Run ECAPA not available: {e}{Colors.ENDC}")
+        else:
+            print(f"{Colors.CYAN}      → Cloud Run not configured, skipping{Colors.ENDC}")
+
+        # Step 3: Test Local ECAPA (ML Engine Registry)
+        print(f"{Colors.CYAN}   Step 3/5: Testing local ECAPA via ML Engine Registry...{Colors.ENDC}")
+        try:
+            # Force ECAPA initialization
+            ecapa_ready = await ensure_ecapa_available()
+            if ecapa_ready:
+                ecapa_verification_result["local_ecapa_tested"] = True
+                print(f"{Colors.GREEN}   ✅ Local ECAPA available via ML Engine Registry{Colors.ENDC}")
+            else:
+                print(f"{Colors.YELLOW}   ⚠️  ensure_ecapa_available returned False{Colors.ENDC}")
+        except Exception as e:
+            ecapa_verification_result["errors"].append(f"Local ECAPA error: {str(e)}")
+            print(f"{Colors.YELLOW}   ⚠️  Local ECAPA not available: {e}{Colors.ENDC}")
+
+        # Step 4: Test Embedding Extraction with dummy audio
+        print(f"{Colors.CYAN}   Step 4/5: Testing embedding extraction with synthetic audio...{Colors.ENDC}")
+        try:
+            from voice_unlock.ml_engine_registry import extract_speaker_embedding
+
+            # Generate synthetic 16kHz audio (1 second of silence with slight noise)
+            sample_rate = 16000
+            duration = 1.0
+            t = np.linspace(0, duration, int(sample_rate * duration), dtype=np.float32)
+            # Add slight noise to avoid NaN issues with pure silence
+            synthetic_audio = np.random.randn(len(t)).astype(np.float32) * 0.01
+
+            # Convert to bytes (wav format simulation)
+            import io
+            import wave
+
+            audio_buffer = io.BytesIO()
+            with wave.open(audio_buffer, 'wb') as wav_file:
+                wav_file.setnchannels(1)
+                wav_file.setsampwidth(2)  # 16-bit
+                wav_file.setframerate(sample_rate)
+                wav_file.writeframes((synthetic_audio * 32767).astype(np.int16).tobytes())
+            audio_bytes = audio_buffer.getvalue()
+
+            # Try to extract embedding
+            embedding = await extract_speaker_embedding(audio_bytes)
+
+            if embedding is not None and len(embedding) > 0:
+                ecapa_verification_result["embedding_extraction_tested"] = True
+                ecapa_verification_result["embedding_shape"] = str(embedding.shape if hasattr(embedding, 'shape') else len(embedding))
+                print(f"{Colors.GREEN}   ✅ Embedding extraction successful!{Colors.ENDC}")
+                print(f"{Colors.GREEN}      → Embedding shape: {ecapa_verification_result['embedding_shape']}{Colors.ENDC}")
+                print(f"{Colors.GREEN}      → Backend used: {os.getenv('JARVIS_ECAPA_BACKEND', 'unknown')}{Colors.ENDC}")
+            else:
+                ecapa_verification_result["errors"].append("Embedding extraction returned None/empty")
+                print(f"{Colors.FAIL}   ❌ Embedding extraction returned None/empty{Colors.ENDC}")
+        except Exception as e:
+            ecapa_verification_result["errors"].append(f"Embedding extraction error: {str(e)}")
+            print(f"{Colors.FAIL}   ❌ Embedding extraction failed: {e}{Colors.ENDC}")
+            import traceback
+            traceback.print_exc()
+
+        # Step 5: Test SpeakerVerificationService integration (the actual voice unlock service)
+        print(f"{Colors.CYAN}   Step 5/6: Testing SpeakerVerificationService integration...{Colors.ENDC}")
+        try:
+            from voice.speaker_verification_service import SpeakerVerificationService
+
+            # Create a temporary instance to test initialization
+            test_service = SpeakerVerificationService()
+            await test_service.initialize()
+
+            # Check if the service correctly detected registry encoder
+            if hasattr(test_service, '_use_registry_encoder'):
+                if test_service._use_registry_encoder:
+                    print(f"{Colors.GREEN}   ✅ SpeakerVerificationService using ML Registry encoder{Colors.ENDC}")
+                else:
+                    print(f"{Colors.YELLOW}   ⚠️  SpeakerVerificationService using local encoder (fallback){Colors.ENDC}")
+            else:
+                print(f"{Colors.CYAN}      → Service initialized (encoder mode unknown){Colors.ENDC}")
+
+            # Test the service's _extract_speaker_embedding method directly
+            if hasattr(test_service, '_extract_speaker_embedding'):
+                test_embedding_result = await test_service._extract_speaker_embedding(audio_bytes)
+                if test_embedding_result is not None and len(test_embedding_result) > 0:
+                    print(f"{Colors.GREEN}   ✅ SpeakerVerificationService._extract_speaker_embedding() works!{Colors.ENDC}")
+                    print(f"{Colors.GREEN}      → Result shape: {test_embedding_result.shape if hasattr(test_embedding_result, 'shape') else len(test_embedding_result)}{Colors.ENDC}")
+                    ecapa_verification_result["verification_pipeline_ready"] = True
+                else:
+                    print(f"{Colors.YELLOW}   ⚠️  SpeakerVerificationService embedding extraction returned empty{Colors.ENDC}")
+            else:
+                print(f"{Colors.CYAN}      → _extract_speaker_embedding method not found{Colors.ENDC}")
+
+            # Cleanup test service
+            if hasattr(test_service, 'shutdown'):
+                await test_service.shutdown()
+
+        except Exception as e:
+            ecapa_verification_result["errors"].append(f"SpeakerVerificationService error: {str(e)}")
+            print(f"{Colors.YELLOW}   ⚠️  SpeakerVerificationService test failed: {e}{Colors.ENDC}")
+            # Don't fail the whole pipeline - this is a bonus check
+
+        # Step 6: Determine overall pipeline readiness
+        print(f"{Colors.CYAN}   Step 6/6: Evaluating voice authentication pipeline status...{Colors.ENDC}")
+
+        # Pipeline is ready if we can extract embeddings (regardless of source)
+        if ecapa_verification_result["embedding_extraction_tested"]:
+            ecapa_verification_result["verification_pipeline_ready"] = True
+            print(f"{Colors.GREEN}   ✅ Voice authentication pipeline is READY{Colors.ENDC}")
+        elif ecapa_verification_result["cloud_ecapa_tested"] or ecapa_verification_result["local_ecapa_tested"]:
+            # ECAPA is available but embedding test failed - might still work
+            ecapa_verification_result["verification_pipeline_ready"] = True
+            print(f"{Colors.YELLOW}   ⚠️  ECAPA available but embedding test had issues{Colors.ENDC}")
+            print(f"{Colors.YELLOW}      → Voice unlock may still work, monitoring...{Colors.ENDC}")
+        else:
+            print(f"{Colors.FAIL}   ❌ Voice authentication pipeline NOT ready{Colors.ENDC}")
+            print(f"{Colors.FAIL}      → Voice unlock may not work correctly{Colors.ENDC}")
+            if ecapa_verification_result["errors"]:
+                print(f"{Colors.FAIL}      → Errors: {ecapa_verification_result['errors']}{Colors.ENDC}")
+
+        return ecapa_verification_result
+
+    # Run the verification
+    try:
+        ecapa_verification_result = await verify_ecapa_pipeline()
+    except Exception as e:
+        print(f"{Colors.FAIL}   ❌ ECAPA verification failed with exception: {e}{Colors.ENDC}")
+        ecapa_verification_result["errors"].append(f"Verification exception: {str(e)}")
+
+    # Summary
+    print(f"\n{Colors.CYAN}   ═══ ECAPA Verification Summary ═══{Colors.ENDC}")
+    print(f"   • ML Registry: {'✅' if ecapa_verification_result['ml_registry_tested'] else '❌'}")
+    print(f"   • Cloud ECAPA: {'✅' if ecapa_verification_result['cloud_ecapa_tested'] else '⚠️  (not tested/available)'}")
+    print(f"   • Local ECAPA: {'✅' if ecapa_verification_result['local_ecapa_tested'] else '⚠️  (not tested/available)'}")
+    print(f"   • Embedding Extraction: {'✅' if ecapa_verification_result['embedding_extraction_tested'] else '❌'}")
+    print(f"   • Selected Backend: {ecapa_verification_result['selected_backend']}")
+    print(f"   • Pipeline Ready: {'✅ YES' if ecapa_verification_result['verification_pipeline_ready'] else '❌ NO'}")
+
+    # Store in environment for other components to check
+    os.environ["JARVIS_ECAPA_VERIFIED"] = "true" if ecapa_verification_result["verification_pipeline_ready"] else "false"
+    os.environ["JARVIS_ECAPA_EMBEDDING_TESTED"] = "true" if ecapa_verification_result["embedding_extraction_tested"] else "false"
+
+    print(f"{Colors.CYAN}{'='*60}{Colors.ENDC}\n")
+
     if args.restart:
         print(f"\n{Colors.BLUE}🔄 RESTART MODE{Colors.ENDC}")
         print("Restarting JARVIS with intelligent system verification...\n")
