@@ -13272,7 +13272,7 @@ async def main():
     parser.add_argument(
         "--restart",
         action="store_true",
-        help="Restart JARVIS: kill old instances, start fresh, and verify intelligent system",
+        help="Restart JARVIS: kill old instances, load fresh async code (fixes 'Processing...' hangs from blocking encode_batch), and verify intelligent system",
     )
     parser.add_argument(
         "--check-only",
@@ -13534,6 +13534,24 @@ async def main():
             print(
                 f"\n{Colors.CYAN}🔄 Restart mode: Will kill existing instances before starting{Colors.ENDC}"
             )
+            print(f"{Colors.CYAN}{'─'*60}{Colors.ENDC}")
+            print(f"{Colors.CYAN}📦 Async Code Reload - Why Restart is Needed:{Colors.ENDC}")
+            print(f"{Colors.CYAN}{'─'*60}{Colors.ENDC}")
+            print(f"   When the backend hasn't been restarted after code changes,")
+            print(f"   old blocking code may still be running, causing hangs.")
+            print(f"")
+            print(f"{Colors.YELLOW}   Common 'Processing...' Hang Flow:{Colors.ENDC}")
+            print(f"   1. Voice unlock starts")
+            print(f"   2. VBI upfront check (3s timeout) → fails if encoder not loaded")
+            print(f"   3. Parallel tasks start: STT + speaker ID")
+            print(f"   4. _identify_speaker calls _try_on_demand_ecapa_load")
+            print(f"   5. This calls ensure_ecapa_available(timeout=30.0)")
+            print(f"   6. {Colors.FAIL}OLD CODE: Blocking encode_batch prevents async yielding{Colors.ENDC}")
+            print(f"   7. Even with timeout, blocking call freezes the event loop")
+            print(f"")
+            print(f"{Colors.GREEN}   ✅ FIX: Restart loads new async code that wraps encode_batch{Colors.ENDC}")
+            print(f"{Colors.GREEN}      in asyncio.to_thread() - event loop stays responsive!{Colors.ENDC}")
+            print(f"{Colors.CYAN}{'─'*60}{Colors.ENDC}")
 
     # Acquire PID lock (after instance check passes or for --restart)
     try:
@@ -13627,6 +13645,10 @@ async def main():
 
                 if args.restart:
                     print(f"{Colors.GREEN}   ✨ FORCE RESTART - All old processes terminated!{Colors.ENDC}")
+                    print(f"{Colors.GREEN}   ✅ Fresh async code will be loaded:{Colors.ENDC}")
+                    print(f"{Colors.GREEN}      • encode_batch wrapped in asyncio.to_thread(){Colors.ENDC}")
+                    print(f"{Colors.GREEN}      • Cloud Run fallback: https://jarvis-ml-888774109345.us-central1.run.app{Colors.ENDC}")
+                    print(f"{Colors.GREEN}      • No more 'Processing...' event loop blocking!{Colors.ENDC}")
                 else:
                     print(f"{Colors.YELLOW}   ✨ Code changes detected - cleaned up old processes!{Colors.ENDC}")
 
