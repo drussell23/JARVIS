@@ -146,7 +146,8 @@ class MobileNetV3FeatureExtractor(nn.Module):
         features = torch.flatten(features, 1)
 
         # Convert to numpy
-        return features.cpu().numpy().flatten()
+        # CRITICAL: Use .copy() to avoid memory corruption when tensor is GC'd
+        return features.cpu().numpy().flatten().copy()
 
 
 class MLTemplateGenerator:

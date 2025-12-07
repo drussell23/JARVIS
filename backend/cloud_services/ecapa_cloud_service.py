@@ -914,7 +914,8 @@ class OptimizedModelLoader:
                     return self._jit_model(audio).squeeze()
 
             elif self.active_strategy == "onnx":
-                audio_np = audio.numpy() if isinstance(audio, torch.Tensor) else audio
+                # CRITICAL: Use .copy() to avoid memory corruption when tensor is GC'd
+                audio_np = audio.cpu().numpy().copy() if isinstance(audio, torch.Tensor) else np.asarray(audio)
                 result = self._onnx_session.run(["embedding"], {"audio": audio_np})
                 return torch.tensor(result[0]).squeeze()
 
@@ -1353,7 +1354,9 @@ class ECAPAModelManager:
 
                 # Run inference
                 with torch.no_grad():
-                    embedding = self.model.encode_batch(audio_tensor).squeeze().cpu().numpy()
+                    # CRITICAL: Use .copy() to avoid memory corruption when tensor is GC'd
+                    result = self.model.encode_batch(audio_tensor).squeeze().cpu()
+                    embedding = np.array(result.numpy(), dtype=np.float32, copy=True)
 
                 pattern_time_ms = (time.time() - pattern_start) * 1000
 
@@ -1436,18 +1439,23 @@ class ECAPAModelManager:
             # Use optimized loader if available (v20.0.0)
             if self._using_optimized and self._optimized_loader:
                 # Run in thread pool to avoid blocking
+                # CRITICAL: Use np.array with copy=True to avoid memory corruption
+                # when tensor is GC'd after thread pool worker exits
+                def _encode_optimized():
+                    result = self._optimized_loader.encode(audio_tensor).cpu()
+                    return np.array(result.numpy(), dtype=np.float32, copy=True)
+
                 loop = asyncio.get_running_loop()
-                embedding = await loop.run_in_executor(
-                    None,
-                    lambda: self._optimized_loader.encode(audio_tensor).cpu().numpy()
-                )
+                embedding = await loop.run_in_executor(None, _encode_optimized)
             else:
                 # Legacy path using standard SpeechBrain model
+                # CRITICAL: Use np.array with copy=True to avoid memory corruption
+                def _encode_legacy():
+                    result = self.model.encode_batch(audio_tensor).squeeze().cpu()
+                    return np.array(result.numpy(), dtype=np.float32, copy=True)
+
                 loop = asyncio.get_running_loop()
-                embedding = await loop.run_in_executor(
-                    None,
-                    lambda: self.model.encode_batch(audio_tensor).squeeze().cpu().numpy()
-                )
+                embedding = await loop.run_in_executor(None, _encode_legacy)
 
             # Update stats
             inference_time = (time.time() - start_time) * 1000

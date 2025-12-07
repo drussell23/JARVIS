@@ -83,10 +83,12 @@ class MLResponseGenerator:
         if self.model and self.torch_available:
             try:
                 with _torch_module.no_grad():
-                    return self.model(error_features).numpy()
+                    # CRITICAL: Use .copy() to avoid memory corruption when tensor is GC'd
+                    result = self.model(error_features)
+                    return result.cpu().numpy().copy()
             except:
                 pass
-        
+
         # Fallback response distribution
         return np.array([0.7, 0.15, 0.05, 0.05, 0.03, 0.02, 0, 0])
 
@@ -181,7 +183,8 @@ class GracefulResponseHandler:
             try:
                 error_tensor = _torch_module.tensor(error_features[:10], dtype=_torch_module.float32)
                 with _torch_module.no_grad():
-                    strategy_weights = self.strategy_network(error_tensor).numpy()
+                    # CRITICAL: Use .copy() to avoid memory corruption when tensor is GC'd
+                    strategy_weights = self.strategy_network(error_tensor).cpu().numpy().copy()
                     response_type = self.ml_generator.forward(error_tensor)
             except:
                 # Fallback if torch fails
