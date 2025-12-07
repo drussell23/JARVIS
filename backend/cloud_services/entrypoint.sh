@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# ECAPA Cloud Service Entrypoint Script v20.0.0
+# ECAPA Cloud Service Entrypoint Script v20.2.0
 # =============================================================================
 # Robust startup script that handles:
 # - Optimized model detection (JIT/ONNX/Quantized)
@@ -182,7 +182,7 @@ verify_cache() {
 
 main() {
     log_info "=============================================="
-    log_info "ECAPA Cloud Service Startup v20.0.0"
+    log_info "ECAPA Cloud Service Startup v20.2.0"
     log_info "  Multi-Strategy Optimization Support"
     log_info "=============================================="
     log_info "User: $(whoami) (UID: $(id -u))"

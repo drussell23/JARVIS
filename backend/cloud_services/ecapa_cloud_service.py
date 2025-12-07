@@ -508,6 +508,10 @@ class OptimizedModelLoader:
         self._compute_features = None
         self._mean_var_norm = None
 
+        # Torchaudio feature extraction (v20.2.0 - for JIT without SpeechBrain)
+        self._mel_transform = None
+        self._amplitude_to_db = None
+
         # State
         self.active_strategy: Optional[str] = None
         self.requires_feature_extraction: bool = False
@@ -584,30 +588,121 @@ class OptimizedModelLoader:
         return None
 
     def load_jit_model(self, model_path: str) -> bool:
-        """Load a TorchScript JIT model."""
+        """
+        Load a TorchScript JIT model.
+
+        v20.2.0: JIT model only contains embedding extraction.
+        Feature extraction is done with torchaudio (no SpeechBrain at runtime).
+        """
         logger.info(f"Loading JIT model from {model_path}...")
         start = time.time()
 
         try:
+            # Load JIT config to determine if model needs features or audio
+            config_path = os.path.join(self.cache_dir, "ecapa_jit_config.json")
+            jit_config = {}
+            if os.path.exists(config_path):
+                with open(config_path, 'r') as f:
+                    jit_config = json.load(f)
+                logger.info(f"Loaded JIT config: input_type={jit_config.get('input_type', 'audio')}")
+
+            # Check if this JIT model needs features (v20.2.0 embedding-only model)
+            needs_features = jit_config.get("input_type") == "features"
+
+            # Load the JIT model
             self._jit_model = torch.jit.load(model_path, map_location=self.device)
             self._jit_model.eval()
 
-            # Run warmup inference
-            with torch.no_grad():
-                test_audio = torch.randn(1, 32000)
-                _ = self._jit_model(test_audio)
+            if needs_features:
+                # Set up torchaudio-based feature extraction (no SpeechBrain!)
+                logger.info("Setting up torchaudio feature extraction...")
+                import torchaudio
+                import torchaudio.transforms as T
+
+                n_mels = jit_config.get("n_mels", 80)
+                sample_rate = jit_config.get("sample_rate", 16000)
+                n_fft = jit_config.get("n_fft", 400)
+                hop_length = jit_config.get("hop_length", 160)
+                win_length = jit_config.get("win_length", 400)
+                f_min = jit_config.get("f_min", 20)
+                f_max = jit_config.get("f_max", 7600)
+
+                # Create MelSpectrogram transform
+                self._mel_transform = T.MelSpectrogram(
+                    sample_rate=sample_rate,
+                    n_fft=n_fft,
+                    hop_length=hop_length,
+                    win_length=win_length,
+                    n_mels=n_mels,
+                    f_min=f_min,
+                    f_max=f_max,
+                    power=2.0,
+                )
+
+                # Create amplitude to dB transform (log mel)
+                self._amplitude_to_db = T.AmplitudeToDB(stype='power', top_db=80)
+
+                self.requires_feature_extraction = True
+                logger.info(f"   MelSpec: {n_mels} mels, {sample_rate}Hz, hop={hop_length}")
+
+                # Run warmup with features
+                with torch.no_grad():
+                    test_audio = torch.randn(1, 32000)
+                    test_features = self._extract_features_torchaudio(test_audio)
+                    _ = self._jit_model(test_features)
+            else:
+                # Legacy: JIT model takes audio directly
+                self.requires_feature_extraction = False
+                self._mel_transform = None
+                self._amplitude_to_db = None
+
+                # Run warmup with audio
+                with torch.no_grad():
+                    test_audio = torch.randn(1, 32000)
+                    _ = self._jit_model(test_audio)
 
             self.load_time_ms = (time.time() - start) * 1000
             self.model_size_mb = os.path.getsize(model_path) / (1024 * 1024)
-            self.requires_feature_extraction = False  # Full pipeline JIT
 
             logger.info(f"JIT model loaded in {self.load_time_ms:.1f}ms ({self.model_size_mb:.2f} MB)")
+            logger.info(f"   Feature extraction: {'torchaudio' if needs_features else 'built-in'}")
             return True
 
         except Exception as e:
             logger.error(f"Failed to load JIT model: {e}")
             logger.debug(traceback.format_exc())
             return False
+
+    def _extract_features_torchaudio(self, audio: torch.Tensor) -> torch.Tensor:
+        """
+        Extract mel features using torchaudio (no SpeechBrain dependency).
+
+        Args:
+            audio: Raw audio [batch, samples]
+
+        Returns:
+            Mel features [batch, time, n_mels]
+        """
+        if self._mel_transform is None:
+            raise RuntimeError("MelSpectrogram transform not initialized")
+
+        # Ensure audio is 2D: [batch, samples]
+        if audio.dim() == 1:
+            audio = audio.unsqueeze(0)
+
+        # Compute mel spectrogram: [batch, n_mels, time]
+        mel = self._mel_transform(audio)
+
+        # Convert to log scale (dB)
+        mel_db = self._amplitude_to_db(mel)
+
+        # Transpose to [batch, time, n_mels] for ECAPA model
+        mel_db = mel_db.transpose(1, 2)
+
+        # Apply simple normalization (mean/var norm approximation)
+        mel_db = (mel_db - mel_db.mean(dim=1, keepdim=True)) / (mel_db.std(dim=1, keepdim=True) + 1e-6)
+
+        return mel_db
 
     def load_onnx_model(self, model_path: str) -> bool:
         """Load an ONNX model with ONNXRuntime."""
@@ -793,10 +888,16 @@ class OptimizedModelLoader:
         Extract speaker embedding from audio.
 
         Automatically uses the loaded optimized model.
+        v20.2.0: JIT models use torchaudio for feature extraction.
         """
         with torch.no_grad():
             if self.active_strategy in ["jit_trace", "jit_script"]:
-                return self._jit_model(audio).squeeze()
+                # v20.2.0: JIT model may need features, not raw audio
+                if self.requires_feature_extraction and self._mel_transform is not None:
+                    features = self._extract_features_torchaudio(audio)
+                    return self._jit_model(features).squeeze()
+                else:
+                    return self._jit_model(audio).squeeze()
 
             elif self.active_strategy == "onnx":
                 audio_np = audio.numpy() if isinstance(audio, torch.Tensor) else audio
