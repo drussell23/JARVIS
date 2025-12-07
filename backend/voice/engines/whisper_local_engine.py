@@ -102,8 +102,9 @@ class WhisperLocalEngine(BaseSTTEngine):
 
         try:
             # Ensure audio is in proper format
-            from voice.audio_format_converter import prepare_audio_for_stt
-            audio_data = prepare_audio_for_stt(audio_data)
+            # CRITICAL FIX: Use async version to avoid blocking event loop during FFmpeg transcoding
+            from voice.audio_format_converter import prepare_audio_for_stt_async
+            audio_data = await prepare_audio_for_stt_async(audio_data)
 
             # Convert audio bytes to numpy array
             audio_array = await self._bytes_to_audio_array(audio_data)

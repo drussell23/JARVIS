@@ -1681,15 +1681,16 @@ class IntelligentVoiceUnlockService:
         )
 
         # Convert audio to proper format with error handling
+        # CRITICAL FIX: Use async version to avoid blocking event loop during FFmpeg transcoding
         try:
-            from voice.audio_format_converter import prepare_audio_for_stt
-            audio_data = prepare_audio_for_stt(audio_data)
+            from voice.audio_format_converter import prepare_audio_for_stt_async
+            audio_data = await prepare_audio_for_stt_async(audio_data)
             diagnostics.audio_size_bytes = len(audio_data) if audio_data else 0
             logger.info(f"📊 Audio prepared: {diagnostics.audio_size_bytes} bytes")
 
             stage_audio_prep.complete(
                 success=True,
-                algorithm_used="prepare_audio_for_stt",
+                algorithm_used="prepare_audio_for_stt_async",
                 input_size_bytes=stage_audio_prep.metadata.get('input_size_raw', 0),
                 output_size_bytes=diagnostics.audio_size_bytes
             )
