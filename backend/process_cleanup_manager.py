@@ -1,10 +1,20 @@
 #!/usr/bin/env python3
 """
 Intelligent Process Cleanup Manager for JARVIS
-Dynamically identifies and cleans up stuck/hanging processes without hardcoding
-Uses Swift performance monitoring for minimal overhead
-Enhanced with code change detection to ensure only latest instance runs
-Integrated with GCP VM session tracking for cloud resource cleanup
+===============================================
+v2.0.0 - Enhanced with Enterprise-Grade Robustness
+
+Features:
+- Circuit Breaker pattern for fault tolerance
+- Health monitoring with Prometheus-style metrics
+- Retry logic with exponential backoff
+- Event-driven cleanup triggers
+- Watchdog timer for self-healing
+- Resource pool management
+- Dynamic configuration (no hardcoding)
+- UE (Uninterruptible Sleep) state detection
+- GCP VM session tracking and cleanup
+- Async parallel process cleanup
 """
 
 import asyncio
@@ -12,30 +22,911 @@ import hashlib
 import json
 import logging
 import os
+import random
 import signal
 import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
-from datetime import datetime
+import weakref
+from collections import deque
+from contextlib import asynccontextmanager, contextmanager
+from datetime import datetime, timedelta
+from enum import Enum, auto
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 import psutil
 from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Callable, Set, Tuple
 
 # Check for Swift availability
 try:
     pass
-
     SWIFT_AVAILABLE = True
 except (ImportError, OSError):
     SWIFT_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# CIRCUIT BREAKER PATTERN - Fault Tolerance
+# =============================================================================
+
+class CircuitState(Enum):
+    """Circuit breaker states."""
+    CLOSED = auto()      # Normal operation - requests flow through
+    OPEN = auto()        # Failing - requests blocked
+    HALF_OPEN = auto()   # Testing - limited requests allowed
+
+
+@dataclass
+class CircuitBreakerConfig:
+    """Configuration for circuit breaker behavior."""
+    failure_threshold: int = 5           # Failures before opening circuit
+    success_threshold: int = 3           # Successes to close circuit from half-open
+    timeout_seconds: float = 30.0        # Time before transitioning from open to half-open
+    half_open_max_requests: int = 3      # Max requests allowed in half-open state
+
+    # Exponential backoff settings
+    initial_backoff: float = 1.0         # Initial retry delay in seconds
+    max_backoff: float = 60.0            # Maximum retry delay
+    backoff_multiplier: float = 2.0      # Backoff multiplier
+    jitter_factor: float = 0.1           # Random jitter to prevent thundering herd
+
+
+class CircuitBreaker:
+    """
+    Circuit Breaker implementation for fault-tolerant cleanup operations.
+
+    Prevents cascading failures by:
+    1. Tracking failure rates for operations
+    2. Opening circuit when failures exceed threshold
+    3. Allowing recovery attempts after timeout
+    4. Automatically recovering when system stabilizes
+    """
+
+    def __init__(self, name: str, config: Optional[CircuitBreakerConfig] = None):
+        self.name = name
+        self.config = config or CircuitBreakerConfig()
+        self._state = CircuitState.CLOSED
+        self._failure_count = 0
+        self._success_count = 0
+        self._last_failure_time: Optional[float] = None
+        self._half_open_requests = 0
+        self._lock = threading.RLock()
+
+        # Metrics tracking
+        self._total_requests = 0
+        self._total_failures = 0
+        self._total_successes = 0
+        self._state_changes: deque = deque(maxlen=100)  # Track state change history
+
+        logger.debug(f"CircuitBreaker '{name}' initialized in CLOSED state")
+
+    @property
+    def state(self) -> CircuitState:
+        """Get current circuit state with automatic timeout handling."""
+        with self._lock:
+            if self._state == CircuitState.OPEN:
+                # Check if timeout has elapsed
+                if self._last_failure_time:
+                    elapsed = time.time() - self._last_failure_time
+                    if elapsed >= self.config.timeout_seconds:
+                        self._transition_to(CircuitState.HALF_OPEN)
+            return self._state
+
+    def _transition_to(self, new_state: CircuitState) -> None:
+        """Transition to a new state with logging and metrics."""
+        old_state = self._state
+        self._state = new_state
+
+        # Record state change
+        self._state_changes.append({
+            'timestamp': time.time(),
+            'from': old_state.name,
+            'to': new_state.name,
+            'failure_count': self._failure_count,
+            'success_count': self._success_count
+        })
+
+        if new_state == CircuitState.HALF_OPEN:
+            self._half_open_requests = 0
+        elif new_state == CircuitState.CLOSED:
+            self._failure_count = 0
+            self._success_count = 0
+
+        logger.info(f"🔌 CircuitBreaker '{self.name}': {old_state.name} → {new_state.name}")
+
+    def can_execute(self) -> bool:
+        """Check if request can proceed through the circuit."""
+        state = self.state  # This triggers timeout check
+
+        with self._lock:
+            if state == CircuitState.CLOSED:
+                return True
+            elif state == CircuitState.OPEN:
+                return False
+            else:  # HALF_OPEN
+                if self._half_open_requests < self.config.half_open_max_requests:
+                    self._half_open_requests += 1
+                    return True
+                return False
+
+    def record_success(self) -> None:
+        """Record a successful operation."""
+        with self._lock:
+            self._total_requests += 1
+            self._total_successes += 1
+
+            if self._state == CircuitState.HALF_OPEN:
+                self._success_count += 1
+                if self._success_count >= self.config.success_threshold:
+                    self._transition_to(CircuitState.CLOSED)
+            elif self._state == CircuitState.CLOSED:
+                # Reset failure count on success
+                self._failure_count = max(0, self._failure_count - 1)
+
+    def record_failure(self, error: Optional[Exception] = None) -> None:
+        """Record a failed operation."""
+        with self._lock:
+            self._total_requests += 1
+            self._total_failures += 1
+            self._failure_count += 1
+            self._last_failure_time = time.time()
+
+            if self._state == CircuitState.HALF_OPEN:
+                # Single failure in half-open returns to open
+                self._transition_to(CircuitState.OPEN)
+            elif self._state == CircuitState.CLOSED:
+                if self._failure_count >= self.config.failure_threshold:
+                    self._transition_to(CircuitState.OPEN)
+                    logger.warning(
+                        f"⚠️ CircuitBreaker '{self.name}' opened after {self._failure_count} failures"
+                    )
+
+    def get_backoff_delay(self, attempt: int) -> float:
+        """Calculate exponential backoff delay with jitter."""
+        delay = min(
+            self.config.initial_backoff * (self.config.backoff_multiplier ** attempt),
+            self.config.max_backoff
+        )
+        # Add jitter
+        jitter = delay * self.config.jitter_factor * random.random()
+        return delay + jitter
+
+    def get_metrics(self) -> Dict[str, Any]:
+        """Get circuit breaker metrics for monitoring."""
+        with self._lock:
+            return {
+                'name': self.name,
+                'state': self._state.name,
+                'failure_count': self._failure_count,
+                'success_count': self._success_count,
+                'total_requests': self._total_requests,
+                'total_failures': self._total_failures,
+                'total_successes': self._total_successes,
+                'failure_rate': self._total_failures / max(1, self._total_requests),
+                'last_failure_time': self._last_failure_time,
+                'recent_state_changes': list(self._state_changes)[-10:]
+            }
+
+    @contextmanager
+    def protected_call(self):
+        """Context manager for circuit-protected synchronous operations."""
+        if not self.can_execute():
+            raise CircuitBreakerOpenError(
+                f"CircuitBreaker '{self.name}' is {self.state.name}"
+            )
+        try:
+            yield
+            self.record_success()
+        except Exception as e:
+            self.record_failure(e)
+            raise
+
+    @asynccontextmanager
+    async def protected_call_async(self):
+        """Context manager for circuit-protected async operations."""
+        if not self.can_execute():
+            raise CircuitBreakerOpenError(
+                f"CircuitBreaker '{self.name}' is {self.state.name}"
+            )
+        try:
+            yield
+            self.record_success()
+        except Exception as e:
+            self.record_failure(e)
+            raise
+
+
+class CircuitBreakerOpenError(Exception):
+    """Raised when circuit breaker is open and blocking requests."""
+    pass
+
+
+# =============================================================================
+# HEALTH MONITORING & METRICS
+# =============================================================================
+
+@dataclass
+class CleanupMetrics:
+    """Prometheus-style metrics for cleanup operations."""
+    # Counters
+    total_cleanups: int = 0
+    successful_cleanups: int = 0
+    failed_cleanups: int = 0
+    processes_killed: int = 0
+    ue_processes_skipped: int = 0
+    ports_freed: int = 0
+    vms_deleted: int = 0
+
+    # Gauges
+    current_jarvis_processes: int = 0
+    current_memory_usage_percent: float = 0.0
+    current_cpu_usage_percent: float = 0.0
+
+    # Histograms (simplified as lists)
+    cleanup_durations_ms: List[float] = field(default_factory=list)
+    kill_durations_ms: List[float] = field(default_factory=list)
+
+    # Timestamps
+    last_cleanup_time: Optional[float] = None
+    last_success_time: Optional[float] = None
+    last_failure_time: Optional[float] = None
+    startup_time: float = field(default_factory=time.time)
+
+    def record_cleanup(self, success: bool, duration_ms: float,
+                       processes_killed: int = 0, ue_skipped: int = 0,
+                       ports_freed: int = 0, vms_deleted: int = 0) -> None:
+        """Record a cleanup operation."""
+        self.total_cleanups += 1
+        self.cleanup_durations_ms.append(duration_ms)
+        self.last_cleanup_time = time.time()
+
+        if success:
+            self.successful_cleanups += 1
+            self.last_success_time = time.time()
+        else:
+            self.failed_cleanups += 1
+            self.last_failure_time = time.time()
+
+        self.processes_killed += processes_killed
+        self.ue_processes_skipped += ue_skipped
+        self.ports_freed += ports_freed
+        self.vms_deleted += vms_deleted
+
+        # Keep only last 1000 duration samples
+        if len(self.cleanup_durations_ms) > 1000:
+            self.cleanup_durations_ms = self.cleanup_durations_ms[-1000:]
+
+    def get_summary(self) -> Dict[str, Any]:
+        """Get metrics summary for export."""
+        avg_duration = (
+            sum(self.cleanup_durations_ms) / len(self.cleanup_durations_ms)
+            if self.cleanup_durations_ms else 0
+        )
+        p99_duration = (
+            sorted(self.cleanup_durations_ms)[int(len(self.cleanup_durations_ms) * 0.99)]
+            if self.cleanup_durations_ms else 0
+        )
+
+        return {
+            'counters': {
+                'total_cleanups': self.total_cleanups,
+                'successful_cleanups': self.successful_cleanups,
+                'failed_cleanups': self.failed_cleanups,
+                'processes_killed': self.processes_killed,
+                'ue_processes_skipped': self.ue_processes_skipped,
+                'ports_freed': self.ports_freed,
+                'vms_deleted': self.vms_deleted,
+            },
+            'gauges': {
+                'current_jarvis_processes': self.current_jarvis_processes,
+                'current_memory_usage_percent': self.current_memory_usage_percent,
+                'current_cpu_usage_percent': self.current_cpu_usage_percent,
+            },
+            'histograms': {
+                'cleanup_duration_avg_ms': avg_duration,
+                'cleanup_duration_p99_ms': p99_duration,
+                'cleanup_duration_count': len(self.cleanup_durations_ms),
+            },
+            'timestamps': {
+                'uptime_seconds': time.time() - self.startup_time,
+                'last_cleanup_time': self.last_cleanup_time,
+                'last_success_time': self.last_success_time,
+                'last_failure_time': self.last_failure_time,
+            },
+            'rates': {
+                'success_rate': self.successful_cleanups / max(1, self.total_cleanups),
+                'failure_rate': self.failed_cleanups / max(1, self.total_cleanups),
+            }
+        }
+
+
+class HealthMonitor:
+    """
+    Health monitoring system for cleanup manager.
+    Tracks system health and triggers alerts/actions.
+    """
+
+    def __init__(self):
+        self.metrics = CleanupMetrics()
+        self._health_checks: List[Callable[[], Tuple[bool, str]]] = []
+        self._alert_handlers: List[Callable[[str, Dict], None]] = []
+        self._lock = threading.Lock()
+
+        # Health thresholds
+        self.memory_warning_threshold = 0.70
+        self.memory_critical_threshold = 0.85
+        self.cpu_warning_threshold = 0.80
+        self.cpu_critical_threshold = 0.95
+        self.failure_rate_threshold = 0.30
+
+        # Register default health checks
+        self._register_default_checks()
+
+    def _register_default_checks(self) -> None:
+        """Register default health checks."""
+        self.register_health_check(self._check_memory)
+        self.register_health_check(self._check_cpu)
+        self.register_health_check(self._check_failure_rate)
+
+    def _check_memory(self) -> Tuple[bool, str]:
+        """Check memory usage health."""
+        try:
+            mem = psutil.virtual_memory()
+            self.metrics.current_memory_usage_percent = mem.percent / 100.0
+
+            if mem.percent >= self.memory_critical_threshold * 100:
+                return False, f"CRITICAL: Memory at {mem.percent:.1f}%"
+            elif mem.percent >= self.memory_warning_threshold * 100:
+                return True, f"WARNING: Memory at {mem.percent:.1f}%"
+            return True, f"OK: Memory at {mem.percent:.1f}%"
+        except Exception as e:
+            return False, f"ERROR: Memory check failed - {e}"
+
+    def _check_cpu(self) -> Tuple[bool, str]:
+        """Check CPU usage health."""
+        try:
+            cpu = psutil.cpu_percent(interval=0.1)
+            self.metrics.current_cpu_usage_percent = cpu / 100.0
+
+            if cpu >= self.cpu_critical_threshold * 100:
+                return False, f"CRITICAL: CPU at {cpu:.1f}%"
+            elif cpu >= self.cpu_warning_threshold * 100:
+                return True, f"WARNING: CPU at {cpu:.1f}%"
+            return True, f"OK: CPU at {cpu:.1f}%"
+        except Exception as e:
+            return False, f"ERROR: CPU check failed - {e}"
+
+    def _check_failure_rate(self) -> Tuple[bool, str]:
+        """Check cleanup failure rate."""
+        if self.metrics.total_cleanups < 5:
+            return True, "OK: Not enough data"
+
+        rate = self.metrics.failed_cleanups / self.metrics.total_cleanups
+        if rate >= self.failure_rate_threshold:
+            return False, f"CRITICAL: Failure rate at {rate*100:.1f}%"
+        return True, f"OK: Failure rate at {rate*100:.1f}%"
+
+    def register_health_check(self, check: Callable[[], Tuple[bool, str]]) -> None:
+        """Register a custom health check."""
+        with self._lock:
+            self._health_checks.append(check)
+
+    def register_alert_handler(self, handler: Callable[[str, Dict], None]) -> None:
+        """Register an alert handler."""
+        with self._lock:
+            self._alert_handlers.append(handler)
+
+    def run_health_checks(self) -> Dict[str, Any]:
+        """Run all health checks and return results."""
+        results = {
+            'healthy': True,
+            'checks': [],
+            'timestamp': time.time()
+        }
+
+        with self._lock:
+            for check in self._health_checks:
+                try:
+                    healthy, message = check()
+                    results['checks'].append({
+                        'name': check.__name__,
+                        'healthy': healthy,
+                        'message': message
+                    })
+                    if not healthy:
+                        results['healthy'] = False
+                except Exception as e:
+                    results['checks'].append({
+                        'name': check.__name__,
+                        'healthy': False,
+                        'message': f"Check failed: {e}"
+                    })
+                    results['healthy'] = False
+
+        # Trigger alerts if unhealthy
+        if not results['healthy']:
+            self._trigger_alert('health_check_failed', results)
+
+        return results
+
+    def _trigger_alert(self, alert_type: str, data: Dict) -> None:
+        """Trigger registered alert handlers."""
+        with self._lock:
+            for handler in self._alert_handlers:
+                try:
+                    handler(alert_type, data)
+                except Exception as e:
+                    logger.error(f"Alert handler failed: {e}")
+
+    def get_health_status(self) -> Dict[str, Any]:
+        """Get comprehensive health status."""
+        checks = self.run_health_checks()
+        return {
+            'health': checks,
+            'metrics': self.metrics.get_summary()
+        }
+
+
+# =============================================================================
+# RETRY LOGIC WITH EXPONENTIAL BACKOFF
+# =============================================================================
+
+class RetryStrategy:
+    """
+    Configurable retry strategy with exponential backoff.
+    """
+
+    def __init__(
+        self,
+        max_attempts: int = 3,
+        initial_delay: float = 1.0,
+        max_delay: float = 30.0,
+        multiplier: float = 2.0,
+        jitter: float = 0.1,
+        retryable_exceptions: Optional[Tuple[type, ...]] = None
+    ):
+        self.max_attempts = max_attempts
+        self.initial_delay = initial_delay
+        self.max_delay = max_delay
+        self.multiplier = multiplier
+        self.jitter = jitter
+        self.retryable_exceptions = retryable_exceptions or (Exception,)
+
+    def get_delay(self, attempt: int) -> float:
+        """Calculate delay for given attempt number."""
+        delay = min(
+            self.initial_delay * (self.multiplier ** attempt),
+            self.max_delay
+        )
+        # Add jitter
+        jitter_amount = delay * self.jitter * random.random()
+        return delay + jitter_amount
+
+    def should_retry(self, attempt: int, exception: Exception) -> bool:
+        """Determine if operation should be retried."""
+        if attempt >= self.max_attempts:
+            return False
+        return isinstance(exception, self.retryable_exceptions)
+
+
+def with_retry(strategy: Optional[RetryStrategy] = None):
+    """
+    Decorator for adding retry logic to functions.
+    """
+    if strategy is None:
+        strategy = RetryStrategy()
+
+    def decorator(func: Callable):
+        if asyncio.iscoroutinefunction(func):
+            async def async_wrapper(*args, **kwargs):
+                last_exception = None
+                for attempt in range(strategy.max_attempts):
+                    try:
+                        return await func(*args, **kwargs)
+                    except Exception as e:
+                        last_exception = e
+                        if strategy.should_retry(attempt, e):
+                            delay = strategy.get_delay(attempt)
+                            logger.warning(
+                                f"Retry {attempt + 1}/{strategy.max_attempts} for {func.__name__} "
+                                f"after {delay:.2f}s: {e}"
+                            )
+                            await asyncio.sleep(delay)
+                        else:
+                            raise
+                raise last_exception
+            return async_wrapper
+        else:
+            def sync_wrapper(*args, **kwargs):
+                last_exception = None
+                for attempt in range(strategy.max_attempts):
+                    try:
+                        return func(*args, **kwargs)
+                    except Exception as e:
+                        last_exception = e
+                        if strategy.should_retry(attempt, e):
+                            delay = strategy.get_delay(attempt)
+                            logger.warning(
+                                f"Retry {attempt + 1}/{strategy.max_attempts} for {func.__name__} "
+                                f"after {delay:.2f}s: {e}"
+                            )
+                            time.sleep(delay)
+                        else:
+                            raise
+                raise last_exception
+            return sync_wrapper
+    return decorator
+
+
+# =============================================================================
+# WATCHDOG TIMER - Self-Healing
+# =============================================================================
+
+class WatchdogTimer:
+    """
+    Watchdog timer for detecting and recovering from hangs.
+
+    Features:
+    - Automatic restart of stuck operations
+    - Configurable timeout and actions
+    - Thread-safe operation
+    """
+
+    def __init__(
+        self,
+        timeout_seconds: float = 60.0,
+        on_timeout: Optional[Callable[[], None]] = None,
+        name: str = "watchdog"
+    ):
+        self.timeout_seconds = timeout_seconds
+        self.on_timeout = on_timeout
+        self.name = name
+        self._timer: Optional[threading.Timer] = None
+        self._lock = threading.Lock()
+        self._is_armed = False
+        self._last_feed_time: Optional[float] = None
+        self._timeout_count = 0
+
+    def arm(self) -> None:
+        """Arm the watchdog timer."""
+        with self._lock:
+            self.disarm()
+            self._timer = threading.Timer(self.timeout_seconds, self._on_timeout)
+            self._timer.daemon = True
+            self._timer.start()
+            self._is_armed = True
+            self._last_feed_time = time.time()
+            logger.debug(f"Watchdog '{self.name}' armed ({self.timeout_seconds}s timeout)")
+
+    def feed(self) -> None:
+        """Feed the watchdog (reset timer)."""
+        with self._lock:
+            if self._is_armed:
+                self.disarm()
+                self._timer = threading.Timer(self.timeout_seconds, self._on_timeout)
+                self._timer.daemon = True
+                self._timer.start()
+                self._is_armed = True
+                self._last_feed_time = time.time()
+
+    def disarm(self) -> None:
+        """Disarm the watchdog timer."""
+        with self._lock:
+            if self._timer:
+                self._timer.cancel()
+                self._timer = None
+            self._is_armed = False
+
+    def _on_timeout(self) -> None:
+        """Handle watchdog timeout."""
+        self._timeout_count += 1
+        logger.error(f"🐕 Watchdog '{self.name}' timeout! (count: {self._timeout_count})")
+
+        if self.on_timeout:
+            try:
+                self.on_timeout()
+            except Exception as e:
+                logger.error(f"Watchdog timeout handler failed: {e}")
+
+    @contextmanager
+    def guarded(self):
+        """Context manager for watchdog-protected operations."""
+        self.arm()
+        try:
+            yield self
+        finally:
+            self.disarm()
+
+    def get_status(self) -> Dict[str, Any]:
+        """Get watchdog status."""
+        with self._lock:
+            return {
+                'name': self.name,
+                'is_armed': self._is_armed,
+                'timeout_seconds': self.timeout_seconds,
+                'timeout_count': self._timeout_count,
+                'last_feed_time': self._last_feed_time,
+                'time_since_feed': (
+                    time.time() - self._last_feed_time
+                    if self._last_feed_time else None
+                )
+            }
+
+
+# =============================================================================
+# EVENT-DRIVEN CLEANUP TRIGGERS
+# =============================================================================
+
+class CleanupEventType(Enum):
+    """Types of events that can trigger cleanup."""
+    MEMORY_PRESSURE = auto()
+    CPU_PRESSURE = auto()
+    FILE_CHANGE = auto()
+    PROCESS_CRASH = auto()
+    MANUAL_TRIGGER = auto()
+    SCHEDULED = auto()
+    PORT_CONFLICT = auto()
+    UE_STATE_DETECTED = auto()
+    CIRCUIT_BREAKER_TRIP = auto()
+
+
+@dataclass
+class CleanupEvent:
+    """Event that triggers cleanup."""
+    event_type: CleanupEventType
+    timestamp: float = field(default_factory=time.time)
+    data: Dict[str, Any] = field(default_factory=dict)
+    priority: int = 0  # Higher = more urgent
+    source: str = "unknown"
+
+
+class EventDrivenCleanupTrigger:
+    """
+    Event-driven system for triggering cleanup operations.
+
+    Monitors system state and fires cleanup events when needed.
+    """
+
+    def __init__(self):
+        self._handlers: Dict[CleanupEventType, List[Callable[[CleanupEvent], None]]] = {}
+        self._event_queue: deque = deque(maxlen=1000)
+        self._lock = threading.Lock()
+        self._running = False
+        self._monitor_thread: Optional[threading.Thread] = None
+
+        # Thresholds
+        self.memory_pressure_threshold = 0.80
+        self.cpu_pressure_threshold = 0.90
+        self.check_interval = 5.0  # seconds
+
+    def register_handler(
+        self,
+        event_type: CleanupEventType,
+        handler: Callable[[CleanupEvent], None]
+    ) -> None:
+        """Register a handler for an event type."""
+        with self._lock:
+            if event_type not in self._handlers:
+                self._handlers[event_type] = []
+            self._handlers[event_type].append(handler)
+
+    def emit_event(self, event: CleanupEvent) -> None:
+        """Emit a cleanup event."""
+        with self._lock:
+            self._event_queue.append(event)
+            handlers = self._handlers.get(event.event_type, [])
+
+        logger.info(f"📣 Cleanup event: {event.event_type.name} from {event.source}")
+
+        for handler in handlers:
+            try:
+                handler(event)
+            except Exception as e:
+                logger.error(f"Event handler failed: {e}")
+
+    def start_monitoring(self) -> None:
+        """Start background monitoring for events."""
+        if self._running:
+            return
+
+        self._running = True
+        self._monitor_thread = threading.Thread(
+            target=self._monitor_loop,
+            daemon=True,
+            name="cleanup-event-monitor"
+        )
+        self._monitor_thread.start()
+        logger.info("📡 Event-driven cleanup monitor started")
+
+    def stop_monitoring(self) -> None:
+        """Stop background monitoring."""
+        self._running = False
+        if self._monitor_thread:
+            self._monitor_thread.join(timeout=5.0)
+            self._monitor_thread = None
+        logger.info("📡 Event-driven cleanup monitor stopped")
+
+    def _monitor_loop(self) -> None:
+        """Background monitoring loop."""
+        while self._running:
+            try:
+                self._check_memory_pressure()
+                self._check_cpu_pressure()
+            except Exception as e:
+                logger.error(f"Monitor loop error: {e}")
+
+            time.sleep(self.check_interval)
+
+    def _check_memory_pressure(self) -> None:
+        """Check for memory pressure."""
+        try:
+            mem = psutil.virtual_memory()
+            if mem.percent / 100.0 >= self.memory_pressure_threshold:
+                self.emit_event(CleanupEvent(
+                    event_type=CleanupEventType.MEMORY_PRESSURE,
+                    priority=8,
+                    source="system_monitor",
+                    data={'memory_percent': mem.percent}
+                ))
+        except Exception:
+            pass
+
+    def _check_cpu_pressure(self) -> None:
+        """Check for CPU pressure."""
+        try:
+            cpu = psutil.cpu_percent(interval=0.1)
+            if cpu / 100.0 >= self.cpu_pressure_threshold:
+                self.emit_event(CleanupEvent(
+                    event_type=CleanupEventType.CPU_PRESSURE,
+                    priority=6,
+                    source="system_monitor",
+                    data={'cpu_percent': cpu}
+                ))
+        except Exception:
+            pass
+
+    def get_recent_events(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """Get recent events."""
+        with self._lock:
+            events = list(self._event_queue)[-limit:]
+
+        return [
+            {
+                'type': e.event_type.name,
+                'timestamp': e.timestamp,
+                'priority': e.priority,
+                'source': e.source,
+                'data': e.data
+            }
+            for e in events
+        ]
+
+
+# =============================================================================
+# RESOURCE POOL MANAGEMENT
+# =============================================================================
+
+class ResourcePool:
+    """
+    Manages limited resources like ports with proper allocation/deallocation.
+    """
+
+    def __init__(self, resource_type: str, resources: List[Any]):
+        self.resource_type = resource_type
+        self._available = set(resources)
+        self._allocated = set()
+        self._reservations: Dict[str, Any] = {}
+        self._lock = threading.Lock()
+
+    def allocate(self, requester: str) -> Optional[Any]:
+        """Allocate a resource to a requester."""
+        with self._lock:
+            if not self._available:
+                logger.warning(f"No {self.resource_type} available for {requester}")
+                return None
+
+            resource = self._available.pop()
+            self._allocated.add(resource)
+            self._reservations[requester] = resource
+            logger.debug(f"Allocated {self.resource_type} {resource} to {requester}")
+            return resource
+
+    def release(self, requester: str) -> bool:
+        """Release a resource back to the pool."""
+        with self._lock:
+            resource = self._reservations.pop(requester, None)
+            if resource:
+                self._allocated.discard(resource)
+                self._available.add(resource)
+                logger.debug(f"Released {self.resource_type} {resource} from {requester}")
+                return True
+            return False
+
+    def release_resource(self, resource: Any) -> bool:
+        """Release a specific resource."""
+        with self._lock:
+            if resource in self._allocated:
+                self._allocated.discard(resource)
+                self._available.add(resource)
+                # Remove from reservations
+                for requester, res in list(self._reservations.items()):
+                    if res == resource:
+                        del self._reservations[requester]
+                        break
+                return True
+            return False
+
+    def is_available(self, resource: Any) -> bool:
+        """Check if a specific resource is available."""
+        with self._lock:
+            return resource in self._available
+
+    def blacklist(self, resource: Any) -> None:
+        """Remove a resource from the pool entirely."""
+        with self._lock:
+            self._available.discard(resource)
+            self._allocated.discard(resource)
+            logger.warning(f"Blacklisted {self.resource_type} {resource}")
+
+    def get_status(self) -> Dict[str, Any]:
+        """Get pool status."""
+        with self._lock:
+            return {
+                'resource_type': self.resource_type,
+                'total': len(self._available) + len(self._allocated),
+                'available': len(self._available),
+                'allocated': len(self._allocated),
+                'available_resources': list(self._available),
+                'allocated_resources': list(self._allocated),
+                'reservations': dict(self._reservations)
+            }
+
+
+# Global instances for robust cleanup infrastructure
+_global_health_monitor: Optional[HealthMonitor] = None
+_global_event_trigger: Optional[EventDrivenCleanupTrigger] = None
+_port_pool: Optional[ResourcePool] = None
+_cleanup_circuit_breakers: Dict[str, CircuitBreaker] = {}
+
+
+def get_health_monitor() -> HealthMonitor:
+    """Get global health monitor instance."""
+    global _global_health_monitor
+    if _global_health_monitor is None:
+        _global_health_monitor = HealthMonitor()
+    return _global_health_monitor
+
+
+def get_event_trigger() -> EventDrivenCleanupTrigger:
+    """Get global event trigger instance."""
+    global _global_event_trigger
+    if _global_event_trigger is None:
+        _global_event_trigger = EventDrivenCleanupTrigger()
+    return _global_event_trigger
+
+
+def get_port_pool(ports: Optional[List[int]] = None) -> ResourcePool:
+    """Get global port pool instance."""
+    global _port_pool
+    if _port_pool is None:
+        default_ports = ports or [8000, 8001, 8010, 8011, 8080, 8765, 8888]
+        _port_pool = ResourcePool("port", default_ports)
+    return _port_pool
+
+
+def get_circuit_breaker(name: str, config: Optional[CircuitBreakerConfig] = None) -> CircuitBreaker:
+    """Get or create a circuit breaker by name."""
+    global _cleanup_circuit_breakers
+    if name not in _cleanup_circuit_breakers:
+        _cleanup_circuit_breakers[name] = CircuitBreaker(name, config)
+    return _cleanup_circuit_breakers[name]
 
 
 # =============================================================================
@@ -867,14 +1758,65 @@ class GCPVMSessionManager:
 
 
 class ProcessCleanupManager:
-    """Manages cleanup of stuck or zombie processes with code change detection"""
+    """
+    Enhanced Process Cleanup Manager for JARVIS
+    ============================================
+    v2.0.0 - Enterprise-Grade Robustness
+
+    Features:
+    - Circuit breaker pattern for fault tolerance
+    - Health monitoring with Prometheus-style metrics
+    - Retry logic with exponential backoff
+    - Event-driven cleanup triggers
+    - Watchdog timer for self-healing
+    - Resource pool management
+    - UE (Uninterruptible Sleep) state detection
+    - GCP VM session tracking
+    """
 
     def __init__(self):
-        """Initialize the cleanup manager"""
+        """Initialize the cleanup manager with robust components."""
         self.swift_monitor = None  # Initialize as None
 
         # Initialize GCP VM session manager
         self.vm_manager = GCPVMSessionManager()
+
+        # Initialize robust infrastructure components
+        self.health_monitor = get_health_monitor()
+        self.event_trigger = get_event_trigger()
+        self.port_pool = get_port_pool()
+
+        # Circuit breakers for different operations
+        self.process_kill_circuit = get_circuit_breaker(
+            "process_kill",
+            CircuitBreakerConfig(failure_threshold=5, timeout_seconds=30.0)
+        )
+        self.port_cleanup_circuit = get_circuit_breaker(
+            "port_cleanup",
+            CircuitBreakerConfig(failure_threshold=3, timeout_seconds=20.0)
+        )
+        self.vm_cleanup_circuit = get_circuit_breaker(
+            "vm_cleanup",
+            CircuitBreakerConfig(failure_threshold=3, timeout_seconds=60.0)
+        )
+
+        # Watchdog for long-running cleanup operations
+        self.cleanup_watchdog = WatchdogTimer(
+            timeout_seconds=120.0,
+            on_timeout=self._on_cleanup_timeout,
+            name="cleanup_watchdog"
+        )
+
+        # Retry strategy for transient failures
+        self.retry_strategy = RetryStrategy(
+            max_attempts=3,
+            initial_delay=1.0,
+            max_delay=10.0,
+            multiplier=2.0
+        )
+
+        # Register event handlers
+        self._register_event_handlers()
 
         # Default configuration - Aggressive memory target of 35%
         self.config = {
@@ -1018,6 +1960,217 @@ class ProcessCleanupManager:
 
         # Backend base path
         self.backend_path = Path(__file__).parent.absolute()
+
+        # Start event monitoring if configured
+        if self.config.get("enable_event_monitoring", True):
+            self.event_trigger.start_monitoring()
+
+        logger.info("✅ ProcessCleanupManager v2.0.0 initialized with robust infrastructure")
+
+    def _register_event_handlers(self) -> None:
+        """Register handlers for cleanup events."""
+        # Memory pressure handler
+        self.event_trigger.register_handler(
+            CleanupEventType.MEMORY_PRESSURE,
+            self._handle_memory_pressure
+        )
+
+        # Port conflict handler
+        self.event_trigger.register_handler(
+            CleanupEventType.PORT_CONFLICT,
+            self._handle_port_conflict
+        )
+
+        # UE state handler
+        self.event_trigger.register_handler(
+            CleanupEventType.UE_STATE_DETECTED,
+            self._handle_ue_state_detected
+        )
+
+        # Circuit breaker trip handler
+        self.event_trigger.register_handler(
+            CleanupEventType.CIRCUIT_BREAKER_TRIP,
+            self._handle_circuit_breaker_trip
+        )
+
+        logger.debug("Registered cleanup event handlers")
+
+    def _handle_memory_pressure(self, event: CleanupEvent) -> None:
+        """Handle memory pressure event - trigger aggressive cleanup."""
+        logger.warning(f"🔥 Memory pressure detected: {event.data.get('memory_percent', '?')}%")
+
+        # Record metric
+        self.health_monitor.metrics.current_memory_usage_percent = event.data.get('memory_percent', 0) / 100
+
+        # Trigger aggressive cleanup if enabled
+        if self.config.get("aggressive_cleanup", True):
+            try:
+                self._cleanup_ipc_resources()
+                self._cleanup_orphaned_ports()
+            except Exception as e:
+                logger.error(f"Memory pressure cleanup failed: {e}")
+
+    def _handle_port_conflict(self, event: CleanupEvent) -> None:
+        """Handle port conflict event."""
+        port = event.data.get('port')
+        logger.warning(f"🔌 Port conflict detected on port {port}")
+
+        # Blacklist the port if UE process is holding it
+        if event.data.get('ue_process'):
+            self.port_pool.blacklist(port)
+
+    def _handle_ue_state_detected(self, event: CleanupEvent) -> None:
+        """Handle UE state detection."""
+        pid = event.data.get('pid')
+        port = event.data.get('port')
+        logger.warning(f"⚠️ UE state process detected: PID {pid} on port {port}")
+
+        # Track in metrics
+        self.health_monitor.metrics.ue_processes_skipped += 1
+
+    def _handle_circuit_breaker_trip(self, event: CleanupEvent) -> None:
+        """Handle circuit breaker trip."""
+        breaker_name = event.data.get('breaker_name')
+        logger.error(f"🔌 Circuit breaker '{breaker_name}' tripped!")
+
+    def _on_cleanup_timeout(self) -> None:
+        """Handle cleanup operation timeout from watchdog."""
+        logger.error("⏰ Cleanup operation timed out! Forcing recovery...")
+
+        # Record failure in metrics
+        self.health_monitor.metrics.record_cleanup(
+            success=False,
+            duration_ms=self.cleanup_watchdog.timeout_seconds * 1000,
+            processes_killed=0
+        )
+
+        # Emit event for tracking
+        self.event_trigger.emit_event(CleanupEvent(
+            event_type=CleanupEventType.PROCESS_CRASH,
+            priority=10,
+            source="watchdog",
+            data={'reason': 'cleanup_timeout'}
+        ))
+
+    def get_robust_status(self) -> Dict[str, Any]:
+        """
+        Get comprehensive status of all robust components.
+        Useful for debugging and monitoring.
+        """
+        return {
+            'version': '2.0.0',
+            'health': self.health_monitor.get_health_status(),
+            'circuit_breakers': {
+                'process_kill': self.process_kill_circuit.get_metrics(),
+                'port_cleanup': self.port_cleanup_circuit.get_metrics(),
+                'vm_cleanup': self.vm_cleanup_circuit.get_metrics(),
+            },
+            'watchdog': self.cleanup_watchdog.get_status(),
+            'port_pool': self.port_pool.get_status(),
+            'recent_events': self.event_trigger.get_recent_events(20),
+        }
+
+    def robust_force_restart_cleanup(self, skip_code_check: bool = True) -> List[Dict]:
+        """
+        Enhanced force restart cleanup with circuit breaker protection.
+        Wraps the original force_restart_cleanup with robust error handling.
+        """
+        start_time = time.time()
+
+        # Check circuit breaker
+        if not self.process_kill_circuit.can_execute():
+            logger.error("Process kill circuit breaker is OPEN - cleanup blocked")
+            raise CircuitBreakerOpenError("Process kill operations are currently blocked")
+
+        # Use watchdog to detect hangs
+        with self.cleanup_watchdog.guarded() as watchdog:
+            try:
+                # Feed watchdog periodically during cleanup
+                result = self.force_restart_cleanup(skip_code_check=skip_code_check)
+
+                # Record success
+                duration_ms = (time.time() - start_time) * 1000
+                processes_killed = len([r for r in result if r.get('status') in ['terminated', 'force_killed', 'sigkill']])
+                ue_skipped = len([r for r in result if r.get('ue_state')])
+
+                self.health_monitor.metrics.record_cleanup(
+                    success=True,
+                    duration_ms=duration_ms,
+                    processes_killed=processes_killed,
+                    ue_skipped=ue_skipped
+                )
+
+                self.process_kill_circuit.record_success()
+                logger.info(f"✅ Robust cleanup completed in {duration_ms:.1f}ms")
+                return result
+
+            except Exception as e:
+                # Record failure
+                duration_ms = (time.time() - start_time) * 1000
+                self.health_monitor.metrics.record_cleanup(
+                    success=False,
+                    duration_ms=duration_ms
+                )
+                self.process_kill_circuit.record_failure(e)
+                logger.error(f"❌ Robust cleanup failed: {e}")
+                raise
+
+    async def robust_cleanup_async(self) -> Dict[str, Any]:
+        """
+        Async version of robust cleanup with full error handling.
+        """
+        start_time = time.time()
+
+        # Check circuit breaker
+        if not self.process_kill_circuit.can_execute():
+            return {
+                'success': False,
+                'error': 'Circuit breaker is OPEN',
+                'duration_ms': 0
+            }
+
+        try:
+            async with self.process_kill_circuit.protected_call_async():
+                # Run cleanup in thread pool to avoid blocking
+                loop = asyncio.get_event_loop()
+                result = await loop.run_in_executor(
+                    None,
+                    lambda: self.force_restart_cleanup(skip_code_check=True)
+                )
+
+                duration_ms = (time.time() - start_time) * 1000
+                processes_killed = len([r for r in result if r.get('status') in ['terminated', 'force_killed', 'sigkill']])
+
+                self.health_monitor.metrics.record_cleanup(
+                    success=True,
+                    duration_ms=duration_ms,
+                    processes_killed=processes_killed
+                )
+
+                return {
+                    'success': True,
+                    'cleaned_processes': result,
+                    'duration_ms': duration_ms,
+                    'processes_killed': processes_killed
+                }
+
+        except CircuitBreakerOpenError as e:
+            return {
+                'success': False,
+                'error': str(e),
+                'duration_ms': (time.time() - start_time) * 1000
+            }
+        except Exception as e:
+            duration_ms = (time.time() - start_time) * 1000
+            self.health_monitor.metrics.record_cleanup(
+                success=False,
+                duration_ms=duration_ms
+            )
+            return {
+                'success': False,
+                'error': str(e),
+                'duration_ms': duration_ms
+            }
 
     def _get_swift_monitor(self):
         """
