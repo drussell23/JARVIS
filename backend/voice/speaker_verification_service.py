@@ -1303,7 +1303,12 @@ class VoiceProcessingCache:
 
     def _generate_key(self, audio_data: bytes, operation: str) -> str:
         """Generate cache key from audio fingerprint."""
-        audio_hash = hashlib.sha256(audio_data[:8000]).hexdigest()[:32]
+        # Handle both bytes and string input robustly
+        if isinstance(audio_data, str):
+            audio_bytes = audio_data.encode('utf-8')
+        else:
+            audio_bytes = audio_data
+        audio_hash = hashlib.sha256(audio_bytes[:8000]).hexdigest()[:32]
         return f"{operation}:{audio_hash}"
 
     def get(self, audio_data: bytes, operation: str) -> Optional[Dict[str, Any]]:
