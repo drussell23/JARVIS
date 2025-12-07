@@ -250,10 +250,19 @@ class CloudECAPAClientConfig:
     # Cloud Run URLs use format: https://{service}-{random_suffix}.a.run.app
     # The actual URL is discovered at deployment time and stored in env var
     # Default is the current deployed service URL
+    # Dynamic endpoint discovery - tries multiple known endpoints
+    # Updated 2024-12 to new Cloud Run URL format
     PRIMARY_ENDPOINT = os.getenv(
         "JARVIS_CLOUD_ML_ENDPOINT",
-        "https://jarvis-ml-pvalxny6iq-uc.a.run.app"
+        "https://jarvis-ml-888774109345.us-central1.run.app"
     )
+
+    # Fallback endpoints for redundancy (no hardcoding - all from env or discovery)
+    FALLBACK_ENDPOINTS = [
+        e.strip() for e in
+        os.getenv("JARVIS_CLOUD_ML_FALLBACK_ENDPOINTS", "").split(",")
+        if e.strip()
+    ]
 
     # Timeouts
     CONNECT_TIMEOUT = float(os.getenv("CLOUD_ECAPA_CONNECT_TIMEOUT", "5.0"))
@@ -836,26 +845,48 @@ class CloudECAPAClient:
         for endpoint in self._endpoints:
             self._circuit_breakers[endpoint] = EndpointCircuitBreaker(endpoint=endpoint)
 
-        # Create aiohttp session
+        # Create robust aiohttp session with enhanced connection handling
         try:
             import aiohttp
+            import ssl
 
             timeout = aiohttp.ClientTimeout(
                 total=CloudECAPAClientConfig.REQUEST_TIMEOUT,
                 connect=CloudECAPAClientConfig.CONNECT_TIMEOUT,
+                sock_read=CloudECAPAClientConfig.REQUEST_TIMEOUT,
+                sock_connect=CloudECAPAClientConfig.CONNECT_TIMEOUT,
             )
 
-            # Connection pooling
+            # Create SSL context for Cloud Run HTTPS
+            ssl_context = ssl.create_default_context()
+            ssl_context.check_hostname = True
+            ssl_context.verify_mode = ssl.CERT_REQUIRED
+
+            # Enhanced connection pooling with keepalive and auto-reconnect
             connector = aiohttp.TCPConnector(
-                limit=20,  # Max connections
-                limit_per_host=5,  # Max per endpoint
+                limit=30,  # Increased max connections
+                limit_per_host=10,  # Increased per-host limit
                 ttl_dns_cache=300,  # DNS cache TTL
+                ssl=ssl_context,  # Proper SSL handling
+                keepalive_timeout=30,  # Keep connections alive
+                enable_cleanup_closed=True,  # Clean up closed connections
+                force_close=False,  # Allow connection reuse
             )
 
             self._session = aiohttp.ClientSession(
                 timeout=timeout,
                 connector=connector,
+                headers={
+                    "User-Agent": f"JARVIS-CloudECAPA/{self.VERSION}",
+                    "Accept": "application/json",
+                    "Connection": "keep-alive",
+                },
             )
+
+            # Store session creation time for potential refresh
+            self._session_created_at = time.time()
+            self._session_max_age = 3600  # Refresh session every hour
+
         except ImportError:
             logger.error("aiohttp not available. Install with: pip install aiohttp")
             return False
@@ -1563,6 +1594,64 @@ class CloudECAPAClient:
             "threshold": threshold,
         }
 
+    async def _refresh_session_if_stale(self):
+        """Refresh HTTP session if it's too old or has connection issues."""
+        import aiohttp
+        import ssl
+
+        # Check if session needs refresh (older than max age)
+        if hasattr(self, '_session_created_at'):
+            session_age = time.time() - self._session_created_at
+            if session_age > getattr(self, '_session_max_age', 3600):
+                logger.info("🔄 Refreshing stale HTTP session...")
+                await self._recreate_session()
+
+    async def _recreate_session(self):
+        """Recreate the aiohttp session (fixes connection pool issues)."""
+        import aiohttp
+        import ssl
+
+        # Close old session if it exists
+        if self._session:
+            try:
+                await self._session.close()
+            except Exception:
+                pass
+
+        timeout = aiohttp.ClientTimeout(
+            total=CloudECAPAClientConfig.REQUEST_TIMEOUT,
+            connect=CloudECAPAClientConfig.CONNECT_TIMEOUT,
+            sock_read=CloudECAPAClientConfig.REQUEST_TIMEOUT,
+            sock_connect=CloudECAPAClientConfig.CONNECT_TIMEOUT,
+        )
+
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = True
+        ssl_context.verify_mode = ssl.CERT_REQUIRED
+
+        connector = aiohttp.TCPConnector(
+            limit=30,
+            limit_per_host=10,
+            ttl_dns_cache=300,
+            ssl=ssl_context,
+            keepalive_timeout=30,
+            enable_cleanup_closed=True,
+            force_close=False,
+        )
+
+        self._session = aiohttp.ClientSession(
+            timeout=timeout,
+            connector=connector,
+            headers={
+                "User-Agent": f"JARVIS-CloudECAPA/{self.VERSION}",
+                "Accept": "application/json",
+                "Connection": "keep-alive",
+            },
+        )
+
+        self._session_created_at = time.time()
+        logger.info("✅ HTTP session recreated successfully")
+
     async def _extract_from_endpoint(
         self,
         endpoint: str,
@@ -1570,9 +1659,14 @@ class CloudECAPAClient:
         sample_rate: int = 16000,
         format: str = "float32"
     ) -> Optional[np.ndarray]:
-        """Extract embedding from a specific endpoint with retries."""
+        """Extract embedding from a specific endpoint with robust error handling."""
+        import aiohttp
+
         if not self._session:
-            return None
+            await self._recreate_session()
+
+        # Check for stale session
+        await self._refresh_session_if_stale()
 
         # Construct the correct URL based on endpoint format
         # Cloud Run service has /api/ml/speaker_embedding as the extraction endpoint
@@ -1590,7 +1684,8 @@ class CloudECAPAClient:
             "format": format,
         }
 
-        # Retry with exponential backoff
+        # Retry with exponential backoff and connection error handling
+        last_error = None
         for attempt in range(1, CloudECAPAClientConfig.MAX_RETRIES + 1):
             try:
                 async with self._session.post(url, json=payload) as response:
@@ -1613,8 +1708,40 @@ class CloudECAPAClient:
                         error_text = await response.text()
                         raise ValueError(f"HTTP {response.status}: {error_text}")
 
-            except (asyncio.TimeoutError, ValueError) as e:
-                # Don't retry client errors or timeouts
+            except aiohttp.ServerDisconnectedError as e:
+                # Server disconnected - recreate session and retry
+                logger.warning(f"Server disconnected (attempt {attempt}), recreating session...")
+                await self._recreate_session()
+                last_error = e
+                if attempt < CloudECAPAClientConfig.MAX_RETRIES:
+                    await asyncio.sleep(1.0)  # Brief pause before retry
+                    self._stats["retries"] += 1
+                    continue
+
+            except aiohttp.ClientConnectorError as e:
+                # Connection error - retry with backoff
+                logger.warning(f"Connection error (attempt {attempt}): {e}")
+                last_error = e
+                if attempt < CloudECAPAClientConfig.MAX_RETRIES:
+                    backoff = min(
+                        CloudECAPAClientConfig.RETRY_BACKOFF_BASE * (2 ** (attempt - 1)),
+                        CloudECAPAClientConfig.RETRY_BACKOFF_MAX
+                    )
+                    await asyncio.sleep(backoff)
+                    self._stats["retries"] += 1
+                    continue
+
+            except asyncio.TimeoutError as e:
+                # Timeout - don't retry immediately, might be overloaded
+                logger.warning(f"Request timeout (attempt {attempt})")
+                last_error = e
+                if attempt < CloudECAPAClientConfig.MAX_RETRIES:
+                    await asyncio.sleep(2.0)  # Longer pause for timeout
+                    self._stats["retries"] += 1
+                    continue
+
+            except ValueError as e:
+                # Client error - don't retry
                 raise
             except Exception as e:
                 if attempt < CloudECAPAClientConfig.MAX_RETRIES:

@@ -426,6 +426,242 @@ class DynamicTimeoutManager:
         logger.info("🔄 Timeout manager reset to cold start state")
 
 
+# =============================================================================
+# PROGRESSIVE CONFIDENCE MESSENGER - Contextual voice feedback
+# =============================================================================
+
+@dataclass
+class AuthenticationContext:
+    """Context for generating personalized authentication messages."""
+    confidence: float
+    threshold: float
+    speaker_name: str
+    is_owner: bool
+    audio_quality: str = "good"  # good, fair, poor
+    time_of_day: str = "day"  # morning, afternoon, evening, night
+    is_first_unlock_today: bool = False
+    consecutive_failures: int = 0
+    voice_sounds_different: bool = False
+    background_noise_detected: bool = False
+    stt_confidence: float = 1.0
+
+
+class ProgressiveConfidenceMessenger:
+    """
+    Generates personalized, context-aware authentication messages.
+
+    Based on JARVIS Enhancement Strategy for voice realism:
+    - High Confidence (>90%): Natural, confident tone
+    - Good Confidence (85-90%): Slight acknowledgment
+    - Borderline (80-85%): Shows brief verification process
+    - Low Confidence (<80%): Helpful, not accusatory
+
+    Features:
+    - Time-of-day awareness
+    - Environmental awareness (background noise)
+    - Voice quality adaptation
+    - Failure handling with recovery suggestions
+    - Learning acknowledgment
+    """
+
+    # Confidence level thresholds
+    HIGH_CONFIDENCE = 0.90
+    GOOD_CONFIDENCE = 0.85
+    BORDERLINE_CONFIDENCE = 0.80
+
+    # Time-based greetings (no hardcoding - these are templates)
+    TIME_GREETINGS = {
+        "morning": ["Good morning", "Morning"],
+        "afternoon": ["Good afternoon"],
+        "evening": ["Good evening"],
+        "night": ["Working late?", "Up late"],
+    }
+
+    def __init__(self):
+        self._unlock_count = 0
+        self._last_unlock_time: Optional[datetime] = None
+        self._consecutive_failures = 0
+        self._voice_adaptation_count = 0
+
+    def get_time_of_day(self) -> str:
+        """Determine time of day from current hour."""
+        hour = datetime.now().hour
+        if 5 <= hour < 12:
+            return "morning"
+        elif 12 <= hour < 17:
+            return "afternoon"
+        elif 17 <= hour < 21:
+            return "evening"
+        else:
+            return "night"
+
+    def generate_success_message(self, ctx: AuthenticationContext) -> str:
+        """
+        Generate personalized success message based on confidence and context.
+
+        Args:
+            ctx: Authentication context with all relevant info
+
+        Returns:
+            Personalized message string
+        """
+        speaker = ctx.speaker_name or "there"
+        confidence = ctx.confidence
+        threshold = ctx.threshold
+
+        # High Confidence (>90%) - Natural, confident
+        if confidence >= self.HIGH_CONFIDENCE:
+            return self._high_confidence_message(ctx, speaker)
+
+        # Good Confidence (85-90%) - Brief acknowledgment
+        elif confidence >= self.GOOD_CONFIDENCE:
+            return self._good_confidence_message(ctx, speaker)
+
+        # Borderline (80-85%) - Shows verification process
+        elif confidence >= self.BORDERLINE_CONFIDENCE:
+            return self._borderline_confidence_message(ctx, speaker)
+
+        # Low but passing (threshold to 80%) - Cautious acknowledgment
+        else:
+            return self._low_confidence_message(ctx, speaker)
+
+    def _high_confidence_message(self, ctx: AuthenticationContext, speaker: str) -> str:
+        """Generate message for high confidence (>90%)."""
+        time_of_day = self.get_time_of_day()
+
+        # Time-aware messages
+        if time_of_day == "morning" and ctx.is_first_unlock_today:
+            greetings = self.TIME_GREETINGS["morning"]
+            import random
+            greeting = random.choice(greetings)
+            return f"{greeting}, {speaker}. Unlocking for you."
+
+        elif time_of_day == "night":
+            return f"Working late, {speaker}? Unlocking now."
+
+        # Standard high-confidence response
+        return f"Of course, {speaker}. Unlocking for you."
+
+    def _good_confidence_message(self, ctx: AuthenticationContext, speaker: str) -> str:
+        """Generate message for good confidence (85-90%)."""
+        # Check for environmental factors
+        if ctx.background_noise_detected:
+            return f"Got you despite the background noise, {speaker}. Unlocking now."
+
+        return f"Verified. Unlocking for you, {speaker}."
+
+    def _borderline_confidence_message(self, ctx: AuthenticationContext, speaker: str) -> str:
+        """Generate message for borderline confidence (80-85%)."""
+        # Voice sounds different (tired, sick, etc.)
+        if ctx.voice_sounds_different:
+            return f"Your voice sounds a bit different today, {speaker}, but I'm confident it's you. Unlocking now."
+
+        # Audio quality issues
+        if ctx.audio_quality == "poor":
+            return f"Signal was a bit weak, but I've verified it's you, {speaker}. Unlocking."
+
+        return f"One moment... yes, verified. Unlocking for you, {speaker}."
+
+    def _low_confidence_message(self, ctx: AuthenticationContext, speaker: str) -> str:
+        """Generate message for low but passing confidence."""
+        confidence_pct = int(ctx.confidence * 100)
+
+        # Explain why confidence was lower
+        if ctx.background_noise_detected:
+            return f"Verified despite background noise ({confidence_pct}% confidence). Unlocking, {speaker}."
+
+        if ctx.audio_quality == "poor":
+            return f"Audio quality was low, but patterns match. Unlocking for you, {speaker}."
+
+        return f"Verified with {confidence_pct}% confidence. Unlocking, {speaker}."
+
+    def generate_failure_message(self, ctx: AuthenticationContext) -> str:
+        """
+        Generate helpful failure message with recovery suggestions.
+
+        Args:
+            ctx: Authentication context
+
+        Returns:
+            Helpful failure message
+        """
+        confidence_pct = int(ctx.confidence * 100)
+        threshold_pct = int(ctx.threshold * 100)
+        gap = threshold_pct - confidence_pct
+
+        # Very low confidence - likely wrong person
+        if confidence_pct < 50:
+            return (
+                f"I don't recognize this voice. This device is locked to authorized users only. "
+                f"If you need access, please use the password."
+            )
+
+        # Close to threshold - provide helpful feedback
+        if gap <= 10:
+            suggestions = []
+
+            if ctx.background_noise_detected:
+                suggestions.append("move to a quieter area")
+
+            if ctx.audio_quality == "poor":
+                suggestions.append("speak a bit closer to the microphone")
+
+            if ctx.stt_confidence < 0.7:
+                suggestions.append("speak more clearly")
+
+            if suggestions:
+                suggestion_text = " or ".join(suggestions)
+                return (
+                    f"Almost there ({confidence_pct}%, need {threshold_pct}%). "
+                    f"Try again - maybe {suggestion_text}?"
+                )
+
+            return (
+                f"Voice confidence was {confidence_pct}% (need {threshold_pct}%). "
+                f"Please try again, or use password if you prefer."
+            )
+
+        # Moderate gap - general retry suggestion
+        return (
+            f"Having trouble verifying your voice ({confidence_pct}% vs {threshold_pct}% threshold). "
+            f"Would you like to try again or use password?"
+        )
+
+    def generate_retry_prompt(self, ctx: AuthenticationContext, attempt_number: int) -> str:
+        """Generate context-aware retry prompt."""
+        if attempt_number == 1:
+            if ctx.background_noise_detected:
+                return "There's some background noise. Could you try again, speaking a bit louder?"
+            return "Let me try again - please repeat your command."
+
+        elif attempt_number == 2:
+            return "Still having trouble. One more try, or I can use password instead."
+
+        else:
+            return "I'm having difficulty with voice verification. Switching to password."
+
+    def record_unlock(self, success: bool):
+        """Record unlock attempt for tracking."""
+        if success:
+            self._unlock_count += 1
+            self._consecutive_failures = 0
+            self._last_unlock_time = datetime.now()
+        else:
+            self._consecutive_failures += 1
+
+
+# Global messenger instance
+_confidence_messenger: Optional[ProgressiveConfidenceMessenger] = None
+
+
+def get_confidence_messenger() -> ProgressiveConfidenceMessenger:
+    """Get the global confidence messenger instance."""
+    global _confidence_messenger
+    if _confidence_messenger is None:
+        _confidence_messenger = ProgressiveConfidenceMessenger()
+    return _confidence_messenger
+
+
 # Global timeout manager instance
 _timeout_manager = DynamicTimeoutManager()
 
@@ -2929,14 +3165,32 @@ class IntelligentVoiceUnlockService:
 
             if unlock_success:
                 logger.info(f"✅ Screen unlocked by {speaker_name} (keychain: {service_used})")
+
+                # Generate progressive confidence message
+                try:
+                    messenger = get_confidence_messenger()
+                    ctx = AuthenticationContext(
+                        confidence=context_analysis.get("verification_confidence", 0.85),
+                        threshold=context_analysis.get("threshold", 0.35),
+                        speaker_name=speaker_name,
+                        is_owner=True,
+                        audio_quality=context_analysis.get("audio_quality", "good"),
+                        stt_confidence=context_analysis.get("stt_confidence", 0.9),
+                        background_noise_detected=context_analysis.get("background_noise", False),
+                        is_first_unlock_today=context_analysis.get("is_first_today", False),
+                    )
+                    personalized_message = messenger.generate_success_message(ctx)
+                    messenger.record_unlock(success=True)
+                except Exception as e:
+                    logger.debug(f"Progressive messaging failed: {e}")
+                    personalized_message = f"Screen unlocked by {speaker_name}"
             else:
                 logger.error(f"❌ Unlock failed for {speaker_name} - password may be incorrect")
+                personalized_message = "Unlock failed - password may be incorrect"
 
             return {
                 "success": unlock_success,
-                "message": (
-                    f"Screen unlocked by {speaker_name}" if unlock_success else "Unlock failed - password may be incorrect"
-                ),
+                "message": personalized_message,
             }
 
         except Exception as e:

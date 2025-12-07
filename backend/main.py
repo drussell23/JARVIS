@@ -194,21 +194,29 @@ print(f"[STARTUP-DEBUG] Running from: {os.path.abspath(__file__)}")
 print(f"[STARTUP-DEBUG] Working directory: {os.getcwd()}")
 print(f"[STARTUP-DEBUG] Python path: {sys.path[:3]}")  # First 3 entries
 
-# DEBUG: Run coordinate diagnostic
+# DEBUG: Run coordinate diagnostic (dynamic path detection - no hardcoding!)
 try:
-    print("[STARTUP-DEBUG] Running coordinate diagnostic...")
-    exec(
-        open(
-            "/Users/derekjrussell/Documents/repos/JARVIS-AI-Agent/diagnose_coordinate_doubling.py"
-        ).read()
-    )
+    from pathlib import Path as _DebugPath
+    _project_root = _DebugPath(__file__).resolve().parent.parent  # backend -> project root
+    _diag_script = _project_root / "diagnose_coordinate_doubling.py"
+
+    if _diag_script.exists():
+        print("[STARTUP-DEBUG] Running coordinate diagnostic...")
+        exec(_diag_script.read_text())
+    else:
+        print(f"[STARTUP-DEBUG] Coordinate diagnostic script not found at {_diag_script}")
 except Exception as e:
     print(f"[STARTUP-DEBUG] Coordinate diagnostic failed: {e}")
 
-# DEBUG: Install PyAutoGUI intercept to track coordinate doubling
+# DEBUG: Install PyAutoGUI intercept to track coordinate doubling (dynamic path!)
 try:
+    from pathlib import Path as _IntPath
+    _project_root = _IntPath(__file__).resolve().parent.parent
+
+    if str(_project_root) not in sys.path:
+        sys.path.insert(0, str(_project_root))
+
     print("[STARTUP-DEBUG] Installing PyAutoGUI intercept...")
-    sys.path.insert(0, "/Users/derekjrussell/Documents/repos/JARVIS-AI-Agent")
     import pyautogui_intercept
 
     pyautogui_intercept.install_intercept()

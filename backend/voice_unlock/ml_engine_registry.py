@@ -1423,14 +1423,13 @@ class MLEngineRegistry:
 
             # Fallback: Use environment variable or default GCP endpoint
             if not self._cloud_endpoint:
-                # Cloud Run URLs use format: https://{service}-{random_suffix}.a.run.app
-                # The actual URL is discovered at deployment time and stored in env var
-                # Default is the current deployed service URL
+                # Cloud Run URLs - dynamically discovered from environment
+                # Updated 2024-12 to new Cloud Run URL format
                 self._cloud_endpoint = os.getenv(
                     "JARVIS_CLOUD_ML_ENDPOINT",
-                    "https://jarvis-ml-pvalxny6iq-uc.a.run.app"
+                    "https://jarvis-ml-888774109345.us-central1.run.app"
                 )
-                logger.info(f"   Using fallback cloud endpoint: {self._cloud_endpoint}")
+                logger.info(f"   Using cloud endpoint: {self._cloud_endpoint}")
 
             self._use_cloud = True
             logger.info("☁️  Cloud routing activated for ML operations")
