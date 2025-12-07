@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Cloud ECAPA Speaker Embedding Service v19.0.0
+Cloud ECAPA Speaker Embedding Service v19.3.0
 ==============================================
 
 Ultra-fast, production-ready cloud service for ECAPA-TDNN speaker embeddings.
-Designed for GCP Cloud Run with <5s cold starts using pre-baked model cache.
+Designed for GCP Cloud Run with <5s cold starts using TorchScript JIT models.
 
 Key Features:
+- TORCHSCRIPT JIT: Pre-compiled model loads in <2s (vs 140s standard)
 - STRICT OFFLINE MODE: Zero network calls at runtime
 - PRE-BAKED MODEL: Model weights baked into Docker image
 - ASYNC PARALLEL LOADING: Non-blocking initialization
@@ -16,7 +17,7 @@ Key Features:
 - Embedding caching with TTL
 - Comprehensive metrics and telemetry
 
-v19.0.0 - Ultra-Fast Cold Starts with Pre-Baked Model
+v19.3.0 - TorchScript JIT for Ultra-Fast Cold Starts (<5s)
 
 Endpoints:
     GET  /health              - Health check with ECAPA readiness
