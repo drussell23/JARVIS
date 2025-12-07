@@ -247,14 +247,12 @@ class CloudECAPAClientConfig:
     # Fallback endpoint construction
     # Note: Cloud Run URLs use project NUMBER, not project ID
     GCP_PROJECT = os.getenv("GCP_PROJECT_ID", "jarvis-473803")
-    GCP_PROJECT_NUMBER = os.getenv("GCP_PROJECT_NUMBER", "888774109345")
-    GCP_REGION = os.getenv("GCP_REGION", "us-central1")
-
-    # Primary endpoint - uses project number for Cloud Run URL
-    # Note: No path suffix - service routes are at root level (/health, /speaker_embedding)
+    # Cloud Run URLs use format: https://{service}-{random_suffix}.a.run.app
+    # The actual URL is discovered at deployment time and stored in env var
+    # Default is the current deployed service URL
     PRIMARY_ENDPOINT = os.getenv(
         "JARVIS_CLOUD_ML_ENDPOINT",
-        f"https://jarvis-ml-{GCP_PROJECT_NUMBER}.{GCP_REGION}.run.app"
+        "https://jarvis-ml-pvalxny6iq-uc.a.run.app"
     )
 
     # Timeouts
@@ -299,9 +297,11 @@ class CloudECAPAClientConfig:
         if cls.PRIMARY_ENDPOINT and cls.PRIMARY_ENDPOINT not in endpoints:
             endpoints.append(cls.PRIMARY_ENDPOINT)
 
-        # Add Cloud Run default (uses project number for URL)
-        cloud_run_default = f"https://jarvis-ml-{cls.GCP_PROJECT_NUMBER}.{cls.GCP_REGION}.run.app/api/ml"
-        if cloud_run_default not in endpoints:
+        # Add Cloud Run default - uses correct Cloud Run URL format
+        # Note: Cloud Run URLs are https://{service}-{random_suffix}.a.run.app
+        # The actual URL is discovered at deployment time
+        cloud_run_default = f"{cls.PRIMARY_ENDPOINT}/api/ml" if cls.PRIMARY_ENDPOINT else None
+        if cloud_run_default and cloud_run_default not in endpoints:
             endpoints.append(cloud_run_default)
 
         # Add localhost for development

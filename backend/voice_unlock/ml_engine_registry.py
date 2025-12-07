@@ -1423,15 +1423,12 @@ class MLEngineRegistry:
 
             # Fallback: Use environment variable or default GCP endpoint
             if not self._cloud_endpoint:
-                # Note: Cloud Run URLs use project NUMBER, not project ID
-                gcp_project_number = os.getenv("GCP_PROJECT_NUMBER", "888774109345")
-                gcp_region = os.getenv("GCP_REGION", "us-central1")
-
-                # Try Cloud Run endpoint first (uses project number for URL)
-                # Note: No /api/ml suffix - service routes are at root level
+                # Cloud Run URLs use format: https://{service}-{random_suffix}.a.run.app
+                # The actual URL is discovered at deployment time and stored in env var
+                # Default is the current deployed service URL
                 self._cloud_endpoint = os.getenv(
                     "JARVIS_CLOUD_ML_ENDPOINT",
-                    f"https://jarvis-ml-{gcp_project_number}.{gcp_region}.run.app"
+                    "https://jarvis-ml-pvalxny6iq-uc.a.run.app"
                 )
                 logger.info(f"   Using fallback cloud endpoint: {self._cloud_endpoint}")
 
@@ -1558,7 +1555,7 @@ class MLEngineRegistry:
                 test_audio_bytes = test_audio.tobytes()
                 test_audio_b64 = base64.b64encode(test_audio_bytes).decode('utf-8')
 
-                embed_endpoint = f"{self._cloud_endpoint.rstrip('/')}/speaker_embedding"
+                embed_endpoint = f"{self._cloud_endpoint.rstrip('/')}/api/ml/speaker_embedding"
 
                 async with aiohttp.ClientSession() as session:
                     async with session.post(
@@ -1654,6 +1651,105 @@ class MLEngineRegistry:
             logger.error(f"❌ Local ECAPA fallback exception: {e}")
             return False
 
+    async def _fallback_to_cloud(self, reason: str) -> bool:
+        """
+        Fallback to cloud ECAPA when local is unavailable (memory pressure, timeout, etc).
+
+        This is the INVERSE of _fallback_to_local_ecapa. When local ECAPA loading
+        fails (e.g., due to memory pressure on macOS), we attempt to use the
+        GCP Cloud Run ECAPA service instead.
+
+        Args:
+            reason: Why we're falling back to cloud (for logging)
+
+        Returns:
+            True if cloud ECAPA was successfully verified and activated
+        """
+        logger.warning("=" * 70)
+        logger.warning("🔄 LOCAL FALLBACK: Attempting cloud ECAPA activation")
+        logger.warning("=" * 70)
+        logger.warning(f"   Reason: {reason}")
+        logger.warning("   Cloud Run service will handle ECAPA embedding extraction")
+        logger.warning("=" * 70)
+
+        # Ensure we have a cloud endpoint configured
+        if not self._cloud_endpoint:
+            # Try to get from environment variable
+            self._cloud_endpoint = os.getenv(
+                "JARVIS_CLOUD_ECAPA_ENDPOINT",
+                os.getenv("JARVIS_ML_CLOUD_ENDPOINT", None)
+            )
+
+            if not self._cloud_endpoint:
+                # Try GCP Cloud Run default URL format
+                project_id = os.getenv("GCP_PROJECT_ID", "jarvis-473803")
+                region = os.getenv("GCP_REGION", "us-central1")
+                service_name = os.getenv("GCP_ECAPA_SERVICE", "jarvis-ml")
+
+                # GCP Cloud Run URL format: https://{service}-{random_suffix}.a.run.app
+                # We need to discover this or have it configured
+                logger.warning("   No cloud endpoint configured - checking for Cloud Run URL...")
+
+                # Common Cloud Run URL patterns to try
+                cloud_run_urls = [
+                    os.getenv("CLOUD_RUN_ECAPA_URL"),
+                    f"https://{service_name}-pvalxny6iq-uc.a.run.app",  # Known production URL
+                    f"https://{service_name}-888774109345.{region}.run.app",
+                ]
+
+                for url in cloud_run_urls:
+                    if url:
+                        self._cloud_endpoint = url
+                        logger.info(f"   Trying cloud endpoint: {url}")
+                        break
+
+        if not self._cloud_endpoint:
+            logger.error("❌ No cloud endpoint available for fallback")
+            logger.error("   Set JARVIS_CLOUD_ECAPA_ENDPOINT environment variable")
+            return False
+
+        logger.info(f"   Cloud endpoint: {self._cloud_endpoint}")
+
+        # Enable cloud mode
+        self._use_cloud = True
+        self._cloud_verified = False
+
+        # Verify the cloud backend is actually ready
+        try:
+            cloud_ready, verify_msg = await self._verify_cloud_backend_ready(
+                timeout=float(os.getenv("JARVIS_ECAPA_CLOUD_TIMEOUT", "15.0")),
+                retry_count=int(os.getenv("JARVIS_ECAPA_CLOUD_RETRIES", "3")),
+                test_extraction=True  # Always test extraction for fallback
+            )
+
+            if cloud_ready:
+                logger.info("=" * 70)
+                logger.info("✅ CLOUD FALLBACK SUCCESS: Cloud ECAPA activated")
+                logger.info("=" * 70)
+                logger.info(f"   Verification: {verify_msg}")
+                logger.info(f"   Endpoint: {self._cloud_endpoint}")
+                logger.info("   All ECAPA operations will use cloud backend")
+                logger.info("=" * 70)
+                return True
+            else:
+                logger.error("=" * 70)
+                logger.error("❌ CLOUD FALLBACK FAILED: Cloud verification failed")
+                logger.error("=" * 70)
+                logger.error(f"   Reason: {verify_msg}")
+                logger.error("   Voice unlock will not work until ECAPA is available")
+                logger.error("=" * 70)
+                self._use_cloud = False
+                self._cloud_verified = False
+                return False
+
+        except Exception as e:
+            logger.error(f"❌ Cloud fallback exception: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            self._use_cloud = False
+            self._cloud_verified = False
+            return False
+
     def get_ecapa_status(self) -> Dict[str, Any]:
         """
         Get detailed ECAPA encoder availability status.
@@ -1722,7 +1818,7 @@ class MLEngineRegistry:
             # Encode audio as base64
             audio_b64 = base64.b64encode(audio_data).decode('utf-8')
 
-            endpoint = f"{self._cloud_endpoint}/speaker_embedding"
+            endpoint = f"{self._cloud_endpoint.rstrip('/')}/api/ml/speaker_embedding"
             payload = {
                 "audio_data": audio_b64,
                 "sample_rate": 16000,
@@ -1805,7 +1901,7 @@ class MLEngineRegistry:
             else:
                 ref_list = list(reference_embedding)
 
-            endpoint = f"{self._cloud_endpoint}/verify_speaker"
+            endpoint = f"{self._cloud_endpoint.rstrip('/')}/api/ml/speaker_verify"
             payload = {
                 "audio_data": audio_b64,
                 "reference_embedding": ref_list,

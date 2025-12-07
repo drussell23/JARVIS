@@ -2365,6 +2365,22 @@ class SpeakerVerificationService:
         self._unified_cache_hits = 0
         self._unified_cache_misses = 0
 
+    def get_ecapa_status(self) -> Dict[str, Any]:
+        """
+        Get ECAPA encoder status for diagnostics and integration tests.
+
+        Returns:
+            Dict with ECAPA availability info:
+            - available: bool - True if ECAPA encoder is ready
+            - source: str - 'local', 'cloud', or None
+            - message: str - Status message from ECAPA loading
+        """
+        return {
+            "available": getattr(self, '_use_registry_encoder', False),
+            "source": getattr(self, '_ecapa_load_source', None),
+            "message": getattr(self, '_ecapa_load_message', None),
+        }
+
     async def _run_in_executor(self, func, *args, **kwargs) -> Any:
         """Run a CPU-intensive function in the thread pool to avoid blocking."""
         loop = asyncio.get_running_loop()
