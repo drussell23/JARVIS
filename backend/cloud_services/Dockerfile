@@ -1,4 +1,4 @@
-# ECAPA Cloud Service Dockerfile v20.2.0
+# ECAPA Cloud Service Dockerfile v20.3.0
 # =======================================
 #
 # Production-ready container for ECAPA-TDNN speaker embedding service.
@@ -18,7 +18,7 @@
 # Build: docker build -t ecapa-cloud-service .
 # Run:   docker run -p 8010:8010 ecapa-cloud-service
 #
-# v20.2.0 - Pure PyTorch JIT model (no SpeechBrain at runtime) for <5s cold start
+# v20.3.0 - Complete SpeechBrain lazy import for <5s cold start
 
 # =============================================================================
 # BUILD ARGUMENTS - Dynamic configuration
@@ -120,7 +120,7 @@ ARG HF_CACHE_DIR
 
 # Labels
 LABEL maintainer="JARVIS AI Agent Team"
-LABEL version="20.2.0"
+LABEL version="20.3.0"
 LABEL description="ECAPA-TDNN Cloud Speaker Embedding Service - Ultra-Fast Cold Starts with JIT/ONNX/Quantization"
 
 # Install runtime dependencies only

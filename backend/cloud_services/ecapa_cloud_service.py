@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Cloud ECAPA Speaker Embedding Service v20.0.0
+Cloud ECAPA Speaker Embedding Service v20.3.0
 ==============================================
 
 Ultra-fast, production-ready cloud service for ECAPA-TDNN speaker embeddings.
@@ -20,7 +20,7 @@ Key Features:
 - Embedding caching with TTL
 - Comprehensive metrics and telemetry
 
-v20.0.0 - Multi-Strategy Optimization for Ultra-Fast Cold Starts (<2s)
+v20.3.0 - Complete SpeechBrain Lazy Import for Ultra-Fast Cold Starts (<5s)
 
 Endpoints:
     GET  /health              - Health check with ECAPA readiness
@@ -91,9 +91,21 @@ print(">>> Pre-importing torch at module level...", flush=True)
 import torch
 print(f">>> torch {torch.__version__} imported successfully", flush=True)
 
-print(">>> Pre-importing speechbrain at module level...", flush=True)
-from speechbrain.inference.speaker import EncoderClassifier
-print(">>> speechbrain imported successfully", flush=True)
+# v20.2.0: CONDITIONAL SpeechBrain import - only load if JIT model not available
+# This saves ~60 seconds of cold start time when using JIT!
+_SPEECHBRAIN_LOADED = False
+EncoderClassifier = None  # Will be lazy-loaded if needed
+
+def _lazy_import_speechbrain():
+    """Lazy import SpeechBrain only when needed (fallback from JIT)."""
+    global _SPEECHBRAIN_LOADED, EncoderClassifier
+    if not _SPEECHBRAIN_LOADED:
+        print(">>> Lazy-importing speechbrain (JIT fallback)...", flush=True)
+        from speechbrain.inference.speaker import EncoderClassifier as EC
+        EncoderClassifier = EC
+        _SPEECHBRAIN_LOADED = True
+        print(">>> speechbrain imported successfully", flush=True)
+    return EncoderClassifier
 
 # Configure logging
 logging.basicConfig(
@@ -776,7 +788,9 @@ class OptimizedModelLoader:
         start = time.time()
 
         try:
-            self._speechbrain_encoder = EncoderClassifier.from_hparams(
+            # v20.2.0: Lazy import SpeechBrain only when needed
+            EC = _lazy_import_speechbrain()
+            self._speechbrain_encoder = EC.from_hparams(
                 source=CloudECAPAConfig.MODEL_PATH,
                 savedir=self.cache_dir,
                 run_opts={"device": self.device}
