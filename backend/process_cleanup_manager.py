@@ -2,7 +2,7 @@
 """
 Intelligent Process Cleanup Manager for JARVIS
 ===============================================
-v2.0.0 - Enhanced with Enterprise-Grade Robustness
+v3.0.0 - Enhanced with Hybrid Cloud & Cloud Run Integration
 
 Features:
 - Circuit Breaker pattern for fault tolerance
@@ -15,6 +15,14 @@ Features:
 - UE (Uninterruptible Sleep) state detection
 - GCP VM session tracking and cleanup
 - Async parallel process cleanup
+
+v3.0.0 NEW - Hybrid Cloud Integration:
+- Cloud Run ECAPA endpoint health checking
+- Intelligent ML model offload to cloud under memory pressure
+- Progressive memory relief strategies (moderate/high/critical)
+- Automatic cloud routing activation when local memory is constrained
+- Non-essential process cleanup with memory tracking
+- Hybrid cloud status reporting
 """
 
 import asyncio
@@ -1996,19 +2004,304 @@ class ProcessCleanupManager:
         logger.debug("Registered cleanup event handlers")
 
     def _handle_memory_pressure(self, event: CleanupEvent) -> None:
-        """Handle memory pressure event - trigger aggressive cleanup."""
-        logger.warning(f"🔥 Memory pressure detected: {event.data.get('memory_percent', '?')}%")
+        """
+        Handle memory pressure event with Hybrid Cloud awareness.
+
+        Enhanced v3.0.0:
+        - Cloud Run offload detection
+        - Intelligent ML model migration to cloud
+        - Hybrid cloud state management
+        - Progressive memory relief strategies
+        """
+        memory_percent = event.data.get('memory_percent', 0)
+        logger.warning(f"🔥 Memory pressure detected: {memory_percent}%")
 
         # Record metric
-        self.health_monitor.metrics.current_memory_usage_percent = event.data.get('memory_percent', 0) / 100
+        self.health_monitor.metrics.current_memory_usage_percent = memory_percent / 100
 
-        # Trigger aggressive cleanup if enabled
+        # Progressive memory relief strategy - handle async safely
+        self._schedule_memory_relief(memory_percent)
+
+        # Trigger aggressive cleanup if enabled (synchronous fallback)
         if self.config.get("aggressive_cleanup", True):
             try:
                 self._cleanup_ipc_resources()
                 self._cleanup_orphaned_ports()
             except Exception as e:
                 logger.error(f"Memory pressure cleanup failed: {e}")
+
+    def _schedule_memory_relief(self, memory_percent: float) -> None:
+        """
+        Schedule async memory relief safely, handling both sync and async contexts.
+        """
+        # Select the appropriate relief coroutine
+        if memory_percent >= 90:
+            coro = self._critical_memory_relief()
+            level = "CRITICAL"
+        elif memory_percent >= 80:
+            coro = self._high_memory_relief()
+            level = "HIGH"
+        elif memory_percent >= 70:
+            coro = self._moderate_memory_relief()
+            level = "MODERATE"
+        else:
+            return  # No relief needed
+
+        # Try to schedule in existing event loop, or run in new one
+        try:
+            loop = asyncio.get_running_loop()
+            # We're in an async context - create task
+            asyncio.create_task(coro)
+            logger.info(f"☁️  Scheduled {level} memory relief (async)")
+        except RuntimeError:
+            # No running loop - run in a background thread to avoid blocking
+            import threading
+
+            def run_relief():
+                try:
+                    asyncio.run(coro)
+                    logger.info(f"☁️  Completed {level} memory relief (background)")
+                except Exception as e:
+                    logger.error(f"Background memory relief failed: {e}")
+
+            thread = threading.Thread(target=run_relief, daemon=True, name=f"memory-relief-{level}")
+            thread.start()
+            logger.info(f"☁️  Started {level} memory relief (background thread)")
+
+    async def _check_cloud_run_available(self) -> bool:
+        """Check if Cloud Run ECAPA endpoint is available for offload."""
+        try:
+            import aiohttp
+            cloud_url = os.getenv(
+                "JARVIS_CLOUD_ML_ENDPOINT",
+                "https://jarvis-ml-888774109345.us-central1.run.app"
+            )
+            health_url = f"{cloud_url.rstrip('/')}/health"
+
+            async with aiohttp.ClientSession() as session:
+                async with session.get(health_url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return data.get("ecapa_ready", False)
+        except Exception as e:
+            logger.debug(f"Cloud Run health check failed: {e}")
+        return False
+
+    async def _trigger_cloud_offload(self) -> Dict[str, Any]:
+        """
+        Trigger ML model offload to Cloud Run.
+
+        Returns:
+            Dict with offload results and memory freed
+        """
+        result = {
+            "success": False,
+            "memory_freed_mb": 0,
+            "models_offloaded": [],
+            "cloud_available": False,
+        }
+
+        try:
+            # Check if Cloud Run is available
+            cloud_available = await self._check_cloud_run_available()
+            result["cloud_available"] = cloud_available
+
+            if not cloud_available:
+                logger.warning("☁️  Cloud Run not available for offload")
+                return result
+
+            logger.info("☁️  Cloud Run available - initiating ML model offload...")
+
+            # Try to get ML Engine Registry and switch to cloud mode
+            try:
+                from voice_unlock.ml_engine_registry import get_ml_registry
+
+                registry = await get_ml_registry()
+                if registry:
+                    # Check current memory usage before offload
+                    mem_before = psutil.virtual_memory().used / (1024 ** 2)
+
+                    # Activate cloud routing
+                    if hasattr(registry, 'activate_cloud_routing'):
+                        await registry.activate_cloud_routing()
+                        result["models_offloaded"].append("ECAPA-TDNN")
+                        logger.info("☁️  Activated cloud routing for ECAPA-TDNN")
+
+                    # Unload local models to free memory
+                    if hasattr(registry, 'unload_local_models'):
+                        await registry.unload_local_models()
+                        logger.info("☁️  Unloaded local ML models")
+
+                    # Measure memory freed
+                    mem_after = psutil.virtual_memory().used / (1024 ** 2)
+                    result["memory_freed_mb"] = max(0, mem_before - mem_after)
+                    result["success"] = True
+
+                    logger.info(
+                        f"☁️  Cloud offload complete: freed {result['memory_freed_mb']:.0f}MB, "
+                        f"offloaded {len(result['models_offloaded'])} models"
+                    )
+
+            except ImportError:
+                logger.debug("ML Engine Registry not available for offload")
+            except Exception as e:
+                logger.error(f"ML offload failed: {e}")
+
+        except Exception as e:
+            logger.error(f"Cloud offload failed: {e}")
+
+        return result
+
+    async def _critical_memory_relief(self) -> None:
+        """
+        CRITICAL memory relief (>90% usage).
+        Maximum aggressive cleanup + immediate cloud offload.
+        """
+        logger.warning("🚨 CRITICAL memory pressure - maximum relief mode")
+
+        # 1. Immediate cloud offload
+        offload_result = await self._trigger_cloud_offload()
+        if offload_result["success"]:
+            logger.info(f"☁️  Cloud offload freed {offload_result['memory_freed_mb']:.0f}MB")
+
+        # 2. Kill non-essential JARVIS processes
+        try:
+            killed = self._kill_non_essential_processes()
+            if killed:
+                logger.info(f"🔪 Killed {len(killed)} non-essential processes")
+        except Exception as e:
+            logger.error(f"Failed to kill non-essential processes: {e}")
+
+        # 3. Force garbage collection
+        try:
+            import gc
+            gc.collect()
+            logger.info("🗑️  Forced garbage collection")
+        except Exception:
+            pass
+
+        # 4. Clear Python caches
+        try:
+            import sys
+            if hasattr(sys, '_clear_type_cache'):
+                sys._clear_type_cache()
+        except Exception:
+            pass
+
+    async def _high_memory_relief(self) -> None:
+        """
+        HIGH memory relief (80-90% usage).
+        Aggressive cleanup + cloud offload.
+        """
+        logger.warning("⚠️  HIGH memory pressure - aggressive relief mode")
+
+        # 1. Try cloud offload first
+        offload_result = await self._trigger_cloud_offload()
+        if offload_result["success"]:
+            logger.info(f"☁️  Cloud offload freed {offload_result['memory_freed_mb']:.0f}MB")
+            return  # Cloud offload successful, might be enough
+
+        # 2. Standard aggressive cleanup
+        try:
+            self._cleanup_ipc_resources()
+        except Exception as e:
+            logger.debug(f"IPC cleanup failed: {e}")
+
+        # 3. Garbage collection
+        try:
+            import gc
+            gc.collect()
+        except Exception:
+            pass
+
+    async def _moderate_memory_relief(self) -> None:
+        """
+        MODERATE memory relief (70-80% usage).
+        Standard cleanup + notify about cloud option.
+        """
+        logger.info("📊 Moderate memory pressure - standard relief mode")
+
+        # 1. Check if cloud offload would help
+        cloud_available = await self._check_cloud_run_available()
+        if cloud_available:
+            logger.info(
+                "☁️  Cloud Run is available - consider enabling cloud_first_mode "
+                "for better memory management"
+            )
+
+        # 2. Light cleanup
+        try:
+            import gc
+            gc.collect()
+        except Exception:
+            pass
+
+    def _kill_non_essential_processes(self) -> List[Dict]:
+        """
+        Kill non-essential JARVIS processes to free memory.
+        Essential processes (voice unlock, main backend) are preserved.
+        """
+        killed = []
+        non_essential_patterns = [
+            "vision_websocket",
+            "document_writer",
+            "wake_word_api",
+            "jarvis_reload_manager",
+        ]
+
+        try:
+            for proc in psutil.process_iter(['pid', 'name', 'cmdline', 'memory_info']):
+                try:
+                    cmdline = ' '.join(proc.info.get('cmdline') or []).lower()
+
+                    # Check if it's a non-essential process
+                    is_non_essential = any(
+                        pattern in cmdline for pattern in non_essential_patterns
+                    )
+
+                    if is_non_essential:
+                        mem_mb = proc.info.get('memory_info', {})
+                        if hasattr(mem_mb, 'rss'):
+                            mem_mb = mem_mb.rss / (1024 ** 2)
+                        else:
+                            mem_mb = 0
+
+                        proc.terminate()
+                        killed.append({
+                            "pid": proc.info['pid'],
+                            "name": proc.info['name'],
+                            "memory_mb": mem_mb,
+                        })
+                        logger.info(f"🔪 Killed non-essential: {proc.info['name']} (PID {proc.info['pid']}, {mem_mb:.0f}MB)")
+
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+
+        except Exception as e:
+            logger.error(f"Error killing non-essential processes: {e}")
+
+        return killed
+
+    def get_hybrid_cloud_status(self) -> Dict[str, Any]:
+        """
+        Get current hybrid cloud status for cleanup decisions.
+        """
+        status = {
+            "cloud_run_available": False,
+            "cloud_run_url": os.getenv(
+                "JARVIS_CLOUD_ML_ENDPOINT",
+                "https://jarvis-ml-888774109345.us-central1.run.app"
+            ),
+            "memory_percent": psutil.virtual_memory().percent,
+            "cloud_first_mode": os.getenv("JARVIS_CLOUD_FIRST_MODE", "false").lower() == "true",
+            "ml_offload_recommended": False,
+        }
+
+        # Recommend offload if memory is high
+        if status["memory_percent"] > 75:
+            status["ml_offload_recommended"] = True
+
+        return status
 
     def _handle_port_conflict(self, event: CleanupEvent) -> None:
         """Handle port conflict event."""
@@ -2058,7 +2351,7 @@ class ProcessCleanupManager:
         Useful for debugging and monitoring.
         """
         return {
-            'version': '2.0.0',
+            'version': '3.0.0',
             'health': self.health_monitor.get_health_status(),
             'circuit_breakers': {
                 'process_kill': self.process_kill_circuit.get_metrics(),

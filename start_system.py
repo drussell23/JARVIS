@@ -14354,36 +14354,47 @@ async def main():
             ecapa_verification_result["errors"].append(f"ML Registry error: {str(e)}")
             print(f"{Colors.FAIL}   ❌ ML Engine Registry error: {e}{Colors.ENDC}")
 
-        # Step 2: Test Cloud Run ECAPA (if configured)
+        # Step 2: Test Cloud Run ECAPA (always test - we have default endpoint)
         print(f"{Colors.CYAN}   Step 2/5: Testing Cloud Run ECAPA endpoint...{Colors.ENDC}")
-        cloud_endpoint = os.getenv("JARVIS_CLOUD_ML_ENDPOINT", "")
-        if cloud_endpoint or os.getenv("JARVIS_ECAPA_BACKEND") == "cloud_run":
-            try:
-                import aiohttp
-                # Try the Cloud Run health endpoint
-                cloud_url = cloud_endpoint or "https://jarvis-ml-888774109345.us-central1.run.app"
-                health_url = f"{cloud_url.rstrip('/api/ml').rstrip('/')}/health"
+        # Default Cloud Run endpoint (updated 2024-12 to new URL format)
+        default_cloud_url = "https://jarvis-ml-888774109345.us-central1.run.app"
+        cloud_endpoint = os.getenv("JARVIS_CLOUD_ML_ENDPOINT", default_cloud_url)
 
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(health_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                        if resp.status == 200:
-                            health_data = await resp.json()
-                            ecapa_ready = health_data.get("ecapa_ready", False)
-                            load_source = health_data.get("load_source", "unknown")
-                            ecapa_verification_result["cloud_ecapa_tested"] = True
+        try:
+            import aiohttp
+            # Try the Cloud Run health endpoint
+            # Properly strip /api/ml suffix if present (don't use rstrip - it strips chars not strings)
+            cloud_url = cloud_endpoint.rstrip('/')
+            if cloud_url.endswith('/api/ml'):
+                cloud_url = cloud_url[:-7]  # Remove '/api/ml'
+            health_url = f"{cloud_url}/health"
+            print(f"{Colors.CYAN}      → Testing: {health_url}{Colors.ENDC}")
 
-                            if ecapa_ready:
-                                print(f"{Colors.GREEN}   ✅ Cloud Run ECAPA is ready{Colors.ENDC}")
-                                print(f"{Colors.GREEN}      → Load source: {load_source}{Colors.ENDC}")
-                            else:
-                                print(f"{Colors.YELLOW}   ⚠️  Cloud Run responding but ECAPA not ready{Colors.ENDC}")
+            async with aiohttp.ClientSession() as session:
+                async with session.get(health_url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    if resp.status == 200:
+                        health_data = await resp.json()
+                        ecapa_ready = health_data.get("ecapa_ready", False)
+                        load_source = health_data.get("load_source", "unknown")
+                        load_time = health_data.get("load_time_ms", 0)
+                        ecapa_verification_result["cloud_ecapa_tested"] = True
+
+                        if ecapa_ready:
+                            print(f"{Colors.GREEN}   ✅ Cloud Run ECAPA is ready{Colors.ENDC}")
+                            print(f"{Colors.GREEN}      → Load source: {load_source}{Colors.ENDC}")
+                            print(f"{Colors.GREEN}      → Load time: {load_time:.0f}ms{Colors.ENDC}")
                         else:
-                            print(f"{Colors.YELLOW}   ⚠️  Cloud Run returned status {resp.status}{Colors.ENDC}")
-            except Exception as e:
-                ecapa_verification_result["errors"].append(f"Cloud ECAPA error: {str(e)}")
-                print(f"{Colors.YELLOW}   ⚠️  Cloud Run ECAPA not available: {e}{Colors.ENDC}")
-        else:
-            print(f"{Colors.CYAN}      → Cloud Run not configured, skipping{Colors.ENDC}")
+                            status = health_data.get("status", "unknown")
+                            print(f"{Colors.YELLOW}   ⚠️  Cloud Run responding but ECAPA not ready (status: {status}){Colors.ENDC}")
+                            print(f"{Colors.YELLOW}      → Model may still be loading, retry in a moment{Colors.ENDC}")
+                    else:
+                        print(f"{Colors.YELLOW}   ⚠️  Cloud Run returned status {resp.status}{Colors.ENDC}")
+        except asyncio.TimeoutError:
+            ecapa_verification_result["errors"].append("Cloud ECAPA timeout (15s)")
+            print(f"{Colors.YELLOW}   ⚠️  Cloud Run ECAPA timed out (cold start may be in progress){Colors.ENDC}")
+        except Exception as e:
+            ecapa_verification_result["errors"].append(f"Cloud ECAPA error: {str(e)}")
+            print(f"{Colors.YELLOW}   ⚠️  Cloud Run ECAPA not available: {e}{Colors.ENDC}")
 
         # Step 3: Test Local ECAPA (ML Engine Registry)
         print(f"{Colors.CYAN}   Step 3/5: Testing local ECAPA via ML Engine Registry...{Colors.ENDC}")
