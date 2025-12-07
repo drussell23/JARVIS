@@ -159,92 +159,51 @@ verify_cache() {
 
 main() {
     log_info "=============================================="
-    log_info "ECAPA Cloud Service Startup - v18.4.0"
+    log_info "ECAPA Cloud Service Startup - v18.5.0"
     log_info "=============================================="
     log_info "User: $(whoami) (UID: $(id -u))"
     log_info "Working directory: $(pwd)"
-    log_info "Source cache: $SOURCE_CACHE"
-    log_info "Runtime cache: $RUNTIME_CACHE"
+    log_info "Pre-baked cache: $SOURCE_CACHE"
+    log_info "HF_HOME: ${HF_HOME:-not set}"
+    log_info "HF_HUB_OFFLINE: ${HF_HUB_OFFLINE:-not set}"
     log_info "=============================================="
 
-    # Step 1: Check if source cache can be used directly
-    log_info "Step 1: Checking pre-baked cache..."
+    # Step 1: Verify pre-baked cache exists
+    log_info "Step 1: Verifying pre-baked cache..."
 
-    CACHE_READY=false
-    FINAL_CACHE_DIR=""
-
-    # FIRST: Try to use source cache directly (fastest - no copy needed)
-    if verify_cache "$SOURCE_CACHE"; then
-        # Check if source cache is readable
-        if [ -r "$SOURCE_CACHE/hyperparams.yaml" ] && [ -r "$SOURCE_CACHE/embedding_model.ckpt" ]; then
-            FINAL_CACHE_DIR="$SOURCE_CACHE"
-            CACHE_READY=true
-            log_info "✅ Using pre-baked cache directly: $SOURCE_CACHE"
-            # Tell Python to use the source cache directly
-            export ECAPA_CACHE_DIR="$SOURCE_CACHE"
+    # Check HuggingFace cache exists (this is where the model actually lives)
+    HF_CACHE_PATH="${HF_HOME:-/opt/ecapa_cache/huggingface}"
+    if [ -d "$HF_CACHE_PATH" ]; then
+        log_info "✅ HuggingFace cache found: $HF_CACHE_PATH"
+        # List contents for debugging
+        HF_CACHE_CONTENTS=$(find "$HF_CACHE_PATH" -type f -name "*.yaml" -o -name "*.ckpt" 2>/dev/null | head -5)
+        if [ -n "$HF_CACHE_CONTENTS" ]; then
+            log_info "✅ Model files found in HuggingFace cache"
+            log_debug "Files: $HF_CACHE_CONTENTS"
         else
-            log_warn "Pre-baked cache files not readable, will try copying..."
+            log_warn "⚠️ No model files found in HuggingFace cache"
         fi
+    else
+        log_warn "⚠️ HuggingFace cache not found: $HF_CACHE_PATH"
     fi
 
-    # SECOND: Try copying to runtime location if direct use failed
-    if [ "$CACHE_READY" = "false" ]; then
-        log_info "Copying cache to runtime location..."
-        if copy_cache "$SOURCE_CACHE" "$RUNTIME_CACHE"; then
-            if verify_cache "$RUNTIME_CACHE"; then
-                FINAL_CACHE_DIR="$RUNTIME_CACHE"
-                CACHE_READY=true
-                log_info "Primary cache setup successful: $RUNTIME_CACHE"
-            fi
-        fi
+    # Also check savedir
+    if [ -d "$SOURCE_CACHE" ]; then
+        log_info "✅ Source cache exists: $SOURCE_CACHE"
+        ls -la "$SOURCE_CACHE" 2>/dev/null | head -10 || true
+    else
+        log_warn "⚠️ Source cache not found: $SOURCE_CACHE"
     fi
 
-    # THIRD: Try fallback location if primary failed
-    if [ "$CACHE_READY" = "false" ]; then
-        log_warn "Primary cache setup failed, trying fallback..."
+    # Step 2: Create writable temp directories
+    log_info "Step 2: Creating temp directories..."
 
-        if copy_cache "$SOURCE_CACHE" "$FALLBACK_CACHE"; then
-            if verify_cache "$FALLBACK_CACHE"; then
-                FINAL_CACHE_DIR="$FALLBACK_CACHE"
-                CACHE_READY=true
-                export ECAPA_CACHE_DIR="$FALLBACK_CACHE"
-                log_info "Fallback cache setup successful: $FALLBACK_CACHE"
-            fi
-        fi
-    fi
+    mkdir -p /tmp/torch_cache /tmp/xdg_cache /tmp/speechbrain_cache 2>/dev/null || true
 
-    # LAST RESORT: Let SpeechBrain download fresh
-    if [ "$CACHE_READY" = "false" ]; then
-        log_warn "⚠️ Pre-downloaded cache not available, will download fresh (slow startup!)"
-
-        # Create empty writable cache directory
-        create_writable_dir "$RUNTIME_CACHE"
-        FINAL_CACHE_DIR="$RUNTIME_CACHE"
-
-        # Set environment to download fresh
-        export ECAPA_CACHE_DIR="$RUNTIME_CACHE"
-        export SPEECHBRAIN_CACHE="$RUNTIME_CACHE"
-
-        log_info "Fresh download will be attempted at startup"
-    fi
-
-    # Step 2: Set additional environment variables
-    log_info "Step 2: Setting environment variables..."
-
-    # Ensure various cache directories point to writable location
-    export HF_HOME="${FINAL_CACHE_DIR}/huggingface"
-    export TRANSFORMERS_CACHE="${FINAL_CACHE_DIR}/transformers"
-    export TORCH_HOME="${FINAL_CACHE_DIR}/torch"
-    export XDG_CACHE_HOME="${FINAL_CACHE_DIR}"
-
-    # Create subdirectories
-    mkdir -p "$HF_HOME" "$TRANSFORMERS_CACHE" "$TORCH_HOME" 2>/dev/null || true
-    chmod -R 777 "$FINAL_CACHE_DIR" 2>/dev/null || true
-
-    log_info "Cache environment configured:"
-    log_info "  ECAPA_CACHE_DIR=$ECAPA_CACHE_DIR"
-    log_info "  HF_HOME=$HF_HOME"
-    log_info "  TORCH_HOME=$TORCH_HOME"
+    log_info "Environment configured:"
+    log_info "  ECAPA_CACHE_DIR=${ECAPA_CACHE_DIR:-not set}"
+    log_info "  HF_HOME=${HF_HOME:-not set}"
+    log_info "  HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-not set}"
 
     # Step 3: Pre-flight checks
     log_info "Step 3: Running pre-flight checks..."
@@ -264,19 +223,11 @@ main() {
         exit 1
     fi
 
-    # Step 4: Final cache state
-    log_info "Step 4: Final cache state:"
-    log_info "Cache directory: $FINAL_CACHE_DIR"
-    ls -la "$FINAL_CACHE_DIR" 2>/dev/null || log_warn "Could not list cache directory"
-
-    # Show disk space
-    df -h "$FINAL_CACHE_DIR" 2>/dev/null | tail -1 || true
-
     log_info "=============================================="
     log_info "Starting ECAPA Cloud Service..."
     log_info "=============================================="
 
-    # Step 5: Start the service
+    # Start the service
     exec python ecapa_cloud_service.py
 }
 

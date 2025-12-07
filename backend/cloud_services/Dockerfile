@@ -18,7 +18,7 @@
 # GCP Deployment:
 #   ./deploy_cloud_run.sh
 #
-# v18.4.0 - Fixed permissions, direct pre-baked cache usage
+# v18.5.0 - HuggingFace Hub cache pre-baked + offline mode for fast cold starts
 
 # =============================================================================
 # Stage 1: Build dependencies
@@ -42,9 +42,19 @@ RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r /tmp/requirements.txt
 
 # Pre-download ECAPA model to cache (speeds up container startup)
-RUN python -c "from speechbrain.inference.speaker import EncoderClassifier; \
-    EncoderClassifier.from_hparams(source='speechbrain/spkrec-ecapa-voxceleb', \
-    savedir='/opt/ecapa_cache')"
+# Set HF_HOME to match runtime location - this is where SpeechBrain downloads model files
+ENV HF_HOME="/opt/ecapa_cache/huggingface"
+ENV HUGGINGFACE_HUB_CACHE="/opt/ecapa_cache/huggingface"
+ENV TRANSFORMERS_CACHE="/opt/ecapa_cache/huggingface"
+
+# Download and cache the ECAPA model - this populates both HF cache and savedir
+RUN mkdir -p /opt/ecapa_cache/huggingface && \
+    python -c "from speechbrain.inference.speaker import EncoderClassifier; \
+    encoder = EncoderClassifier.from_hparams(source='speechbrain/spkrec-ecapa-voxceleb', \
+    savedir='/opt/ecapa_cache'); \
+    print('Model downloaded successfully'); \
+    print('Files in /opt/ecapa_cache:'); \
+    import os; [print(f'  {f}') for f in os.listdir('/opt/ecapa_cache') if not f.startswith('.')]"
 
 
 # =============================================================================
@@ -54,7 +64,7 @@ FROM python:3.11-slim-bookworm AS production
 
 # Labels
 LABEL maintainer="JARVIS AI Agent Team"
-LABEL version="18.4.0"
+LABEL version="18.5.0"
 LABEL description="ECAPA-TDNN Cloud Speaker Embedding Service"
 
 # Install runtime dependencies only
@@ -106,20 +116,25 @@ RUN chown -R ecapa:ecapa /app && \
 USER ecapa
 
 # Environment variables
-# Use /tmp for runtime cache (writable), pre-downloaded cache is at /opt/ecapa_cache
+# CRITICAL: Point HuggingFace to the PRE-BAKED cache location at /opt/ecapa_cache
 ENV ECAPA_MODEL_PATH="speechbrain/spkrec-ecapa-voxceleb"
-ENV ECAPA_CACHE_DIR="/tmp/ecapa_cache"
+ENV ECAPA_CACHE_DIR="/opt/ecapa_cache"
 ENV ECAPA_SOURCE_CACHE="/opt/ecapa_cache"
 ENV ECAPA_DEVICE="cpu"
 ENV ECAPA_WARMUP_ON_START="true"
 ENV PORT="8010"
 
-# Additional cache environment variables for various libraries
-ENV HF_HOME="/tmp/ecapa_cache/huggingface"
-ENV TRANSFORMERS_CACHE="/tmp/ecapa_cache/transformers"
-ENV TORCH_HOME="/tmp/ecapa_cache/torch"
-ENV XDG_CACHE_HOME="/tmp/ecapa_cache"
-ENV SPEECHBRAIN_CACHE="/tmp/ecapa_cache"
+# Point HuggingFace to pre-baked cache (CRITICAL for offline mode)
+ENV HF_HOME="/opt/ecapa_cache/huggingface"
+ENV HUGGINGFACE_HUB_CACHE="/opt/ecapa_cache/huggingface"
+ENV TRANSFORMERS_CACHE="/opt/ecapa_cache/huggingface"
+ENV HF_HUB_OFFLINE="1"
+ENV TRANSFORMERS_OFFLINE="1"
+
+# Use /tmp for writable caches (torch, etc.)
+ENV TORCH_HOME="/tmp/torch_cache"
+ENV XDG_CACHE_HOME="/tmp/xdg_cache"
+ENV SPEECHBRAIN_CACHE="/tmp/speechbrain_cache"
 
 # Expose port
 EXPOSE 8010

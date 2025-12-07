@@ -13895,8 +13895,21 @@ async def main():
 
                             if response.status == 200:
                                 result["available"] = True
-                                result["healthy"] = True
                                 result["latency_ms"] = latency
+
+                                # Parse health response for detailed status
+                                try:
+                                    data = await response.json()
+                                    result["ecapa_ready"] = data.get("ecapa_ready", False)
+                                    result["load_source"] = data.get("load_source", "unknown")
+                                    result["using_prebaked"] = data.get("using_prebaked_cache", False)
+                                    result["status"] = data.get("status", "unknown")
+                                    # Only mark healthy if ECAPA is ready
+                                    result["healthy"] = data.get("ecapa_ready", False)
+                                except:
+                                    # If JSON parsing fails, assume healthy if responding
+                                    result["healthy"] = True
+
                                 return result
                     except:
                         continue
@@ -13979,7 +13992,21 @@ async def main():
     cloud_latency = f" ({cloud_probe.get('latency_ms', 0):.0f}ms)" if cloud_probe.get("latency_ms") else ""
 
     print(f"   {docker_icon} Docker: {'Healthy' + docker_latency if docker_probe.get('healthy') else ('Available' if docker_probe.get('available') else docker_probe.get('error', 'Unavailable'))}")
-    print(f"   {cloud_icon} Cloud Run: {'Healthy' + cloud_latency if cloud_probe.get('healthy') else cloud_probe.get('error', 'Unavailable')}")
+
+    # Enhanced Cloud Run status display
+    if cloud_probe.get('healthy'):
+        cloud_status = f"Healthy{cloud_latency}"
+        load_source = cloud_probe.get('load_source', 'unknown')
+        if load_source == 'prebaked':
+            cloud_status += f" [prebaked cache]"
+        elif cloud_probe.get('status') == 'initializing':
+            cloud_status = f"Initializing{cloud_latency} [waiting for ECAPA]"
+    elif cloud_probe.get('available'):
+        cloud_status = f"Initializing{cloud_latency} [ECAPA not ready]"
+    else:
+        cloud_status = cloud_probe.get('error', 'Unavailable')
+    print(f"   {cloud_icon} Cloud Run: {cloud_status}")
+
     print(f"   {local_icon} Local ECAPA: {'Ready' if local_probe.get('available') and local_probe.get('memory_ok') else local_probe.get('error', 'Unavailable')}")
 
     # ─────────────────────────────────────────────────────────────────────────

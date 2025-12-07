@@ -1572,8 +1572,10 @@ class MLEngineRegistry:
                                     elapsed = time.time() - wait_start
                                     load_source = data.get("load_source", "unknown")
                                     load_time_ms = data.get("load_time_ms", "N/A")
+                                    using_prebaked = data.get("using_prebaked_cache", False)
                                     logger.info(f"✅ Cloud ECAPA ready after {elapsed:.1f}s wait")
                                     logger.info(f"   Load source: {load_source}")
+                                    logger.info(f"   Using prebaked cache: {using_prebaked}")
                                     logger.info(f"   Model load time: {load_time_ms}ms")
                                     break
                                 else:
