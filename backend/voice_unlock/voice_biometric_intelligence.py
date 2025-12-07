@@ -1277,13 +1277,21 @@ class VoiceBiometricIntelligence:
             if encoder is None:
                 return None
 
-            # Convert audio bytes to tensor
-            audio_array = np.frombuffer(audio_data, dtype=np.float32)
-            audio_tensor = torch.tensor(audio_array).unsqueeze(0)
+            def _extract_sync():
+                """Run blocking PyTorch operations in thread pool."""
+                # Convert audio bytes to tensor
+                audio_array = np.frombuffer(audio_data, dtype=np.float32)
+                audio_tensor = torch.tensor(audio_array).unsqueeze(0)
 
-            # Extract embedding
-            with torch.no_grad():
-                embedding = encoder.encode_batch(audio_tensor)
+                # Extract embedding
+                with torch.no_grad():
+                    embedding = encoder.encode_batch(audio_tensor)
+
+                # CRITICAL: Return a copy to avoid memory issues when tensor is GC'd
+                return embedding.squeeze().detach().clone().cpu().numpy().copy()
+
+            # CRITICAL FIX: Run blocking PyTorch in thread pool to avoid blocking event loop
+            embedding = await asyncio.to_thread(_extract_sync)
 
             if self._quantization_available:
                 self._stats['quantized_inferences'] += 1

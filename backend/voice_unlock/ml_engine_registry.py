@@ -2503,12 +2503,21 @@ async def _extract_local_embedding(
         ecapa_engine = registry.get_engine("ecapa_tdnn")
         if ecapa_engine is not None:
             import torch
-            # Audio should be float32, 16kHz, mono
-            audio_array = np.frombuffer(audio_data, dtype=np.float32)
-            audio_tensor = torch.tensor(audio_array).unsqueeze(0)
 
-            with torch.no_grad():
-                embedding = ecapa_engine.encode_batch(audio_tensor)
+            def _extract_sync():
+                """Run blocking PyTorch operations in thread pool."""
+                # Audio should be float32, 16kHz, mono
+                audio_array = np.frombuffer(audio_data, dtype=np.float32)
+                audio_tensor = torch.tensor(audio_array).unsqueeze(0)
+
+                with torch.no_grad():
+                    embedding = ecapa_engine.encode_batch(audio_tensor)
+
+                # CRITICAL: Return a copy to avoid memory issues when tensor is GC'd
+                return embedding.squeeze().detach().clone().cpu().numpy().copy()
+
+            # CRITICAL FIX: Run blocking PyTorch in thread pool to avoid blocking event loop
+            embedding = await asyncio.to_thread(_extract_sync)
 
             logger.debug(f"Local embedding extracted via ML Registry: shape {embedding.shape}")
             return embedding
