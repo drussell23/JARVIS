@@ -40,11 +40,12 @@ ARG CACHE_DIR
 ARG HF_CACHE_DIR
 ARG OPTIMIZATION_STRATEGY
 
-# Install build dependencies
+# Install build dependencies (cmake needed for onnx-simplifier)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     git \
     curl \
+    cmake \
     && rm -rf /var/lib/apt/lists/*
 
 # Create virtual environment
@@ -59,11 +60,11 @@ RUN pip install --no-cache-dir --upgrade pip && \
 # Install ONNX dependencies for optimization (REQUIRED for fast cold starts)
 # - onnx: For model export
 # - onnxruntime: For fast inference at runtime
-# - onnx-simplifier: For optimizing the ONNX graph
+# - onnxsim: For optimizing the ONNX graph (renamed from onnx-simplifier)
 RUN pip install --no-cache-dir \
     onnx==1.15.0 \
     onnxruntime==1.16.3 \
-    onnx-simplifier==0.4.35 && \
+    onnxsim==0.4.36 && \
     echo "ONNX dependencies installed successfully"
 
 # =============================================================================
