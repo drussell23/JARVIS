@@ -860,17 +860,82 @@ class UnifiedVoiceCacheManager:
             logger.debug(f"ChromaDB store error: {e}")
             return False
 
-    def _normalize_embedding(self, embedding: np.ndarray) -> np.ndarray:
-        """Normalize embedding to unit length for cosine similarity"""
-        # Handle NaN values - replace with zeros
-        if np.any(np.isnan(embedding)):
-            logger.warning("⚠️ Embedding contains NaN values - replacing with zeros")
-            embedding = np.nan_to_num(embedding, nan=0.0)
+    def _to_numpy_flat(self, embedding) -> Optional[np.ndarray]:
+        """
+        Convert embedding (torch tensor or numpy array) to flat numpy array.
 
-        norm = np.linalg.norm(embedding)
-        if norm == 0 or np.isnan(norm):
-            return embedding
-        return embedding / norm
+        CRITICAL: This handles the torch → numpy conversion that can cause NaN issues.
+        """
+        if embedding is None:
+            return None
+
+        try:
+            import torch
+            if isinstance(embedding, torch.Tensor):
+                # Proper conversion: detach from graph, move to CPU, convert to numpy
+                embedding = embedding.detach().cpu().numpy()
+        except ImportError:
+            pass
+        except Exception as e:
+            logger.warning(f"⚠️ Torch conversion warning: {e}")
+
+        # Ensure numpy array and flatten
+        try:
+            embedding_np = np.asarray(embedding, dtype=np.float32).flatten()
+        except Exception as e:
+            logger.error(f"❌ Failed to convert embedding to numpy: {e}")
+            return None
+
+        return embedding_np
+
+    def _normalize_embedding(self, embedding) -> Optional[np.ndarray]:
+        """
+        Normalize embedding to unit length for cosine similarity.
+
+        CRITICAL: This function GUARANTEES a NaN-free return or None.
+
+        Returns:
+            Normalized numpy array (NaN-free) or None if embedding is invalid
+        """
+        # First, ensure we have a proper numpy array
+        embedding_np = self._to_numpy_flat(embedding)
+        if embedding_np is None:
+            logger.warning("⚠️ _normalize_embedding: conversion to numpy failed")
+            return None
+
+        # Check for empty embedding
+        if len(embedding_np) == 0:
+            logger.warning("⚠️ _normalize_embedding: empty embedding")
+            return None
+
+        # CRITICAL: Check for NaN/Inf BEFORE any operations
+        if np.any(np.isnan(embedding_np)) or np.any(np.isinf(embedding_np)):
+            logger.warning("⚠️ Embedding contains NaN/Inf values - attempting recovery")
+            # Replace NaN with 0, Inf with large finite values
+            embedding_np = np.nan_to_num(embedding_np, nan=0.0, posinf=1e6, neginf=-1e6)
+
+            # If ALL values were NaN, we get all zeros - this is unrecoverable
+            if np.all(embedding_np == 0):
+                logger.error("❌ Embedding was entirely NaN - unrecoverable")
+                return None
+
+        # Compute norm
+        norm = np.linalg.norm(embedding_np)
+
+        # Handle zero/invalid norm
+        if norm == 0 or np.isnan(norm) or np.isinf(norm):
+            logger.warning(f"⚠️ Invalid embedding norm: {norm}")
+            return None
+
+        # Normalize
+        normalized = embedding_np / norm
+
+        # FINAL VALIDATION: Ensure result is NaN-free (paranoia check)
+        if np.any(np.isnan(normalized)):
+            logger.error("❌ Normalization produced NaN - this should never happen!")
+            return None
+
+        return normalized
 
     # =========================================================================
     # ANTI-SPOOFING DETECTION
@@ -1085,9 +1150,12 @@ class UnifiedVoiceCacheManager:
         """Compute cosine similarity between two embeddings"""
         if a is None or b is None:
             return 0.0
+        # Handle NaN values - return 0 similarity if either contains NaN
+        if np.any(np.isnan(a)) or np.any(np.isnan(b)):
+            return 0.0
         norm_a = np.linalg.norm(a)
         norm_b = np.linalg.norm(b)
-        if norm_a == 0 or norm_b == 0:
+        if norm_a == 0 or norm_b == 0 or np.isnan(norm_a) or np.isnan(norm_b):
             return 0.0
         return float(np.dot(a, b) / (norm_a * norm_b))
 
@@ -1825,10 +1893,14 @@ class UnifiedVoiceCacheManager:
             # STEP 0: CRITICAL - ENSURE ENCODER IS AVAILABLE (ON-DEMAND LOADING)
             # =====================================================================
             # This is the key fix for 0% confidence - we MUST have an encoder
+            ensure_start = time_module.time()
             encoder_available, encoder, encoder_status = await self.ensure_encoder_available(
                 timeout=30.0,  # Allow up to 30s for first-time model loading
                 trigger_load=True,  # Force loading if not available
             )
+            ensure_time = (time_module.time() - ensure_start) * 1000
+            if ensure_time > 100:
+                logger.info(f"⏱️ ensure_encoder_available took {ensure_time:.1f}ms")
 
             if encoder_available:
                 logger.debug(f"✅ Encoder guaranteed available: {encoder_status}")
@@ -1843,6 +1915,7 @@ class UnifiedVoiceCacheManager:
             # =====================================================================
             # PATH 1: Cloud extraction (if cloud mode active)
             # =====================================================================
+            path1_start = time_module.time()
             if getattr(self, "_using_cloud_ecapa", False):
                 try:
                     from voice_unlock.ml_engine_registry import get_ml_registry_sync
@@ -1852,12 +1925,19 @@ class UnifiedVoiceCacheManager:
                         # Normalize audio data to bytes if needed
                         audio_bytes = normalize_audio_data(audio_data)
                         if audio_bytes:
+                            cloud_start = time_module.time()
                             embedding = await registry.extract_speaker_embedding_cloud(audio_bytes)
+                            cloud_time = (time_module.time() - cloud_start) * 1000
+                            logger.info(f"⏱️ PATH 1 Cloud API call took {cloud_time:.1f}ms")
                             if embedding is not None:
-                                embedding_np = self._normalize_embedding(embedding.flatten())
-                                extract_time_ms = (time_module.time() - start_time) * 1000
-                                logger.debug(f"☁️ Extracted embedding via CLOUD in {extract_time_ms:.1f}ms")
-                                return embedding_np
+                                # Use _normalize_embedding which handles torch→numpy and NaN validation
+                                embedding_np = self._normalize_embedding(embedding)
+                                if embedding_np is not None:
+                                    extract_time_ms = (time_module.time() - start_time) * 1000
+                                    logger.info(f"☁️ Extracted embedding via CLOUD in {extract_time_ms:.1f}ms total")
+                                    return embedding_np
+                                else:
+                                    attempts.append("Cloud: normalization failed (NaN/invalid)")
                             else:
                                 attempts.append("Cloud: extraction returned None")
                         else:
@@ -1867,28 +1947,37 @@ class UnifiedVoiceCacheManager:
                 except Exception as e:
                     attempts.append(f"Cloud: {e}")
                     logger.debug(f"Cloud extraction failed: {e}")
+            path1_time = (time_module.time() - path1_start) * 1000
+            if path1_time > 100:
+                logger.info(f"⏱️ PATH 1 (Cloud) total: {path1_time:.1f}ms")
 
             # =====================================================================
             # PATH 2: Local encoder (direct or cached)
             # =====================================================================
+            path2_start = time_module.time()
             encoder = self.get_ecapa_encoder()
 
             if encoder is not None:
                 try:
                     # Run CPU-intensive PyTorch operations in thread pool to avoid blocking
-                    embedding_np = await asyncio.to_thread(
+                    local_start = time_module.time()
+                    raw_embedding = await asyncio.to_thread(
                         self._extract_embedding_sync,
                         encoder,
                         audio_data
                     )
+                    local_time = (time_module.time() - local_start) * 1000
+                    logger.info(f"⏱️ PATH 2 Local extraction took {local_time:.1f}ms")
 
-                    if embedding_np is not None:
-                        # Normalize (fast numpy operation)
-                        embedding_np = self._normalize_embedding(embedding_np)
-
-                        extract_time_ms = (time_module.time() - start_time) * 1000
-                        logger.debug(f"Extracted embedding in {extract_time_ms:.1f}ms (local)")
-                        return embedding_np
+                    if raw_embedding is not None:
+                        # Normalize - handles torch→numpy and NaN validation
+                        embedding_np = self._normalize_embedding(raw_embedding)
+                        if embedding_np is not None:
+                            extract_time_ms = (time_module.time() - start_time) * 1000
+                            logger.info(f"🖥️ Extracted embedding in {extract_time_ms:.1f}ms (local)")
+                            return embedding_np
+                        else:
+                            attempts.append("Local encoder: normalization failed (NaN/invalid)")
                     else:
                         attempts.append("Local encoder: extraction returned None")
                 except Exception as e:
@@ -1896,10 +1985,14 @@ class UnifiedVoiceCacheManager:
                     logger.warning(f"Local encoder extraction failed: {e}")
             else:
                 attempts.append("Local encoder: not available")
+            path2_time = (time_module.time() - path2_start) * 1000
+            if path2_time > 100:
+                logger.info(f"⏱️ PATH 2 (Local) total: {path2_time:.1f}ms")
 
             # =====================================================================
             # PATH 3: ML Registry fallback
             # =====================================================================
+            path3_start = time_module.time()
             logger.debug("Primary encoder unavailable, trying ML Registry fallback...")
             try:
                 from voice_unlock.ml_engine_registry import extract_speaker_embedding as ml_extract
@@ -1907,12 +2000,19 @@ class UnifiedVoiceCacheManager:
                 # Normalize audio data to bytes
                 audio_bytes = normalize_audio_data(audio_data)
                 if audio_bytes:
+                    ml_start = time_module.time()
                     embedding = await ml_extract(audio_bytes)
+                    ml_time = (time_module.time() - ml_start) * 1000
+                    logger.info(f"⏱️ PATH 3 ML Registry call took {ml_time:.1f}ms")
                     if embedding is not None:
-                        embedding_np = self._normalize_embedding(embedding.flatten())
-                        extract_time_ms = (time_module.time() - start_time) * 1000
-                        logger.debug(f"Extracted embedding via ML Registry in {extract_time_ms:.1f}ms")
-                        return embedding_np
+                        # Use _normalize_embedding which handles torch→numpy and NaN validation
+                        embedding_np = self._normalize_embedding(embedding)
+                        if embedding_np is not None:
+                            extract_time_ms = (time_module.time() - start_time) * 1000
+                            logger.info(f"🔧 Extracted embedding via ML Registry in {extract_time_ms:.1f}ms")
+                            return embedding_np
+                        else:
+                            attempts.append("ML Registry: normalization failed (NaN/invalid)")
                     else:
                         attempts.append("ML Registry: extraction returned None")
                 else:
@@ -1922,10 +2022,14 @@ class UnifiedVoiceCacheManager:
             except Exception as e:
                 attempts.append(f"ML Registry: {e}")
                 logger.debug(f"ML Registry fallback failed: {e}")
+            path3_time = (time_module.time() - path3_start) * 1000
+            if path3_time > 100:
+                logger.info(f"⏱️ PATH 3 (ML Registry) total: {path3_time:.1f}ms")
 
             # =====================================================================
             # PATH 4: Speaker Verification Service engine (last resort)
             # =====================================================================
+            path4_start = time_module.time()
             logger.debug("Trying Speaker Verification Service fallback...")
             try:
                 from voice.speaker_verification_service import get_speaker_verification_service
@@ -1934,12 +2038,19 @@ class UnifiedVoiceCacheManager:
                 if svc and svc.speechbrain_engine:
                     audio_bytes = normalize_audio_data(audio_data)
                     if audio_bytes:
+                        svc_start = time_module.time()
                         embedding = await svc.speechbrain_engine.extract_speaker_embedding(audio_bytes)
+                        svc_time = (time_module.time() - svc_start) * 1000
+                        logger.info(f"⏱️ PATH 4 Speaker Service call took {svc_time:.1f}ms")
                         if embedding is not None:
-                            embedding_np = self._normalize_embedding(embedding.flatten())
-                            extract_time_ms = (time_module.time() - start_time) * 1000
-                            logger.debug(f"Extracted embedding via Speaker Service in {extract_time_ms:.1f}ms")
-                            return embedding_np
+                            # Use _normalize_embedding which handles torch→numpy and NaN validation
+                            embedding_np = self._normalize_embedding(embedding)
+                            if embedding_np is not None:
+                                extract_time_ms = (time_module.time() - start_time) * 1000
+                                logger.info(f"🎤 Extracted embedding via Speaker Service in {extract_time_ms:.1f}ms")
+                                return embedding_np
+                            else:
+                                attempts.append("Speaker Service: normalization failed (NaN/invalid)")
                         else:
                             attempts.append("Speaker Service: extraction returned None")
                     else:
@@ -1951,12 +2062,17 @@ class UnifiedVoiceCacheManager:
             except Exception as e:
                 attempts.append(f"Speaker Service: {e}")
                 logger.debug(f"Speaker Service fallback failed: {e}")
+            path4_time = (time_module.time() - path4_start) * 1000
+            if path4_time > 100:
+                logger.info(f"⏱️ PATH 4 (Speaker Service) total: {path4_time:.1f}ms")
 
             # =====================================================================
             # ALL PATHS FAILED - Log detailed diagnostics
             # =====================================================================
+            total_time_ms = (time_module.time() - start_time) * 1000
             logger.error("=" * 60)
             logger.error("❌ EMBEDDING EXTRACTION FAILED - All paths exhausted!")
+            logger.error(f"   ⏱️ Total time spent: {total_time_ms:.1f}ms")
             logger.error("=" * 60)
             logger.error("   Attempts:")
             for i, attempt in enumerate(attempts, 1):
@@ -2228,16 +2344,9 @@ class UnifiedVoiceCacheManager:
             match_time_ms=match_time_ms,
         )
 
-    def _normalize_embedding(self, embedding: np.ndarray) -> np.ndarray:
-        """Normalize embedding to unit length"""
-        # Handle NaN values
-        if np.any(np.isnan(embedding)):
-            embedding = np.nan_to_num(embedding, nan=0.0)
-
-        norm = np.linalg.norm(embedding)
-        if norm > 0 and not np.isnan(norm):
-            return embedding / norm
-        return embedding
+    # NOTE: _normalize_embedding is defined earlier in this class (line ~891)
+    # with comprehensive NaN/Inf handling and torch tensor conversion.
+    # Do NOT redefine it here - Python would override the robust version.
 
     def _compute_similarity(
         self,
@@ -2246,6 +2355,9 @@ class UnifiedVoiceCacheManager:
     ) -> float:
         """Compute cosine similarity between two embeddings"""
         if a is None or b is None:
+            return 0.0
+        # Handle NaN in either array
+        if np.any(np.isnan(a)) or np.any(np.isnan(b)):
             return 0.0
         # Assume already normalized
         return float(np.dot(a, b))
