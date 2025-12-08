@@ -38,7 +38,6 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import AsyncIterator, Dict, List, Optional, Tuple
-from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import torch
@@ -655,7 +654,7 @@ class SpeechBrainEngine(BaseSTTEngine):
                         return load_fallback_ref(model_source, {"device": device_ref})
                     raise
 
-            self.asr_model = await loop.run_in_executor(None, _load_asr_model)
+            self.asr_model = _load_asr_model()
 
             # Apply quantization if on CPU for faster inference
             if self.device == "cpu" and hasattr(torch, "quantization"):
@@ -703,8 +702,15 @@ class SpeechBrainEngine(BaseSTTEngine):
             return self._encoder_load_task
 
         logger.info("🚀 Pre-loading speaker encoder in background for faster unlock...")
-        self._encoder_load_task = asyncio.create_task(self._load_speaker_encoder())
-        return self._encoder_load_task
+        # CRITICAL: On macOS/Apple Silicon, background loading of PyTorch models is unsafe.
+        # We must load it synchronously or not at all.
+        # Since this method implies "background" but we can't do it safely in background,
+        # we will skip the eager load here and let it happen (synchronously) on first use
+        # via ensure_speaker_encoder_ready(). This avoids the crash at startup.
+        
+        # self._encoder_load_task = asyncio.create_task(self._load_speaker_encoder())
+        logger.warning("⚠️ Background pre-loading disabled on macOS to prevent segfaults. Model will load on first use.")
+        return None
 
     async def ensure_speaker_encoder_ready(self):
         """
@@ -737,12 +743,9 @@ class SpeechBrainEngine(BaseSTTEngine):
         Loads the ECAPA-TDNN speaker encoder for speaker verification and
         embedding extraction. Called automatically when speaker features are used.
 
-        Uses a dedicated thread pool with timeout to prevent deadlocks from
-        blocking I/O operations during model loading.
-
-        Raises:
-            Exception: If speaker encoder loading fails
-            asyncio.TimeoutError: If loading takes longer than 120 seconds
+        CRITICAL: On macOS/Apple Silicon, this MUST run synchronously on the main thread
+        to avoid segfaults (EXC_BAD_ACCESS) caused by PyTorch/Metal interaction
+        in background threads.
         """
         if self.speaker_encoder_loaded:
             return
@@ -767,53 +770,39 @@ class SpeechBrainEngine(BaseSTTEngine):
             encoder_device = "cpu"
             logger.info(f"   Using device: {encoder_device} (FFT operations required)")
 
-            # Create dedicated thread pool for model loading to avoid event loop conflicts
-            # Using max_workers=1 ensures sequential loading and prevents thread exhaustion
-            if _HAS_MANAGED_EXECUTOR:
-                executor = ManagedThreadPoolExecutor(
-                    max_workers=1,
-                    thread_name_prefix="speechbrain_loader",
-                    name="speechbrain_loader"
-                )
-            else:
-                executor = ThreadPoolExecutor(
-                    max_workers=1,
-                    thread_name_prefix="speechbrain_loader"
-                )
-
+            # Use the current event loop instead of a separate thread executor
+            # This avoids segfaults caused by thread-local storage issues in PyTorch/SpeechBrain
+            loop = asyncio.get_running_loop()
+            
             # SAFETY: Capture references BEFORE defining sync function to prevent segfaults
             cache_dir_ref = self.cache_dir
             load_ecapa_fallback_ref = self._load_ecapa_fallback
             loading_lock_ref = self._model_loading_lock  # CRITICAL: Thread-safe loading lock
-
+            
             def _load_model_sync():
-                """Synchronous model loading function to run in dedicated thread.
-
-                CRITICAL: Uses loading_lock_ref to prevent concurrent model loads
-                from different threads/event loops. This is essential because:
-                1. Background preloader thread has its own event loop
-                2. Main async code may also try to load
-                3. PyTorch model loading is NOT thread-safe
+                """Synchronous model loading function.
+                
+                CRITICAL: Run on main thread to prevent segfaults on macOS/Apple Silicon.
                 """
                 # CRITICAL: Acquire loading lock to prevent concurrent loads
                 # This lock protects against segfaults from concurrent model loading
                 with loading_lock_ref:
                     # Set thread-local PyTorch settings to avoid conflicts
                     torch.set_num_threads(1)  # Prevent thread pool exhaustion
-
+                    
                     import os
                     old_mps_fallback = None
-
+                    
                     try:
                         # Apply PyTorch workarounds if needed
                         if is_apple_silicon and pytorch_version.startswith(('2.9', '2.10', '2.11')):
                             logger.info("   🔧 Applying PyTorch 2.9.0+ Apple Silicon workaround...")
                             old_mps_fallback = os.environ.get('PYTORCH_MPS_HIGH_WATERMARK_RATIO')
                             os.environ['PYTORCH_MPS_HIGH_WATERMARK_RATIO'] = '0.0'
-
+                            
                             if hasattr(torch.backends, 'mps'):
                                 torch.backends.mps.is_built = lambda: False
-
+                            
                         # Load model with appropriate run_opts
                         run_opts = {"device": "cpu"}
                         if is_apple_silicon and pytorch_version.startswith(('2.9', '2.10', '2.11')):
@@ -821,9 +810,9 @@ class SpeechBrainEngine(BaseSTTEngine):
                                 "data_parallel_backend": False,
                                 "distributed_launch": False,
                             })
-
+                            
                         logger.info(f"   Loading from thread: {threading.current_thread().name}")
-
+                        
                         # Try standard from_hparams first
                         try:
                             # Use captured cache_dir_ref instead of self.cache_dir
@@ -841,7 +830,7 @@ class SpeechBrainEngine(BaseSTTEngine):
                                 return load_ecapa_fallback_ref(run_opts)
                             else:
                                 raise
-
+                                
                     finally:
                         # Restore environment
                         if old_mps_fallback is not None:
@@ -850,34 +839,22 @@ class SpeechBrainEngine(BaseSTTEngine):
                             os.environ.pop('PYTORCH_MPS_HIGH_WATERMARK_RATIO', None)
 
             try:
-                # Load model with timeout to prevent infinite hangs
-                loop = asyncio.get_running_loop()
-                logger.info("   Submitting model loading task to dedicated thread pool...")
-
-                # Use asyncio.wait_for to enforce timeout
-                self.speaker_encoder = await asyncio.wait_for(
-                    loop.run_in_executor(executor, _load_model_sync),
-                    timeout=120.0  # 2 minute timeout for model loading
-                )
-
-                logger.info("   ✅ Model loaded and transferred to main thread")
-
-            except asyncio.TimeoutError:
+                logger.info("   Loading model synchronously on main thread (required for macOS stability)...")
+                # CRITICAL: Run synchronously on main thread to avoid segfaults
+                # Do NOT use run_in_executor here
+                self.speaker_encoder = _load_model_sync()
+                
+                logger.info("   ✅ Model loaded successfully")
+                
+            except Exception as e:
                 logger.error(
-                    "❌ Speaker encoder loading timed out after 120 seconds!\n"
-                    "   This usually indicates a deadlock or blocking operation.\n"
-                    "   Possible causes:\n"
-                    "   - Event loop conflict with torch.load()\n"
-                    "   - Thread pool exhaustion\n"
-                    "   - Corrupted model files\n"
-                    "   \n"
-                    "   Try clearing the cache: rm -rf ~/.cache/jarvis/speechbrain"
+                    "❌ Speaker encoder loading failed!\n"
+                    f"   Error: {e}"
                 )
                 raise
             finally:
-                # Always shutdown executor to prevent thread leaks
-                executor.shutdown(wait=False)
-
+                pass
+            
             self.speaker_encoder_loaded = True
             logger.info("✅ Speaker encoder loaded successfully")
 
