@@ -1078,7 +1078,7 @@ class UnifiedWebSocketManager:
 
                         result = {
                             "response": jarvis_result.get("response", ""),
-                            "success": jarvis_result.get("status") == "success",
+                            "success": jarvis_result.get("success", jarvis_result.get("status") == "success"),
                             "command_type": jarvis_result.get("command_type", "unknown"),
                             "metadata": jarvis_result,
                         }
