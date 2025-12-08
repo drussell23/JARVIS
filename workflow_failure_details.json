@@ -1,0 +1,83 @@
+{
+  "workflow_name": "Database Connection Validation",
+  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/20024966322",
+  "branch": "dependabot/pip/backend/scipy-1.16.3",
+  "commit_sha": "1a6c61d",
+  "run_number": 557,
+  "failed_count": 1,
+  "fix_branch": "fix/ci/database-connection-validation-run557-20251208-111001",
+  "pr_title": "\ud83d\udea8 Fix CI/CD: Database Connection Validation (Run #557)",
+  "analyses": [
+    {
+      "error_patterns": [
+        {
+          "pattern": "ERROR|Error|error",
+          "matches": [
+            {
+              "line_number": 63,
+              "content": "2025-12-08T10:33:10.5067326Z ##[error]Process completed with exit code 1.",
+              "severity": "high",
+              "emoji": "\u274c"
+            }
+          ],
+          "count": 1
+        },
+        {
+          "pattern": "FAIL|Failed|failed",
+          "matches": [
+            {
+              "line_number": 97,
+              "content": "2025-12-08T10:33:10.6507977Z ##[warning]The process '/usr/bin/git' failed with exit code 128",
+              "severity": "high",
+              "emoji": "\ud83d\udca5"
+            }
+          ],
+          "count": 1
+        },
+        {
+          "pattern": "WARN|Warning|warning",
+          "matches": [
+            {
+              "line_number": 97,
+              "content": "2025-12-08T10:33:10.6507977Z ##[warning]The process '/usr/bin/git' failed with exit code 128",
+              "severity": "medium",
+              "emoji": "\u26a0\ufe0f"
+            }
+          ],
+          "count": 1
+        },
+        {
+          "pattern": "timeout|timed out",
+          "matches": [
+            {
+              "line_number": 3,
+              "content": "2025-12-08T10:33:07.5296933Z Downloading async_timeout-5.0.1-py3-none-any.whl (6.2 kB)",
+              "severity": "medium",
+              "emoji": "\u23f1\ufe0f"
+            },
+            {
+              "line_number": 17,
+              "content": "2025-12-08T10:33:07.6782299Z Installing collected packages: urllib3, typing-extensions, pyyaml, pycparser, pyasn1, psycopg2-binary, propcache, idna, greenlet, frozenlist, dnspython, charset_normalizer, certifi, cachetools, attrs, async-timeout, aiohappyeyeballs, aiofiles, sqlalchemy, rsa, Requests, pyasn1-modules, multidict, cffi, aiosignal, yarl, google-auth, cryptography, aiohttp, cloud-sql-python-connector",
+              "severity": "medium",
+              "emoji": "\u23f1\ufe0f"
+            },
+            {
+              "line_number": 19,
+              "content": "2025-12-08T10:33:09.8440318Z Successfully installed Requests-2.32.5 aiofiles-25.1.0 aiohappyeyeballs-2.6.1 aiohttp-3.13.2 aiosignal-1.4.0 async-timeout-5.0.1 attrs-25.4.0 cachetools-6.2.2 certifi-2025.11.12 cffi-2.0.0 charset_normalizer-3.4.4 cloud-sql-python-connector-1.18.5 cryptography-46.0.3 dnspython-2.8.0 frozenlist-1.8.0 google-auth-2.43.0 greenlet-3.3.0 idna-3.11 multidict-6.7.0 propcache-0.4.1 psycopg2-binary-2.9.11 pyasn1-0.6.1 pyasn1-modules-0.4.2 pycparser-2.23 pyyaml-6.0.3 rsa-4.9.1 sqlalchemy-2.0.44 typing-extensions-4.15.0 urllib3-2.6.0 yarl-1.22.0",
+              "severity": "medium",
+              "emoji": "\u23f1\ufe0f"
+            }
+          ],
+          "count": 3
+        }
+      ],
+      "suggested_fixes": [
+        "Consider increasing timeout values or optimizing slow operations"
+      ],
+      "severity": "high",
+      "category": "syntax_error",
+      "similar_failures": []
+    }
+  ],
+  "timestamp": "2025-12-08T11:10:01.770180"
+}
