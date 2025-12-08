@@ -1,65 +1,54 @@
 {
-  "workflow_name": "Secret Scanning",
-  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/20022810769",
-  "branch": "cursor/jarvis-voice-unlock-integration-gemini-3-pro-preview-bbfb",
-  "commit_sha": "ae22a46",
-  "run_number": 662,
+  "workflow_name": "PR Automation & Validation",
+  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/20022880774",
+  "branch": "fix/ci/secret-scanning-run662-20251208-091737",
+  "commit_sha": "fd4fdfc",
+  "run_number": 724,
   "failed_count": 1,
-  "fix_branch": "fix/ci/secret-scanning-run662-20251208-091737",
-  "pr_title": "\ud83d\udea8 Fix CI/CD: Secret Scanning (Run #662)",
+  "fix_branch": "fix/ci/pr-automation-validation-run724-20251208-091941",
+  "pr_title": "\ud83d\udea8 Fix CI/CD: PR Automation & Validation (Run #724)",
   "analyses": [
     {
       "error_patterns": [
         {
-          "pattern": "FAIL|Failed|failed",
+          "pattern": "ERROR|Error|error",
           "matches": [
             {
-              "line_number": 97,
-              "content": "2025-12-08T09:16:10.7103628Z ##[warning]The process '/usr/bin/git' failed with exit code 128",
+              "line_number": 25,
+              "content": "2025-12-08T09:18:19.0833606Z   subjectPatternError: The PR title must start with a capital letter.",
               "severity": "high",
-              "emoji": "\ud83d\udca5"
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 37,
+              "content": "2025-12-08T09:18:19.5797474Z ##[error]No release type found in pull request title \"\ud83d\udea8 Fix CI/CD: Secret Scanning (Run #662)\". Add a prefix to indicate what kind of release this pull request corresponds to. For reference, see https://www.conventionalcommits.org/",
+              "severity": "high",
+              "emoji": "\u274c"
+            }
+          ],
+          "count": 2
+        },
+        {
+          "pattern": "timeout|timed out",
+          "matches": [
+            {
+              "line_number": 29,
+              "content": "- fix: Resolve database connection timeout",
+              "severity": "medium",
+              "emoji": "\u23f1\ufe0f"
             }
           ],
           "count": 1
-        },
-        {
-          "pattern": "WARN|Warning|warning",
-          "matches": [
-            {
-              "line_number": 60,
-              "content": "2025-12-08T09:16:09.4333348Z ##[warning]\ud83d\uded1 Leaks detected, see job summary for details",
-              "severity": "medium",
-              "emoji": "\u26a0\ufe0f"
-            },
-            {
-              "line_number": 66,
-              "content": "2025-12-08T09:16:09.4432905Z   if-no-files-found: warn",
-              "severity": "medium",
-              "emoji": "\u26a0\ufe0f"
-            },
-            {
-              "line_number": 71,
-              "content": "2025-12-08T09:16:09.6454514Z ##[warning]No files were found with the provided path: gitleaks-report.json. No artifacts will be uploaded.",
-              "severity": "medium",
-              "emoji": "\u26a0\ufe0f"
-            },
-            {
-              "line_number": 97,
-              "content": "2025-12-08T09:16:10.7103628Z ##[warning]The process '/usr/bin/git' failed with exit code 128",
-              "severity": "medium",
-              "emoji": "\u26a0\ufe0f"
-            }
-          ],
-          "count": 4
         }
       ],
       "suggested_fixes": [
-        "Review the logs above for specific error messages"
+        "Consider increasing timeout values or optimizing slow operations",
+        "Check service availability and network connectivity"
       ],
       "severity": "high",
-      "category": "permission_error",
+      "category": "timeout",
       "similar_failures": []
     }
   ],
-  "timestamp": "2025-12-08T09:17:37.601183"
+  "timestamp": "2025-12-08T09:19:41.351098"
 }
