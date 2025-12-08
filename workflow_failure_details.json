@@ -1,12 +1,12 @@
 {
   "workflow_name": "PR Automation & Validation",
-  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/20022810760",
-  "branch": "cursor/jarvis-voice-unlock-integration-gemini-3-pro-preview-bbfb",
-  "commit_sha": "ae22a46",
-  "run_number": 719,
+  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/20022880152",
+  "branch": "fix/ci/pr-automation-validation-run719-20251208-091738",
+  "commit_sha": "8428b37",
+  "run_number": 723,
   "failed_count": 1,
-  "fix_branch": "fix/ci/pr-automation-validation-run719-20251208-091738",
-  "pr_title": "\ud83d\udea8 Fix CI/CD: PR Automation & Validation (Run #719)",
+  "fix_branch": "fix/ci/pr-automation-validation-run723-20251208-091940",
+  "pr_title": "\ud83d\udea8 Fix CI/CD: PR Automation & Validation (Run #723)",
   "analyses": [
     {
       "error_patterns": [
@@ -15,13 +15,13 @@
           "matches": [
             {
               "line_number": 25,
-              "content": "2025-12-08T09:16:13.7031721Z   subjectPatternError: The PR title must start with a capital letter.",
+              "content": "2025-12-08T09:18:18.6831653Z   subjectPatternError: The PR title must start with a capital letter.",
               "severity": "high",
               "emoji": "\u274c"
             },
             {
               "line_number": 37,
-              "content": "2025-12-08T09:16:14.2132523Z ##[error]No release type found in pull request title \"Jarvis voice unlock integration\". Add a prefix to indicate what kind of release this pull request corresponds to. For reference, see https://www.conventionalcommits.org/",
+              "content": "2025-12-08T09:18:19.2628555Z ##[error]No release type found in pull request title \"\ud83d\udea8 Fix CI/CD: PR Automation & Validation (Run #719)\". Add a prefix to indicate what kind of release this pull request corresponds to. For reference, see https://www.conventionalcommits.org/",
               "severity": "high",
               "emoji": "\u274c"
             }
@@ -50,5 +50,5 @@
       "similar_failures": []
     }
   ],
-  "timestamp": "2025-12-08T09:17:38.266332"
+  "timestamp": "2025-12-08T09:19:40.958491"
 }
