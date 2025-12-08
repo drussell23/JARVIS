@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Cloud ECAPA Speaker Embedding Service v20.3.0
+Cloud ECAPA Speaker Embedding Service v20.4.0
 ==============================================
 
 Ultra-fast, production-ready cloud service for ECAPA-TDNN speaker embeddings.
@@ -13,14 +13,19 @@ Key Features:
 - DYNAMIC QUANTIZATION: Reduced model size with int8 weights
 - STRICT OFFLINE MODE: Zero network calls at runtime
 - PRE-BAKED MODEL: Model weights baked into Docker image
-- ASYNC PARALLEL LOADING: Non-blocking initialization
+- BLOCKING STARTUP: FastAPI waits for ECAPA before accepting requests
 - FAST-FAIL: Immediate error if pre-baked cache missing
 - Circuit breaker for downstream failures
 - Request batching for efficiency
 - Embedding caching with TTL
 - Comprehensive metrics and telemetry
 
-v20.3.0 - Complete SpeechBrain Lazy Import for Ultra-Fast Cold Starts (<5s)
+v20.4.0 - BLOCKING Initialization with Advanced Startup State Machine
+      - Dynamic timeout calculation with cold start detection
+      - Retry logic with exponential backoff and jitter
+      - Startup state machine (pending/initializing/retrying/ready/degraded/failed)
+      - Graceful degradation on partial failures
+      - Comprehensive startup metrics in /health endpoint
 
 Endpoints:
     GET  /health              - Health check with ECAPA readiness
@@ -1630,35 +1635,233 @@ if FASTAPI_AVAILABLE:
     # Health & Status Endpoints
     # =========================================================================
 
+    # =========================================================================
+    # ADVANCED STARTUP STATE MACHINE (v20.4.0)
+    # =========================================================================
+    class StartupState(Enum):
+        """Startup state machine for robust initialization tracking."""
+        PENDING = "pending"
+        INITIALIZING = "initializing"
+        RETRYING = "retrying"
+        READY = "ready"
+        DEGRADED = "degraded"  # Partial functionality
+        FAILED = "failed"
+
+    # Global startup context for metrics and state tracking
+    _startup_context: Dict[str, Any] = {
+        "state": StartupState.PENDING,
+        "attempt": 0,
+        "max_attempts": int(os.getenv("ECAPA_STARTUP_MAX_ATTEMPTS", "3")),
+        "start_time": None,
+        "ready_time": None,
+        "total_duration_ms": None,
+        "last_error": None,
+        "retry_delays": [],
+    }
+
+    def _get_dynamic_timeout() -> float:
+        """
+        Calculate dynamic startup timeout based on environment and conditions.
+
+        Factors:
+        - Base timeout from environment
+        - Cloud Run cold start buffer
+        - First-inference warmup time for ML models
+        """
+        base_timeout = float(os.getenv("ECAPA_STARTUP_TIMEOUT", "60.0"))
+
+        # Add buffer for Cloud Run cold starts (container spin-up overhead)
+        cloud_run_buffer = float(os.getenv("ECAPA_CLOUD_RUN_BUFFER", "15.0"))
+
+        # Check if this is likely a cold start (no cached state)
+        is_cold_start = not os.path.exists("/tmp/.ecapa_warm_marker")
+        cold_start_multiplier = 1.5 if is_cold_start else 1.0
+
+        dynamic_timeout = (base_timeout + cloud_run_buffer) * cold_start_multiplier
+
+        # Cap at reasonable maximum
+        max_timeout = float(os.getenv("ECAPA_STARTUP_MAX_TIMEOUT", "120.0"))
+        return min(dynamic_timeout, max_timeout)
+
+    def _get_retry_delay(attempt: int) -> float:
+        """
+        Calculate exponential backoff delay for retry attempts.
+
+        Formula: base_delay * (2 ^ attempt) + jitter
+        """
+        base_delay = float(os.getenv("ECAPA_RETRY_BASE_DELAY", "2.0"))
+        max_delay = float(os.getenv("ECAPA_RETRY_MAX_DELAY", "15.0"))
+
+        # Exponential backoff
+        delay = base_delay * (2 ** attempt)
+
+        # Add jitter (±20%) to prevent thundering herd
+        import random
+        jitter = delay * 0.2 * (random.random() * 2 - 1)
+        delay += jitter
+
+        return min(delay, max_delay)
+
     @app.on_event("startup")
     async def startup_event():
-        """Initialize model on startup."""
-        logger.info("Starting ECAPA Cloud Service...")
-        manager = get_model_manager()
+        """
+        BLOCKING ECAPA Initialization with Advanced Robustness (v20.4.0)
 
-        # Start initialization in background with exception handling
-        async def init_with_logging():
+        ROOT CAUSE FIX: FastAPI waits for ECAPA to be ready before accepting requests.
+
+        Features:
+        - Dynamic timeout calculation based on environment
+        - Retry logic with exponential backoff
+        - State machine for robust tracking
+        - Comprehensive metrics and telemetry
+        - Graceful degradation on partial failures
+        - Cold start detection and optimization
+        """
+        _startup_context["state"] = StartupState.INITIALIZING
+        _startup_context["start_time"] = time.time()
+
+        logger.info("=" * 70)
+        logger.info("🚀 ECAPA Cloud Service v20.4.0 - BLOCKING Initialization")
+        logger.info("=" * 70)
+
+        manager = get_model_manager()
+        dynamic_timeout = _get_dynamic_timeout()
+        max_attempts = _startup_context["max_attempts"]
+
+        logger.info(f"   Dynamic timeout: {dynamic_timeout:.1f}s")
+        logger.info(f"   Max retry attempts: {max_attempts}")
+        logger.info(f"   Cold start detection: {not os.path.exists('/tmp/.ecapa_warm_marker')}")
+
+        last_error: Optional[Exception] = None
+
+        for attempt in range(max_attempts):
+            _startup_context["attempt"] = attempt + 1
+
+            if attempt > 0:
+                _startup_context["state"] = StartupState.RETRYING
+                retry_delay = _get_retry_delay(attempt)
+                _startup_context["retry_delays"].append(retry_delay)
+                logger.warning(f"⏳ Retry attempt {attempt + 1}/{max_attempts} after {retry_delay:.1f}s delay...")
+                await asyncio.sleep(retry_delay)
+
             try:
-                logger.info("Background initialization task starting...")
-                result = await manager.initialize()
-                logger.info(f"Background initialization completed: {result}")
+                logger.info(f"📦 Initialization attempt {attempt + 1}/{max_attempts}...")
+
+                # Blocking initialization with timeout protection
+                result = await asyncio.wait_for(
+                    manager.initialize(),
+                    timeout=dynamic_timeout
+                )
+
+                if result:
+                    # SUCCESS - Mark as ready
+                    _startup_context["state"] = StartupState.READY
+                    _startup_context["ready_time"] = time.time()
+                    _startup_context["total_duration_ms"] = (
+                        _startup_context["ready_time"] - _startup_context["start_time"]
+                    ) * 1000
+
+                    # Create warm marker for future starts
+                    try:
+                        Path("/tmp/.ecapa_warm_marker").touch()
+                    except Exception:
+                        pass  # Non-critical
+
+                    logger.info("=" * 70)
+                    logger.info("✅ ECAPA READY - Service accepting requests")
+                    logger.info(f"   Load source: {manager.load_source}")
+                    logger.info(f"   Load time: {manager.load_time_ms:.0f}ms")
+                    logger.info(f"   Total startup: {_startup_context['total_duration_ms']:.0f}ms")
+                    logger.info(f"   Attempts: {attempt + 1}")
+                    if _startup_context["retry_delays"]:
+                        logger.info(f"   Retry delays: {_startup_context['retry_delays']}")
+                    logger.info("=" * 70)
+                    return  # Success - exit startup
+
+                else:
+                    # initialize() returned False - not an exception but a failure
+                    last_error = Exception("initialize() returned False")
+                    logger.warning(f"⚠️ Attempt {attempt + 1} returned False, will retry...")
+
+            except asyncio.TimeoutError:
+                last_error = asyncio.TimeoutError(f"Initialization timeout after {dynamic_timeout}s")
+                _startup_context["last_error"] = str(last_error)
+                logger.error(f"⏰ Attempt {attempt + 1} TIMEOUT after {dynamic_timeout:.1f}s")
+
+                # Increase timeout for next attempt
+                dynamic_timeout = min(dynamic_timeout * 1.5, 180.0)
+                logger.info(f"   Increased timeout for next attempt: {dynamic_timeout:.1f}s")
+
             except Exception as e:
-                logger.error(f"Background initialization failed: {e}")
-                import traceback
+                last_error = e
+                _startup_context["last_error"] = str(e)
+                logger.error(f"❌ Attempt {attempt + 1} FAILED: {e}")
                 logger.error(traceback.format_exc())
 
-        asyncio.create_task(init_with_logging())
+        # All attempts exhausted - enter degraded or failed state
+        _startup_context["total_duration_ms"] = (time.time() - _startup_context["start_time"]) * 1000
+
+        # Check if model is partially loaded (degraded mode)
+        if manager._model is not None or manager._optimized_loader is not None:
+            _startup_context["state"] = StartupState.DEGRADED
+            logger.warning("=" * 70)
+            logger.warning("⚠️ ECAPA DEGRADED MODE - Partial initialization")
+            logger.warning(f"   Model loaded: {manager._model is not None}")
+            logger.warning(f"   Optimized loader: {manager._optimized_loader is not None}")
+            logger.warning(f"   Last error: {last_error}")
+            logger.warning("   Service will start but may have reduced functionality")
+            logger.warning("=" * 70)
+        else:
+            _startup_context["state"] = StartupState.FAILED
+            logger.error("=" * 70)
+            logger.error("❌ ECAPA FAILED - All initialization attempts exhausted")
+            logger.error(f"   Attempts: {max_attempts}")
+            logger.error(f"   Total time: {_startup_context['total_duration_ms']:.0f}ms")
+            logger.error(f"   Last error: {last_error}")
+            logger.error("   Service will start but health checks will show 'failed'")
+            logger.error("=" * 70)
 
     @app.get("/health")
     async def health_check():
-        """Health check endpoint with cache status."""
+        """
+        Health check endpoint with startup state machine (v20.4.0).
+
+        Returns comprehensive health status including:
+        - ECAPA model readiness
+        - Startup state (pending/initializing/retrying/ready/degraded/failed)
+        - Initialization metrics and timing
+        - Cache and load source information
+        """
         manager = get_model_manager()
+        startup_state = _startup_context.get("state", StartupState.PENDING)
+
+        # Determine overall health status based on state machine
+        if startup_state == StartupState.READY:
+            status = "healthy"
+        elif startup_state == StartupState.DEGRADED:
+            status = "degraded"
+        elif startup_state == StartupState.FAILED:
+            status = "unhealthy"
+        elif startup_state in (StartupState.INITIALIZING, StartupState.RETRYING):
+            status = "initializing"
+        else:
+            status = "pending"
 
         response = {
-            "status": "healthy" if manager.is_ready else "initializing",
+            "status": status,
             "ecapa_ready": manager.is_ready,
+            "startup_state": startup_state.value if hasattr(startup_state, 'value') else str(startup_state),
             "timestamp": datetime.utcnow().isoformat(),
+            "version": "20.4.0",
         }
+
+        # Include startup metrics
+        if _startup_context.get("total_duration_ms"):
+            response["startup_duration_ms"] = _startup_context["total_duration_ms"]
+        if _startup_context.get("attempt"):
+            response["startup_attempts"] = _startup_context["attempt"]
+        if _startup_context.get("last_error"):
+            response["last_error"] = _startup_context["last_error"]
 
         # Include cache info if model is loaded
         if manager.is_ready:
@@ -1675,11 +1878,58 @@ if FASTAPI_AVAILABLE:
 
         return {
             "service": "ecapa_cloud_service",
-            "version": "20.0.0",
+            "version": "20.4.0",
             "config": CloudECAPAConfig.to_dict(),
             "model": manager.status(),
             "prebaked_manifest": manager._prebaked_manifest,
             "optimization_manifest": manager._optimized_loader.optimization_manifest if manager._optimized_loader else None,
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+
+    @app.get("/startup-diagnostics")
+    async def startup_diagnostics():
+        """
+        Detailed startup diagnostics endpoint (v20.4.0).
+
+        Returns comprehensive startup state machine information for debugging:
+        - Current startup state
+        - All timing metrics
+        - Retry history with delays
+        - Error information
+        - Environment configuration
+        """
+        manager = get_model_manager()
+        startup_state = _startup_context.get("state", StartupState.PENDING)
+
+        return {
+            "service": "ecapa_cloud_service",
+            "version": "20.4.0",
+            "startup": {
+                "state": startup_state.value if hasattr(startup_state, 'value') else str(startup_state),
+                "attempt": _startup_context.get("attempt", 0),
+                "max_attempts": _startup_context.get("max_attempts", 3),
+                "start_time": _startup_context.get("start_time"),
+                "ready_time": _startup_context.get("ready_time"),
+                "total_duration_ms": _startup_context.get("total_duration_ms"),
+                "retry_delays": _startup_context.get("retry_delays", []),
+                "last_error": _startup_context.get("last_error"),
+            },
+            "model": {
+                "is_ready": manager.is_ready,
+                "load_source": manager.load_source if manager.is_ready else None,
+                "load_time_ms": manager.load_time_ms if manager.is_ready else None,
+                "using_prebaked": manager._using_prebaked,
+                "circuit_breaker_state": manager.circuit_breaker.state.name if manager.circuit_breaker else None,
+            },
+            "environment": {
+                "ECAPA_STARTUP_TIMEOUT": os.getenv("ECAPA_STARTUP_TIMEOUT", "60.0"),
+                "ECAPA_STARTUP_MAX_ATTEMPTS": os.getenv("ECAPA_STARTUP_MAX_ATTEMPTS", "3"),
+                "ECAPA_CLOUD_RUN_BUFFER": os.getenv("ECAPA_CLOUD_RUN_BUFFER", "15.0"),
+                "ECAPA_RETRY_BASE_DELAY": os.getenv("ECAPA_RETRY_BASE_DELAY", "2.0"),
+                "ECAPA_RETRY_MAX_DELAY": os.getenv("ECAPA_RETRY_MAX_DELAY", "15.0"),
+                "ECAPA_STARTUP_MAX_TIMEOUT": os.getenv("ECAPA_STARTUP_MAX_TIMEOUT", "120.0"),
+                "cold_start_marker_exists": os.path.exists("/tmp/.ecapa_warm_marker"),
+            },
             "timestamp": datetime.utcnow().isoformat(),
         }
 

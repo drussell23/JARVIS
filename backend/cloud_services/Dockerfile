@@ -155,6 +155,9 @@ RUN chown -R ecapa:ecapa ${CACHE_DIR} && \
 # Create app directory
 WORKDIR /app
 
+# Cache-buster ARG - change this to force rebuild of application code
+ARG CACHE_BUST=v20.4.0
+
 # Copy application code
 COPY ecapa_cloud_service.py .
 COPY compile_model.py .

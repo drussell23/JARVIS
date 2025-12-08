@@ -16,7 +16,7 @@
 #   ./deploy_cloud_run.sh --local-build      # Build locally, push to GCR
 #   ./deploy_cloud_run.sh --dry-run          # Show commands without executing
 #
-# v20.3.0 - JIT Pre-Compilation Support
+# v20.4.0 - BLOCKING Initialization with Startup State Machine
 # =============================================================================
 
 set -e
@@ -180,7 +180,7 @@ fi
 
 # Build image
 IMAGE_URI="${AR_LOCATION}-docker.pkg.dev/${GCP_PROJECT}/${AR_REPO}/${IMAGE_NAME}:latest"
-IMAGE_URI_TAGGED="${AR_LOCATION}-docker.pkg.dev/${GCP_PROJECT}/${AR_REPO}/${IMAGE_NAME}:v20.3.0"
+IMAGE_URI_TAGGED="${AR_LOCATION}-docker.pkg.dev/${GCP_PROJECT}/${AR_REPO}/${IMAGE_NAME}:v20.4.0"
 
 if [ "$SKIP_BUILD" = false ]; then
     if [ "$LOCAL_BUILD" = true ]; then
