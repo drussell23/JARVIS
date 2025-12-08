@@ -1,0 +1,65 @@
+{
+  "workflow_name": "Secret Scanning",
+  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/20022810769",
+  "branch": "cursor/jarvis-voice-unlock-integration-gemini-3-pro-preview-bbfb",
+  "commit_sha": "ae22a46",
+  "run_number": 662,
+  "failed_count": 1,
+  "fix_branch": "fix/ci/secret-scanning-run662-20251208-091737",
+  "pr_title": "\ud83d\udea8 Fix CI/CD: Secret Scanning (Run #662)",
+  "analyses": [
+    {
+      "error_patterns": [
+        {
+          "pattern": "FAIL|Failed|failed",
+          "matches": [
+            {
+              "line_number": 97,
+              "content": "2025-12-08T09:16:10.7103628Z ##[warning]The process '/usr/bin/git' failed with exit code 128",
+              "severity": "high",
+              "emoji": "\ud83d\udca5"
+            }
+          ],
+          "count": 1
+        },
+        {
+          "pattern": "WARN|Warning|warning",
+          "matches": [
+            {
+              "line_number": 60,
+              "content": "2025-12-08T09:16:09.4333348Z ##[warning]\ud83d\uded1 Leaks detected, see job summary for details",
+              "severity": "medium",
+              "emoji": "\u26a0\ufe0f"
+            },
+            {
+              "line_number": 66,
+              "content": "2025-12-08T09:16:09.4432905Z   if-no-files-found: warn",
+              "severity": "medium",
+              "emoji": "\u26a0\ufe0f"
+            },
+            {
+              "line_number": 71,
+              "content": "2025-12-08T09:16:09.6454514Z ##[warning]No files were found with the provided path: gitleaks-report.json. No artifacts will be uploaded.",
+              "severity": "medium",
+              "emoji": "\u26a0\ufe0f"
+            },
+            {
+              "line_number": 97,
+              "content": "2025-12-08T09:16:10.7103628Z ##[warning]The process '/usr/bin/git' failed with exit code 128",
+              "severity": "medium",
+              "emoji": "\u26a0\ufe0f"
+            }
+          ],
+          "count": 4
+        }
+      ],
+      "suggested_fixes": [
+        "Review the logs above for specific error messages"
+      ],
+      "severity": "high",
+      "category": "permission_error",
+      "similar_failures": []
+    }
+  ],
+  "timestamp": "2025-12-08T09:17:37.601183"
+}
