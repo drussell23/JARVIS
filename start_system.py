@@ -13071,6 +13071,391 @@ async def ensure_cloud_sql_proxy():
         return False
 
 
+# =============================================================================
+# DOCKER DAEMON MANAGEMENT - Robust, Async, Auto-Start
+# =============================================================================
+
+class DockerDaemonManager:
+    """
+    Robust, async Docker daemon management with auto-start capability.
+
+    Features:
+    - Platform-aware Docker Desktop detection (macOS, Windows, Linux)
+    - Async polling for daemon readiness
+    - Configurable timeouts and retry logic
+    - Detailed status reporting
+    - Dynamic detection without hardcoding
+    """
+
+    # Default configuration (no hardcoding - all configurable via env vars)
+    DEFAULT_STARTUP_TIMEOUT = int(os.environ.get("DOCKER_STARTUP_TIMEOUT", "120"))  # 2 minutes
+    DEFAULT_POLL_INTERVAL = float(os.environ.get("DOCKER_POLL_INTERVAL", "2.0"))  # 2 seconds
+    DEFAULT_MAX_RETRIES = int(os.environ.get("DOCKER_MAX_RETRIES", "3"))
+
+    def __init__(self):
+        self._platform = platform.system().lower()
+        self._docker_path = self._detect_docker_path()
+        self._daemon_status = {
+            "installed": False,
+            "daemon_running": False,
+            "version": None,
+            "started_automatically": False,
+            "startup_time_ms": None,
+            "error": None,
+            "platform": self._platform
+        }
+
+    def _detect_docker_path(self) -> Optional[str]:
+        """Dynamically detect Docker executable path."""
+        import shutil
+
+        # Try common Docker paths based on platform
+        if self._platform == "darwin":  # macOS
+            paths = [
+                "/usr/local/bin/docker",
+                "/opt/homebrew/bin/docker",
+                "/Applications/Docker.app/Contents/Resources/bin/docker"
+            ]
+        elif self._platform == "windows":
+            paths = [
+                "C:\\Program Files\\Docker\\Docker\\resources\\bin\\docker.exe",
+                "C:\\ProgramData\\DockerDesktop\\version-bin\\docker.exe"
+            ]
+        else:  # Linux
+            paths = [
+                "/usr/bin/docker",
+                "/usr/local/bin/docker"
+            ]
+
+        # Check explicit paths first
+        for path in paths:
+            if os.path.exists(path):
+                return path
+
+        # Fall back to shutil.which for PATH lookup
+        return shutil.which("docker")
+
+    def _get_docker_desktop_app(self) -> Optional[str]:
+        """Get Docker Desktop application name/path based on platform."""
+        if self._platform == "darwin":
+            # Check if Docker.app exists
+            docker_app_paths = [
+                "/Applications/Docker.app",
+                os.path.expanduser("~/Applications/Docker.app")
+            ]
+            for path in docker_app_paths:
+                if os.path.exists(path):
+                    return path
+            return "Docker"  # Fallback to app name for 'open -a'
+        elif self._platform == "windows":
+            return "Docker Desktop"
+        elif self._platform == "linux":
+            # Linux typically uses systemd or direct daemon
+            return "docker"
+        return None
+
+    async def check_docker_installed(self) -> bool:
+        """Check if Docker is installed on the system."""
+        if not self._docker_path:
+            self._daemon_status["error"] = "Docker not found in PATH or common locations"
+            return False
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                self._docker_path, "--version",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+
+            if proc.returncode == 0:
+                self._daemon_status["installed"] = True
+                self._daemon_status["version"] = stdout.decode().strip()
+                return True
+            else:
+                self._daemon_status["error"] = f"Docker check failed: {stderr.decode()}"
+                return False
+        except asyncio.TimeoutError:
+            self._daemon_status["error"] = "Docker version check timed out"
+            return False
+        except Exception as e:
+            self._daemon_status["error"] = f"Docker check error: {str(e)}"
+            return False
+
+    async def check_daemon_running(self) -> bool:
+        """Check if Docker daemon is currently running."""
+        if not self._docker_path:
+            return False
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                self._docker_path, "info", "--format", "{{.ServerVersion}}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+
+            if proc.returncode == 0:
+                self._daemon_status["daemon_running"] = True
+                return True
+            else:
+                self._daemon_status["daemon_running"] = False
+                return False
+        except asyncio.TimeoutError:
+            self._daemon_status["daemon_running"] = False
+            return False
+        except Exception:
+            self._daemon_status["daemon_running"] = False
+            return False
+
+    async def start_docker_daemon(self) -> bool:
+        """
+        Attempt to start Docker Desktop/daemon based on platform.
+
+        Returns:
+            bool: True if daemon start was initiated successfully
+        """
+        docker_app = self._get_docker_desktop_app()
+        if not docker_app:
+            self._daemon_status["error"] = "Could not determine Docker Desktop application"
+            return False
+
+        print(f"  {Colors.CYAN}→ Starting Docker Desktop...{Colors.ENDC}")
+
+        try:
+            if self._platform == "darwin":
+                # macOS: Use 'open -a' to launch Docker Desktop
+                proc = await asyncio.create_subprocess_exec(
+                    "open", "-a", docker_app,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                await asyncio.wait_for(proc.communicate(), timeout=30)
+
+                if proc.returncode == 0:
+                    print(f"  {Colors.GREEN}✓ Docker Desktop launch initiated{Colors.ENDC}")
+                    return True
+                else:
+                    self._daemon_status["error"] = "Failed to launch Docker Desktop"
+                    return False
+
+            elif self._platform == "windows":
+                # Windows: Start Docker Desktop via Start Menu
+                proc = await asyncio.create_subprocess_exec(
+                    "cmd", "/c", "start", "", "Docker Desktop",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                await asyncio.wait_for(proc.communicate(), timeout=30)
+                return proc.returncode == 0
+
+            elif self._platform == "linux":
+                # Linux: Try systemd first, then direct daemon start
+                try:
+                    # Try systemd
+                    proc = await asyncio.create_subprocess_exec(
+                        "sudo", "systemctl", "start", "docker",
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    )
+                    await asyncio.wait_for(proc.communicate(), timeout=30)
+                    if proc.returncode == 0:
+                        return True
+                except Exception:
+                    pass
+
+                # Fall back to direct daemon start
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        "sudo", "dockerd", "--daemon",
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    )
+                    # Don't wait - daemon runs in background
+                    return True
+                except Exception as e:
+                    self._daemon_status["error"] = f"Failed to start Docker on Linux: {str(e)}"
+                    return False
+
+            return False
+
+        except asyncio.TimeoutError:
+            self._daemon_status["error"] = "Docker Desktop launch timed out"
+            return False
+        except Exception as e:
+            self._daemon_status["error"] = f"Failed to start Docker: {str(e)}"
+            return False
+
+    async def wait_for_daemon(
+        self,
+        timeout: Optional[float] = None,
+        poll_interval: Optional[float] = None
+    ) -> bool:
+        """
+        Wait asynchronously for Docker daemon to become ready.
+
+        Args:
+            timeout: Maximum time to wait in seconds (default from env or 120s)
+            poll_interval: Time between checks in seconds (default from env or 2s)
+
+        Returns:
+            bool: True if daemon became ready within timeout
+        """
+        timeout = timeout or self.DEFAULT_STARTUP_TIMEOUT
+        poll_interval = poll_interval or self.DEFAULT_POLL_INTERVAL
+
+        start_time = time.time()
+        attempt = 0
+
+        print(f"  {Colors.CYAN}→ Waiting for Docker daemon (up to {timeout}s)...{Colors.ENDC}")
+
+        while (time.time() - start_time) < timeout:
+            attempt += 1
+
+            if await self.check_daemon_running():
+                elapsed = time.time() - start_time
+                self._daemon_status["startup_time_ms"] = int(elapsed * 1000)
+                print(f"  {Colors.GREEN}✓ Docker daemon ready ({elapsed:.1f}s){Colors.ENDC}")
+                return True
+
+            # Progress indicator every 10 seconds
+            elapsed = time.time() - start_time
+            if attempt % 5 == 0:  # Every 5 attempts (10 seconds with 2s interval)
+                print(f"  {Colors.CYAN}  ...still waiting ({elapsed:.0f}s elapsed){Colors.ENDC}")
+
+            await asyncio.sleep(poll_interval)
+
+        self._daemon_status["error"] = f"Docker daemon did not start within {timeout}s"
+        print(f"  {Colors.FAIL}✗ Docker daemon did not start within {timeout}s{Colors.ENDC}")
+        return False
+
+    async def ensure_daemon_running(
+        self,
+        auto_start: bool = True,
+        timeout: Optional[float] = None,
+        max_retries: Optional[int] = None
+    ) -> dict:
+        """
+        Ensure Docker daemon is running, with optional auto-start.
+
+        This is the main entry point for Docker daemon management.
+
+        Args:
+            auto_start: Whether to automatically start Docker if not running
+            timeout: Maximum time to wait for daemon startup
+            max_retries: Maximum number of start attempts
+
+        Returns:
+            dict: Status information including:
+                - installed: bool
+                - daemon_running: bool
+                - version: str or None
+                - started_automatically: bool
+                - startup_time_ms: int or None
+                - error: str or None
+                - platform: str
+        """
+        max_retries = max_retries or self.DEFAULT_MAX_RETRIES
+        timeout = timeout or self.DEFAULT_STARTUP_TIMEOUT
+
+        print(f"\n{Colors.CYAN}🐳 Docker Daemon Status Check{Colors.ENDC}")
+
+        # Step 1: Check if Docker is installed
+        if not await self.check_docker_installed():
+            print(f"  {Colors.FAIL}✗ Docker not installed{Colors.ENDC}")
+            print(f"    Install Docker Desktop: https://www.docker.com/products/docker-desktop")
+            return self._daemon_status.copy()
+
+        print(f"  {Colors.GREEN}✓ Docker installed: {self._daemon_status['version']}{Colors.ENDC}")
+
+        # Step 2: Check if daemon is already running
+        if await self.check_daemon_running():
+            print(f"  {Colors.GREEN}✓ Docker daemon is running{Colors.ENDC}")
+            return self._daemon_status.copy()
+
+        # Step 3: Daemon not running - attempt auto-start if enabled
+        if not auto_start:
+            print(f"  {Colors.FAIL}✗ Docker daemon not running (auto-start disabled){Colors.ENDC}")
+            self._daemon_status["error"] = "Docker daemon not running"
+            return self._daemon_status.copy()
+
+        print(f"  {Colors.YELLOW}⚠️  Docker daemon not running - attempting auto-start{Colors.ENDC}")
+
+        # Retry loop for daemon start
+        for attempt in range(1, max_retries + 1):
+            print(f"  {Colors.CYAN}→ Start attempt {attempt}/{max_retries}{Colors.ENDC}")
+
+            if await self.start_docker_daemon():
+                if await self.wait_for_daemon(timeout=timeout):
+                    self._daemon_status["started_automatically"] = True
+                    return self._daemon_status.copy()
+
+            if attempt < max_retries:
+                print(f"  {Colors.YELLOW}⚠️  Retrying in 5 seconds...{Colors.ENDC}")
+                await asyncio.sleep(5)
+
+        print(f"  {Colors.FAIL}✗ Failed to start Docker daemon after {max_retries} attempts{Colors.ENDC}")
+        return self._daemon_status.copy()
+
+    def get_status(self) -> dict:
+        """Get current daemon status without performing checks."""
+        return self._daemon_status.copy()
+
+    def get_status_emoji(self) -> str:
+        """Get a formatted status string with emoji."""
+        if self._daemon_status["daemon_running"]:
+            auto = " (auto-started)" if self._daemon_status["started_automatically"] else ""
+            return f"{Colors.GREEN}✓ Docker: Running{auto}{Colors.ENDC}"
+        elif not self._daemon_status["installed"]:
+            return f"{Colors.FAIL}✗ Docker: Not installed{Colors.ENDC}"
+        else:
+            error = self._daemon_status.get("error", "Not running")
+            return f"{Colors.FAIL}✗ Docker: {error}{Colors.ENDC}"
+
+
+# Global Docker daemon manager instance (singleton pattern)
+_docker_daemon_manager: Optional[DockerDaemonManager] = None
+
+
+def get_docker_daemon_manager() -> DockerDaemonManager:
+    """Get or create the global Docker daemon manager."""
+    global _docker_daemon_manager
+    if _docker_daemon_manager is None:
+        _docker_daemon_manager = DockerDaemonManager()
+    return _docker_daemon_manager
+
+
+async def ensure_docker_daemon_running(
+    auto_start: bool = True,
+    timeout: Optional[float] = None,
+    max_retries: Optional[int] = None
+) -> dict:
+    """
+    Convenience function to ensure Docker daemon is running.
+
+    This wraps the DockerDaemonManager.ensure_daemon_running() method.
+
+    Args:
+        auto_start: Whether to automatically start Docker if not running
+        timeout: Maximum time to wait for daemon startup (default: 120s)
+        max_retries: Maximum number of start attempts (default: 3)
+
+    Returns:
+        dict: Status information
+    """
+    manager = get_docker_daemon_manager()
+    return await manager.ensure_daemon_running(
+        auto_start=auto_start,
+        timeout=timeout,
+        max_retries=max_retries
+    )
+
+
+# =============================================================================
+# END DOCKER DAEMON MANAGEMENT
+# =============================================================================
+
+
 async def ensure_docker_ecapa_service(force_rebuild: bool = False) -> dict:
     """
     Ensure Docker ECAPA cloud service is running locally.
@@ -13095,51 +13480,27 @@ async def ensure_docker_ecapa_service(force_rebuild: bool = False) -> dict:
         "container_running": False,
         "endpoint": None,
         "error": None,
+        "docker_daemon_status": None,
     }
 
     print(f"\n{Colors.CYAN}🐳 Docker ECAPA Service Setup{Colors.ENDC}")
 
-    # Check if Docker is available
-    try:
-        docker_check = subprocess.run(
-            ["docker", "--version"],
-            capture_output=True,
-            text=True,
-            timeout=10
-        )
-        if docker_check.returncode != 0:
-            result["error"] = "Docker not installed"
-            print(f"  {Colors.FAIL}✗ Docker not installed{Colors.ENDC}")
-            print(f"    Install Docker Desktop: https://www.docker.com/products/docker-desktop")
-            return result
-        print(f"  {Colors.GREEN}✓ Docker available: {docker_check.stdout.strip()}{Colors.ENDC}")
-    except FileNotFoundError:
-        result["error"] = "Docker not found in PATH"
-        print(f"  {Colors.FAIL}✗ Docker not found in PATH{Colors.ENDC}")
-        return result
-    except subprocess.TimeoutExpired:
-        result["error"] = "Docker check timed out"
-        print(f"  {Colors.FAIL}✗ Docker check timed out{Colors.ENDC}")
+    # Use the robust Docker daemon manager with auto-start capability
+    docker_status = await ensure_docker_daemon_running(auto_start=True)
+    result["docker_daemon_status"] = docker_status
+
+    if not docker_status.get("installed", False):
+        result["error"] = "Docker not installed"
         return result
 
-    # Check if Docker daemon is running
-    try:
-        daemon_check = subprocess.run(
-            ["docker", "info"],
-            capture_output=True,
-            text=True,
-            timeout=10
-        )
-        if daemon_check.returncode != 0:
-            result["error"] = "Docker daemon not running"
-            print(f"  {Colors.FAIL}✗ Docker daemon not running{Colors.ENDC}")
-            print(f"    Please start Docker Desktop")
-            return result
-        print(f"  {Colors.GREEN}✓ Docker daemon running{Colors.ENDC}")
-    except subprocess.TimeoutExpired:
-        result["error"] = "Docker daemon check timed out"
-        print(f"  {Colors.FAIL}✗ Docker daemon check timed out - is Docker Desktop running?{Colors.ENDC}")
+    if not docker_status.get("daemon_running", False):
+        result["error"] = docker_status.get("error", "Docker daemon not running")
         return result
+
+    # Report if Docker was auto-started
+    if docker_status.get("started_automatically", False):
+        startup_time = docker_status.get("startup_time_ms", 0)
+        print(f"  {Colors.GREEN}✓ Docker was auto-started ({startup_time}ms){Colors.ENDC}")
 
     # Path to docker-compose.yml
     cloud_services_dir = Path(__file__).parent / "backend" / "cloud_services"
@@ -13885,8 +14246,16 @@ async def main():
     print(f"{Colors.CYAN}   Phase 1: Probing available backends...{Colors.ENDC}")
 
     async def probe_docker_backend() -> dict:
-        """Probe Docker ECAPA backend availability and health."""
-        result = {"available": False, "healthy": False, "endpoint": None, "latency_ms": None, "error": None}
+        """Probe Docker ECAPA backend availability and health with auto-start."""
+        result = {
+            "available": False,
+            "healthy": False,
+            "endpoint": None,
+            "latency_ms": None,
+            "error": None,
+            "daemon_status": None,
+            "auto_started": False
+        }
 
         if skip_docker:
             result["error"] = "Skipped by --no-docker flag"
@@ -13896,24 +14265,21 @@ async def main():
             import subprocess
             import time
 
-            # Check if Docker is available
-            docker_check = subprocess.run(
-                ["docker", "--version"],
-                capture_output=True, text=True, timeout=5
-            )
-            if docker_check.returncode != 0:
+            # Use the robust Docker daemon manager with auto-start
+            docker_manager = get_docker_daemon_manager()
+            daemon_status = await docker_manager.ensure_daemon_running(auto_start=True)
+            result["daemon_status"] = daemon_status
+
+            if not daemon_status.get("installed", False):
                 result["error"] = "Docker not installed"
                 return result
 
-            # Check if Docker daemon is running
-            daemon_check = subprocess.run(
-                ["docker", "info"],
-                capture_output=True, text=True, timeout=10
-            )
-            if daemon_check.returncode != 0:
-                result["error"] = "Docker daemon not running"
+            if not daemon_status.get("daemon_running", False):
+                result["error"] = daemon_status.get("error", "Docker daemon not running")
                 return result
 
+            # Track if Docker was auto-started
+            result["auto_started"] = daemon_status.get("started_automatically", False)
             result["available"] = True
 
             # Check if container is already running
