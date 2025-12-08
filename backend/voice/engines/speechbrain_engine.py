@@ -1613,9 +1613,8 @@ __all__ = ["EncoderDecoderASR"]
                         embedding_safe = embeddings[0].detach().clone().cpu()
                         return np.array(embedding_safe.numpy(), dtype=np.float32, copy=True)
 
-            # Run blocking encode_batch in thread pool
-            loop = asyncio.get_running_loop()
-            embedding = await loop.run_in_executor(None, _encode_sync)
+            # Run blocking encode_batch synchronously on main thread (macOS stability)
+            embedding = _encode_sync()
 
             logger.info(f"   Embedding extracted: shape={embedding.shape}, dtype={embedding.dtype}")
             logger.debug(f"   Embedding stats: min={embedding.min():.4f}, max={embedding.max():.4f}, norm={np.linalg.norm(embedding):.4f}")
@@ -1723,9 +1722,8 @@ __all__ = ["EncoderDecoderASR"]
                 audio_io = io.BytesIO(audio_data)
                 return sf.read(audio_io, dtype='float32')
 
-            # Run blocking I/O in thread pool to prevent event loop freeze
-            loop = asyncio.get_running_loop()
-            waveform, sample_rate = await loop.run_in_executor(None, _decode_sync)
+            # Run blocking I/O synchronously on main thread (macOS stability)
+            waveform, sample_rate = _decode_sync()
             logger.debug(f"✅ soundfile decoded: {waveform.shape}, {sample_rate}Hz")
             return waveform, sample_rate
         except Exception as e:
@@ -1775,9 +1773,8 @@ __all__ = ["EncoderDecoderASR"]
 
                 return samples, sample_rate
 
-            # Run blocking ffmpeg decode in thread pool to prevent event loop freeze
-            loop = asyncio.get_running_loop()
-            samples, sample_rate = await loop.run_in_executor(None, _decode_sync)
+            # Run blocking ffmpeg decode synchronously on main thread (macOS stability)
+            samples, sample_rate = _decode_sync()
 
             logger.debug(f"✅ pydub decoded: {samples.shape}, {sample_rate}Hz, format={detected_format}")
             return samples, sample_rate
@@ -1797,9 +1794,8 @@ __all__ = ["EncoderDecoderASR"]
                 audio_io = io.BytesIO(audio_data)
                 return librosa.load(audio_io, sr=None, mono=True)
 
-            # Run blocking librosa decode in thread pool to prevent event loop freeze
-            loop = asyncio.get_running_loop()
-            waveform, sample_rate = await loop.run_in_executor(None, _decode_sync)
+            # Run blocking librosa decode synchronously on main thread (macOS stability)
+            waveform, sample_rate = _decode_sync()
             logger.debug(f"✅ librosa decoded: {waveform.shape}, {sample_rate}Hz")
             return waveform, sample_rate
 
@@ -2025,41 +2021,32 @@ __all__ = ["EncoderDecoderASR"]
                 return audio_tensor
 
             # Stage 1: Spectral subtraction (noise reduction) - must run first
-            # Run in thread pool to avoid blocking
+            # Run synchronously on main thread (macOS stability)
             def _spectral_sub():
                 if preprocessor_ref is None:
                     raise RuntimeError("Preprocessor reference became None during spectral subtraction")
                 return preprocessor_ref.spectral_subtraction(audio_tensor)
 
-            audio_tensor = await loop.run_in_executor(None, _spectral_sub)
+            audio_tensor = _spectral_sub()
 
-            # Stage 2: Run AGC and bandpass filter IN PARALLEL (both operate on audio independently)
-            # Then apply VAD at the end
+            # Stage 2: Run AGC and bandpass SEQUENTIALLY (macOS stability)
             def _agc():
                 if preprocessor_ref is None:
                     raise RuntimeError("Preprocessor reference became None during AGC")
                 return preprocessor_ref.automatic_gain_control(audio_tensor)
 
-            def _bandpass():
-                if preprocessor_ref is None:
-                    raise RuntimeError("Preprocessor reference became None during bandpass")
-                return preprocessor_ref.apply_bandpass_filter(audio_tensor)
-
-            # Run AGC and bandpass in parallel - both read from audio_tensor
-            agc_future = loop.run_in_executor(None, _agc)
-            bandpass_future = loop.run_in_executor(None, _bandpass)
-
-            # Wait for both to complete
-            agc_result, bandpass_result = await asyncio.gather(agc_future, bandpass_future)
+            # Note: The original parallel code calculated bandpass on original tensor but discarded it
+            # We will follow the effective logic: AGC -> Bandpass
+            
+            agc_result = _agc()
 
             # Combine results: use AGC output, then apply bandpass characteristics
-            # AGC normalizes amplitude, bandpass filters frequency - apply AGC then bandpass
             def _apply_bandpass_to_agc():
                 if preprocessor_ref is None:
                     raise RuntimeError("Preprocessor reference became None during bandpass application")
                 return preprocessor_ref.apply_bandpass_filter(agc_result)
 
-            audio_tensor = await loop.run_in_executor(None, _apply_bandpass_to_agc)
+            audio_tensor = _apply_bandpass_to_agc()
 
             # Stage 3: VAD (voice activity detection) - runs last to trim silence
             def _vad():
@@ -2067,7 +2054,7 @@ __all__ = ["EncoderDecoderASR"]
                     raise RuntimeError("Preprocessor reference became None during VAD")
                 return preprocessor_ref.voice_activity_detection(audio_tensor)
 
-            audio_tensor, vad_ratio = await loop.run_in_executor(None, _vad)
+            audio_tensor, vad_ratio = _vad()
 
             return audio_tensor
 
