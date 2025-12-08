@@ -105,6 +105,24 @@ try:
 except ImportError:
     _HAS_MANAGED_EXECUTOR = False
 
+# Import singleton PyTorch executor for thread-safe operations
+try:
+    from core.pytorch_executor import (
+        get_pytorch_executor,
+        run_in_pytorch_thread,
+        run_in_pytorch_thread_sync
+    )
+    _HAS_PYTORCH_EXECUTOR = True
+except ImportError:
+    _HAS_PYTORCH_EXECUTOR = False
+
+    # Fallback: run synchronously if executor not available
+    async def run_in_pytorch_thread(func, *args, **kwargs):
+        from functools import partial
+        if args or kwargs:
+            return partial(func, *args, **kwargs)()
+        return func()
+
 logger = logging.getLogger(__name__)
 
 # Log Apple Silicon detection
@@ -711,7 +729,12 @@ class SpeechBrainEngine(BaseSTTEngine):
                         return load_fallback_ref(model_source, {"device": device_ref})
                     raise
 
-            self.asr_model = _load_asr_model()
+            # Use dedicated PyTorch executor for model loading
+            logger.info("   Loading ASR model in dedicated PyTorch thread...")
+            if _HAS_PYTORCH_EXECUTOR:
+                self.asr_model = await run_in_pytorch_thread(_load_asr_model)
+            else:
+                self.asr_model = _load_asr_model()
 
             # Apply quantization if on CPU for faster inference
             if self.device == "cpu" and hasattr(torch, "quantization"):
@@ -759,15 +782,11 @@ class SpeechBrainEngine(BaseSTTEngine):
             return self._encoder_load_task
 
         logger.info("🚀 Pre-loading speaker encoder in background for faster unlock...")
-        # CRITICAL: On macOS/Apple Silicon, background loading of PyTorch models is unsafe.
-        # We must load it synchronously or not at all.
-        # Since this method implies "background" but we can't do it safely in background,
-        # we will skip the eager load here and let it happen (synchronously) on first use
-        # via ensure_speaker_encoder_ready(). This avoids the crash at startup.
-        
-        # self._encoder_load_task = asyncio.create_task(self._load_speaker_encoder())
-        logger.warning("⚠️ Background pre-loading disabled on macOS to prevent segfaults. Model will load on first use.")
-        return None
+
+        # With the dedicated PyTorch executor, background loading is now safe!
+        # All PyTorch operations are serialized to a single thread, preventing segfaults.
+        self._encoder_load_task = asyncio.create_task(self._load_speaker_encoder())
+        return self._encoder_load_task
 
     async def ensure_speaker_encoder_ready(self):
         """
@@ -895,16 +914,20 @@ class SpeechBrainEngine(BaseSTTEngine):
                         elif 'PYTORCH_MPS_HIGH_WATERMARK_RATIO' in os.environ:
                             os.environ.pop('PYTORCH_MPS_HIGH_WATERMARK_RATIO', None)
 
-            # Run synchronously on main thread (macOS stability)
-            # loop = asyncio.get_running_loop()
-            # self.speaker_encoder = await asyncio.wait_for(
-            #    loop.run_in_executor(executor, _load_model_sync),
-            #    timeout=120.0  # 2 minute timeout for model loading
-            # )
-            logger.info("   Loading model synchronously on main thread (required for macOS stability)...")
-            self.speaker_encoder = _load_model_sync()
+            # Use dedicated single-threaded PyTorch executor
+            # This keeps the event loop responsive while ensuring all PyTorch
+            # operations are serialized to a single thread (prevents segfaults)
+            logger.info("   Loading model in dedicated PyTorch thread (async but serialized)...")
 
-            logger.info("   ✅ Model loaded and transferred to main thread")
+            if _HAS_PYTORCH_EXECUTOR:
+                # Use the singleton executor - single worker thread, no concurrent access
+                self.speaker_encoder = await run_in_pytorch_thread(_load_model_sync)
+            else:
+                # Fallback to synchronous (blocks event loop but safe)
+                logger.warning("   ⚠️ PyTorch executor not available, loading synchronously...")
+                self.speaker_encoder = _load_model_sync()
+
+            logger.info("   ✅ Model loaded successfully")
 
         except Exception as e:
             logger.error(
@@ -1654,20 +1677,19 @@ __all__ = ["EncoderDecoderASR"]
 
             def _encode_sync():
                 """
-                Run ECAPA-TDNN encoding in thread to avoid blocking event loop.
+                Run ECAPA-TDNN encoding in the dedicated PyTorch thread.
 
                 Uses captured encoder_ref to prevent null pointer access if
                 encoder is unloaded during extraction.
 
-                CRITICAL: Uses inference_lock to ensure thread-safe model access.
-                PyTorch models are NOT thread-safe - concurrent calls cause segfaults.
+                The PyTorch executor ensures all operations are serialized,
+                but we keep the lock as an extra safety layer.
                 """
                 # Double-check reference is valid
                 if encoder_ref is None:
                     raise RuntimeError("Encoder reference became None during extraction")
 
-                # CRITICAL: Acquire lock before model inference
-                # This prevents concurrent encode_batch calls which cause SIGSEGV
+                # Lock provides extra safety (executor already serializes, but belt + suspenders)
                 with inference_lock:
                     with torch.no_grad():
                         # Encode the waveform using captured reference
@@ -1677,8 +1699,12 @@ __all__ = ["EncoderDecoderASR"]
                         embedding_safe = embeddings[0].detach().clone().cpu()
                         return np.array(embedding_safe.numpy(), dtype=np.float32, copy=True)
 
-            # Run blocking encode_batch synchronously on main thread (macOS stability)
-            embedding = _encode_sync()
+            # Use dedicated PyTorch executor (async but serialized to single thread)
+            if _HAS_PYTORCH_EXECUTOR:
+                embedding = await run_in_pytorch_thread(_encode_sync)
+            else:
+                # Fallback to synchronous
+                embedding = _encode_sync()
 
             logger.info(f"   Embedding extracted: shape={embedding.shape}, dtype={embedding.dtype}")
             logger.debug(f"   Embedding stats: min={embedding.min():.4f}, max={embedding.max():.4f}, norm={np.linalg.norm(embedding):.4f}")

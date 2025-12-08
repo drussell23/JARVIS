@@ -63,6 +63,11 @@ try:
 except ImportError:
     _HAS_MANAGED_EXECUTOR = False
 
+# Detect Apple Silicon early
+import sys
+import platform
+_IS_APPLE_SILICON = platform.machine() == 'arm64' and sys.platform == 'darwin'
+
 # ============================================================================
 # ASYNC OPTIMIZATION: Shared Thread Pool for CPU-Intensive Operations
 # ============================================================================
@@ -76,6 +81,12 @@ _verification_executor: Optional[ThreadPoolExecutor] = None
 def get_verification_executor() -> ThreadPoolExecutor:
     """Get or create the shared thread pool for verification operations."""
     global _verification_executor
+    
+    # On Apple Silicon, we MUST NOT use a thread pool for PyTorch/Numpy operations
+    # as it causes segfaults. We return None to force synchronous execution.
+    if _IS_APPLE_SILICON:
+        return None
+        
     if _verification_executor is None:
         # Use 4 workers for parallel CPU-intensive operations
         if _HAS_MANAGED_EXECUTOR:
@@ -117,18 +128,17 @@ try:
     import torchaudio
 
     # CRITICAL: Enforce single-threaded mode on Apple Silicon to prevent segfaults
-    if _IS_APPLE_SILICON:
-        try:
-            if torch.get_num_threads() != 1:
-                torch.set_num_threads(1)
-            if torch.get_num_interop_threads() != 1:
-                torch.set_num_interop_threads(1)
-            logging.getLogger(__name__).info(
-                "🍎 Apple Silicon detected - enforcing single-threaded PyTorch mode"
-            )
-        except RuntimeError:
-            # Already set - that's fine
-            pass
+    try:
+        if torch.get_num_threads() != 1:
+            torch.set_num_threads(1)
+        if torch.get_num_interop_threads() != 1:
+            torch.set_num_interop_threads(1)
+        logging.getLogger(__name__).info(
+            "🍎 Apple Silicon detected - enforcing single-threaded PyTorch mode"
+        )
+    except RuntimeError:
+        # Already set - that's fine
+        pass
 
     # Check if list_audio_backends is missing (torchaudio >= 2.9.0)
     if not hasattr(torchaudio, 'list_audio_backends'):
@@ -1672,10 +1682,20 @@ class MultiFactorAuthFusionEngine:
         ]
 
     async def _run_in_executor(self, func, *args, **kwargs) -> Any:
-        """Run a CPU-intensive function in the thread pool."""
-        loop = asyncio.get_running_loop()
+        """Run a CPU-intensive function in the thread pool (or sync on Apple Silicon)."""
         if kwargs:
             func = partial(func, **kwargs)
+
+        # CRITICAL: On Apple Silicon, run synchronously on main thread
+        # This prevents segfaults caused by PyTorch/Numpy in background threads
+        if _IS_APPLE_SILICON:
+            return func(*args)
+            
+        # Also run sync if no executor available
+        if self._executor is None:
+            return func(*args)
+
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(self._executor, func, *args)
 
     async def analyze_voice_for_illness(
@@ -1704,13 +1724,20 @@ class MultiFactorAuthFusionEngine:
             if len(audio_array) < 1600:  # Less than 0.1 second
                 return result
 
-            # Run all CPU-intensive feature extraction in parallel using thread pool
-            f0_task = self._run_in_executor(self._estimate_f0_sync, audio_array)
-            quality_task = self._run_in_executor(self._calculate_voice_quality_sync, audio_array)
-            snr_task = self._run_in_executor(self._estimate_snr_sync, audio_array)
-
-            # Wait for all results
-            f0, quality, snr = await asyncio.gather(f0_task, quality_task, snr_task)
+            # Run all CPU-intensive feature extraction
+            # On Apple Silicon, these will run sequentially on main thread (safe)
+            # On other platforms, they run in parallel threads (fast)
+            if _IS_APPLE_SILICON:
+                # Sequential execution to avoid race conditions
+                f0 = await self._run_in_executor(self._estimate_f0_sync, audio_array)
+                quality = await self._run_in_executor(self._calculate_voice_quality_sync, audio_array)
+                snr = await self._run_in_executor(self._estimate_snr_sync, audio_array)
+            else:
+                # Parallel execution
+                f0_task = self._run_in_executor(self._estimate_f0_sync, audio_array)
+                quality_task = self._run_in_executor(self._calculate_voice_quality_sync, audio_array)
+                snr_task = self._run_in_executor(self._estimate_snr_sync, audio_array)
+                f0, quality, snr = await asyncio.gather(f0_task, quality_task, snr_task)
 
             result.fundamental_frequency_hz = f0
             result.voice_quality_score = quality
