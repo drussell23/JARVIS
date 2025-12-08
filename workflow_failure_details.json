@@ -1,12 +1,12 @@
 {
-  "workflow_name": "Database Connection Validation",
-  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/20022810772",
-  "branch": "cursor/jarvis-voice-unlock-integration-gemini-3-pro-preview-bbfb",
-  "commit_sha": "ae22a46",
-  "run_number": 554,
+  "workflow_name": "PR Automation & Validation",
+  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/20022883370",
+  "branch": "fix/ci/database-connection-validation-run554-20251208-091751",
+  "commit_sha": "e09ac72",
+  "run_number": 726,
   "failed_count": 1,
-  "fix_branch": "fix/ci/database-connection-validation-run554-20251208-091751",
-  "pr_title": "\ud83d\udea8 Fix CI/CD: Database Connection Validation (Run #554)",
+  "fix_branch": "fix/ci/pr-automation-validation-run726-20251208-091931",
+  "pr_title": "\ud83d\udea8 Fix CI/CD: PR Automation & Validation (Run #726)",
   "analyses": [
     {
       "error_patterns": [
@@ -14,70 +14,41 @@
           "pattern": "ERROR|Error|error",
           "matches": [
             {
-              "line_number": 63,
-              "content": "2025-12-08T09:16:54.0775913Z ##[error]Process completed with exit code 1.",
+              "line_number": 25,
+              "content": "2025-12-08T09:18:25.6288763Z   subjectPatternError: The PR title must start with a capital letter.",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 37,
+              "content": "2025-12-08T09:18:26.2340955Z ##[error]No release type found in pull request title \"\ud83d\udea8 Fix CI/CD: Database Connection Validation (Run #554)\". Add a prefix to indicate what kind of release this pull request corresponds to. For reference, see https://www.conventionalcommits.org/",
               "severity": "high",
               "emoji": "\u274c"
             }
           ],
-          "count": 1
-        },
-        {
-          "pattern": "FAIL|Failed|failed",
-          "matches": [
-            {
-              "line_number": 97,
-              "content": "2025-12-08T09:16:54.2285501Z ##[warning]The process '/usr/bin/git' failed with exit code 128",
-              "severity": "high",
-              "emoji": "\ud83d\udca5"
-            }
-          ],
-          "count": 1
-        },
-        {
-          "pattern": "WARN|Warning|warning",
-          "matches": [
-            {
-              "line_number": 97,
-              "content": "2025-12-08T09:16:54.2285501Z ##[warning]The process '/usr/bin/git' failed with exit code 128",
-              "severity": "medium",
-              "emoji": "\u26a0\ufe0f"
-            }
-          ],
-          "count": 1
+          "count": 2
         },
         {
           "pattern": "timeout|timed out",
           "matches": [
             {
-              "line_number": 3,
-              "content": "2025-12-08T09:16:51.0733022Z Downloading async_timeout-5.0.1-py3-none-any.whl (6.2 kB)",
-              "severity": "medium",
-              "emoji": "\u23f1\ufe0f"
-            },
-            {
-              "line_number": 17,
-              "content": "2025-12-08T09:16:51.2661855Z Installing collected packages: urllib3, typing-extensions, pyyaml, pycparser, pyasn1, psycopg2-binary, propcache, idna, greenlet, frozenlist, dnspython, charset_normalizer, certifi, cachetools, attrs, async-timeout, aiohappyeyeballs, aiofiles, sqlalchemy, rsa, Requests, pyasn1-modules, multidict, cffi, aiosignal, yarl, google-auth, cryptography, aiohttp, cloud-sql-python-connector",
-              "severity": "medium",
-              "emoji": "\u23f1\ufe0f"
-            },
-            {
-              "line_number": 19,
-              "content": "2025-12-08T09:16:53.7309859Z Successfully installed Requests-2.32.5 aiofiles-25.1.0 aiohappyeyeballs-2.6.1 aiohttp-3.13.2 aiosignal-1.4.0 async-timeout-5.0.1 attrs-25.4.0 cachetools-6.2.2 certifi-2025.11.12 cffi-2.0.0 charset_normalizer-3.4.4 cloud-sql-python-connector-1.18.5 cryptography-46.0.3 dnspython-2.8.0 frozenlist-1.8.0 google-auth-2.43.0 greenlet-3.3.0 idna-3.11 multidict-6.7.0 propcache-0.4.1 psycopg2-binary-2.9.11 pyasn1-0.6.1 pyasn1-modules-0.4.2 pycparser-2.23 pyyaml-6.0.3 rsa-4.9.1 sqlalchemy-2.0.44 typing-extensions-4.15.0 urllib3-2.6.0 yarl-1.22.0",
+              "line_number": 29,
+              "content": "- fix: Resolve database connection timeout",
               "severity": "medium",
               "emoji": "\u23f1\ufe0f"
             }
           ],
-          "count": 3
+          "count": 1
         }
       ],
       "suggested_fixes": [
-        "Consider increasing timeout values or optimizing slow operations"
+        "Consider increasing timeout values or optimizing slow operations",
+        "Check service availability and network connectivity"
       ],
       "severity": "high",
-      "category": "syntax_error",
+      "category": "timeout",
       "similar_failures": []
     }
   ],
-  "timestamp": "2025-12-08T09:17:51.498813"
+  "timestamp": "2025-12-08T09:19:31.902743"
 }
