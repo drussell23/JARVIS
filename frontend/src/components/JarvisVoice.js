@@ -7,7 +7,13 @@ import WorkflowProgress from './WorkflowProgress'; // Workflow progress componen
 import mlAudioHandler from '../utils/MLAudioHandler'; // ML-enhanced audio handling
 import { getNetworkRecoveryManager } from '../utils/NetworkRecoveryManager'; // Advanced network recovery
 import WakeWordService from './WakeWordService'; // Wake word detection service
-import configService from '../services/DynamicConfigService'; // Dynamic configuration service
+import configService, {
+  getBackendState,
+  onBackendState,
+  onBackendReady,
+  onStartupProgress,
+  waitForConfig as waitForConfigService
+} from '../services/DynamicConfigService'; // Dynamic configuration service
 import adaptiveVoiceDetection from '../utils/AdaptiveVoiceDetection'; // Adaptive voice learning system
 import HybridSTTClient from '../utils/HybridSTTClient'; // Hybrid STT client (replaces browser SpeechRecognition)
 import VoiceStatsDisplay from './VoiceStatsDisplay'; // Adaptive voice stats display
@@ -34,50 +40,91 @@ let API_URL = null;
 let WS_URL = null;
 let configReady = false;
 
-// Create promise to wait for config
-const configPromise = new Promise((resolve) => {
+// Backend state tracking for real-time synchronization
+let backendStateListeners = [];
+let backendReady = false;
+
+/**
+ * Get dynamically inferred URLs based on current environment
+ * Zero hardcoding - derives from window.location
+ */
+const inferUrls = () => {
+  const hostname = typeof window !== 'undefined' ? window.location.hostname : 'localhost';
+  const protocol = typeof window !== 'undefined' ? window.location.protocol.replace(':', '') : 'http';
+  const wsProtocol = protocol === 'https' ? 'wss' : 'ws';
+  const port = 8000; // Default JARVIS backend port
+
+  return {
+    API_BASE_URL: `${protocol}://${hostname}:${port}`,
+    WS_BASE_URL: `${wsProtocol}://${hostname}:${port}`
+  };
+};
+
+// Create promise to wait for config with enhanced robustness
+const configPromise = new Promise(async (resolve) => {
   // Check if config is already ready
   const currentApiUrl = configService.getApiUrl();
   if (currentApiUrl) {
     API_URL = currentApiUrl;
     WS_URL = configService.getWebSocketUrl();
     configReady = true;
-    console.log('JarvisVoice: Config already ready', { API_URL, WS_URL });
-    resolve();
+    console.log('[JarvisVoice] Config already ready', { API_URL, WS_URL });
+    resolve({ API_URL, WS_URL });
     return;
   }
 
   // Initialize API URLs when config is ready
   const handleConfigReady = (config) => {
-    API_URL = config.API_BASE_URL || configService.getApiUrl() || 'http://localhost:8000';
-    WS_URL = config.WS_BASE_URL || configService.getWebSocketUrl() || API_URL.replace('http://', 'ws://').replace('https://', 'wss://');
+    if (configReady) return; // Prevent duplicate handling
+
+    API_URL = config?.API_BASE_URL || configService.getApiUrl() || inferUrls().API_BASE_URL;
+    WS_URL = config?.WS_BASE_URL || configService.getWebSocketUrl() || inferUrls().WS_BASE_URL;
     configReady = true;
-    console.log('JarvisVoice: Config ready', { API_URL, WS_URL });
-    resolve();
+    console.log('[JarvisVoice] Config ready', { API_URL, WS_URL });
+    resolve({ API_URL, WS_URL });
   };
 
+  // Subscribe to config ready event
   configService.once('config-ready', handleConfigReady);
 
-  // Check again in case we missed the event
-  setTimeout(() => {
+  // Try the enhanced waitForConfig with timeout
+  try {
+    const config = await waitForConfigService(5000);
     if (!configReady) {
-      const currentApiUrl = configService.getApiUrl();
-      if (currentApiUrl) {
-        handleConfigReady(configService.config);
-      }
+      handleConfigReady(config);
     }
-  }, 100);
+  } catch (err) {
+    console.log('[JarvisVoice] Config timeout, using inferred URLs');
+    if (!configReady) {
+      handleConfigReady(inferUrls());
+    }
+  }
+});
 
-  // Final fallback after 1 second
-  setTimeout(() => {
-    if (!configReady) {
-      console.log('JarvisVoice: Using fallback config after timeout');
-      handleConfigReady({
-        API_BASE_URL: 'http://localhost:8000',
-        WS_BASE_URL: 'ws://localhost:8000'
-      });
+// Subscribe to backend state changes for real-time status sync
+onBackendState((state) => {
+  console.log('[JarvisVoice] Backend state update:', state);
+  backendReady = state.ready || false;
+
+  // Notify all registered listeners
+  backendStateListeners.forEach(listener => {
+    try {
+      listener(state);
+    } catch (err) {
+      console.error('[JarvisVoice] Backend state listener error:', err);
     }
-  }, 1000);
+  });
+});
+
+// Subscribe to backend ready event
+onBackendReady((state) => {
+  console.log('[JarvisVoice] Backend ready notification:', state);
+  backendReady = true;
+});
+
+// Subscribe to startup progress for detailed tracking
+onStartupProgress((progress) => {
+  console.log(`[JarvisVoice] Startup progress: ${progress.progress}% - ${progress.message}`);
 });
 
 // Also listen for config updates
@@ -122,8 +169,8 @@ class VisionConnection {
         await configPromise;
       }
 
-      // Use main backend port for vision WebSocket
-      const wsBaseUrl = WS_URL || configService.getWebSocketUrl() || 'ws://localhost:8000';
+      // Use main backend port for vision WebSocket - dynamic URL inference
+      const wsBaseUrl = WS_URL || configService.getWebSocketUrl() || inferUrls().WS_BASE_URL;
       const wsUrl = `${wsBaseUrl}/vision/ws`;  // Use consistent WebSocket URL
       console.log('VisionConnection: Connecting to', wsUrl);
       this.socket = new WebSocket(wsUrl);
@@ -850,6 +897,48 @@ const JarvisVoice = () => {
     };
   }, []);
 
+  // Subscribe to backend state for real-time status synchronization
+  useEffect(() => {
+    const handleBackendState = (state) => {
+      console.log('[JarvisVoice] Backend state change:', state);
+
+      // Sync jarvisStatus with backend ready state
+      if (state.ready && jarvisStatus !== 'online') {
+        console.log('[JarvisVoice] Backend ready - setting status to online');
+        setJarvisStatus('online');
+      }
+    };
+
+    // Register listener for backend state changes
+    backendStateListeners.push(handleBackendState);
+
+    // Also subscribe to startup progress for transparency
+    const unsubscribe = configService.on('startup-progress', (progress) => {
+      console.log(`[JarvisVoice] Startup: ${progress.progress}% - ${progress.message}`);
+    });
+
+    // Listen for jarvis-startup-state custom event (from ConfigAwareStartup)
+    const handleStartupState = (event) => {
+      const state = event.detail;
+      console.log('[JarvisVoice] Startup state event:', state);
+
+      if (state.phase === 'ready' && jarvisStatus !== 'online') {
+        setJarvisStatus('online');
+      }
+    };
+
+    window.addEventListener('jarvis-startup-state', handleStartupState);
+
+    return () => {
+      // Remove from listeners
+      const index = backendStateListeners.indexOf(handleBackendState);
+      if (index > -1) backendStateListeners.splice(index, 1);
+
+      if (typeof unsubscribe === 'function') unsubscribe();
+      window.removeEventListener('jarvis-startup-state', handleStartupState);
+    };
+  }, [jarvisStatus]);
+
   // Separate effect for auto-activation
   useEffect(() => {
     if (jarvisStatus === 'offline' || jarvisStatus === null) {
@@ -882,8 +971,9 @@ const JarvisVoice = () => {
     }
 
     try {
-      const apiUrl = API_URL || configService.getApiUrl() || 'http://localhost:8000';
-      console.log('JarvisVoice: Checking JARVIS status at:', apiUrl);
+      // Get API URL dynamically - no hardcoding
+      const apiUrl = API_URL || configService.getApiUrl() || inferUrls().API_BASE_URL;
+      console.log('[JarvisVoice] Checking JARVIS status at:', apiUrl);
       const response = await fetch(`${apiUrl}/voice/jarvis/status`);
       const data = await response.json();
 
@@ -1072,7 +1162,8 @@ const JarvisVoice = () => {
     }
 
     try {
-      const wsBaseUrl = WS_URL || configService.getWebSocketUrl() || 'ws://localhost:8000';
+      // Get WebSocket URL dynamically - no hardcoding
+      const wsBaseUrl = WS_URL || configService.getWebSocketUrl() || inferUrls().WS_BASE_URL;
       const wsUrl = `${wsBaseUrl}/ws`;  // Use unified WebSocket endpoint
       console.log(`[WS-ADVANCED] Connecting to unified WebSocket (attempt ${reconnectionStateRef.current.attempts + 1}/${reconnectionStateRef.current.maxAttempts}):`, wsUrl);
 
@@ -1082,10 +1173,23 @@ const JarvisVoice = () => {
         console.log('[WS-ADVANCED] ✅ Connected to JARVIS WebSocket');
         setError(null);
 
+        // CRITICAL FIX: Set status to 'online' immediately on WebSocket open
+        // Don't wait for 'connected' message from server - WebSocket open IS connected
+        setJarvisStatus('online');
+        console.log('[WS-ADVANCED] Status set to online (WebSocket connected)');
+
         // Reset reconnection state on successful connection
         reconnectionStateRef.current.attempts = 0;
         reconnectionStateRef.current.connectionHealth = 100;
         reconnectionStateRef.current.reconnecting = false;
+
+        // Check if backend state is ready and sync
+        const currentBackendState = getBackendState();
+        if (currentBackendState.ready) {
+          console.log('[WS-ADVANCED] Backend confirmed ready:', currentBackendState);
+        } else {
+          console.log('[WS-ADVANCED] Backend state:', currentBackendState.status, '- WebSocket connected');
+        }
 
         // Initialize Hybrid STT Client (if enabled)
         if (useHybridSTT && !hybridSTTClientRef.current) {
@@ -1105,6 +1209,18 @@ const JarvisVoice = () => {
 
         // Start ping/pong health monitoring
         startHealthMonitoring();
+
+        // Send initial handshake to get server confirmation
+        try {
+          wsRef.current.send(JSON.stringify({
+            type: 'handshake',
+            client_version: '2.0',
+            timestamp: Date.now(),
+            capabilities: ['voice', 'streaming', 'health_monitoring']
+          }));
+        } catch (e) {
+          console.warn('[WS-ADVANCED] Failed to send handshake:', e);
+        }
       };
 
       wsRef.current.onmessage = (event) => {
@@ -1864,7 +1980,7 @@ const JarvisVoice = () => {
       // Try to connect to backend wake word service if available
       try {
         const wakeService = new WakeWordService();
-        const apiUrl = API_URL || configService.getApiUrl() || 'http://localhost:8000';
+        const apiUrl = API_URL || configService.getApiUrl() || inferUrls().API_BASE_URL;
         console.log('JarvisVoice: Initializing wake word service at:', apiUrl);
         const initialized = await wakeService.initialize(apiUrl);
         if (initialized) {
@@ -2486,7 +2602,7 @@ const JarvisVoice = () => {
     }
 
     try {
-      const apiUrl = API_URL || configService.getApiUrl() || 'http://localhost:8000';
+      const apiUrl = API_URL || configService.getApiUrl() || inferUrls().API_BASE_URL;
       console.log('JarvisVoice: Activating JARVIS at:', apiUrl);
       const response = await fetch(`${apiUrl}/voice/jarvis/activate`, {
         method: 'POST',
@@ -2982,7 +3098,7 @@ const JarvisVoice = () => {
   const playAudioUsingPost = async (text, onStartCallback = null) => {
     console.log('[JARVIS Audio] POST: Attempting to play audio via POST');
     try {
-      const apiUrl = API_URL || configService.getApiUrl() || 'http://localhost:8000';
+      const apiUrl = API_URL || configService.getApiUrl() || inferUrls().API_BASE_URL;
       const response = await fetch(`${apiUrl}/audio/speak`, {
         method: 'POST',
         headers: {
@@ -3137,7 +3253,7 @@ const JarvisVoice = () => {
 
       if (!usePost) {
         // Short text: Use GET method with URL
-        const apiUrl = API_URL || configService.getApiUrl() || 'http://localhost:8000';
+        const apiUrl = API_URL || configService.getApiUrl() || inferUrls().API_BASE_URL;
         const audioUrl = `${apiUrl}/audio/speak/${encodeURIComponent(text)}`;
         console.log('[JARVIS Audio] Using GET method:', audioUrl);
 

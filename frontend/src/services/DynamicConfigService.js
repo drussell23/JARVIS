@@ -1,11 +1,35 @@
 /**
- * Dynamic Configuration Service
- * =============================
- * Automatically discovers backend services and configures endpoints
- * with zero hardcoding. Features self-healing and intelligent retry.
+ * Dynamic Configuration Service v2.0
+ * ===================================
+ * Advanced zero-hardcode configuration with:
+ * - Intelligent multi-strategy discovery
+ * - Circuit breaker pattern with adaptive thresholds
+ * - Backend startup state synchronization
+ * - WebSocket connection state management
+ * - Real-time health scoring with exponential backoff
+ * - Environment-aware configuration inference
+ * - Startup progress tracking for UI sync
  */
 
 import logger from '../utils/DebugLogger';
+
+// Environment detection (no hardcoding)
+const ENV = {
+  isDev: () => typeof window !== 'undefined' &&
+    (window.location.hostname === 'localhost' ||
+     window.location.hostname === '127.0.0.1' ||
+     window.location.hostname.includes('.local')),
+  isSecure: () => typeof window !== 'undefined' && window.location.protocol === 'https:',
+  getHostname: () => typeof window !== 'undefined' ? window.location.hostname : 'localhost',
+  getProtocol: () => typeof window !== 'undefined' ? window.location.protocol.replace(':', '') : 'http'
+};
+
+// Circuit Breaker States
+const CIRCUIT_STATE = {
+  CLOSED: 'closed',      // Normal operation
+  OPEN: 'open',          // Failing, reject requests
+  HALF_OPEN: 'half_open' // Testing if service recovered
+};
 
 class DynamicConfigService {
   constructor() {
@@ -14,73 +38,173 @@ class DynamicConfigService {
       WS_BASE_URL: null,
       ENDPOINTS: {},
       SERVICES: {},
-      discovered: false
+      discovered: false,
+      // Backend startup state sync
+      backendState: {
+        status: 'unknown',
+        mode: 'unknown',
+        startupProgress: 0,
+        components: {},
+        lastUpdate: null
+      }
     };
 
-    // Discovery configuration
-    // Prioritize 8000 (JARVIS backend port) first
-    // 8010/8011 as fallbacks
-    this.commonPorts = [8000, 8010, 8011, 8001, 3001, 8080, 8888];
-    // Skip ports with known CORS issues: 5000 (Control Center)
-    this.excludedPorts = [5000, 5001];
-    this.discoveryTimeout = 500; // ms per port
+    // Discovery configuration - dynamically ordered by environment
+    this.commonPorts = this._inferPorts();
+    this.excludedPorts = [5000, 5001]; // macOS Control Center
+    this.discoveryTimeout = 500;
     this.maxRetries = 3;
 
     // Service patterns for identification
     this.servicePatterns = {
       backend: {
-        endpoints: ['/health', '/api/health', '/api', '/docs'],
-        identifiers: ['jarvis', 'api', 'backend', 'fastapi']
+        endpoints: ['/health/ping', '/health', '/health/startup', '/api/health', '/docs'],
+        identifiers: ['jarvis', 'api', 'backend', 'fastapi', 'status', 'ok']
       },
       websocket: {
-        endpoints: ['/ws', '/websocket', '/socket.io'],
+        endpoints: ['/ws', '/voice/jarvis/ws', '/vision/ws'],
         identifiers: ['websocket', 'ws', 'realtime']
       }
     };
 
-    // Health monitoring
-    this.healthCheckInterval = 30000; // 30 seconds
+    // Health monitoring with adaptive intervals
+    this.healthCheckInterval = 30000;
     this.healthScores = new Map();
     this.lastHealthCheck = new Map();
+    this.healthCheckTimer = null;
 
-    // Event listeners
+    // Circuit breaker configuration
+    this.circuitBreaker = {
+      state: CIRCUIT_STATE.CLOSED,
+      failures: 0,
+      threshold: 5,           // Failures before opening
+      resetTimeout: 30000,    // Time before trying again
+      lastFailure: null,
+      successThreshold: 2,    // Successes needed to close
+      halfOpenSuccesses: 0
+    };
+
+    // Startup progress tracking
+    this.startupProgress = {
+      phase: 'initializing',
+      progress: 0,
+      message: 'Starting configuration discovery...',
+      components: {},
+      lastUpdate: Date.now()
+    };
+
+    // Event listeners with priority support
     this.listeners = new Map();
+    this.listenerPriorities = new Map();
+
+    // Connection state
+    this.connectionState = {
+      isOnline: navigator.onLine,
+      lastOnlineCheck: Date.now(),
+      reconnectAttempts: 0,
+      maxReconnectAttempts: 10
+    };
+
+    // Listen for online/offline events
+    if (typeof window !== 'undefined') {
+      window.addEventListener('online', () => this._handleOnline());
+      window.addEventListener('offline', () => this._handleOffline());
+    }
 
     // Auto-discovery on instantiation
     this.discover();
   }
 
+  /**
+   * Infer optimal port order based on environment
+   */
+  _inferPorts() {
+    const envPort = typeof process !== 'undefined' && process.env?.REACT_APP_BACKEND_PORT;
+    const defaultPorts = [8000, 8010, 8011, 8001, 3001, 8080, 8888];
+
+    if (envPort) {
+      const port = parseInt(envPort, 10);
+      // Put environment-specified port first
+      return [port, ...defaultPorts.filter(p => p !== port)];
+    }
+
+    return defaultPorts;
+  }
+
+  _handleOnline() {
+    logger.success('🌐 Network connection restored');
+    this.connectionState.isOnline = true;
+    this.connectionState.reconnectAttempts = 0;
+    this.emit('network-online');
+
+    // Re-validate config when coming back online
+    if (this.config.discovered) {
+      this.validateConfig(this.config).then(isValid => {
+        if (!isValid) {
+          logger.warning('Config invalid after reconnect, rediscovering...');
+          this.discover();
+        }
+      });
+    }
+  }
+
+  _handleOffline() {
+    logger.warning('📴 Network connection lost');
+    this.connectionState.isOnline = false;
+    this.emit('network-offline');
+  }
+
   async discover() {
     logger.config('🔍 Starting automatic service discovery...');
+    this._updateStartupProgress('discovering', 10, 'Searching for backend services...');
+
+    // Check circuit breaker
+    if (!this._checkCircuitBreaker()) {
+      logger.warning('Circuit breaker OPEN, waiting for reset...');
+      this._updateStartupProgress('waiting', 5, 'Waiting for service recovery...');
+      return this.config;
+    }
 
     // Try to load from localStorage first
     const cached = this.loadCachedConfig();
     if (cached) {
       logger.info('Found cached config, validating...');
+      this._updateStartupProgress('validating', 20, 'Validating cached configuration...');
+
       const isValid = await this.validateConfig(cached);
       if (isValid) {
         logger.success('✅ Using cached configuration', cached);
-        this.config = cached;
+        this.config = { ...cached, discovered: true };
+        this._recordCircuitSuccess();
+        this._updateStartupProgress('connected', 100, 'Connected to backend!');
         this.emit('config-ready', this.config);
+
+        // Sync backend state immediately
+        await this._syncBackendState();
 
         // Still run discovery in background to update
         this.backgroundDiscovery();
         return this.config;
       } else {
         logger.warning('❌ Cached config validation failed, will rediscover');
+        this._recordCircuitFailure();
       }
     }
 
     logger.config('No valid cached config, starting fresh discovery...');
+    this._updateStartupProgress('scanning', 30, 'Scanning for available services...');
 
-    // Full discovery
+    // Full discovery with circuit breaker awareness
     const services = await this.discoverServices();
 
     if (services.backend) {
       this.config.API_BASE_URL = services.backend.url;
-      this.config.WS_BASE_URL = services.backend.url.replace('http://', 'ws://');
+      this.config.WS_BASE_URL = this._inferWebSocketUrl(services.backend.url);
       this.config.ENDPOINTS = services.backend.endpoints;
       this.config.discovered = true;
+
+      // Record success
+      this._recordCircuitSuccess();
 
       // Save to cache
       this.saveConfig();
@@ -88,17 +212,202 @@ class DynamicConfigService {
       // Start health monitoring
       this.startHealthMonitoring();
 
+      // Sync backend state
+      this._updateStartupProgress('syncing', 80, 'Synchronizing with backend...');
+      await this._syncBackendState();
+
+      this._updateStartupProgress('connected', 100, 'Connected to backend!');
       logger.success('✅ Service discovery complete:', this.config);
       this.emit('config-ready', this.config);
     } else {
       logger.error('❌ No backend service found');
+      this._recordCircuitFailure();
+      this._updateStartupProgress('failed', 0, 'Backend not found. Retrying...');
       this.emit('discovery-failed', { reason: 'No backend found' });
 
-      // Retry discovery
-      setTimeout(() => this.discover(), 5000);
+      // Exponential backoff retry
+      const retryDelay = Math.min(5000 * Math.pow(2, this.connectionState.reconnectAttempts), 60000);
+      this.connectionState.reconnectAttempts++;
+
+      if (this.connectionState.reconnectAttempts <= this.connectionState.maxReconnectAttempts) {
+        logger.info(`Retrying discovery in ${retryDelay}ms (attempt ${this.connectionState.reconnectAttempts})`);
+        setTimeout(() => this.discover(), retryDelay);
+      }
     }
 
     return this.config;
+  }
+
+  /**
+   * Infer WebSocket URL from HTTP URL with protocol awareness
+   */
+  _inferWebSocketUrl(httpUrl) {
+    if (!httpUrl) return null;
+    return httpUrl
+      .replace('https://', 'wss://')
+      .replace('http://', 'ws://');
+  }
+
+  /**
+   * Update startup progress for UI sync
+   */
+  _updateStartupProgress(phase, progress, message, components = null) {
+    this.startupProgress = {
+      phase,
+      progress,
+      message,
+      components: components || this.startupProgress.components,
+      lastUpdate: Date.now()
+    };
+    this.emit('startup-progress', this.startupProgress);
+  }
+
+  /**
+   * Sync backend startup state for accurate UI display
+   */
+  async _syncBackendState() {
+    if (!this.config.API_BASE_URL) return;
+
+    try {
+      // Try startup endpoint first (more detailed)
+      const startupUrl = `${this.config.API_BASE_URL}/health/startup`;
+      const response = await this.fetchWithTimeout(startupUrl, 3000, true);
+
+      if (response.ok) {
+        const data = await response.json();
+        this.config.backendState = {
+          status: data.status || 'ready',
+          mode: data.mode || 'full',
+          startupProgress: data.progress || 100,
+          components: data.components || {},
+          ready: data.ready !== false,
+          lastUpdate: Date.now()
+        };
+
+        // Emit backend state update
+        this.emit('backend-state', this.config.backendState);
+
+        // If not fully ready, poll for updates
+        if (!this.config.backendState.ready) {
+          this._pollBackendState();
+        }
+      }
+    } catch (error) {
+      logger.debug('Backend state sync failed:', error.message);
+      // Set a default state
+      this.config.backendState = {
+        status: 'connected',
+        mode: 'unknown',
+        startupProgress: 100,
+        components: {},
+        ready: true,
+        lastUpdate: Date.now()
+      };
+    }
+  }
+
+  /**
+   * Poll backend state until fully ready
+   */
+  _pollBackendState() {
+    const pollInterval = setInterval(async () => {
+      await this._syncBackendState();
+
+      if (this.config.backendState.ready) {
+        clearInterval(pollInterval);
+        this.emit('backend-ready', this.config.backendState);
+      }
+    }, 2000);
+
+    // Stop polling after 2 minutes
+    setTimeout(() => clearInterval(pollInterval), 120000);
+  }
+
+  /**
+   * Circuit Breaker: Check if requests should be allowed
+   */
+  _checkCircuitBreaker() {
+    const cb = this.circuitBreaker;
+
+    if (cb.state === CIRCUIT_STATE.CLOSED) {
+      return true;
+    }
+
+    if (cb.state === CIRCUIT_STATE.OPEN) {
+      // Check if reset timeout has passed
+      const elapsed = Date.now() - cb.lastFailure;
+      if (elapsed >= cb.resetTimeout) {
+        logger.info('Circuit breaker transitioning to HALF_OPEN');
+        cb.state = CIRCUIT_STATE.HALF_OPEN;
+        cb.halfOpenSuccesses = 0;
+        return true;
+      }
+      return false;
+    }
+
+    // HALF_OPEN - allow one request to test
+    return true;
+  }
+
+  /**
+   * Circuit Breaker: Record a failure
+   */
+  _recordCircuitFailure() {
+    const cb = this.circuitBreaker;
+    cb.failures++;
+    cb.lastFailure = Date.now();
+
+    if (cb.state === CIRCUIT_STATE.HALF_OPEN) {
+      logger.warning('Circuit breaker re-opening after half-open failure');
+      cb.state = CIRCUIT_STATE.OPEN;
+      cb.halfOpenSuccesses = 0;
+    } else if (cb.failures >= cb.threshold) {
+      logger.warning(`Circuit breaker OPEN after ${cb.failures} failures`);
+      cb.state = CIRCUIT_STATE.OPEN;
+      this.emit('circuit-open', { failures: cb.failures });
+    }
+  }
+
+  /**
+   * Circuit Breaker: Record a success
+   */
+  _recordCircuitSuccess() {
+    const cb = this.circuitBreaker;
+
+    if (cb.state === CIRCUIT_STATE.HALF_OPEN) {
+      cb.halfOpenSuccesses++;
+      if (cb.halfOpenSuccesses >= cb.successThreshold) {
+        logger.success('Circuit breaker CLOSED after recovery');
+        cb.state = CIRCUIT_STATE.CLOSED;
+        cb.failures = 0;
+        cb.halfOpenSuccesses = 0;
+        this.emit('circuit-closed');
+      }
+    } else {
+      // Reset failure count on success in closed state
+      cb.failures = Math.max(0, cb.failures - 1);
+    }
+  }
+
+  /**
+   * Get current circuit breaker state
+   */
+  getCircuitBreakerState() {
+    return { ...this.circuitBreaker };
+  }
+
+  /**
+   * Get current startup progress
+   */
+  getStartupProgress() {
+    return { ...this.startupProgress };
+  }
+
+  /**
+   * Get backend state
+   */
+  getBackendState() {
+    return { ...this.config.backendState };
   }
 
   async discoverServices() {
@@ -612,6 +921,21 @@ class DynamicConfigService {
 
 // Create singleton instance
 const configService = new DynamicConfigService();
+
+// Export convenience functions for common operations
+export const waitForConfig = (timeout) => configService.waitForConfig(timeout);
+export const getApiUrl = (endpoint) => configService.getApiUrl(endpoint);
+export const getWebSocketUrl = (endpoint) => configService.getWebSocketUrl(endpoint);
+export const getBackendState = () => configService.getBackendState();
+export const getStartupProgress = () => configService.getStartupProgress();
+export const getCircuitBreakerState = () => configService.getCircuitBreakerState();
+export const onConfigReady = (callback) => configService.on('config-ready', callback);
+export const onBackendState = (callback) => configService.on('backend-state', callback);
+export const onStartupProgress = (callback) => configService.on('startup-progress', callback);
+export const onBackendReady = (callback) => configService.on('backend-ready', callback);
+
+// Export circuit breaker states for external use
+export { CIRCUIT_STATE };
 
 // Export for use in other modules
 export default configService;
