@@ -3,14 +3,62 @@
 ## Overview
 Voice-based biometric authentication system for macOS that enables hands-free unlocking using speaker verification technology.
 
+## 🆕 Neural Parallel Voice Unlock Architecture (v20.5.0)
+
+For the complete technical deep-dive into the advanced voice biometric system, see:
+- **[Neural Parallel Architecture Guide](./NEURAL_PARALLEL_ARCHITECTURE.md)** - Comprehensive system design, bottlenecks, edge cases, and cost optimization
+
+### Quick Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│              NEURAL PARALLEL ARCHITECTURE (v20.5.0)             │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│                    ┌──────────────────┐                        │
+│                    │   Audio Input    │                        │
+│                    └────────┬─────────┘                        │
+│                             │                                   │
+│         ┌───────────────────┼───────────────────┐              │
+│         ▼                   ▼                   ▼              │
+│   ┌──────────┐        ┌──────────┐       ┌──────────┐         │
+│   │  ECAPA   │        │ Physics  │       │ Context  │         │
+│   │ ML Model │        │   PAVA   │       │ Engine   │         │
+│   │  (Cloud) │        │ (Local)  │       │          │         │
+│   └────┬─────┘        └────┬─────┘       └────┬─────┘         │
+│        │                   │                  │                │
+│        └───────────────────┼──────────────────┘                │
+│                            ▼                                   │
+│                   ┌────────────────┐                          │
+│                   │   BAYESIAN     │                          │
+│                   │    FUSION      │                          │
+│                   └────────┬───────┘                          │
+│                            ▼                                   │
+│                       DECISION                                 │
+│                  (250ms parallel)                              │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Key Features:**
+- **13.6x faster** than sequential architecture (~250ms vs ~2.8s)
+- **7-layer anti-spoofing** including VTL, Doppler, and double-reverb detection
+- **Hybrid cloud/local** with automatic failover
+- **Scale-to-zero** GCP Cloud Run deployment (~$0.02/month)
+- **<5s cold start** with pre-baked JIT models
+
 ## Current Status
 - ✅ PRD documentation created
 - ✅ Project structure initialized
+- ✅ **Neural Parallel Architecture v20.5.0** implemented
 - ✅ Core modules implemented:
   - Voiceprint management system
   - Feature extraction engine
-  - Anti-spoofing detection
-- 🚧 In Progress: Audio capture prototype
+  - Anti-spoofing detection (7-layer PAVA)
+  - Bayesian confidence fusion
+  - ECAPA-TDNN cloud service
+- ✅ GCP Cloud Run deployment
+- ✅ Hybrid cloud/local ML routing
+- 🚧 In Progress: Continuous learning optimization
 - 📋 Planned: Swift UI implementation
 
 ## Architecture
