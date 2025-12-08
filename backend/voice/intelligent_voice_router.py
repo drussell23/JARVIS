@@ -284,12 +284,22 @@ class IntelligentVoiceRouter:
             raise RuntimeError("Resemblyzer model not loaded")
 
         try:
+            # SAFETY: Capture model reference BEFORE spawning thread to prevent
+            # segfaults if model is unloaded during thread execution
+            model_ref = self.resemblyzer_model
+            if model_ref is None:
+                raise RuntimeError("Resemblyzer model became None after check")
+
             # Run CPU-intensive operations in thread pool to avoid blocking event loop
             def _extract_embedding_sync():
+                # Double-check model reference is still valid inside thread
+                if model_ref is None:
+                    raise RuntimeError("Resemblyzer model reference became None during extraction")
                 import io
                 import librosa
                 audio_array, sr = librosa.load(io.BytesIO(audio_data), sr=16000)
-                embedding = self.resemblyzer_model.embed_utterance(audio_array)
+                # Use captured model_ref instead of self.resemblyzer_model
+                embedding = model_ref.embed_utterance(audio_array)
                 return embedding
 
             embedding = await asyncio.to_thread(_extract_embedding_sync)
@@ -324,8 +334,17 @@ class IntelligentVoiceRouter:
             raise RuntimeError("PyAnnote model not loaded")
 
         try:
+            # SAFETY: Capture model reference BEFORE spawning thread to prevent
+            # segfaults if model is unloaded during thread execution
+            model_ref = self.pyannote_model
+            if model_ref is None:
+                raise RuntimeError("PyAnnote model became None after check")
+
             # Run CPU-intensive operations in thread pool to avoid blocking event loop
             def _extract_embedding_sync():
+                # Double-check model reference is still valid inside thread
+                if model_ref is None:
+                    raise RuntimeError("PyAnnote model reference became None during extraction")
                 import io
                 import librosa
                 import torch
@@ -335,7 +354,8 @@ class IntelligentVoiceRouter:
                     waveform = torch.from_numpy(audio_array).unsqueeze(0)
                     # CRITICAL: Use .copy() to avoid memory corruption!
                     # .numpy() shares memory with tensor - must copy before returning
-                    result = self.pyannote_model(waveform).squeeze()
+                    # Use captured model_ref instead of self.pyannote_model
+                    result = model_ref(waveform).squeeze()
                     embedding = np.array(result.cpu().numpy(), dtype=np.float32, copy=True)
                 return embedding
 

@@ -586,7 +586,12 @@ class WhisperAudioHandler:
                 logger.error("Failed to load Whisper model for transcription")
                 return None
 
+        # SAFETY: Capture model reference BEFORE any async operations or thread spawning
+        # to prevent segfaults if model is unloaded during execution
         model = self.model
+        if model is None:
+            logger.error("Whisper model is None after loading check - race condition?")
+            return None
 
         try:
             # Convert to bytes
@@ -606,6 +611,9 @@ class WhisperAudioHandler:
 
             # Transcribe with Whisper in thread pool to avoid blocking
             def _transcribe_sync():
+                # Double-check model reference is still valid inside thread
+                if model is None:
+                    raise RuntimeError("Whisper model reference became None during transcription")
                 logger.info(f"🎤 Transcribing audio directly (bypass WAV file)")
                 logger.info(f"   Audio array shape: {normalized_audio.shape}, dtype: {normalized_audio.dtype}")
                 logger.info(f"   Audio min: {normalized_audio.min():.6f}, max: {normalized_audio.max():.6f}")
