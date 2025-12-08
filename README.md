@@ -2977,17 +2977,276 @@ async def generate_announcement() # Generate natural language explanation
 
 **Purpose:** Monitors Docker, GCP Cloud Run, and VM Spot instances in real-time.
 
-**Checks:**
-- **Docker Status:** Container health, latency, availability
-- **GCP Cloud Run:** Service status, cold start state, endpoint health
-- **VM Spot Instances:** Instance status, zone, availability
-- **Network Latency:** Response times for each infrastructure component
+**Comprehensive Infrastructure Monitoring:**
 
-**Integration:**
-- Automatically checked during authentication traces
-- Included in verbose announcements
-- Available via dedicated API endpoint
-- Logged in decision traces for debugging
+The `InfrastructureStatusChecker` provides real-time health monitoring of all infrastructure components used by JARVIS voice authentication. This enables proactive detection of infrastructure issues that might affect authentication performance.
+
+**Components Monitored:**
+
+| Component | What It Checks | Status Values | Health Check Method |
+|-----------|---------------|---------------|---------------------|
+| **docker** | Docker container health (if running in Docker) | `HEALTHY` / `UNAVAILABLE` | Container status check |
+| **jarvis_backend** | JARVIS API health endpoint | `HEALTHY` / `DEGRADED` / `UNAVAILABLE` | HTTP GET `/health` with latency |
+| **local_ml_service** | Local ECAPA-TDNN service | `HEALTHY` / `UNAVAILABLE` | HTTP GET `/health` endpoint |
+| **gcp_cloud_run_ecapa** | GCP Cloud Run ECAPA service | `HEALTHY` / `DEGRADED` / `UNAVAILABLE` / `UNKNOWN` | HTTPS GET Cloud Run endpoint |
+| **gcp_vm_spot_gpu** | GCP VM Spot GPU instance | `HEALTHY` / `DEGRADED` / `UNAVAILABLE` / `UNKNOWN` | HTTP GET VM endpoint with preemption detection |
+
+**Configuration:**
+
+**Environment Variables Required:**
+```bash
+# Docker Configuration
+export DOCKER_CONTAINER=true                    # Set if running in Docker container
+
+# JARVIS Backend
+export JARVIS_BACKEND_URL=http://localhost:8010 # Backend API URL (default: http://localhost:8010)
+
+# Local ML Service  
+export LOCAL_ML_SERVICE_URL=http://localhost:8001/health  # Local ECAPA service endpoint
+
+# GCP Cloud Run Configuration
+export CLOUD_RUN_ECAPA_URL=https://your-ecapa-service-xxxxx-uc.a.run.app  # Your Cloud Run URL
+export CLOUD_RUN_REGION=us-central1                                          # GCP region
+
+# GCP VM Spot GPU Configuration
+export GCP_VM_SPOT_GPU_URL=http://your-vm-spot-ip:8080     # VM Spot instance IP:port
+export GCP_VM_SPOT_ZONE=us-central1-a                       # GCP zone
+
+# GCP Project
+export GCP_PROJECT_ID=jarvis-473803  # Your GCP Project ID
+```
+
+**Health Check Details:**
+
+**1. Docker Container:**
+- Checks if running inside Docker container
+- Verifies container health status
+- No latency measurement (local container)
+
+**2. JARVIS Backend:**
+- Health endpoint: `{JARVIS_BACKEND_URL}/health`
+- Measures response latency
+- Checks for `status: "healthy"` in response
+- Status: `HEALTHY` (<100ms), `DEGRADED` (100-500ms), `UNAVAILABLE` (>500ms or error)
+
+**3. Local ML Service:**
+- Health endpoint: `{LOCAL_ML_SERVICE_URL}/health`
+- Checks ECAPA-TDNN service availability
+- Status: `HEALTHY` (responds) or `UNAVAILABLE` (no response)
+
+**4. GCP Cloud Run ECAPA:**
+- Health endpoint: `{CLOUD_RUN_ECAPA_URL}/health`
+- Measures network latency
+- Detects cold start state
+- Checks service readiness
+- Status: `HEALTHY` (<500ms, ready), `DEGRADED` (>500ms or initializing), `UNAVAILABLE` (error), `UNKNOWN` (not configured)
+
+**5. GCP VM Spot GPU:**
+- Health endpoint: `{GCP_VM_SPOT_GPU_URL}/health`
+- Measures network latency
+- Detects VM preemption (Spot instance may be terminated)
+- Checks GPU availability
+- Status: `HEALTHY` (<200ms, available), `DEGRADED` (slow or preemption warning), `UNAVAILABLE` (no response), `UNKNOWN` (not configured)
+
+**Integration Points:**
+
+**1. Automatic During Authentication:**
+```python
+# Infrastructure status automatically checked during trace
+infrastructure_status = await infrastructure_checker.check_all()
+
+# Recorded in trace
+trace.infrastructure = {
+    "docker": {"status": "healthy", "latency_ms": 0},
+    "jarvis_backend": {"status": "healthy", "latency_ms": 12.5},
+    "local_ml_service": {"status": "unavailable"},
+    "gcp_cloud_run_ecapa": {"status": "healthy", "latency_ms": 245, "region": "us-central1"},
+    "gcp_vm_spot_gpu": {"status": "degraded", "details": {"note": "Spot instance may be preempted"}}
+}
+```
+
+**2. Included in Verbose Announcements:**
+```
+When JARVIS_ANNOUNCE_INFRASTRUCTURE=true:
+
+All healthy:
+"All cloud services are healthy."
+
+Partial availability:
+"3 of 5 cloud services healthy."
+
+VM Spot preempted:
+"GCP VM Spot instance may be preempted - falling back to Cloud Run."
+
+Specific component issues:
+"Docker container healthy. Cloud Run ready (245ms latency). VM Spot instance unavailable - using Cloud Run fallback."
+```
+
+**3. Dedicated API Endpoint:**
+```bash
+curl http://localhost:8010/api/voice-unlock/transparency/infrastructure
+```
+
+**Response Structure:**
+```json
+{
+  "success": true,
+  "timestamp": "2025-12-08T10:15:23Z",
+  "summary": {
+    "healthy_count": 4,
+    "total_count": 5,
+    "overall_status": "degraded",
+    "degraded_count": 1,
+    "unavailable_count": 0
+  },
+  "components": [
+    {
+      "component": "docker",
+      "status": "healthy",
+      "details": {
+        "running": true,
+        "container_id": "abc123..."
+      }
+    },
+    {
+      "component": "jarvis_backend",
+      "status": "healthy",
+      "latency_ms": 12.5,
+      "endpoint": "http://localhost:8010/health"
+    },
+    {
+      "component": "local_ml_service",
+      "status": "unavailable",
+      "error": "Connection refused",
+      "endpoint": "http://localhost:8001/health"
+    },
+    {
+      "component": "gcp_cloud_run_ecapa",
+      "status": "healthy",
+      "latency_ms": 245,
+      "location": "us-central1",
+      "endpoint": "https://ecapa-service-xxx-uc.a.run.app",
+      "cold_start": false
+    },
+    {
+      "component": "gcp_vm_spot_gpu",
+      "status": "degraded",
+      "latency_ms": 892,
+      "zone": "us-central1-a",
+      "endpoint": "http://34.123.45.67:8080",
+      "details": {
+        "note": "Spot instance may be preempted",
+        "response_time_slow": true
+      }
+    }
+  ]
+}
+```
+
+**4. Logged in Decision Traces:**
+```json
+{
+  "infrastructure": {
+    "docker": {
+      "status": "healthy",
+      "latency_ms": 0
+    },
+    "jarvis_backend": {
+      "status": "healthy",
+      "latency_ms": 12.5,
+      "endpoint": "http://localhost:8010"
+    },
+    "gcp_cloud_run_ecapa": {
+      "status": "healthy",
+      "latency_ms": 245,
+      "location": "us-central1",
+      "cold_start": false
+    },
+    "gcp_vm_spot_gpu": {
+      "status": "degraded",
+      "latency_ms": 892,
+      "details": {
+        "preemption_warning": true,
+        "slow_response": true
+      }
+    }
+  }
+}
+```
+
+**Status Interpretation:**
+
+**HEALTHY:**
+- Service is available and responding quickly
+- No issues detected
+- Ready for production use
+
+**DEGRADED:**
+- Service is available but experiencing issues:
+  - High latency (>500ms for Cloud Run, >200ms for VM)
+  - Spot instance preemption warning
+  - Cold start state (Cloud Run)
+- Service still functional but may affect performance
+- System will use fallback if available
+
+**UNAVAILABLE:**
+- Service is not responding
+- Connection errors
+- Service not configured
+- System should use fallback
+
+**UNKNOWN:**
+- Service endpoint not configured
+- Environment variables missing
+- Service not discoverable
+- System will skip this component
+
+**Performance Impact:**
+
+**Check Frequency:**
+- Checked once per authentication trace (not per phase)
+- Cached for 30 seconds (avoid redundant checks)
+- Async execution (non-blocking)
+
+**Latency:**
+- **Parallel Checks:** All components checked simultaneously
+- **Timeout:** 5 seconds per component
+- **Total Time:** ~1-2 seconds (parallel execution)
+- **Cached Results:** Subsequent checks <5ms (cache hit)
+
+**Startup Integration:**
+
+When you run `python3 start_system.py --restart`, the transparency engine configuration is displayed:
+
+```
+[VOICE UNLOCK] 🔍 Checking Voice Transparency Engine...
+[VOICE UNLOCK] ✅ Transparency Engine: ENABLED
+[VOICE UNLOCK]    ├─ Verbose Mode: OFF
+[VOICE UNLOCK]    ├─ Debug Voice: OFF
+[VOICE UNLOCK]    ├─ Explain Decisions: ON
+[VOICE UNLOCK]    ├─ Announce Confidence: borderline
+[VOICE UNLOCK]    ├─ Cloud Status: ON          <-- Infrastructure monitoring enabled
+[VOICE UNLOCK]    └─ Trace Retention: 24h
+```
+
+**Infrastructure Monitoring Benefits:**
+
+**For Users:**
+- Understand if delays are due to infrastructure (e.g., "Cloud Run cold start")
+- Know which services are being used (Docker vs Cloud Run vs VM)
+- Get warnings about degraded services
+
+**For Developers:**
+- Identify infrastructure bottlenecks
+- Debug authentication delays
+- Monitor service health in real-time
+- Detect VM preemption before it causes failures
+
+**For Operations:**
+- Proactive monitoring of all infrastructure components
+- Early warning of service degradation
+- Cost optimization insights (VM Spot vs Cloud Run usage)
+- Capacity planning data
 
 #### 4. DecisionTrace
 
@@ -3639,23 +3898,100 @@ curl http://localhost:8010/api/voice-unlock/transparency/infrastructure
 
 # Response:
 {
-  "docker": {
-    "status": "healthy",
-    "latency_ms": 15,
-    "endpoint": "http://localhost:8010/api/ml"
+  "success": true,
+  "timestamp": "2025-12-08T10:15:23Z",
+  "summary": {
+    "healthy_count": 4,
+    "total_count": 5,
+    "overall_status": "degraded",
+    "degraded_count": 1,
+    "unavailable_count": 0
   },
-  "cloud_run": {
-    "status": "ready",
-    "latency_ms": 234,
-    "cold_start": false
-  },
-  "vm_spot": {
-    "status": "available",
-    "zone": "us-central1-a",
-    "instance_id": "jarvis-auto-12345"
+  "components": [
+    {
+      "component": "docker",
+      "status": "healthy",
+      "details": {
+        "running": true,
+        "container_id": "abc123..."
+      }
+    },
+    {
+      "component": "jarvis_backend",
+      "status": "healthy",
+      "latency_ms": 12.5,
+      "endpoint": "http://localhost:8010/health"
+    },
+    {
+      "component": "local_ml_service",
+      "status": "unavailable",
+      "error": "Connection refused",
+      "endpoint": "http://localhost:8001/health"
+    },
+    {
+      "component": "gcp_cloud_run_ecapa",
+      "status": "healthy",
+      "latency_ms": 245,
+      "location": "us-central1",
+      "endpoint": "https://ecapa-service-xxx-uc.a.run.app",
+      "cold_start": false
+    },
+    {
+      "component": "gcp_vm_spot_gpu",
+      "status": "degraded",
+      "latency_ms": 892,
+      "zone": "us-central1-a",
+      "endpoint": "http://34.123.45.67:8080",
+      "details": {
+        "note": "Spot instance may be preempted",
+        "response_time_slow": true
+      }
+    }
+  ]
+}
+```
+
+**Example 6: Infrastructure Status Interpretation**
+
+**All Healthy:**
+```json
+{
+  "summary": {
+    "healthy_count": 5,
+    "total_count": 5,
+    "overall_status": "healthy"
   }
 }
 ```
+**JARVIS Announcement:** "All cloud services are healthy."
+
+**Degraded (Partial Availability):**
+```json
+{
+  "summary": {
+    "healthy_count": 3,
+    "total_count": 5,
+    "overall_status": "degraded",
+    "degraded_count": 1,
+    "unavailable_count": 1
+  }
+}
+```
+**JARVIS Announcement:** "3 of 5 cloud services healthy. GCP VM Spot instance may be preempted - falling back to Cloud Run."
+
+**VM Spot Preempted:**
+```json
+{
+  "components": [
+    {
+      "component": "gcp_vm_spot_gpu",
+      "status": "unavailable",
+      "error": "Connection timeout - instance may be preempted"
+    }
+  ]
+}
+```
+**JARVIS Announcement:** "GCP VM Spot instance unavailable - using Cloud Run fallback."
 
 ### 🎓 Technical Achievements
 
@@ -3683,6 +4019,70 @@ curl http://localhost:8010/api/voice-unlock/transparency/infrastructure
 4. Enable verbose mode if desired: `export JARVIS_VERBOSE_MODE=true`
 5. Monitor trace API endpoints for debugging
 6. Adjust configuration based on preferences
+
+### 🚀 Startup Integration
+
+The Voice Transparency Engine is now fully integrated into the JARVIS startup process. When you run `python3 start_system.py --restart`, the system automatically checks and reports the transparency engine status.
+
+**Startup Output Example:**
+```
+[VOICE UNLOCK] 🔍 Checking Voice Transparency Engine...
+[VOICE UNLOCK] ✅ Transparency Engine: ENABLED
+[VOICE UNLOCK]    ├─ Verbose Mode: OFF
+[VOICE UNLOCK]    ├─ Debug Voice: OFF
+[VOICE UNLOCK]    ├─ Explain Decisions: ON
+[VOICE UNLOCK]    ├─ Announce Confidence: borderline
+[VOICE UNLOCK]    ├─ Cloud Status: ON          <-- Infrastructure monitoring enabled
+[VOICE UNLOCK]    └─ Trace Retention: 24h
+[VOICE UNLOCK]    💡 TIP: Set JARVIS_VERBOSE_MODE=true for detailed spoken feedback
+[VOICE UNLOCK]    💡 TIP: Set JARVIS_DEBUG_VOICE=true for phase-by-phase announcements
+```
+
+**Enhanced Module Status (v4.0):**
+
+The startup process now also reports status of all enhanced modules:
+
+```
+[VOICE UNLOCK] ✅ VBI: READY (1 profiles, state=ready)
+[VOICE UNLOCK]    ├─ Derek J. Russell [OWNER] (dim=192, samples=272)
+[VOICE UNLOCK]    └─ Enhanced Modules (v4.0): 6/7 active
+[VOICE UNLOCK]       ✓ reasoning_graph
+[VOICE UNLOCK]       ✓ pattern_memory
+[VOICE UNLOCK]       ✓ drift_detector
+[VOICE UNLOCK]       ✓ orchestrator
+[VOICE UNLOCK]       ✓ langfuse_tracer
+[VOICE UNLOCK]       ✓ cost_tracker
+[VOICE UNLOCK]       ✓ transparency_engine
+```
+
+**Module Status Tracking:**
+
+The system tracks availability of each enhanced module:
+- **reasoning_graph** - LangGraph state machine for intelligent reasoning
+- **pattern_memory** - ChromaDB persistent pattern storage
+- **drift_detector** - Voice evolution tracking and baseline adaptation
+- **orchestrator** - Multi-factor authentication fallback chain
+- **langfuse_tracer** - Observability and audit trails
+- **cost_tracker** - Helicone cost optimization tracking
+- **transparency_engine** - Complete decision transparency system
+
+**Configuration Validation:**
+
+During startup, the system validates all transparency configuration:
+- Checks environment variables are set correctly
+- Verifies infrastructure endpoints are accessible
+- Tests trace storage functionality
+- Validates announcement generation
+
+**Error Handling:**
+
+If the transparency engine fails to initialize:
+```
+[VOICE UNLOCK] ⚠️  Transparency Engine: CHECK FAILED - Connection refused
+[VOICE UNLOCK]    💡 Set JARVIS_TRANSPARENCY_ENABLED=true to enable
+```
+
+The system gracefully degrades - voice unlock continues to work, but without transparency features.
 
 ---
 
