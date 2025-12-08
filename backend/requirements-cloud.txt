@@ -14,7 +14,7 @@ en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_
 PyYAML==6.0.1
 websockets==12.0
 numpy==1.24.3
-scipy==1.11.4
+scipy==1.16.3
 
 # Automation dependencies
 icalendar==5.0.11
