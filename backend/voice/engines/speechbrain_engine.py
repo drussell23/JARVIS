@@ -838,22 +838,23 @@ class SpeechBrainEngine(BaseSTTEngine):
                         elif 'PYTORCH_MPS_HIGH_WATERMARK_RATIO' in os.environ:
                             os.environ.pop('PYTORCH_MPS_HIGH_WATERMARK_RATIO', None)
 
-            try:
-                logger.info("   Loading model synchronously on main thread (required for macOS stability)...")
-                # CRITICAL: Run synchronously on main thread to avoid segfaults
-                # Do NOT use run_in_executor here
-                self.speaker_encoder = _load_model_sync()
-                
-                logger.info("   ✅ Model loaded successfully")
-                
-            except Exception as e:
-                logger.error(
-                    "❌ Speaker encoder loading failed!\n"
-                    f"   Error: {e}"
-                )
-                raise
-            finally:
-                pass
+            # Run synchronously on main thread (macOS stability)
+            # loop = asyncio.get_running_loop()
+            # self.speaker_encoder = await asyncio.wait_for(
+            #    loop.run_in_executor(executor, _load_model_sync),
+            #    timeout=120.0  # 2 minute timeout for model loading
+            # )
+            logger.info("   Loading model synchronously on main thread (required for macOS stability)...")
+            self.speaker_encoder = _load_model_sync()
+
+            logger.info("   ✅ Model loaded and transferred to main thread")
+
+        except Exception as e:
+            logger.error(
+                "❌ Speaker encoder loading failed!\n"
+                f"   Error: {e}"
+            )
+            raise
             
             self.speaker_encoder_loaded = True
             logger.info("✅ Speaker encoder loaded successfully")
@@ -876,16 +877,22 @@ class SpeechBrainEngine(BaseSTTEngine):
             )
 
             # Provide helpful diagnostics for common issues
-            if is_apple_silicon and pytorch_version.startswith(('2.9', '2.10', '2.11')):
-                logger.error(
-                    "\n   🔍 APPLE SILICON + PYTORCH 2.9.0+ DETECTED:\n"
-                    "   This combination has known segfault issues during model loading.\n"
-                    "   \n"
-                    "   RECOMMENDED FIXES:\n"
-                    "   1. Downgrade PyTorch: pip install torch==2.3.1 torchaudio==2.3.1\n"
-                    "   2. Or set environment variable: export PYTORCH_ENABLE_MPS_FALLBACK=0\n"
-                    "   3. Or upgrade to PyTorch 2.12+ when available (fix expected)\n"
-                )
+            # Ensure safe access to variables that might not be defined if crash happens early
+            try:
+                is_apple_silicon = platform.machine() == 'arm64' and sys.platform == 'darwin'
+                pytorch_version = torch.__version__
+                if is_apple_silicon and pytorch_version.startswith(('2.9', '2.10', '2.11')):
+                    logger.error(
+                        "\n   🔍 APPLE SILICON + PYTORCH 2.9.0+ DETECTED:\n"
+                        "   This combination has known segfault issues during model loading.\n"
+                        "   \n"
+                        "   RECOMMENDED FIXES:\n"
+                        "   1. Downgrade PyTorch: pip install torch==2.3.1 torchaudio==2.3.1\n"
+                        "   2. Or set environment variable: export PYTORCH_ENABLE_MPS_FALLBACK=0\n"
+                        "   3. Or upgrade to PyTorch 2.12+ when available (fix expected)\n"
+                    )
+            except Exception:
+                pass
             raise
 
     def _load_ecapa_fallback(self, run_opts: dict):
