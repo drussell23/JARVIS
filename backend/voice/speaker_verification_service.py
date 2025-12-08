@@ -18,9 +18,30 @@ Features:
 Enhanced Version: 2.1.0 - Async Optimized (Non-Blocking)
 """
 
+# ============================================================================
+# CRITICAL: Apple Silicon / PyTorch Segfault Prevention
+# ============================================================================
+# These environment variables MUST be set BEFORE importing torch/torchaudio.
+# This is duplicated from speechbrain_engine.py to ensure it runs first
+# regardless of import order.
+# ============================================================================
+import os
+import sys
+import platform
+
+_IS_APPLE_SILICON = platform.machine() == 'arm64' and sys.platform == 'darwin'
+
+if _IS_APPLE_SILICON:
+    os.environ.setdefault('OMP_NUM_THREADS', '1')
+    os.environ.setdefault('MKL_NUM_THREADS', '1')
+    os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
+    os.environ.setdefault('VECLIB_MAXIMUM_THREADS', '1')
+    os.environ.setdefault('NUMEXPR_NUM_THREADS', '1')
+    os.environ.setdefault('PYTORCH_ENABLE_MPS_FALLBACK', '1')
+    os.environ.setdefault('PYTORCH_MPS_HIGH_WATERMARK_RATIO', '0.0')
+
 import asyncio
 import logging
-import os
 import threading
 import hashlib
 import time
@@ -92,7 +113,22 @@ def shutdown_verification_executor():
 # Solution: Monkey patch torchaudio before importing SpeechBrain
 # ============================================================================
 try:
+    import torch
     import torchaudio
+
+    # CRITICAL: Enforce single-threaded mode on Apple Silicon to prevent segfaults
+    if _IS_APPLE_SILICON:
+        try:
+            if torch.get_num_threads() != 1:
+                torch.set_num_threads(1)
+            if torch.get_num_interop_threads() != 1:
+                torch.set_num_interop_threads(1)
+            logging.getLogger(__name__).info(
+                "🍎 Apple Silicon detected - enforcing single-threaded PyTorch mode"
+            )
+        except RuntimeError:
+            # Already set - that's fine
+            pass
 
     # Check if list_audio_backends is missing (torchaudio >= 2.9.0)
     if not hasattr(torchaudio, 'list_audio_backends'):

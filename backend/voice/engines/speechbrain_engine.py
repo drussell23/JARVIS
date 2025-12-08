@@ -29,6 +29,39 @@ Example:
     >>> print(f"Text: {result.text}, Confidence: {result.confidence}")
 """
 
+# ============================================================================
+# CRITICAL: Apple Silicon / PyTorch Segfault Prevention
+# ============================================================================
+# These environment variables MUST be set BEFORE importing torch/torchaudio.
+# PyTorch on Apple Silicon M1/M2 can segfault during model loading due to:
+# 1. OpenMP thread conflicts with macOS Grand Central Dispatch
+# 2. MPS (Metal Performance Shaders) initialization issues
+# 3. MKL threading conflicts
+#
+# Setting these to 1 forces single-threaded mode which prevents segfaults.
+# Performance impact is minimal for inference workloads.
+# ============================================================================
+import os
+import sys
+import platform
+
+# Detect Apple Silicon early
+_IS_APPLE_SILICON = platform.machine() == 'arm64' and sys.platform == 'darwin'
+
+if _IS_APPLE_SILICON:
+    # Force single-threaded mode to prevent segfaults
+    os.environ.setdefault('OMP_NUM_THREADS', '1')
+    os.environ.setdefault('MKL_NUM_THREADS', '1')
+    os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
+    os.environ.setdefault('VECLIB_MAXIMUM_THREADS', '1')
+    os.environ.setdefault('NUMEXPR_NUM_THREADS', '1')
+
+    # Disable MPS to force CPU-only mode (more stable)
+    os.environ.setdefault('PYTORCH_ENABLE_MPS_FALLBACK', '1')
+
+    # Prevent PyTorch from spawning extra threads
+    os.environ.setdefault('PYTORCH_MPS_HIGH_WATERMARK_RATIO', '0.0')
+
 import asyncio
 import hashlib
 import logging
@@ -47,6 +80,24 @@ from scipy.signal import butter, filtfilt, medfilt
 
 from .base_engine import BaseSTTEngine, STTResult
 
+# ============================================================================
+# CRITICAL: Enforce single-threaded PyTorch on Apple Silicon
+# ============================================================================
+# This MUST happen immediately after importing torch, before any operations.
+# Even with environment variables set, PyTorch may still use multiple threads
+# unless explicitly told not to via set_num_threads().
+# Note: These can only be called once, so we check first to avoid errors.
+# ============================================================================
+if _IS_APPLE_SILICON:
+    try:
+        if torch.get_num_threads() != 1:
+            torch.set_num_threads(1)
+        if torch.get_num_interop_threads() != 1:
+            torch.set_num_interop_threads(1)
+    except RuntimeError:
+        # Already set by another module - that's fine
+        pass
+
 # Import managed executor for clean shutdown
 try:
     from core.thread_manager import ManagedThreadPoolExecutor
@@ -55,6 +106,12 @@ except ImportError:
     _HAS_MANAGED_EXECUTOR = False
 
 logger = logging.getLogger(__name__)
+
+# Log Apple Silicon detection
+if _IS_APPLE_SILICON:
+    logging.getLogger(__name__).info(
+        "🍎 Apple Silicon detected - enforcing single-threaded PyTorch mode for stability"
+    )
 
 # Suppress MPS FFT fallback warnings (expected behavior for unsupported ops)
 warnings.filterwarnings("ignore", message=".*MPS backend.*", category=UserWarning)
