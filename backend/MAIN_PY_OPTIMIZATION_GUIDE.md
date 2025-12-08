@@ -116,7 +116,7 @@ BACKEND_LAZY_LOAD_MODELS=true      # Lazy load ML models
 BACKEND_PRELOAD_CACHE=true         # Preload common data
 
 # Performance
-BACKEND_USE_UVLOOP=true            # Use uvloop (Unix only)
+BACKEND_USE_UVLOOP=false           # Use uvloop (DISABLED: Causes segfaults with PyTorch/SpeechBrain on macOS)
 BACKEND_ACCESS_LOG=false           # Disable access logs
 ```
 

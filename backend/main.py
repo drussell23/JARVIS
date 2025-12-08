@@ -4435,7 +4435,7 @@ if __name__ == "__main__":
             port=args.port,
             log_level="info",
             access_log=False,  # Disable access logs for performance
-            loop=("uvloop" if sys.platform != "win32" else "asyncio"),  # Use uvloop on Unix
+            loop="asyncio",  # Use asyncio (uvloop disabled due to speechbrain/torch compatibility)
         )
     else:
         uvicorn.run(app, host="0.0.0.0", port=args.port)
