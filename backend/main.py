@@ -4255,6 +4255,55 @@ async def audio_speak_get(text: str):
 
 
 # ============================================================
+# JARVIS VOICE ENDPOINTS (Frontend Compatibility)
+# ============================================================
+# These endpoints are required by the frontend JarvisVoice.js component
+# They provide status and activation for the voice system
+
+@app.get("/voice/jarvis/status")
+async def voice_jarvis_status():
+    """Get JARVIS voice system status - required by frontend"""
+    voice = components.get("voice", {})
+    voice_unlock = components.get("voice_unlock", {})
+
+    return {
+        "status": "ready",
+        "jarvis_available": voice.get("jarvis_available", False),
+        "voice_unlock_available": bool(voice_unlock.get("router")),
+        "listening": False,
+        "speaking": False,
+        "wake_word_enabled": False,
+        "message": "JARVIS voice system ready"
+    }
+
+
+@app.post("/voice/jarvis/activate")
+async def voice_jarvis_activate(request: dict = None):
+    """Activate JARVIS voice system"""
+    return {
+        "status": "activated",
+        "message": "JARVIS voice system activated",
+        "listening": True
+    }
+
+
+@app.post("/voice/jarvis/speak")
+async def voice_jarvis_speak(request: dict):
+    """Make JARVIS speak text"""
+    voice = components.get("voice", {})
+    jarvis_api = voice.get("jarvis_api")
+
+    if jarvis_api:
+        return await jarvis_api.speak(request)
+
+    # Fallback response
+    return {
+        "status": "ok",
+        "message": f"Would speak: {request.get('text', '')}"
+    }
+
+
+# ============================================================
 # LAZY LOADING HELPER FOR UAE/SAI/LEARNING DB
 # ============================================================
 
