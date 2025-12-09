@@ -1295,6 +1295,28 @@ async def lifespan(app: FastAPI):  # type: ignore[misc]
             logger.warning(f"⚠️  CloudECAPAClient initialization error: {e}")
             logger.info("   → Voice unlock will fallback to local processing")
 
+        # ═══════════════════════════════════════════════════════════════════════════
+        # VBI DEBUG TRACER & ECAPA PRE-WARM - Ensures no cold starts during voice unlock
+        # ═══════════════════════════════════════════════════════════════════════════
+        try:
+            from core.vbi_debug_tracer import prewarm_vbi_at_startup, get_orchestrator
+
+            logger.info("🔥 Pre-warming VBI (Voice Biometric Intelligence) Pipeline...")
+            vbi_prewarm_result = await prewarm_vbi_at_startup()
+
+            if vbi_prewarm_result:
+                logger.info("✅ VBI Pipeline pre-warmed - ready for instant voice unlock")
+                # Store orchestrator in app state for access elsewhere
+                app.state.vbi_orchestrator = get_orchestrator()
+            else:
+                logger.warning("⚠️  VBI pre-warm incomplete - first unlock may be slower")
+
+        except ImportError as e:
+            logger.debug(f"VBI Debug Tracer not available: {e}")
+        except Exception as e:
+            logger.warning(f"⚠️  VBI pre-warm failed: {e}")
+            logger.info("   → Voice unlock will work but first request may be slower")
+
     except ImportError:
         logger.debug("Memory-aware startup not available - using defaults")
     except Exception as e:

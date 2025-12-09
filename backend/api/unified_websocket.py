@@ -22,6 +22,9 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional, Set
 
+# Initialize logger FIRST before using it
+logger = logging.getLogger(__name__)
+
 # Import async pipeline for non-blocking WebSocket operations
 from core.async_pipeline import get_async_pipeline
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
@@ -51,8 +54,6 @@ try:
 except ImportError as e:
     logger.warning(f"Streaming safeguard not available: {e}")
     STREAMING_SAFEGUARD_AVAILABLE = False
-
-logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
