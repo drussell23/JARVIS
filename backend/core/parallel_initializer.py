@@ -107,6 +107,7 @@ class ParallelInitializer:
         self._add_component("cloud_ml_router", priority=21, dependencies=["memory_aware_startup"])
         self._add_component("cloud_ecapa_client", priority=22)
         self._add_component("vbi_prewarm", priority=23, dependencies=["cloud_ecapa_client"])  # VBI pre-warming after ECAPA client
+        self._add_component("vbi_health_monitor", priority=24)  # VBI health monitoring for operation tracking
         self._add_component("ml_engine_registry", priority=25)
 
         # Phase 3: Voice System (parallel)
@@ -531,6 +532,129 @@ class ParallelInitializer:
         except Exception as e:
             logger.error(f"VBI pre-warm failed: {e}")
             logger.error(f"   This is non-fatal - voice unlock will still work")
+            # Don't raise - this is not critical for server operation
+
+    async def _init_vbi_health_monitor(self):
+        """
+        Initialize VBI Health Monitor for advanced operation tracking.
+
+        Provides:
+        - In-flight operation tracking with automatic timeout detection
+        - Application-level heartbeat system for all VBI components
+        - Circuit breakers with adaptive thresholds
+        - Fallback chain orchestration
+        - Integration with CloudECAPAClient, CloudSQL, WebSocket
+        """
+        try:
+            from core.vbi_health_monitor import (
+                get_vbi_health_monitor,
+                ComponentType,
+                HealthLevel,
+            )
+
+            logger.info("=" * 60)
+            logger.info("VBI HEALTH MONITOR INITIALIZATION")
+            logger.info("=" * 60)
+
+            # Get or create the singleton monitor
+            monitor = await get_vbi_health_monitor()
+
+            # Store reference in app state for global access
+            self.app.state.vbi_health_monitor = monitor
+
+            # Register initial heartbeats for existing components
+            components_to_register = []
+
+            # Check for CloudECAPAClient
+            if hasattr(self.app.state, 'cloud_ecapa_client') and self.app.state.cloud_ecapa_client:
+                components_to_register.append((ComponentType.ECAPA_CLIENT, "CloudECAPAClient"))
+
+            # Check for learning database (CloudSQL)
+            if hasattr(self.app.state, 'learning_db') and self.app.state.learning_db:
+                components_to_register.append((ComponentType.CLOUDSQL, "LearningDatabase"))
+
+            # Register heartbeats for existing components
+            for comp_type, comp_name in components_to_register:
+                await monitor.record_heartbeat(
+                    component=comp_type,
+                    health_level=HealthLevel.HEALTHY,
+                    latency_ms=0.0,
+                    metadata={"source": "startup", "component_name": comp_name}
+                )
+                logger.info(f"   Registered heartbeat for {comp_name}")
+
+            # Subscribe to health events for logging/alerting
+            async def handle_health_event(event_type: str, data: dict):
+                """Handle health events from VBI monitor"""
+                if event_type == "operation_timeout":
+                    op_id = data.get("operation_id", "unknown")
+                    op_type = data.get("operation_type", "unknown")
+                    component = data.get("component", "unknown")
+                    elapsed = data.get("elapsed_seconds", 0)
+                    logger.warning(
+                        f"⚠️ VBI Operation Timeout: {op_type} ({op_id}) on {component} "
+                        f"after {elapsed:.1f}s"
+                    )
+                elif event_type == "heartbeat_stale":
+                    component = data.get("component", "unknown")
+                    last_beat = data.get("last_heartbeat_seconds_ago", 0)
+                    logger.warning(
+                        f"⚠️ VBI Heartbeat Stale: {component} - no heartbeat for {last_beat:.1f}s"
+                    )
+                elif event_type == "circuit_opened":
+                    component = data.get("component", "unknown")
+                    failure_rate = data.get("failure_rate", 0)
+                    logger.warning(
+                        f"🔴 Circuit Breaker OPENED: {component} (failure rate: {failure_rate:.1%})"
+                    )
+                elif event_type == "circuit_closed":
+                    component = data.get("component", "unknown")
+                    logger.info(
+                        f"🟢 Circuit Breaker CLOSED: {component} - recovered"
+                    )
+                elif event_type == "health_degraded":
+                    component = data.get("component", "unknown")
+                    level = data.get("health_level", "unknown")
+                    logger.warning(f"⚠️ Health Degraded: {component} -> {level}")
+
+            monitor.on_event(handle_health_event)
+
+            # Get initial system health
+            system_health = await monitor.get_system_health()
+            overall_health = system_health.get("overall_health", "unknown")
+            active_ops = system_health.get("active_operations", 0)
+
+            logger.info(f"   Overall health: {overall_health}")
+            logger.info(f"   Active operations: {active_ops}")
+            logger.info(f"   ✅ VBI Health Monitor ready (operation tracking active)")
+            logger.info("=" * 60)
+
+            # Store status for health checks
+            self.app.state.vbi_health_monitor_status = {
+                "status": "initialized",
+                "overall_health": overall_health,
+                "timestamp": time.time()
+            }
+
+        except ImportError as e:
+            logger.warning(f"VBI Health Monitor not available: {e}")
+            logger.warning("   Operation tracking will not be available")
+            self.app.state.vbi_health_monitor = None
+            self.app.state.vbi_health_monitor_status = {
+                "status": "not_available",
+                "error": str(e),
+                "timestamp": time.time()
+            }
+
+        except Exception as e:
+            logger.error(f"VBI Health Monitor failed: {e}")
+            logger.error("   This is non-fatal - system will operate without advanced health tracking")
+            self.app.state.vbi_health_monitor = None
+            self.app.state.vbi_health_monitor_status = {
+                "status": "failed",
+                "error": str(e),
+                "timestamp": time.time()
+            }
             # Don't raise - this is not critical for server operation
 
     async def _init_ml_engine_registry(self):

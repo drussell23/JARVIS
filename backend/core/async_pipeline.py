@@ -656,6 +656,15 @@ class AdvancedAsyncPipeline:
         if self.agi_os_enabled:
             asyncio.create_task(self._init_agi_os_integration())
 
+        # ═══════════════════════════════════════════════════════════════
+        # VBI Health Monitor Integration - Advanced Health Tracking
+        # ═══════════════════════════════════════════════════════════════
+        self._vbi_health_monitor = None
+        self._health_monitor_enabled = self.config.get("vbi_health_monitor_enabled", True)
+
+        if self._health_monitor_enabled:
+            asyncio.create_task(self._init_vbi_health_monitor())
+
         if self._follow_up_enabled:
             try:
                 self._init_followup_system()
@@ -944,6 +953,121 @@ class AdvancedAsyncPipeline:
         except Exception as e:
             logger.error(f"❌ AGI OS integration failed: {e}", exc_info=True)
             self.agi_os_enabled = False
+
+    async def _init_vbi_health_monitor(self):
+        """Initialize VBI Health Monitor for advanced operation tracking.
+
+        Connects the pipeline to the VBI health monitoring system for:
+        - Operation tracking with timeout detection
+        - Application-level heartbeats
+        - Circuit breaker integration
+        - Fallback chain orchestration
+        """
+        try:
+            from backend.core.vbi_health_monitor import (
+                get_vbi_health_monitor,
+                ComponentType,
+                HealthLevel,
+            )
+
+            self._vbi_health_monitor = await get_vbi_health_monitor()
+
+            # Subscribe to health events from VBI monitor
+            async def handle_health_event(event_type: str, data: dict):
+                """Handle health events from VBI monitor."""
+                if event_type == "operation_timeout":
+                    logger.warning(
+                        f"[VBI-HEALTH] Operation timeout detected: "
+                        f"{data.get('operation_type')} in {data.get('component')}"
+                    )
+                elif event_type == "heartbeat_stale":
+                    logger.warning(
+                        f"[VBI-HEALTH] Stale heartbeat from {data.get('component')}"
+                    )
+                elif event_type == "health_update":
+                    if not data.get("is_healthy", True):
+                        logger.warning(
+                            f"[VBI-HEALTH] System unhealthy: {data.get('overall_health')}"
+                        )
+
+            self._vbi_health_monitor.on_event(handle_health_event)
+
+            logger.info("✅ VBI Health Monitor initialized")
+            logger.info("   • Operation tracking: Active")
+            logger.info("   • Heartbeat monitoring: Active")
+            logger.info("   • Circuit breakers: Configured")
+
+        except ImportError as e:
+            logger.warning(f"⚠️ VBI Health Monitor not available: {e}")
+            self._health_monitor_enabled = False
+        except Exception as e:
+            logger.error(f"❌ VBI Health Monitor initialization failed: {e}", exc_info=True)
+            self._health_monitor_enabled = False
+
+    async def _track_operation(
+        self,
+        operation_type: str,
+        component_type: str = "vbi_engine",
+        timeout_seconds: float = 30.0,
+        metadata: dict = None,
+    ):
+        """Start tracking an operation with the VBI health monitor.
+
+        Args:
+            operation_type: Type of operation (e.g., "voice_unlock")
+            component_type: Component type string
+            timeout_seconds: Timeout for the operation
+            metadata: Additional metadata
+
+        Returns:
+            TrackedOperation or None if health monitor not available
+        """
+        if not self._vbi_health_monitor:
+            return None
+
+        try:
+            from backend.core.vbi_health_monitor import ComponentType
+
+            component_map = {
+                "vbi_engine": ComponentType.VBI_ENGINE,
+                "ecapa_client": ComponentType.ECAPA_CLIENT,
+                "cloud_run": ComponentType.CLOUD_RUN,
+                "cloudsql": ComponentType.CLOUDSQL,
+                "sqlite": ComponentType.SQLITE,
+                "websocket": ComponentType.WEBSOCKET,
+            }
+
+            component = component_map.get(component_type, ComponentType.VBI_ENGINE)
+
+            return await self._vbi_health_monitor.start_operation(
+                operation_type=operation_type,
+                component=component,
+                timeout_seconds=timeout_seconds,
+                metadata=metadata or {},
+            )
+        except Exception as e:
+            logger.debug(f"[VBI-HEALTH] Failed to track operation: {e}")
+            return None
+
+    async def _complete_tracked_operation(self, operation, result=None):
+        """Complete a tracked operation successfully."""
+        if not self._vbi_health_monitor or not operation:
+            return
+
+        try:
+            await self._vbi_health_monitor.complete_operation(operation, result)
+        except Exception as e:
+            logger.debug(f"[VBI-HEALTH] Failed to complete operation: {e}")
+
+    async def _fail_tracked_operation(self, operation, error: str):
+        """Mark a tracked operation as failed."""
+        if not self._vbi_health_monitor or not operation:
+            return
+
+        try:
+            await self._vbi_health_monitor.fail_operation(operation, error)
+        except Exception as e:
+            logger.debug(f"[VBI-HEALTH] Failed to record operation failure: {e}")
 
     async def emit_agi_event(
         self,
@@ -1263,6 +1387,19 @@ class AdvancedAsyncPipeline:
         # Determine action type for logging
         is_lock = "lock" in text_lower and "unlock" not in text_lower
         action_type = "LOCK" if is_lock else "UNLOCK"
+
+        # Start VBI health monitor operation tracking
+        tracked_operation = await self._track_operation(
+            operation_type="voice_unlock" if not is_lock else "screen_lock",
+            component_type="vbi_engine",
+            timeout_seconds=60.0,
+            metadata={
+                "action_type": action_type,
+                "user_name": user_name,
+                "speaker_name": speaker_name,
+                "has_audio": audio_data is not None,
+            }
+        )
 
         logger.info(f"🔒 [LOCK-UNLOCK-START] {action_type} command received at {datetime.now().isoformat()}")
         logger.info(f"🔒 [LOCK-UNLOCK-DETAILS] Command: '{text}', User: {user_name}, Speaker: {speaker_name}")
@@ -1673,6 +1810,15 @@ class AdvancedAsyncPipeline:
             except Exception as e:
                 logger.debug(f"Could not write performance log: {e}")
 
+            # Complete VBI health monitor operation tracking
+            if success:
+                await self._complete_tracked_operation(tracked_operation, {
+                    "action": action,
+                    "latency_ms": latency_ms,
+                })
+            else:
+                await self._fail_tracked_operation(tracked_operation, message or "Operation failed")
+
             return {
                 "success": success,
                 "response": message,
@@ -1691,6 +1837,9 @@ class AdvancedAsyncPipeline:
         except Exception as e:
             # Cancel monitor task
             monitor_task.cancel()
+
+            # Record failure in VBI health monitor
+            await self._fail_tracked_operation(tracked_operation, str(e))
 
             elapsed_ms = (time.time() - start_time) * 1000
             logger.error(
