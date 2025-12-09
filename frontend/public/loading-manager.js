@@ -762,11 +762,29 @@ class JARVISLoadingManager {
         // Skip keepalive messages
         if (stage === 'keepalive' || data.type === 'pong') return;
 
-        console.log(`[Progress] ${progress?.toFixed(1) || '?'}% - ${stage}: ${message}`);
+        // CRITICAL: Progress must be monotonically increasing (never decrease)
+        // Backend stages complete in different orders, but UI should only show forward progress
+        const effectiveProgress = typeof progress === 'number' ? progress : 0;
+        const currentMax = Math.max(this.state.targetProgress || 0, this.state.progress || 0);
+        
+        // Only log and update if progress is increasing (or same stage update)
+        if (effectiveProgress >= currentMax || stage === 'complete') {
+            console.log(`[Progress] ${effectiveProgress}% - ${stage}: ${message}`);
+        } else {
+            // Log skipped updates at debug level
+            console.debug(`[Progress] Skipped backward: ${effectiveProgress}% (current: ${currentMax}%) - ${stage}: ${message}`);
+        }
 
-        // Update target progress
+        // Update target progress ONLY if it increases (monotonic progress)
         if (typeof progress === 'number' && progress >= 0 && progress <= 100) {
-            this.state.targetProgress = progress;
+            // Allow progress to increase or stay the same, never decrease
+            // Exception: 'complete' stage always sets to 100%
+            if (stage === 'complete') {
+                this.state.targetProgress = 100;
+            } else if (progress > this.state.targetProgress) {
+                this.state.targetProgress = progress;
+            }
+            // If progress is less than current, ignore it (out-of-order message)
         }
 
         // Update stage

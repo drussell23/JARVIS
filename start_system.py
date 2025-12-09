@@ -15333,7 +15333,9 @@ async def main():
                     print(f"{Colors.GREEN}   ✓ Loading server started on {loading_server_url}{Colors.ENDC}")
 
                     # Clean up existing JARVIS tabs and redirect to loading page
-                    print(f"{Colors.CYAN}🌐 Redirecting to loading page...{Colors.ENDC}")
+                    print(f"{Colors.CYAN}🌐 Opening Chrome with loading page...{Colors.ENDC}")
+                    
+                    browser_opened = False
                     try:
                         # Use AppleScript to close duplicate tabs and show loading page
                         cleanup_script = """
@@ -15399,16 +15401,61 @@ async def main():
                             activate
                         end tell
                         """
-                        subprocess.run(["osascript", "-e", cleanup_script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
-                    except:
-                        # Fallback to simple open if AppleScript fails
+                        result = subprocess.run(
+                            ["osascript", "-e", cleanup_script], 
+                            stdout=subprocess.PIPE, 
+                            stderr=subprocess.PIPE, 
+                            timeout=5
+                        )
+                        if result.returncode == 0:
+                            browser_opened = True
+                            print(f"{Colors.GREEN}   ✓ Chrome opened with loading page{Colors.ENDC}")
+                        else:
+                            print(f"{Colors.YELLOW}   ⚠️  AppleScript returned non-zero, trying fallback...{Colors.ENDC}")
+                    except subprocess.TimeoutExpired:
+                        print(f"{Colors.YELLOW}   ⚠️  AppleScript timed out, trying fallback...{Colors.ENDC}")
+                    except Exception as e:
+                        print(f"{Colors.YELLOW}   ⚠️  AppleScript failed: {e}, trying fallback...{Colors.ENDC}")
+                    
+                    # Fallback: Use webbrowser module or open command
+                    if not browser_opened:
                         try:
-                            subprocess.Popen(["open", loading_server_url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                        except:
+                            # Try open command with Chrome specifically
+                            result = subprocess.run(
+                                ["open", "-a", "Google Chrome", loading_server_url],
+                                stdout=subprocess.DEVNULL, 
+                                stderr=subprocess.DEVNULL,
+                                timeout=3
+                            )
+                            if result.returncode == 0:
+                                browser_opened = True
+                                print(f"{Colors.GREEN}   ✓ Chrome opened via 'open' command{Colors.ENDC}")
+                        except Exception:
+                            pass
+                    
+                    if not browser_opened:
+                        try:
+                            # Final fallback: webbrowser module
+                            import webbrowser
+                            webbrowser.open(loading_server_url)
+                            browser_opened = True
+                            print(f"{Colors.GREEN}   ✓ Browser opened via webbrowser module{Colors.ENDC}")
+                        except Exception:
                             print(f"{Colors.YELLOW}   ⚠️  Auto-open failed. Navigate to: {loading_server_url}{Colors.ENDC}")
                 else:
                     print(f"{Colors.YELLOW}   ⚠️  Loading server health check failed (server may still be starting){Colors.ENDC}")
-                    print(f"{Colors.CYAN}   ℹ️  If needed, manually open: {loading_server_url}{Colors.ENDC}")
+                    # Try to open anyway - the loading page might still work
+                    print(f"{Colors.CYAN}   ℹ️  Attempting to open browser anyway...{Colors.ENDC}")
+                    try:
+                        subprocess.run(
+                            ["open", "-a", "Google Chrome", loading_server_url],
+                            stdout=subprocess.DEVNULL, 
+                            stderr=subprocess.DEVNULL,
+                            timeout=3
+                        )
+                        print(f"{Colors.GREEN}   ✓ Chrome opened (loading server will show when ready){Colors.ENDC}")
+                    except Exception:
+                        print(f"{Colors.CYAN}   ℹ️  If needed, manually open: {loading_server_url}{Colors.ENDC}")
 
             except Exception as e:
                 print(f"{Colors.YELLOW}   ⚠️  Failed to start loading server: {e}{Colors.ENDC}")
