@@ -87,7 +87,7 @@ jobs:
       test-matrix: ${{ steps.setup-matrix.outputs.matrix }}
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Detect Python Version
         id: detect-python
@@ -155,10 +155,10 @@ jobs:
       matrix: ${{ fromJson(needs.setup-environment.outputs.test-matrix) }}
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
           cache: 'pip'
@@ -197,7 +197,7 @@ jobs:
 
       - name: Upload Test Results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: test-results-mock-${{ matrix.test-suite }}
           path: ${{ env.RESULTS_DIR }}
@@ -210,10 +210,10 @@ jobs:
     if: needs.setup-environment.outputs.test-mode == 'integration'
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: ${{ needs.setup-environment.outputs.python-version }}
           cache: 'pip'
@@ -252,7 +252,7 @@ jobs:
 
       - name: Upload Test Results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: test-results-integration
           path: ${{ env.RESULTS_DIR }}
@@ -267,7 +267,7 @@ jobs:
       needs.setup-environment.outputs.can-test-real == 'true'
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Check Prerequisites
         run: |
@@ -308,7 +308,7 @@ jobs:
 
       - name: Upload Test Results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: test-results-real
           path: ${{ env.RESULTS_DIR }}
@@ -321,7 +321,7 @@ jobs:
     if: always()
     steps:
       - name: Download All Results
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v6
         with:
           path: all-results
 
