@@ -32,6 +32,16 @@ interface PendingACK {
   timeout: NodeJS.Timeout;
 }
 
+interface QueuedMessage {
+  message: any;
+  capability?: string;
+  resolve: () => void;
+  reject: (reason?: any) => void;
+  type: 'normal' | 'reliable';
+  timeout?: number;
+  timestamp: number;
+}
+
 export class DynamicWebSocketClient {
   private connections: Map<string, WebSocket> = new Map();
   private messageHandlers: Map<string, Function[]> = new Map();
@@ -42,6 +52,10 @@ export class DynamicWebSocketClient {
   
   // Reliable messaging
   private pendingACKs: Map<string, PendingACK> = new Map();
+  
+  // Store & Forward (Offline Queue)
+  private offlineQueue: QueuedMessage[] = [];
+  private maxQueueSize = 1000;
   
   // ML-based routing
   private routingModel: any = null;
@@ -288,6 +302,7 @@ export class DynamicWebSocketClient {
         console.log(`✅ Connected to ${endpoint}`);
         this.connections.set(endpoint, ws);
         this.startHeartbeat(endpoint);
+        this.flushQueue(); // Send any queued messages
         resolve(ws);
       };
       
@@ -361,6 +376,42 @@ export class DynamicWebSocketClient {
       pending.resolve();
       this.pendingACKs.delete(ackId);
       console.log(`✅ ACK received for message ${ackId}`);
+    }
+  }
+
+  /**
+   * Flush queued messages when connection is restored
+   */
+  private async flushQueue(): Promise<void> {
+    if (this.offlineQueue.length === 0) return;
+    
+    console.log(`📤 Flushing ${this.offlineQueue.length} queued messages...`);
+    
+    // Process queue
+    const queue = [...this.offlineQueue];
+    this.offlineQueue = [];
+    
+    for (const item of queue) {
+      try {
+        // Respect TTL (Time To Live) - discard if older than 5 minutes
+        if (Date.now() - item.timestamp > 5 * 60 * 1000) {
+          console.warn('Message expired in queue, discarding', item.message.type);
+          item.reject(new Error('Message expired in queue'));
+          continue;
+        }
+
+        if (item.type === 'reliable') {
+          await this.sendReliable(item.message, item.capability, item.timeout);
+        } else {
+          await this.send(item.message, item.capability);
+        }
+        item.resolve();
+      } catch (error) {
+        console.error('Failed to flush message:', error);
+        // If it failed and wasn't a reliable message (which has its own retries), maybe re-queue?
+        // For now, reject it to let the caller handle it, or reliable retry handles it.
+        item.reject(error);
+      }
     }
   }
 
@@ -519,7 +570,33 @@ export class DynamicWebSocketClient {
   /**
    * Send a message with automatic routing
    */
-  async send(message: any, capability?: string): Promise<void> {
+  async send(message: any, capability?: string, allowQueue = true): Promise<void> {
+    // Check if we have any active connections
+    const activeConnection = Array.from(this.connections.values()).find(ws => ws.readyState === WebSocket.OPEN);
+    
+    // If offline, queue the message
+    if (!activeConnection) {
+      if (allowQueue) {
+        if (this.offlineQueue.length < this.maxQueueSize) {
+          console.log('⚠️ Offline: Queueing message', message.type);
+          return new Promise((resolve, reject) => {
+            this.offlineQueue.push({
+              message,
+              capability,
+              resolve,
+              reject,
+              type: 'normal',
+              timestamp: Date.now()
+            });
+          });
+        } else {
+          throw new Error('Offline queue full, message dropped');
+        }
+      } else {
+        throw new Error('No open WebSocket connection available');
+      }
+    }
+
     let targetWs: WebSocket | undefined;
     
     if (capability) {
@@ -546,33 +623,96 @@ export class DynamicWebSocketClient {
   }
   
   /**
-   * Send a reliable message that waits for an ACK
+   * Send a reliable message that waits for an ACK with Auto-Retry
    */
-  async sendReliable(message: any, capability?: string, timeout = 5000): Promise<void> {
+  async sendReliable(message: any, capability?: string, timeout = 5000, retries = 3): Promise<void> {
+    // Check connection first - if offline, queue it
+    const activeConnection = Array.from(this.connections.values()).find(ws => ws.readyState === WebSocket.OPEN);
+    if (!activeConnection) {
+      if (this.offlineQueue.length < this.maxQueueSize) {
+        console.log('⚠️ Offline: Queueing reliable message', message.type);
+        return new Promise((resolve, reject) => {
+          this.offlineQueue.push({
+            message,
+            capability,
+            resolve,
+            reject,
+            type: 'reliable',
+            timeout, // Store timeout config for later
+            timestamp: Date.now()
+          });
+        });
+      } else {
+        throw new Error('Offline queue full, message dropped');
+      }
+    }
+
     const messageId = message.messageId || `msg_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
     const messageWithId = { ...message, messageId };
 
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        if (this.pendingACKs.has(messageId)) {
+    const trySend = async (attempt: number): Promise<void> => {
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          if (this.pendingACKs.has(messageId)) {
+            // Remove from pending
+            this.pendingACKs.delete(messageId);
+            
+            // Retry logic
+            if (attempt < retries) {
+              const backoff = 1000 * Math.pow(2, attempt); // 1s, 2s, 4s
+              console.warn(`ACK timeout for ${messageId}, retrying in ${backoff}ms (attempt ${attempt + 1}/${retries})`);
+              
+              setTimeout(() => {
+                trySend(attempt + 1).then(resolve).catch(reject);
+              }, backoff);
+            } else {
+              reject(new Error(`Reliable delivery failed after ${retries} attempts for ${messageId}`));
+            }
+          }
+        }, timeout);
+
+        this.pendingACKs.set(messageId, {
+          resolve,
+          reject: (err) => {
+             // If actively rejected (e.g. connection closed), we might want to retry immediately or fail
+             clearTimeout(timer);
+             reject(err);
+          },
+          timeout: timer
+        });
+
+        // Send the message using the standard send logic
+        // We bypass internal queueing of send() because we want to handle offline/failures explicitly here
+        this.send(messageWithId, capability, false).catch(err => {
+          // If send fails (throws), we catch it here.
+          clearTimeout(timer);
           this.pendingACKs.delete(messageId);
-          reject(new Error(`ACK timeout for message ${messageId}`));
-        }
-      }, timeout);
-
-      this.pendingACKs.set(messageId, {
-        resolve,
-        reject,
-        timeout: timer
+          
+          // If error is connectivity related, let's push to offline queue manually to be safe
+          if (err.message.includes('No open WebSocket')) {
+             console.log(`⚠️ Connection lost during reliable send for ${messageId}, queueing...`);
+             this.offlineQueue.push({
+                message: messageWithId,
+                capability,
+                resolve,
+                reject,
+                type: 'reliable',
+                timeout,
+                timestamp: Date.now()
+             });
+             // We resolved the trySend promise by queuing it? No, trySend returns a Promise that is linked to 'resolve' passed above.
+             // But here we are pushing 'resolve' to the queue.
+             // So this trySend promise will eventually resolve when the queue processes it.
+             // We don't need to do anything else here.
+          } else {
+             console.error(`Send failed for ${messageId}:`, err);
+             reject(err);
+          }
+        });
       });
+    };
 
-      // Send the message using the standard send logic
-      this.send(messageWithId, capability).catch(err => {
-        clearTimeout(timer);
-        this.pendingACKs.delete(messageId);
-        reject(err);
-      });
-    });
+    return trySend(0);
   }
 
   /**
@@ -672,7 +812,8 @@ export class DynamicWebSocketClient {
       discoveredEndpoints: this.endpoints,
       learnedMessageTypes: Array.from(this.messageTypes.keys()),
       totalMessages: Array.from(this.connectionMetrics.values())
-        .reduce((sum, m) => sum + m.messages, 0)
+        .reduce((sum, m) => sum + m.messages, 0),
+      queueSize: this.offlineQueue.length
     };
     
     return stats;

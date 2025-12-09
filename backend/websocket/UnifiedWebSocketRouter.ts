@@ -54,6 +54,7 @@ export class UnifiedWebSocketRouter extends EventEmitter {
   private messageQueue: Map<string, any[]> = new Map();
   private rateLimiters: Map<string, RateLimiter> = new Map();
   private errorHandler: ErrorHandlingMiddleware;
+  private processedMessageIds: Map<string, number> = new Map(); // messageId -> timestamp
 
   constructor(config: RouterConfig = {}) {
     super();
@@ -371,6 +372,24 @@ export class UnifiedWebSocketRouter extends EventEmitter {
   ): Promise<void> {
     // Check for reliable message ID and send ACK
     if (message.messageId) {
+      // Deduplication Logic
+      if (this.processedMessageIds.has(message.messageId)) {
+        console.log(`♻️ Ignoring duplicate message: ${message.messageId}`);
+        // Resend ACK in case the previous one was lost
+        ws.send(JSON.stringify({
+          type: 'ack',
+          ackId: message.messageId,
+          timestamp: Date.now()
+        }));
+        return; // Stop processing
+      }
+
+      // Record message ID for deduplication
+      this.processedMessageIds.set(message.messageId, Date.now());
+      
+      // Cleanup old IDs periodically (e.g. keep for 5 mins)
+      this.cleanupProcessedIds();
+
       ws.send(JSON.stringify({
         type: 'ack',
         ackId: message.messageId,
@@ -391,6 +410,23 @@ export class UnifiedWebSocketRouter extends EventEmitter {
         type: 'error',
         message: `No handler found for message type: ${messageType}`
       }));
+    }
+  }
+
+  /**
+   * Cleanup processed message IDs to prevent memory leaks
+   */
+  private cleanupProcessedIds(): void {
+    // Only run cleanup occasionally (e.g., 1% of the time or based on size)
+    if (this.processedMessageIds.size > 1000) {
+      const now = Date.now();
+      const ttl = 5 * 60 * 1000; // 5 minutes
+      
+      for (const [id, timestamp] of this.processedMessageIds.entries()) {
+        if (now - timestamp > ttl) {
+          this.processedMessageIds.delete(id);
+        }
+      }
     }
   }
 
