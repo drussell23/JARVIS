@@ -369,6 +369,15 @@ export class UnifiedWebSocketRouter extends EventEmitter {
     context: MessageContext,
     route: RouteHandler
   ): Promise<void> {
+    // Check for reliable message ID and send ACK
+    if (message.messageId) {
+      ws.send(JSON.stringify({
+        type: 'ack',
+        ackId: message.messageId,
+        timestamp: Date.now()
+      }));
+    }
+
     const messageType = message.type || 'default';
     const handler = route.handlers.get(messageType) || route.handlers.get('*');
     

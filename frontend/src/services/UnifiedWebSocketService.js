@@ -96,6 +96,18 @@ class UnifiedWebSocketService {
             throw error;
         }
     }
+
+    /**
+     * Send a reliable message (awaits ACK)
+     */
+    async sendReliable(message, capability, timeout = 5000) {
+        try {
+            await this.client.sendReliable(message, capability, timeout);
+        } catch (error) {
+            console.error('Failed to send reliable message:', error);
+            throw error;
+        }
+    }
     
     /**
      * Request workspace analysis
@@ -239,6 +251,7 @@ export function useUnifiedWebSocket() {
         connect: (capability) => service.connect(capability),
         disconnect: () => service.disconnect(),
         send: (message, capability) => service.send(message, capability),
+        sendReliable: (message, capability, timeout) => service.sendReliable(message, capability, timeout),
         subscribe: (messageType, handler) => service.subscribe(messageType, handler)
     };
 }

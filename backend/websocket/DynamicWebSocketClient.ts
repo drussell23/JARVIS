@@ -26,6 +26,12 @@ interface MessageType {
   validator?: (data: any) => boolean;
 }
 
+interface PendingACK {
+  resolve: () => void;
+  reject: (reason?: any) => void;
+  timeout: NodeJS.Timeout;
+}
+
 export class DynamicWebSocketClient {
   private connections: Map<string, WebSocket> = new Map();
   private messageHandlers: Map<string, Function[]> = new Map();
@@ -33,6 +39,9 @@ export class DynamicWebSocketClient {
   private reconnectTimers: Map<string, NodeJS.Timeout> = new Map();
   private messageTypes: Map<string, MessageType> = new Map();
   private config: WebSocketConfig;
+  
+  // Reliable messaging
+  private pendingACKs: Map<string, PendingACK> = new Map();
   
   // ML-based routing
   private routingModel: any = null;
@@ -298,6 +307,12 @@ export class DynamicWebSocketClient {
       try {
         const data = JSON.parse(event.data);
         
+        // Handle ACKs
+        if (data.type === 'ack' && data.ackId) {
+          this.handleACK(data.ackId);
+          return;
+        }
+
         // Learn message types dynamically
         if (!this.messageTypes.has(data.type)) {
           this.learnMessageType(data);
@@ -336,6 +351,19 @@ export class DynamicWebSocketClient {
     };
   }
   
+  /**
+   * Handle incoming ACK
+   */
+  private handleACK(ackId: string): void {
+    if (this.pendingACKs.has(ackId)) {
+      const pending = this.pendingACKs.get(ackId)!;
+      clearTimeout(pending.timeout);
+      pending.resolve();
+      this.pendingACKs.delete(ackId);
+      console.log(`✅ ACK received for message ${ackId}`);
+    }
+  }
+
   /**
    * Learn message types dynamically
    */
@@ -517,6 +545,36 @@ export class DynamicWebSocketClient {
     targetWs.send(JSON.stringify(message));
   }
   
+  /**
+   * Send a reliable message that waits for an ACK
+   */
+  async sendReliable(message: any, capability?: string, timeout = 5000): Promise<void> {
+    const messageId = message.messageId || `msg_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    const messageWithId = { ...message, messageId };
+
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (this.pendingACKs.has(messageId)) {
+          this.pendingACKs.delete(messageId);
+          reject(new Error(`ACK timeout for message ${messageId}`));
+        }
+      }, timeout);
+
+      this.pendingACKs.set(messageId, {
+        resolve,
+        reject,
+        timeout: timer
+      });
+
+      // Send the message using the standard send logic
+      this.send(messageWithId, capability).catch(err => {
+        clearTimeout(timer);
+        this.pendingACKs.delete(messageId);
+        reject(err);
+      });
+    });
+  }
+
   /**
    * Initialize ML-based routing
    */
