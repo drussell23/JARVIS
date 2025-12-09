@@ -679,6 +679,12 @@ const JarvisVoice = () => {
   const [showSTTDetails, setShowSTTDetails] = useState(true); // Show hybrid STT engine details
   const [useHybridSTT, setUseHybridSTT] = useState(true); // Use hybrid STT instead of browser API
   const [detectedCommand, setDetectedCommand] = useState(null); // 🆕 Command detected by streaming safeguard
+
+  // VBI (Voice Biometric Intelligence) Progress State - Real-time voice unlock tracking
+  const [vbiProgress, setVbiProgress] = useState(null); // { stage, stage_name, progress, status, details }
+  const [vbiStages, setVbiStages] = useState([]); // History of completed stages for display
+  const vbiProgressTimeoutRef = useRef(null); // Auto-hide VBI progress after completion
+
   const typingTimeoutRef = useRef(null);
 
   const wsRef = useRef(null);
@@ -1441,6 +1447,58 @@ const JarvisVoice = () => {
         setIsProcessing(true);
         // Don't cancel speech here - it might cancel the wake word response
         break;
+
+      case 'vbi_progress':
+        // Handle real-time VBI (Voice Biometric Intelligence) progress updates
+        console.log('%c[VBI Progress]', 'color: #00bfff; font-weight: bold',
+          `${data.stage_name} (${data.progress}%) - ${data.status}`);
+
+        // Update VBI progress state
+        setVbiProgress({
+          stage: data.stage,
+          stageName: data.stage_name,
+          stageIcon: data.stage_icon,
+          progress: data.progress,
+          status: data.status,
+          details: data.details || {},
+          error: data.error,
+          traceId: data.trace_id,
+          timestamp: data.timestamp
+        });
+
+        // Add to stages history when a stage completes
+        if (data.status === 'success' || data.status === 'failed') {
+          setVbiStages(prevStages => {
+            // Avoid duplicates
+            if (prevStages.some(s => s.stage === data.stage)) {
+              return prevStages;
+            }
+            return [...prevStages, {
+              stage: data.stage,
+              stageName: data.stage_name,
+              stageIcon: data.stage_icon,
+              status: data.status,
+              progress: data.progress,
+              details: data.details || {},
+              error: data.error
+            }];
+          });
+        }
+
+        // Auto-clear progress after completion
+        if (data.stage === 'complete') {
+          // Clear any existing timeout
+          if (vbiProgressTimeoutRef.current) {
+            clearTimeout(vbiProgressTimeoutRef.current);
+          }
+          // Auto-hide after 5 seconds
+          vbiProgressTimeoutRef.current = setTimeout(() => {
+            setVbiProgress(null);
+            setVbiStages([]);
+          }, 5000);
+        }
+        break;
+
       case 'voice_unlock':
         // Handle voice unlock responses
         console.log('Voice unlock response received:', data);
@@ -3482,6 +3540,77 @@ const JarvisVoice = () => {
           onDismiss={() => setDetectedCommand(null)}
           autoDismiss={3000}
         />
+      )}
+
+      {/* VBI (Voice Biometric Intelligence) Progress Display - Real-time voice unlock visualization */}
+      {vbiProgress && (
+        <div className="vbi-progress-container">
+          <div className="vbi-progress-header">
+            <span className="vbi-icon">
+              {vbiProgress.stage === 'complete'
+                ? (vbiProgress.status === 'success' ? '🔓' : '🔒')
+                : '🔐'}
+            </span>
+            <span className="vbi-title">Voice Biometric Verification</span>
+            <span className="vbi-percentage">{vbiProgress.progress}%</span>
+          </div>
+
+          {/* Progress Bar */}
+          <div className="vbi-progress-bar-container">
+            <div
+              className={`vbi-progress-bar ${vbiProgress.status === 'failed' ? 'error' : ''}`}
+              style={{ width: `${vbiProgress.progress}%` }}
+            >
+              <div className="vbi-progress-glow"></div>
+            </div>
+          </div>
+
+          {/* Current Stage Display */}
+          <div className={`vbi-current-stage ${vbiProgress.status}`}>
+            <span className="vbi-stage-icon">
+              {vbiProgress.status === 'in_progress' ? '⏳' : vbiProgress.status === 'success' ? '✅' : '❌'}
+            </span>
+            <span className="vbi-stage-name">{vbiProgress.stageName}</span>
+            {vbiProgress.details?.message && (
+              <span className="vbi-stage-detail">{vbiProgress.details.message}</span>
+            )}
+          </div>
+
+          {/* Completed Stages Timeline */}
+          {vbiStages.length > 0 && (
+            <div className="vbi-stages-timeline">
+              {vbiStages.map((stage, idx) => (
+                <div key={idx} className={`vbi-timeline-stage ${stage.status}`}>
+                  <span className="vbi-timeline-dot"></span>
+                  <span className="vbi-timeline-name">{stage.stageName}</span>
+                  {stage.status === 'success' && stage.details?.confidence && (
+                    <span className="vbi-timeline-confidence">
+                      {(stage.details.confidence * 100).toFixed(1)}%
+                    </span>
+                  )}
+                  {stage.status === 'success' && stage.details?.speaker && (
+                    <span className="vbi-timeline-speaker">{stage.details.speaker}</span>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Result Display */}
+          {vbiProgress.stage === 'complete' && (
+            <div className={`vbi-result ${vbiProgress.status}`}>
+              {vbiProgress.status === 'success' ? (
+                <span className="vbi-result-text">
+                  Welcome, {vbiProgress.details?.speaker || 'User'} ({((vbiProgress.details?.confidence || 0) * 100).toFixed(1)}% confidence)
+                </span>
+              ) : (
+                <span className="vbi-result-text">
+                  Verification Failed: {vbiProgress.error || 'Unknown error'}
+                </span>
+              )}
+            </div>
+          )}
+        </div>
       )}
 
       {/* Simplified Status Indicator */}

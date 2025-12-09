@@ -1109,11 +1109,26 @@ class UnifiedWebSocketManager:
                         logger.info(f"[WS-VBI] Using VBI Pipeline Orchestrator for voice unlock")
                         try:
                             orchestrator = get_orchestrator()
+
+                            # Create progress callback to send real-time updates via WebSocket
+                            async def vbi_progress_callback(progress_data: dict):
+                                """Send VBI progress updates to frontend in real-time"""
+                                try:
+                                    if websocket:
+                                        await websocket.send_json(progress_data)
+                                        logger.debug(
+                                            f"[WS-VBI] Progress: {progress_data.get('stage_name', 'unknown')} "
+                                            f"({progress_data.get('progress', 0)}%) - {progress_data.get('status', '')}"
+                                        )
+                                except Exception as ws_err:
+                                    logger.warning(f"[WS-VBI] Failed to send progress update: {ws_err}")
+
                             vbi_result = await orchestrator.process_voice_unlock(
                                 command=command_text,
                                 audio_data=audio_data_received,
                                 sample_rate=sample_rate_received or 16000,
-                                mime_type=mime_type_received or "audio/webm"
+                                mime_type=mime_type_received or "audio/webm",
+                                progress_callback=vbi_progress_callback
                             )
 
                             # Get full trace data for frontend display

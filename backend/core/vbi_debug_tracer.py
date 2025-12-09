@@ -818,20 +818,60 @@ class VBIPipelineOrchestrator:
         command: str,
         audio_data: Optional[str] = None,
         sample_rate: int = 16000,
-        mime_type: str = "audio/webm"
+        mime_type: str = "audio/webm",
+        progress_callback: Optional[Callable[[Dict[str, Any]], Any]] = None
     ) -> Dict[str, Any]:
         """
-        Process a voice unlock request with full tracing
+        Process a voice unlock request with full tracing and real-time progress
 
         Args:
             command: The voice command text
             audio_data: Base64 encoded audio data
             sample_rate: Audio sample rate
             mime_type: Audio MIME type
+            progress_callback: Optional async callback for real-time progress updates
+                               Receives dict with: stage, progress, message, details
 
         Returns:
             Dict with response, success status, and trace info
         """
+        # VBI Pipeline Stages with progress percentages and display names
+        VBI_STAGES = {
+            "warmup": {"progress": 5, "name": "Warming Up", "icon": "fire"},
+            "audio_receive": {"progress": 15, "name": "Receiving Audio", "icon": "microphone"},
+            "audio_decode": {"progress": 25, "name": "Decoding Audio", "icon": "waveform"},
+            "audio_preprocess": {"progress": 40, "name": "Preprocessing", "icon": "filter"},
+            "ecapa_extract": {"progress": 60, "name": "Extracting Voiceprint", "icon": "fingerprint"},
+            "speaker_verify": {"progress": 75, "name": "Verifying Speaker", "icon": "user-check"},
+            "decision": {"progress": 85, "name": "Making Decision", "icon": "brain"},
+            "unlock_execute": {"progress": 95, "name": "Unlocking Screen", "icon": "unlock"},
+            "complete": {"progress": 100, "name": "Complete", "icon": "check-circle"},
+        }
+
+        async def send_progress(stage: str, status: str = "in_progress", details: Dict = None, error: str = None):
+            """Send progress update via callback if provided"""
+            if progress_callback:
+                stage_info = VBI_STAGES.get(stage, {"progress": 0, "name": stage, "icon": "cog"})
+                progress_data = {
+                    "type": "vbi_progress",
+                    "stage": stage,
+                    "stage_name": stage_info["name"],
+                    "stage_icon": stage_info["icon"],
+                    "progress": stage_info["progress"],
+                    "status": status,  # "in_progress", "success", "failed"
+                    "details": details or {},
+                    "error": error,
+                    "trace_id": trace_id if 'trace_id' in dir() else None,
+                    "timestamp": time.time()
+                }
+                try:
+                    if asyncio.iscoroutinefunction(progress_callback):
+                        await progress_callback(progress_data)
+                    else:
+                        progress_callback(progress_data)
+                except Exception as cb_err:
+                    logger.warning(f"[VBI-ORCH] Progress callback error: {cb_err}")
+
         # Start trace
         audio_size = len(audio_data) if audio_data else 0
         trace_id = self.tracer.start_trace(
@@ -853,18 +893,22 @@ class VBIPipelineOrchestrator:
         try:
             # Ensure ECAPA is ready
             if not self.prewarmer.is_warm:
+                await send_progress("warmup", "in_progress", {"message": "Initializing voice verification..."})
                 logger.warning(f"[VBI-ORCH] {trace_id} | ECAPA not warm, attempting warmup...")
                 warmup_result = await asyncio.wait_for(
                     self.prewarmer.warmup(),
                     timeout=self.timeouts["ecapa_extraction"]
                 )
                 if warmup_result.get("status") != "success":
+                    await send_progress("warmup", "failed", error="Warmup failed")
                     result["response"] = "Voice verification system is warming up. Please try again in a moment."
                     self.tracer.complete_trace(trace_id, VBIStatus.FAILED)
                     return result
+                await send_progress("warmup", "success", {"message": "System ready"})
 
             # Check if we have audio data
             if not audio_data:
+                await send_progress("audio_receive", "failed", error="No audio data")
                 async with self.tracer.trace_step(trace_id, VBIStage.AUDIO_RECEIVE) as step:
                     step.details["has_audio"] = False
                     logger.warning(f"[VBI-ORCH] {trace_id} | No audio data provided")
@@ -874,37 +918,60 @@ class VBIPipelineOrchestrator:
                 return result
 
             # Stage 1: Audio Receive
+            await send_progress("audio_receive", "in_progress", {"audio_size": audio_size})
             async with self.tracer.trace_step(trace_id, VBIStage.AUDIO_RECEIVE) as step:
                 step.details["has_audio"] = True
                 step.details["audio_size_bytes"] = audio_size
                 step.details["sample_rate"] = sample_rate
                 step.details["mime_type"] = mime_type
+            await send_progress("audio_receive", "success", {
+                "audio_size": audio_size,
+                "sample_rate": sample_rate,
+                "format": mime_type
+            })
 
             # Stage 2: Audio Decode
+            await send_progress("audio_decode", "in_progress", {"message": "Decoding audio stream..."})
             async with self.tracer.trace_step(trace_id, VBIStage.AUDIO_DECODE) as step:
                 decoded_audio = await asyncio.wait_for(
                     self._decode_audio(audio_data, mime_type),
                     timeout=self.timeouts["audio_processing"]
                 )
                 step.details["decoded_size"] = len(decoded_audio) if decoded_audio else 0
+            await send_progress("audio_decode", "success", {
+                "decoded_size": len(decoded_audio) if decoded_audio else 0
+            })
 
             # Stage 3: Audio Preprocess
+            await send_progress("audio_preprocess", "in_progress", {"message": "Enhancing audio quality..."})
             async with self.tracer.trace_step(trace_id, VBIStage.AUDIO_PREPROCESS) as step:
                 processed_audio = await asyncio.wait_for(
                     self._preprocess_audio(decoded_audio, sample_rate),
                     timeout=self.timeouts["audio_processing"]
                 )
                 step.details["processed_samples"] = len(processed_audio) if processed_audio else 0
+            await send_progress("audio_preprocess", "success", {
+                "samples": len(processed_audio) if processed_audio else 0
+            })
 
-            # Stage 4: ECAPA Embedding Extraction
+            # Stage 4: ECAPA Embedding Extraction (most important visual stage)
+            await send_progress("ecapa_extract", "in_progress", {
+                "message": "Extracting unique voiceprint...",
+                "model": "ECAPA-TDNN"
+            })
             async with self.tracer.trace_step(trace_id, VBIStage.ECAPA_EXTRACT) as step:
                 embedding = await asyncio.wait_for(
                     self._extract_embedding(processed_audio),
                     timeout=self.timeouts["ecapa_extraction"]
                 )
                 step.details["embedding_size"] = len(embedding) if embedding else 0
+            await send_progress("ecapa_extract", "success", {
+                "embedding_dimensions": len(embedding) if embedding else 0,
+                "model": "ECAPA-TDNN"
+            })
 
             # Stage 5: Speaker Verification
+            await send_progress("speaker_verify", "in_progress", {"message": "Comparing voiceprint to enrolled speakers..."})
             async with self.tracer.trace_step(trace_id, VBIStage.SPEAKER_VERIFY) as step:
                 verification = await asyncio.wait_for(
                     self._verify_speaker(embedding),
@@ -913,8 +980,14 @@ class VBIPipelineOrchestrator:
                 step.details["speaker_name"] = verification.get("speaker_name", "Unknown")
                 step.details["confidence"] = verification.get("confidence", 0.0)
                 step.details["is_verified"] = verification.get("is_verified", False)
+            await send_progress("speaker_verify", "success", {
+                "speaker": verification.get("speaker_name", "Unknown"),
+                "confidence": verification.get("confidence", 0.0),
+                "verified": verification.get("is_verified", False)
+            })
 
             # Stage 6: Decision
+            await send_progress("decision", "in_progress", {"message": "Analyzing verification results..."})
             async with self.tracer.trace_step(trace_id, VBIStage.DECISION) as step:
                 is_authorized = verification.get("is_verified", False)
                 confidence = verification.get("confidence", 0.0)
@@ -924,12 +997,27 @@ class VBIPipelineOrchestrator:
                 step.details["decision"] = "ALLOW" if is_authorized else "DENY"
 
             if not is_authorized:
+                await send_progress("decision", "failed", {
+                    "decision": "DENY",
+                    "confidence": confidence,
+                    "speaker": speaker_name
+                }, error=f"Voice not verified (confidence: {confidence:.1%})")
                 result["response"] = f"Voice verification failed. Confidence: {confidence:.1%}"
                 result["confidence"] = confidence
                 self.tracer.complete_trace(trace_id, VBIStatus.FAILED, confidence, speaker_name)
                 return result
 
+            await send_progress("decision", "success", {
+                "decision": "ALLOW",
+                "confidence": confidence,
+                "speaker": speaker_name
+            })
+
             # Stage 7: Unlock Execution
+            await send_progress("unlock_execute", "in_progress", {
+                "message": f"Unlocking screen for {speaker_name}...",
+                "speaker": speaker_name
+            })
             async with self.tracer.trace_step(trace_id, VBIStage.UNLOCK_EXECUTE) as step:
                 unlock_result = await asyncio.wait_for(
                     self._execute_unlock(speaker_name),
@@ -937,8 +1025,12 @@ class VBIPipelineOrchestrator:
                 )
                 step.details["unlock_success"] = unlock_result.get("success", False)
                 step.details["method"] = unlock_result.get("method", "unknown")
+            await send_progress("unlock_execute", "success", {
+                "unlocked": unlock_result.get("success", False),
+                "method": unlock_result.get("method", "unknown")
+            })
 
-            # Stage 8: Response Build
+            # Stage 8: Response Build (Complete!)
             async with self.tracer.trace_step(trace_id, VBIStage.RESPONSE_BUILD) as step:
                 response_text = f"Verified. Unlocking for you, {speaker_name}."
                 result["response"] = response_text
@@ -946,6 +1038,13 @@ class VBIPipelineOrchestrator:
                 result["speaker_name"] = speaker_name
                 result["confidence"] = confidence
                 step.details["response_length"] = len(response_text)
+
+            # Send completion progress
+            await send_progress("complete", "success", {
+                "speaker": speaker_name,
+                "confidence": confidence,
+                "message": response_text
+            })
 
             # Complete trace
             self.tracer.complete_trace(trace_id, VBIStatus.SUCCESS, confidence, speaker_name)

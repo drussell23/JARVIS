@@ -838,3 +838,312 @@ AudioQualityStatsDisplay {
     animation-iteration-count: 1 !important;
   }
 }
+
+/* ==================== VBI PROGRESS DISPLAY ==================== */
+/* Voice Biometric Intelligence - Real-time verification progress */
+
+.vbi-progress-container {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 90%;
+  max-width: 500px;
+  background: linear-gradient(135deg, rgba(10, 10, 30, 0.95), rgba(20, 30, 50, 0.95));
+  border: 2px solid #00bfff;
+  border-radius: 16px;
+  padding: 24px;
+  box-shadow:
+    0 0 40px rgba(0, 191, 255, 0.3),
+    0 0 80px rgba(0, 191, 255, 0.1),
+    inset 0 0 60px rgba(0, 191, 255, 0.05);
+  z-index: 9999;
+  animation: vbi-slide-in 0.3s ease-out;
+  backdrop-filter: blur(20px);
+}
+
+@keyframes vbi-slide-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, -45%);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, -50%);
+  }
+}
+
+.vbi-progress-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 20px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid rgba(0, 191, 255, 0.3);
+}
+
+.vbi-icon {
+  font-size: 2rem;
+  animation: vbi-pulse 2s ease-in-out infinite;
+}
+
+@keyframes vbi-pulse {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.1); }
+}
+
+.vbi-title {
+  flex: 1;
+  font-size: 1.2rem;
+  font-weight: 600;
+  color: #00bfff;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.vbi-percentage {
+  font-size: 1.5rem;
+  font-weight: bold;
+  color: #00ff88;
+  font-family: 'Courier New', monospace;
+  text-shadow: 0 0 10px rgba(0, 255, 136, 0.5);
+}
+
+/* Progress Bar */
+.vbi-progress-bar-container {
+  width: 100%;
+  height: 12px;
+  background: rgba(0, 0, 0, 0.4);
+  border-radius: 6px;
+  overflow: hidden;
+  margin-bottom: 20px;
+  border: 1px solid rgba(0, 191, 255, 0.2);
+}
+
+.vbi-progress-bar {
+  height: 100%;
+  background: linear-gradient(90deg, #00bfff, #00ff88, #00bfff);
+  background-size: 200% 100%;
+  border-radius: 6px;
+  transition: width 0.3s ease-out;
+  position: relative;
+  animation: vbi-shimmer 2s linear infinite;
+}
+
+@keyframes vbi-shimmer {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
+.vbi-progress-bar.error {
+  background: linear-gradient(90deg, #ff6b6b, #ff4444, #ff6b6b);
+}
+
+.vbi-progress-glow {
+  position: absolute;
+  right: 0;
+  top: 0;
+  width: 20px;
+  height: 100%;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.6));
+  animation: vbi-glow-move 1s ease-in-out infinite;
+}
+
+@keyframes vbi-glow-move {
+  0%, 100% { opacity: 0.5; }
+  50% { opacity: 1; }
+}
+
+/* Current Stage */
+.vbi-current-stage {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 16px;
+  background: rgba(0, 191, 255, 0.1);
+  border-radius: 8px;
+  margin-bottom: 16px;
+  border-left: 4px solid #00bfff;
+  transition: all 0.3s ease;
+}
+
+.vbi-current-stage.in_progress {
+  border-left-color: #ffa500;
+  background: rgba(255, 165, 0, 0.1);
+}
+
+.vbi-current-stage.success {
+  border-left-color: #00ff88;
+  background: rgba(0, 255, 136, 0.1);
+}
+
+.vbi-current-stage.failed {
+  border-left-color: #ff6b6b;
+  background: rgba(255, 107, 107, 0.1);
+}
+
+.vbi-stage-icon {
+  font-size: 1.3rem;
+}
+
+.vbi-stage-name {
+  font-size: 1rem;
+  font-weight: 500;
+  color: #fff;
+}
+
+.vbi-stage-detail {
+  font-size: 0.85rem;
+  color: rgba(255, 255, 255, 0.6);
+  margin-left: auto;
+  font-style: italic;
+}
+
+/* Timeline Stages */
+.vbi-stages-timeline {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 16px;
+  max-height: 200px;
+  overflow-y: auto;
+  padding-right: 8px;
+}
+
+.vbi-stages-timeline::-webkit-scrollbar {
+  width: 4px;
+}
+
+.vbi-stages-timeline::-webkit-scrollbar-track {
+  background: rgba(0, 0, 0, 0.2);
+  border-radius: 2px;
+}
+
+.vbi-stages-timeline::-webkit-scrollbar-thumb {
+  background: rgba(0, 191, 255, 0.5);
+  border-radius: 2px;
+}
+
+.vbi-timeline-stage {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  background: rgba(0, 0, 0, 0.2);
+  border-radius: 6px;
+  font-size: 0.9rem;
+  animation: vbi-stage-appear 0.3s ease-out;
+}
+
+@keyframes vbi-stage-appear {
+  from {
+    opacity: 0;
+    transform: translateX(-10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+.vbi-timeline-stage.success {
+  border-left: 3px solid #00ff88;
+}
+
+.vbi-timeline-stage.failed {
+  border-left: 3px solid #ff6b6b;
+}
+
+.vbi-timeline-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #00ff88;
+  box-shadow: 0 0 8px rgba(0, 255, 136, 0.5);
+}
+
+.vbi-timeline-stage.failed .vbi-timeline-dot {
+  background: #ff6b6b;
+  box-shadow: 0 0 8px rgba(255, 107, 107, 0.5);
+}
+
+.vbi-timeline-name {
+  flex: 1;
+  color: rgba(255, 255, 255, 0.8);
+}
+
+.vbi-timeline-confidence {
+  color: #00ff88;
+  font-weight: 600;
+  font-family: 'Courier New', monospace;
+}
+
+.vbi-timeline-speaker {
+  color: #00bfff;
+  font-weight: 500;
+  background: rgba(0, 191, 255, 0.2);
+  padding: 2px 8px;
+  border-radius: 4px;
+}
+
+/* Result Display */
+.vbi-result {
+  padding: 16px;
+  border-radius: 8px;
+  text-align: center;
+  animation: vbi-result-appear 0.5s ease-out;
+}
+
+@keyframes vbi-result-appear {
+  from {
+    opacity: 0;
+    transform: scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+.vbi-result.success {
+  background: linear-gradient(135deg, rgba(0, 255, 136, 0.2), rgba(0, 191, 255, 0.2));
+  border: 2px solid #00ff88;
+}
+
+.vbi-result.failed {
+  background: linear-gradient(135deg, rgba(255, 107, 107, 0.2), rgba(255, 68, 68, 0.2));
+  border: 2px solid #ff6b6b;
+}
+
+.vbi-result-text {
+  font-size: 1.1rem;
+  font-weight: 600;
+}
+
+.vbi-result.success .vbi-result-text {
+  color: #00ff88;
+}
+
+.vbi-result.failed .vbi-result-text {
+  color: #ff6b6b;
+}
+
+/* Mobile Responsiveness */
+@media (max-width: 600px) {
+  .vbi-progress-container {
+    width: 95%;
+    padding: 16px;
+  }
+
+  .vbi-title {
+    font-size: 1rem;
+  }
+
+  .vbi-percentage {
+    font-size: 1.2rem;
+  }
+
+  .vbi-stages-timeline {
+    max-height: 150px;
+  }
+}
