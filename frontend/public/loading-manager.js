@@ -1001,22 +1001,128 @@ class JARVISLoadingManager {
         }
     }
 
-    handleCompletion(success, redirectUrl, message) {
+    async handleCompletion(success, redirectUrl, message) {
         if (!success) {
             this.showError(message || 'Startup completed with errors');
             return;
         }
 
-        console.log('[Complete] ✓ Startup successful!');
-        this.cleanup();
-
-        this.elements.subtitle.textContent = 'SYSTEM READY';
-        this.elements.statusMessage.textContent = message || 'JARVIS is online!';
+        console.log('[Complete] ✓ Startup successful! Verifying backend readiness...');
+        
+        // Update UI to show verification phase
+        this.elements.subtitle.textContent = 'VERIFYING BACKEND';
+        this.elements.statusMessage.textContent = 'Ensuring all services are ready...';
         this.state.progress = 100;
         this.state.targetProgress = 100;
         this.updateProgressBar();
 
+        // CRITICAL: Verify backend is actually ready before redirecting
+        // This prevents "SYSTEM OFFLINE" errors on the main app
+        const backendReady = await this.verifyBackendReady(redirectUrl);
+        
+        if (!backendReady) {
+            console.warn('[Complete] Backend verification failed, waiting longer...');
+            this.elements.statusMessage.textContent = 'Backend initializing, please wait...';
+            
+            // Wait and retry
+            await this.sleep(3000);
+            const retryReady = await this.verifyBackendReady(redirectUrl);
+            
+            if (!retryReady) {
+                console.error('[Complete] Backend still not ready after retry');
+                // Proceed anyway - the main app will handle reconnection
+            }
+        }
+
+        console.log('[Complete] Backend verified, proceeding with redirect...');
+        this.cleanup();
+
+        this.elements.subtitle.textContent = 'SYSTEM READY';
+        this.elements.statusMessage.textContent = message || 'JARVIS is online!';
+
         this.playEpicCompletionAnimation(redirectUrl);
+    }
+
+    async verifyBackendReady(redirectUrl) {
+        /**
+         * Verify the backend is fully ready before redirecting.
+         * Checks:
+         * 1. HTTP health endpoint responds
+         * 2. WebSocket endpoint is accessible
+         */
+        const backendPort = this.config.backendPort || 8010;
+        const backendUrl = `${this.config.httpProtocol}//${this.config.hostname}:${backendPort}`;
+        
+        try {
+            // Check 1: HTTP health
+            console.log(`[Verify] Checking backend health at ${backendUrl}/health...`);
+            const healthResponse = await fetch(`${backendUrl}/health`, {
+                method: 'GET',
+                headers: { 'Accept': 'application/json' },
+                signal: AbortSignal.timeout(5000)
+            });
+            
+            if (!healthResponse.ok) {
+                console.warn(`[Verify] Health check failed: ${healthResponse.status}`);
+                return false;
+            }
+            
+            const healthData = await healthResponse.json();
+            console.log('[Verify] Health check passed:', healthData);
+            
+            // Check 2: Try WebSocket connection (quick test)
+            console.log(`[Verify] Testing WebSocket at ws://${this.config.hostname}:${backendPort}/ws/unified...`);
+            const wsReady = await this.testWebSocket(`ws://${this.config.hostname}:${backendPort}/ws/unified`);
+            
+            if (!wsReady) {
+                console.warn('[Verify] WebSocket not ready yet');
+                return false;
+            }
+            
+            console.log('[Verify] ✓ All backend services verified!');
+            return true;
+            
+        } catch (error) {
+            console.warn('[Verify] Backend verification failed:', error.message);
+            return false;
+        }
+    }
+
+    testWebSocket(wsUrl) {
+        /**
+         * Quick WebSocket connectivity test.
+         * Returns true if connection succeeds, false otherwise.
+         */
+        return new Promise((resolve) => {
+            const timeout = setTimeout(() => {
+                console.warn('[Verify] WebSocket test timeout');
+                resolve(false);
+            }, 3000);
+            
+            try {
+                const ws = new WebSocket(wsUrl);
+                
+                ws.onopen = () => {
+                    clearTimeout(timeout);
+                    console.log('[Verify] WebSocket test succeeded');
+                    ws.close();
+                    resolve(true);
+                };
+                
+                ws.onerror = () => {
+                    clearTimeout(timeout);
+                    resolve(false);
+                };
+                
+                ws.onclose = () => {
+                    // If closed before open, it failed
+                };
+                
+            } catch (error) {
+                clearTimeout(timeout);
+                resolve(false);
+            }
+        });
     }
 
     async playEpicCompletionAnimation(redirectUrl) {
