@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 # Port for loading server (separate from frontend:3000 and backend:8010)
 LOADING_SERVER_PORT = 3001
 
-# Global state for progress tracking
+# Global state for progress tracking with monotonic enforcement
 progress_state = {
     "stage": "init",
     "message": "Initializing...",
@@ -28,6 +28,9 @@ progress_state = {
     "timestamp": datetime.now().isoformat(),
     "metadata": {}
 }
+
+# Track the highest progress seen (for monotonic enforcement)
+max_progress_seen = 0
 
 # WebSocket connections
 active_connections = set()
@@ -120,20 +123,49 @@ async def update_progress_endpoint(request):
 
 
 async def update_progress(stage, message, progress, metadata=None):
-    """Update progress and broadcast to all connected clients"""
-    global progress_state
+    """
+    Update progress and broadcast to all connected clients.
+    
+    CRITICAL: Enforces monotonic progress - progress can only increase, never decrease.
+    This prevents UI jumpiness when backend stages complete in random order.
+    The loading server is the SINGLE SOURCE OF TRUTH for progress.
+    """
+    global progress_state, max_progress_seen
 
+    # Convert progress to float for comparison
+    try:
+        progress_value = float(progress) if progress is not None else 0
+    except (TypeError, ValueError):
+        progress_value = 0
+
+    # MONOTONIC PROGRESS ENFORCEMENT
+    # Progress can only increase (or stay the same), never decrease
+    # Exception: 'complete' stage always sets to 100
+    if stage == 'complete':
+        effective_progress = 100
+        max_progress_seen = 100
+    elif progress_value > max_progress_seen:
+        effective_progress = progress_value
+        max_progress_seen = progress_value
+    else:
+        # Progress would decrease - skip the progress update but still update stage/message
+        # This allows late-arriving stages to show their message without moving the bar backward
+        effective_progress = max_progress_seen
+        logger.debug(f"[Progress] Skipped backward: {progress_value}% -> kept at {max_progress_seen}% - {stage}: {message}")
+
+    # Always update stage and message (shows what's currently happening)
+    # But use the monotonic effective_progress for the progress bar
     progress_state = {
         "stage": stage,
         "message": message,
-        "progress": progress,
+        "progress": effective_progress,
         "timestamp": datetime.now().isoformat(),
     }
 
     if metadata:
         progress_state["metadata"] = metadata
 
-    logger.info(f"[Progress] {progress}% - {stage}: {message}")
+    logger.info(f"[Progress] {effective_progress}% - {stage}: {message}")
 
     # Broadcast to all WebSocket connections
     disconnected = set()
