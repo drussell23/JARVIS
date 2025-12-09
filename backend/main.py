@@ -427,7 +427,12 @@ async def parallel_import_components():
     }
 
     # Use thread pool for imports (ManagedThreadPoolExecutor for clean shutdown)
-    with _ImportExecutor(max_workers=4, name='parallel-imports') if THREAD_MANAGER_AVAILABLE else _ImportExecutor(max_workers=4) as executor:
+    # Note: ManagedThreadPoolExecutor supports 'name' param, fallback ThreadPoolExecutor uses 'thread_name_prefix'
+    if THREAD_MANAGER_AVAILABLE:
+        executor_instance = _ImportExecutor(max_workers=4, name='parallel-imports')
+    else:
+        executor_instance = _ImportExecutor(max_workers=4, thread_name_prefix='parallel-imports')
+    with executor_instance as executor:
         # Submit all import tasks
         futures = {name: executor.submit(func) for name, func in import_tasks.items()}
 
@@ -1042,7 +1047,7 @@ async def memory_pressure_callback(pressure_level: str):
         from core.platform_memory_monitor import get_memory_monitor
 
         memory_monitor = get_memory_monitor()
-        snapshot = memory_monitor.capture_snapshot()
+        snapshot = await memory_monitor.get_memory_pressure()
 
         # Determine if VM should be created based on memory pressure level
         should_create, reason, confidence = await gcp_vm_manager.should_create_vm(
@@ -3173,7 +3178,7 @@ try:
     _routes_before = len(app.routes)
     app.include_router(voice_unlock_router, tags=["voice_unlock"])
     _routes_after = len(app.routes)
-    _voice_routes = [r.path for r in app.routes if hasattr(r, 'path') and 'voice-unlock' in r.path]
+    _voice_routes = [getattr(r, 'path', '') for r in app.routes if hasattr(r, 'path') and 'voice-unlock' in getattr(r, 'path', '')]
     logger.info(f"✅ Voice Unlock API mounted at /api/voice-unlock (module level)")
     logger.info(f"   Routes before: {_routes_before}, after: {_routes_after}, voice-unlock: {len(_voice_routes)}")
     if _voice_routes:
@@ -3494,20 +3499,21 @@ async def hybrid_status():
             db = await get_learning_database()
 
             # Query for latest hybrid learning stats
-            async with db.db.cursor() as cursor:
-                await cursor.execute(
+            if db and db.db:
+                async with db.db.cursor() as cursor:
+                    await cursor.execute(
+                        """
+                        SELECT metadata
+                        FROM patterns
+                        WHERE pattern_type = 'hybrid_threshold'
+                        ORDER BY last_seen DESC
+                        LIMIT 1
                     """
-                    SELECT metadata
-                    FROM patterns
-                    WHERE pattern_type = 'hybrid_threshold'
-                    ORDER BY last_seen DESC
-                    LIMIT 1
-                """
-                )
-                result = await cursor.fetchone()
+                    )
+                    result = await cursor.fetchone()
 
-                if result and result[0]:
-                    metadata = json.loads(result[0])
+                    if result and len(result) > 0 and result[0]:
+                        metadata = json.loads(str(result[0]))
                     learned_params = {
                         "thresholds": metadata.get("thresholds", {}),
                         "confidence": metadata.get("confidence", {}),
@@ -3972,9 +3978,10 @@ def mount_routers():
                     from api.unified_websocket import ws_manager
 
                     monitor.set_websocket_manager(ws_manager)
-                    ws_manager.display_monitor = (
-                        monitor  # Allow ws_manager to send current status to new clients
-                    )
+                    if ws_manager is not None:
+                        ws_manager.display_monitor = (  # type: ignore[attr-defined]
+                            monitor  # Allow ws_manager to send current status to new clients
+                        )
                     logger.info("   ✅ Display monitor connected to WebSocket")
                 except Exception as ws_err:
                     logger.warning(f"   ⚠️ Could not connect display monitor to WebSocket: {ws_err}")
@@ -4041,7 +4048,7 @@ def mount_routers():
 
         if use_memory_optimized:
             # Import memory-optimized orchestrator
-            from backend.core.memory_optimized_orchestrator import get_memory_optimized_orchestrator
+            from core.memory_optimized_orchestrator import get_memory_optimized_orchestrator
 
             orchestrator = get_memory_optimized_orchestrator(
                 memory_limit_mb=400
@@ -4204,6 +4211,11 @@ async def ml_audio_websocket_compat(websocket: WebSocket):
         "ML Audio WebSocket connection (legacy endpoint) - providing enhanced compatibility"
     )
 
+    # Initialize variables that may be imported in try block
+    ws_manager = None
+    connection_capabilities: dict = {}
+    client_id: str = ""
+
     try:
         # Import unified handler and datetime
         from datetime import datetime
@@ -4239,7 +4251,8 @@ async def ml_audio_websocket_compat(websocket: WebSocket):
         await websocket.send_json(welcome_msg)
 
         # Add to unified connections with ML audio context
-        ws_manager.connections[client_id] = websocket
+        if ws_manager is not None and hasattr(ws_manager, 'connections'):
+            ws_manager.connections[client_id] = websocket
         connection_capabilities[client_id] = {"ml_audio_stream", "legacy_client"}
 
         # Track stream if ML state available
@@ -4265,15 +4278,19 @@ async def ml_audio_websocket_compat(websocket: WebSocket):
             }
 
             # Handle through unified manager
-            response = await ws_manager.handle_message(client_id, unified_msg)
+            if ws_manager is not None and hasattr(ws_manager, 'handle_message'):
+                response = await ws_manager.handle_message(client_id, unified_msg)
+            else:
+                response = {"status": "ok"}
 
             # Send response
             await websocket.send_json(response)
 
     except WebSocketDisconnect:
         logger.info("ML Audio WebSocket disconnected (legacy)")
-        if client_id in ws_manager.connections:
-            ws_manager.disconnect(client_id)
+        if ws_manager is not None and hasattr(ws_manager, 'connections') and client_id in ws_manager.connections:
+            if hasattr(ws_manager, 'disconnect'):
+                ws_manager.disconnect(client_id)
     except Exception as e:
         logger.error(f"ML Audio WebSocket error: {e}")
         try:
@@ -4406,7 +4423,7 @@ async def voice_jarvis_status():
 
 
 @app.post("/voice/jarvis/activate")
-async def voice_jarvis_activate(request: dict = None):
+async def voice_jarvis_activate(request: Optional[dict] = None):
     """Activate JARVIS voice system"""
     return {
         "status": "activated",
