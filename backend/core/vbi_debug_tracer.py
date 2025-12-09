@@ -434,6 +434,11 @@ class ECAPAPreWarmer:
 
         This should be called at startup to ensure ECAPA is ready
         before any unlock requests come in.
+
+        v1.1.0 Enhancement:
+        - Uses CloudECAPAClient's wait_for_ecapa_ready() for robust cold start handling
+        - Ensures ECAPA model is fully loaded before marking as warm
+        - No more "Processing..." hangs during first unlock
         """
         async with self._lock:
             if self.is_warm and not force:
@@ -447,8 +452,9 @@ class ECAPAPreWarmer:
                     }
 
             logger.info("=" * 70)
-            logger.info("[ECAPA-PREWARM] STARTING PRE-WARM SEQUENCE")
+            logger.info("[ECAPA-PREWARM] STARTING PRE-WARM SEQUENCE v1.1.0")
             logger.info("=" * 70)
+            logger.info("   Using enhanced CloudECAPAClient with wait_for_ecapa_ready")
 
             start_time = time.time()
             result = {"status": "unknown", "stages": []}
@@ -563,7 +569,90 @@ class ECAPAPreWarmer:
             return None
 
     async def _send_warmup_request(self, endpoint: str) -> Dict[str, Any]:
-        """Send warmup embedding request"""
+        """
+        Send warmup embedding request using CloudECAPAClient
+
+        v1.1.0 Enhancement:
+        - Uses CloudECAPAClient's wait_for_ecapa_ready() for robust cold start handling
+        - If Cloud Run is cold, waits for ECAPA model to load
+        - Uses semantic caching to avoid redundant model loads
+        """
+        try:
+            # Use the enhanced CloudECAPAClient instead of raw HTTP
+            from voice_unlock.cloud_ecapa_client import get_cloud_ecapa_client
+
+            client = await get_cloud_ecapa_client()
+            if not client:
+                raise Exception("CloudECAPAClient not available")
+
+            # Initialize the client if needed
+            if not client._initialized:
+                logger.info("[ECAPA-PREWARM] Initializing CloudECAPAClient...")
+                init_result = await client.initialize()
+                if not init_result.get("success", False):
+                    raise Exception(f"CloudECAPAClient init failed: {init_result.get('error')}")
+
+            # First, use wait_for_ecapa_ready() to ensure the Cloud Run ECAPA is ready
+            logger.info("[ECAPA-PREWARM] Checking if ECAPA model is ready...")
+            ready_result = await client.wait_for_ecapa_ready(
+                endpoint=endpoint,
+                timeout=120.0,  # 2 minute timeout for cold starts
+                poll_interval=3.0,  # Check every 3 seconds
+                log_progress=True
+            )
+
+            if not ready_result.get("ready"):
+                raise Exception(f"ECAPA not ready after waiting: {ready_result.get('error')}")
+
+            logger.info(f"[ECAPA-PREWARM] ✅ ECAPA model ready! (waited {ready_result.get('elapsed_seconds', 0):.1f}s)")
+
+            # Now extract a test embedding to fully warm up the model
+            import base64
+            import struct
+
+            # Decode the warmup audio from base64 to raw bytes
+            warmup_audio_bytes = base64.b64decode(self._warmup_audio)
+
+            # Convert 16-bit PCM to float32 for the client
+            num_samples = len(warmup_audio_bytes) // 2
+            pcm_samples = struct.unpack(f'{num_samples}h', warmup_audio_bytes)
+            float_samples = [s / 32768.0 for s in pcm_samples]  # Normalize to [-1, 1]
+            float_audio = struct.pack(f'{len(float_samples)}f', *float_samples)
+
+            logger.info("[ECAPA-PREWARM] Extracting warmup embedding...")
+            embedding = await client.extract_embedding(
+                audio_data=float_audio,
+                sample_rate=16000,
+                format="float32",
+                use_cache=False  # Don't cache warmup - we want to exercise the full path
+            )
+
+            if embedding is None:
+                raise Exception("Embedding extraction returned None")
+
+            embedding_list = embedding.tolist() if hasattr(embedding, 'tolist') else list(embedding)
+
+            logger.info(f"[ECAPA-PREWARM] ✅ Warmup embedding extracted: {len(embedding_list)} dimensions")
+
+            return {
+                "embedding": embedding_list,
+                "embedding_size": len(embedding_list),
+                "endpoint_path": "/api/ml/speaker_embedding",
+                "client_version": client.VERSION,
+                "cold_start_waited": ready_result.get("elapsed_seconds", 0) > 1.0
+            }
+
+        except ImportError as e:
+            logger.warning(f"[ECAPA-PREWARM] CloudECAPAClient not available, falling back to raw HTTP: {e}")
+            # Fallback to raw HTTP for backwards compatibility
+            return await self._send_warmup_request_raw(endpoint)
+
+        except Exception as e:
+            logger.error(f"[ECAPA-PREWARM] CloudECAPAClient warmup failed: {e}")
+            raise
+
+    async def _send_warmup_request_raw(self, endpoint: str) -> Dict[str, Any]:
+        """Fallback raw HTTP warmup request (if CloudECAPAClient not available)"""
         import aiohttp
 
         async with aiohttp.ClientSession() as session:
