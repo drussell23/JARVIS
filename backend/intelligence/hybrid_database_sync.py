@@ -1067,6 +1067,12 @@ class HybridDatabaseSync:
         self.cloudsql_healthy = False
         self.last_health_check = datetime.now()
 
+        # Startup mode: suppress CloudSQL warnings until proxy is confirmed ready
+        # This prevents noisy logs during early startup when proxy hasn't started yet
+        self._startup_mode = True
+        self._proxy_ready = False
+        self._startup_grace_period = 60  # seconds to wait before CloudSQL attempts
+
         # Metrics
         self.metrics = SyncMetrics()
 
@@ -1086,6 +1092,25 @@ class HybridDatabaseSync:
             and self.connection_manager.is_initialized
             and self.sqlite_conn is not None
         )
+
+    def set_proxy_ready(self, ready: bool = True):
+        """
+        Signal that the Cloud SQL proxy is ready for connections.
+        
+        Call this after the proxy has been started to enable CloudSQL
+        reconnection attempts in the health check loop.
+        """
+        self._proxy_ready = ready
+        self._startup_mode = not ready
+        if ready:
+            logger.info("✅ CloudSQL proxy marked as ready - enabling reconnection attempts")
+        else:
+            logger.info("⏸️  CloudSQL proxy marked as not ready - suppressing reconnection attempts")
+
+    @property
+    def is_proxy_ready(self) -> bool:
+        """Check if the Cloud SQL proxy has been signaled as ready."""
+        return self._proxy_ready
 
     async def initialize(self):
         """Initialize database connections and start background sync"""
@@ -1227,11 +1252,16 @@ class HybridDatabaseSync:
                             await conn.fetchval("SELECT 1")
 
                         self.circuit_breaker.record_success()
+                        self.cloudsql_healthy = True
                         self.metrics.cloudsql_available = True
                         self.metrics.circuit_state = self.circuit_breaker.get_state().value
                         logger.info("✅ CloudSQL connected via singleton manager")
                     except Exception as e:
-                        logger.warning(f"⚠️  CloudSQL test query failed: {e}")
+                        # Suppress warnings during startup mode (before proxy is ready)
+                        if self._startup_mode and not self._proxy_ready:
+                            logger.debug(f"⏳ CloudSQL test query skipped during startup: {e}")
+                        else:
+                            logger.warning(f"⚠️  CloudSQL test query failed: {e}")
                         self.circuit_breaker.record_failure()
                         self.metrics.cloudsql_available = False
             else:
@@ -1239,8 +1269,12 @@ class HybridDatabaseSync:
                 self.metrics.cloudsql_available = False
 
         except Exception as e:
-            logger.warning(f"⚠️  CloudSQL connection manager failed: {e}")
-            logger.info("📱 Using cache-first offline mode (will retry in background)")
+            # Suppress warnings during startup mode (before proxy is ready)
+            if self._startup_mode and not self._proxy_ready:
+                logger.debug(f"⏳ CloudSQL connection skipped during startup: {e}")
+            else:
+                logger.warning(f"⚠️  CloudSQL connection manager failed: {e}")
+                logger.info("📱 Using cache-first offline mode (will retry in background)")
             self.circuit_breaker.record_failure()
             self.metrics.cloudsql_available = False
 
@@ -1499,13 +1533,31 @@ class HybridDatabaseSync:
         - Auto-reconnects if connection lost
         - Warms cache on reconnection
         - Periodically refreshes cache (every 5 minutes if CloudSQL healthy)
+        - Suppresses warnings during startup until proxy is ready
         """
         last_cache_refresh = datetime.now()
         cache_refresh_interval = 300  # 5 minutes
+        startup_warning_logged = False
 
         while not self._shutdown:
             try:
                 await asyncio.sleep(10)  # Check every 10 seconds
+
+                # During startup mode, skip CloudSQL reconnection attempts
+                # This prevents noisy logs before the proxy is started
+                if self._startup_mode and not self._proxy_ready:
+                    # Check if we've exceeded the grace period
+                    elapsed = time.time() - self._start_time
+                    if elapsed < self._startup_grace_period:
+                        # Still in startup grace period - silently skip
+                        if not startup_warning_logged:
+                            logger.debug("⏳ Startup mode: waiting for CloudSQL proxy to be ready...")
+                            startup_warning_logged = True
+                        continue
+                    else:
+                        # Grace period exceeded - exit startup mode
+                        self._startup_mode = False
+                        logger.info("⏰ Startup grace period ended - CloudSQL reconnection attempts enabled")
 
                 # Skip if already healthy and recently checked
                 if self.cloudsql_healthy and (datetime.now() - self.last_health_check).seconds < 30:

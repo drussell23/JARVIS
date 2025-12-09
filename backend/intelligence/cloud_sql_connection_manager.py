@@ -604,6 +604,13 @@ class CloudSQLConnectionManager:
         self._on_leak_callbacks: List[Callable] = []
         self._on_error_callbacks: List[Callable] = []
 
+        # Startup mode: suppress connection errors until proxy is confirmed ready
+        # This prevents noisy logs during early startup when proxy hasn't started yet
+        self._startup_mode = True
+        self._proxy_ready = False
+        self._start_time = time.time()
+        self._startup_grace_period = 60  # seconds before logging connection errors
+
         self._register_shutdown_handlers()
         CloudSQLConnectionManager._initialized = True
         logger.info("🔧 CloudSQL Connection Manager v3.0 initialized")
@@ -1011,7 +1018,11 @@ class CloudSQLConnectionManager:
             yield conn
 
         except asyncio.TimeoutError:
-            logger.error("⏱️ Connection timeout - pool exhausted")
+            # Suppress timeout errors during startup mode (before proxy is ready)
+            if not self._should_suppress_error():
+                logger.error("⏱️ Connection timeout - pool exhausted")
+            else:
+                logger.debug("⏱️ Connection timeout during startup (proxy not ready yet)")
             self.error_count += 1
             self.metrics.total_timeouts += 1
             self.metrics.pool_exhaustion_count += 1
@@ -1025,8 +1036,12 @@ class CloudSQLConnectionManager:
             raise
 
         except Exception as e:
+            # Suppress connection errors during startup mode (before proxy is ready)
             if str(e) and str(e) != "0":
-                logger.error(f"❌ Connection error: {e}")
+                if not self._should_suppress_error():
+                    logger.error(f"❌ Connection error: {e}")
+                else:
+                    logger.debug(f"⏳ Connection error during startup (proxy not ready yet): {e}")
             self.error_count += 1
             self.metrics.total_errors += 1
             self.metrics.last_error = datetime.now()
@@ -1272,6 +1287,37 @@ class CloudSQLConnectionManager:
         """Reload configuration from environment variables."""
         self._conn_config.reload_from_env()
         logger.info("🔄 Configuration reloaded")
+
+    def set_proxy_ready(self, ready: bool = True) -> None:
+        """
+        Signal that the Cloud SQL proxy is ready for connections.
+        
+        Call this after the proxy has been started to enable connection
+        error logging. During startup mode, connection errors are suppressed
+        to avoid noisy logs before the proxy is ready.
+        """
+        self._proxy_ready = ready
+        self._startup_mode = not ready
+        if ready:
+            logger.info("✅ CloudSQL proxy marked as ready - connection error logging enabled")
+
+    @property
+    def is_proxy_ready(self) -> bool:
+        """Check if the Cloud SQL proxy has been signaled as ready."""
+        return self._proxy_ready
+
+    def _should_suppress_error(self) -> bool:
+        """Check if connection errors should be suppressed (during startup)."""
+        if not self._startup_mode:
+            return False
+        if self._proxy_ready:
+            return False
+        # Check if we've exceeded the grace period
+        elapsed = time.time() - self._start_time
+        if elapsed >= self._startup_grace_period:
+            self._startup_mode = False
+            return False
+        return True
 
 
 # =============================================================================

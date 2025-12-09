@@ -7433,6 +7433,27 @@ class AsyncSystemManager:
             self.cloud_sql_proxy_manager = proxy_manager
             print(f"{Colors.GREEN}   ✓ Proxy manager registered for lifecycle management{Colors.ENDC}")
 
+            # Signal that proxy is ready - enables CloudSQL connection attempts
+            # This stops the "Attempting CloudSQL reconnection" warnings during startup
+            try:
+                from intelligence.cloud_sql_connection_manager import get_connection_manager
+                from intelligence.hybrid_database_sync import HybridDatabaseSync
+                
+                # Signal connection manager
+                conn_manager = get_connection_manager()
+                conn_manager.set_proxy_ready(True)
+                
+                # Signal hybrid sync (if initialized via singleton)
+                try:
+                    if HybridDatabaseSync._instance is not None:
+                        HybridDatabaseSync._instance.set_proxy_ready(True)
+                except Exception:
+                    pass  # Hybrid sync may not be initialized yet
+                    
+                print(f"{Colors.GREEN}   ✓ CloudSQL modules notified - proxy ready{Colors.ENDC}")
+            except ImportError:
+                pass  # Modules not available
+
         except FileNotFoundError as e:
             print(f"{Colors.YELLOW}⚠️  Cloud SQL proxy not configured: {e}{Colors.ENDC}")
             print(f"{Colors.YELLOW}   Voice biometrics will use SQLite fallback{Colors.ENDC}")
