@@ -1062,6 +1062,24 @@ class JARVISLoadingManager {
         }
 
         console.log('[Complete] Backend verified, proceeding with redirect...');
+        
+        // CRITICAL: Persist backend readiness state for main app
+        // This prevents "CONNECTING TO BACKEND..." showing after loading completes
+        const backendPort = this.config.backendPort || 8010;
+        const backendUrl = `${this.config.httpProtocol}//${this.config.hostname}:${backendPort}`;
+        const wsUrl = `ws://${this.config.hostname}:${backendPort}`;
+        
+        try {
+            localStorage.setItem('jarvis_backend_verified', 'true');
+            localStorage.setItem('jarvis_backend_url', backendUrl);
+            localStorage.setItem('jarvis_backend_ws_url', wsUrl);
+            localStorage.setItem('jarvis_backend_verified_at', Date.now().toString());
+            localStorage.setItem('jarvis_backend_port', backendPort.toString());
+            console.log('[Complete] ✓ Backend readiness state persisted for main app');
+        } catch (e) {
+            console.warn('[Complete] Could not persist backend state:', e);
+        }
+        
         this.cleanup();
 
         this.elements.subtitle.textContent = 'SYSTEM READY';

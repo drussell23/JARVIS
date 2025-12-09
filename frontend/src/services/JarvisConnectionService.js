@@ -62,7 +62,6 @@ class JarvisConnectionService {
    */
   async _initialize() {
     console.log('[JarvisConnection] Initializing...');
-    this._setState(ConnectionState.DISCOVERING);
     
     // Listen for config service events
     configService.on('config-ready', (config) => this._handleConfigReady(config));
@@ -70,8 +69,102 @@ class JarvisConnectionService {
     configService.on('backend-ready', (state) => this._handleBackendReady(state));
     configService.on('discovery-failed', () => this._handleDiscoveryFailed());
     
-    // Start discovery
+    // FAST PATH: Check if backend was just verified by loading page
+    // This prevents "CONNECTING TO BACKEND..." showing after loading completes
+    const fastPathResult = await this._tryFastPathConnection();
+    if (fastPathResult) {
+      console.log('[JarvisConnection] ✅ Fast-path connection successful (backend was just verified)');
+      return;
+    }
+    
+    // Normal discovery flow
+    this._setState(ConnectionState.DISCOVERING);
     await this._discoverBackend();
+  }
+
+  /**
+   * Try fast-path connection using persisted backend state from loading page
+   * Returns true if successful, false if should fall back to normal discovery
+   */
+  async _tryFastPathConnection() {
+    try {
+      const backendVerified = localStorage.getItem('jarvis_backend_verified') === 'true';
+      const verifiedAt = parseInt(localStorage.getItem('jarvis_backend_verified_at') || '0');
+      const timeSinceVerification = Date.now() - verifiedAt;
+      
+      // Only use fast path if verified within last 30 seconds
+      const FAST_PATH_TIMEOUT = 30000;
+      
+      if (!backendVerified || timeSinceVerification > FAST_PATH_TIMEOUT) {
+        console.log('[JarvisConnection] Fast-path not available (not recently verified)');
+        return false;
+      }
+      
+      const backendUrl = localStorage.getItem('jarvis_backend_url');
+      const wsUrl = localStorage.getItem('jarvis_backend_ws_url');
+      const backendPort = localStorage.getItem('jarvis_backend_port');
+      
+      if (!backendUrl || !wsUrl) {
+        console.log('[JarvisConnection] Fast-path not available (missing URLs)');
+        return false;
+      }
+      
+      console.log(`[JarvisConnection] Fast-path: Backend was verified ${Math.round(timeSinceVerification / 1000)}s ago`);
+      console.log(`[JarvisConnection] Fast-path: Using ${backendUrl}`);
+      
+      // Set URLs directly (skip discovery)
+      this.backendUrl = backendUrl;
+      this.wsUrl = wsUrl;
+      
+      // DON'T set state to CONNECTING - that shows "CONNECTING TO BACKEND..."
+      // Instead, stay in INITIALIZING state during the quick verification
+      // The UI shows "INITIALIZING..." which is less jarring than "CONNECTING TO BACKEND..."
+      
+      // Quick health check (should be fast since backend was just verified)
+      const health = await this._checkBackendHealth();
+      if (!health.ok) {
+        console.warn('[JarvisConnection] Fast-path health check failed, falling back to discovery');
+        this._clearFastPathState();
+        return false;
+      }
+      
+      // Update backend mode
+      this.backendMode = health.mode || 'full';
+      
+      // Initialize WebSocket client
+      await this._initializeWebSocket();
+      
+      // Start health monitoring
+      this._startHealthMonitoring();
+      
+      // Go directly to ONLINE (skipping CONNECTING state entirely)
+      this._setState(ConnectionState.ONLINE);
+      this.consecutiveFailures = 0;
+      
+      // Clear fast-path state (one-time use)
+      this._clearFastPathState();
+      
+      console.log(`[JarvisConnection] ✅ Fast-path connected to backend (${this.backendMode} mode)`);
+      return true;
+      
+    } catch (error) {
+      console.warn('[JarvisConnection] Fast-path failed:', error.message);
+      this._clearFastPathState();
+      return false;
+    }
+  }
+
+  /**
+   * Clear fast-path state from localStorage
+   */
+  _clearFastPathState() {
+    try {
+      localStorage.removeItem('jarvis_backend_verified');
+      localStorage.removeItem('jarvis_backend_verified_at');
+      // Keep jarvis_backend_url and jarvis_backend_ws_url for fallback
+    } catch (e) {
+      // Ignore
+    }
   }
 
   /**
