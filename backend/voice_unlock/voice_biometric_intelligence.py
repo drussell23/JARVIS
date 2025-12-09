@@ -2129,7 +2129,78 @@ class VoiceBiometricIntelligence:
             return None
 
     async def _extract_embedding_fast(self, audio_data: bytes) -> Optional[Any]:
-        """Extract embedding using fastest available method (quantized if available)."""
+        """
+        Extract embedding using fastest available method with cloud fallback (v5.0.0).
+        
+        Priority order:
+        1. Local quantized encoder (fastest if available)
+        2. Local standard encoder (via registry)
+        3. Cloud ECAPA service (GCP Cloud Run fallback)
+        
+        Features:
+        - Timeout protection (prevents event loop blocking)
+        - Automatic cloud fallback on local failure
+        - Memory pressure detection for smart routing
+        """
+        import os
+        
+        # Get configuration
+        local_timeout = float(os.getenv('VBI_LOCAL_EXTRACTION_TIMEOUT', '5.0'))
+        use_cloud_fallback = os.getenv('VBI_CLOUD_FALLBACK', 'true').lower() == 'true'
+        
+        # Check memory pressure - skip local if RAM is low
+        skip_local = False
+        try:
+            import psutil
+            available_gb = psutil.virtual_memory().available / (1024**3)
+            memory_threshold = float(os.getenv('VBI_MEMORY_THRESHOLD_GB', '3.0'))
+            
+            if available_gb < memory_threshold:
+                logger.info(f"⚠️ Low RAM ({available_gb:.1f}GB) - skipping local extraction")
+                skip_local = True
+                self._stats['cloud_routing_memory_pressure'] = self._stats.get('cloud_routing_memory_pressure', 0) + 1
+        except Exception:
+            pass
+        
+        # Try local extraction first (unless skipped due to memory)
+        if not skip_local:
+            try:
+                embedding = await asyncio.wait_for(
+                    self._extract_embedding_local(audio_data),
+                    timeout=local_timeout
+                )
+                
+                if embedding is not None:
+                    self._stats['local_extractions'] = self._stats.get('local_extractions', 0) + 1
+                    return embedding
+                    
+            except asyncio.TimeoutError:
+                logger.warning(f"⏱️ Local extraction timed out after {local_timeout}s")
+                self._stats['local_timeouts'] = self._stats.get('local_timeouts', 0) + 1
+                
+            except Exception as e:
+                logger.debug(f"Local extraction failed: {e}")
+                self._stats['local_failures'] = self._stats.get('local_failures', 0) + 1
+        
+        # Cloud fallback
+        if use_cloud_fallback:
+            try:
+                logger.info("🌐 Attempting cloud ECAPA extraction...")
+                embedding = await self._extract_embedding_cloud(audio_data)
+                
+                if embedding is not None:
+                    self._stats['cloud_extractions'] = self._stats.get('cloud_extractions', 0) + 1
+                    logger.info("✅ Cloud extraction successful")
+                    return embedding
+                    
+            except Exception as e:
+                logger.warning(f"Cloud extraction failed: {e}")
+                self._stats['cloud_failures'] = self._stats.get('cloud_failures', 0) + 1
+        
+        return None
+
+    async def _extract_embedding_local(self, audio_data: bytes) -> Optional[Any]:
+        """Extract embedding using local encoder (thread-pooled)."""
         try:
             import torch
             import numpy as np
@@ -2151,28 +2222,19 @@ class VoiceBiometricIntelligence:
                 return None
 
             def _extract_sync():
-                """
-                Run blocking PyTorch operations in thread pool.
-
-                Uses captured encoder reference to prevent null pointer access
-                if encoder is unloaded during extraction.
-                """
-                # SAFETY: Check encoder reference is still valid
+                """Run blocking PyTorch operations in thread pool."""
                 if encoder is None:
                     raise RuntimeError("Encoder reference became None during extraction")
 
-                # Convert audio bytes to tensor
                 audio_array = np.frombuffer(audio_data, dtype=np.float32)
                 audio_tensor = torch.tensor(audio_array).unsqueeze(0)
 
-                # Extract embedding using captured reference
                 with torch.no_grad():
                     embedding = encoder.encode_batch(audio_tensor)
 
-                # CRITICAL: Return a copy to avoid memory issues when tensor is GC'd
                 return embedding.squeeze().detach().clone().cpu().numpy().copy()
 
-            # CRITICAL FIX: Run blocking PyTorch in thread pool to avoid blocking event loop
+            # Run in thread pool to avoid blocking event loop
             embedding = await asyncio.to_thread(_extract_sync)
 
             if self._quantization_available:
@@ -2181,8 +2243,61 @@ class VoiceBiometricIntelligence:
             return embedding
 
         except Exception as e:
-            logger.debug(f"Fast embedding extraction failed: {e}")
+            logger.debug(f"Local embedding extraction failed: {e}")
             return None
+
+    async def _extract_embedding_cloud(self, audio_data: bytes) -> Optional[Any]:
+        """Extract embedding using cloud ECAPA service (GCP Cloud Run)."""
+        import os
+        import base64
+        
+        try:
+            # Try to use existing cloud ECAPA client
+            try:
+                from voice_unlock.cloud_ecapa_client import get_cloud_ecapa_client
+                client = await get_cloud_ecapa_client()
+                
+                if client and client.is_available():
+                    result = await client.extract_embedding(audio_data)
+                    if result and 'embedding' in result:
+                        import numpy as np
+                        embedding = np.array(result['embedding'])
+                        return embedding
+            except ImportError:
+                pass
+            
+            # Fallback: Direct HTTP call to Cloud Run
+            cloud_run_url = os.getenv(
+                'ECAPA_CLOUD_RUN_URL',
+                'https://jarvis-ml-888774109345.us-central1.run.app'
+            )
+            
+            import aiohttp
+            
+            # Encode audio for transmission
+            audio_b64 = base64.b64encode(audio_data).decode('utf-8')
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{cloud_run_url}/api/ml/speaker_embedding",
+                    json={
+                        "audio_data": audio_b64,
+                        "sample_rate": 16000
+                    },
+                    timeout=aiohttp.ClientTimeout(total=10.0)
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if 'embedding' in data:
+                            import numpy as np
+                            return np.array(data['embedding'])
+                    else:
+                        logger.warning(f"Cloud ECAPA returned {resp.status}")
+                        
+        except Exception as e:
+            logger.debug(f"Cloud embedding extraction failed: {e}")
+            
+        return None
 
     def _start_speculative_unlock(self, context: Optional[Dict[str, Any]]):
         """Start unlock preparation speculatively (will be confirmed later)."""
