@@ -429,9 +429,9 @@ async def parallel_import_components():
     # Use thread pool for imports (ManagedThreadPoolExecutor for clean shutdown)
     # Note: ManagedThreadPoolExecutor supports 'name' param, fallback ThreadPoolExecutor uses 'thread_name_prefix'
     if THREAD_MANAGER_AVAILABLE:
-        executor_instance = _ImportExecutor(max_workers=4, name='parallel-imports')
+        executor_instance = ManagedThreadPoolExecutor(max_workers=4, name='parallel-imports')
     else:
-        executor_instance = _ImportExecutor(max_workers=4, thread_name_prefix='parallel-imports')
+        executor_instance = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix='parallel-imports')
     with executor_instance as executor:
         # Submit all import tasks
         futures = {name: executor.submit(func) for name, func in import_tasks.items()}
@@ -505,7 +505,7 @@ def import_memory_system():
         from memory.memory_api import MemoryAPI
         from memory.memory_manager import ComponentPriority, M1MemoryManager
 
-        memory["manager_class"] = M1MemoryManager
+        memory["manager_class"] = M1MemoryManager  # type: ignore
         memory["priority"] = ComponentPriority
         memory["api"] = MemoryAPI
         memory["available"] = True
@@ -3512,8 +3512,10 @@ async def hybrid_status():
                     )
                     result = await cursor.fetchone()
 
-                    if result and len(result) > 0 and result[0]:
-                        metadata = json.loads(str(result[0]))
+                    if result and len(result) > 0:
+                        row_data = result[0] if isinstance(result, (list, tuple)) else result  # type: ignore[index]
+                        if row_data:
+                            metadata = json.loads(str(row_data))
                     learned_params = {
                         "thresholds": metadata.get("thresholds", {}),
                         "confidence": metadata.get("confidence", {}),
@@ -3888,7 +3890,7 @@ def mount_routers():
 
         # Fallback to individual WebSocket APIs if unified not available
         try:
-            from api.vision_websocket import router as vision_ws_router
+            from api.vision_websocket import router as vision_ws_router  # type: ignore[attr-defined]
 
             app.include_router(vision_ws_router, prefix="/vision", tags=["vision"])
             logger.info("✅ Vision WebSocket API mounted (fallback)")
@@ -3954,7 +3956,7 @@ def mount_routers():
 
                 # Connect Vision Navigator with Claude Vision analyzer
                 try:
-                    from display.vision_ui_navigator import get_vision_navigator
+                    from display.vision_ui_navigator import get_vision_navigator  # type: ignore[attr-defined]
 
                     navigator = get_vision_navigator()
 
@@ -4048,7 +4050,7 @@ def mount_routers():
 
         if use_memory_optimized:
             # Import memory-optimized orchestrator
-            from core.memory_optimized_orchestrator import get_memory_optimized_orchestrator
+            from core.memory_optimized_orchestrator import get_memory_optimized_orchestrator  # type: ignore[import-not-found]
 
             orchestrator = get_memory_optimized_orchestrator(
                 memory_limit_mb=400
@@ -4279,7 +4281,7 @@ async def ml_audio_websocket_compat(websocket: WebSocket):
 
             # Handle through unified manager
             if ws_manager is not None and hasattr(ws_manager, 'handle_message'):
-                response = await ws_manager.handle_message(client_id, unified_msg)
+                response = await ws_manager.handle_message(client_id, unified_msg)  # type: ignore[misc]
             else:
                 response = {"status": "ok"}
 
