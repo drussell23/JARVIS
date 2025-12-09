@@ -1099,10 +1099,16 @@ class UnifiedWebSocketManager:
                         logger.info(f"   MIME Type: {mime_type_received}")
                     logger.info("=" * 70)
 
-                    # Check if this is a voice unlock command
-                    is_unlock_command = any(
-                        keyword in command_text.lower()
-                        for keyword in ["unlock", "lock my screen", "screen unlock", "voice unlock"]
+                    # Check if this is a voice UNLOCK command (requires VBI verification)
+                    # NOTE: "lock my screen" is NOT an unlock command - it's a lock command!
+                    # Only UNLOCK commands need voice biometric verification
+                    command_lower = command_text.lower()
+                    is_unlock_command = (
+                        "unlock" in command_lower and 
+                        "lock" not in command_lower.replace("unlock", "")  # Ensure it's not just "lock"
+                    ) or any(
+                        keyword in command_lower
+                        for keyword in ["screen unlock", "voice unlock", "unlock my screen", "unlock screen"]
                     )
 
                     if is_unlock_command and audio_data_received and VBI_TRACER_AVAILABLE:
