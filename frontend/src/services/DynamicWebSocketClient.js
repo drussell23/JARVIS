@@ -134,7 +134,7 @@ class DynamicWebSocketClient {
     const baseUrl = window.location.origin.replace('http', 'ws');
     const commonPaths = [
       '/ws', '/websocket', '/socket', '/live',
-      '/vision/ws/vision', '/voice/ws', '/automation/ws',
+      '/vision/ws/vision', '/voice/jarvis/stream', '/automation/ws',
       '/api/ws', '/stream', '/realtime'
     ];
     

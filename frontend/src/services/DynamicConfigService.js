@@ -62,7 +62,7 @@ class DynamicConfigService {
         identifiers: ['jarvis', 'api', 'backend', 'fastapi', 'status', 'ok']
       },
       websocket: {
-        endpoints: ['/ws', '/voice/jarvis/ws', '/vision/ws'],
+        endpoints: ['/ws', '/voice/jarvis/stream', '/vision/ws'],
         identifiers: ['websocket', 'ws', 'realtime']
       }
     };

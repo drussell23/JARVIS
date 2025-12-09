@@ -189,28 +189,30 @@ class JarvisConnectionService {
       });
       
       // Set up endpoints manually
+      // Note: The main unified WebSocket is at /ws (handles all capabilities)
+      // JARVIS voice streaming is at /voice/jarvis/stream
       this.wsClient.endpoints = [
         {
-          path: `${this.wsUrl}/voice/jarvis/ws`,
-          capabilities: ['voice', 'command', 'jarvis'],
+          path: `${this.wsUrl}/ws`,
+          capabilities: ['voice', 'command', 'jarvis', 'general'],
           priority: 10
+        },
+        {
+          path: `${this.wsUrl}/voice/jarvis/stream`,
+          capabilities: ['voice', 'command', 'jarvis'],
+          priority: 9
         },
         {
           path: `${this.wsUrl}/vision/ws`,
           capabilities: ['vision', 'monitoring', 'analysis'],
-          priority: 9
-        },
-        {
-          path: `${this.wsUrl}/ws`,
-          capabilities: ['general'],
-          priority: 5
+          priority: 8
         }
       ];
     }
     
-    // Connect to main JARVIS endpoint
+    // Connect to unified WebSocket endpoint (handles all communication)
     try {
-      await this.wsClient.connect(`${this.wsUrl}/voice/jarvis/ws`);
+      await this.wsClient.connect(`${this.wsUrl}/ws`);
       
       // Set up message handlers
       this.wsClient.on('*', (data, endpoint) => {
