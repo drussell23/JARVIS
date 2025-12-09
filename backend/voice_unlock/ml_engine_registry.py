@@ -2272,6 +2272,68 @@ class MLEngineRegistry:
         self._use_cloud = False
         return True
 
+    async def activate_cloud_routing(self) -> bool:
+        """
+        Public method to activate cloud routing for ML operations.
+        
+        Called by process_cleanup_manager during memory pressure to offload
+        heavy ML models to GCP Cloud Run.
+        
+        Returns:
+            True if cloud routing was successfully activated
+        """
+        logger.info("☁️  [PUBLIC] activate_cloud_routing called by cleanup manager")
+        return await self._activate_cloud_routing()
+
+    async def unload_local_models(self) -> int:
+        """
+        Unload local ML models to free memory.
+        
+        Called by process_cleanup_manager during high memory pressure
+        to free RAM by releasing locally loaded models.
+        
+        Returns:
+            Number of models unloaded
+        """
+        unloaded_count = 0
+        
+        try:
+            logger.info("☁️  [UNLOAD] Starting local model unload...")
+            
+            for engine_name, wrapper in list(self._engines.items()):
+                if wrapper.engine is not None:
+                    try:
+                        # Clear the engine reference
+                        engine_type = type(wrapper.engine).__name__
+                        wrapper.engine = None
+                        wrapper.last_used = None
+                        unloaded_count += 1
+                        logger.info(f"☁️  [UNLOAD] Unloaded {engine_name} ({engine_type})")
+                    except Exception as e:
+                        logger.warning(f"☁️  [UNLOAD] Failed to unload {engine_name}: {e}")
+            
+            # Force garbage collection to actually free memory
+            import gc
+            gc.collect()
+            
+            # If using PyTorch, clear CUDA cache (safe to call even if not using CUDA)
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                # Also clear MPS cache on Apple Silicon
+                if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                    torch.mps.empty_cache()
+            except Exception:
+                pass  # PyTorch not available or no GPU
+            
+            logger.info(f"☁️  [UNLOAD] Unloaded {unloaded_count} local models, GC completed")
+            
+        except Exception as e:
+            logger.error(f"☁️  [UNLOAD] Error during model unload: {e}")
+        
+        return unloaded_count
+
 
 # =============================================================================
 # GLOBAL ACCESS FUNCTIONS
