@@ -485,6 +485,40 @@
             background: var(--jarvis-red);
         }
 
+        /* New status states for loading progress */
+        .status-indicator.starting,
+        .status-indicator.loading {
+            background: var(--jarvis-orange);
+        }
+
+        .status-indicator.initializing,
+        .status-indicator.verifying {
+            background: var(--jarvis-blue, #00a8ff);
+            animation: blink 1s infinite;
+        }
+
+        .status-indicator.finalizing {
+            background: var(--jarvis-green);
+            animation: blink 0.5s infinite;
+        }
+
+        .status-indicator.ready {
+            background: var(--jarvis-green);
+            animation: none;
+            box-shadow: 0 0 10px var(--jarvis-green);
+        }
+
+        .status-indicator.waiting,
+        .status-indicator.warning {
+            background: var(--jarvis-orange);
+            animation: blink 0.8s infinite;
+        }
+
+        .status-indicator.error {
+            background: var(--jarvis-red);
+            animation: none;
+        }
+
         @keyframes blink {
             0%, 100% { opacity: 1; }
             50% { opacity: 0.3; }

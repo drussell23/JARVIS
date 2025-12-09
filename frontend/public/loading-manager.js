@@ -803,6 +803,21 @@ class JARVISLoadingManager {
         }
         if (message) this.state.message = message;
 
+        // Update status text based on stage/progress
+        if (stage === 'ready' || stage === 'complete') {
+            this.updateStatusText('Backend ready', 'ready');
+        } else if (stage === 'failed') {
+            this.updateStatusText('Startup failed', 'error');
+        } else if (stage === 'starting' || effectiveProgress < 30) {
+            this.updateStatusText('Starting backend...', 'starting');
+        } else if (effectiveProgress >= 30 && effectiveProgress < 70) {
+            this.updateStatusText('Loading components...', 'loading');
+        } else if (effectiveProgress >= 70 && effectiveProgress < 95) {
+            this.updateStatusText('Initializing services...', 'initializing');
+        } else if (effectiveProgress >= 95) {
+            this.updateStatusText('Almost ready...', 'finalizing');
+        }
+
         // Extract metadata
         if (metadata) {
             if (metadata.memory_available_gb !== undefined) {
@@ -999,11 +1014,20 @@ class JARVISLoadingManager {
             this.elements.statusText.textContent = text;
             this.elements.statusText.className = `status-text ${status}`;
         }
+        
+        // Also update the status indicator visual if it exists
+        const statusIndicator = document.getElementById('status-indicator');
+        if (statusIndicator) {
+            statusIndicator.className = `status-indicator ${status}`;
+        }
+        
+        console.log(`[Status] ${text} (${status})`);
     }
 
     async handleCompletion(success, redirectUrl, message) {
         if (!success) {
             this.showError(message || 'Startup completed with errors');
+            this.updateStatusText('Startup failed', 'error');
             return;
         }
 
@@ -1012,6 +1036,7 @@ class JARVISLoadingManager {
         // Update UI to show verification phase
         this.elements.subtitle.textContent = 'VERIFYING BACKEND';
         this.elements.statusMessage.textContent = 'Ensuring all services are ready...';
+        this.updateStatusText('Verifying backend...', 'verifying');
         this.state.progress = 100;
         this.state.targetProgress = 100;
         this.updateProgressBar();
@@ -1023,6 +1048,7 @@ class JARVISLoadingManager {
         if (!backendReady) {
             console.warn('[Complete] Backend verification failed, waiting longer...');
             this.elements.statusMessage.textContent = 'Backend initializing, please wait...';
+            this.updateStatusText('Waiting for backend...', 'waiting');
             
             // Wait and retry
             await this.sleep(3000);
@@ -1030,6 +1056,7 @@ class JARVISLoadingManager {
             
             if (!retryReady) {
                 console.error('[Complete] Backend still not ready after retry');
+                this.updateStatusText('Backend slow, proceeding...', 'warning');
                 // Proceed anyway - the main app will handle reconnection
             }
         }
@@ -1039,6 +1066,7 @@ class JARVISLoadingManager {
 
         this.elements.subtitle.textContent = 'SYSTEM READY';
         this.elements.statusMessage.textContent = message || 'JARVIS is online!';
+        this.updateStatusText('System ready', 'ready');
 
         this.playEpicCompletionAnimation(redirectUrl);
     }
@@ -1053,6 +1081,8 @@ class JARVISLoadingManager {
         const backendPort = this.config.backendPort || 8010;
         const backendUrl = `${this.config.httpProtocol}//${this.config.hostname}:${backendPort}`;
         
+        this.updateStatusText('Checking health...', 'verifying');
+        
         try {
             // Check 1: HTTP health
             console.log(`[Verify] Checking backend health at ${backendUrl}/health...`);
@@ -1064,26 +1094,32 @@ class JARVISLoadingManager {
             
             if (!healthResponse.ok) {
                 console.warn(`[Verify] Health check failed: ${healthResponse.status}`);
+                this.updateStatusText('Health check failed', 'warning');
                 return false;
             }
             
             const healthData = await healthResponse.json();
             console.log('[Verify] Health check passed:', healthData);
+            this.updateStatusText('Testing WebSocket...', 'verifying');
             
             // Check 2: Try WebSocket connection (quick test)
-            console.log(`[Verify] Testing WebSocket at ws://${this.config.hostname}:${backendPort}/ws/unified...`);
-            const wsReady = await this.testWebSocket(`ws://${this.config.hostname}:${backendPort}/ws/unified`);
+            // Use /ws which is the unified WebSocket endpoint
+            console.log(`[Verify] Testing WebSocket at ws://${this.config.hostname}:${backendPort}/ws...`);
+            const wsReady = await this.testWebSocket(`ws://${this.config.hostname}:${backendPort}/ws`);
             
             if (!wsReady) {
                 console.warn('[Verify] WebSocket not ready yet');
+                this.updateStatusText('WebSocket not ready', 'warning');
                 return false;
             }
             
             console.log('[Verify] ✓ All backend services verified!');
+            this.updateStatusText('Backend ready', 'ready');
             return true;
             
         } catch (error) {
             console.warn('[Verify] Backend verification failed:', error.message);
+            this.updateStatusText('Verification failed', 'warning');
             return false;
         }
     }
