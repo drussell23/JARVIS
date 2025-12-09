@@ -1,7 +1,14 @@
 /**
- * JARVIS Advanced Loading Manager v4.0
+ * JARVIS Advanced Loading Manager v4.1
  * 
- * Synchronized with start_system.py --restart backend stages
+ * ARCHITECTURE: Display-only client that trusts start_system.py as authority
+ * 
+ * Flow: start_system.py → loading_server.py → loading-manager.js (here)
+ * 
+ * This component does NOT independently verify system readiness.
+ * It displays progress received from the loading server and redirects
+ * when told to. start_system.py is responsible for verifying frontend
+ * is ready before sending "complete".
  *
  * Features:
  * - Smooth 1-100% progress with real-time updates
@@ -10,9 +17,9 @@
  * - Cloud ECAPA pre-warming status
  * - Memory-aware mode selection display
  * - Recent speaker cache initialization
- * - Robust error handling with automatic retry
  * - WebSocket + HTTP polling fallback
  * - Epic cinematic completion animation
+ * - Quick sanity check before redirect (safety net only)
  */
 
 class JARVISLoadingManager {
@@ -526,11 +533,12 @@ class JARVISLoadingManager {
     }
 
     async init() {
-        console.log('[JARVIS] Loading Manager v4.0 starting...');
+        console.log('[JARVIS] Loading Manager v4.1 starting...');
         console.log(`[Config] Loading server: ${this.config.hostname}:${this.config.loadingServerPort}`);
+        console.log('[Mode] DISPLAY - trusts start_system.py as authority');
 
-        // QUICK CHECK: Only skip loading screen if BOTH backend AND frontend are ready
-        // This prevents premature redirect when backend is up but frontend isn't
+        // Quick check: Skip loading if system already fully ready
+        // This handles page refresh when JARVIS is already running
         const fullyReady = await this.checkFullSystemReady();
         if (fullyReady) {
             console.log('[JARVIS] ✅ Full system already ready - skipping loading screen');
@@ -542,14 +550,14 @@ class JARVISLoadingManager {
         this.createDetailedStatusPanel();
         this.startSmoothProgress();
 
-        // Connect to loading server (port 3001)
+        // Connect to loading server (port 3001) - this is our PRIMARY source
+        // start_system.py → loading_server.py → here
         await this.connectWebSocket();
         this.startPolling();
         this.startHealthMonitoring();
         
-        // Start backend health polling as a fallback (less aggressive)
-        // Only triggers completion after multiple consecutive healthy checks
-        this.startBackendHealthPolling();
+        // NOTE: No independent health polling - we trust the loading server
+        // The loading server has a watchdog for edge cases
     }
 
     async checkBackendHealth() {
@@ -1106,47 +1114,26 @@ class JARVISLoadingManager {
             return;
         }
 
-        console.log('[Complete] ✓ Startup successful! Verifying system readiness...');
+        console.log('[Complete] ✓ Received completion from authority (start_system.py)');
         
-        // Update UI to show verification phase
-        this.elements.subtitle.textContent = 'VERIFYING SYSTEM';
-        this.elements.statusMessage.textContent = 'Ensuring all services are ready...';
-        this.updateStatusText('Verifying system...', 'verifying');
+        // Update UI to show completion
+        this.elements.subtitle.textContent = 'SYSTEM READY';
+        this.elements.statusMessage.textContent = message || 'JARVIS is online!';
+        this.updateStatusText('System ready', 'ready');
         this.state.progress = 100;
         this.state.targetProgress = 100;
         this.updateProgressBar();
 
-        // CRITICAL: Verify FULL system (backend + frontend) before redirecting
-        // This prevents "SYSTEM OFFLINE" errors on the main app
-        const maxRetries = 10;
-        let retryCount = 0;
-        let systemReady = false;
-        
-        while (retryCount < maxRetries && !systemReady) {
-            systemReady = await this.verifyBackendReady(redirectUrl);
-            
-            if (!systemReady) {
-                retryCount++;
-                const waitTime = Math.min(2000 + (retryCount * 500), 5000); // Increase wait time with retries
-                console.warn(`[Complete] System not ready (attempt ${retryCount}/${maxRetries}), waiting ${waitTime}ms...`);
-                
-                // Update UI with retry status
-                this.elements.statusMessage.textContent = `Waiting for services... (${retryCount}/${maxRetries})`;
-                this.updateStatusText(`Retry ${retryCount}/${maxRetries}...`, 'waiting');
-                
-                await this.sleep(waitTime);
-            }
-        }
-        
-        if (!systemReady) {
-            console.error('[Complete] System still not ready after max retries');
-            this.updateStatusText('System slow, proceeding...', 'warning');
-            this.elements.statusMessage.textContent = 'Services may still be starting...';
-            // Give one final pause before proceeding
+        // Quick sanity check - just verify frontend is reachable before redirect
+        // We trust start_system.py already verified this, this is just a safety net
+        const frontendOk = await this.checkFrontendReady();
+        if (!frontendOk) {
+            console.warn('[Complete] Frontend sanity check failed, brief wait...');
+            this.elements.statusMessage.textContent = 'Finalizing...';
             await this.sleep(2000);
         }
 
-        console.log('[Complete] System verified, proceeding with redirect...');
+        console.log('[Complete] Proceeding with redirect...');
         
         // CRITICAL: Persist backend readiness state for main app
         // This prevents "CONNECTING TO BACKEND..." showing after loading completes

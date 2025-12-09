@@ -152,78 +152,79 @@ async def check_full_system_health():
     return True, "Full system ready (backend + frontend)"
 
 
-async def backend_readiness_monitor():
+async def system_health_watchdog():
     """
-    Background task to monitor FULL SYSTEM readiness (backend + frontend).
+    WATCHDOG (not authority): Only kicks in if start_system.py fails to send updates.
     
-    ROOT FIX: This monitor now checks BOTH backend AND frontend before
-    triggering completion. Previously it only checked backend, causing
-    the loading page to redirect before the frontend was ready.
+    ARCHITECTURE:
+    - start_system.py is the SINGLE SOURCE OF TRUTH for progress
+    - loading_server.py is a RELAY that passes through progress
+    - This watchdog is a FALLBACK that only activates after extended silence
+    
+    The watchdog does NOT compete with start_system.py. It only acts if:
+    1. No progress updates received for 60+ seconds AND
+    2. System appears to be ready (both backend + frontend responding)
+    
+    This handles edge cases like start_system.py crashing after starting services.
     """
     global progress_state, max_progress_seen
     
-    logger.info("[Monitor] Starting system readiness monitor (backend + frontend)...")
+    logger.info("[Watchdog] Started (fallback only - start_system.py is authority)")
     
-    backend_ready_logged = False
+    # Wait before starting - give start_system.py time to take control
+    await asyncio.sleep(30)
+    
+    last_progress_time = time.time()
+    silence_threshold = 60  # Only act after 60 seconds of silence
     
     while True:
         try:
-            # First check if backend is ready
-            backend_ready, backend_reason = await check_backend_health()
+            # Check if we've received updates recently
+            current_progress = progress_state.get("progress", 0)
             
-            if backend_ready and not backend_ready_logged:
-                logger.info(f"[Monitor] Backend ready: {backend_reason}")
-                backend_ready_logged = True
+            # If progress is updating, reset the silence timer
+            if current_progress > 0:
+                last_progress_time = time.time()
+            
+            # Only intervene if:
+            # 1. Extended silence (no updates for 60+ seconds)
+            # 2. Not already complete
+            # 3. System appears ready
+            time_since_update = time.time() - last_progress_time
+            
+            if time_since_update > silence_threshold and max_progress_seen < 100:
+                logger.warning(f"[Watchdog] No progress updates for {int(time_since_update)}s, checking system...")
                 
-                # Update progress to show we're waiting for frontend
-                if max_progress_seen < 98:
-                    await update_progress(
-                        "finalizing",
-                        "Backend ready, waiting for frontend...",
-                        98,
-                        {
-                            "backend_ready": True,
-                            "frontend_ready": False,
-                            "icon": "⏳",
-                            "label": "Finalizing",
-                            "sublabel": "Frontend starting..."
-                        }
-                    )
-            
-            if not backend_ready:
-                logger.debug(f"[Monitor] Backend not ready: {backend_reason}")
-                await asyncio.sleep(1)
-                continue
-            
-            # Backend is ready - now check frontend
-            frontend_ready, frontend_reason = await check_frontend_health()
-            
-            if frontend_ready:
-                logger.info(f"[Monitor] Full system ready: Backend + Frontend")
+                # Check if system is actually ready
+                backend_ok, _ = await check_backend_health()
+                frontend_ok, _ = await check_frontend_health()
                 
-                # NOW we can safely trigger completion
-                if max_progress_seen < 100:
+                if backend_ok and frontend_ok:
+                    logger.info("[Watchdog] System ready but start_system.py silent - triggering completion")
                     await update_progress(
                         "complete",
-                        "JARVIS is online - All systems operational",
+                        "JARVIS is online (watchdog recovery)",
                         100,
                         {
                             "success": True,
                             "redirect_url": f"http://localhost:{FRONTEND_PORT}",
                             "backend_ready": True,
-                            "frontend_ready": True
+                            "frontend_ready": True,
+                            "watchdog_triggered": True
                         }
                     )
-                break
-            else:
-                logger.debug(f"[Monitor] Frontend not ready: {frontend_reason}")
-                
+                    break
+                elif backend_ok:
+                    logger.debug("[Watchdog] Backend ready, waiting for frontend...")
+                else:
+                    logger.debug("[Watchdog] System not ready yet")
+                    
         except Exception as e:
-            logger.debug(f"[Monitor] Check failed: {e}")
+            logger.debug(f"[Watchdog] Check failed: {e}")
         
-        await asyncio.sleep(1)  # Check every second
+        await asyncio.sleep(5)  # Check every 5 seconds (not aggressive)
     
-    logger.info("[Monitor] System readiness monitor stopped")
+    logger.info("[Watchdog] Stopped")
 
 
 async def serve_loading_page(request):
@@ -412,14 +413,15 @@ async def start_server(host='0.0.0.0', port=LOADING_SERVER_PORT):
     site = web.TCPSite(runner, host, port)
     await site.start()
 
-    logger.info(f"✅ Loading server v2.1 started on http://{host}:{port}")
+    logger.info(f"✅ Loading server v2.2 started on http://{host}:{port}")
     logger.info(f"   WebSocket: ws://{host}:{port}/ws/startup-progress")
     logger.info(f"   HTTP API: http://{host}:{port}/api/startup-progress")
     logger.info(f"   CORS: Enabled for all origins")
+    logger.info(f"   Mode: RELAY (start_system.py is authority)")
     
-    # Start system readiness monitor (checks BOTH backend AND frontend)
-    backend_check_task = asyncio.create_task(backend_readiness_monitor())
-    logger.info(f"   System Monitor: Started (backend:{BACKEND_PORT} + frontend:{FRONTEND_PORT})")
+    # Start watchdog as FALLBACK only (not competing with start_system.py)
+    backend_check_task = asyncio.create_task(system_health_watchdog())
+    logger.info(f"   Watchdog: Fallback after 60s silence")
     
     return runner
 
