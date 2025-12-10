@@ -195,33 +195,39 @@ class VoiceUnlockMetricsMonitor:
         self._log_session_summary()
 
     async def _cleanup_orphaned_processes(self):
-        """Clean up orphaned DB Browser processes from previous --restart"""
+        """
+        Handle DB Browser from previous session on --restart.
+        
+        IMPORTANT: We NO LONGER close DB Browser on restart!
+        If it's already open, we reuse it. This prevents annoying close/reopen cycles.
+        We only clean up the PID file to ensure accurate tracking.
+        """
         try:
-            # Check if we have a stale PID file from previous run
+            # Check if we have a PID file from previous run
             if self.pid_file.exists():
                 try:
                     with open(self.pid_file, 'r') as f:
                         old_pid = int(f.read().strip())
 
-                    # Check if this PID still exists
+                    # Check if this PID still exists and is DB Browser
                     if psutil.pid_exists(old_pid):
                         try:
                             proc = psutil.Process(old_pid)
                             # Verify it's actually DB Browser
                             if proc.name() and 'DB Browser' in proc.name():
-                                logger.info(f"🧹 Found orphaned DB Browser from previous session (PID: {old_pid})")
-                                logger.info("   Cleaning up for fresh restart...")
-                                proc.terminate()
-                                try:
-                                    proc.wait(timeout=3)
-                                except psutil.TimeoutExpired:
-                                    proc.kill()
-                                logger.info("   ✅ Orphaned process cleaned up")
+                                # DON'T close it! Mark it as already running instead
+                                logger.info(f"✅ DB Browser from previous session still running (PID: {old_pid})")
+                                logger.info("   Keeping it open (no close/reopen on restart)")
+                                self.db_browser_already_running = True
+                                self.db_browser_pid = old_pid
+                                # Keep the PID file since the process is still valid
+                                return  # Don't delete PID file, process is still valid
                         except (psutil.NoSuchProcess, psutil.AccessDenied):
                             pass
 
-                    # Remove stale PID file
+                    # Process doesn't exist anymore - remove stale PID file
                     self.pid_file.unlink()
+                    logger.debug("Removed stale PID file (process no longer exists)")
 
                 except (ValueError, FileNotFoundError):
                     # Invalid PID file - just remove it
@@ -349,9 +355,20 @@ class VoiceUnlockMetricsMonitor:
             return None
 
     async def _launch_db_browser(self):
-        """Launch DB Browser for SQLite (with duplicate detection and smart handling)"""
+        """
+        Launch DB Browser for SQLite with intelligent handling.
+        
+        Behavior:
+        - If already running: Reuse existing instance (no close/reopen)
+        - If not running: Launch in FULL SCREEN for optimal viewing
+        """
         try:
-            # First, check if DB Browser is already running with our database
+            # Skip if we already detected it running during cleanup phase
+            if self.db_browser_already_running:
+                logger.info(f"✅ DB Browser already running (PID: {self.db_browser_pid}) - reusing")
+                return
+
+            # Check if DB Browser is already running with our database
             existing_pid = self._is_db_browser_running()
             if existing_pid:
                 logger.info(f"✅ DB Browser already running (PID: {existing_pid})")
@@ -381,7 +398,7 @@ class VoiceUnlockMetricsMonitor:
                 return
 
             # Launch DB Browser with the database
-            logger.info("🚀 Launching DB Browser for SQLite...")
+            logger.info("🚀 Launching DB Browser for SQLite in FULL SCREEN...")
 
             # Use 'open' command to launch in background
             self.db_browser_process = subprocess.Popen(
@@ -405,6 +422,9 @@ class VoiceUnlockMetricsMonitor:
                         f.write(str(new_pid))
                 except Exception as e:
                     logger.debug(f"Could not save PID file: {e}")
+                
+                # Make it FULL SCREEN using AppleScript
+                await self._make_db_browser_fullscreen()
             else:
                 logger.info("✅ DB Browser launched successfully")
 
@@ -417,6 +437,61 @@ class VoiceUnlockMetricsMonitor:
             logger.warning(f"Could not auto-launch DB Browser: {e}")
             logger.info("💡 You can manually open it with:")
             logger.info(f"   open -a 'DB Browser for SQLite' {self.db_path}")
+    
+    async def _make_db_browser_fullscreen(self):
+        """
+        Make DB Browser window full screen using AppleScript.
+        
+        This provides optimal viewing of the metrics database.
+        Uses native macOS full-screen (green button) for a clean experience.
+        """
+        try:
+            # AppleScript to make DB Browser full screen
+            # Uses System Events to trigger full screen (same as clicking green button)
+            applescript = '''
+            tell application "System Events"
+                -- Wait for DB Browser to be ready
+                repeat 10 times
+                    if exists process "DB Browser for SQLite" then
+                        exit repeat
+                    end if
+                    delay 0.2
+                end repeat
+                
+                tell process "DB Browser for SQLite"
+                    set frontmost to true
+                    delay 0.3
+                    
+                    -- Try to enter full screen via menu
+                    try
+                        -- View > Enter Full Screen (or similar)
+                        click menu item "Enter Full Screen" of menu "View" of menu bar 1
+                    on error
+                        -- Fallback: Use keyboard shortcut Ctrl+Cmd+F
+                        keystroke "f" using {control down, command down}
+                    end try
+                end tell
+            end tell
+            '''
+            
+            process = await asyncio.create_subprocess_exec(
+                'osascript', '-e', applescript,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=5)
+            
+            if process.returncode == 0:
+                logger.info("🖥️  DB Browser set to FULL SCREEN")
+            else:
+                # Non-critical - window still opens, just not full screen
+                logger.debug(f"Full screen note: {stderr.decode() if stderr else 'timeout'}")
+                
+        except asyncio.TimeoutError:
+            logger.debug("Full screen command timed out (window still opens)")
+        except Exception as e:
+            logger.debug(f"Could not set full screen: {e}")
 
     async def _monitor_loop(self):
         """Main monitoring loop - watches for new unlock attempts"""
