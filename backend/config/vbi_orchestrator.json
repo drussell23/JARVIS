@@ -1,0 +1,137 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "VBI Parallel Orchestrator Configuration v3.0.0 - Zero Hardcoding",
+  
+  "version": "3.0.0",
+  "description": "Dynamic configuration for Parallel VBI Pipeline Orchestrator",
+  
+  "pipeline": {
+    "total_timeout_seconds": 30.0,
+    "stage_default_timeout_seconds": 10.0,
+    "parallel_batch_timeout_seconds": 15.0,
+    "max_concurrent_stages": 5,
+    "enable_parallel_stages": true
+  },
+  
+  "stage_timeouts": {
+    "audio_decode": 2.0,
+    "audio_preprocess": 3.0,
+    "embedding_extraction": 15.0,
+    "speaker_verification": 5.0,
+    "anti_spoofing": 5.0,
+    "behavioral_analysis": 3.0,
+    "decision_fusion": 1.0,
+    "physics_verification": 3.0,
+    "drift_detection": 2.0
+  },
+  
+  "circuit_breaker": {
+    "failure_threshold": 5,
+    "recovery_timeout_seconds": 30.0,
+    "half_open_max_calls": 3,
+    "adaptive_thresholds": true
+  },
+  
+  "retry": {
+    "max_retries": 3,
+    "base_delay_seconds": 0.5,
+    "max_delay_seconds": 5.0,
+    "jitter_factor": 0.25,
+    "exponential_base": 2.0
+  },
+  
+  "verification_thresholds": {
+    "verification_threshold": 0.40,
+    "high_confidence_threshold": 0.85,
+    "early_exit_threshold": 0.95,
+    "spoofing_threshold": 0.70,
+    "borderline_low": 0.35,
+    "borderline_high": 0.65
+  },
+  
+  "fusion_weights": {
+    "embedding": 0.50,
+    "anti_spoofing": 0.30,
+    "behavioral": 0.15,
+    "physics": 0.05,
+    "$comment": "Weights must sum to 1.0"
+  },
+  
+  "resource_monitoring": {
+    "enabled": true,
+    "memory_pressure_threshold_gb": 3.0,
+    "cpu_pressure_threshold_percent": 80,
+    "check_interval_seconds": 5.0
+  },
+  
+  "progress_updates": {
+    "enabled": true,
+    "update_interval_ms": 100,
+    "include_details": true,
+    "websocket_broadcast": true
+  },
+  
+  "self_healing": {
+    "enabled": true,
+    "health_check_interval_seconds": 30.0,
+    "auto_recover": true,
+    "max_recovery_attempts": 3
+  },
+  
+  "fallback": {
+    "enabled": true,
+    "timeout_multiplier": 1.5,
+    "enable_local_fallback": true,
+    "local_ram_threshold_gb": 6.0
+  },
+  
+  "cloud_first": {
+    "enabled": true,
+    "primary_endpoint": "https://jarvis-ml-888774109345.us-central1.run.app",
+    "fallback_endpoints": [
+      "https://jarvis-ml-backup.us-central1.run.app"
+    ],
+    "health_check_timeout_seconds": 2.0,
+    "extraction_timeout_seconds": 3.0
+  },
+  
+  "stage_categories": {
+    "preprocessing": {
+      "description": "Must run sequentially first",
+      "stages": ["audio_decode", "audio_preprocess"]
+    },
+    "extraction": {
+      "description": "Can run in parallel",
+      "stages": ["embedding_extraction"]
+    },
+    "verification": {
+      "description": "Can run in parallel with extraction",
+      "stages": ["speaker_verification"]
+    },
+    "analysis": {
+      "description": "Can run in parallel with verification",
+      "stages": ["anti_spoofing", "behavioral_analysis", "physics_verification"]
+    },
+    "fusion": {
+      "description": "Requires all previous results",
+      "stages": ["decision_fusion"]
+    }
+  },
+  
+  "telemetry": {
+    "enabled": true,
+    "log_level": "INFO",
+    "trace_sampling_rate": 1.0,
+    "metrics_export_interval_seconds": 60.0
+  },
+  
+  "behavioral_analysis": {
+    "typical_hours_start": 6,
+    "typical_hours_end": 24,
+    "morning_boost_hours": [6, 7, 8, 9, 10],
+    "morning_boost_value": 0.10,
+    "evening_hours": [18, 19, 20, 21, 22],
+    "evening_boost_value": 0.05,
+    "late_night_penalty": -0.10
+  }
+}

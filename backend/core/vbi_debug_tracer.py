@@ -1886,3 +1886,163 @@ async def prewarm_vbi_at_startup():
     else:
         logger.error(f"[VBI-STARTUP]  Pre-warm failed: {result}")
         return False
+
+
+# =============================================================================
+# PARALLEL ORCHESTRATOR INTEGRATION
+# =============================================================================
+
+async def process_voice_unlock_parallel(
+    command: str,
+    audio_data: Optional[bytes] = None,
+    sample_rate: int = 16000,
+    progress_callback: Optional[Callable[[Dict[str, Any]], Any]] = None,
+    use_parallel: bool = True,
+) -> Dict[str, Any]:
+    """
+    Process voice unlock using the parallel VBI orchestrator.
+    
+    This is the recommended entry point for voice unlock operations.
+    Uses the new ParallelVBIOrchestrator for faster, more robust verification.
+    
+    Args:
+        command: Voice command text
+        audio_data: Raw audio bytes (can be base64 encoded string)
+        sample_rate: Audio sample rate (default 16000)
+        progress_callback: Optional callback for progress updates
+        use_parallel: Use parallel orchestrator (default True)
+    
+    Returns:
+        Dict with verification result and pipeline metadata
+    """
+    if not audio_data:
+        return {
+            "success": False,
+            "response": "No audio data provided",
+            "error": "missing_audio",
+        }
+    
+    # Convert base64 if needed
+    if isinstance(audio_data, str):
+        import base64
+        audio_data = base64.b64decode(audio_data)
+    
+    if use_parallel:
+        try:
+            from core.vbi_parallel_integration import verify_voice_with_progress
+            
+            result = await verify_voice_with_progress(
+                audio_data=audio_data,
+                context={
+                    "sample_rate": sample_rate,
+                    "command": command,
+                },
+                speak=False,
+                progress_callback=progress_callback,
+            )
+            
+            return {
+                "success": result.verified,
+                "response": result.announcement,
+                "speaker_name": result.speaker_name,
+                "confidence": result.confidence,
+                "verification_method": result.verification_method.value,
+                "verification_time_ms": result.verification_time_ms,
+                "stages_completed": result.stages_completed,
+                "stages_failed": result.stages_failed,
+                "stage_results": result.stage_results,
+                "decision_factors": result.decision_factors,
+                "warnings": result.warnings,
+            }
+            
+        except ImportError as e:
+            logger.warning(f"Parallel orchestrator not available: {e}, falling back to legacy")
+        except Exception as e:
+            logger.warning(f"Parallel orchestrator failed: {e}, falling back to legacy")
+    
+    # Fallback to legacy orchestrator
+    orchestrator = get_orchestrator()
+    
+    # Encode audio for legacy orchestrator
+    import base64
+    audio_b64 = base64.b64encode(audio_data).decode('utf-8')
+    
+    return await orchestrator.process_voice_unlock(
+        command=command,
+        audio_data=audio_b64,
+        sample_rate=sample_rate,
+        progress_callback=progress_callback,
+    )
+
+
+async def get_vbi_diagnostics() -> Dict[str, Any]:
+    """
+    Get comprehensive VBI diagnostics from all subsystems.
+    
+    Returns:
+        Dict with health status, stats, and configuration from:
+        - Legacy VBI Pipeline Orchestrator
+        - Parallel VBI Orchestrator
+        - ECAPA Pre-warmer
+        - Debug Tracer
+    """
+    diagnostics = {
+        "timestamp": datetime.now().isoformat(),
+        "components": {},
+    }
+    
+    # Legacy orchestrator
+    try:
+        orchestrator = get_orchestrator()
+        diagnostics["components"]["legacy_orchestrator"] = orchestrator.get_diagnostics()
+    except Exception as e:
+        diagnostics["components"]["legacy_orchestrator"] = {"error": str(e)}
+    
+    # Parallel orchestrator
+    try:
+        from core.parallel_vbi_orchestrator import get_parallel_vbi_orchestrator
+        parallel = await get_parallel_vbi_orchestrator()
+        diagnostics["components"]["parallel_orchestrator"] = {
+            "health": parallel.get_health(),
+            "stats": parallel.get_stats(),
+        }
+    except Exception as e:
+        diagnostics["components"]["parallel_orchestrator"] = {"error": str(e)}
+    
+    # Pre-warmer
+    try:
+        prewarmer = get_prewarmer()
+        diagnostics["components"]["ecapa_prewarmer"] = prewarmer.get_status()
+    except Exception as e:
+        diagnostics["components"]["ecapa_prewarmer"] = {"error": str(e)}
+    
+    # Debug tracer
+    try:
+        tracer = get_tracer()
+        diagnostics["components"]["debug_tracer"] = tracer.get_performance_stats()
+    except Exception as e:
+        diagnostics["components"]["debug_tracer"] = {"error": str(e)}
+    
+    # VBI Health Monitor
+    try:
+        from core.vbi_health_monitor import get_vbi_health_monitor
+        monitor = await get_vbi_health_monitor()
+        diagnostics["components"]["health_monitor"] = await monitor.get_system_health()
+    except Exception as e:
+        diagnostics["components"]["health_monitor"] = {"error": str(e)}
+    
+    # Overall health determination
+    overall_health = "healthy"
+    for component, data in diagnostics["components"].items():
+        if isinstance(data, dict):
+            if data.get("error"):
+                overall_health = "degraded"
+            elif data.get("health", {}).get("status") == "critical":
+                overall_health = "critical"
+                break
+            elif data.get("health", {}).get("status") == "degraded":
+                overall_health = "degraded"
+    
+    diagnostics["overall_health"] = overall_health
+    
+    return diagnostics
