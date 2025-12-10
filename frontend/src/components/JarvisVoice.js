@@ -1047,19 +1047,15 @@ const JarvisVoice = () => {
     };
   }, [jarvisStatus]);
 
-  // Separate effect for auto-activation
+  // Separate effect for auto-activation and wake word setup
   useEffect(() => {
-    if (jarvisStatus === 'offline' || jarvisStatus === null) {
-      const timer = setTimeout(() => {
-        console.log('Auto-activating JARVIS for seamless experience');
-        activateJarvis();
-      }, 2000);
-      return () => clearTimeout(timer);
-    } else if (jarvisStatus === 'online' && !continuousListening) {
+    // Don't auto-activate when offline/reconnecting - connection service handles that
+    // Only enable wake word when actually online
+    if (jarvisStatus === 'online' && !continuousListening) {
       // Enable wake word detection when JARVIS comes online
       console.log('JARVIS online, enabling wake word detection');
       // Small delay to ensure speech recognition is initialized
-      setTimeout(() => {
+      const timer = setTimeout(() => {
         if (recognitionRef.current) {
           enableContinuousListening();
         } else {
@@ -1068,6 +1064,7 @@ const JarvisVoice = () => {
           setTimeout(() => enableContinuousListening(), 1000);
         }
       }, 1000);
+      return () => clearTimeout(timer);
     }
   }, [jarvisStatus, continuousListening]);
 
@@ -3756,9 +3753,11 @@ const JarvisVoice = () => {
           ) : jarvisStatus === 'activating' || jarvisStatus === 'initializing' ? (
             <>INITIALIZING...</>
           ) : jarvisStatus === 'connecting' ? (
-            <>CONNECTING TO BACKEND...</>
+            <>CONNECTING...</>
+          ) : jarvisStatus === 'reconnecting' ? (
+            <>RECONNECTING...</>
           ) : jarvisStatus === 'offline' ? (
-            <>SYSTEM OFFLINE - START BACKEND</>
+            <>OFFLINE - SEARCHING FOR BACKEND...</>
           ) : (
             <>SYSTEM {(jarvisStatus || 'offline').toUpperCase()}</>
           )}

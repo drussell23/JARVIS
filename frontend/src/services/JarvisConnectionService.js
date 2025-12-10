@@ -1,22 +1,22 @@
 /**
- * JarvisConnectionService - Unified Connection Management for JARVIS
- * ====================================================================
- * Combines backend discovery, WebSocket management, and status tracking
- * into a single, robust service with React hooks for easy integration.
- * 
- * Features:
- * - Auto-discovery of backend services
- * - Reliable WebSocket with ACKs, retry, offline queue
- * - Connection state management with event emitting
- * - Health monitoring with predictive healing
- * - React hooks for clean component integration
+ * JarvisConnectionService v3.0 - Unified Connection Management
+ * =============================================================
+ * Single source of truth for JARVIS backend connectivity with:
+ * - Non-blocking async connection management
+ * - Coordinated service discovery via DynamicConfigService
+ * - Intelligent WebSocket management with health monitoring
+ * - React hooks for seamless UI integration
+ * - Zero hardcoding - fully dynamic
  */
 
 import React from 'react';
 import DynamicWebSocketClient from './DynamicWebSocketClient';
 import configService from './DynamicConfigService';
 
-// Connection States
+// ============================================================================
+// CONNECTION STATES
+// ============================================================================
+
 export const ConnectionState = {
   INITIALIZING: 'initializing',
   DISCOVERING: 'discovering',
@@ -27,6 +27,41 @@ export const ConnectionState = {
   ERROR: 'error'
 };
 
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+/**
+ * Yields to event loop to prevent blocking
+ */
+const yieldToEventLoop = () => new Promise(resolve => setTimeout(resolve, 0));
+
+/**
+ * Create timeout controller for fetch operations
+ */
+const fetchWithTimeout = async (url, options = {}, timeoutMs = 5000) => {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  
+  try {
+    const response = await fetch(url, {
+      ...options,
+      signal: controller.signal,
+      mode: 'cors',
+      credentials: 'omit'
+    });
+    clearTimeout(timeoutId);
+    return response;
+  } catch (error) {
+    clearTimeout(timeoutId);
+    throw error;
+  }
+};
+
+// ============================================================================
+// JARVIS CONNECTION SERVICE
+// ============================================================================
+
 class JarvisConnectionService {
   constructor() {
     // State
@@ -34,119 +69,147 @@ class JarvisConnectionService {
     this.backendUrl = null;
     this.wsUrl = null;
     this.lastError = null;
-    this.backendMode = 'unknown'; // 'minimal' or 'full'
+    this.backendMode = 'unknown';
     
-    // WebSocket Client
+    // WebSocket client
     this.wsClient = null;
     
     // Event listeners
     this.listeners = new Map();
     
     // Health monitoring
-    this.healthCheckInterval = null;
-    this.healthCheckFrequency = 5000; // 5 seconds
+    this.healthConfig = {
+      checkInterval: 30000,
+      timeout: 5000,
+      maxFailures: 3
+    };
+    this.healthCheckTimer = null;
     this.consecutiveFailures = 0;
-    this.maxConsecutiveFailures = 3;
     
     // Discovery state
-    this.discoveryAttempts = 0;
-    this.maxDiscoveryAttempts = 10;
-    this.discoveryInterval = null;
+    this.discoveryState = {
+      attempts: 0,
+      maxAttempts: 10,
+      inProgress: false
+    };
     
-    // Initialize
-    this._initialize();
+    // Initialize asynchronously (non-blocking)
+    this._initializeAsync();
   }
 
-  /**
-   * Initialize the service
-   */
-  async _initialize() {
+  // ==========================================================================
+  // INITIALIZATION
+  // ==========================================================================
+
+  async _initializeAsync() {
     console.log('[JarvisConnection] Initializing...');
     
-    // Listen for config service events
-    configService.on('config-ready', (config) => this._handleConfigReady(config));
-    configService.on('backend-state', (state) => this._handleBackendState(state));
-    configService.on('backend-ready', (state) => this._handleBackendReady(state));
-    configService.on('discovery-failed', () => this._handleDiscoveryFailed());
+    // Subscribe to config service events
+    this._subscribeToConfigService();
     
-    // FAST PATH: Check if backend was just verified by loading page
-    // This prevents "CONNECTING TO BACKEND..." showing after loading completes
-    const fastPathResult = await this._tryFastPathConnection();
-    if (fastPathResult) {
-      console.log('[JarvisConnection] ✅ Fast-path connection successful (backend was just verified)');
+    // Yield to prevent blocking
+    await yieldToEventLoop();
+    
+    // Try fast path first (recently verified backend)
+    const fastPathSuccess = await this._tryFastPath();
+    if (fastPathSuccess) {
+      console.log('[JarvisConnection] ✅ Fast-path connection successful');
       return;
     }
     
-    // Normal discovery flow
+    // Start normal discovery
     this._setState(ConnectionState.DISCOVERING);
     await this._discoverBackend();
   }
 
-  /**
-   * Try fast-path connection using persisted backend state from loading page
-   * Returns true if successful, false if should fall back to normal discovery
-   */
-  async _tryFastPathConnection() {
+  _subscribeToConfigService() {
+    // Config ready - backend discovered
+    configService.on('config-ready', (config) => {
+      console.log('[JarvisConnection] Config ready:', config.API_BASE_URL);
+      if (config.API_BASE_URL && config.API_BASE_URL !== this.backendUrl) {
+        this.backendUrl = config.API_BASE_URL;
+        this.wsUrl = config.WS_BASE_URL;
+        this._connectToBackend();
+      }
+    });
+    
+    // Backend state updates
+    configService.on('backend-state', (state) => {
+      console.log('[JarvisConnection] Backend state:', state);
+      if (state.ready && this.connectionState !== ConnectionState.ONLINE) {
+        this._setState(ConnectionState.ONLINE);
+      }
+      this.backendMode = state.mode || 'unknown';
+      this._emit('modeChange', { mode: this.backendMode });
+    });
+    
+    // Backend fully ready
+    configService.on('backend-ready', (state) => {
+      console.log('[JarvisConnection] Backend ready');
+      this.backendMode = state.mode || 'full';
+      if (this.connectionState !== ConnectionState.ONLINE) {
+        this._connectToBackend();
+      }
+    });
+    
+    // Discovery failed
+    configService.on('discovery-failed', ({ reason }) => {
+      console.warn('[JarvisConnection] Discovery failed:', reason);
+      this._handleDiscoveryFailed();
+    });
+    
+    // Startup progress
+    configService.on('startup-progress', (progress) => {
+      this._emit('startupProgress', progress);
+    });
+  }
+
+  // ==========================================================================
+  // FAST PATH CONNECTION
+  // ==========================================================================
+
+  async _tryFastPath() {
     try {
-      const backendVerified = localStorage.getItem('jarvis_backend_verified') === 'true';
+      // Check localStorage for recently verified backend
+      const verified = localStorage.getItem('jarvis_backend_verified') === 'true';
       const verifiedAt = parseInt(localStorage.getItem('jarvis_backend_verified_at') || '0');
       const timeSinceVerification = Date.now() - verifiedAt;
       
-      // Only use fast path if verified within last 30 seconds
-      const FAST_PATH_TIMEOUT = 30000;
-      
-      if (!backendVerified || timeSinceVerification > FAST_PATH_TIMEOUT) {
-        console.log('[JarvisConnection] Fast-path not available (not recently verified)');
+      // Only use fast path if verified within 30 seconds
+      if (!verified || timeSinceVerification > 30000) {
         return false;
       }
       
       const backendUrl = localStorage.getItem('jarvis_backend_url');
       const wsUrl = localStorage.getItem('jarvis_backend_ws_url');
-      const backendPort = localStorage.getItem('jarvis_backend_port');
       
       if (!backendUrl || !wsUrl) {
-        console.log('[JarvisConnection] Fast-path not available (missing URLs)');
         return false;
       }
       
-      console.log(`[JarvisConnection] Fast-path: Backend was verified ${Math.round(timeSinceVerification / 1000)}s ago`);
-      console.log(`[JarvisConnection] Fast-path: Using ${backendUrl}`);
+      console.log(`[JarvisConnection] Fast-path: Backend verified ${Math.round(timeSinceVerification / 1000)}s ago`);
       
-      // Set URLs directly (skip discovery)
-      this.backendUrl = backendUrl;
-      this.wsUrl = wsUrl;
-      
-      // DON'T set state to CONNECTING - that shows "CONNECTING TO BACKEND..."
-      // Instead, stay in INITIALIZING state during the quick verification
-      // The UI shows "INITIALIZING..." which is less jarring than "CONNECTING TO BACKEND..."
-      
-      // Quick health check (should be fast since backend was just verified)
-      const health = await this._checkBackendHealth();
-      if (!health.ok) {
-        console.warn('[JarvisConnection] Fast-path health check failed, falling back to discovery');
+      // Quick health verification
+      const isHealthy = await this._quickHealthCheck(backendUrl);
+      if (!isHealthy) {
         this._clearFastPathState();
         return false;
       }
       
-      // Update backend mode
-      this.backendMode = health.mode || 'full';
+      // Set URLs and connect
+      this.backendUrl = backendUrl;
+      this.wsUrl = wsUrl;
       
-      // Initialize WebSocket client
       await this._initializeWebSocket();
-      
-      // Start health monitoring
       this._startHealthMonitoring();
       
-      // Go directly to ONLINE (skipping CONNECTING state entirely)
       this._setState(ConnectionState.ONLINE);
       this.consecutiveFailures = 0;
       
       // Clear fast-path state (one-time use)
       this._clearFastPathState();
       
-      console.log(`[JarvisConnection] ✅ Fast-path connected to backend (${this.backendMode} mode)`);
       return true;
-      
     } catch (error) {
       console.warn('[JarvisConnection] Fast-path failed:', error.message);
       this._clearFastPathState();
@@ -154,39 +217,34 @@ class JarvisConnectionService {
     }
   }
 
-  /**
-   * Clear fast-path state from localStorage
-   */
   _clearFastPathState() {
     try {
       localStorage.removeItem('jarvis_backend_verified');
       localStorage.removeItem('jarvis_backend_verified_at');
-      // Keep jarvis_backend_url and jarvis_backend_ws_url for fallback
-    } catch (e) {
+    } catch {
       // Ignore
     }
   }
 
-  /**
-   * Discover backend services
-   */
+  // ==========================================================================
+  // BACKEND DISCOVERY
+  // ==========================================================================
+
   async _discoverBackend() {
-    this.discoveryAttempts++;
-    console.log(`[JarvisConnection] Discovery attempt ${this.discoveryAttempts}/${this.maxDiscoveryAttempts}`);
+    if (this.discoveryState.inProgress) {
+      return;
+    }
+    
+    this.discoveryState.inProgress = true;
+    this.discoveryState.attempts++;
+    
+    console.log(`[JarvisConnection] Discovery attempt ${this.discoveryState.attempts}`);
     
     try {
-      // Check if config is already available
-      const apiUrl = configService.getApiUrl();
-      if (apiUrl) {
-        this.backendUrl = apiUrl;
-        this.wsUrl = configService.getWebSocketUrl();
-        await this._connectToBackend();
-        return;
-      }
+      // Wait for config service to discover backend
+      const config = await configService.waitForConfig(15000);
       
-      // Wait for config with timeout
-      const config = await configService.waitForConfig(10000);
-      if (config && config.API_BASE_URL) {
+      if (config?.API_BASE_URL) {
         this.backendUrl = config.API_BASE_URL;
         this.wsUrl = config.WS_BASE_URL;
         await this._connectToBackend();
@@ -196,12 +254,35 @@ class JarvisConnectionService {
     } catch (error) {
       console.warn('[JarvisConnection] Discovery failed:', error.message);
       this._handleDiscoveryFailed();
+    } finally {
+      this.discoveryState.inProgress = false;
     }
   }
 
-  /**
-   * Connect to the discovered backend
-   */
+  _handleDiscoveryFailed() {
+    if (this.discoveryState.attempts < this.discoveryState.maxAttempts) {
+      // Calculate exponential backoff
+      const delay = Math.min(
+        3000 * Math.pow(1.5, this.discoveryState.attempts - 1),
+        30000
+      );
+      
+      console.log(`[JarvisConnection] Retrying discovery in ${Math.round(delay / 1000)}s`);
+      this._setState(ConnectionState.RECONNECTING);
+      
+      setTimeout(() => this._discoverBackend(), delay);
+    } else {
+      console.error('[JarvisConnection] Max discovery attempts reached');
+      this._setState(ConnectionState.OFFLINE);
+      this.lastError = 'Could not find backend service';
+      this._emit('error', { message: this.lastError });
+    }
+  }
+
+  // ==========================================================================
+  // BACKEND CONNECTION
+  // ==========================================================================
+
   async _connectToBackend() {
     this._setState(ConnectionState.CONNECTING);
     
@@ -212,44 +293,44 @@ class JarvisConnectionService {
         throw new Error(`Backend unhealthy: ${health.error}`);
       }
       
-      // Update backend mode
       this.backendMode = health.mode || 'full';
       
-      // Initialize WebSocket client
+      // Initialize WebSocket
       await this._initializeWebSocket();
       
       // Start health monitoring
       this._startHealthMonitoring();
       
-      // Set online
+      // Update state
       this._setState(ConnectionState.ONLINE);
       this.consecutiveFailures = 0;
       
-      console.log(`[JarvisConnection] ✅ Connected to backend (${this.backendMode} mode)`);
+      console.log(`[JarvisConnection] ✅ Connected (${this.backendMode} mode)`);
       
     } catch (error) {
-      console.error('[JarvisConnection] Connection failed:', error);
+      console.error('[JarvisConnection] Connection failed:', error.message);
       this.lastError = error.message;
       this._setState(ConnectionState.ERROR);
-      
-      // Schedule retry
       this._scheduleReconnect();
     }
   }
 
-  /**
-   * Check backend health
-   */
+  async _quickHealthCheck(url) {
+    try {
+      const response = await fetchWithTimeout(`${url}/health`, {}, 2000);
+      return response.ok;
+    } catch {
+      return false;
+    }
+  }
+
   async _checkBackendHealth() {
     try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 5000);
-      
-      const response = await fetch(`${this.backendUrl}/health`, {
-        signal: controller.signal
-      });
-      
-      clearTimeout(timeout);
+      const response = await fetchWithTimeout(
+        `${this.backendUrl}/health`,
+        { headers: { 'Accept': 'application/json' } },
+        this.healthConfig.timeout
+      );
       
       if (response.ok) {
         const data = await response.json();
@@ -266,24 +347,22 @@ class JarvisConnectionService {
     }
   }
 
-  /**
-   * Initialize WebSocket client
-   */
+  // ==========================================================================
+  // WEBSOCKET MANAGEMENT
+  // ==========================================================================
+
   async _initializeWebSocket() {
-    // Create client if not exists
+    // Create client if needed
     if (!this.wsClient) {
       this.wsClient = new DynamicWebSocketClient({
-        autoDiscover: false, // We handle discovery
+        autoDiscover: false,
         reconnectStrategy: 'exponential',
         maxReconnectAttempts: 10,
         heartbeatInterval: 30000,
-        dynamicRouting: true,
-        messageValidation: true
+        connectionTimeout: 10000
       });
       
-      // Set up endpoints manually
-      // Note: The main unified WebSocket is at /ws (handles all capabilities)
-      // JARVIS voice streaming is at /voice/jarvis/stream
+      // Configure endpoints
       this.wsClient.endpoints = [
         {
           path: `${this.wsUrl}/ws`,
@@ -297,63 +376,80 @@ class JarvisConnectionService {
         },
         {
           path: `${this.wsUrl}/vision/ws`,
-          capabilities: ['vision', 'monitoring', 'analysis'],
+          capabilities: ['vision', 'monitoring'],
           priority: 8
+        }
+      ];
+      
+      // Set up event handlers
+      this._setupWebSocketHandlers();
+    } else {
+      // Update endpoints if URL changed
+      this.wsClient.endpoints = [
+        {
+          path: `${this.wsUrl}/ws`,
+          capabilities: ['voice', 'command', 'jarvis', 'general'],
+          priority: 10
         }
       ];
     }
     
-    // Connect to unified WebSocket endpoint (handles all communication)
+    // Connect to main WebSocket
     try {
       await this.wsClient.connect(`${this.wsUrl}/ws`);
-      
-      // Set up message handlers
-      this.wsClient.on('*', (data, endpoint) => {
-        this._emit('message', { data, endpoint });
-      });
-      
-      this.wsClient.on('response', (data) => {
-        this._emit('response', data);
-      });
-      
-      this.wsClient.on('jarvis_response', (data) => {
-        this._emit('jarvis_response', data);
-      });
-      
-      this.wsClient.on('workflow_progress', (data) => {
-        this._emit('workflow_progress', data);
-      });
-      
-      this.wsClient.on('vbi_progress', (data) => {
-        this._emit('vbi_progress', data);
-      });
-      
-      this.wsClient.on('proactive_suggestion', (data) => {
-        this._emit('proactive_suggestion', data);
-      });
-      
     } catch (error) {
-      console.warn('[JarvisConnection] WebSocket connection failed, will retry');
-      throw error;
+      console.warn('[JarvisConnection] WebSocket connection failed:', error.message);
+      // Don't throw - HTTP health check passed, WS might still work later
     }
   }
 
-  /**
-   * Start health monitoring
-   */
-  _startHealthMonitoring() {
-    if (this.healthCheckInterval) {
-      clearInterval(this.healthCheckInterval);
-    }
+  _setupWebSocketHandlers() {
+    // Forward all messages
+    this.wsClient.on('*', (data, endpoint) => {
+      this._emit('message', { data, endpoint });
+    });
     
-    this.healthCheckInterval = setInterval(async () => {
+    // Specific message types
+    const messageTypes = [
+      'response', 'jarvis_response', 'workflow_progress',
+      'vbi_progress', 'proactive_suggestion', 'voice_unlock',
+      'transcription', 'error'
+    ];
+    
+    messageTypes.forEach(type => {
+      this.wsClient.on(type, (data) => {
+        this._emit(type, data);
+      });
+    });
+    
+    // Connection events
+    this.wsClient.on('connected', (data) => {
+      console.log('[JarvisConnection] WebSocket connected:', data.endpoint);
+      if (this.connectionState !== ConnectionState.ONLINE) {
+        this._setState(ConnectionState.ONLINE);
+      }
+    });
+    
+    this.wsClient.on('disconnected', (data) => {
+      console.log('[JarvisConnection] WebSocket disconnected:', data.endpoint);
+    });
+  }
+
+  // ==========================================================================
+  // HEALTH MONITORING
+  // ==========================================================================
+
+  _startHealthMonitoring() {
+    this._stopHealthMonitoring();
+    
+    this.healthCheckTimer = setInterval(async () => {
       const health = await this._checkBackendHealth();
       
       if (!health.ok) {
         this.consecutiveFailures++;
-        console.warn(`[JarvisConnection] Health check failed (${this.consecutiveFailures}/${this.maxConsecutiveFailures})`);
+        console.warn(`[JarvisConnection] Health check failed (${this.consecutiveFailures}/${this.healthConfig.maxFailures})`);
         
-        if (this.consecutiveFailures >= this.maxConsecutiveFailures) {
+        if (this.consecutiveFailures >= this.healthConfig.maxFailures) {
           this._handleConnectionLost();
         }
       } else {
@@ -361,27 +457,21 @@ class JarvisConnectionService {
         
         // Check for mode changes
         if (health.mode !== this.backendMode) {
-          console.log(`[JarvisConnection] Backend mode changed: ${this.backendMode} -> ${health.mode}`);
+          console.log(`[JarvisConnection] Mode changed: ${this.backendMode} -> ${health.mode}`);
           this.backendMode = health.mode;
           this._emit('modeChange', { mode: health.mode });
         }
       }
-    }, this.healthCheckFrequency);
+    }, this.healthConfig.checkInterval);
   }
 
-  /**
-   * Stop health monitoring
-   */
   _stopHealthMonitoring() {
-    if (this.healthCheckInterval) {
-      clearInterval(this.healthCheckInterval);
-      this.healthCheckInterval = null;
+    if (this.healthCheckTimer) {
+      clearInterval(this.healthCheckTimer);
+      this.healthCheckTimer = null;
     }
   }
 
-  /**
-   * Handle connection lost
-   */
   _handleConnectionLost() {
     console.warn('[JarvisConnection] Connection lost');
     this._stopHealthMonitoring();
@@ -389,73 +479,23 @@ class JarvisConnectionService {
     this._scheduleReconnect();
   }
 
-  /**
-   * Schedule reconnection attempt
-   */
   _scheduleReconnect() {
     this._setState(ConnectionState.RECONNECTING);
     
-    const delay = Math.min(5000 * Math.pow(1.5, this.consecutiveFailures), 30000);
-    console.log(`[JarvisConnection] Reconnecting in ${delay}ms...`);
+    const delay = Math.min(
+      5000 * Math.pow(1.5, this.consecutiveFailures),
+      30000
+    );
     
-    setTimeout(async () => {
-      await this._connectToBackend();
-    }, delay);
+    console.log(`[JarvisConnection] Reconnecting in ${Math.round(delay / 1000)}s`);
+    
+    setTimeout(() => this._connectToBackend(), delay);
   }
 
-  /**
-   * Handle config ready event
-   */
-  _handleConfigReady(config) {
-    if (config.API_BASE_URL && config.API_BASE_URL !== this.backendUrl) {
-      console.log('[JarvisConnection] Config updated, reconnecting...');
-      this.backendUrl = config.API_BASE_URL;
-      this.wsUrl = config.WS_BASE_URL;
-      this._connectToBackend();
-    }
-  }
+  // ==========================================================================
+  // STATE MANAGEMENT
+  // ==========================================================================
 
-  /**
-   * Handle backend state update
-   */
-  _handleBackendState(state) {
-    if (state.ready && this.connectionState !== ConnectionState.ONLINE) {
-      console.log('[JarvisConnection] Backend ready signal received');
-      this._connectToBackend();
-    }
-  }
-
-  /**
-   * Handle backend ready event
-   */
-  _handleBackendReady(state) {
-    console.log('[JarvisConnection] Backend fully ready');
-    if (this.connectionState !== ConnectionState.ONLINE) {
-      this._connectToBackend();
-    }
-  }
-
-  /**
-   * Handle discovery failed
-   */
-  _handleDiscoveryFailed() {
-    if (this.discoveryAttempts < this.maxDiscoveryAttempts) {
-      const delay = Math.min(3000 * Math.pow(1.5, this.discoveryAttempts), 30000);
-      console.log(`[JarvisConnection] Retrying discovery in ${delay}ms...`);
-      
-      setTimeout(() => {
-        this._discoverBackend();
-      }, delay);
-    } else {
-      console.error('[JarvisConnection] Max discovery attempts reached');
-      this._setState(ConnectionState.OFFLINE);
-      this.lastError = 'Could not find backend service';
-    }
-  }
-
-  /**
-   * Set connection state and emit event
-   */
   _setState(newState) {
     if (this.connectionState !== newState) {
       const oldState = this.connectionState;
@@ -465,9 +505,10 @@ class JarvisConnectionService {
     }
   }
 
-  /**
-   * Emit an event to all listeners
-   */
+  // ==========================================================================
+  // EVENT SYSTEM
+  // ==========================================================================
+
   _emit(event, data) {
     const handlers = this.listeners.get(event) || [];
     const allHandlers = this.listeners.get('*') || [];
@@ -476,74 +517,63 @@ class JarvisConnectionService {
       try {
         handler(data);
       } catch (error) {
-        console.error(`[JarvisConnection] Event handler error for ${event}:`, error);
+        console.error(`[JarvisConnection] Handler error for ${event}:`, error);
       }
     });
   }
 
-  // ============ Public API ============
-
-  /**
-   * Get current connection state
-   */
-  getState() {
-    return this.connectionState;
-  }
-
-  /**
-   * Check if connected
-   */
-  isConnected() {
-    return this.connectionState === ConnectionState.ONLINE;
-  }
-
-  /**
-   * Get backend mode
-   */
-  getMode() {
-    return this.backendMode;
-  }
-
-  /**
-   * Get last error
-   */
-  getLastError() {
-    return this.lastError;
-  }
-
-  /**
-   * Subscribe to events
-   */
   on(event, handler) {
     if (!this.listeners.has(event)) {
       this.listeners.set(event, []);
     }
     this.listeners.get(event).push(handler);
-    
     return () => this.off(event, handler);
   }
 
-  /**
-   * Unsubscribe from events
-   */
   off(event, handler) {
     const handlers = this.listeners.get(event);
     if (handlers) {
       const index = handlers.indexOf(handler);
-      if (index > -1) {
-        handlers.splice(index, 1);
-      }
+      if (index > -1) handlers.splice(index, 1);
     }
   }
 
-  /**
-   * Send a command to JARVIS
-   */
-  async sendCommand(command, options = {}) {
-    if (!this.isConnected()) {
-      console.warn('[JarvisConnection] Not connected, queueing command');
+  // ==========================================================================
+  // PUBLIC API
+  // ==========================================================================
+
+  getState() {
+    return this.connectionState;
+  }
+
+  isConnected() {
+    return this.connectionState === ConnectionState.ONLINE;
+  }
+
+  getMode() {
+    return this.backendMode;
+  }
+
+  getLastError() {
+    return this.lastError;
+  }
+
+  getWebSocket() {
+    if (!this.wsClient) return null;
+    for (const [, ws] of this.wsClient.connections) {
+      if (ws.readyState === WebSocket.OPEN) {
+        return ws;
+      }
     }
-    
+    return null;
+  }
+
+  isWebSocketConnected() {
+    const ws = this.getWebSocket();
+    return ws && ws.readyState === WebSocket.OPEN;
+  }
+
+  async sendCommand(command, options = {}) {
     const message = {
       type: 'command',
       text: command,
@@ -552,68 +582,29 @@ class JarvisConnectionService {
       timestamp: Date.now()
     };
     
-    // Include audio data if provided
     if (options.audioData) {
       message.audio_data = options.audioData.audio;
       message.sample_rate = options.audioData.sampleRate;
       message.mime_type = options.audioData.mimeType;
     }
     
-    // Use reliable send for commands
     if (options.reliable !== false) {
-      return this.wsClient.sendReliable(message, 'jarvis', options.timeout || 10000);
-    } else {
-      return this.wsClient.send(message, 'jarvis');
+      return this.wsClient?.sendReliable(message, 'jarvis', options.timeout || 10000);
     }
+    return this.wsClient?.send(message, 'jarvis');
   }
 
-  /**
-   * Send a message (any type)
-   */
   async send(message, options = {}) {
     if (options.reliable) {
-      return this.wsClient.sendReliable(message, options.capability, options.timeout || 5000);
+      return this.wsClient?.sendReliable(message, options.capability, options.timeout || 5000);
     }
-    return this.wsClient.send(message, options.capability);
+    return this.wsClient?.send(message, options.capability);
   }
 
-  /**
-   * Subscribe to a specific message type
-   */
   subscribe(messageType, handler) {
-    if (this.wsClient) {
-      this.wsClient.on(messageType, handler);
-    }
-    return () => {
-      // Note: DynamicWebSocketClient doesn't have off() yet, but handlers are cleaned on destroy
-    };
+    return this.wsClient?.on(messageType, handler);
   }
 
-  /**
-   * Get the raw WebSocket connection (for backward compatibility)
-   */
-  getWebSocket() {
-    if (!this.wsClient) return null;
-    // Return the first open connection
-    for (const [_, ws] of this.wsClient.connections) {
-      if (ws.readyState === WebSocket.OPEN) {
-        return ws;
-      }
-    }
-    return null;
-  }
-
-  /**
-   * Check if WebSocket is connected
-   */
-  isWebSocketConnected() {
-    const ws = this.getWebSocket();
-    return ws && ws.readyState === WebSocket.OPEN;
-  }
-
-  /**
-   * Get connection statistics
-   */
   getStats() {
     return {
       state: this.connectionState,
@@ -624,30 +615,25 @@ class JarvisConnectionService {
     };
   }
 
-  /**
-   * Force reconnection
-   */
   async reconnect() {
     console.log('[JarvisConnection] Manual reconnect requested');
     this._stopHealthMonitoring();
     this.consecutiveFailures = 0;
-    this.discoveryAttempts = 0;
+    this.discoveryState.attempts = 0;
     await this._discoverBackend();
   }
 
-  /**
-   * Cleanup
-   */
   destroy() {
     this._stopHealthMonitoring();
-    if (this.wsClient) {
-      this.wsClient.destroy();
-    }
+    this.wsClient?.destroy();
     this.listeners.clear();
   }
 }
 
-// ============ Singleton Instance ============
+// ============================================================================
+// SINGLETON INSTANCE
+// ============================================================================
+
 let serviceInstance = null;
 
 export function getJarvisConnectionService() {
@@ -657,7 +643,10 @@ export function getJarvisConnectionService() {
   return serviceInstance;
 }
 
-// ============ React Hook ============
+// ============================================================================
+// REACT HOOK
+// ============================================================================
+
 export function useJarvisConnection() {
   const [state, setState] = React.useState(ConnectionState.INITIALIZING);
   const [mode, setMode] = React.useState('unknown');
@@ -671,7 +660,7 @@ export function useJarvisConnection() {
     setMode(service.getMode());
     setError(service.getLastError());
     
-    // Subscribe to state changes
+    // Subscribe to changes
     const unsubscribeState = service.on('stateChange', ({ state: newState }) => {
       setState(newState);
       setError(service.getLastError());
@@ -688,7 +677,6 @@ export function useJarvisConnection() {
   }, [service]);
   
   return {
-    // State
     state,
     mode,
     error,
@@ -696,18 +684,19 @@ export function useJarvisConnection() {
     isConnecting: state === ConnectionState.CONNECTING || state === ConnectionState.RECONNECTING,
     isOffline: state === ConnectionState.OFFLINE,
     
-    // Actions
     sendCommand: (cmd, opts) => service.sendCommand(cmd, opts),
     send: (msg, opts) => service.send(msg, opts),
     subscribe: (type, handler) => service.subscribe(type, handler),
     reconnect: () => service.reconnect(),
     
-    // Service access
     service
   };
 }
 
-// ============ Helper to map state to UI status ============
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
 export function connectionStateToJarvisStatus(state) {
   switch (state) {
     case ConnectionState.ONLINE:
@@ -716,7 +705,7 @@ export function connectionStateToJarvisStatus(state) {
     case ConnectionState.DISCOVERING:
       return 'connecting';
     case ConnectionState.RECONNECTING:
-      return 'connecting';
+      return 'reconnecting';
     case ConnectionState.INITIALIZING:
       return 'initializing';
     case ConnectionState.OFFLINE:
