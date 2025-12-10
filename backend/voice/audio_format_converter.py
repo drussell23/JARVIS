@@ -994,6 +994,158 @@ class AudioFormatConverter:
 
         return header + audio_bytes
 
+    def convert_to_wav(
+        self,
+        audio_data: Any,
+        target_sample_rate: Optional[int] = None,
+        target_channels: Optional[int] = None,
+        target_bit_depth: Optional[int] = None
+    ) -> bytes:
+        """
+        Convert any audio format to WAV file bytes.
+
+        This is the main entry point for full WAV conversion.
+        Handles all input types (base64, bytes, arrays, etc.) and formats
+        (WebM, OGG, MP3, etc.) and produces a complete WAV file.
+
+        CRITICAL: This method is used by the VBI pipeline to prepare audio
+        for speaker verification (ECAPA-TDNN). The output must be a valid
+        WAV file with proper headers.
+
+        Args:
+            audio_data: Audio in any format (bytes, base64 string, numpy array, etc.)
+            target_sample_rate: Target sample rate (defaults to 16000 for VBI)
+            target_channels: Target channels (defaults to 1 for mono)
+            target_bit_depth: Target bit depth (defaults to 16)
+
+        Returns:
+            Complete WAV file bytes ready for speaker verification
+
+        Example:
+            >>> converter = AudioFormatConverter()
+            >>> wav_bytes = converter.convert_to_wav(webm_audio_base64, target_sample_rate=16000)
+            >>> # wav_bytes is a complete WAV file that can be saved or processed
+        """
+        # Use provided values or fall back to config
+        sample_rate = target_sample_rate or self.config.target_sample_rate
+        channels = target_channels or self.config.target_channels
+        bit_depth = target_bit_depth or self.config.target_bit_depth
+
+        # Step 1: Convert input to bytes (handles base64, arrays, dict, etc.)
+        audio_bytes = self.convert_to_bytes(audio_data)
+
+        if not audio_bytes:
+            logger.warning("[convert_to_wav] Empty audio data after input conversion")
+            # Return empty but valid WAV file (silent audio)
+            return self.create_wav_header(b'', sample_rate, channels, bit_depth)
+
+        # Step 2: Convert to PCM format (handles WebM, OGG, MP3, etc.)
+        # Temporarily update config for this conversion if different sample rate requested
+        original_sample_rate = self.config.target_sample_rate
+        original_channels = self.config.target_channels
+        original_bit_depth = self.config.target_bit_depth
+
+        try:
+            if target_sample_rate:
+                self.config.target_sample_rate = sample_rate
+            if target_channels:
+                self.config.target_channels = channels
+            if target_bit_depth:
+                self.config.target_bit_depth = bit_depth
+
+            pcm_data = self.ensure_pcm_format(audio_bytes)
+
+        finally:
+            # Restore original config
+            self.config.target_sample_rate = original_sample_rate
+            self.config.target_channels = original_channels
+            self.config.target_bit_depth = original_bit_depth
+
+        if not pcm_data:
+            logger.warning("[convert_to_wav] Failed to convert to PCM")
+            return self.create_wav_header(b'', sample_rate, channels, bit_depth)
+
+        # Step 3: Create complete WAV file with header
+        wav_bytes = self.create_wav_header(pcm_data, sample_rate, channels, bit_depth)
+
+        logger.info(
+            f"✅ [convert_to_wav] Converted to WAV: {len(wav_bytes)} bytes "
+            f"({sample_rate}Hz, {channels}ch, {bit_depth}-bit)"
+        )
+
+        return wav_bytes
+
+    async def convert_to_wav_async(
+        self,
+        audio_data: Any,
+        target_sample_rate: Optional[int] = None,
+        target_channels: Optional[int] = None,
+        target_bit_depth: Optional[int] = None
+    ) -> bytes:
+        """
+        Async version of convert_to_wav.
+
+        Runs the potentially slow transcoding in a thread pool to avoid
+        blocking the event loop. Ideal for WebSocket handlers and API endpoints.
+
+        Args:
+            audio_data: Audio in any format
+            target_sample_rate: Target sample rate (defaults to 16000)
+            target_channels: Target channels (defaults to 1)
+            target_bit_depth: Target bit depth (defaults to 16)
+
+        Returns:
+            Complete WAV file bytes
+
+        Example:
+            >>> converter = AudioFormatConverter()
+            >>> wav_bytes = await converter.convert_to_wav_async(webm_audio_base64)
+        """
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            self._executor,
+            lambda: self.convert_to_wav(
+                audio_data,
+                target_sample_rate,
+                target_channels,
+                target_bit_depth
+            )
+        )
+
+    def convert_to_pcm(
+        self,
+        audio_data: Any,
+        target_sample_rate: Optional[int] = None
+    ) -> bytes:
+        """
+        Convert any audio format to raw PCM bytes (without WAV header).
+
+        Alias for ensure_pcm_format with input conversion.
+        Use convert_to_wav() if you need a complete WAV file.
+
+        Args:
+            audio_data: Audio in any format
+            target_sample_rate: Target sample rate (optional)
+
+        Returns:
+            Raw PCM bytes (16-bit signed, little-endian)
+        """
+        audio_bytes = self.convert_to_bytes(audio_data)
+
+        if not audio_bytes:
+            return b''
+
+        # Handle custom sample rate
+        if target_sample_rate and target_sample_rate != self.config.target_sample_rate:
+            original = self.config.target_sample_rate
+            self.config.target_sample_rate = target_sample_rate
+            try:
+                return self.ensure_pcm_format(audio_bytes)
+            finally:
+                self.config.target_sample_rate = original
+
+        return self.ensure_pcm_format(audio_bytes)
+
     # =========================================================================
     # Statistics and Info
     # =========================================================================

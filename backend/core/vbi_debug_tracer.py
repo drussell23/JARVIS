@@ -1074,26 +1074,49 @@ class VBIPipelineOrchestrator:
             raise
 
     async def _preprocess_audio(self, audio_bytes: bytes, sample_rate: int) -> Any:
-        """Preprocess audio for embedding extraction"""
+        """
+        Preprocess audio for embedding extraction.
+        
+        Converts any audio format (WebM, OGG, MP3, etc.) to 16kHz mono WAV
+        suitable for ECAPA-TDNN speaker verification.
+        
+        Args:
+            audio_bytes: Raw audio bytes (any format)
+            sample_rate: Original sample rate hint (may not be accurate for compressed formats)
+            
+        Returns:
+            WAV file bytes ready for ECAPA embedding extraction
+        """
         try:
-            from voice.audio_format_converter import AudioFormatConverter
-            converter = AudioFormatConverter()
-
-            # Convert to proper format for ECAPA
-            processed = await asyncio.to_thread(
-                converter.convert_to_wav,
-                audio_bytes,
-                target_sample_rate=16000
+            from voice.audio_format_converter import AudioFormatConverter, get_audio_converter
+            
+            # Use singleton converter for caching benefits
+            converter = get_audio_converter()
+            
+            # Use the async method to avoid blocking the event loop
+            # This handles all format detection and transcoding
+            processed = await converter.convert_to_wav_async(
+                audio_data=audio_bytes,
+                target_sample_rate=16000,  # ECAPA requires 16kHz
+                target_channels=1,         # Mono
+                target_bit_depth=16        # 16-bit
             )
+            
+            if not processed or len(processed) < 44:  # 44 bytes is minimum WAV header
+                logger.warning("[VBI-ORCH] Audio preprocessing returned empty/invalid WAV")
+                raise ValueError("Audio preprocessing failed - empty result")
+                
+            logger.info(f"[VBI-ORCH] Audio preprocessed: {len(audio_bytes)} bytes → {len(processed)} bytes WAV")
             return processed
 
-        except ImportError:
-            # Fallback: return raw bytes
-            logger.warning("[VBI-ORCH] AudioFormatConverter not available, using raw audio")
+        except ImportError as e:
+            # Fallback: try to use raw bytes (may not work for compressed formats)
+            logger.warning(f"[VBI-ORCH] AudioFormatConverter not available: {e}, using raw audio")
             return audio_bytes
         except Exception as e:
-            logger.error(f"[VBI-ORCH] Audio preprocessing failed: {e}")
-            raise
+            logger.error(f"[VBI-ORCH] Audio preprocessing failed: {type(e).__name__}: {e}")
+            # Re-raise to trigger proper error handling in the pipeline
+            raise RuntimeError(f"Audio preprocessing failed: {e}") from e
 
     async def _extract_embedding(self, audio_data: Any) -> List[float]:
         """Extract ECAPA embedding"""
