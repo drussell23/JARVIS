@@ -786,12 +786,15 @@ class VBIPipelineOrchestrator:
         self.prewarmer = ECAPAPreWarmer()
 
         # Dynamic timeouts (in seconds)
+        # NOTE: Warmup should happen at STARTUP, not during user requests!
+        # The warmup_timeout here is a FALLBACK if startup warmup failed
         self.timeouts = {
+            "warmup": float(os.environ.get("VBI_WARMUP_TIMEOUT", "30")),  # Separate warmup timeout (fallback)
             "audio_processing": float(os.environ.get("VBI_AUDIO_TIMEOUT", "5")),
-            "ecapa_extraction": float(os.environ.get("VBI_ECAPA_TIMEOUT", "15")),
+            "ecapa_extraction": float(os.environ.get("VBI_ECAPA_TIMEOUT", "30")),  # Increased for cold endpoints
             "speaker_verification": float(os.environ.get("VBI_VERIFY_TIMEOUT", "5")),
             "unlock_execution": float(os.environ.get("VBI_UNLOCK_TIMEOUT", "10")),
-            "total_pipeline": float(os.environ.get("VBI_TOTAL_TIMEOUT", "30"))
+            "total_pipeline": float(os.environ.get("VBI_TOTAL_TIMEOUT", "60"))  # Increased for reliability
         }
 
         # Retry configuration
@@ -891,20 +894,35 @@ class VBIPipelineOrchestrator:
         }
 
         try:
-            # Ensure ECAPA is ready
+            # Check ECAPA warmup status
+            # NOTE: Warmup should have happened at STARTUP via component_warmup_config.py
+            # This is a FALLBACK if startup warmup failed - we try but proceed anyway
             if not self.prewarmer.is_warm:
                 await send_progress("warmup", "in_progress", {"message": "Initializing voice verification..."})
-                logger.warning(f"[VBI-ORCH] {trace_id} | ECAPA not warm, attempting warmup...")
-                warmup_result = await asyncio.wait_for(
-                    self.prewarmer.warmup(),
-                    timeout=self.timeouts["ecapa_extraction"]
-                )
-                if warmup_result.get("status") != "success":
-                    await send_progress("warmup", "failed", error="Warmup failed")
-                    result["response"] = "Voice verification system is warming up. Please try again in a moment."
-                    self.tracer.complete_trace(trace_id, VBIStatus.FAILED)
-                    return result
-                await send_progress("warmup", "success", {"message": "System ready"})
+                logger.warning(f"[VBI-ORCH] {trace_id} | ECAPA not pre-warmed at startup, attempting fallback warmup...")
+                
+                try:
+                    warmup_result = await asyncio.wait_for(
+                        self.prewarmer.warmup(),
+                        timeout=self.timeouts["warmup"]  # Use dedicated warmup timeout
+                    )
+                    
+                    if warmup_result.get("status") == "success":
+                        await send_progress("warmup", "success", {"message": "System ready"})
+                        logger.info(f"[VBI-ORCH] {trace_id} | Fallback warmup succeeded")
+                    else:
+                        # Warmup didn't succeed but we'll try verification anyway
+                        await send_progress("warmup", "skipped", {"message": "Proceeding with verification..."})
+                        logger.warning(f"[VBI-ORCH] {trace_id} | Warmup status: {warmup_result.get('status')}, proceeding anyway")
+                        
+                except asyncio.TimeoutError:
+                    # Warmup timed out - proceed anyway, the extraction might still work
+                    await send_progress("warmup", "skipped", {"message": "Proceeding with verification..."})
+                    logger.warning(f"[VBI-ORCH] {trace_id} | Warmup timeout, proceeding with verification anyway")
+                    
+            else:
+                # Already warm from startup - skip warmup stage entirely
+                logger.info(f"[VBI-ORCH] {trace_id} | ECAPA already warm from startup, skipping warmup stage")
 
             # Check if we have audio data
             if not audio_data:

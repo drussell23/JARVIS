@@ -702,6 +702,19 @@ async def register_manual_components(warmup):
         category="security",
     )
 
+    # 🔥 ECAPA-TDNN Pre-Warmer - CRITICAL for instant voice unlock!
+    # This warms up the Cloud ECAPA endpoint at STARTUP, not when user says "unlock my screen"
+    warmup.register_component(
+        name="ecapa_prewarmer",
+        loader=load_ecapa_prewarmer,
+        priority=ComponentPriority.CRITICAL,
+        health_check=check_ecapa_prewarmer_health,
+        timeout=120.0,  # 2 minutes - Cloud Run cold starts can take time
+        retry_count=2,
+        required=False,  # Don't block startup, but try hard
+        category="voice_biometrics",
+    )
+
     warmup.register_component(
         name="voice_auth",
         loader=load_voice_auth,
@@ -973,6 +986,118 @@ async def check_screen_lock_detector_health(detector) -> bool:
         result = await detector.is_screen_locked()
         return isinstance(result, bool)
     except:
+        return False
+
+
+# =============================================================================
+# 🔥 ECAPA-TDNN PRE-WARMER - Warms up Cloud ECAPA at STARTUP
+# =============================================================================
+
+async def load_ecapa_prewarmer():
+    """
+    🔥 Pre-warm ECAPA-TDNN Cloud endpoint at STARTUP.
+    
+    This ensures voice biometric verification is INSTANT when the user says
+    "unlock my screen" - no more waiting for Cloud Run cold starts!
+    
+    The warmup:
+    1. Finds the Cloud ECAPA endpoint (Cloud Run or Spot VM)
+    2. Sends a warmup request to trigger model loading
+    3. Verifies the embedding is valid
+    4. Marks the system as "warm" for instant future requests
+    """
+    logger.info("[WARMUP] 🔥 Starting ECAPA-TDNN pre-warming at STARTUP...")
+    start_time = time.time()
+    
+    try:
+        # Import the pre-warmer and VBI orchestrator
+        from core.vbi_debug_tracer import ECAPAPreWarmer, get_vbi_orchestrator
+        
+        # Get or create the prewarmer (singleton)
+        prewarmer = ECAPAPreWarmer()
+        
+        # Check if already warm
+        if prewarmer.is_warm:
+            elapsed = time.time() - start_time
+            logger.info(f"[WARMUP] ✅ ECAPA already warm ({elapsed:.2f}s)")
+            return prewarmer
+        
+        # Perform the warmup - this is the slow part that should happen at STARTUP
+        logger.info("[WARMUP] 🔄 Warming up Cloud ECAPA endpoint (this may take 30-60s on cold start)...")
+        
+        warmup_result = await asyncio.wait_for(
+            prewarmer.warmup(force=False),
+            timeout=120.0  # 2 minute timeout for cold starts
+        )
+        
+        elapsed = time.time() - start_time
+        
+        if warmup_result.get("status") == "success":
+            logger.info(f"[WARMUP] ✅ ECAPA-TDNN PRE-WARMED SUCCESSFULLY in {elapsed:.2f}s!")
+            logger.info(f"[WARMUP]    └─ Endpoint: {warmup_result.get('stages', [{}])[0].get('endpoint', 'unknown')}")
+            logger.info(f"[WARMUP]    └─ Embedding dimensions: {warmup_result.get('stages', [{}])[-1].get('embedding_size', 192)}")
+            logger.info(f"[WARMUP]    └─ Voice unlock commands will now be INSTANT! 🚀")
+        elif warmup_result.get("status") == "already_warm":
+            logger.info(f"[WARMUP] ✅ ECAPA was already warm ({elapsed:.2f}s)")
+        else:
+            logger.warning(f"[WARMUP] ⚠️ ECAPA warmup status: {warmup_result.get('status')} ({elapsed:.2f}s)")
+            logger.warning(f"[WARMUP]    └─ Error: {warmup_result.get('error', 'unknown')}")
+            logger.warning(f"[WARMUP]    └─ Voice unlock will work but may be slow on first request")
+        
+        return prewarmer
+        
+    except asyncio.TimeoutError:
+        elapsed = time.time() - start_time
+        logger.warning(f"[WARMUP] ⏱️ ECAPA warmup timed out after {elapsed:.2f}s")
+        logger.warning("[WARMUP]    └─ Cloud endpoint may be cold, first unlock will be slower")
+        logger.warning("[WARMUP]    └─ Continuing startup - warmup will happen on first request")
+        
+        # Return the prewarmer anyway - it'll warm up on first request
+        try:
+            from core.vbi_debug_tracer import ECAPAPreWarmer
+            return ECAPAPreWarmer()
+        except:
+            return None
+        
+    except ImportError as e:
+        logger.warning(f"[WARMUP] ⚠️ ECAPA pre-warmer not available: {e}")
+        logger.warning("[WARMUP]    └─ Voice unlock may be slower on first request")
+        return None
+        
+    except Exception as e:
+        elapsed = time.time() - start_time
+        logger.error(f"[WARMUP] ❌ ECAPA pre-warmup failed: {e} ({elapsed:.2f}s)")
+        import traceback
+        logger.debug(traceback.format_exc())
+        
+        # Return None but don't crash - voice unlock will warm up on first request
+        return None
+
+
+async def check_ecapa_prewarmer_health(prewarmer) -> bool:
+    """
+    Verify ECAPA pre-warmer is ready for instant voice unlock.
+    
+    Returns True if:
+    - Pre-warmer exists and is warm, OR
+    - Pre-warmer exists (will warm on first request)
+    """
+    if prewarmer is None:
+        return False
+    
+    try:
+        is_warm = prewarmer.is_warm
+        
+        if is_warm:
+            logger.info("[WARMUP] ✅ ECAPA pre-warmer health check PASSED (warm)")
+        else:
+            logger.info("[WARMUP] ⚠️ ECAPA pre-warmer exists but not warm (will warm on first request)")
+        
+        # Return True even if not warm - the prewarmer exists and will work
+        return True
+        
+    except Exception as e:
+        logger.warning(f"[WARMUP] ⚠️ ECAPA health check error: {e}")
         return False
 
 
