@@ -145,6 +145,7 @@ regexes = [
   '''# Clear password variable''',
   '''password=password,''',
   '''password\s*=\s*password,''',
+  '''password=config\.db_password,''',
   # ML Architecture and metrics (documentation, no actual secrets)
   '''Position in password''',
   '''### \*\*Password Typing''',
@@ -234,6 +235,7 @@ paths = [
   '''diagnose_connections.py''',
   '''backend/intelligence/cloud_sql_connection_manager.py''',
   '''backend/core/lifecycle_manager.py''',
+  '''backend/core/vbi_debug_tracer.py''',
   '''diagnose_voice_confidence.py''',
   '''diagnose_verification_failure.py''',
   '''diagnose_low_confidence.py''',
