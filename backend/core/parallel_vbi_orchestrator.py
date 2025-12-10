@@ -1113,25 +1113,42 @@ class SpeakerVerificationStage(VBIStage):
                 db = await get_learning_database()
                 if db:
                     profiles = await db.get_all_speaker_profiles()
+                    logger.info(f"[PARALLEL-VBI] 📊 Learning DB returned {len(profiles)} profiles")
                     
                     for profile in profiles:
-                        profile_emb = profile.get("embedding")
-                        if profile_emb is not None and len(profile_emb) > 0:
+                        # CRITICAL FIX: Database returns 'voiceprint_embedding', not 'embedding'
+                        profile_emb = profile.get("voiceprint_embedding") or profile.get("embedding")
+                        speaker_name = profile.get("speaker_name", "Unknown")
+                        
+                        if profile_emb is None:
+                            continue
+                        
+                        # Handle bytes vs numpy array
+                        if isinstance(profile_emb, bytes):
+                            profile_arr = np.frombuffer(profile_emb, dtype=np.float32)
+                        elif isinstance(profile_emb, (list, tuple)):
                             profile_arr = np.array(profile_emb, dtype=np.float32)
-                            profile_norm = profile_arr / (np.linalg.norm(profile_arr) + 1e-10)
+                        else:
+                            profile_arr = np.array(profile_emb, dtype=np.float32)
+                        
+                        if len(profile_arr) < 50:
+                            continue
                             
-                            similarity = float(np.dot(test_norm, profile_norm))
-                            
-                            if similarity > best_match["similarity"]:
-                                threshold = self.config.get("verification_threshold", 0.40)
-                                best_match = {
-                                    "is_verified": similarity >= threshold,
-                                    "speaker_name": profile.get("speaker_name", "Unknown"),
-                                    "confidence": similarity,
-                                    "similarity": similarity,
-                                }
+                        profile_norm = profile_arr / (np.linalg.norm(profile_arr) + 1e-10)
+                        
+                        similarity = float(np.dot(test_norm, profile_norm))
+                        logger.info(f"[PARALLEL-VBI] 📊 Profile '{speaker_name}': similarity={similarity:.4f}")
+                        
+                        if similarity > best_match["similarity"]:
+                            threshold = self.config.get("verification_threshold", 0.40)
+                            best_match = {
+                                "is_verified": similarity >= threshold,
+                                "speaker_name": speaker_name,
+                                "confidence": similarity,
+                                "similarity": similarity,
+                            }
             except Exception as e:
-                logger.debug(f"Learning DB check failed: {e}")
+                logger.warning(f"Learning DB check failed: {e}")
         
         context.speaker_verification = best_match
         return best_match

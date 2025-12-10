@@ -1636,13 +1636,17 @@ class VBIPipelineOrchestrator:
                 unified_cache = await get_unified_voice_cache()
                 
                 if unified_cache and unified_cache.is_ready:
-                    for profile_name, profile in unified_cache.get_preloaded_profiles().items():
+                    preloaded = unified_cache.get_preloaded_profiles()
+                    logger.info(f"[VBI-ORCH] ⚡ Unified cache has {len(preloaded)} preloaded profiles")
+                    
+                    for profile_name, profile in preloaded.items():
                         if profile.embedding is not None:
                             profile_embedding = np.array(profile.embedding, dtype=np.float32)
                             profile_norm = profile_embedding / (np.linalg.norm(profile_embedding) + 1e-10)
                             
                             # Cosine similarity
                             similarity = float(np.dot(test_norm, profile_norm))
+                            logger.info(f"[VBI-ORCH] ⚡ Cache profile '{profile_name}': similarity={similarity:.4f}")
                             
                             if similarity > best_match["confidence"]:
                                 best_match = {
@@ -1650,13 +1654,17 @@ class VBIPipelineOrchestrator:
                                     "speaker_name": profile_name,
                                     "confidence": similarity
                                 }
+                        else:
+                            logger.debug(f"[VBI-ORCH] ⚡ Cache profile '{profile_name}' has no embedding")
                                 
                     if best_match["is_verified"]:
                         logger.info(f"[VBI-ORCH] ⚡ Unified cache match: {best_match['speaker_name']} ({best_match['confidence']:.1%})")
                         return best_match
+                else:
+                    logger.warning(f"[VBI-ORCH] ⚠️ Unified cache not ready: cache={unified_cache is not None}, ready={unified_cache.is_ready if unified_cache else 'N/A'}")
                         
             except Exception as e:
-                logger.debug(f"[VBI-ORCH] Unified cache check failed: {e}")
+                logger.warning(f"[VBI-ORCH] Unified cache check failed: {e}")
             
             # Strategy 2: Check learning database profiles
             try:
@@ -1665,30 +1673,48 @@ class VBIPipelineOrchestrator:
                 
                 if db:
                     profiles = await db.get_all_speaker_profiles()
+                    logger.info(f"[VBI-ORCH] 📊 Learning DB returned {len(profiles)} profiles")
                     
                     for profile in profiles:
-                        profile_embedding = profile.get("embedding")
-                        if profile_embedding is not None and len(profile_embedding) > 0:
+                        # CRITICAL FIX: Database returns 'voiceprint_embedding', not 'embedding'
+                        profile_embedding = profile.get("voiceprint_embedding") or profile.get("embedding")
+                        speaker_name = profile.get("speaker_name", profile.get("name", "Unknown"))
+                        
+                        if profile_embedding is None:
+                            logger.debug(f"[VBI-ORCH] Profile '{speaker_name}' has no embedding")
+                            continue
+                            
+                        # Handle bytes vs numpy array
+                        if isinstance(profile_embedding, bytes):
+                            profile_array = np.frombuffer(profile_embedding, dtype=np.float32)
+                        elif isinstance(profile_embedding, (list, tuple)):
                             profile_array = np.array(profile_embedding, dtype=np.float32)
-                            profile_norm = profile_array / (np.linalg.norm(profile_array) + 1e-10)
+                        else:
+                            profile_array = np.array(profile_embedding, dtype=np.float32)
+                        
+                        if len(profile_array) < 50:
+                            logger.debug(f"[VBI-ORCH] Profile '{speaker_name}' embedding too short: {len(profile_array)}")
+                            continue
                             
-                            # Cosine similarity
-                            similarity = float(np.dot(test_norm, profile_norm))
-                            
-                            if similarity > best_match["confidence"]:
-                                speaker_name = profile.get("speaker_name", profile.get("name", "Unknown"))
-                                best_match = {
-                                    "is_verified": similarity >= 0.40,
-                                    "speaker_name": speaker_name,
-                                    "confidence": similarity
-                                }
+                        profile_norm = profile_array / (np.linalg.norm(profile_array) + 1e-10)
+                        
+                        # Cosine similarity
+                        similarity = float(np.dot(test_norm, profile_norm))
+                        logger.info(f"[VBI-ORCH] 📊 Profile '{speaker_name}': similarity={similarity:.4f} (dim={len(profile_array)})")
+                        
+                        if similarity > best_match["confidence"]:
+                            best_match = {
+                                "is_verified": similarity >= 0.40,
+                                "speaker_name": speaker_name,
+                                "confidence": similarity
+                            }
                     
                     if best_match["is_verified"]:
                         logger.info(f"[VBI-ORCH] 🔐 Database match: {best_match['speaker_name']} ({best_match['confidence']:.1%})")
                         return best_match
                         
             except Exception as e:
-                logger.debug(f"[VBI-ORCH] Learning database check failed: {e}")
+                logger.warning(f"[VBI-ORCH] Learning database check failed: {e}")
             
             # Strategy 3: Try Voice Biometric Intelligence
             try:
@@ -1793,6 +1819,65 @@ class VBIPipelineOrchestrator:
             except Exception as e:
                 logger.warning(f"[VBI-ORCH] ⚠️ CloudSQL query failed: {type(e).__name__}: {e}")
             
+            # =================================================================
+            # Strategy 5: Direct SQLite Query (user said profiles are synced here)
+            # =================================================================
+            if best_match["confidence"] == 0:
+                logger.info("[VBI-ORCH] 💾 Strategy 5: Direct SQLite query...")
+                try:
+                    import aiosqlite
+                    from pathlib import Path
+                    
+                    # Try multiple SQLite paths
+                    sqlite_paths = [
+                        Path.home() / ".jarvis" / "learning" / "voice_biometrics_sync.db",
+                        Path.home() / ".jarvis" / "jarvis_learning.db",
+                        Path.home() / ".jarvis" / "learning" / "jarvis_learning.db",
+                    ]
+                    
+                    for db_path in sqlite_paths:
+                        if db_path.exists():
+                            logger.info(f"[VBI-ORCH] 💾 Found SQLite: {db_path}")
+                            async with aiosqlite.connect(str(db_path)) as conn:
+                                conn.row_factory = aiosqlite.Row
+                                cursor = await conn.execute("""
+                                    SELECT speaker_name, voiceprint_embedding, total_samples
+                                    FROM speaker_profiles
+                                    WHERE voiceprint_embedding IS NOT NULL
+                                """)
+                                rows = await cursor.fetchall()
+                                
+                                logger.info(f"[VBI-ORCH] 💾 SQLite has {len(rows)} profiles with embeddings")
+                                
+                                for row in rows:
+                                    speaker_name = row['speaker_name']
+                                    embedding_blob = row['voiceprint_embedding']
+                                    total_samples = row['total_samples']
+                                    
+                                    if embedding_blob:
+                                        profile_embedding = np.frombuffer(embedding_blob, dtype=np.float32)
+                                        
+                                        if len(profile_embedding) >= 50:
+                                            profile_norm = profile_embedding / (np.linalg.norm(profile_embedding) + 1e-10)
+                                            similarity = float(np.dot(test_norm, profile_norm))
+                                            
+                                            logger.info(f"[VBI-ORCH] 💾 SQLite '{speaker_name}' (samples={total_samples}): similarity={similarity:.4f}")
+                                            
+                                            if similarity > best_match["confidence"]:
+                                                best_match = {
+                                                    "is_verified": similarity >= 0.40,
+                                                    "speaker_name": speaker_name,
+                                                    "confidence": similarity
+                                                }
+                                                
+                                if best_match["is_verified"]:
+                                    logger.info(f"[VBI-ORCH] 💾 SQLite match: {best_match['speaker_name']} ({best_match['confidence']:.1%})")
+                                    return best_match
+                            break  # Found a working SQLite database
+                            
+                except Exception as e:
+                    logger.warning(f"[VBI-ORCH] ⚠️ SQLite query failed: {type(e).__name__}: {e}")
+            
             # Log the result even if not verified
             if best_match["confidence"] > 0:
                 logger.warning(
@@ -1800,8 +1885,8 @@ class VBIPipelineOrchestrator:
                     f"({best_match['confidence']:.1%} < 40%)"
                 )
             else:
-                logger.warning("[VBI-ORCH] No matching profiles found in ANY source")
-                logger.warning("[VBI-ORCH] Ensure voice profile is enrolled in CloudSQL")
+                logger.error("[VBI-ORCH] ❌ No matching profiles found in ANY source!")
+                logger.error("[VBI-ORCH] Check: 1) Profile enrolled 2) Embeddings synced 3) SQLite populated")
                 
             return best_match
 
