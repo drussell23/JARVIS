@@ -3331,9 +3331,13 @@ class VoiceBiometricIntelligence:
             fused = max(0.0, fused - poor_quality_penalty)
             logger.debug(f"Applied poor quality penalty: -{poor_quality_penalty:.0%}")
 
-        logger.debug(
-            f"Fusion result: voice={voice_conf:.1%}×{voice_weight:.2f} + "
-            f"behavioral={behavioral_conf:.1%}×{behavioral_weight:.2f} = {fused:.1%}"
+        # Enhanced logging for confidence fusion debugging
+        logger.info(
+            f"📊 [VBI] Confidence Fusion:\n"
+            f"   Voice: {voice_conf:.1%} × {voice_weight:.2f} = {voice_conf * voice_weight:.1%}\n"
+            f"   Behavioral: {behavioral_conf:.1%} × {behavioral_weight:.2f} = {behavioral_conf * behavioral_weight:.1%}\n"
+            f"   Audio Quality: {audio_quality:.1%}\n"
+            f"   → Fused Confidence: {fused:.1%}"
         )
 
         return max(0.0, min(1.0, fused))
@@ -3523,19 +3527,69 @@ class VoiceBiometricIntelligence:
         return quality
 
     def _determine_level(self, result: VerificationResult) -> RecognitionLevel:
-        """Determine recognition level from confidence."""
+        """
+        Determine recognition level from confidence with dynamic threshold adjustment.
+        
+        v2.0.0 Enhancements:
+        - Dynamic threshold adjustment based on profile quality
+        - Behavioral boost for trusted patterns
+        - Detailed logging for debugging confidence issues
+        """
         conf = result.fused_confidence
-
-        if conf >= self._config.instant_recognition_threshold:
-            return RecognitionLevel.INSTANT
-        elif conf >= self._config.confident_threshold:
-            return RecognitionLevel.CONFIDENT
-        elif conf >= self._config.borderline_threshold:
-            return RecognitionLevel.GOOD
-        elif conf >= self._config.rejection_threshold:
-            return RecognitionLevel.BORDERLINE
+        voice_conf = result.voice_confidence
+        behavioral_conf = result.behavioral.behavioral_confidence if result.behavioral else 0.0
+        
+        # Dynamic threshold adjustment based on profile quality
+        # If we have a strong behavioral match, lower thresholds slightly
+        threshold_adjustment = 0.0
+        adjustment_reasons = []
+        
+        if behavioral_conf >= 0.85 and result.behavioral:
+            if result.behavioral.is_typical_time:
+                threshold_adjustment -= 0.03
+                adjustment_reasons.append("typical_time")
+            if result.behavioral.device_trusted:
+                threshold_adjustment -= 0.02
+                adjustment_reasons.append("trusted_device")
+            if result.behavioral.consecutive_failures == 0:
+                threshold_adjustment -= 0.02
+                adjustment_reasons.append("no_failures")
+        
+        # If profile has many samples (well-trained), we can be more lenient
+        profile_samples = getattr(self, '_owner_profile_samples', 0)
+        if profile_samples >= 10:
+            threshold_adjustment -= 0.02
+            adjustment_reasons.append(f"trained_profile_{profile_samples}s")
+        
+        # Calculate adjusted thresholds
+        instant_thresh = max(0.85, self._config.instant_recognition_threshold + threshold_adjustment)
+        confident_thresh = max(0.75, self._config.confident_threshold + threshold_adjustment)
+        borderline_thresh = max(0.65, self._config.borderline_threshold + threshold_adjustment)
+        rejection_thresh = max(0.50, self._config.rejection_threshold + threshold_adjustment)
+        
+        # Determine level with adjusted thresholds
+        if conf >= instant_thresh:
+            level = RecognitionLevel.INSTANT
+        elif conf >= confident_thresh:
+            level = RecognitionLevel.CONFIDENT
+        elif conf >= borderline_thresh:
+            level = RecognitionLevel.GOOD
+        elif conf >= rejection_thresh:
+            level = RecognitionLevel.BORDERLINE
         else:
-            return RecognitionLevel.UNKNOWN
+            level = RecognitionLevel.UNKNOWN
+        
+        # Enhanced logging for debugging
+        logger.info(
+            f"🎯 [VBI] Confidence Analysis:\n"
+            f"   Voice: {voice_conf:.1%} | Behavioral: {behavioral_conf:.1%} | Fused: {conf:.1%}\n"
+            f"   Thresholds (adjusted): instant={instant_thresh:.1%}, confident={confident_thresh:.1%}, "
+            f"borderline={borderline_thresh:.1%}, reject={rejection_thresh:.1%}\n"
+            f"   Adjustment: {threshold_adjustment:+.1%} ({', '.join(adjustment_reasons) if adjustment_reasons else 'none'})\n"
+            f"   → Level: {level.value.upper()}"
+        )
+        
+        return level
 
     def _determine_method(self, result: VerificationResult) -> VerificationMethod:
         """Determine which verification method was used."""

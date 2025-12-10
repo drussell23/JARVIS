@@ -1369,11 +1369,20 @@ class UnifiedVoiceCacheManager:
                     except sqlite3.Error as e:
                         logger.warning(f"Fallback metrics database error: {e}")
 
+            # ================================================================
+            # CLOUDSQL FALLBACK: Bootstrap from CloudSQL if local is empty
+            # ================================================================
+            if loaded == 0:
+                logger.info("📡 No local profiles found, trying CloudSQL bootstrap...")
+                loaded = await self._bootstrap_from_cloudsql()
+            
             if loaded == 0:
                 logger.warning(
                     "⚠️ No voice profiles loaded! Voice recognition will fail. "
-                    "Ensure Derek's voiceprint is enrolled in the learning database."
+                    "Ensure your voiceprint is enrolled in the learning database or CloudSQL."
                 )
+            else:
+                logger.info(f"🎉 Total voice profiles loaded: {loaded}")
 
             self._stats.profiles_preloaded = loaded
             return loaded
@@ -1381,6 +1390,179 @@ class UnifiedVoiceCacheManager:
         except Exception as e:
             logger.error(f"Failed to preload voice profiles: {e}", exc_info=True)
             return 0
+
+    async def _bootstrap_from_cloudsql(self) -> int:
+        """
+        Bootstrap voice profiles from CloudSQL when local databases are empty.
+        
+        This provides a fallback path for users whose voice profiles are stored
+        in CloudSQL (GCP PostgreSQL database).
+        
+        Returns:
+            Number of profiles loaded from CloudSQL
+        """
+        loaded = 0
+        
+        try:
+            # Try to import CloudSQL components
+            try:
+                from intelligence.cloud_sql_connection_manager import get_cloud_sql_manager
+                from intelligence.hybrid_database_sync import HybridDatabaseSync
+            except ImportError:
+                logger.debug("CloudSQL modules not available for bootstrap")
+                return 0
+            
+            # Check if CloudSQL is configured
+            cloud_sql_instance = os.environ.get("CLOUD_SQL_INSTANCE")
+            if not cloud_sql_instance:
+                logger.debug("CLOUD_SQL_INSTANCE not configured, skipping CloudSQL bootstrap")
+                return 0
+            
+            logger.info("🔄 Bootstrapping voice profiles from CloudSQL...")
+            
+            # Try HybridDatabaseSync first (most reliable)
+            try:
+                hybrid_sync = HybridDatabaseSync()
+                await asyncio.wait_for(hybrid_sync.initialize(), timeout=10.0)
+                
+                if hybrid_sync.is_initialized:
+                    success = await asyncio.wait_for(
+                        hybrid_sync.bootstrap_voice_profiles_from_cloudsql(),
+                        timeout=30.0
+                    )
+                    
+                    if success:
+                        # Reload profiles from local SQLite (now populated)
+                        logger.info("✅ CloudSQL bootstrap successful, reloading local cache...")
+                        loaded = await self._reload_from_local_sqlite()
+                        
+                        if loaded > 0:
+                            logger.info(f"🎉 Loaded {loaded} profile(s) from CloudSQL")
+                            return loaded
+                            
+            except asyncio.TimeoutError:
+                logger.warning("⏱️ CloudSQL bootstrap timed out")
+            except Exception as e:
+                logger.warning(f"HybridDatabaseSync bootstrap failed: {e}")
+            
+            # Direct CloudSQL query as last resort
+            try:
+                cloud_manager = get_cloud_sql_manager()
+                if cloud_manager and await cloud_manager.is_available():
+                    async with cloud_manager.connection() as conn:
+                        rows = await conn.fetch("""
+                            SELECT 
+                                speaker_name,
+                                voiceprint_embedding,
+                                embedding_dimension,
+                                total_samples,
+                                recognition_confidence,
+                                is_primary_user
+                            FROM speaker_profiles
+                            WHERE voiceprint_embedding IS NOT NULL
+                            ORDER BY is_primary_user DESC, last_updated DESC
+                        """)
+                        
+                        for row in rows:
+                            try:
+                                speaker_name = row['speaker_name']
+                                embedding_bytes = row['voiceprint_embedding']
+                                
+                                if not embedding_bytes:
+                                    continue
+                                    
+                                embedding = np.frombuffer(embedding_bytes, dtype=np.float32)
+                                
+                                if len(embedding) < 50:
+                                    continue
+                                
+                                profile = VoiceProfile(
+                                    speaker_name=speaker_name,
+                                    embedding=embedding,
+                                    embedding_dimensions=len(embedding),
+                                    total_samples=row.get('total_samples', 0),
+                                    avg_confidence=row.get('recognition_confidence', 0.0),
+                                    source="cloudsql",
+                                )
+                                
+                                self._preloaded_profiles[speaker_name] = profile
+                                loaded += 1
+                                
+                                owner_tag = " [OWNER]" if row.get('is_primary_user') else ""
+                                logger.info(
+                                    f"✅ Loaded from CloudSQL: {speaker_name}{owner_tag} "
+                                    f"(dim={len(embedding)})"
+                                )
+                                
+                            except Exception as e:
+                                logger.debug(f"Failed to load profile from CloudSQL row: {e}")
+                                
+                        if loaded > 0:
+                            logger.info(f"✅ Direct CloudSQL load: {loaded} profile(s)")
+                            
+            except Exception as e:
+                logger.debug(f"Direct CloudSQL query failed: {e}")
+            
+            return loaded
+            
+        except Exception as e:
+            logger.warning(f"CloudSQL bootstrap failed: {e}")
+            return 0
+
+    async def _reload_from_local_sqlite(self) -> int:
+        """Reload profiles from local SQLite after CloudSQL bootstrap."""
+        import sqlite3
+        
+        loaded = 0
+        db_path = os.path.join(
+            os.path.expanduser("~/.jarvis/learning"),
+            "jarvis_learning.db"
+        )
+        
+        if not os.path.exists(db_path):
+            return 0
+            
+        try:
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+                SELECT speaker_name, voiceprint_embedding, embedding_dimension,
+                       total_samples, recognition_confidence, is_primary_user
+                FROM speaker_profiles
+                WHERE voiceprint_embedding IS NOT NULL
+            """)
+            
+            for row in cursor.fetchall():
+                try:
+                    speaker_name = row["speaker_name"]
+                    embedding = np.frombuffer(row["voiceprint_embedding"], dtype=np.float32)
+                    
+                    if len(embedding) < 50:
+                        continue
+                    
+                    profile = VoiceProfile(
+                        speaker_name=speaker_name,
+                        embedding=embedding,
+                        embedding_dimensions=len(embedding),
+                        total_samples=row["total_samples"] or 0,
+                        avg_confidence=row["recognition_confidence"] or 0.0,
+                        source="learning_database_post_bootstrap",
+                    )
+                    
+                    self._preloaded_profiles[speaker_name] = profile
+                    loaded += 1
+                    
+                except Exception as e:
+                    logger.debug(f"Failed to reload profile: {e}")
+                    
+            conn.close()
+            
+        except Exception as e:
+            logger.warning(f"SQLite reload failed: {e}")
+            
+        return loaded
 
     async def _ensure_models_loaded(self) -> bool:
         """
