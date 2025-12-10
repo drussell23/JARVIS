@@ -88,6 +88,133 @@ logger = logging.getLogger(__name__)
 # Global set to track active WebSocket connections
 active_websockets: set = set()
 
+# ============================================================================
+# SPEECH RECOGNITION ERROR TRACKING - Circuit breaker for client-side errors
+# ============================================================================
+
+class SpeechRecognitionTracker:
+    """
+    Tracks speech recognition errors from frontend clients.
+    Implements circuit breaker pattern to prevent overwhelming clients with restarts.
+    """
+    def __init__(self):
+        self.errors = {}  # client_id -> list of error timestamps
+        self.error_window = 60  # seconds
+        self.max_errors_per_window = 20
+        self.backoff_durations = {}  # client_id -> backoff end timestamp
+        self.total_errors = 0
+        self.total_recoveries = 0
+        
+    def record_error(self, client_id: str, error_type: str) -> dict:
+        """Record a speech recognition error and return recovery advice."""
+        import time
+        now = time.time()
+        
+        # Initialize client tracking
+        if client_id not in self.errors:
+            self.errors[client_id] = []
+        
+        # Clean old errors outside window
+        self.errors[client_id] = [
+            ts for ts in self.errors[client_id] 
+            if now - ts < self.error_window
+        ]
+        
+        # Add new error
+        self.errors[client_id].append(now)
+        self.total_errors += 1
+        
+        error_count = len(self.errors[client_id])
+        
+        # Check if client should back off
+        if error_count >= self.max_errors_per_window:
+            # Calculate backoff duration (exponential)
+            backoff_multiplier = min(error_count // self.max_errors_per_window, 5)
+            backoff_duration = 5 * (2 ** backoff_multiplier)  # 5s, 10s, 20s, 40s, 80s max
+            self.backoff_durations[client_id] = now + backoff_duration
+            
+            return {
+                "should_backoff": True,
+                "backoff_seconds": backoff_duration,
+                "error_count": error_count,
+                "message": f"Too many errors ({error_count}). Backing off for {backoff_duration}s."
+            }
+        
+        return {
+            "should_backoff": False,
+            "error_count": error_count,
+            "message": "Error recorded. Continue listening."
+        }
+    
+    def record_recovery(self, client_id: str):
+        """Record successful recovery."""
+        self.total_recoveries += 1
+        # Clear backoff on successful recovery
+        if client_id in self.backoff_durations:
+            del self.backoff_durations[client_id]
+    
+    def get_client_status(self, client_id: str) -> dict:
+        """Get status for a specific client."""
+        import time
+        now = time.time()
+        
+        # Check if in backoff period
+        if client_id in self.backoff_durations:
+            remaining = self.backoff_durations[client_id] - now
+            if remaining > 0:
+                return {
+                    "status": "backoff",
+                    "remaining_seconds": remaining,
+                    "can_listen": False
+                }
+            else:
+                # Backoff expired
+                del self.backoff_durations[client_id]
+        
+        # Clean and count recent errors
+        if client_id in self.errors:
+            self.errors[client_id] = [
+                ts for ts in self.errors[client_id]
+                if now - ts < self.error_window
+            ]
+            error_count = len(self.errors[client_id])
+        else:
+            error_count = 0
+        
+        return {
+            "status": "ok" if error_count < 5 else "degraded",
+            "recent_errors": error_count,
+            "can_listen": True
+        }
+    
+    def get_stats(self) -> dict:
+        """Get overall statistics."""
+        import time
+        now = time.time()
+        
+        # Clean old errors
+        active_clients = 0
+        total_recent_errors = 0
+        for client_id in list(self.errors.keys()):
+            self.errors[client_id] = [
+                ts for ts in self.errors[client_id]
+                if now - ts < self.error_window
+            ]
+            if self.errors[client_id]:
+                active_clients += 1
+                total_recent_errors += len(self.errors[client_id])
+        
+        return {
+            "active_clients": active_clients,
+            "recent_errors": total_recent_errors,
+            "total_errors": self.total_errors,
+            "total_recoveries": self.total_recoveries,
+            "clients_in_backoff": len(self.backoff_durations)
+        }
+
+# Global speech recognition tracker
+speech_tracker = SpeechRecognitionTracker()
+
 
 async def broadcast_shutdown_notification():
     """Broadcast shutdown notification to all connected WebSocket clients"""
@@ -713,6 +840,31 @@ class JARVISVoiceAPI:
 
         # Personality
         self.router.add_api_route("/personality", self.get_personality, methods=["GET"])
+        
+        # ================================================================
+        # SPEECH RECOGNITION HEALTH ENDPOINTS
+        # ================================================================
+        # These endpoints help the frontend manage speech recognition errors
+        # and implement circuit breaker patterns for better reliability.
+        # ================================================================
+        self.router.add_api_route(
+            "/speech/health",
+            self.get_speech_health,
+            methods=["GET"],
+            summary="Get speech recognition health status"
+        )
+        self.router.add_api_route(
+            "/speech/error",
+            self.report_speech_error,
+            methods=["POST"],
+            summary="Report a speech recognition error"
+        )
+        self.router.add_api_route(
+            "/speech/recovery",
+            self.report_speech_recovery,
+            methods=["POST"],
+            summary="Report successful speech recovery"
+        )
 
         # WebSocket for real-time interaction
         # Note: WebSocket routes must be added using the decorator pattern in FastAPI
@@ -906,6 +1058,95 @@ class JARVISVoiceAPI:
                 },
                 "startup_announced": self._startup_announced,  # Tell frontend if announcement was made
             }
+
+    # ================================================================
+    # SPEECH RECOGNITION HEALTH ENDPOINTS
+    # ================================================================
+    
+    async def get_speech_health(self, client_id: str = "default") -> Dict:
+        """
+        Get speech recognition health status for a client.
+        
+        This endpoint helps the frontend determine if it should:
+        - Continue listening normally
+        - Back off due to too many errors
+        - Attempt recovery procedures
+        
+        Args:
+            client_id: Unique identifier for the client (e.g., browser session ID)
+            
+        Returns:
+            Health status with recommendations
+        """
+        client_status = speech_tracker.get_client_status(client_id)
+        global_stats = speech_tracker.get_stats()
+        
+        return {
+            "client": client_status,
+            "global": global_stats,
+            "recommendations": {
+                "can_listen": client_status["can_listen"],
+                "suggested_action": "continue" if client_status["status"] == "ok" else "reduce_frequency",
+                "retry_after_seconds": client_status.get("remaining_seconds", 0)
+            },
+            "timestamp": datetime.now().isoformat()
+        }
+    
+    async def report_speech_error(
+        self, 
+        client_id: str = "default",
+        error_type: str = "aborted",
+        error_message: str = ""
+    ) -> Dict:
+        """
+        Report a speech recognition error from the frontend.
+        
+        This allows the backend to track error patterns and provide
+        intelligent recovery recommendations.
+        
+        Args:
+            client_id: Unique identifier for the client
+            error_type: Type of error (aborted, no-speech, network, not-allowed, etc.)
+            error_message: Optional error message for debugging
+            
+        Returns:
+            Recovery advice for the client
+        """
+        result = speech_tracker.record_error(client_id, error_type)
+        
+        # Log significant errors (but not routine ones)
+        if error_type not in ["no-speech", "aborted"] or result.get("should_backoff"):
+            logger.warning(
+                f"[SPEECH] Client {client_id} error: {error_type} "
+                f"(count: {result['error_count']}, backoff: {result.get('should_backoff', False)})"
+            )
+        
+        return {
+            "status": "recorded",
+            "advice": result,
+            "timestamp": datetime.now().isoformat()
+        }
+    
+    async def report_speech_recovery(self, client_id: str = "default") -> Dict:
+        """
+        Report successful speech recognition recovery.
+        
+        This clears any backoff state and resets error tracking.
+        
+        Args:
+            client_id: Unique identifier for the client
+            
+        Returns:
+            Confirmation of recovery
+        """
+        speech_tracker.record_recovery(client_id)
+        logger.info(f"[SPEECH] Client {client_id} recovered successfully")
+        
+        return {
+            "status": "recovered",
+            "client_status": speech_tracker.get_client_status(client_id),
+            "timestamp": datetime.now().isoformat()
+        }
 
     async def activate(self) -> Dict:
         """Activate JARVIS voice system"""
@@ -2852,6 +3093,32 @@ class JARVISVoiceAPI:
                     await websocket.send_json(
                         {"type": "pong", "timestamp": datetime.now().isoformat()}
                     )
+                
+                elif data.get("type") == "speech_error":
+                    # Handle speech recognition errors from frontend
+                    client_id = data.get("client_id", f"ws_{id(websocket)}")
+                    error_type = data.get("error", "unknown")
+                    error_message = data.get("message", "")
+                    
+                    result = speech_tracker.record_error(client_id, error_type)
+                    
+                    # Send back advice
+                    await websocket.send_json({
+                        "type": "speech_advice",
+                        "advice": result,
+                        "timestamp": datetime.now().isoformat()
+                    })
+                
+                elif data.get("type") == "speech_recovery":
+                    # Handle successful speech recovery from frontend
+                    client_id = data.get("client_id", f"ws_{id(websocket)}")
+                    speech_tracker.record_recovery(client_id)
+                    
+                    await websocket.send_json({
+                        "type": "speech_status",
+                        "status": "recovered",
+                        "timestamp": datetime.now().isoformat()
+                    })
 
         except WebSocketDisconnect:
             logger.info("JARVIS WebSocket disconnected")
