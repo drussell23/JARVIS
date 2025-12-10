@@ -726,7 +726,7 @@ class ParallelInitializer:
             raise  # This is important for voice unlock
 
     async def _init_speaker_verification(self):
-        """Initialize speaker verification service"""
+        """Initialize speaker verification service and pre-warm ECAPA classifier"""
         try:
             from voice.speaker_verification_service import SpeakerVerificationService
 
@@ -745,6 +745,15 @@ class ParallelInitializer:
 
         except Exception as e:
             logger.warning(f"Speaker verification failed: {e}")
+
+        # Pre-warm local ECAPA classifier to avoid 12s cold start on first unlock
+        try:
+            from voice_unlock.intelligent_voice_unlock_service import prewarm_ecapa_classifier
+            logger.info("   Pre-warming ECAPA classifier for voice unlock...")
+            await prewarm_ecapa_classifier()
+            logger.info("   ECAPA classifier pre-warmed successfully")
+        except Exception as e:
+            logger.warning(f"   ECAPA pre-warm failed (non-fatal): {e}")
 
     async def _init_voice_unlock_api(self):
         """Ensure voice unlock API is mounted and components dict is populated"""

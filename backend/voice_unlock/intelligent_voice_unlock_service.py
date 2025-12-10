@@ -3706,6 +3706,56 @@ class RobustUnlockStage(Enum):
     COMPLETE = "complete"
 
 
+# =============================================================================
+# GLOBAL CACHED ECAPA CLASSIFIER - Avoids 12s cold start on each request
+# =============================================================================
+_cached_ecapa_classifier = None
+_ecapa_classifier_lock = asyncio.Lock()
+
+
+async def get_cached_ecapa_classifier():
+    """Get or create cached ECAPA classifier. Thread-safe singleton."""
+    global _cached_ecapa_classifier
+
+    if _cached_ecapa_classifier is not None:
+        return _cached_ecapa_classifier
+
+    async with _ecapa_classifier_lock:
+        # Double-check after acquiring lock
+        if _cached_ecapa_classifier is not None:
+            return _cached_ecapa_classifier
+
+        logger.info("[ROBUST-ECAPA] Loading ECAPA classifier (cold start)...")
+        start = time.time()
+
+        def _load_model():
+            from speechbrain.inference.speaker import EncoderClassifier
+            return EncoderClassifier.from_hparams(
+                source="speechbrain/spkrec-ecapa-voxceleb",
+                savedir=os.path.expanduser("~/.cache/speechbrain/spkrec-ecapa-voxceleb")
+            )
+
+        loop = asyncio.get_event_loop()
+        _cached_ecapa_classifier = await loop.run_in_executor(None, _load_model)
+
+        elapsed = time.time() - start
+        logger.info(f"[ROBUST-ECAPA] ECAPA classifier loaded in {elapsed:.2f}s")
+        return _cached_ecapa_classifier
+
+
+async def prewarm_ecapa_classifier():
+    """Pre-warm the ECAPA classifier at startup. Call this in server initialization."""
+    try:
+        logger.info("[ROBUST-ECAPA] Pre-warming ECAPA classifier...")
+        classifier = await get_cached_ecapa_classifier()
+        if classifier:
+            logger.info("[ROBUST-ECAPA] ECAPA classifier pre-warmed successfully")
+            return True
+    except Exception as e:
+        logger.error(f"[ROBUST-ECAPA] Failed to pre-warm ECAPA classifier: {e}")
+    return False
+
+
 async def _load_speaker_embedding_direct(speaker_name: str = "Derek") -> Optional[List[float]]:
     """Load speaker embedding directly from SQLite database."""
     import numpy as np
@@ -3867,11 +3917,16 @@ async def _extract_ecapa_robust(audio_bytes: bytes) -> Optional[List[float]]:
     except Exception as e:
         logger.warning(f"[ROBUST-ECAPA] Cloud ECAPA failed: {e}")
 
-    # Strategy 2: Local SpeechBrain with robust audio loading
+    # Strategy 2: Local SpeechBrain with CACHED classifier
     try:
-        logger.info("[ROBUST-ECAPA] Trying local SpeechBrain...")
+        logger.info("[ROBUST-ECAPA] Trying local SpeechBrain with cached classifier...")
 
-        def _local():
+        # Get cached classifier (async, loads once on first call)
+        classifier = await get_cached_ecapa_classifier()
+        if classifier is None:
+            raise ValueError("Failed to get ECAPA classifier")
+
+        def _extract_with_cached_classifier():
             import torchaudio
             import torch
 
@@ -3898,14 +3953,7 @@ async def _extract_ecapa_robust(audio_bytes: bytes) -> Optional[List[float]]:
 
             logger.info(f"[ROBUST-ECAPA] Final waveform: shape={waveform.shape}")
 
-            # Load ECAPA-TDNN model
-            from speechbrain.inference.speaker import EncoderClassifier
-            classifier = EncoderClassifier.from_hparams(
-                source="speechbrain/spkrec-ecapa-voxceleb",
-                savedir=os.path.expanduser("~/.cache/speechbrain/spkrec-ecapa-voxceleb")
-            )
-
-            # Extract embedding
+            # Extract embedding using CACHED classifier (no reload!)
             with torch.no_grad():
                 emb = classifier.encode_batch(waveform).squeeze().numpy()
 
@@ -3914,7 +3962,7 @@ async def _extract_ecapa_robust(audio_bytes: bytes) -> Optional[List[float]]:
 
         loop = asyncio.get_event_loop()
         embedding = await asyncio.wait_for(
-            loop.run_in_executor(None, _local),
+            loop.run_in_executor(None, _extract_with_cached_classifier),
             timeout=RobustUnlockConfig.ECAPA_EXTRACT_TIMEOUT
         )
         if embedding and len(embedding) == 192:
