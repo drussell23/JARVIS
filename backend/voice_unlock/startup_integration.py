@@ -509,6 +509,9 @@ class VoiceUnlockStartup:
         
         This is the CRITICAL first step - without profiles, unlock won't work.
         
+        IMPORTANT: This method uses the singleton VoiceProfileStartupService
+        which ensures profiles are only loaded ONCE even if called multiple times.
+        
         Returns:
             True if profiles are loaded and ready
         """
@@ -522,17 +525,17 @@ class VoiceUnlockStartup:
             
             self.voice_profile_service = get_voice_profile_service()
             
-            # Check if already loaded
+            # Check if already loaded (fast path - no logging spam)
             if is_voice_profile_ready():
                 profile_count = self.voice_profile_service.profile_count
-                logger.info(f"✅ Voice profiles already loaded: {profile_count} profile(s)")
+                logger.debug(f"Voice profiles already loaded: {profile_count} profile(s) - skipping")
                 self.profiles_loaded = True
                 return True
             
-            # Initialize with timeout
+            # Initialize with timeout (only log on first load)
             timeout = float(os.getenv("VOICE_PROFILE_LOAD_TIMEOUT", "30.0"))
             
-            logger.info(f"🔄 Initializing voice profiles (timeout={timeout}s)...")
+            logger.info(f"🔄 Loading voice profiles (timeout={timeout}s)...")
             
             success = await asyncio.wait_for(
                 initialize_voice_profiles(timeout=timeout),
@@ -543,20 +546,22 @@ class VoiceUnlockStartup:
                 profile_count = self.voice_profile_service.profile_count
                 metrics = self.voice_profile_service.metrics
                 
-                logger.info(
-                    f"✅ Voice profiles loaded: {profile_count} profile(s) "
-                    f"(CloudSQL={metrics.profiles_from_cloudsql}, "
-                    f"SQLite={metrics.profiles_from_sqlite})"
-                )
-                
-                # List loaded profiles
-                for name, profile in self.voice_profile_service.get_all_profiles().items():
-                    owner_tag = " [OWNER]" if profile.is_primary_user else ""
+                # Only log summary if this is the first successful load
+                if metrics.profiles_loaded > 0:
                     logger.info(
-                        f"   • {name}{owner_tag}: "
-                        f"dim={profile.embedding_dim}, "
-                        f"conf={profile.recognition_confidence:.1%}"
+                        f"✅ Voice profiles ready: {profile_count} profile(s) "
+                        f"(CloudSQL={metrics.profiles_from_cloudsql}, "
+                        f"SQLite={metrics.profiles_from_sqlite})"
                     )
+                    
+                    # List loaded profiles (only once)
+                    for name, profile in self.voice_profile_service.get_all_profiles().items():
+                        owner_tag = " [OWNER]" if profile.is_primary_user else ""
+                        logger.info(
+                            f"   • {name}{owner_tag}: "
+                            f"dim={profile.embedding_dim}, "
+                            f"conf={profile.recognition_confidence:.1%}"
+                        )
                 
                 self.profiles_loaded = True
                 return True

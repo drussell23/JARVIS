@@ -850,8 +850,11 @@ class IntelligentVoiceUnlockService:
             """
             Initialize unified voice cache manager for instant voice recognition.
 
-            CRITICAL: This preloads Derek's voice profile from SQLite at startup
+            CRITICAL: This preloads your voice profile from SQLite at startup
             so voice matching is instant (<5ms) without recomputing embeddings!
+            
+            NOTE: If VoiceProfileStartupService has already loaded profiles,
+            this will reuse them instead of loading again (prevents duplicates).
             """
             try:
                 from voice_unlock.unified_voice_cache_manager import (
@@ -859,8 +862,18 @@ class IntelligentVoiceUnlockService:
                     initialize_unified_cache,
                 )
 
-                # Initialize the unified cache manager
+                # Get the singleton cache manager
                 self.unified_cache = get_unified_cache_manager()
+                
+                # Check if profiles are already loaded (by VoiceUnlockStartup or another component)
+                existing_profiles = self.unified_cache.profiles_loaded
+                if existing_profiles > 0:
+                    logger.info(
+                        f"📋 Unified Voice Cache already has {existing_profiles} profile(s) - reusing"
+                    )
+                    return
+                
+                # Initialize the unified cache manager (will check for duplicates internally)
                 success = await initialize_unified_cache(
                     preload_profiles=True,
                     preload_models=False,  # Models loaded elsewhere
@@ -868,10 +881,13 @@ class IntelligentVoiceUnlockService:
 
                 if success:
                     profiles_loaded = self.unified_cache.profiles_loaded
-                    logger.info(
-                        f"🎯 Unified Voice Cache initialized "
-                        f"({profiles_loaded} profile(s) preloaded for instant recognition)"
-                    )
+                    if profiles_loaded > 0:
+                        logger.info(
+                            f"🎯 Unified Voice Cache initialized "
+                            f"({profiles_loaded} profile(s) preloaded for instant recognition)"
+                        )
+                    else:
+                        logger.debug("Unified Voice Cache initialized (profiles loaded elsewhere)")
                 else:
                     logger.warning("⚠️ Unified Voice Cache initialization failed - fallback to standard matching")
                     self.unified_cache = None

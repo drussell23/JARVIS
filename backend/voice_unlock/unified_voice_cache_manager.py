@@ -1176,8 +1176,11 @@ class UnifiedVoiceCacheManager:
         """
         Preload voice profiles with robust CloudSQL → SQLite synchronization.
 
-        ENHANCED v2.0: Uses VoiceProfileStartupService for production-grade
+        ENHANCED v2.1: Uses VoiceProfileStartupService for production-grade
         voice profile loading with automatic CloudSQL sync to SQLite.
+        
+        CRITICAL: This method is idempotent - it will NOT reload profiles
+        if they are already loaded. Multiple calls return cached count.
 
         This is the KEY optimization - loads your voice embedding at startup
         so voice matching is instant (no database query needed).
@@ -1190,6 +1193,13 @@ class UnifiedVoiceCacheManager:
         Returns:
             Number of profiles preloaded
         """
+        # CRITICAL: Skip if profiles already loaded to prevent duplicates
+        if len(self._preloaded_profiles) > 0:
+            logger.debug(
+                f"UnifiedVoiceCacheManager: {len(self._preloaded_profiles)} profile(s) already loaded - skipping reload"
+            )
+            return len(self._preloaded_profiles)
+        
         self._state = CacheState.LOADING_PROFILES
 
         try:
@@ -1203,12 +1213,37 @@ class UnifiedVoiceCacheManager:
                 from voice_unlock.voice_profile_startup_service import (
                     get_voice_profile_service,
                     initialize_voice_profiles,
+                    is_voice_profile_ready,
                 )
+                
+                # Check if service already has profiles (avoid duplicate loading)
+                service = get_voice_profile_service()
+                
+                if service.is_ready and service.profile_count > 0:
+                    logger.info(
+                        f"📋 VoiceProfileStartupService already has {service.profile_count} profile(s) - reusing"
+                    )
+                    # Just copy profiles to local cache (no reload)
+                    for speaker_name, profile_data in service.get_all_profiles().items():
+                        if profile_data.is_valid() and speaker_name not in self._preloaded_profiles:
+                            profile = VoiceProfile(
+                                speaker_name=profile_data.speaker_name,
+                                embedding=profile_data.embedding,
+                                embedding_dimensions=profile_data.embedding_dim,
+                                total_samples=profile_data.total_samples,
+                                avg_confidence=profile_data.recognition_confidence,
+                                source=profile_data.source.value,
+                            )
+                            self._preloaded_profiles[speaker_name] = profile
+                            loaded += 1
+                    
+                    self._stats.profiles_preloaded = loaded
+                    logger.info(f"✅ Copied {loaded} profile(s) from VoiceProfileStartupService cache")
+                    return loaded
                 
                 logger.info("🔄 Using VoiceProfileStartupService for profile loading...")
                 
                 # Initialize the service (handles CloudSQL → SQLite sync)
-                service = get_voice_profile_service()
                 init_timeout = float(os.getenv("VOICE_PROFILE_INIT_TIMEOUT", "30.0"))
                 
                 success = await asyncio.wait_for(

@@ -275,22 +275,29 @@ class VoiceProfileStartupService:
     5. Provide fast profile lookup for voice unlock
     
     Thread-safe and async-compatible.
+    
+    CRITICAL: This is a singleton service that ensures profiles are only loaded ONCE.
+    Multiple components may request initialization, but loading only happens once.
     """
     
     _instance: Optional['VoiceProfileStartupService'] = None
     _lock = threading.Lock()
+    _creation_count = 0  # Track creation for debugging
     
     def __new__(cls):
-        """Singleton pattern for global access."""
+        """Singleton pattern for global access - ensures only ONE instance exists."""
         with cls._lock:
             if cls._instance is None:
                 cls._instance = super().__new__(cls)
-                cls._instance._initialized = False
+                cls._instance._constructed = False
+                cls._creation_count += 1
+                logger.debug(f"🔐 VoiceProfileStartupService: Created singleton instance #{cls._creation_count}")
             return cls._instance
     
     def __init__(self):
         """Initialize the service (only once due to singleton)."""
-        if self._initialized:
+        # CRITICAL: Use _constructed flag to prevent re-initialization
+        if hasattr(self, '_constructed') and self._constructed:
             return
         
         self._config = _config
@@ -306,8 +313,13 @@ class VoiceProfileStartupService:
         self._cloudsql_manager = None
         self._sqlite_conn: Optional[sqlite3.Connection] = None
         
-        self._initialized = True
-        logger.info("🔐 VoiceProfileStartupService initialized")
+        # Track loading state to prevent duplicates
+        self._loading_in_progress = False
+        self._load_completed = False
+        self._load_count = 0  # Track how many times load was attempted
+        
+        self._constructed = True
+        logger.info("🔐 VoiceProfileStartupService singleton constructed")
     
     @property
     def is_ready(self) -> bool:
@@ -328,6 +340,9 @@ class VoiceProfileStartupService:
         """
         Initialize the service and load voice profiles.
         
+        CRITICAL: This method is idempotent - calling it multiple times
+        will NOT reload profiles. Once loaded, profiles remain in memory.
+        
         Loading priority:
         1. CloudSQL (if available) - authoritative source
         2. SQLite learning database - local cache
@@ -341,11 +356,42 @@ class VoiceProfileStartupService:
         """
         timeout = timeout or self._config.sync_timeout_seconds
         
+        # FAST PATH: Already ready, skip initialization entirely
+        if self._ready_event.is_set() and len(self._profiles) > 0:
+            logger.debug(
+                f"VoiceProfileStartupService already initialized with {len(self._profiles)} profile(s) - skipping"
+            )
+            return True
+        
         async with self._async_lock:
-            if self._ready_event.is_set():
-                logger.debug("VoiceProfileStartupService already initialized")
+            # Double-check after acquiring lock (another caller may have initialized)
+            if self._ready_event.is_set() and len(self._profiles) > 0:
+                logger.debug(
+                    f"VoiceProfileStartupService initialized by another caller - "
+                    f"{len(self._profiles)} profile(s) already loaded"
+                )
                 return True
             
+            # Prevent concurrent loading
+            if self._loading_in_progress:
+                logger.debug("VoiceProfileStartupService loading already in progress - waiting...")
+                # Wait for load to complete with timeout
+                try:
+                    await asyncio.wait_for(self._ready_event.wait(), timeout=timeout)
+                    return self._ready_event.is_set()
+                except asyncio.TimeoutError:
+                    logger.warning("Timeout waiting for profile loading to complete")
+                    return False
+            
+            # Track this load attempt
+            self._load_count += 1
+            if self._load_count > 1:
+                logger.info(
+                    f"⚠️ VoiceProfileStartupService.initialize() called {self._load_count} times - "
+                    f"this may indicate duplicate initialization in startup flow"
+                )
+            
+            self._loading_in_progress = True
             start_time = time.time()
             self._metrics.sync_status = SyncStatus.IN_PROGRESS
             
@@ -374,6 +420,7 @@ class VoiceProfileStartupService:
                 
                 if loaded > 0:
                     self._metrics.sync_status = SyncStatus.COMPLETED
+                    self._load_completed = True
                     self._ready_event.set()
                     
                     # Start background tasks
@@ -402,6 +449,10 @@ class VoiceProfileStartupService:
                 self._metrics.last_error = str(e)
                 logger.error(f"❌ Voice profile initialization failed: {e}")
                 return False
+                
+            finally:
+                # ALWAYS reset loading flag so retries can work
+                self._loading_in_progress = False
     
     async def _check_cloudsql_availability(self) -> bool:
         """Check if CloudSQL is available and configured."""
