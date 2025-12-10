@@ -704,11 +704,14 @@ const JarvisVoice = () => {
   const isWaitingForCommandRef = useRef(false);
 
   // Circuit breaker for restart loop prevention
+  // v2.0: More tolerant thresholds to prevent false positives during voice unlock
   const restartCircuitBreakerRef = useRef({
     count: 0,
     lastReset: Date.now(),
-    threshold: 5,  // Max restarts per window
-    windowMs: 10000  // 10 second window
+    threshold: 10,  // Increased from 5 - voice unlock causes multiple restarts
+    windowMs: 15000,  // Increased from 10s - give more time for recovery
+    consecutiveFailures: 0,
+    lastSuccessTime: Date.now()
   });
 
   // Track if we should skip the next restart (e.g., due to aborted error)
@@ -2640,22 +2643,29 @@ const JarvisVoice = () => {
           if (now - breaker.lastReset > breaker.windowMs) {
             breaker.count = 0;
             breaker.lastReset = now;
+            breaker.consecutiveFailures = 0;  // Also reset consecutive failures
           }
 
           // Check if we've exceeded threshold
           breaker.count++;
           if (breaker.count > breaker.threshold) {
-            console.warn(`🚨 Circuit breaker tripped: ${breaker.count} restarts in ${breaker.windowMs}ms`);
-            console.warn('⛔ Stopping continuous listening to prevent infinite loop');
-            continuousListeningRef.current = false;
-            setContinuousListening(false);
-            setError('⚠️ Too many microphone restarts - please restart manually');
-            setMicStatus('error');
-            skipNextRestartRef.current = false;  // Reset flag
-            return;  // Don't restart
+            // Only trip if we have actual consecutive failures
+            if (breaker.consecutiveFailures > 3) {
+              console.warn(`🚨 Circuit breaker tripped: ${breaker.count} restarts, ${breaker.consecutiveFailures} consecutive failures`);
+              console.warn('⛔ Stopping continuous listening to prevent infinite loop');
+              continuousListeningRef.current = false;
+              setContinuousListening(false);
+              setError('⚠️ Microphone issues detected - click the mic button to restart');
+              setMicStatus('error');
+              skipNextRestartRef.current = false;
+              return;
+            } else {
+              // Many restarts but working - just log it
+              console.log(`ℹ️ High restart count (${breaker.count}) but no consecutive failures - continuing`);
+            }
           }
 
-          console.log(`♾️ Indefinite listening active - restarting microphone (${breaker.count}/${breaker.threshold})...`);
+          console.log(`♾️ Indefinite listening active - restarting microphone (restart ${breaker.count}, failures: ${breaker.consecutiveFailures})...`);
 
           // Track restart attempts
           let restartAttempt = 0;
@@ -2670,11 +2680,14 @@ const JarvisVoice = () => {
               setError(''); // Clear any errors
               setMicStatus('ready');
 
-              // Reset speech timestamp
+              // Reset speech timestamp and track success
               lastSpeechTimeRef.current = Date.now();
+              restartCircuitBreakerRef.current.consecutiveFailures = 0;
+              restartCircuitBreakerRef.current.lastSuccessTime = Date.now();
             } catch (e) {
               if (e.message && e.message.includes('already started')) {
                 console.log('Microphone already active');
+                restartCircuitBreakerRef.current.consecutiveFailures = 0; // Not a failure
                 return;
               }
 
@@ -2686,9 +2699,17 @@ const JarvisVoice = () => {
                 console.log(`Retrying in ${delay}ms...`);
                 setTimeout(attemptRestart, delay);
               } else {
-                console.error('Failed to restart microphone after max attempts');
-                setError('Microphone restart failed - click to retry');
-                setMicStatus('error');
+                restartCircuitBreakerRef.current.consecutiveFailures++;
+                console.error(`Failed to restart microphone after ${maxAttempts} attempts (consecutive failures: ${restartCircuitBreakerRef.current.consecutiveFailures})`);
+                
+                // Only show error if we have multiple consecutive failures
+                if (restartCircuitBreakerRef.current.consecutiveFailures >= 3) {
+                  setError('Microphone restart failed - click to retry');
+                  setMicStatus('error');
+                } else {
+                  // Temporary issue, will retry on next speech end
+                  console.log('Single restart failure - will retry on next cycle');
+                }
               }
             }
           };
@@ -3030,54 +3051,119 @@ const JarvisVoice = () => {
     isRecordingVoiceRef.current = true;
     console.log('🎤 [VoiceCapture] Recording flag set - starting audio capture for voice biometrics...');
 
-    try {
-      // Get microphone access
-      voiceAudioStreamRef.current = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          channelCount: 1,  // Mono
-          sampleRate: 16000, // 16kHz optimal for speech recognition
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true
+    // Retry configuration
+    const maxRetries = 3;
+    const retryDelays = [100, 300, 1000]; // Exponential-ish backoff
+    
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+      try {
+        // Clean up any existing stream first to prevent resource conflicts
+        if (voiceAudioStreamRef.current) {
+          console.log('🎤 [VoiceCapture] Cleaning up previous stream...');
+          try {
+            voiceAudioStreamRef.current.getTracks().forEach(track => {
+              track.stop();
+            });
+          } catch (e) {
+            console.debug('🎤 [VoiceCapture] Previous stream cleanup:', e.message);
+          }
+          voiceAudioStreamRef.current = null;
         }
-      });
+        
+        // Clean up any existing recorder
+        if (voiceAudioRecorderRef.current) {
+          try {
+            if (voiceAudioRecorderRef.current.state !== 'inactive') {
+              voiceAudioRecorderRef.current.stop();
+            }
+          } catch (e) {
+            console.debug('🎤 [VoiceCapture] Previous recorder cleanup:', e.message);
+          }
+          voiceAudioRecorderRef.current = null;
+        }
+        
+        // Small delay to ensure resources are fully released
+        if (attempt > 0) {
+          await new Promise(resolve => setTimeout(resolve, retryDelays[attempt - 1]));
+          console.log(`🎤 [VoiceCapture] Retry attempt ${attempt + 1}/${maxRetries}...`);
+        }
+        
+        // Get microphone access with robust constraints
+        voiceAudioStreamRef.current = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            channelCount: 1,  // Mono
+            sampleRate: { ideal: 16000, min: 8000, max: 48000 }, // Flexible sample rate
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true
+          }
+        });
 
-      // Try different MIME types for compatibility
-      const mimeTypes = [
-        'audio/webm;codecs=opus',
-        'audio/webm',
-        'audio/ogg;codecs=opus',
-        'audio/wav'
-      ];
+        // Try different MIME types for compatibility
+        const mimeTypes = [
+          'audio/webm;codecs=opus',
+          'audio/webm',
+          'audio/ogg;codecs=opus',
+          'audio/wav'
+        ];
 
-      let selectedMimeType = mimeTypes.find(type => MediaRecorder.isTypeSupported(type));
-      if (!selectedMimeType) {
-        console.warn('🎤 [VoiceCapture] No supported MIME type, using default');
-        selectedMimeType = '';
+        let selectedMimeType = mimeTypes.find(type => MediaRecorder.isTypeSupported(type));
+        if (!selectedMimeType) {
+          console.warn('🎤 [VoiceCapture] No supported MIME type, using default');
+          selectedMimeType = '';
+        }
+
+        voiceAudioRecorderRef.current = new MediaRecorder(
+          voiceAudioStreamRef.current,
+          selectedMimeType ? { mimeType: selectedMimeType } : {}
+        );
+
+        // Collect audio chunks
+        voiceAudioChunksRef.current = [];
+        voiceAudioRecorderRef.current.ondataavailable = (event) => {
+          if (event.data.size > 0) {
+            voiceAudioChunksRef.current.push(event.data);
+          }
+        };
+        
+        // Handle recorder errors gracefully
+        voiceAudioRecorderRef.current.onerror = (event) => {
+          console.error('🎤 [VoiceCapture] MediaRecorder error:', event.error);
+          // Don't set mic error status - the recorder is separate from speech recognition
+        };
+
+        // Start recording with 100ms chunks for continuous capture
+        voiceAudioRecorderRef.current.start(100);
+
+        console.log(`🎤 [VoiceCapture] Recording started (${selectedMimeType || 'default'})`);
+        return; // Success - exit retry loop
+        
+      } catch (error) {
+        console.warn(`🎤 [VoiceCapture] Attempt ${attempt + 1} failed:`, error.message);
+        
+        // Check if it's a permission error (don't retry)
+        if (error.name === 'NotAllowedError' || error.name === 'PermissionDeniedError') {
+          console.error('🎤 [VoiceCapture] Microphone permission denied - not retrying');
+          isRecordingVoiceRef.current = false;
+          // Don't set micStatus to error - speech recognition might still work
+          return;
+        }
+        
+        // Check if it's a device error (don't retry)
+        if (error.name === 'NotFoundError') {
+          console.error('🎤 [VoiceCapture] No microphone found - not retrying');
+          isRecordingVoiceRef.current = false;
+          return;
+        }
+        
+        // For other errors, continue to next retry attempt
+        if (attempt === maxRetries - 1) {
+          console.error('🎤 [VoiceCapture] Failed after all retries:', error);
+          isRecordingVoiceRef.current = false;
+          // Don't set mic error - voice commands still work, just without biometric audio
+          console.warn('🎤 [VoiceCapture] Voice biometric capture unavailable - commands will still work');
+        }
       }
-
-      voiceAudioRecorderRef.current = new MediaRecorder(
-        voiceAudioStreamRef.current,
-        selectedMimeType ? { mimeType: selectedMimeType } : {}
-      );
-
-      // Collect audio chunks
-      voiceAudioChunksRef.current = [];
-      voiceAudioRecorderRef.current.ondataavailable = (event) => {
-        if (event.data.size > 0) {
-          voiceAudioChunksRef.current.push(event.data);
-        }
-      };
-
-      // Start recording with 100ms chunks for continuous capture
-      voiceAudioRecorderRef.current.start(100);
-      // Note: isRecordingVoiceRef.current was set at the top of this function
-
-      console.log(`🎤 [VoiceCapture] Recording started (${selectedMimeType || 'default'})`);
-    } catch (error) {
-      console.error('🎤 [VoiceCapture] Failed to start recording:', error);
-      // Reset flag on error
-      isRecordingVoiceRef.current = false;
     }
   };
 
@@ -3091,8 +3177,9 @@ const JarvisVoice = () => {
 
     // Wait for recorder to be initialized if it's still starting
     let waitAttempts = 0;
-    while (!voiceAudioRecorderRef.current && waitAttempts < 20) {
-      console.log('🎤 [VoiceCapture] Waiting for recorder to initialize...');
+    const maxWaitAttempts = 20;
+    while (!voiceAudioRecorderRef.current && waitAttempts < maxWaitAttempts) {
+      console.log(`🎤 [VoiceCapture] Waiting for recorder to initialize (${waitAttempts + 1}/${maxWaitAttempts})...`);
       await new Promise(resolve => setTimeout(resolve, 50));
       waitAttempts++;
     }
@@ -3104,60 +3191,99 @@ const JarvisVoice = () => {
     }
 
     return new Promise((resolve) => {
-      if (voiceAudioRecorderRef.current && voiceAudioRecorderRef.current.state !== 'inactive') {
-        voiceAudioRecorderRef.current.onstop = async () => {
-          console.log(`🎤 [VoiceCapture] Recording stopped, captured ${voiceAudioChunksRef.current.length} chunks`);
-
-          if (voiceAudioChunksRef.current.length === 0) {
-            resolve(null);
-            return;
-          }
-
-          // Create audio blob
-          const audioBlob = new Blob(voiceAudioChunksRef.current, {
-            type: voiceAudioRecorderRef.current.mimeType || 'audio/webm'
-          });
-
-          console.log(`🎤 [VoiceCapture] Audio blob created: ${audioBlob.size} bytes`);
-
-          // Get actual sample rate from the audio stream (browser may override requested rate)
-          const actualSampleRate = voiceAudioStreamRef.current?.getAudioTracks()[0]?.getSettings().sampleRate || 16000;
-          console.log(`🎤 [VoiceCapture] Actual sample rate: ${actualSampleRate}Hz`);
-
-          // Convert to base64
-          const reader = new FileReader();
-          reader.onloadend = () => {
-            const base64Audio = reader.result.split(',')[1]; // Remove data:audio/...;base64, prefix
-            console.log(`🎤 [VoiceCapture] Converted to base64: ${base64Audio.length} chars`);
-            // Return object with audio data and metadata
-            resolve({
-              audio: base64Audio,
-              sampleRate: actualSampleRate,
-              mimeType: voiceAudioRecorderRef.current.mimeType || 'audio/webm'
+      // Set a timeout to prevent hanging forever
+      const timeoutId = setTimeout(() => {
+        console.warn('🎤 [VoiceCapture] Stop operation timed out, cleaning up...');
+        cleanupAndResolve(null);
+      }, 5000); // 5 second timeout
+      
+      const cleanupAndResolve = (result) => {
+        clearTimeout(timeoutId);
+        
+        // Stop audio stream AFTER getting the data
+        if (voiceAudioStreamRef.current) {
+          try {
+            voiceAudioStreamRef.current.getTracks().forEach(track => {
+              track.stop();
             });
+          } catch (e) {
+            console.debug('🎤 [VoiceCapture] Stream cleanup:', e.message);
+          }
+          voiceAudioStreamRef.current = null;
+        }
+        
+        // Clear recorder reference
+        voiceAudioRecorderRef.current = null;
+        
+        // Reset recording flag
+        isRecordingVoiceRef.current = false;
+        
+        resolve(result);
+      };
+      
+      try {
+        if (voiceAudioRecorderRef.current && voiceAudioRecorderRef.current.state !== 'inactive') {
+          // Store reference to mimeType before clearing
+          const mimeType = voiceAudioRecorderRef.current.mimeType || 'audio/webm';
+          
+          voiceAudioRecorderRef.current.onstop = async () => {
+            console.log(`🎤 [VoiceCapture] Recording stopped, captured ${voiceAudioChunksRef.current.length} chunks`);
+
+            if (voiceAudioChunksRef.current.length === 0) {
+              cleanupAndResolve(null);
+              return;
+            }
+
+            try {
+              // Create audio blob
+              const audioBlob = new Blob(voiceAudioChunksRef.current, { type: mimeType });
+              console.log(`🎤 [VoiceCapture] Audio blob created: ${audioBlob.size} bytes`);
+
+              // Get actual sample rate from the audio stream (browser may override requested rate)
+              const actualSampleRate = voiceAudioStreamRef.current?.getAudioTracks()[0]?.getSettings()?.sampleRate || 16000;
+              console.log(`🎤 [VoiceCapture] Actual sample rate: ${actualSampleRate}Hz`);
+
+              // Convert to base64
+              const reader = new FileReader();
+              reader.onloadend = () => {
+                try {
+                  const base64Audio = reader.result.split(',')[1]; // Remove data:audio/...;base64, prefix
+                  console.log(`🎤 [VoiceCapture] Converted to base64: ${base64Audio?.length || 0} chars`);
+                  
+                  // Clear audio chunks
+                  voiceAudioChunksRef.current = [];
+                  
+                  // Return object with audio data and metadata
+                  cleanupAndResolve({
+                    audio: base64Audio,
+                    sampleRate: actualSampleRate,
+                    mimeType: mimeType
+                  });
+                } catch (e) {
+                  console.error('🎤 [VoiceCapture] Error processing audio:', e);
+                  cleanupAndResolve(null);
+                }
+              };
+              reader.onerror = () => {
+                console.error('🎤 [VoiceCapture] Failed to convert to base64');
+                cleanupAndResolve(null);
+              };
+              reader.readAsDataURL(audioBlob);
+            } catch (e) {
+              console.error('🎤 [VoiceCapture] Error creating audio blob:', e);
+              cleanupAndResolve(null);
+            }
           };
-          reader.onerror = () => {
-            console.error('🎤 [VoiceCapture] Failed to convert to base64');
-            resolve(null);
-          };
-          reader.readAsDataURL(audioBlob);
 
-          // Clean up audio chunks
-          voiceAudioChunksRef.current = [];
-        };
-
-        voiceAudioRecorderRef.current.stop();
-      } else {
-        resolve(null);
+          voiceAudioRecorderRef.current.stop();
+        } else {
+          console.log('🎤 [VoiceCapture] Recorder already inactive');
+          cleanupAndResolve(null);
+        }
+      } catch (e) {
+        console.error('🎤 [VoiceCapture] Error stopping recorder:', e);
+        cleanupAndResolve(null);
       }
-
-      // Stop audio stream
-      if (voiceAudioStreamRef.current) {
-        voiceAudioStreamRef.current.getTracks().forEach(track => track.stop());
-        voiceAudioStreamRef.current = null;
-      }
-
-      isRecordingVoiceRef.current = false;
     });
   };
 
