@@ -355,12 +355,14 @@ class CloudECAPAClientConfig:
 
 class SpotVMBackend:
     """
-    Manages GCP Spot VM for ECAPA processing.
+    Manages GCP Spot VM for ECAPA processing with robust error handling.
 
     Integrates with GCPVMManager for:
     - Auto-creation when Cloud Run is unavailable/slow
     - Scale-to-zero (auto-terminate after idle)
     - Cost tracking
+    - Circuit breaker protection for fault tolerance
+    - Graceful fallback on failures
     """
 
     def __init__(self):
@@ -370,6 +372,11 @@ class SpotVMBackend:
         self._initialized = False
         self._creating = False
         self._last_activity = time.time()
+        self._initialization_error: Optional[str] = None
+        self._consecutive_failures = 0
+        self._max_consecutive_failures = 3
+        self._last_failure_time: Optional[float] = None
+        self._circuit_open_until: Optional[float] = None
 
         # Stats
         self._stats = {
@@ -377,10 +384,48 @@ class SpotVMBackend:
             "vm_terminations": 0,
             "requests_handled": 0,
             "total_cost": 0.0,
+            "creation_failures": 0,
+            "circuit_opens": 0,
         }
 
+    def _is_circuit_open(self) -> bool:
+        """Check if circuit breaker is open (blocking new attempts)."""
+        if self._circuit_open_until is None:
+            return False
+        if time.time() >= self._circuit_open_until:
+            # Circuit breaker recovery period elapsed
+            self._circuit_open_until = None
+            self._consecutive_failures = 0
+            logger.info("🔌 Spot VM circuit breaker recovered - allowing new attempts")
+            return False
+        return True
+
+    def _open_circuit(self, duration_seconds: float = 300):
+        """Open the circuit breaker for a specified duration."""
+        self._circuit_open_until = time.time() + duration_seconds
+        self._stats["circuit_opens"] += 1
+        logger.warning(
+            f"🔴 Spot VM circuit breaker OPEN for {duration_seconds}s "
+            f"(failures: {self._consecutive_failures})"
+        )
+
+    def _record_failure(self):
+        """Record a failure and potentially open the circuit breaker."""
+        self._consecutive_failures += 1
+        self._last_failure_time = time.time()
+        self._stats["creation_failures"] += 1
+        
+        if self._consecutive_failures >= self._max_consecutive_failures:
+            # Open circuit for 5 minutes
+            self._open_circuit(300)
+
+    def _record_success(self):
+        """Record a success and reset failure counter."""
+        self._consecutive_failures = 0
+        self._circuit_open_until = None
+
     async def initialize(self) -> bool:
-        """Initialize Spot VM backend."""
+        """Initialize Spot VM backend with robust error handling."""
         if self._initialized:
             return True
 
@@ -388,43 +433,103 @@ class SpotVMBackend:
             logger.info("ℹ️  Spot VM backend disabled by configuration")
             return False
 
+        # Check circuit breaker
+        if self._is_circuit_open():
+            logger.debug("Spot VM initialization blocked by circuit breaker")
+            return False
+
         try:
             # Import GCP VM Manager (lazy import to avoid circular deps)
-            from core.gcp_vm_manager import get_gcp_vm_manager, COMPUTE_AVAILABLE
+            # Try multiple import paths for flexibility
+            get_gcp_vm_manager_safe = None
+            COMPUTE_AVAILABLE = False
+            
+            for import_path in [
+                "core.gcp_vm_manager",
+                "backend.core.gcp_vm_manager",
+            ]:
+                try:
+                    module = __import__(import_path, fromlist=[
+                        "get_gcp_vm_manager_safe", 
+                        "get_gcp_vm_manager",
+                        "COMPUTE_AVAILABLE"
+                    ])
+                    # Prefer safe getter if available
+                    get_gcp_vm_manager_safe = getattr(module, "get_gcp_vm_manager_safe", None)
+                    if get_gcp_vm_manager_safe is None:
+                        # Fallback to regular getter
+                        get_gcp_vm_manager_safe = getattr(module, "get_gcp_vm_manager", None)
+                    COMPUTE_AVAILABLE = getattr(module, "COMPUTE_AVAILABLE", False)
+                    break
+                except ImportError:
+                    continue
+
+            if get_gcp_vm_manager_safe is None:
+                logger.info(
+                    "ℹ️  Spot VM backend unavailable (gcp_vm_manager not found). "
+                    "Using Cloud Run only."
+                )
+                self._initialization_error = "gcp_vm_manager module not found"
+                return False
 
             if not COMPUTE_AVAILABLE:
                 logger.info(
                     "ℹ️  Spot VM backend unavailable (google-cloud-compute not installed). "
                     "Using Cloud Run only. Install with: pip install google-cloud-compute"
                 )
+                self._initialization_error = "google-cloud-compute not installed"
                 return False
 
-            self._vm_manager = await get_gcp_vm_manager()
+            # Use safe manager getter that returns None instead of throwing
+            self._vm_manager = await get_gcp_vm_manager_safe()
+            
+            if self._vm_manager is None:
+                logger.info(
+                    "ℹ️  GCP VM Manager not available. "
+                    "Using Cloud Run as primary backend."
+                )
+                self._initialization_error = "GCP VM Manager initialization returned None"
+                return False
+
             self._initialized = True
+            self._initialization_error = None
+            self._record_success()
             logger.info("✅ Spot VM backend initialized")
             return True
+
         except ImportError as e:
             logger.info(
                 f"ℹ️  Spot VM backend unavailable: {e}. "
                 "Cloud Run will be used as primary backend."
             )
+            self._initialization_error = str(e)
             return False
         except RuntimeError as e:
             # This is expected when google-cloud-compute isn't installed
-            if "not installed" in str(e).lower():
+            error_msg = str(e).lower()
+            if "not installed" in error_msg or "not available" in error_msg:
                 logger.info(
                     "ℹ️  Spot VM backend unavailable (GCP Compute API not configured). "
                     "Using Cloud Run as primary backend."
                 )
             else:
                 logger.warning(f"⚠️  Spot VM backend initialization error: {e}")
+                self._record_failure()
+            self._initialization_error = str(e)
             return False
         except Exception as e:
             logger.warning(f"⚠️  Spot VM backend initialization failed: {e}")
+            self._initialization_error = str(e)
+            self._record_failure()
             return False
 
     async def ensure_vm_available(self) -> bool:
         """Ensure a Spot VM is available for ECAPA processing."""
+        # Check circuit breaker first
+        if self._is_circuit_open():
+            logger.debug("Spot VM operations blocked by circuit breaker")
+            return False
+
         if not self._initialized:
             if not await self.initialize():
                 return False
@@ -433,12 +538,13 @@ class SpotVMBackend:
         if self._active_vm and self._vm_endpoint:
             # Verify it's still running
             try:
-                await self._health_check()
-                return True
+                if await self._health_check():
+                    return True
             except Exception:
-                logger.warning("Active Spot VM unhealthy, will create new one")
-                self._active_vm = None
-                self._vm_endpoint = None
+                pass
+            logger.warning("Active Spot VM unhealthy, will create new one")
+            self._active_vm = None
+            self._vm_endpoint = None
 
         # Create a new Spot VM if needed
         if not self._creating:
@@ -447,23 +553,44 @@ class SpotVMBackend:
         return False
 
     async def _create_vm(self) -> bool:
-        """Create a new Spot VM for ECAPA."""
+        """Create a new Spot VM for ECAPA with robust error handling."""
         if not self._vm_manager:
+            logger.debug("VM manager not available - cannot create VM")
+            return False
+
+        # Check circuit breaker
+        if self._is_circuit_open():
+            logger.debug("VM creation blocked by circuit breaker")
             return False
 
         self._creating = True
         logger.info("🚀 Creating Spot VM for ECAPA processing...")
 
         try:
-            # Get memory snapshot for VM creation decision
-            from core.platform_memory_monitor import get_memory_snapshot
-            memory_snapshot = await get_memory_snapshot()
+            # Get memory snapshot for VM creation decision (with fallback)
+            memory_snapshot = None
+            try:
+                for import_path in ["core.platform_memory_monitor", "backend.core.platform_memory_monitor"]:
+                    try:
+                        module = __import__(import_path, fromlist=["get_memory_snapshot"])
+                        get_memory_snapshot = getattr(module, "get_memory_snapshot", None)
+                        if get_memory_snapshot:
+                            memory_snapshot = await get_memory_snapshot()
+                            break
+                    except ImportError:
+                        continue
+            except Exception as e:
+                logger.debug(f"Could not get memory snapshot: {e}")
 
             # Create the VM
             vm = await self._vm_manager.create_vm(
                 components=["ecapa-tdnn", "speaker-embedding"],
                 trigger_reason="Cloud ECAPA client fallback",
-                metadata={"client": "cloud_ecapa_client", "version": "18.2.0"}
+                metadata={
+                    "client": "cloud_ecapa_client", 
+                    "version": "19.2.0",
+                    "memory_pressure": str(memory_snapshot) if memory_snapshot else "unknown"
+                }
             )
 
             if vm:
@@ -473,16 +600,22 @@ class SpotVMBackend:
                     self._vm_endpoint = f"http://{vm.ip_address}:8010/api/ml"
                 elif vm.internal_ip:
                     self._vm_endpoint = f"http://{vm.internal_ip}:8010/api/ml"
+                else:
+                    self._vm_endpoint = None
+                    logger.warning("VM created but no IP address available yet")
 
                 self._stats["vm_creations"] += 1
-                logger.info(f"✅ Spot VM created: {vm.name} ({self._vm_endpoint})")
+                self._record_success()
+                logger.info(f"✅ Spot VM created: {vm.name} ({self._vm_endpoint or 'IP pending'})")
                 return True
             else:
-                logger.error("Failed to create Spot VM")
+                logger.warning("VM creation returned None - may have hit rate limits or budget")
+                self._record_failure()
                 return False
 
         except Exception as e:
             logger.error(f"Error creating Spot VM: {e}")
+            self._record_failure()
             return False
         finally:
             self._creating = False
@@ -533,35 +666,45 @@ class SpotVMBackend:
         return False
 
     async def terminate_vm(self, reason: str = "Manual"):
-        """Terminate the active Spot VM."""
+        """Terminate the active Spot VM with graceful error handling."""
         if not self._active_vm or not self._vm_manager:
             return
 
         logger.info(f"🛑 Terminating Spot VM: {reason}")
+        vm_name = self._active_vm.name
 
         try:
             # Update cost before termination
-            self._active_vm.update_cost()
-            self._stats["total_cost"] += self._active_vm.total_cost
+            if hasattr(self._active_vm, 'update_cost'):
+                self._active_vm.update_cost()
+                self._stats["total_cost"] += getattr(self._active_vm, 'total_cost', 0.0)
 
-            await self._vm_manager.terminate_vm(
-                self._active_vm.name,
-                reason=reason
-            )
+            await self._vm_manager.terminate_vm(vm_name, reason=reason)
             self._stats["vm_terminations"] += 1
+            logger.info(f"✅ Spot VM terminated: {vm_name}")
 
         except Exception as e:
-            logger.error(f"Error terminating Spot VM: {e}")
+            logger.error(f"Error terminating Spot VM {vm_name}: {e}")
+            # Don't record failure for termination - VM might already be gone
         finally:
             self._active_vm = None
             self._vm_endpoint = None
 
     def get_stats(self) -> Dict[str, Any]:
+        """Get comprehensive stats including circuit breaker status."""
         return {
             **self._stats,
             "active_vm": self._active_vm.name if self._active_vm else None,
             "endpoint": self._vm_endpoint,
             "idle_minutes": (time.time() - self._last_activity) / 60,
+            "initialized": self._initialized,
+            "initialization_error": self._initialization_error,
+            "circuit_breaker": {
+                "is_open": self._is_circuit_open(),
+                "consecutive_failures": self._consecutive_failures,
+                "max_failures": self._max_consecutive_failures,
+                "open_until": self._circuit_open_until,
+            },
         }
 
 
