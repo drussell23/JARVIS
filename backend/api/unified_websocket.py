@@ -43,6 +43,15 @@ except ImportError as e:
     VBI_TRACER_AVAILABLE = False
     logger.warning(f"[WS] VBI Debug Tracer not available: {e}")
 
+# Import ROBUST voice unlock handler (v1.0.0) - guaranteed timeouts, never hangs
+try:
+    from voice_unlock.intelligent_voice_unlock_service import process_voice_unlock_robust
+    ROBUST_UNLOCK_AVAILABLE = True
+    logger.info("[WS] ✅ Robust Voice Unlock v1.0.0 available (timeout-protected, parallel)")
+except ImportError as e:
+    ROBUST_UNLOCK_AVAILABLE = False
+    logger.warning(f"[WS] Robust Voice Unlock not available: {e}")
+
 # Import streaming safeguard for command detection
 try:
     from voice.streaming_safeguard import (
@@ -1119,100 +1128,135 @@ class UnifiedWebSocketManager:
                         for keyword in ["screen unlock", "voice unlock", "unlock my screen", "unlock screen"]
                     )
 
-                    if is_unlock_command and audio_data_received and VBI_TRACER_AVAILABLE:
-                        # Use VBI Pipeline Orchestrator for voice unlock with full tracing
-                        logger.info(f"[WS-VBI] Using VBI Pipeline Orchestrator for voice unlock")
-                        try:
-                            orchestrator = get_orchestrator()
+                    if is_unlock_command and audio_data_received:
+                        # ============================================================
+                        # ROBUST VOICE UNLOCK v1.0.0 - Primary Handler
+                        # ============================================================
+                        # Uses timeout-protected parallel processing that NEVER hangs.
+                        # Falls back to legacy VBI pipeline only if robust handler fails.
+                        # ============================================================
 
-                            # Create progress callback to send real-time updates via WebSocket
-                            async def vbi_progress_callback(progress_data: dict):
-                                """
-                                Send VBI progress updates to frontend in real-time.
-                                
-                                Supports both Cloud-First VBI format and legacy format:
-                                - Cloud-First: {"stage": "...", "progress": N, "message": "..."}
-                                - Legacy: {"stage_name": "...", "status": "...", "progress": N}
-                                """
-                                try:
-                                    if websocket:
-                                        # Normalize progress data for frontend
-                                        normalized = {
-                                            "type": "vbi_progress",
-                                            "stage": progress_data.get("stage", progress_data.get("stage_name", "unknown")),
-                                            "progress": progress_data.get("progress", 0),
-                                            "message": progress_data.get("message", progress_data.get("status", "")),
-                                            "timestamp": progress_data.get("timestamp", time.time()),
-                                        }
-                                        
-                                        # Include additional data if present
-                                        if "confidence" in progress_data:
-                                            normalized["confidence"] = progress_data["confidence"]
-                                        if "speaker" in progress_data:
-                                            normalized["speaker"] = progress_data["speaker"]
-                                        if "cloud_available" in progress_data:
-                                            normalized["cloud_available"] = progress_data["cloud_available"]
-                                        if "cached" in progress_data:
-                                            normalized["cached"] = progress_data["cached"]
-                                        
-                                        await websocket.send_json(normalized)
-                                        logger.debug(
-                                            f"[WS-VBI] Progress: {normalized['stage']} "
-                                            f"({normalized['progress']}%) - {normalized['message']}"
-                                        )
-                                except Exception as ws_err:
-                                    logger.warning(f"[WS-VBI] Failed to send progress update: {ws_err}")
+                        if ROBUST_UNLOCK_AVAILABLE:
+                            logger.info(f"[WS-ROBUST] Using ROBUST Voice Unlock (timeout-protected)")
+                            try:
+                                # Create progress callback for WebSocket updates
+                                async def robust_progress_callback(progress_data: dict):
+                                    try:
+                                        if websocket:
+                                            normalized = {
+                                                "type": "vbi_progress",
+                                                "stage": progress_data.get("stage", "unknown"),
+                                                "progress": progress_data.get("progress", 0),
+                                                "message": progress_data.get("message", ""),
+                                                "timestamp": progress_data.get("timestamp", time.time()),
+                                            }
+                                            await websocket.send_json(normalized)
+                                    except Exception as ws_err:
+                                        logger.debug(f"[WS-ROBUST] Progress send error: {ws_err}")
 
-                            vbi_result = await orchestrator.process_voice_unlock(
-                                command=command_text,
-                                audio_data=audio_data_received,
-                                sample_rate=sample_rate_received or 16000,
-                                mime_type=mime_type_received or "audio/webm",
-                                progress_callback=vbi_progress_callback
-                            )
+                                # Call robust handler with 15s max timeout
+                                robust_result = await process_voice_unlock_robust(
+                                    command=command_text,
+                                    audio_data=audio_data_received,
+                                    sample_rate=sample_rate_received or 16000,
+                                    mime_type=mime_type_received or "audio/webm",
+                                    progress_callback=robust_progress_callback
+                                )
 
-                            # Get full trace data for frontend display
-                            trace_id = vbi_result.get("trace_id", "")
-                            vbi_trace = None
-                            if trace_id and VBI_TRACER_AVAILABLE:
-                                try:
-                                    tracer = get_tracer()
-                                    # Get the most recent completed trace
-                                    recent_traces = tracer.get_recent_traces(1)
-                                    if recent_traces:
-                                        vbi_trace = recent_traces[0]
-                                except Exception as trace_err:
-                                    logger.warning(f"[WS-VBI] Could not get trace data: {trace_err}")
+                                result = {
+                                    "type": "voice_unlock",
+                                    "response": robust_result.get("response", ""),
+                                    "message": robust_result.get("response", ""),
+                                    "success": robust_result.get("success", False),
+                                    "command_type": "voice_unlock",
+                                    "speaker_name": robust_result.get("speaker_name", ""),
+                                    "confidence": robust_result.get("confidence", 0.0),
+                                    "trace_id": robust_result.get("trace_id", ""),
+                                    "handler": "robust_v1",
+                                    "metadata": robust_result
+                                }
 
-                            result = {
-                                "type": "voice_unlock",  # CRITICAL: Frontend uses this to route to correct handler
-                                "response": vbi_result.get("response", ""),
-                                "message": vbi_result.get("response", ""),  # Alias for frontend compatibility
-                                "success": vbi_result.get("success", False),
-                                "command_type": "voice_unlock",
-                                "speaker_name": vbi_result.get("speaker_name", ""),
-                                "confidence": vbi_result.get("confidence", 0.0),
-                                "trace_id": trace_id,
-                                "vbi_trace": vbi_trace,  # Full trace for frontend display
-                                "metadata": vbi_result
-                            }
+                                logger.info(f"[WS-ROBUST] Result: success={result['success']}, "
+                                           f"confidence={result['confidence']:.1%}, "
+                                           f"duration={robust_result.get('total_duration_ms', 0):.0f}ms")
 
-                            logger.info(f"[WS-VBI] VBI Pipeline Result:")
-                            logger.info(f"   Success: {result['success']}")
-                            logger.info(f"   Response: {result['response'][:100]}")
-                            logger.info(f"   Speaker: {result.get('speaker_name', 'N/A')}")
-                            logger.info(f"   Confidence: {result.get('confidence', 0):.1%}")
-                            logger.info(f"   Trace ID: {trace_id}")
-                            logger.info(f"   Trace Data: {'Included' if vbi_trace else 'Not available'}")
+                            except Exception as robust_error:
+                                logger.error(f"[WS-ROBUST] Error: {robust_error}", exc_info=True)
+                                result = None  # Fall through to legacy VBI
 
-                        except Exception as vbi_error:
-                            logger.error(f"[WS-VBI] VBI Pipeline Error: {vbi_error}", exc_info=True)
-                            # Fall back to standard processing
-                            logger.info(f"[WS-VBI] Falling back to standard JARVIS API")
-                            result = None
+                        # ============================================================
+                        # LEGACY VBI Pipeline - Fallback Handler
+                        # ============================================================
+                        if result is None and VBI_TRACER_AVAILABLE:
+                            logger.info(f"[WS-VBI] Falling back to legacy VBI Pipeline Orchestrator")
+                            try:
+                                orchestrator = get_orchestrator()
 
-                    else:
-                        result = None  # Will process through standard path
+                                # Create progress callback to send real-time updates via WebSocket
+                                async def vbi_progress_callback(progress_data: dict):
+                                    """Send VBI progress updates to frontend in real-time."""
+                                    try:
+                                        if websocket:
+                                            normalized = {
+                                                "type": "vbi_progress",
+                                                "stage": progress_data.get("stage", progress_data.get("stage_name", "unknown")),
+                                                "progress": progress_data.get("progress", 0),
+                                                "message": progress_data.get("message", progress_data.get("status", "")),
+                                                "timestamp": progress_data.get("timestamp", time.time()),
+                                            }
+                                            if "confidence" in progress_data:
+                                                normalized["confidence"] = progress_data["confidence"]
+                                            if "speaker" in progress_data:
+                                                normalized["speaker"] = progress_data["speaker"]
+                                            await websocket.send_json(normalized)
+                                    except Exception as ws_err:
+                                        logger.warning(f"[WS-VBI] Failed to send progress update: {ws_err}")
+
+                                vbi_result = await orchestrator.process_voice_unlock(
+                                    command=command_text,
+                                    audio_data=audio_data_received,
+                                    sample_rate=sample_rate_received or 16000,
+                                    mime_type=mime_type_received or "audio/webm",
+                                    progress_callback=vbi_progress_callback
+                                )
+
+                                # Get full trace data for frontend display
+                                trace_id = vbi_result.get("trace_id", "")
+                                vbi_trace = None
+                                if trace_id and VBI_TRACER_AVAILABLE:
+                                    try:
+                                        tracer = get_tracer()
+                                        recent_traces = tracer.get_recent_traces(1)
+                                        if recent_traces:
+                                            vbi_trace = recent_traces[0]
+                                    except Exception as trace_err:
+                                        logger.warning(f"[WS-VBI] Could not get trace data: {trace_err}")
+
+                                result = {
+                                    "type": "voice_unlock",
+                                    "response": vbi_result.get("response", ""),
+                                    "message": vbi_result.get("response", ""),
+                                    "success": vbi_result.get("success", False),
+                                    "command_type": "voice_unlock",
+                                    "speaker_name": vbi_result.get("speaker_name", ""),
+                                    "confidence": vbi_result.get("confidence", 0.0),
+                                    "trace_id": trace_id,
+                                    "vbi_trace": vbi_trace,
+                                    "handler": "legacy_vbi",
+                                    "metadata": vbi_result
+                                }
+
+                                logger.info(f"[WS-VBI] Legacy VBI Pipeline Result:")
+                                logger.info(f"   Success: {result['success']}")
+                                logger.info(f"   Confidence: {result.get('confidence', 0):.1%}")
+
+                            except Exception as vbi_error:
+                                logger.error(f"[WS-VBI] VBI Pipeline Error: {vbi_error}", exc_info=True)
+                                result = None
+
+                        # No unlock handler available
+                        if result is None and not ROBUST_UNLOCK_AVAILABLE and not VBI_TRACER_AVAILABLE:
+                            result = None  # Will process through standard path
 
                     # Standard JARVIS API processing (for non-unlock or no audio)
                     if result is None:

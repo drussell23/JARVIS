@@ -3658,3 +3658,311 @@ def get_intelligent_unlock_service() -> IntelligentVoiceUnlockService:
     if _intelligent_unlock_service is None:
         _intelligent_unlock_service = IntelligentVoiceUnlockService()
     return _intelligent_unlock_service
+
+
+# =============================================================================
+# ROBUST VOICE UNLOCK v1.0.0 - Timeout-Protected Parallel Processing
+# =============================================================================
+# This section provides a simplified, robust voice unlock that:
+# 1. Has HARD timeouts on every operation (guaranteed to never hang)
+# 2. Uses direct database queries (no complex cache layers)
+# 3. Runs ECAPA extraction and profile loading in parallel
+# 4. Fails gracefully with informative error messages
+# =============================================================================
+
+import base64
+import sqlite3
+import time
+import traceback
+from enum import Enum
+
+
+class RobustUnlockConfig:
+    """Configuration for robust unlock with environment overrides."""
+    MAX_TOTAL_TIMEOUT = float(os.environ.get("JARVIS_ROBUST_MAX_TIMEOUT", "15.0"))
+    AUDIO_DECODE_TIMEOUT = float(os.environ.get("JARVIS_ROBUST_AUDIO_TIMEOUT", "2.0"))
+    PROFILE_LOAD_TIMEOUT = float(os.environ.get("JARVIS_ROBUST_PROFILE_TIMEOUT", "3.0"))
+    ECAPA_EXTRACT_TIMEOUT = float(os.environ.get("JARVIS_ROBUST_ECAPA_TIMEOUT", "8.0"))
+    UNLOCK_EXECUTE_TIMEOUT = float(os.environ.get("JARVIS_ROBUST_UNLOCK_TIMEOUT", "5.0"))
+    CONFIDENCE_THRESHOLD = float(os.environ.get("JARVIS_ROBUST_THRESHOLD", "0.40"))
+    LEARNING_DB_PATH = os.path.expanduser("~/.jarvis/learning/jarvis_learning.db")
+
+
+class RobustUnlockStage(Enum):
+    """Stages in the robust unlock pipeline."""
+    INIT = "init"
+    AUDIO_DECODE = "audio_decode"
+    PROFILE_LOAD = "profile_load"
+    ECAPA_EXTRACT = "ecapa_extract"
+    VERIFICATION = "verification"
+    UNLOCK_EXECUTE = "unlock_execute"
+    COMPLETE = "complete"
+
+
+async def _load_speaker_embedding_direct(speaker_name: str = "Derek") -> Optional[List[float]]:
+    """Load speaker embedding directly from SQLite database."""
+    import numpy as np
+
+    db_path = RobustUnlockConfig.LEARNING_DB_PATH
+    if not os.path.exists(db_path):
+        logger.warning(f"[ROBUST] Database not found: {db_path}")
+        return None
+
+    try:
+        def _load():
+            conn = sqlite3.connect(db_path, timeout=2.0)
+            cursor = conn.cursor()
+            queries = [
+                ("speaker_profiles", "voiceprint_embedding", "speaker_name"),
+                ("speaker_profiles", "embedding", "speaker_name"),
+                ("voice_profiles", "embedding", "speaker_name"),
+            ]
+            embedding = None
+            for table, emb_col, name_col in queries:
+                try:
+                    cursor.execute(f"""
+                        SELECT {emb_col} FROM {table}
+                        WHERE {name_col} LIKE ? OR {name_col} LIKE ? LIMIT 1
+                    """, (f"%{speaker_name}%", f"%{speaker_name.lower()}%"))
+                    row = cursor.fetchone()
+                    if row and row[0]:
+                        raw = row[0]
+                        if isinstance(raw, bytes):
+                            try:
+                                embedding = np.frombuffer(raw, dtype=np.float32).tolist()
+                                if len(embedding) == 192:
+                                    break
+                            except:
+                                pass
+                except sqlite3.Error:
+                    continue
+            conn.close()
+            return embedding
+
+        loop = asyncio.get_event_loop()
+        return await asyncio.wait_for(
+            loop.run_in_executor(None, _load),
+            timeout=RobustUnlockConfig.PROFILE_LOAD_TIMEOUT
+        )
+    except asyncio.TimeoutError:
+        logger.error("[ROBUST] Profile load timeout")
+    except Exception as e:
+        logger.error(f"[ROBUST] Profile load error: {e}")
+    return None
+
+
+async def _extract_ecapa_robust(audio_bytes: bytes) -> Optional[List[float]]:
+    """Extract ECAPA embedding with timeout-protected fallbacks."""
+    import numpy as np
+
+    # Strategy 1: Cloud ECAPA
+    try:
+        logger.info("[ROBUST] Trying cloud ECAPA...")
+        from voice_unlock.cloud_ecapa_client import get_cloud_ecapa_client
+        client = await asyncio.wait_for(get_cloud_ecapa_client(), timeout=3.0)
+        if client:
+            embedding = await asyncio.wait_for(
+                client.extract_embedding(audio_data=audio_bytes, sample_rate=16000,
+                                         format="float32", use_cache=True, use_fast_path=True),
+                timeout=RobustUnlockConfig.ECAPA_EXTRACT_TIMEOUT
+            )
+            if embedding is not None and len(embedding) == 192:
+                logger.info("[ROBUST] Cloud ECAPA succeeded")
+                return embedding.tolist() if hasattr(embedding, 'tolist') else list(embedding)
+    except asyncio.TimeoutError:
+        logger.warning("[ROBUST] Cloud ECAPA timeout")
+    except Exception as e:
+        logger.warning(f"[ROBUST] Cloud ECAPA failed: {e}")
+
+    # Strategy 2: Local SpeechBrain
+    try:
+        logger.info("[ROBUST] Trying local SpeechBrain...")
+
+        def _local():
+            from speechbrain.inference.speaker import EncoderClassifier
+            import torchaudio
+            import torch
+            import io
+            waveform, sr = torchaudio.load(io.BytesIO(audio_bytes))
+            if sr != 16000:
+                waveform = torchaudio.transforms.Resample(sr, 16000)(waveform)
+            if waveform.shape[0] > 1:
+                waveform = waveform.mean(dim=0, keepdim=True)
+            classifier = EncoderClassifier.from_hparams(
+                source="speechbrain/spkrec-ecapa-voxceleb",
+                savedir=os.path.expanduser("~/.cache/speechbrain/spkrec-ecapa-voxceleb")
+            )
+            with torch.no_grad():
+                emb = classifier.encode_batch(waveform).squeeze().numpy()
+            return emb.tolist()
+
+        loop = asyncio.get_event_loop()
+        embedding = await asyncio.wait_for(
+            loop.run_in_executor(None, _local),
+            timeout=RobustUnlockConfig.ECAPA_EXTRACT_TIMEOUT
+        )
+        if embedding and len(embedding) == 192:
+            logger.info("[ROBUST] Local SpeechBrain succeeded")
+            return embedding
+    except asyncio.TimeoutError:
+        logger.error("[ROBUST] Local SpeechBrain timeout")
+    except Exception as e:
+        logger.error(f"[ROBUST] Local SpeechBrain failed: {e}")
+    return None
+
+
+async def _decode_audio_robust(audio_base64: str, mime_type: str = "audio/webm") -> Optional[bytes]:
+    """Decode and convert audio to WAV format."""
+    try:
+        raw = base64.b64decode(audio_base64)
+        if raw[:4] == b'RIFF' and raw[8:12] == b'WAVE':
+            return raw
+
+        def _convert():
+            import subprocess
+            proc = subprocess.Popen(
+                ['ffmpeg', '-i', 'pipe:0', '-f', 'wav', '-ar', '16000', '-ac', '1', '-acodec', 'pcm_s16le', 'pipe:1'],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            )
+            wav, _ = proc.communicate(input=raw, timeout=5.0)
+            return wav if proc.returncode == 0 and len(wav) > 44 else None
+
+        loop = asyncio.get_event_loop()
+        wav = await asyncio.wait_for(
+            loop.run_in_executor(None, _convert),
+            timeout=RobustUnlockConfig.AUDIO_DECODE_TIMEOUT
+        )
+        return wav if wav else raw
+    except Exception as e:
+        logger.error(f"[ROBUST] Audio decode error: {e}")
+    return None
+
+
+def _verify_speaker_robust(test_emb: List[float], ref_emb: List[float]) -> Tuple[bool, float]:
+    """Verify speaker using cosine similarity."""
+    import numpy as np
+    test = np.array(test_emb, dtype=np.float32)
+    ref = np.array(ref_emb, dtype=np.float32)
+    test_n = test / (np.linalg.norm(test) + 1e-10)
+    ref_n = ref / (np.linalg.norm(ref) + 1e-10)
+    sim = float(np.dot(test_n, ref_n))
+    verified = sim >= RobustUnlockConfig.CONFIDENCE_THRESHOLD
+    logger.info(f"[ROBUST] Verification: sim={sim:.4f}, threshold={RobustUnlockConfig.CONFIDENCE_THRESHOLD}, verified={verified}")
+    return verified, sim
+
+
+async def _execute_unlock_robust(speaker_name: str) -> bool:
+    """Execute screen unlock."""
+    try:
+        from voice_unlock.macos_screen_lock import MacOSScreenLock
+        lock = MacOSScreenLock()
+        loop = asyncio.get_event_loop()
+        return await asyncio.wait_for(
+            loop.run_in_executor(None, lock.unlock, speaker_name),
+            timeout=RobustUnlockConfig.UNLOCK_EXECUTE_TIMEOUT
+        )
+    except Exception as e:
+        logger.error(f"[ROBUST] Unlock failed: {e}")
+    return False
+
+
+async def process_voice_unlock_robust(
+    command: str,
+    audio_data: str,
+    sample_rate: int = 16000,
+    mime_type: str = "audio/webm",
+    progress_callback: Optional[Callable[[Dict[str, Any]], Any]] = None
+) -> Dict[str, Any]:
+    """
+    Robust voice unlock with hard timeouts and parallel processing.
+    GUARANTEED to return within MAX_TOTAL_TIMEOUT seconds.
+    """
+    start = time.time()
+    stages = []
+
+    async def progress(stage: str, pct: int, msg: str):
+        if progress_callback:
+            try:
+                data = {"type": "vbi_progress", "stage": stage, "progress": pct, "message": msg, "timestamp": time.time()}
+                if asyncio.iscoroutinefunction(progress_callback):
+                    await progress_callback(data)
+                else:
+                    progress_callback(data)
+            except:
+                pass
+
+    def result(success: bool, msg: str, speaker: str = "Unknown", conf: float = 0.0, err: str = None):
+        return {
+            "success": success, "response": msg, "speaker_name": speaker,
+            "confidence": conf, "total_duration_ms": (time.time() - start) * 1000,
+            "error": err, "trace_id": f"robust_{int(time.time())}", "stages": stages, "handler": "robust_v1"
+        }
+
+    try:
+        async def _unlock():
+            logger.info("=" * 60)
+            logger.info(f"[ROBUST] VOICE UNLOCK STARTED - {len(audio_data)} bytes audio")
+            logger.info("=" * 60)
+
+            await progress("init", 5, "Starting...")
+
+            # Parallel: decode audio + load profile
+            await progress("audio_decode", 15, "Decoding audio...")
+            audio_task = asyncio.create_task(_decode_audio_robust(audio_data, mime_type))
+            profile_task = asyncio.create_task(_load_speaker_embedding_direct("Derek"))
+
+            try:
+                audio_bytes, ref_emb = await asyncio.gather(audio_task, profile_task, return_exceptions=True)
+            except Exception as e:
+                return result(False, f"Parallel load failed: {e}", err=str(e))
+
+            if isinstance(audio_bytes, Exception) or not audio_bytes:
+                return result(False, "Failed to decode audio", err=str(audio_bytes) if isinstance(audio_bytes, Exception) else "No audio")
+
+            stages.append({"stage": "audio_decode", "success": True})
+
+            if isinstance(ref_emb, Exception) or not ref_emb:
+                logger.warning(f"[ROBUST] No reference embedding: {ref_emb}")
+            else:
+                stages.append({"stage": "profile_load", "success": True, "dim": len(ref_emb)})
+                logger.info(f"[ROBUST] Reference embedding: {len(ref_emb)} dims")
+
+            await progress("ecapa_extract", 45, "Extracting voiceprint...")
+            test_emb = await _extract_ecapa_robust(audio_bytes)
+
+            if not test_emb:
+                return result(False, "Failed to extract voiceprint", err="ECAPA failed")
+
+            stages.append({"stage": "ecapa_extract", "success": True, "dim": len(test_emb)})
+            await progress("verification", 75, "Verifying speaker...")
+
+            if not ref_emb:
+                return result(False, "No voice profile found", conf=0.0, err="No reference embedding")
+
+            verified, conf = _verify_speaker_robust(test_emb, ref_emb)
+            stages.append({"stage": "verification", "success": verified, "confidence": conf})
+
+            if not verified:
+                await progress("verification", 80, f"Failed: {conf:.1%}")
+                return result(False, f"Voice not verified ({conf:.1%})", conf=conf)
+
+            await progress("unlock_execute", 90, "Unlocking...")
+            unlocked = await _execute_unlock_robust("Derek")
+            stages.append({"stage": "unlock_execute", "success": unlocked})
+
+            if not unlocked:
+                return result(False, "Screen unlock failed", speaker="Derek", conf=conf, err="Unlock execution failed")
+
+            await progress("complete", 100, "Unlocked!")
+            return result(True, f"Verified. Unlocking for you, Derek.", speaker="Derek", conf=conf)
+
+        res = await asyncio.wait_for(_unlock(), timeout=RobustUnlockConfig.MAX_TOTAL_TIMEOUT)
+        logger.info(f"[ROBUST] RESULT: {'SUCCESS' if res['success'] else 'FAILED'} in {res['total_duration_ms']:.0f}ms")
+        return res
+
+    except asyncio.TimeoutError:
+        logger.error(f"[ROBUST] Total timeout ({RobustUnlockConfig.MAX_TOTAL_TIMEOUT}s)")
+        return result(False, "Voice unlock timed out", err=f"Timeout after {RobustUnlockConfig.MAX_TOTAL_TIMEOUT}s")
+    except Exception as e:
+        logger.error(f"[ROBUST] Error: {e}\n{traceback.format_exc()}")
+        return result(False, f"Voice unlock error: {e}", err=str(e))
