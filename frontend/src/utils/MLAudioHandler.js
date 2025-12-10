@@ -31,8 +31,10 @@ class MLAudioHandler {
             predictionThreshold: 0.7
         };
 
-        // Wait for config service before initializing
-        this.initializeWhenReady();
+        // Wait for config service AND backend to be ready before initializing
+        // This prevents WebSocket connection spam during startup
+        this.backendReady = false;
+        this.initializeWhenBackendReady();
 
         // Browser detection
         this.browserInfo = this.detectBrowser();
@@ -134,21 +136,61 @@ class MLAudioHandler {
         return false;
     }
 
-    async initializeWhenReady() {
+    async initializeWhenBackendReady() {
         try {
+            // First wait for config service to discover backend
             await configService.waitForConfig();
-            console.log('ML Audio: Config service ready, initializing...');
+            console.log('ML Audio: Config discovered, waiting for backend to be ready...');
             
+            // Now wait for backend to be FULLY ready (not just discovered)
+            // This prevents WebSocket connection spam during startup
+            const maxWaitTime = 60000; // 60 seconds max
+            const startTime = Date.now();
+            
+            while (Date.now() - startTime < maxWaitTime) {
+                const backendState = configService.getBackendState();
+                
+                // Check if backend is truly ready (startup complete, WebSocket available)
+                if (backendState.ready || backendState.status === 'ready') {
+                    console.log('ML Audio: Backend is READY, initializing WebSocket...');
+                    this.backendReady = true;
+                    break;
+                }
+                
+                // Also check startup progress > 90% as an indicator
+                const startupProgress = configService.getStartupProgress();
+                if (startupProgress && startupProgress.progress >= 90) {
+                    console.log(`ML Audio: Backend startup at ${startupProgress.progress}%, initializing...`);
+                    this.backendReady = true;
+                    break;
+                }
+                
+                // Wait and check again
+                await new Promise(resolve => setTimeout(resolve, 2000));
+            }
+            
+            if (!this.backendReady) {
+                // Timeout - try anyway but with warnings
+                console.warn('ML Audio: Backend readiness timeout - attempting connection anyway');
+                this.backendReady = true;
+            }
+
             // Load configuration from backend
             await this.loadConfiguration();
-            
+
             // Initialize WebSocket connection to ML backend
-            setTimeout(() => this.connectToMLBackend(), 2000);
+            // Delay slightly to ensure backend WebSocket endpoints are ready
+            setTimeout(() => this.connectToMLBackend(), 3000);
         } catch (error) {
             console.error('ML Audio: Failed to initialize', error);
-            // Retry initialization
-            setTimeout(() => this.initializeWhenReady(), 5000);
+            // Retry initialization with longer delay
+            setTimeout(() => this.initializeWhenBackendReady(), 10000);
         }
+    }
+    
+    // Legacy method name for compatibility
+    async initializeWhenReady() {
+        return this.initializeWhenBackendReady();
     }
 
     async loadConfiguration() {
@@ -171,9 +213,19 @@ class MLAudioHandler {
     }
 
     async connectToMLBackend() {
+        // Don't attempt connection if backend isn't ready yet
+        if (!this.backendReady) {
+            // Silent skip - will be called again after backend is ready
+            return;
+        }
+        
         if (this.isConnecting || this.connectionAttempts >= this.maxConnectionAttempts) {
             if (this.connectionAttempts >= this.maxConnectionAttempts) {
-                console.warn('ML Audio: Max connection attempts reached, stopping reconnection');
+                // Only warn once
+                if (!this._maxAttemptsWarned) {
+                    console.debug('ML Audio: Max connection attempts reached, operating without ML features');
+                    this._maxAttemptsWarned = true;
+                }
             }
             return;
         }
@@ -189,46 +241,64 @@ class MLAudioHandler {
                 wsUrl = configService.getWebSocketUrl('audio/ml/stream');
             }
             if (!wsUrl) {
-                console.warn('ML Audio: WebSocket URL not available yet');
+                // Silent debug log, not warning
+                if (this.connectionAttempts === 1) {
+                    console.debug('ML Audio: Waiting for WebSocket URL...');
+                }
                 this.isConnecting = false;
                 setTimeout(() => this.connectToMLBackend(), 5000);
                 return;
             }
             
+            // Only log on first connection attempt
+            if (this.connectionAttempts === 1) {
+                console.log('ML Audio: Connecting to backend...');
+            }
+            
             this.ws = new WebSocket(wsUrl);
 
             this.ws.onopen = () => {
-                console.log('Connected to ML Audio Backend');
+                console.log('✅ ML Audio: Connected to backend WebSocket');
                 this.connectionAttempts = 0;
                 this.currentBackoffDelay = 1000;
                 this.isConnecting = false;
+                this._maxAttemptsWarned = false;
                 this.sendTelemetry('connection', { status: 'connected' });
             };
 
             this.ws.onmessage = (event) => {
-                const data = JSON.parse(event.data);
-                this.handleMLMessage(data);
+                try {
+                    const data = JSON.parse(event.data);
+                    this.handleMLMessage(data);
+                } catch (e) {
+                    // Ignore non-JSON messages silently
+                }
             };
 
             this.ws.onerror = (error) => {
-                // Don't log every error to avoid spam
-                if (this.connectionAttempts === 1) {
-                    console.warn('ML Audio WebSocket not available, will retry...');
-                }
+                // Silent - errors will be handled by onclose
             };
 
             this.ws.onclose = () => {
                 this.isConnecting = false;
                 if (this.connectionAttempts < this.maxConnectionAttempts) {
-                    const delay = Math.min(this.currentBackoffDelay, 30000); // Max 30s
-                    console.log(`ML Audio WebSocket closed, retrying in ${delay / 1000}s (attempt ${this.connectionAttempts}/${this.maxConnectionAttempts})`);
+                    // Exponential backoff with jitter to prevent thundering herd
+                    const jitter = Math.random() * 1000;
+                    const delay = Math.min(this.currentBackoffDelay + jitter, 30000);
+                    
+                    // Only log every 5th attempt to reduce spam
+                    if (this.connectionAttempts % 5 === 0) {
+                        console.debug(`ML Audio: Reconnecting (attempt ${this.connectionAttempts}/${this.maxConnectionAttempts})`);
+                    }
+                    
                     setTimeout(() => this.connectToMLBackend(), delay);
                     this.currentBackoffDelay = Math.floor(this.currentBackoffDelay * this.backoffMultiplier);
                 }
             };
         } catch (error) {
             this.isConnecting = false;
-            console.error('Failed to connect to ML backend:', error);
+            // Silent reconnect
+            setTimeout(() => this.connectToMLBackend(), 5000);
         }
     }
 
@@ -250,14 +320,21 @@ class MLAudioHandler {
     }
 
     async handleAudioError(error, recognition) {
-        // Handle "no-speech" errors quietly - they're expected during silence
-        if (error.error === 'no-speech') {
-            // Don't log to console - this is normal behavior
-            // Just update metrics silently
-            this.metrics.noSpeechEvents = (this.metrics.noSpeechEvents || 0) + 1;
+        // Handle common expected errors silently
+        const silentErrors = ['no-speech', 'aborted', 'network'];
+        const errorCode = error.error || error.name;
+        
+        if (silentErrors.includes(errorCode)) {
+            // Update metrics silently without console spam
+            this.metrics[`${errorCode}Events`] = (this.metrics[`${errorCode}Events`] || 0) + 1;
+            
+            // Only log actual problems, not routine events
+            if (errorCode === 'network' && this.metrics.networkEvents % 10 === 1) {
+                console.debug('ML Audio: Intermittent network issue (monitoring)');
+            }
         } else {
-            // Log actual errors
-            console.error('Audio error detected:', error);
+            // Log actual unexpected errors
+            console.warn('ML Audio: Unexpected error:', errorCode);
             this.metrics.errors++;
         }
 

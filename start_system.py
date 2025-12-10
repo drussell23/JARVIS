@@ -15511,44 +15511,118 @@ async def main():
             ecapa_verification_result["errors"].append(f"ML Registry error: {str(e)}")
             print(f"{Colors.FAIL}   ❌ ML Engine Registry error: {e}{Colors.ENDC}")
 
-        # Step 2: Test Cloud Run ECAPA (always test - we have default endpoint)
-        print(f"{Colors.CYAN}   Step 2/5: Testing Cloud Run ECAPA endpoint...{Colors.ENDC}")
+        # Step 2: WAIT for Cloud Run ECAPA to be FULLY READY (with blocking retry)
+        # ═══════════════════════════════════════════════════════════════════════════
+        # CRITICAL: This is the fix for VBI stuck at 60% during unlock!
+        # We MUST wait for the ECAPA model to be loaded during startup,
+        # not during the unlock request when user is waiting.
+        # ═══════════════════════════════════════════════════════════════════════════
+        print(f"{Colors.CYAN}   Step 2/5: WAITING for Cloud Run ECAPA to be ready (blocking)...{Colors.ENDC}")
+        
         # Default Cloud Run endpoint (updated 2024-12 to new URL format)
         default_cloud_url = "https://jarvis-ml-888774109345.us-central1.run.app"
         cloud_endpoint = os.getenv("JARVIS_CLOUD_ML_ENDPOINT", default_cloud_url)
-
+        
+        # Configuration for wait-for-ready
+        ECAPA_WAIT_TIMEOUT = float(os.getenv("ECAPA_STARTUP_WAIT_TIMEOUT", "90"))  # Max 90s to wait
+        ECAPA_POLL_INTERVAL = float(os.getenv("ECAPA_STARTUP_POLL_INTERVAL", "3"))  # Poll every 3s
+        ECAPA_PREWARM_ENDPOINT = os.getenv("ECAPA_PREWARM_ENDPOINT", "/api/ml/prewarm")  # Trigger model load
+        
+        cloud_ecapa_ready = False
+        cloud_wait_start = time.time()
+        
         try:
             import aiohttp
-            # Try the Cloud Run health endpoint
-            # Properly strip /api/ml suffix if present (don't use rstrip - it strips chars not strings)
+            
+            # Properly strip /api/ml suffix if present
             cloud_url = cloud_endpoint.rstrip('/')
             if cloud_url.endswith('/api/ml'):
                 cloud_url = cloud_url[:-7]  # Remove '/api/ml'
             health_url = f"{cloud_url}/health"
-            print(f"{Colors.CYAN}      → Testing: {health_url}{Colors.ENDC}")
-
-            async with aiohttp.ClientSession() as session:
-                async with session.get(health_url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                    if resp.status == 200:
-                        health_data = await resp.json()
-                        ecapa_ready = health_data.get("ecapa_ready", False)
-                        load_source = health_data.get("load_source", "unknown")
-                        load_time = health_data.get("load_time_ms", 0)
-                        ecapa_verification_result["cloud_ecapa_tested"] = True
-
-                        if ecapa_ready:
-                            print(f"{Colors.GREEN}   ✅ Cloud Run ECAPA is ready{Colors.ENDC}")
-                            print(f"{Colors.GREEN}      → Load source: {load_source}{Colors.ENDC}")
-                            print(f"{Colors.GREEN}      → Load time: {load_time:.0f}ms{Colors.ENDC}")
+            prewarm_url = f"{cloud_url}{ECAPA_PREWARM_ENDPOINT}"
+            
+            print(f"{Colors.CYAN}      → Health endpoint: {health_url}{Colors.ENDC}")
+            print(f"{Colors.CYAN}      → Pre-warm endpoint: {prewarm_url}{Colors.ENDC}")
+            print(f"{Colors.CYAN}      → Max wait time: {ECAPA_WAIT_TIMEOUT}s{Colors.ENDC}")
+            
+            # FIRST: Trigger pre-warm to force model loading
+            print(f"{Colors.CYAN}      🔥 Triggering ECAPA model pre-warm...{Colors.ENDC}")
+            try:
+                async with aiohttp.ClientSession() as session:
+                    # Fire off prewarm request (this triggers model loading on cloud)
+                    async with session.post(
+                        prewarm_url,
+                        json={"warmup": True},
+                        timeout=aiohttp.ClientTimeout(total=30)
+                    ) as resp:
+                        if resp.status == 200:
+                            prewarm_data = await resp.json()
+                            print(f"{Colors.GREEN}      ✓ Pre-warm triggered: {prewarm_data.get('message', 'OK')}{Colors.ENDC}")
                         else:
-                            status = health_data.get("status", "unknown")
-                            print(f"{Colors.YELLOW}   ⚠️  Cloud Run responding but ECAPA not ready (status: {status}){Colors.ENDC}")
-                            print(f"{Colors.YELLOW}      → Model may still be loading, retry in a moment{Colors.ENDC}")
-                    else:
-                        print(f"{Colors.YELLOW}   ⚠️  Cloud Run returned status {resp.status}{Colors.ENDC}")
-        except asyncio.TimeoutError:
-            ecapa_verification_result["errors"].append("Cloud ECAPA timeout (15s)")
-            print(f"{Colors.YELLOW}   ⚠️  Cloud Run ECAPA timed out (cold start may be in progress){Colors.ENDC}")
+                            print(f"{Colors.YELLOW}      → Pre-warm returned {resp.status} (model may load on-demand){Colors.ENDC}")
+            except Exception as prewarm_err:
+                print(f"{Colors.YELLOW}      → Pre-warm request failed: {prewarm_err} (model may load on-demand){Colors.ENDC}")
+            
+            # SECOND: Poll until ECAPA is ready or timeout
+            print(f"{Colors.CYAN}      ⏳ Waiting for ECAPA model to be fully loaded...{Colors.ENDC}")
+            poll_attempt = 0
+            last_status = None
+            
+            async with aiohttp.ClientSession() as session:
+                while (time.time() - cloud_wait_start) < ECAPA_WAIT_TIMEOUT:
+                    poll_attempt += 1
+                    elapsed = time.time() - cloud_wait_start
+                    
+                    try:
+                        async with session.get(
+                            health_url, 
+                            timeout=aiohttp.ClientTimeout(total=10)
+                        ) as resp:
+                            if resp.status == 200:
+                                health_data = await resp.json()
+                                ecapa_ready = health_data.get("ecapa_ready", False)
+                                status = health_data.get("status", "unknown")
+                                load_source = health_data.get("load_source", "unknown")
+                                load_time = health_data.get("load_time_ms", 0)
+                                
+                                if ecapa_ready:
+                                    # SUCCESS! ECAPA is ready
+                                    cloud_ecapa_ready = True
+                                    ecapa_verification_result["cloud_ecapa_tested"] = True
+                                    total_wait = time.time() - cloud_wait_start
+                                    
+                                    print(f"\n{Colors.GREEN}   ✅ Cloud Run ECAPA is READY!{Colors.ENDC}")
+                                    print(f"{Colors.GREEN}      → Status: {status}{Colors.ENDC}")
+                                    print(f"{Colors.GREEN}      → Load source: {load_source}{Colors.ENDC}")
+                                    print(f"{Colors.GREEN}      → Model load time: {load_time:.0f}ms{Colors.ENDC}")
+                                    print(f"{Colors.GREEN}      → Total startup wait: {total_wait:.1f}s{Colors.ENDC}")
+                                    break
+                                else:
+                                    # Not ready yet - update status indicator
+                                    if status != last_status:
+                                        print(f"{Colors.YELLOW}      → [{elapsed:.0f}s] Status: {status} (waiting...){Colors.ENDC}")
+                                        last_status = status
+                                    else:
+                                        # Show progress dots
+                                        print(f"{Colors.CYAN}      → [{elapsed:.0f}s] Poll #{poll_attempt}: {status}{Colors.ENDC}", end='\r')
+                            else:
+                                print(f"{Colors.YELLOW}      → [{elapsed:.0f}s] Health returned {resp.status}{Colors.ENDC}")
+                                
+                    except asyncio.TimeoutError:
+                        print(f"{Colors.YELLOW}      → [{elapsed:.0f}s] Poll timed out (cold start?){Colors.ENDC}")
+                    except Exception as poll_err:
+                        print(f"{Colors.YELLOW}      → [{elapsed:.0f}s] Poll error: {poll_err}{Colors.ENDC}")
+                    
+                    # Wait before next poll
+                    await asyncio.sleep(ECAPA_POLL_INTERVAL)
+            
+            # Check if we timed out
+            if not cloud_ecapa_ready:
+                total_wait = time.time() - cloud_wait_start
+                ecapa_verification_result["errors"].append(f"Cloud ECAPA not ready after {total_wait:.0f}s")
+                print(f"\n{Colors.YELLOW}   ⚠️  Cloud Run ECAPA did not become ready within {ECAPA_WAIT_TIMEOUT}s{Colors.ENDC}")
+                print(f"{Colors.YELLOW}      → Will attempt local fallback or retry during verification{Colors.ENDC}")
+                
         except Exception as e:
             ecapa_verification_result["errors"].append(f"Cloud ECAPA error: {str(e)}")
             print(f"{Colors.YELLOW}   ⚠️  Cloud Run ECAPA not available: {e}{Colors.ENDC}")
