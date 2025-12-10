@@ -2069,22 +2069,89 @@ class ProcessCleanupManager:
             logger.info(f"☁️  Started {level} memory relief (background thread)")
 
     async def _check_cloud_run_available(self) -> bool:
-        """Check if Cloud Run ECAPA endpoint is available for offload."""
+        """
+        Check if Cloud Run ECAPA endpoint is available for offload.
+        
+        Uses multiple fallback strategies:
+        1. Primary: aiohttp async request
+        2. Fallback: httpx (if available) for better timeout handling
+        3. Final fallback: sync requests in thread pool
+        
+        Also handles Cloud Run cold start by using generous timeouts.
+        """
+        cloud_url = os.getenv(
+            "JARVIS_CLOUD_ML_ENDPOINT",
+            "https://jarvis-ml-888774109345.us-central1.run.app"
+        )
+        # Handle if URL already has /api/ml suffix
+        base_url = cloud_url.rstrip('/').replace('/api/ml', '')
+        health_url = f"{base_url}/health"
+        
+        # Strategy 1: Try aiohttp with generous timeout for cold start
         try:
             import aiohttp
-            cloud_url = os.getenv(
-                "JARVIS_CLOUD_ML_ENDPOINT",
-                "https://jarvis-ml-888774109345.us-central1.run.app"
-            )
-            health_url = f"{cloud_url.rstrip('/')}/health"
-
-            async with aiohttp.ClientSession() as session:
-                async with session.get(health_url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+            # Use 15 second timeout to handle Cloud Run cold start
+            async with aiohttp.ClientSession(
+                connector=aiohttp.TCPConnector(ssl=False, limit=1),
+                timeout=aiohttp.ClientTimeout(total=15, connect=10)
+            ) as session:
+                async with session.get(health_url) as resp:
                     if resp.status == 200:
                         data = await resp.json()
-                        return data.get("ecapa_ready", False)
+                        is_ready = data.get("ecapa_ready", False)
+                        if is_ready:
+                            logger.info(f"☁️  Cloud Run is ready (ecapa_ready: True)")
+                            return True
+                        else:
+                            logger.warning(f"☁️  Cloud Run responded but ECAPA not ready")
+                            return False
+                    else:
+                        logger.warning(f"☁️  Cloud Run health returned {resp.status}")
+        except asyncio.TimeoutError:
+            logger.warning(f"☁️  Cloud Run health check timeout (cold start?)")
         except Exception as e:
-            logger.debug(f"Cloud Run health check failed: {e}")
+            logger.debug(f"Cloud Run aiohttp check failed: {e}")
+        
+        # Strategy 2: Try httpx if available (better timeout handling)
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=15.0, verify=False) as client:
+                resp = await client.get(health_url)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    is_ready = data.get("ecapa_ready", False)
+                    if is_ready:
+                        logger.info(f"☁️  Cloud Run ready via httpx")
+                        return True
+        except ImportError:
+            pass  # httpx not available
+        except Exception as e:
+            logger.debug(f"Cloud Run httpx check failed: {e}")
+        
+        # Strategy 3: Sync fallback in thread pool (most reliable)
+        try:
+            import requests
+            from concurrent.futures import ThreadPoolExecutor
+            
+            def sync_check():
+                try:
+                    resp = requests.get(health_url, timeout=15, verify=False)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        return data.get("ecapa_ready", False)
+                except Exception as e:
+                    logger.debug(f"Sync Cloud Run check failed: {e}")
+                return False
+            
+            loop = asyncio.get_running_loop()
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                result = await loop.run_in_executor(executor, sync_check)
+                if result:
+                    logger.info(f"☁️  Cloud Run ready via sync fallback")
+                    return True
+        except Exception as e:
+            logger.debug(f"Cloud Run sync fallback failed: {e}")
+        
         return False
 
     async def _trigger_cloud_offload(self) -> Dict[str, Any]:

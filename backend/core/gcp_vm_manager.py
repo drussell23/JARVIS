@@ -349,7 +349,9 @@ class GCPVMManager:
             should_create, reason, score = await self.gcp_optimizer.should_create_vm(
                 memory_snapshot, current_processes=None
             )
-            return should_create, reason, score.overall_score
+            # PressureScore uses composite_score, not overall_score
+            confidence = score.composite_score if hasattr(score, 'composite_score') else getattr(score, 'overall_score', 0.0)
+            return should_create, reason, confidence
 
         # Fallback: Simple memory pressure check
         if memory_snapshot.gcp_shift_recommended:

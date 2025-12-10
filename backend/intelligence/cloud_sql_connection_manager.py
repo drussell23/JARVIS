@@ -1254,6 +1254,24 @@ class CloudSQLConnectionManager:
         """Get comprehensive statistics (async version)."""
         return self.get_stats()
 
+    async def get_pool(self) -> Optional["asyncpg.Pool"]:
+        """
+        Get the underlying connection pool.
+        
+        This method provides async-compatible access to the raw pool for
+        advanced use cases like health checks that need direct pool access.
+        
+        Returns:
+            The asyncpg pool if initialized, None otherwise
+        """
+        if not self.pool:
+            logger.warning("get_pool() called but pool is not initialized")
+            return None
+        if self.is_shutting_down:
+            logger.warning("get_pool() called but manager is shutting down")
+            return None
+        return self.pool
+
     @property
     def is_initialized(self) -> bool:
         return self.pool is not None and not self.is_shutting_down
