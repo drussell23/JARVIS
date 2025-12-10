@@ -2681,28 +2681,77 @@ const JarvisVoice = () => {
               break;
 
             case 'aborted':
-              // Don't show error for aborted (usually intentional)
-              console.log('Recognition aborted');
-              // CRITICAL: If speech was recently active, this abort might have interrupted processing
-              // Skip the automatic restart to prevent losing the speech result
-              const timeSinceSpeech = Date.now() - lastSpeechTimeRef.current;
-              if (speechActiveRef.current || timeSinceSpeech < 2000) {
-                console.log(`⚠️ Abort during active speech (${timeSinceSpeech}ms ago) - will delay restart`);
+              // ================================================================
+              // IMPROVED ABORT HANDLING - Prevents restart loop
+              // ================================================================
+              // Track abort frequency to detect loops
+              if (!window._abortTracker) {
+                window._abortTracker = { count: 0, lastReset: Date.now(), consecutiveAborts: 0 };
+              }
+              
+              const tracker = window._abortTracker;
+              const now = Date.now();
+              
+              // Reset counter every 10 seconds
+              if (now - tracker.lastReset > 10000) {
+                tracker.count = 0;
+                tracker.consecutiveAborts = 0;
+                tracker.lastReset = now;
+              }
+              
+              tracker.count++;
+              tracker.consecutiveAborts++;
+              
+              // Only log first abort or every 10th to reduce console spam
+              if (tracker.consecutiveAborts === 1 || tracker.consecutiveAborts % 10 === 0) {
+                console.log(`Recognition aborted (count: ${tracker.consecutiveAborts})`);
+              }
+              
+              // If too many aborts in succession, back off
+              if (tracker.consecutiveAborts > 5) {
+                console.warn(`⚠️ Too many aborts (${tracker.consecutiveAborts}) - backing off for 3 seconds`);
                 skipNextRestartRef.current = true;
-                // Schedule a delayed restart after speech processing completes
+                
+                // Back off for 3 seconds before allowing restart
                 setTimeout(() => {
-                  if (continuousListeningRef.current && !speechActiveRef.current) {
-                    console.log('🔄 Restarting after speech abort delay');
-                    skipNextRestartRef.current = false;
+                  tracker.consecutiveAborts = 0;
+                  skipNextRestartRef.current = false;
+                  if (continuousListeningRef.current) {
+                    console.log('🔄 Resuming after abort backoff');
                     try {
                       recognitionRef.current.start();
                     } catch (e) {
                       if (!e.message?.includes('already started')) {
-                        console.log('Delayed restart after abort failed:', e.message);
+                        console.debug('Backoff restart failed:', e.message);
+                      }
+                    }
+                  }
+                }, 3000);
+                break;  // Don't do any further processing
+              }
+              
+              // If speech was recently active, delay restart
+              const timeSinceSpeech = Date.now() - lastSpeechTimeRef.current;
+              if (speechActiveRef.current || timeSinceSpeech < 2000) {
+                console.debug(`Abort during active speech (${timeSinceSpeech}ms ago) - delaying restart`);
+                skipNextRestartRef.current = true;
+                setTimeout(() => {
+                  if (continuousListeningRef.current && !speechActiveRef.current) {
+                    skipNextRestartRef.current = false;
+                    tracker.consecutiveAborts = 0;  // Reset on successful delay
+                    try {
+                      recognitionRef.current.start();
+                    } catch (e) {
+                      if (!e.message?.includes('already started')) {
+                        console.debug('Delayed abort restart failed:', e.message);
                       }
                     }
                   }
                 }, 1000);
+              } else {
+                // Normal abort (not during speech) - let onend handle restart
+                // Don't skip, just let it flow naturally
+                tracker.consecutiveAborts = 0;  // Reset counter on clean abort
               }
               break;
 
@@ -2713,11 +2762,15 @@ const JarvisVoice = () => {
       };
 
       recognitionRef.current.onend = () => {
-        console.log('Speech recognition ended - enforcing indefinite listening');
+        // Only log occasionally to reduce console spam
+        const breaker = restartCircuitBreakerRef.current;
+        if (breaker.count % 10 === 0 || breaker.count < 3) {
+          console.log('Speech recognition ended - enforcing indefinite listening');
+        }
 
         // Check if we should skip this restart (e.g., due to aborted error)
         if (skipNextRestartRef.current) {
-          console.log('⏭️ Skipping restart due to skipNextRestart flag');
+          console.debug('⏭️ Skipping restart due to skipNextRestart flag');
           skipNextRestartRef.current = false;  // Reset flag
           return;  // Don't restart
         }
@@ -2727,17 +2780,17 @@ const JarvisVoice = () => {
         const timeSinceLastSpeech = now - lastSpeechTimeRef.current;
         
         if (speechActiveRef.current || timeSinceLastSpeech < 1000) {
-          console.log(`🔇 Speech was active ${timeSinceLastSpeech}ms ago - delaying restart for result processing`);
+          console.debug(`🔇 Speech was active ${timeSinceLastSpeech}ms ago - delaying restart`);
           // Delay restart to allow result processing
           setTimeout(() => {
             if (!speechActiveRef.current && continuousListeningRef.current) {
-              console.log('⏰ Delayed restart after speech processing');
               try {
                 recognitionRef.current.start();
-                console.log('✅ Delayed restart successful');
+                // Reset abort tracker on successful start
+                if (window._abortTracker) window._abortTracker.consecutiveAborts = 0;
               } catch (e) {
                 if (!e.message?.includes('already started')) {
-                  console.log('Delayed restart failed:', e.message);
+                  console.debug('Delayed restart failed:', e.message);
                 }
               }
             }
@@ -2748,7 +2801,6 @@ const JarvisVoice = () => {
         // ALWAYS restart if continuous listening is enabled (check ref for most current state)
         if (continuousListeningRef.current || continuousListening) {
           // Check circuit breaker to prevent infinite restart loops
-          const breaker = restartCircuitBreakerRef.current;
 
           // Reset counter if window has passed
           if (now - breaker.lastReset > breaker.windowMs) {
@@ -2770,13 +2822,14 @@ const JarvisVoice = () => {
               setMicStatus('error');
               skipNextRestartRef.current = false;
               return;
-            } else {
-              // Many restarts but working - just log it
-              console.log(`ℹ️ High restart count (${breaker.count}) but no consecutive failures - continuing`);
             }
+            // Many restarts but working - continue silently
           }
 
-          console.log(`♾️ Indefinite listening active - restarting microphone (restart ${breaker.count}, failures: ${breaker.consecutiveFailures})...`);
+          // Only log every 10th restart to reduce spam
+          if (breaker.count % 10 === 0 || breaker.count < 3) {
+            console.log(`♾️ Indefinite listening - restart ${breaker.count}`);
+          }
 
           // Track restart attempts
           let restartAttempt = 0;
