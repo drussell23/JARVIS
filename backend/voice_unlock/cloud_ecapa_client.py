@@ -264,20 +264,21 @@ class CloudECAPAClientConfig:
         if e.strip()
     ]
 
-    # Timeouts
-    CONNECT_TIMEOUT = float(os.getenv("CLOUD_ECAPA_CONNECT_TIMEOUT", "5.0"))
-    REQUEST_TIMEOUT = float(os.getenv("CLOUD_ECAPA_REQUEST_TIMEOUT", "30.0"))
+    # Timeouts - v2.1: Reduced for faster fallback to other strategies
+    CONNECT_TIMEOUT = float(os.getenv("CLOUD_ECAPA_CONNECT_TIMEOUT", "3.0"))  # Reduced from 5s
+    REQUEST_TIMEOUT = float(os.getenv("CLOUD_ECAPA_REQUEST_TIMEOUT", "8.0"))  # Reduced from 30s
 
     # ECAPA model initialization wait settings
-    # Cloud Run cold starts can take 30-120s for ECAPA model loading
-    ECAPA_WAIT_FOR_READY = os.getenv("CLOUD_ECAPA_WAIT_FOR_READY", "true").lower() == "true"
-    ECAPA_READY_TIMEOUT = float(os.getenv("CLOUD_ECAPA_READY_TIMEOUT", "120.0"))  # Max wait time
-    ECAPA_READY_POLL_INTERVAL = float(os.getenv("CLOUD_ECAPA_READY_POLL", "5.0"))  # Poll every 5s
+    # NOTE: Cold start waiting should happen at STARTUP, not during user requests
+    # These values are fallback for when startup warmup failed
+    ECAPA_WAIT_FOR_READY = os.getenv("CLOUD_ECAPA_WAIT_FOR_READY", "false").lower() == "true"  # Disabled by default
+    ECAPA_READY_TIMEOUT = float(os.getenv("CLOUD_ECAPA_READY_TIMEOUT", "30.0"))  # Reduced from 120s
+    ECAPA_READY_POLL_INTERVAL = float(os.getenv("CLOUD_ECAPA_READY_POLL", "3.0"))  # Reduced from 5s
 
-    # Retries
-    MAX_RETRIES = int(os.getenv("CLOUD_ECAPA_MAX_RETRIES", "3"))
-    RETRY_BACKOFF_BASE = float(os.getenv("CLOUD_ECAPA_BACKOFF_BASE", "1.0"))
-    RETRY_BACKOFF_MAX = float(os.getenv("CLOUD_ECAPA_BACKOFF_MAX", "10.0"))
+    # Retries - v2.1: Reduced to allow faster fallback
+    MAX_RETRIES = int(os.getenv("CLOUD_ECAPA_MAX_RETRIES", "1"))  # Reduced from 3
+    RETRY_BACKOFF_BASE = float(os.getenv("CLOUD_ECAPA_BACKOFF_BASE", "0.5"))  # Reduced from 1.0
+    RETRY_BACKOFF_MAX = float(os.getenv("CLOUD_ECAPA_BACKOFF_MAX", "2.0"))  # Reduced from 10.0
 
     # Circuit breaker
     CB_FAILURE_THRESHOLD = int(os.getenv("CLOUD_ECAPA_CB_FAILURES", "5"))

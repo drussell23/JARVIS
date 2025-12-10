@@ -788,13 +788,14 @@ class VBIPipelineOrchestrator:
         # Dynamic timeouts (in seconds)
         # NOTE: Warmup should happen at STARTUP, not during user requests!
         # The warmup_timeout here is a FALLBACK if startup warmup failed
+        # v2.1: Increased extraction timeout to allow all 3 fallback strategies (10s each + overhead)
         self.timeouts = {
             "warmup": float(os.environ.get("VBI_WARMUP_TIMEOUT", "30")),  # Separate warmup timeout (fallback)
             "audio_processing": float(os.environ.get("VBI_AUDIO_TIMEOUT", "5")),
-            "ecapa_extraction": float(os.environ.get("VBI_ECAPA_TIMEOUT", "30")),  # Increased for cold endpoints
-            "speaker_verification": float(os.environ.get("VBI_VERIFY_TIMEOUT", "5")),
+            "ecapa_extraction": float(os.environ.get("VBI_ECAPA_TIMEOUT", "45")),  # 3 strategies @ ~10-15s each
+            "speaker_verification": float(os.environ.get("VBI_VERIFY_TIMEOUT", "10")),  # Increased for profile lookup
             "unlock_execution": float(os.environ.get("VBI_UNLOCK_TIMEOUT", "10")),
-            "total_pipeline": float(os.environ.get("VBI_TOTAL_TIMEOUT", "60"))  # Increased for reliability
+            "total_pipeline": float(os.environ.get("VBI_TOTAL_TIMEOUT", "90"))  # Increased for full fallback chain
         }
 
         # Retry configuration
@@ -1165,15 +1166,24 @@ class VBIPipelineOrchestrator:
         
         # =========================================================================
         # STRATEGY 1: Cloud ECAPA Client (fastest, no local memory)
+        # Timeout: 12s to allow time for fallbacks within 45s total budget
         # =========================================================================
         try:
-            logger.info("[VBI-ORCH] 🌐 Trying Cloud ECAPA extraction...")
+            logger.info("[VBI-ORCH] 🌐 Strategy 1/3: Trying Cloud ECAPA extraction...")
             from voice_unlock.cloud_ecapa_client import get_cloud_ecapa_client
             
-            client = await get_cloud_ecapa_client()
+            # Quick check if client can be initialized (2s timeout)
+            try:
+                client = await asyncio.wait_for(
+                    get_cloud_ecapa_client(),
+                    timeout=2.0
+                )
+            except asyncio.TimeoutError:
+                client = None
+                logger.warning("[VBI-ORCH] ⚠️ CloudECAPAClient init timeout (2s)")
             
             if client is not None:
-                # Extract with timeout
+                # Extract with timeout - keep short to allow fallbacks
                 embedding = await asyncio.wait_for(
                     client.extract_embedding(
                         audio_data=audio_bytes,
@@ -1182,7 +1192,7 @@ class VBIPipelineOrchestrator:
                         use_cache=True,
                         use_fast_path=True
                     ),
-                    timeout=20.0  # 20 second timeout for cloud
+                    timeout=10.0  # 10 second timeout for cloud
                 )
                 
                 if embedding is not None:
@@ -1196,8 +1206,8 @@ class VBIPipelineOrchestrator:
                 logger.warning("[VBI-ORCH] ⚠️ CloudECAPAClient not available, trying fallback...")
                 
         except asyncio.TimeoutError:
-            last_error = "Cloud ECAPA timeout (20s)"
-            logger.warning("[VBI-ORCH] ⏱️ Cloud ECAPA timed out, trying fallback...")
+            last_error = "Cloud ECAPA timeout (10s)"
+            logger.warning("[VBI-ORCH] ⏱️ Cloud ECAPA timed out after 10s, trying fallback...")
         except ImportError as e:
             last_error = f"Import error: {e}"
             logger.warning(f"[VBI-ORCH] ⚠️ CloudECAPAClient import failed: {e}")
@@ -1207,13 +1217,21 @@ class VBIPipelineOrchestrator:
         
         # =========================================================================
         # STRATEGY 2: ML Engine Registry (orchestrated cloud/local routing)
+        # Timeout: 15s total (5s for ensure + 10s for extraction)
         # =========================================================================
         try:
-            logger.info("[VBI-ORCH] 🔄 Trying ML Engine Registry extraction...")
+            logger.info("[VBI-ORCH] 🔄 Strategy 2/3: Trying ML Engine Registry extraction...")
             from voice_unlock.ml_engine_registry import extract_speaker_embedding, ensure_ecapa_available
             
-            # Ensure ECAPA is available (may trigger cloud or local load)
-            success, msg, _ = await ensure_ecapa_available()
+            # Ensure ECAPA is available with short timeout (don't wait forever for load)
+            try:
+                success, msg, _ = await asyncio.wait_for(
+                    ensure_ecapa_available(),
+                    timeout=5.0
+                )
+            except asyncio.TimeoutError:
+                success = False
+                msg = "ensure_ecapa_available timeout (5s)"
             
             if success:
                 # Convert bytes to numpy array for registry
@@ -1221,7 +1239,7 @@ class VBIPipelineOrchestrator:
                 
                 embedding = await asyncio.wait_for(
                     extract_speaker_embedding(audio_array),
-                    timeout=30.0  # 30 second timeout for registry
+                    timeout=10.0  # 10 second timeout for extraction
                 )
                 
                 if embedding is not None:
@@ -1236,8 +1254,8 @@ class VBIPipelineOrchestrator:
                 logger.warning(f"[VBI-ORCH] ⚠️ ML Registry not available: {msg}")
                 
         except asyncio.TimeoutError:
-            last_error = "ML Registry timeout (30s)"
-            logger.warning("[VBI-ORCH] ⏱️ ML Registry timed out, trying local...")
+            last_error = "ML Registry extraction timeout (10s)"
+            logger.warning("[VBI-ORCH] ⏱️ ML Registry timed out after 10s, trying local...")
         except ImportError as e:
             last_error = f"Import error: {e}"
             logger.warning(f"[VBI-ORCH] ⚠️ ML Registry import failed: {e}")
@@ -1247,34 +1265,39 @@ class VBIPipelineOrchestrator:
         
         # =========================================================================
         # STRATEGY 3: Direct Local SpeechBrain (last resort - high memory)
+        # Timeout: 15s - if cloud and registry both failed, local is last hope
         # =========================================================================
         try:
-            logger.info("[VBI-ORCH] 💻 Trying direct local SpeechBrain extraction (last resort)...")
+            logger.info("[VBI-ORCH] 💻 Strategy 3/3: Trying direct local SpeechBrain extraction...")
             from voice.speaker_verification_service import get_speaker_verification_service
             
+            # Get the service - it should already be initialized
             service = get_speaker_verification_service()
-            if service is None:
-                service = await get_speaker_verification_service()
             
             if service and hasattr(service, '_local_engine') and service._local_engine:
                 audio_array = np.frombuffer(audio_bytes, dtype=np.float32)
                 
+                # Try to use the local engine directly
                 embedding = await asyncio.wait_for(
-                    service._local_engine.encode_batch(audio_array),
-                    timeout=45.0  # 45 second timeout for local
+                    asyncio.to_thread(
+                        lambda: service._local_engine.encode_batch(audio_array.reshape(1, -1))
+                    ),
+                    timeout=15.0  # 15 second timeout for local
                 )
                 
                 if embedding is not None:
                     # Handle batch output shape
-                    if len(embedding.shape) > 1:
+                    if hasattr(embedding, 'squeeze'):
                         embedding = embedding.squeeze()
                     embedding_list = embedding.tolist() if hasattr(embedding, 'tolist') else list(embedding)
                     logger.info(f"[VBI-ORCH] ✅ Local SpeechBrain extraction succeeded: {len(embedding_list)} dimensions")
                     return embedding_list
+            else:
+                logger.warning("[VBI-ORCH] ⚠️ Local SpeechBrain engine not available")
                     
         except asyncio.TimeoutError:
-            last_error = "Local SpeechBrain timeout (45s)"
-            logger.warning("[VBI-ORCH] ⏱️ Local SpeechBrain timed out")
+            last_error = "Local SpeechBrain timeout (15s)"
+            logger.warning("[VBI-ORCH] ⏱️ Local SpeechBrain timed out after 15s")
         except ImportError as e:
             last_error = f"Import error: {e}"
             logger.warning(f"[VBI-ORCH] ⚠️ Local SpeechBrain import failed: {e}")
