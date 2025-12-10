@@ -2,14 +2,14 @@
 
 ## Executive Summary
 
-- **Workflow**: 🎨 Advanced Auto-Diagram Generator
-- **Run Number**: #102
-- **Branch**: `cursor/build-ai-voice-receptionist-c22b`
-- **Commit**: `399dfb260e2eda62893885df7c2448bfb90ce299`
+- **Workflow**: PR Automation & Validation
+- **Run Number**: #867
+- **Branch**: `fix/ci/advanced-auto-diagram-generator-run102-20251210-183129`
+- **Commit**: `3afed33f28514fee914e65c7fd3841781ec25789`
 - **Status**: ❌ FAILED
-- **Timestamp**: 2025-12-10T18:30:03Z
-- **Triggered By**: @drussell23
-- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/20109239937)
+- **Timestamp**: 2025-12-10T18:31:55Z
+- **Triggered By**: @cubic-dev-ai[bot]
+- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/20109289617)
 
 ## Failure Overview
 
@@ -17,23 +17,23 @@ Total Failed Jobs: **1**
 
 | # | Job Name | Category | Severity | Duration |
 |---|----------|----------|----------|----------|
-| 1 | 🔍 Discover & Analyze Diagrams | permission_error | high | 9s |
+| 1 | Validate PR Title | timeout | high | 4s |
 
 ## Detailed Analysis
 
-### 1. 🔍 Discover & Analyze Diagrams
+### 1. Validate PR Title
 
 **Status**: ❌ failure
-**Category**: Permission Error
+**Category**: Timeout
 **Severity**: HIGH
-**Started**: 2025-12-10T18:30:07Z
-**Completed**: 2025-12-10T18:30:16Z
-**Duration**: 9 seconds
-**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/20109239937/job/57701708359)
+**Started**: 2025-12-10T18:31:59Z
+**Completed**: 2025-12-10T18:32:03Z
+**Duration**: 4 seconds
+**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/20109289617/job/57701889307)
 
 #### Failed Steps
 
-- **Step 3**: 🔍 Discover diagram files
+- **Step 2**: Validate Conventional Commits
 
 #### Error Analysis
 
@@ -42,23 +42,18 @@ Total Failed Jobs: **1**
 - Pattern: `ERROR|Error|error`
   - Occurrences: 2
   - Sample matches:
-    - Line 82: `2025-12-10T18:30:14.0785684Z ##[error]Unable to process file command 'output' successfully.`
-    - Line 83: `2025-12-10T18:30:14.0793860Z ##[error]Invalid format '  "ABBY_CONNECT_SKILLS_ASSESSMENT.md"'`
+    - Line 25: `2025-12-10T18:32:01.2430957Z   subjectPatternError: The PR title must start with a capital letter.`
+    - Line 37: `2025-12-10T18:32:01.8674982Z ##[error]No release type found in pull request title "🚨 Fix CI/CD: 🎨 Ad`
 
-- Pattern: `FAIL|Failed|failed`
-  - Occurrences: 2
-  - Sample matches:
-    - Line 68: `2025-12-10T18:30:13.2760782Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}`
-    - Line 93: `2025-12-10T18:30:14.2295422Z ##[warning]The process '/usr/bin/git' failed with exit code 128`
-
-- Pattern: `WARN|Warning|warning`
+- Pattern: `timeout|timed out`
   - Occurrences: 1
   - Sample matches:
-    - Line 93: `2025-12-10T18:30:14.2295422Z ##[warning]The process '/usr/bin/git' failed with exit code 128`
+    - Line 29: `- fix: Resolve database connection timeout`
 
 #### Suggested Fixes
 
-1. Review the logs above for specific error messages
+1. Consider increasing timeout values or optimizing slow operations
+2. Check service availability and network connectivity
 
 ---
 
@@ -78,5 +73,5 @@ Total Failed Jobs: **1**
 
 ---
 
-📊 *Report generated on 2025-12-10T18:31:29.385178*
+📊 *Report generated on 2025-12-10T18:32:50.389783*
 🤖 *JARVIS CI/CD Auto-PR Manager*
