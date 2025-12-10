@@ -697,6 +697,40 @@ const JarvisVoice = () => {
   const offlineModeRef = useRef(false);
   const commandQueueRef = useRef([]);
   const proxyEndpointRef = useRef(null);
+
+  // 🆕 ROBUST COMMAND QUEUE SYSTEM - Never lose commands during WebSocket issues
+  const pendingCommandsRef = useRef([]);  // Commands waiting for WebSocket
+  const commandQueueProcessingRef = useRef(false);  // Prevent concurrent processing
+  const maxQueuedCommands = 10;  // Prevent memory buildup
+  const commandQueueTimeoutMs = 30000;  // Max time to wait before discarding
+
+  // 🆕 INTELLIGENT SPEECH RECOVERY - Prevents loops while staying responsive
+  const speechRecoveryStateRef = useRef({
+    consecutiveAborts: 0,
+    lastAbortTime: 0,
+    inBackoffMode: false,
+    backoffEndTime: 0,
+    pendingRestart: false,
+    lastSuccessfulRecognition: Date.now(),
+    recognitionAttempts: 0,
+    commandsDetectedDuringBackoff: []  // Don't lose commands during backoff
+  });
+
+  // 🆕 DYNAMIC CONFIGURATION - No hardcoding
+  const voiceConfigRef = useRef({
+    wakeWords: ['hey jarvis', 'jarvis', 'ok jarvis', 'hello jarvis', 'hey j'],
+    wakeWordFuzzyThreshold: 0.7,  // For partial matches like "hey" -> "hey jarvis"
+    criticalCommandConfidenceThreshold: 0.40,  // Lower than before for better detection
+    normalCommandConfidenceThreshold: 0.65,
+    maxAbortBackoffMs: 1500,  // Reduced from 3000ms
+    minTimeBetweenRestarts: 100,  // Minimum ms between recognition restarts
+    commandTimeoutAfterWakeWord: 45000,  // Longer timeout for command after wake word
+    partialMatchPatterns: {
+      unlock: ['unlock', 'unloc', 'unlo', 'un lock', 'on lock'],
+      lock: ['lock', 'loc', 'log my', 'locking'],
+      jarvis: ['jarvis', 'jarv', 'jarv is', 'jar vis', 'j.a.r.v.i.s']
+    }
+  });
   const recognitionRef = useRef(null);
   const hybridSTTClientRef = useRef(null); // Hybrid STT client (replaces browser SpeechRecognition)
   const visionConnectionRef = useRef(null);
@@ -1399,10 +1433,19 @@ const JarvisVoice = () => {
             type: 'handshake',
             client_version: '2.0',
             timestamp: Date.now(),
-            capabilities: ['voice', 'streaming', 'health_monitoring']
+            capabilities: ['voice', 'streaming', 'health_monitoring', 'command_queue']
           }));
         } catch (e) {
           console.warn('[WS-ADVANCED] Failed to send handshake:', e);
+        }
+
+        // 🆕 PROCESS QUEUED COMMANDS - Send any commands that were queued during disconnection
+        if (pendingCommandsRef.current.length > 0) {
+          console.log(`[WS-ADVANCED] 📬 Processing ${pendingCommandsRef.current.length} queued command(s)...`);
+          // Small delay to ensure connection is fully stable
+          setTimeout(() => {
+            processCommandQueue();
+          }, 200);
         }
       };
 
@@ -2279,6 +2322,254 @@ const JarvisVoice = () => {
     }
   };
 
+  // ============================================================================
+  // 🆕 ROBUST COMMAND QUEUE SYSTEM
+  // Never lose commands during WebSocket disconnection
+  // ============================================================================
+
+  const queueCommand = (command, metadata = {}) => {
+    const queuedCommand = {
+      id: `cmd_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`,
+      command,
+      metadata,
+      timestamp: Date.now(),
+      attempts: 0,
+      maxAttempts: 3
+    };
+
+    // Prevent queue overflow
+    if (pendingCommandsRef.current.length >= maxQueuedCommands) {
+      console.warn('[CMD-QUEUE] Queue full, removing oldest command');
+      pendingCommandsRef.current.shift();
+    }
+
+    pendingCommandsRef.current.push(queuedCommand);
+    console.log(`[CMD-QUEUE] Command queued: "${command}" (queue size: ${pendingCommandsRef.current.length})`);
+
+    // Try to process immediately
+    processCommandQueue();
+
+    return queuedCommand.id;
+  };
+
+  const processCommandQueue = async () => {
+    // Prevent concurrent processing
+    if (commandQueueProcessingRef.current) {
+      return;
+    }
+
+    // Check if WebSocket is ready
+    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+      console.log('[CMD-QUEUE] WebSocket not ready, will retry when connected');
+      return;
+    }
+
+    commandQueueProcessingRef.current = true;
+
+    try {
+      while (pendingCommandsRef.current.length > 0) {
+        const queuedCmd = pendingCommandsRef.current[0];
+
+        // Check if command has expired
+        if (Date.now() - queuedCmd.timestamp > commandQueueTimeoutMs) {
+          console.warn(`[CMD-QUEUE] Command expired: "${queuedCmd.command}"`);
+          pendingCommandsRef.current.shift();
+          continue;
+        }
+
+        // Try to send
+        try {
+          queuedCmd.attempts++;
+
+          const message = {
+            type: 'command',
+            text: queuedCmd.command,
+            mode: autonomousMode ? 'autonomous' : 'manual',
+            priority: queuedCmd.metadata.priority || 'normal',
+            metadata: {
+              ...queuedCmd.metadata,
+              queuedAt: queuedCmd.timestamp,
+              processedAt: Date.now(),
+              queueAttempt: queuedCmd.attempts
+            }
+          };
+
+          // Attach audio if available
+          if (queuedCmd.metadata.audioData) {
+            message.audio_data = queuedCmd.metadata.audioData.audio;
+            message.sample_rate = queuedCmd.metadata.audioData.sampleRate;
+            message.mime_type = queuedCmd.metadata.audioData.mimeType;
+          }
+
+          wsRef.current.send(JSON.stringify(message));
+          console.log(`[CMD-QUEUE] ✅ Sent queued command: "${queuedCmd.command}"`);
+
+          // Remove from queue on success
+          pendingCommandsRef.current.shift();
+
+          // Small delay between commands
+          await new Promise(r => setTimeout(r, 100));
+
+        } catch (sendError) {
+          console.error('[CMD-QUEUE] Failed to send:', sendError);
+
+          if (queuedCmd.attempts >= queuedCmd.maxAttempts) {
+            console.error(`[CMD-QUEUE] Max attempts reached for: "${queuedCmd.command}"`);
+            pendingCommandsRef.current.shift();
+          } else {
+            // Will retry next cycle
+            break;
+          }
+        }
+      }
+    } finally {
+      commandQueueProcessingRef.current = false;
+    }
+  };
+
+  // ============================================================================
+  // 🆕 FUZZY WAKE WORD MATCHING
+  // Handles partial matches like "hey" for "hey jarvis"
+  // ============================================================================
+
+  const fuzzyMatchWakeWord = (transcript) => {
+    const config = voiceConfigRef.current;
+    const normalizedTranscript = transcript.toLowerCase().trim();
+
+    // First, check exact matches
+    for (const wakeWord of config.wakeWords) {
+      if (normalizedTranscript.includes(wakeWord)) {
+        return { matched: true, wakeWord, matchType: 'exact', confidence: 1.0 };
+      }
+    }
+
+    // Check partial matches for jarvis variations
+    const jarvisPatterns = config.partialMatchPatterns.jarvis;
+    for (const pattern of jarvisPatterns) {
+      if (normalizedTranscript.includes(pattern)) {
+        return { matched: true, wakeWord: 'jarvis', matchType: 'partial', confidence: 0.9 };
+      }
+    }
+
+    // Check if transcript starts with "hey" and might be incomplete
+    if (normalizedTranscript.startsWith('hey') && normalizedTranscript.length < 12) {
+      // Could be "hey jarvis" in progress
+      return { matched: false, potential: true, wakeWord: null, matchType: 'potential', confidence: 0.5 };
+    }
+
+    // Check for "hey" followed by any word starting with 'j'
+    const heyJMatch = normalizedTranscript.match(/hey\s+j\w*/);
+    if (heyJMatch) {
+      return { matched: true, wakeWord: 'hey jarvis', matchType: 'fuzzy', confidence: 0.8 };
+    }
+
+    return { matched: false, potential: false, wakeWord: null, matchType: 'none', confidence: 0 };
+  };
+
+  // ============================================================================
+  // 🆕 FUZZY COMMAND MATCHING
+  // Handles partial command matches like "unlock" variations
+  // ============================================================================
+
+  const fuzzyMatchCommand = (transcript) => {
+    const config = voiceConfigRef.current;
+    const normalizedTranscript = transcript.toLowerCase().trim();
+
+    // Check for unlock command patterns
+    for (const pattern of config.partialMatchPatterns.unlock) {
+      if (normalizedTranscript.includes(pattern)) {
+        // Extract the full command
+        const fullCommand = normalizedTranscript.includes('screen')
+          ? 'unlock my screen'
+          : normalizedTranscript.includes('mac')
+            ? 'unlock my mac'
+            : 'unlock my screen';
+        return { matched: true, command: fullCommand, commandType: 'unlock', confidence: 0.85 };
+      }
+    }
+
+    // Check for lock command patterns (but not unlock)
+    if (!normalizedTranscript.includes('unlock')) {
+      for (const pattern of config.partialMatchPatterns.lock) {
+        if (normalizedTranscript.includes(pattern)) {
+          const fullCommand = normalizedTranscript.includes('screen')
+            ? 'lock my screen'
+            : normalizedTranscript.includes('mac')
+              ? 'lock my mac'
+              : 'lock my screen';
+          return { matched: true, command: fullCommand, commandType: 'lock', confidence: 0.85 };
+        }
+      }
+    }
+
+    return { matched: false, command: null, commandType: null, confidence: 0 };
+  };
+
+  // ============================================================================
+  // 🆕 INTELLIGENT SPEECH RECOVERY
+  // Handles aborts without losing responsiveness
+  // ============================================================================
+
+  const handleIntelligentRecovery = () => {
+    const recovery = speechRecoveryStateRef.current;
+    const now = Date.now();
+
+    // Process any commands detected during backoff
+    if (recovery.commandsDetectedDuringBackoff.length > 0) {
+      console.log(`[RECOVERY] Processing ${recovery.commandsDetectedDuringBackoff.length} commands from backoff period`);
+      recovery.commandsDetectedDuringBackoff.forEach(cmd => {
+        queueCommand(cmd.command, cmd.metadata);
+      });
+      recovery.commandsDetectedDuringBackoff = [];
+    }
+
+    // Check if we're in backoff and it's expired
+    if (recovery.inBackoffMode && now >= recovery.backoffEndTime) {
+      console.log('[RECOVERY] Backoff period ended, resuming normal operation');
+      recovery.inBackoffMode = false;
+      recovery.consecutiveAborts = 0;
+    }
+
+    // Try to restart recognition if continuous listening is enabled
+    if (continuousListeningRef.current && !recovery.inBackoffMode) {
+      try {
+        if (recognitionRef.current) {
+          recognitionRef.current.start();
+          recovery.recognitionAttempts++;
+          console.log('[RECOVERY] ✅ Recognition restarted');
+        }
+      } catch (e) {
+        if (!e.message?.includes('already started')) {
+          console.debug('[RECOVERY] Restart attempt failed:', e.message);
+        }
+      }
+    }
+  };
+
+  const enterSmartBackoff = (reason = 'unknown') => {
+    const recovery = speechRecoveryStateRef.current;
+    const config = voiceConfigRef.current;
+
+    recovery.consecutiveAborts++;
+    recovery.lastAbortTime = Date.now();
+
+    // Calculate adaptive backoff - shorter than before
+    const baseBackoff = Math.min(
+      config.maxAbortBackoffMs,
+      200 * Math.pow(1.5, Math.min(recovery.consecutiveAborts - 1, 4))
+    );
+
+    recovery.backoffEndTime = Date.now() + baseBackoff;
+    recovery.inBackoffMode = true;
+
+    console.log(`[RECOVERY] Entering smart backoff: ${baseBackoff}ms (reason: ${reason}, consecutive: ${recovery.consecutiveAborts})`);
+
+    // Schedule recovery
+    setTimeout(() => {
+      handleIntelligentRecovery();
+    }, baseBackoff);
+  };
+
   const initializeSpeechRecognition = async () => {
     if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
       const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -2325,17 +2616,22 @@ const JarvisVoice = () => {
 
         // 🆕 ULTRA-FAST-PATH: Check for critical unlock/lock commands immediately
         // These commands get special priority with LOWER confidence threshold
+        // Also use fuzzy matching for better detection
         const isUnlockCommand = /unlock\s*(my)?\s*(screen|mac|computer)?/i.test(transcript);
-        const isLockCommand = /lock\s*(my)?\s*(screen|mac|computer)?/i.test(transcript);
+        const isLockCommand = /lock\s*(my)?\s*(screen|mac|computer)?/i.test(transcript) && !isUnlockCommand;
         const isCriticalCommand = isUnlockCommand || isLockCommand;
 
-        // For critical commands, use a much lower confidence threshold (0.50 instead of 0.85)
+        // Get dynamic threshold from config (no hardcoding)
+        const criticalThreshold = voiceConfigRef.current.criticalCommandConfidenceThreshold;
+
+        // For critical commands, use a much lower confidence threshold from config
         // This ensures unlock commands are caught on the first attempt
-        if (isCriticalCommand && confidence >= 0.50) {
+        if (isCriticalCommand && confidence >= criticalThreshold) {
           console.log(`🔓 CRITICAL COMMAND ULTRA-FAST-PATH: "${transcript}" (conf: ${(confidence * 100).toFixed(1)}%)`);
 
           // For unlock commands, process immediately without waiting for final
-          if (isFinal || confidence >= 0.60) {
+          // Use dynamic threshold from config
+          if (isFinal || confidence >= voiceConfigRef.current.normalCommandConfidenceThreshold) {
             console.log(`🔓 Processing ${isUnlockCommand ? 'unlock' : 'lock'} command IMMEDIATELY via priority path`);
             
             // 🚀 ULTRA-FAST: Send command directly without waiting for audio buffer
@@ -2373,18 +2669,36 @@ const JarvisVoice = () => {
         // Process based on adaptive decision
         if (!shouldProcess && !isWaitingForCommandRef.current) return;
 
-        // Check for wake words when not waiting for command
+        // 🆕 Check for wake words with FUZZY MATCHING when not waiting for command
         if (!isWaitingForCommandRef.current && continuousListeningRef.current) {
-          const wakeWords = ['hey jarvis', 'jarvis', 'ok jarvis', 'hello jarvis'];
-          const detectedWakeWord = wakeWords.find(word => transcript.includes(word));
+          // Use new fuzzy matching system
+          const wakeWordMatch = fuzzyMatchWakeWord(transcript);
+          const detectedWakeWord = wakeWordMatch.matched ? wakeWordMatch.wakeWord : null;
 
-          console.log('🔍 Wake word check:', {
+          console.log('🔍 Wake word check (fuzzy):', {
             transcript,
             isWaiting: isWaitingForCommandRef.current,
             continuousListening: continuousListeningRef.current,
             detectedWakeWord,
+            matchType: wakeWordMatch.matchType,
+            matchConfidence: wakeWordMatch.confidence,
             shouldProcess
           });
+
+          // Also check for direct critical commands without wake word (e.g., "unlock my screen")
+          const directCommandMatch = fuzzyMatchCommand(transcript);
+          if (directCommandMatch.matched && (isFinal || confidence >= voiceConfigRef.current.criticalCommandConfidenceThreshold)) {
+            console.log(`🎯 Direct ${directCommandMatch.commandType} command detected without wake word: "${transcript}"`);
+            sendPriorityCommand(directCommandMatch.command, {
+              confidence,
+              originalConfidence: confidence,
+              isFinal,
+              wasCriticalCommand: true,
+              commandType: directCommandMatch.commandType,
+              matchType: 'direct_fuzzy'
+            });
+            return;
+          }
 
           if (detectedWakeWord) {
             console.log('🎯 Wake word detected:', detectedWakeWord, `(confidence: ${(confidence * 100).toFixed(1)}%)`, '| Current state:', {
@@ -2682,76 +2996,51 @@ const JarvisVoice = () => {
 
             case 'aborted':
               // ================================================================
-              // IMPROVED ABORT HANDLING - Prevents restart loop
+              // 🆕 INTELLIGENT ABORT HANDLING - Uses smart backoff system
               // ================================================================
-              // Track abort frequency to detect loops
-              if (!window._abortTracker) {
-                window._abortTracker = { count: 0, lastReset: Date.now(), consecutiveAborts: 0 };
-              }
-              
-              const tracker = window._abortTracker;
-              const now = Date.now();
-              
-              // Reset counter every 10 seconds
-              if (now - tracker.lastReset > 10000) {
-                tracker.count = 0;
-                tracker.consecutiveAborts = 0;
-                tracker.lastReset = now;
-              }
-              
-              tracker.count++;
-              tracker.consecutiveAborts++;
-              
-              // Only log first abort or every 10th to reduce console spam
-              if (tracker.consecutiveAborts === 1 || tracker.consecutiveAborts % 10 === 0) {
-                console.log(`Recognition aborted (count: ${tracker.consecutiveAborts})`);
-              }
-              
-              // If too many aborts in succession, back off
-              if (tracker.consecutiveAborts > 5) {
-                console.warn(`⚠️ Too many aborts (${tracker.consecutiveAborts}) - backing off for 3 seconds`);
-                skipNextRestartRef.current = true;
-                
-                // Back off for 3 seconds before allowing restart
-                setTimeout(() => {
-                  tracker.consecutiveAborts = 0;
-                  skipNextRestartRef.current = false;
-                  if (continuousListeningRef.current) {
-                    console.log('🔄 Resuming after abort backoff');
-                    try {
-                      recognitionRef.current.start();
-                    } catch (e) {
-                      if (!e.message?.includes('already started')) {
-                        console.debug('Backoff restart failed:', e.message);
+              {
+                const recovery = speechRecoveryStateRef.current;
+                const abortNow = Date.now();
+
+                // Reset if enough time has passed since last abort
+                if (abortNow - recovery.lastAbortTime > 5000) {
+                  recovery.consecutiveAborts = 0;
+                }
+
+                recovery.consecutiveAborts++;
+                recovery.lastAbortTime = abortNow;
+
+                // Only log occasionally to reduce spam
+                if (recovery.consecutiveAborts === 1 || recovery.consecutiveAborts % 5 === 0) {
+                  console.log(`[ABORT] Recognition aborted (consecutive: ${recovery.consecutiveAborts})`);
+                }
+
+                // If too many aborts, use smart backoff (much shorter than before)
+                if (recovery.consecutiveAborts > 3) {
+                  enterSmartBackoff('too_many_aborts');
+                  break;
+                }
+
+                // If speech was recently active, short delay before restart
+                const abortTimeSinceSpeech = abortNow - lastSpeechTimeRef.current;
+                if (speechActiveRef.current || abortTimeSinceSpeech < 1000) {
+                  console.debug(`[ABORT] During active speech (${abortTimeSinceSpeech}ms ago) - short delay`);
+                  setTimeout(() => {
+                    if (continuousListeningRef.current && !speechActiveRef.current) {
+                      recovery.consecutiveAborts = 0;
+                      try {
+                        recognitionRef.current.start();
+                      } catch (e) {
+                        if (!e.message?.includes('already started')) {
+                          console.debug('[ABORT] Delayed restart failed:', e.message);
                       }
                     }
                   }
-                }, 3000);
-                break;  // Don't do any further processing
-              }
-              
-              // If speech was recently active, delay restart
-              const timeSinceSpeech = Date.now() - lastSpeechTimeRef.current;
-              if (speechActiveRef.current || timeSinceSpeech < 2000) {
-                console.debug(`Abort during active speech (${timeSinceSpeech}ms ago) - delaying restart`);
-                skipNextRestartRef.current = true;
-                setTimeout(() => {
-                  if (continuousListeningRef.current && !speechActiveRef.current) {
-                    skipNextRestartRef.current = false;
-                    tracker.consecutiveAborts = 0;  // Reset on successful delay
-                    try {
-                      recognitionRef.current.start();
-                    } catch (e) {
-                      if (!e.message?.includes('already started')) {
-                        console.debug('Delayed abort restart failed:', e.message);
-                      }
-                    }
-                  }
-                }, 1000);
-              } else {
-                // Normal abort (not during speech) - let onend handle restart
-                // Don't skip, just let it flow naturally
-                tracker.consecutiveAborts = 0;  // Reset counter on clean abort
+                }, 500);  // Reduced from 1000ms
+                } else {
+                  // Normal abort - let recovery system handle restart quickly
+                  recovery.consecutiveAborts = 0;
+                }
               }
               break;
 
@@ -2786,8 +3075,9 @@ const JarvisVoice = () => {
             if (!speechActiveRef.current && continuousListeningRef.current) {
               try {
                 recognitionRef.current.start();
-                // Reset abort tracker on successful start
-                if (window._abortTracker) window._abortTracker.consecutiveAborts = 0;
+                // Reset recovery state on successful start
+                speechRecoveryStateRef.current.consecutiveAborts = 0;
+                speechRecoveryStateRef.current.lastSuccessfulRecognition = Date.now();
               } catch (e) {
                 if (!e.message?.includes('already started')) {
                   console.debug('Delayed restart failed:', e.message);
@@ -2949,10 +3239,37 @@ const JarvisVoice = () => {
         }
       }
       
-      // If still not connected, fallback to REST immediately
+      // If still not connected, queue the command for when connection is restored
       if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
-        console.warn('❌ Quick reconnect failed - using REST API fallback');
-        sendTextCommand(command);
+        console.warn('❌ Quick reconnect failed - queuing command for later delivery');
+
+        // Get audio while we can for later use
+        let audioForQueue = null;
+        if (continuousAudioBufferRef.current && continuousAudioBufferRef.current.isRunning) {
+          try {
+            const bufferedAudio = await continuousAudioBufferRef.current.getBufferedAudioBase64(2000);
+            if (bufferedAudio && bufferedAudio.audio) {
+              audioForQueue = {
+                audio: bufferedAudio.audio,
+                sampleRate: bufferedAudio.sampleRate,
+                mimeType: bufferedAudio.mimeType
+              };
+            }
+          } catch (e) {
+            console.log('[Priority] Could not capture audio for queue');
+          }
+        }
+
+        // Queue the command with priority
+        queueCommand(command, {
+          ...confidenceInfo,
+          priority: 'critical',
+          isPriorityCommand: true,
+          commandType: confidenceInfo.commandType || 'unlock',
+          audioData: audioForQueue
+        });
+
+        setResponse('⏳ Command queued - connecting...');
         return;
       }
     }
@@ -3025,11 +3342,36 @@ const JarvisVoice = () => {
         }
       }
 
-      // If still not connected after 5 seconds, show error
+      // If still not connected after 5 seconds, queue the command
       if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
-        console.error('❌ Failed to reconnect WebSocket');
-        setError('⚠️ Connection lost - please refresh the page');
-        return;  // Don't send command
+        console.warn('❌ Failed to reconnect WebSocket - queuing command');
+
+        // Try to get audio for the queued command
+        let audioForQueue = null;
+        if (continuousAudioBufferRef.current && continuousAudioBufferRef.current.isRunning) {
+          try {
+            const bufferedAudio = await continuousAudioBufferRef.current.getBufferedAudioBase64(3000);
+            if (bufferedAudio && bufferedAudio.audio) {
+              audioForQueue = {
+                audio: bufferedAudio.audio,
+                sampleRate: bufferedAudio.sampleRate,
+                mimeType: bufferedAudio.mimeType
+              };
+            }
+          } catch (e) {
+            console.log('[Voice] Could not capture audio for queue');
+          }
+        }
+
+        // Queue the command
+        queueCommand(command, {
+          ...confidenceInfo,
+          audioData: audioForQueue
+        });
+
+        setError('⏳ Command queued - will send when connected');
+        setResponse('⏳ Queued: ' + command);
+        return;
       }
     }
 
