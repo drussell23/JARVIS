@@ -6178,6 +6178,10 @@ class AsyncSystemManager:
         self.frontend_only = False
         self.is_restart = False  # Track if this is a restart
         self.use_optimized = True  # Use optimized backend by default
+        
+        # Browser configuration for development
+        self.use_incognito = False  # Use Incognito/Private mode (avoids cache issues)
+        self.preferred_browser = None  # None = auto-detect, or "chrome", "safari", "arc"
         self.auto_cleanup = True  # Auto cleanup without prompting (enabled by default)
         self.resource_coordinator = None
         self.jarvis_coordinator = None
@@ -10849,8 +10853,251 @@ if (typeof localStorage !== 'undefined') {
             # Non-critical, don't fail startup
             logger.debug(f"Could not add cache clearing: {e}")
 
+    async def _open_incognito_browser(self, url: str, preferred_browser: str = None) -> bool:
+        """
+        Open URL in Incognito/Private browsing mode.
+        
+        This is essential for development as it:
+        - Bypasses all cached CSS, JS, and assets
+        - Starts with fresh localStorage/sessionStorage
+        - No service worker interference
+        - Guaranteed to see the latest frontend changes
+        
+        Args:
+            url: URL to open
+            preferred_browser: "chrome", "safari", "arc", or None for auto-detect
+            
+        Returns:
+            True if successfully opened, False to fall through to normal mode
+        """
+        if platform.system() != "Darwin":
+            # Non-macOS: use command line flags
+            return await self._open_incognito_non_macos(url, preferred_browser)
+        
+        # macOS: Use AppleScript for precise control
+        # Priority order if no preference: Chrome (best incognito support) > Safari > Arc
+        browser_order = []
+        if preferred_browser:
+            browser_order = [preferred_browser.lower()]
+        else:
+            browser_order = ["chrome", "safari", "arc"]
+        
+        for browser in browser_order:
+            success = await self._try_incognito_browser(url, browser)
+            if success:
+                return True
+        
+        logger.warning("Could not open Incognito window, falling back to normal mode")
+        return False
+    
+    async def _try_incognito_browser(self, url: str, browser: str) -> bool:
+        """Try to open an incognito window in the specified browser."""
+        
+        if browser == "chrome":
+            # Chrome: Open new incognito window with URL
+            applescript = f'''
+            tell application "System Events"
+                if not (exists process "Google Chrome") then
+                    return false
+                end if
+            end tell
+            
+            tell application "Google Chrome"
+                -- Close any existing JARVIS incognito windows first
+                set jarvisPatterns to {{"localhost:3000", "localhost:3001", "localhost:8010", "127.0.0.1:3000", "127.0.0.1:3001"}}
+                
+                repeat with w in windows
+                    if mode of w is "incognito" then
+                        set shouldClose to false
+                        repeat with t in tabs of w
+                            set tabURL to URL of t
+                            repeat with pattern in jarvisPatterns
+                                if tabURL contains pattern then
+                                    set shouldClose to true
+                                    exit repeat
+                                end if
+                            end repeat
+                            if shouldClose then exit repeat
+                        end repeat
+                        
+                        if shouldClose then
+                            close w
+                        end if
+                    end if
+                end repeat
+                
+                -- Create new incognito window
+                set incognitoWindow to make new window with properties {{mode:"incognito"}}
+                tell incognitoWindow
+                    set URL of active tab to "{url}"
+                end tell
+                activate
+                
+                return true
+            end tell
+            '''
+            
+        elif browser == "safari":
+            # Safari: Private window
+            applescript = f'''
+            tell application "System Events"
+                if not (exists process "Safari") then
+                    return false
+                end if
+            end tell
+            
+            tell application "Safari"
+                -- Close any existing JARVIS private windows
+                set jarvisPatterns to {{"localhost:3000", "localhost:3001", "localhost:8010", "127.0.0.1:3000", "127.0.0.1:3001"}}
+                
+                repeat with w in windows
+                    try
+                        -- Safari private windows have a specific property
+                        set windowName to name of w
+                        if windowName contains "Private" then
+                            repeat with t in tabs of w
+                                set tabURL to URL of t
+                                repeat with pattern in jarvisPatterns
+                                    if tabURL contains pattern then
+                                        close w
+                                        exit repeat
+                                    end if
+                                end repeat
+                            end repeat
+                        end if
+                    end try
+                end repeat
+                
+                activate
+            end tell
+            
+            -- Use System Events to open private window via menu
+            tell application "System Events"
+                tell process "Safari"
+                    -- File > New Private Window (Cmd+Shift+N)
+                    keystroke "n" using {{command down, shift down}}
+                    delay 0.5
+                    
+                    -- Type URL in address bar
+                    keystroke "l" using command down
+                    delay 0.2
+                    keystroke "{url}"
+                    delay 0.1
+                    keystroke return
+                end tell
+            end tell
+            
+            return true
+            '''
+            
+        elif browser == "arc":
+            # Arc: Incognito mode
+            applescript = f'''
+            tell application "System Events"
+                if not (exists process "Arc") then
+                    return false
+                end if
+            end tell
+            
+            tell application "Arc"
+                activate
+            end tell
+            
+            -- Arc uses Cmd+Shift+N for incognito
+            tell application "System Events"
+                tell process "Arc"
+                    keystroke "n" using {{command down, shift down}}
+                    delay 0.5
+                    keystroke "l" using command down
+                    delay 0.2
+                    keystroke "{url}"
+                    delay 0.1
+                    keystroke return
+                end tell
+            end tell
+            
+            return true
+            '''
+        else:
+            return False
+        
+        try:
+            process = await asyncio.create_subprocess_exec(
+                "osascript", "-e", applescript,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=10)
+            
+            if process.returncode == 0:
+                result = stdout.decode().strip().lower()
+                if result != "false":
+                    browser_name = {"chrome": "Chrome", "safari": "Safari", "arc": "Arc"}.get(browser, browser)
+                    print(f"{Colors.GREEN}🔒 Opened JARVIS in {browser_name} Incognito/Private window{Colors.ENDC}")
+                    logger.info(f"Opened incognito window in {browser_name}")
+                    return True
+            
+            # Browser not running or failed
+            return False
+            
+        except asyncio.TimeoutError:
+            logger.warning(f"Timeout opening {browser} incognito window")
+            return False
+        except Exception as e:
+            logger.debug(f"Failed to open {browser} incognito: {e}")
+            return False
+    
+    async def _open_incognito_non_macos(self, url: str, preferred_browser: str = None) -> bool:
+        """Open incognito browser on non-macOS systems (Linux/Windows)."""
+        import shutil
+        
+        # Try browsers in order
+        browsers = []
+        if preferred_browser:
+            browsers = [preferred_browser]
+        else:
+            browsers = ["chrome", "chromium", "firefox"]
+        
+        for browser in browsers:
+            try:
+                if browser in ("chrome", "chromium"):
+                    # Google Chrome / Chromium
+                    chrome_paths = ["google-chrome", "chromium-browser", "chromium", "chrome"]
+                    for chrome in chrome_paths:
+                        if shutil.which(chrome):
+                            process = await asyncio.create_subprocess_exec(
+                                chrome, "--incognito", url,
+                                stdout=asyncio.subprocess.DEVNULL,
+                                stderr=asyncio.subprocess.DEVNULL
+                            )
+                            print(f"{Colors.GREEN}🔒 Opened JARVIS in Chrome Incognito{Colors.ENDC}")
+                            return True
+                            
+                elif browser == "firefox":
+                    if shutil.which("firefox"):
+                        process = await asyncio.create_subprocess_exec(
+                            "firefox", "--private-window", url,
+                            stdout=asyncio.subprocess.DEVNULL,
+                            stderr=asyncio.subprocess.DEVNULL
+                        )
+                        print(f"{Colors.GREEN}🔒 Opened JARVIS in Firefox Private Window{Colors.ENDC}")
+                        return True
+                        
+            except Exception as e:
+                logger.debug(f"Failed to open {browser}: {e}")
+                continue
+        
+        return False
+
     async def open_browser_smart(self, custom_url: str = None):
-        """Open browser intelligently - reuse tabs when possible
+        """Open browser intelligently with advanced features.
+        
+        Features:
+        - Incognito/Private mode support (bypasses cache for development)
+        - Tab reuse to avoid accumulating JARVIS tabs
+        - Multi-browser support (Chrome, Safari, Arc)
+        - Preferred browser selection
+        - Smart fallbacks
 
         Args:
             custom_url: Optional custom URL to open (e.g., loading page)
@@ -10868,6 +11115,16 @@ if (typeof localStorage !== 'undefined') {
         # On restart, give browsers a moment to settle
         if self.is_restart:
             await asyncio.sleep(0.5)
+        
+        # Use Incognito mode if enabled (bypasses cache for fresh frontend)
+        use_incognito = getattr(self, 'use_incognito', False)
+        preferred_browser = getattr(self, 'preferred_browser', None)
+        
+        if use_incognito:
+            logger.info(f"🔒 Opening in Incognito mode (cache-free for development)")
+            result = await self._open_incognito_browser(url, preferred_browser)
+            if result:
+                return  # Success, don't fall through
 
         # Try to reuse existing tab on macOS using AppleScript
         if platform.system() == "Darwin":
@@ -14091,6 +14348,22 @@ async def main():
         help="Restart JARVIS: kill old instances, load fresh async code (fixes 'Processing...' hangs from blocking encode_batch), and verify intelligent system",
     )
     parser.add_argument(
+        "--incognito",
+        action="store_true",
+        help="Open browser in Incognito/Private mode (bypasses cache for fresh frontend changes). Auto-enabled with --restart.",
+    )
+    parser.add_argument(
+        "--no-incognito",
+        action="store_true",
+        help="Disable Incognito mode even on restart (use normal browser window)",
+    )
+    parser.add_argument(
+        "--browser",
+        choices=["chrome", "safari", "arc", "auto"],
+        default="auto",
+        help="Preferred browser (default: auto-detect running browser)",
+    )
+    parser.add_argument(
         "--check-only",
         action="store_true",
         help="Check system state and provide recommendations without starting",
@@ -16073,6 +16346,20 @@ async def main():
     _manager.frontend_only = args.frontend_only
     _manager.is_restart = args.restart  # Track if this is a restart
     _manager.use_optimized = not args.standard
+    
+    # Browser configuration - Incognito mode for cache-free development
+    # Auto-enable incognito on restart unless explicitly disabled
+    if args.no_incognito:
+        _manager.use_incognito = False
+    elif args.incognito or args.restart:
+        _manager.use_incognito = True
+        if args.restart and not args.incognito:
+            print(f"{Colors.CYAN}🔒 Auto-enabling Incognito mode for restart (use --no-incognito to disable){Colors.ENDC}")
+    else:
+        # Check environment variable
+        _manager.use_incognito = os.environ.get("JARVIS_INCOGNITO", "").lower() in ("true", "1", "yes")
+    
+    _manager.preferred_browser = args.browser if args.browser != "auto" else None
 
     # Set global reference for voice verification tracking
     global _global_system_manager

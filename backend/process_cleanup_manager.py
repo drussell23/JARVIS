@@ -2239,13 +2239,29 @@ class ProcessCleanupManager:
             memory_pressure = mem.percent
             available_gb = mem.available / (1024**3)
             
-            # Create a simple memory snapshot
+            # Create a memory snapshot with all required attributes
+            import platform as platform_module
+            total_gb = mem.total / (1024**3)
+            used_gb = mem.used / (1024**3)
+            
             class MemorySnapshot:
                 def __init__(self):
                     self.gcp_shift_recommended = True  # We're here because of critical memory
                     self.memory_pressure = memory_pressure
                     self.available_gb = available_gb
+                    self.used_gb = used_gb
+                    self.total_gb = total_gb
+                    self.usage_percent = memory_pressure
                     self.reasoning = f"Critical memory pressure: {memory_pressure:.1f}%"
+                    # Platform info required by intelligent_gcp_optimizer
+                    self.platform = platform_module.system().lower()
+                    # macOS specific attributes
+                    self.macos_pressure_level = "critical" if memory_pressure > 85 else "warning" if memory_pressure > 70 else "normal"
+                    self.macos_is_swapping = memory_pressure > 75
+                    self.macos_page_outs = 0
+                    # Linux specific (None on macOS)
+                    self.linux_psi_some_avg10 = None
+                    self.linux_psi_full_avg10 = None
             
             snapshot = MemorySnapshot()
             
