@@ -1,12 +1,12 @@
 {
   "workflow_name": "PR Automation & Validation",
-  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/20109239917",
-  "branch": "cursor/build-ai-voice-receptionist-c22b",
-  "commit_sha": "399dfb2",
-  "run_number": 864,
+  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/20109297266",
+  "branch": "fix/ci/pr-automation-validation-run864-20251210-183137",
+  "commit_sha": "73ab666",
+  "run_number": 870,
   "failed_count": 1,
-  "fix_branch": "fix/ci/pr-automation-validation-run864-20251210-183137",
-  "pr_title": "\ud83d\udea8 Fix CI/CD: PR Automation & Validation (Run #864)",
+  "fix_branch": "fix/ci/pr-automation-validation-run870-20251210-183308",
+  "pr_title": "\ud83d\udea8 Fix CI/CD: PR Automation & Validation (Run #870)",
   "analyses": [
     {
       "error_patterns": [
@@ -15,13 +15,13 @@
           "matches": [
             {
               "line_number": 25,
-              "content": "2025-12-10T18:30:11.5914073Z   subjectPatternError: The PR title must start with a capital letter.",
+              "content": "2025-12-10T18:32:17.1928006Z   subjectPatternError: The PR title must start with a capital letter.",
               "severity": "high",
               "emoji": "\u274c"
             },
             {
               "line_number": 37,
-              "content": "2025-12-10T18:30:12.1340742Z ##[error]No release type found in pull request title \"Build ai voice receptionist\". Add a prefix to indicate what kind of release this pull request corresponds to. For reference, see https://www.conventionalcommits.org/",
+              "content": "2025-12-10T18:32:17.6980268Z ##[error]No release type found in pull request title \"\ud83d\udea8 Fix CI/CD: PR Automation & Validation (Run #864)\". Add a prefix to indicate what kind of release this pull request corresponds to. For reference, see https://www.conventionalcommits.org/",
               "severity": "high",
               "emoji": "\u274c"
             }
@@ -50,5 +50,5 @@
       "similar_failures": []
     }
   ],
-  "timestamp": "2025-12-10T18:31:37.052165"
+  "timestamp": "2025-12-10T18:33:08.958905"
 }

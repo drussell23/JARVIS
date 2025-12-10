@@ -3,13 +3,13 @@
 ## Executive Summary
 
 - **Workflow**: PR Automation & Validation
-- **Run Number**: #864
-- **Branch**: `cursor/build-ai-voice-receptionist-c22b`
-- **Commit**: `399dfb260e2eda62893885df7c2448bfb90ce299`
+- **Run Number**: #870
+- **Branch**: `fix/ci/pr-automation-validation-run864-20251210-183137`
+- **Commit**: `73ab6669f539d83c5714aa02d63c696b9b79cefc`
 - **Status**: ❌ FAILED
-- **Timestamp**: 2025-12-10T18:30:03Z
-- **Triggered By**: @drussell23
-- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/20109239917)
+- **Timestamp**: 2025-12-10T18:32:11Z
+- **Triggered By**: @cubic-dev-ai[bot]
+- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/20109297266)
 
 ## Failure Overview
 
@@ -17,7 +17,7 @@ Total Failed Jobs: **1**
 
 | # | Job Name | Category | Severity | Duration |
 |---|----------|----------|----------|----------|
-| 1 | Validate PR Title | timeout | high | 5s |
+| 1 | Validate PR Title | timeout | high | 3s |
 
 ## Detailed Analysis
 
@@ -26,10 +26,10 @@ Total Failed Jobs: **1**
 **Status**: ❌ failure
 **Category**: Timeout
 **Severity**: HIGH
-**Started**: 2025-12-10T18:30:09Z
-**Completed**: 2025-12-10T18:30:14Z
-**Duration**: 5 seconds
-**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/20109239917/job/57701708212)
+**Started**: 2025-12-10T18:32:15Z
+**Completed**: 2025-12-10T18:32:18Z
+**Duration**: 3 seconds
+**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/20109297266/job/57701915128)
 
 #### Failed Steps
 
@@ -42,8 +42,8 @@ Total Failed Jobs: **1**
 - Pattern: `ERROR|Error|error`
   - Occurrences: 2
   - Sample matches:
-    - Line 25: `2025-12-10T18:30:11.5914073Z   subjectPatternError: The PR title must start with a capital letter.`
-    - Line 37: `2025-12-10T18:30:12.1340742Z ##[error]No release type found in pull request title "Build ai voice re`
+    - Line 25: `2025-12-10T18:32:17.1928006Z   subjectPatternError: The PR title must start with a capital letter.`
+    - Line 37: `2025-12-10T18:32:17.6980268Z ##[error]No release type found in pull request title "🚨 Fix CI/CD: PR A`
 
 - Pattern: `timeout|timed out`
   - Occurrences: 1
@@ -73,5 +73,5 @@ Total Failed Jobs: **1**
 
 ---
 
-📊 *Report generated on 2025-12-10T18:31:37.052064*
+📊 *Report generated on 2025-12-10T18:33:08.958807*
 🤖 *JARVIS CI/CD Auto-PR Manager*
