@@ -61,9 +61,77 @@ from enum import Enum, auto
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
-import numpy as np
+# NumPy is required for voice embeddings
+try:
+    import numpy as np
+    NUMPY_AVAILABLE = True
+except ImportError:
+    NUMPY_AVAILABLE = False
+    np = None  # type: ignore
 
 logger = logging.getLogger(__name__)
+
+# Graceful check for numpy - provide clear error if missing
+if not NUMPY_AVAILABLE:
+    logger.error(
+        "❌ CRITICAL: numpy is not installed! Voice profile service requires numpy. "
+        "Install with: pip install numpy"
+    )
+
+
+# =============================================================================
+# Embedding Utilities
+# =============================================================================
+
+def _decode_embedding(data: bytes) -> Union[Any, List[float]]:
+    """
+    Decode embedding bytes to array format.
+    
+    Uses numpy if available, falls back to struct module otherwise.
+    
+    Args:
+        data: Raw bytes of float32 embedding
+        
+    Returns:
+        numpy.ndarray if numpy available, List[float] otherwise
+    """
+    if not data:
+        return [] if not NUMPY_AVAILABLE else (np.array([], dtype=np.float32) if np else [])
+    
+    if NUMPY_AVAILABLE and np is not None:
+        return np.frombuffer(data, dtype=np.float32)
+    else:
+        # Fallback to struct module
+        import struct
+        num_floats = len(data) // 4
+        return list(struct.unpack(f'<{num_floats}f', data))
+
+
+def _encode_embedding(embedding: Union[Any, List[float]]) -> bytes:
+    """
+    Encode embedding to bytes format.
+    
+    Handles numpy arrays and Python lists.
+    
+    Args:
+        embedding: numpy.ndarray or List[float]
+        
+    Returns:
+        Raw bytes of float32 values
+    """
+    if embedding is None:
+        return b''
+    
+    # Handle numpy array
+    if hasattr(embedding, 'tobytes'):
+        return embedding.tobytes()
+    
+    # Handle list
+    if isinstance(embedding, (list, tuple)):
+        import struct
+        return struct.pack(f'<{len(embedding)}f', *embedding)
+    
+    return b''
 
 
 # =============================================================================
@@ -184,7 +252,7 @@ class SyncStatus(Enum):
 class VoiceProfileData:
     """Voice profile data structure."""
     speaker_name: str
-    embedding: np.ndarray
+    embedding: Any  # np.ndarray when numpy available, List[float] otherwise
     embedding_dim: int
     total_samples: int = 0
     recognition_confidence: float = 0.0
@@ -204,16 +272,33 @@ class VoiceProfileData:
     
     def is_valid(self) -> bool:
         """Check if profile has valid embedding."""
-        return (
-            self.embedding is not None and
-            len(self.embedding) >= _config.min_embedding_dim
-        )
+        if self.embedding is None:
+            return False
+        
+        try:
+            emb_len = len(self.embedding)
+            return emb_len >= _config.min_embedding_dim
+        except (TypeError, AttributeError):
+            return False
     
     def embedding_hash(self) -> str:
         """Generate hash of embedding for comparison."""
         if self.embedding is None:
             return ""
-        return hashlib.sha256(self.embedding.tobytes()).hexdigest()[:16]
+        
+        try:
+            # Handle numpy array
+            if hasattr(self.embedding, 'tobytes'):
+                return hashlib.sha256(self.embedding.tobytes()).hexdigest()[:16]
+            # Handle list of floats
+            elif isinstance(self.embedding, (list, tuple)):
+                import struct
+                data = struct.pack(f'<{len(self.embedding)}f', *self.embedding)
+                return hashlib.sha256(data).hexdigest()[:16]
+            else:
+                return ""
+        except Exception:
+            return ""
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
@@ -670,8 +755,8 @@ class VoiceProfileStartupService:
                         if not embedding_bytes:
                             continue
                         
-                        # Decode embedding
-                        embedding = np.frombuffer(embedding_bytes, dtype=np.float32)
+                        # Decode embedding (handles numpy and non-numpy environments)
+                        embedding = _decode_embedding(embedding_bytes)
                         
                         if len(embedding) < self._config.min_embedding_dim:
                             logger.debug(f"Skipping {speaker_name}: embedding too small ({len(embedding)})")
@@ -856,7 +941,8 @@ class VoiceProfileStartupService:
                         if not embedding_bytes:
                             continue
                         
-                        embedding = np.frombuffer(embedding_bytes, dtype=np.float32)
+                        # Decode embedding (handles numpy and non-numpy environments)
+                        embedding = _decode_embedding(embedding_bytes)
                         
                         if len(embedding) < _config.min_embedding_dim:
                             continue
