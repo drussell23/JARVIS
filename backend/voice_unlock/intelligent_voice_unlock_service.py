@@ -3679,12 +3679,19 @@ from enum import Enum
 
 class RobustUnlockConfig:
     """Configuration for robust unlock with environment overrides."""
-    MAX_TOTAL_TIMEOUT = float(os.environ.get("JARVIS_ROBUST_MAX_TIMEOUT", "15.0"))
-    AUDIO_DECODE_TIMEOUT = float(os.environ.get("JARVIS_ROBUST_AUDIO_TIMEOUT", "2.0"))
-    PROFILE_LOAD_TIMEOUT = float(os.environ.get("JARVIS_ROBUST_PROFILE_TIMEOUT", "3.0"))
-    ECAPA_EXTRACT_TIMEOUT = float(os.environ.get("JARVIS_ROBUST_ECAPA_TIMEOUT", "8.0"))
+    # Total timeout for entire unlock operation
+    MAX_TOTAL_TIMEOUT = float(os.environ.get("JARVIS_ROBUST_MAX_TIMEOUT", "30.0"))
+    # Audio decode: base64 decode + FFmpeg conversion
+    AUDIO_DECODE_TIMEOUT = float(os.environ.get("JARVIS_ROBUST_AUDIO_TIMEOUT", "15.0"))
+    # Profile load from SQLite
+    PROFILE_LOAD_TIMEOUT = float(os.environ.get("JARVIS_ROBUST_PROFILE_TIMEOUT", "5.0"))
+    # ECAPA embedding extraction (cloud + local fallback)
+    ECAPA_EXTRACT_TIMEOUT = float(os.environ.get("JARVIS_ROBUST_ECAPA_TIMEOUT", "15.0"))
+    # Unlock execution via AppleScript
     UNLOCK_EXECUTE_TIMEOUT = float(os.environ.get("JARVIS_ROBUST_UNLOCK_TIMEOUT", "5.0"))
+    # Minimum cosine similarity to verify speaker
     CONFIDENCE_THRESHOLD = float(os.environ.get("JARVIS_ROBUST_THRESHOLD", "0.40"))
+    # Path to learning database with voiceprints
     LEARNING_DB_PATH = os.path.expanduser("~/.jarvis/learning/jarvis_learning.db")
 
 
@@ -3752,12 +3759,98 @@ async def _load_speaker_embedding_direct(speaker_name: str = "Derek") -> Optiona
 
 
 async def _extract_ecapa_robust(audio_bytes: bytes) -> Optional[List[float]]:
-    """Extract ECAPA embedding with timeout-protected fallbacks."""
+    """Extract ECAPA embedding with timeout-protected fallbacks and robust audio loading."""
     import numpy as np
+    import tempfile
+
+    logger.info(f"[ROBUST-ECAPA] Starting extraction: {len(audio_bytes)} bytes audio")
+
+    # Helper: Load audio with multiple strategies
+    def _load_audio_robust(audio_data: bytes):
+        """Load audio using multiple strategies until one succeeds."""
+        import torchaudio
+        import torch
+        import io
+
+        errors = []
+
+        # Strategy 1: Direct BytesIO load (works for WAV)
+        try:
+            logger.info("[ROBUST-ECAPA] Trying direct BytesIO load...")
+            waveform, sr = torchaudio.load(io.BytesIO(audio_data))
+            logger.info(f"[ROBUST-ECAPA] BytesIO load SUCCESS: shape={waveform.shape}, sr={sr}")
+            return waveform, sr
+        except Exception as e:
+            errors.append(f"BytesIO: {e}")
+            logger.debug(f"[ROBUST-ECAPA] BytesIO failed: {e}")
+
+        # Strategy 2: Temp file with format hint from magic bytes
+        format_ext = '.wav'  # Default
+        if audio_data[:4] == b'\x1aE\xdf\xa3':
+            format_ext = '.webm'
+        elif audio_data[:4] == b'OggS':
+            format_ext = '.ogg'
+        elif audio_data[:4] == b'fLaC':
+            format_ext = '.flac'
+
+        try:
+            logger.info(f"[ROBUST-ECAPA] Trying temp file load with ext={format_ext}...")
+            with tempfile.NamedTemporaryFile(suffix=format_ext, delete=False) as f:
+                f.write(audio_data)
+                temp_path = f.name
+
+            waveform, sr = torchaudio.load(temp_path)
+            os.unlink(temp_path)
+            logger.info(f"[ROBUST-ECAPA] Temp file load SUCCESS: shape={waveform.shape}, sr={sr}")
+            return waveform, sr
+        except Exception as e:
+            errors.append(f"TempFile({format_ext}): {e}")
+            logger.debug(f"[ROBUST-ECAPA] Temp file failed: {e}")
+            if 'temp_path' in locals() and os.path.exists(temp_path):
+                os.unlink(temp_path)
+
+        # Strategy 3: scipy.io.wavfile for pure WAV
+        if audio_data[:4] == b'RIFF':
+            try:
+                logger.info("[ROBUST-ECAPA] Trying scipy wavfile load...")
+                from scipy.io import wavfile
+                sr, data = wavfile.read(io.BytesIO(audio_data))
+                # Convert to torch tensor
+                if data.dtype == np.int16:
+                    data = data.astype(np.float32) / 32768.0
+                elif data.dtype == np.int32:
+                    data = data.astype(np.float32) / 2147483648.0
+                waveform = torch.from_numpy(data).unsqueeze(0) if data.ndim == 1 else torch.from_numpy(data.T)
+                logger.info(f"[ROBUST-ECAPA] scipy load SUCCESS: shape={waveform.shape}, sr={sr}")
+                return waveform, sr
+            except Exception as e:
+                errors.append(f"scipy: {e}")
+                logger.debug(f"[ROBUST-ECAPA] scipy failed: {e}")
+
+        # Strategy 4: librosa as last resort
+        try:
+            logger.info("[ROBUST-ECAPA] Trying librosa load...")
+            import librosa
+            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
+                f.write(audio_data)
+                temp_path = f.name
+            y, sr = librosa.load(temp_path, sr=None)
+            os.unlink(temp_path)
+            waveform = torch.from_numpy(y).unsqueeze(0)
+            logger.info(f"[ROBUST-ECAPA] librosa load SUCCESS: shape={waveform.shape}, sr={sr}")
+            return waveform, sr
+        except Exception as e:
+            errors.append(f"librosa: {e}")
+            logger.debug(f"[ROBUST-ECAPA] librosa failed: {e}")
+            if 'temp_path' in locals() and os.path.exists(temp_path):
+                os.unlink(temp_path)
+
+        logger.error(f"[ROBUST-ECAPA] All audio load strategies failed: {errors}")
+        return None, None
 
     # Strategy 1: Cloud ECAPA
     try:
-        logger.info("[ROBUST] Trying cloud ECAPA...")
+        logger.info("[ROBUST-ECAPA] Trying cloud ECAPA...")
         from voice_unlock.cloud_ecapa_client import get_cloud_ecapa_client
         client = await asyncio.wait_for(get_cloud_ecapa_client(), timeout=3.0)
         if client:
@@ -3767,33 +3860,56 @@ async def _extract_ecapa_robust(audio_bytes: bytes) -> Optional[List[float]]:
                 timeout=RobustUnlockConfig.ECAPA_EXTRACT_TIMEOUT
             )
             if embedding is not None and len(embedding) == 192:
-                logger.info("[ROBUST] Cloud ECAPA succeeded")
+                logger.info(f"[ROBUST-ECAPA] Cloud ECAPA SUCCESS: {len(embedding)} dims")
                 return embedding.tolist() if hasattr(embedding, 'tolist') else list(embedding)
     except asyncio.TimeoutError:
-        logger.warning("[ROBUST] Cloud ECAPA timeout")
+        logger.warning("[ROBUST-ECAPA] Cloud ECAPA timeout")
     except Exception as e:
-        logger.warning(f"[ROBUST] Cloud ECAPA failed: {e}")
+        logger.warning(f"[ROBUST-ECAPA] Cloud ECAPA failed: {e}")
 
-    # Strategy 2: Local SpeechBrain
+    # Strategy 2: Local SpeechBrain with robust audio loading
     try:
-        logger.info("[ROBUST] Trying local SpeechBrain...")
+        logger.info("[ROBUST-ECAPA] Trying local SpeechBrain...")
 
         def _local():
-            from speechbrain.inference.speaker import EncoderClassifier
             import torchaudio
             import torch
-            import io
-            waveform, sr = torchaudio.load(io.BytesIO(audio_bytes))
+
+            # Load audio with robust strategy
+            waveform, sr = _load_audio_robust(audio_bytes)
+            if waveform is None:
+                raise ValueError("Failed to load audio with any strategy")
+
+            logger.info(f"[ROBUST-ECAPA] Audio loaded: shape={waveform.shape}, sr={sr}")
+
+            # Resample if needed
             if sr != 16000:
+                logger.info(f"[ROBUST-ECAPA] Resampling from {sr} to 16000 Hz")
                 waveform = torchaudio.transforms.Resample(sr, 16000)(waveform)
+
+            # Convert to mono if stereo
             if waveform.shape[0] > 1:
+                logger.info(f"[ROBUST-ECAPA] Converting {waveform.shape[0]} channels to mono")
                 waveform = waveform.mean(dim=0, keepdim=True)
+
+            # Ensure proper shape [1, samples]
+            if waveform.dim() == 1:
+                waveform = waveform.unsqueeze(0)
+
+            logger.info(f"[ROBUST-ECAPA] Final waveform: shape={waveform.shape}")
+
+            # Load ECAPA-TDNN model
+            from speechbrain.inference.speaker import EncoderClassifier
             classifier = EncoderClassifier.from_hparams(
                 source="speechbrain/spkrec-ecapa-voxceleb",
                 savedir=os.path.expanduser("~/.cache/speechbrain/spkrec-ecapa-voxceleb")
             )
+
+            # Extract embedding
             with torch.no_grad():
                 emb = classifier.encode_batch(waveform).squeeze().numpy()
+
+            logger.info(f"[ROBUST-ECAPA] Embedding extracted: {len(emb)} dims")
             return emb.tolist()
 
         loop = asyncio.get_event_loop()
@@ -3802,40 +3918,181 @@ async def _extract_ecapa_robust(audio_bytes: bytes) -> Optional[List[float]]:
             timeout=RobustUnlockConfig.ECAPA_EXTRACT_TIMEOUT
         )
         if embedding and len(embedding) == 192:
-            logger.info("[ROBUST] Local SpeechBrain succeeded")
+            logger.info(f"[ROBUST-ECAPA] Local SpeechBrain SUCCESS: {len(embedding)} dims")
             return embedding
     except asyncio.TimeoutError:
-        logger.error("[ROBUST] Local SpeechBrain timeout")
+        logger.error("[ROBUST-ECAPA] Local SpeechBrain timeout")
     except Exception as e:
-        logger.error(f"[ROBUST] Local SpeechBrain failed: {e}")
+        logger.error(f"[ROBUST-ECAPA] Local SpeechBrain failed: {e}")
+        import traceback
+        logger.debug(f"[ROBUST-ECAPA] Traceback: {traceback.format_exc()}")
+
     return None
 
 
 async def _decode_audio_robust(audio_base64: str, mime_type: str = "audio/webm") -> Optional[bytes]:
-    """Decode and convert audio to WAV format."""
+    """
+    Decode and convert audio to WAV format with multiple fallback strategies.
+
+    Strategies (in order):
+    1. Check if already WAV - return as-is
+    2. FFmpeg pipe conversion (fastest)
+    3. FFmpeg temp file conversion (most compatible)
+    4. Return raw audio for torchaudio to handle
+    """
+    import tempfile
+    import shutil
+
+    logger.info(f"[ROBUST-AUDIO] Starting audio decode: base64_len={len(audio_base64)}, mime={mime_type}")
+
+    # Step 1: Base64 decode
     try:
         raw = base64.b64decode(audio_base64)
-        if raw[:4] == b'RIFF' and raw[8:12] == b'WAVE':
-            return raw
+        logger.info(f"[ROBUST-AUDIO] Base64 decoded: {len(raw)} bytes, magic={raw[:4].hex() if len(raw) >= 4 else 'N/A'}")
+    except Exception as e:
+        logger.error(f"[ROBUST-AUDIO] Base64 decode FAILED: {e}")
+        return None
 
-        def _convert():
-            import subprocess
+    if len(raw) < 100:
+        logger.error(f"[ROBUST-AUDIO] Audio too short: {len(raw)} bytes")
+        return None
+
+    # Step 2: Check if already WAV
+    if len(raw) >= 12 and raw[:4] == b'RIFF' and raw[8:12] == b'WAVE':
+        logger.info("[ROBUST-AUDIO] Already WAV format, returning as-is")
+        return raw
+
+    # Detect format from magic bytes
+    format_hint = "unknown"
+    if raw[:4] == b'\x1aE\xdf\xa3':  # WebM/Matroska
+        format_hint = "webm"
+    elif raw[:4] == b'OggS':  # Ogg container
+        format_hint = "ogg"
+    elif raw[:4] == b'fLaC':  # FLAC
+        format_hint = "flac"
+    elif raw[:3] == b'ID3' or (raw[0] == 0xff and (raw[1] & 0xe0) == 0xe0):  # MP3
+        format_hint = "mp3"
+    logger.info(f"[ROBUST-AUDIO] Detected format: {format_hint}")
+
+    # Step 3: Try FFmpeg pipe conversion
+    def _ffmpeg_pipe_convert():
+        """Convert via stdin/stdout pipe."""
+        try:
             proc = subprocess.Popen(
-                ['ffmpeg', '-i', 'pipe:0', '-f', 'wav', '-ar', '16000', '-ac', '1', '-acodec', 'pcm_s16le', 'pipe:1'],
+                [
+                    'ffmpeg', '-hide_banner', '-loglevel', 'error',
+                    '-i', 'pipe:0',
+                    '-f', 'wav', '-ar', '16000', '-ac', '1', '-acodec', 'pcm_s16le',
+                    'pipe:1'
+                ],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
             )
-            wav, _ = proc.communicate(input=raw, timeout=5.0)
-            return wav if proc.returncode == 0 and len(wav) > 44 else None
+            wav_out, stderr = proc.communicate(input=raw, timeout=8.0)
 
-        loop = asyncio.get_event_loop()
-        wav = await asyncio.wait_for(
-            loop.run_in_executor(None, _convert),
-            timeout=RobustUnlockConfig.AUDIO_DECODE_TIMEOUT
+            if proc.returncode == 0 and len(wav_out) > 44:
+                return wav_out, None
+            else:
+                return None, stderr.decode('utf-8', errors='ignore')
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            return None, "FFmpeg pipe timeout"
+        except Exception as e:
+            return None, str(e)
+
+    # Step 4: Try FFmpeg temp file conversion (more compatible)
+    def _ffmpeg_file_convert():
+        """Convert via temp files for better format support."""
+        temp_in = None
+        temp_out = None
+        try:
+            # Determine input extension from mime type
+            ext_map = {
+                'audio/webm': '.webm',
+                'audio/ogg': '.ogg',
+                'audio/mp4': '.m4a',
+                'audio/mpeg': '.mp3',
+                'audio/wav': '.wav',
+                'audio/x-wav': '.wav',
+            }
+            in_ext = ext_map.get(mime_type.split(';')[0], '.webm')
+
+            # Create temp files
+            temp_in = tempfile.NamedTemporaryFile(suffix=in_ext, delete=False)
+            temp_out = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+            temp_in.write(raw)
+            temp_in.close()
+            temp_out.close()
+
+            # Run FFmpeg with file I/O
+            result = subprocess.run(
+                [
+                    'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
+                    '-i', temp_in.name,
+                    '-f', 'wav', '-ar', '16000', '-ac', '1', '-acodec', 'pcm_s16le',
+                    temp_out.name
+                ],
+                capture_output=True, timeout=10.0
+            )
+
+            if result.returncode == 0 and os.path.exists(temp_out.name):
+                with open(temp_out.name, 'rb') as f:
+                    wav_data = f.read()
+                if len(wav_data) > 44:
+                    return wav_data, None
+
+            return None, result.stderr.decode('utf-8', errors='ignore')
+
+        except subprocess.TimeoutExpired:
+            return None, "FFmpeg file timeout"
+        except Exception as e:
+            return None, str(e)
+        finally:
+            # Cleanup temp files
+            if temp_in and os.path.exists(temp_in.name):
+                os.unlink(temp_in.name)
+            if temp_out and os.path.exists(temp_out.name):
+                os.unlink(temp_out.name)
+
+    # Try strategies in order
+    loop = asyncio.get_event_loop()
+
+    # Strategy 1: FFmpeg pipe (fast)
+    try:
+        logger.info("[ROBUST-AUDIO] Trying FFmpeg pipe conversion...")
+        wav_data, err = await asyncio.wait_for(
+            loop.run_in_executor(None, _ffmpeg_pipe_convert),
+            timeout=10.0
         )
-        return wav if wav else raw
+        if wav_data:
+            logger.info(f"[ROBUST-AUDIO] FFmpeg pipe SUCCESS: {len(wav_data)} bytes WAV")
+            return wav_data
+        else:
+            logger.warning(f"[ROBUST-AUDIO] FFmpeg pipe failed: {err}")
+    except asyncio.TimeoutError:
+        logger.warning("[ROBUST-AUDIO] FFmpeg pipe timeout")
     except Exception as e:
-        logger.error(f"[ROBUST] Audio decode error: {e}")
-    return None
+        logger.warning(f"[ROBUST-AUDIO] FFmpeg pipe error: {e}")
+
+    # Strategy 2: FFmpeg file (more compatible)
+    try:
+        logger.info("[ROBUST-AUDIO] Trying FFmpeg file conversion...")
+        wav_data, err = await asyncio.wait_for(
+            loop.run_in_executor(None, _ffmpeg_file_convert),
+            timeout=12.0
+        )
+        if wav_data:
+            logger.info(f"[ROBUST-AUDIO] FFmpeg file SUCCESS: {len(wav_data)} bytes WAV")
+            return wav_data
+        else:
+            logger.warning(f"[ROBUST-AUDIO] FFmpeg file failed: {err}")
+    except asyncio.TimeoutError:
+        logger.warning("[ROBUST-AUDIO] FFmpeg file timeout")
+    except Exception as e:
+        logger.warning(f"[ROBUST-AUDIO] FFmpeg file error: {e}")
+
+    # Strategy 3: Return raw for torchaudio to handle
+    logger.warning(f"[ROBUST-AUDIO] All conversions failed, returning raw {len(raw)} bytes for torchaudio")
+    return raw
 
 
 def _verify_speaker_robust(test_emb: List[float], ref_emb: List[float]) -> Tuple[bool, float]:
@@ -3901,8 +4158,26 @@ async def process_voice_unlock_robust(
     try:
         async def _unlock():
             logger.info("=" * 60)
-            logger.info(f"[ROBUST] VOICE UNLOCK STARTED - {len(audio_data)} bytes audio")
+            logger.info(f"[ROBUST] VOICE UNLOCK STARTED")
+            logger.info(f"[ROBUST] Audio data type: {type(audio_data)}, length: {len(audio_data) if audio_data else 0}")
+            logger.info(f"[ROBUST] MIME type: {mime_type}, Sample rate: {sample_rate}")
             logger.info("=" * 60)
+
+            # Validate input
+            if not audio_data:
+                logger.error("[ROBUST] No audio data provided!")
+                return result(False, "No audio data provided", err="audio_data is empty or None")
+
+            if not isinstance(audio_data, str):
+                logger.error(f"[ROBUST] Audio data is not string: {type(audio_data)}")
+                return result(False, "Audio data must be base64 string", err=f"Got {type(audio_data)}")
+
+            # Check if base64 looks valid
+            if len(audio_data) < 100:
+                logger.error(f"[ROBUST] Audio data too short: {len(audio_data)} chars")
+                return result(False, "Audio data too short", err=f"Only {len(audio_data)} chars")
+
+            logger.info(f"[ROBUST] Audio data preview: {audio_data[:50]}...")
 
             await progress("init", 5, "Starting...")
 
@@ -3914,10 +4189,23 @@ async def process_voice_unlock_robust(
             try:
                 audio_bytes, ref_emb = await asyncio.gather(audio_task, profile_task, return_exceptions=True)
             except Exception as e:
+                logger.error(f"[ROBUST] Parallel gather failed: {e}")
                 return result(False, f"Parallel load failed: {e}", err=str(e))
 
-            if isinstance(audio_bytes, Exception) or not audio_bytes:
-                return result(False, "Failed to decode audio", err=str(audio_bytes) if isinstance(audio_bytes, Exception) else "No audio")
+            # Check audio decode result
+            if isinstance(audio_bytes, Exception):
+                logger.error(f"[ROBUST] Audio decode raised exception: {audio_bytes}")
+                return result(False, f"Audio decode error: {audio_bytes}", err=str(audio_bytes))
+
+            if audio_bytes is None:
+                logger.error("[ROBUST] Audio decode returned None")
+                return result(False, "Audio decode returned None - check format", err="decode returned None")
+
+            if len(audio_bytes) < 100:
+                logger.error(f"[ROBUST] Decoded audio too short: {len(audio_bytes)} bytes")
+                return result(False, f"Decoded audio too short ({len(audio_bytes)} bytes)", err="decoded audio < 100 bytes")
+
+            logger.info(f"[ROBUST] Audio decoded successfully: {len(audio_bytes)} bytes")
 
             stages.append({"stage": "audio_decode", "success": True})
 
