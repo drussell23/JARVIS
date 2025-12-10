@@ -2396,6 +2396,11 @@ class UnifiedVoiceCacheManager:
         3. Updates session cache for faster future matches
         4. Records to database for continuous learning
 
+        v2.0.0 Enhancements:
+        - Emergency profile loading if profiles are 0
+        - Multiple extraction fallbacks including Cloud ECAPA
+        - Better error logging with specific failure reasons
+
         Args:
             audio_data: Raw audio waveform
             sample_rate: Audio sample rate
@@ -2405,18 +2410,60 @@ class UnifiedVoiceCacheManager:
             MatchResult with verification details
         """
         start_time = time.time()
+        
+        # CRITICAL: Check if profiles are loaded, emergency load if not
+        if len(self._preloaded_profiles) == 0:
+            logger.warning("⚠️ NO PROFILES LOADED - Attempting emergency reload...")
+            try:
+                await asyncio.wait_for(self._emergency_profile_load(), timeout=5.0)
+                logger.info(f"✅ Emergency load: {len(self._preloaded_profiles)} profiles now available")
+            except Exception as e:
+                logger.error(f"❌ Emergency profile load failed: {e}")
+        
+        # Log verification start with context
+        logger.info(
+            f"🔐 Starting voice verification:\n"
+            f"   Profiles loaded: {len(self._preloaded_profiles)}\n"
+            f"   Audio size: {len(audio_data) if audio_data else 0} bytes\n"
+            f"   Sample rate: {sample_rate}"
+        )
 
-        # Step 1: Extract embedding from audio
+        # Step 1: Extract embedding from audio with enhanced fallbacks
         embedding = await self.extract_embedding(audio_data, sample_rate)
+        
         if embedding is None:
+            # Try CloudECAPAClient as emergency fallback
+            logger.warning("⚠️ Primary extraction failed - trying CloudECAPAClient fallback...")
+            embedding = await self._emergency_cloud_extraction(audio_data)
+        
+        if embedding is None:
+            logger.error(
+                "❌ Embedding extraction FAILED:\n"
+                "   This will result in 0% confidence.\n"
+                "   Check if ECAPA model is loaded or Cloud ECAPA is accessible."
+            )
             return MatchResult(
                 matched=False,
-                match_type="none",
+                match_type="extraction_failed",
                 match_time_ms=(time.time() - start_time) * 1000,
             )
+        
+        logger.info(f"✅ Embedding extracted: shape={embedding.shape}")
 
         # Step 2: Match against profiles
         result = await self.match_voice_embedding(embedding, expected_speaker)
+        
+        # Log result for debugging
+        if result.matched:
+            logger.info(f"✅ MATCH: {result.speaker_name} ({result.similarity:.1%})")
+        else:
+            logger.info(
+                f"📊 No match found:\n"
+                f"   Best similarity: {result.similarity:.1%}\n"
+                f"   Speaker: {result.speaker_name or 'unknown'}\n"
+                f"   Match type: {result.match_type}\n"
+                f"   Profiles checked: {len(self._preloaded_profiles)}"
+            )
 
         # Step 3: If matched, trigger continuous learning (background)
         if result.matched and result.speaker_name:
@@ -2429,6 +2476,86 @@ class UnifiedVoiceCacheManager:
             )
 
         return result
+
+    async def _emergency_profile_load(self):
+        """Emergency profile loading when cache is empty."""
+        try:
+            # Try SQLite first (fastest)
+            loaded = await self._preload_voice_profiles()
+            if loaded > 0:
+                return
+            
+            # Try CloudSQL bootstrap
+            loaded = await self._bootstrap_from_cloudsql()
+            if loaded > 0:
+                return
+            
+            # Last resort: try to create profile from learning database directly
+            try:
+                from intelligence.learning_database import get_learning_database
+                db = await get_learning_database()
+                profiles = await db.get_all_speaker_profiles()
+                
+                for profile in profiles:
+                    if profile.get('voiceprint_embedding'):
+                        embedding = np.frombuffer(
+                            profile['voiceprint_embedding'], 
+                            dtype=np.float32
+                        )
+                        if len(embedding) >= 50:
+                            self._preloaded_profiles[profile['speaker_name']] = VoiceProfile(
+                                speaker_name=profile['speaker_name'],
+                                embedding=embedding,
+                                embedding_dimensions=len(embedding),
+                                total_samples=profile.get('total_samples', 0),
+                                avg_confidence=profile.get('recognition_confidence', 0.0),
+                                source="emergency_learning_db",
+                            )
+                            loaded += 1
+                            
+                if loaded > 0:
+                    logger.info(f"✅ Emergency loaded {loaded} profiles from learning database")
+                    
+            except Exception as e:
+                logger.debug(f"Emergency learning DB load failed: {e}")
+                
+        except Exception as e:
+            logger.error(f"Emergency profile load failed: {e}")
+
+    async def _emergency_cloud_extraction(self, audio_data) -> Optional[np.ndarray]:
+        """Emergency embedding extraction using CloudECAPAClient."""
+        try:
+            from voice_unlock.cloud_ecapa_client import get_cloud_ecapa_client
+            
+            client = await asyncio.wait_for(get_cloud_ecapa_client(), timeout=5.0)
+            if not client:
+                logger.debug("CloudECAPAClient not available for emergency extraction")
+                return None
+            
+            # Initialize if needed
+            if not client._initialized:
+                await asyncio.wait_for(client.initialize(), timeout=10.0)
+            
+            # Extract embedding
+            embedding = await asyncio.wait_for(
+                client.extract_embedding(
+                    audio_data=audio_data,
+                    sample_rate=16000,
+                    format="float32" if isinstance(audio_data, bytes) else "auto"
+                ),
+                timeout=15.0
+            )
+            
+            if embedding is not None:
+                logger.info(f"✅ Emergency Cloud ECAPA extraction successful: shape={embedding.shape}")
+                return embedding
+                
+        except asyncio.TimeoutError:
+            logger.warning("⏱️ Emergency cloud extraction timed out")
+        except Exception as e:
+            logger.debug(f"Emergency cloud extraction failed: {e}")
+        
+        return None
 
     async def _record_successful_verification(
         self,
@@ -2600,9 +2727,26 @@ class UnifiedVoiceCacheManager:
         embedding: np.ndarray,
         speaker_hint: Optional[str] = None,
     ) -> MatchResult:
-        """Check preloaded profiles for match"""
+        """
+        Check preloaded profiles for match with detailed logging.
+        
+        v2.0.0: Enhanced with comprehensive similarity logging to debug 0% issues.
+        """
         best_match = None
         best_similarity = 0.0
+        
+        # CRITICAL: Check if we even have profiles to match against
+        if len(self._preloaded_profiles) == 0:
+            logger.warning(
+                "❌ NO PROFILES TO MATCH AGAINST!\n"
+                "   This will always result in 0% confidence.\n"
+                "   Ensure voice profiles are loaded at startup."
+            )
+            return MatchResult(
+                matched=False,
+                similarity=0.0,
+                match_type="no_profiles",
+            )
 
         # If we have a hint, check that first
         profiles_to_check = []
@@ -2616,17 +2760,50 @@ class UnifiedVoiceCacheManager:
             if name != speaker_hint:
                 profiles_to_check.append((name, profile))
 
+        # Log matching attempt
+        logger.debug(
+            f"🔍 Matching against {len(profiles_to_check)} profiles "
+            f"(embedding shape: {embedding.shape if embedding is not None else 'None'})"
+        )
+
+        # Track all similarities for debugging
+        all_similarities = []
+
         for speaker_name, profile in profiles_to_check:
             if not profile.is_valid():
+                logger.debug(f"   ⚠️ Skipping invalid profile: {speaker_name}")
                 continue
 
             # Normalize stored embedding
             stored_emb = self._normalize_embedding(profile.embedding)
+            
+            if stored_emb is None:
+                logger.debug(f"   ⚠️ Failed to normalize embedding for: {speaker_name}")
+                continue
+                
+            # Check dimension match
+            if embedding.shape != stored_emb.shape:
+                logger.warning(
+                    f"   ⚠️ Dimension mismatch for {speaker_name}: "
+                    f"input={embedding.shape}, stored={stored_emb.shape}"
+                )
+                continue
+                
             similarity = self._compute_similarity(embedding, stored_emb)
+            all_similarities.append((speaker_name, similarity))
 
             if similarity > best_similarity:
                 best_similarity = similarity
                 best_match = speaker_name
+
+        # Log all similarities for debugging
+        if all_similarities:
+            logger.info(
+                f"📊 Profile similarities:\n" +
+                "\n".join([f"   {name}: {sim:.1%}" for name, sim in sorted(all_similarities, key=lambda x: -x[1])])
+            )
+        else:
+            logger.warning("⚠️ No valid profiles were checked - all profiles may be invalid")
 
         # Determine match type based on similarity
         if best_similarity >= CacheConfig.INSTANT_MATCH_THRESHOLD:
