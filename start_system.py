@@ -10883,10 +10883,13 @@ if (typeof localStorage !== 'undefined') {
             browser_order = ["chrome", "safari", "arc"]
         
         for browser in browser_order:
+            logger.info(f"🔒 Trying {browser} for incognito...")
             success = await self._try_incognito_browser(url, browser)
             if success:
                 return True
+            logger.debug(f"{browser} incognito failed, trying next...")
         
+        print(f"{Colors.YELLOW}⚠️  Could not open Incognito window, falling back to normal browser{Colors.ENDC}")
         logger.warning("Could not open Incognito window, falling back to normal mode")
         return False
     
@@ -10894,47 +10897,46 @@ if (typeof localStorage !== 'undefined') {
         """Try to open an incognito window in the specified browser."""
         
         if browser == "chrome":
-            # Chrome: Open new incognito window with URL
-            applescript = f'''
-            tell application "System Events"
-                if not (exists process "Google Chrome") then
-                    return false
-                end if
-            end tell
+            # Chrome: Most reliable approach - always use command line with --incognito flag
+            # This works whether Chrome is running or not
+            try:
+                logger.info("🔒 Opening Chrome Incognito via command line...")
+                
+                # Use open -na to open new instance with incognito flag
+                # The -n flag opens a new instance, -a specifies the app
+                process = await asyncio.create_subprocess_exec(
+                    '/usr/bin/open', '-na', 'Google Chrome', '--args', '--incognito', url,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=10)
+                
+                if process.returncode == 0:
+                    print(f"{Colors.GREEN}🔒 Opened JARVIS in Chrome Incognito window{Colors.ENDC}")
+                    logger.info(f"✅ Chrome Incognito opened successfully")
+                    # Give Chrome a moment to open the incognito window
+                    await asyncio.sleep(1)
+                    return True
+                else:
+                    error = stderr.decode() if stderr else "Unknown error"
+                    logger.warning(f"Chrome Incognito command failed: {error}")
+                    
+            except asyncio.TimeoutError:
+                logger.warning("Chrome Incognito command timed out")
+            except Exception as e:
+                logger.warning(f"Chrome Incognito failed: {e}")
             
+            # Fallback to AppleScript if command line failed
+            applescript = f'''
             tell application "Google Chrome"
-                -- Close any existing JARVIS incognito windows first
-                set jarvisPatterns to {{"localhost:3000", "localhost:3001", "localhost:8010", "127.0.0.1:3000", "127.0.0.1:3001"}}
-                
-                repeat with w in windows
-                    if mode of w is "incognito" then
-                        set shouldClose to false
-                        repeat with t in tabs of w
-                            set tabURL to URL of t
-                            repeat with pattern in jarvisPatterns
-                                if tabURL contains pattern then
-                                    set shouldClose to true
-                                    exit repeat
-                                end if
-                            end repeat
-                            if shouldClose then exit repeat
-                        end repeat
-                        
-                        if shouldClose then
-                            close w
-                        end if
-                    end if
-                end repeat
-                
-                -- Create new incognito window
                 set incognitoWindow to make new window with properties {{mode:"incognito"}}
+                delay 0.3
                 tell incognitoWindow
                     set URL of active tab to "{url}"
                 end tell
                 activate
-                
-                return true
             end tell
+            return "success"
             '''
             
         elif browser == "safari":
@@ -11022,6 +11024,8 @@ if (typeof localStorage !== 'undefined') {
             return False
         
         try:
+            logger.info(f"🔒 Attempting to open {browser} in incognito mode...")
+            
             process = await asyncio.create_subprocess_exec(
                 "osascript", "-e", applescript,
                 stdout=asyncio.subprocess.PIPE,
@@ -11029,22 +11033,30 @@ if (typeof localStorage !== 'undefined') {
             )
             stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=10)
             
-            if process.returncode == 0:
-                result = stdout.decode().strip().lower()
-                if result != "false":
-                    browser_name = {"chrome": "Chrome", "safari": "Safari", "arc": "Arc"}.get(browser, browser)
-                    print(f"{Colors.GREEN}🔒 Opened JARVIS in {browser_name} Incognito/Private window{Colors.ENDC}")
-                    logger.info(f"Opened incognito window in {browser_name}")
-                    return True
+            result = stdout.decode().strip().lower() if stdout else ""
+            error = stderr.decode().strip() if stderr else ""
             
-            # Browser not running or failed
+            logger.debug(f"AppleScript result: returncode={process.returncode}, stdout='{result}', stderr='{error}'")
+            
+            if process.returncode == 0 and result != "false":
+                browser_name = {"chrome": "Chrome", "safari": "Safari", "arc": "Arc"}.get(browser, browser)
+                print(f"{Colors.GREEN}🔒 Opened JARVIS in {browser_name} Incognito/Private window{Colors.ENDC}")
+                logger.info(f"✅ Opened incognito window in {browser_name}")
+                return True
+            
+            # Log why it failed
+            if error:
+                logger.warning(f"Incognito {browser} failed: {error}")
+            elif result == "false":
+                logger.info(f"{browser} not running, trying next browser...")
+            
             return False
             
         except asyncio.TimeoutError:
             logger.warning(f"Timeout opening {browser} incognito window")
             return False
         except Exception as e:
-            logger.debug(f"Failed to open {browser} incognito: {e}")
+            logger.warning(f"Failed to open {browser} incognito: {e}")
             return False
     
     async def _open_incognito_non_macos(self, url: str, preferred_browser: str = None) -> bool:
