@@ -54,7 +54,11 @@ class DynamicConfigService {
     // Excluded ports:
     // - 5000, 5001: macOS Control Center
     // - 3001: JARVIS Loading Server (not the backend!)
-    this.excludedPorts = [5000, 5001, 3001];
+    // Excluded ports: 
+    // - 5000, 5001: Flask dev servers
+    // - 3001: Old loading server
+    // - 8001: WebSocket proxy/loading server (NOT the main JARVIS backend!)
+    this.excludedPorts = [5000, 5001, 3001, 8001];
     this.discoveryTimeout = 500;
     this.maxRetries = 3;
 
@@ -425,11 +429,16 @@ class DynamicConfigService {
 
     const results = await Promise.all(scanPromises);
 
-    // Process results
+    // Process results - keep first (highest priority) port for each service type
     for (const service of results) {
       if (service) {
-        discovered[service.type] = service;
-        this.healthScores.set(service.url, 1.0);
+        // Don't overwrite if we already found this service type on a higher-priority port
+        if (!discovered[service.type]) {
+          discovered[service.type] = service;
+          this.healthScores.set(service.url, 1.0);
+        } else {
+          console.log(`⏩ Skipping ${service.type} on port ${service.port} - already found on port ${discovered[service.type].port}`);
+        }
       }
     }
 

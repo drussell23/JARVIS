@@ -2799,8 +2799,27 @@ const JarvisVoice = () => {
         console.log(`🎤 Sending command with audio data for voice verification (${audioData.sampleRate}Hz, ${audioData.mimeType})`);
       }
 
-      wsRef.current.send(JSON.stringify(message));
-      setResponse('⚙️ Processing...');
+      try {
+        wsRef.current.send(JSON.stringify(message));
+        setResponse('⚙️ Processing...');
+        
+        // Set a timeout to detect if backend doesn't respond (zombie WebSocket detection)
+        setTimeout(() => {
+          // If still showing Processing after 10 seconds, WebSocket might be dead
+          if (response === '⚙️ Processing...' || isProcessing) {
+            console.warn('[WS] No response after 10s - WebSocket might be dead, forcing reconnect...');
+            if (wsRef.current) {
+              wsRef.current.close(); // Force close to trigger reconnect
+            }
+            // Fallback to REST API
+            sendTextCommand(command);
+          }
+        }, 10000);
+      } catch (sendError) {
+        console.error('[WS] Failed to send command via WebSocket:', sendError);
+        // Fallback to REST API
+        sendTextCommand(command);
+      }
     } else {
       // Fallback to REST API if WebSocket not connected
       sendTextCommand(command);
@@ -2824,17 +2843,35 @@ const JarvisVoice = () => {
 
     // Send via WebSocket
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({
-        type: 'command',
-        text: textCommand,
-        mode: autonomousMode ? 'autonomous' : 'manual',
-        metadata: {
-          source: 'text_input',
-          timestamp: Date.now()
-        }
-      }));
-      setResponse('⚙️ Processing...');
-      setIsProcessing(true);
+      try {
+        wsRef.current.send(JSON.stringify({
+          type: 'command',
+          text: textCommand,
+          mode: autonomousMode ? 'autonomous' : 'manual',
+          metadata: {
+            source: 'text_input',
+            timestamp: Date.now()
+          }
+        }));
+        setResponse('⚙️ Processing...');
+        setIsProcessing(true);
+        
+        // Set a timeout to detect zombie WebSocket (no response after 10s)
+        setTimeout(() => {
+          if (isProcessing) {
+            console.warn('[WS] No response after 10s for text command - reconnecting...');
+            if (wsRef.current) {
+              wsRef.current.close(); // Force reconnect
+            }
+            setResponse('❌ Connection lost - please try again');
+            setIsProcessing(false);
+          }
+        }, 10000);
+      } catch (sendError) {
+        console.error('[WS] Failed to send text command:', sendError);
+        setResponse('❌ Failed to send command');
+        setIsProcessing(false);
+      }
     } else {
       setResponse('❌ Not connected to JARVIS');
     }
