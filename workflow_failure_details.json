@@ -1,0 +1,65 @@
+{
+  "workflow_name": "Secret Scanning",
+  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/19259195367",
+  "branch": "main",
+  "commit_sha": "45daba9",
+  "run_number": 166,
+  "failed_count": 1,
+  "fix_branch": "fix/ci/secret-scanning-run166-20251111-081442",
+  "pr_title": "\ud83d\udea8 Fix CI/CD: Secret Scanning (Run #166)",
+  "analyses": [
+    {
+      "error_patterns": [
+        {
+          "pattern": "FAIL|Failed|failed",
+          "matches": [
+            {
+              "line_number": 97,
+              "content": "2025-11-11T08:09:26.1751023Z ##[warning]The process '/usr/bin/git' failed with exit code 128",
+              "severity": "high",
+              "emoji": "\ud83d\udca5"
+            }
+          ],
+          "count": 1
+        },
+        {
+          "pattern": "WARN|Warning|warning",
+          "matches": [
+            {
+              "line_number": 76,
+              "content": "2025-11-11T08:09:25.7971929Z ##[warning]\ud83d\uded1 Leaks detected, see job summary for details",
+              "severity": "medium",
+              "emoji": "\u26a0\ufe0f"
+            },
+            {
+              "line_number": 82,
+              "content": "2025-11-11T08:09:25.8103477Z   if-no-files-found: warn",
+              "severity": "medium",
+              "emoji": "\u26a0\ufe0f"
+            },
+            {
+              "line_number": 87,
+              "content": "2025-11-11T08:09:26.0234901Z ##[warning]No files were found with the provided path: gitleaks-report.json. No artifacts will be uploaded.",
+              "severity": "medium",
+              "emoji": "\u26a0\ufe0f"
+            },
+            {
+              "line_number": 97,
+              "content": "2025-11-11T08:09:26.1751023Z ##[warning]The process '/usr/bin/git' failed with exit code 128",
+              "severity": "medium",
+              "emoji": "\u26a0\ufe0f"
+            }
+          ],
+          "count": 4
+        }
+      ],
+      "suggested_fixes": [
+        "Review the logs above for specific error messages"
+      ],
+      "severity": "high",
+      "category": "permission_error",
+      "similar_failures": []
+    }
+  ],
+  "timestamp": "2025-11-11T08:14:42.755083"
+}
