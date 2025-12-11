@@ -696,41 +696,77 @@ WantedBy=default.target
 
             return health_data
 
-        # Try actual database connection
+        # Try actual database connection with retry logic
+        # GCP CloudSQL instances may need time to wake up from auto-suspend
         conn = None
         cursor = None
+        max_retries = 3
+        base_timeout = 10  # Increased from 5 to handle slow wakeups
+        last_error = None
+
         try:
-            port = self.config['cloud_sql']['port']
-            conn = psycopg2.connect(
-                host='127.0.0.1',
-                port=port,
-                database=self.config['cloud_sql'].get('database', 'postgres'),
-                user=self.config['cloud_sql'].get('user', 'postgres'),
-                password=self.config['cloud_sql'].get('password', ''),
-                connect_timeout=5
-            )
+            for attempt in range(max_retries):
+                try:
+                    port = self.config['cloud_sql']['port']
+                    # Exponential backoff for timeout: 10s, 15s, 20s
+                    timeout = base_timeout + (attempt * 5)
 
-            # Execute test query
-            cursor = conn.cursor()
-            cursor.execute("SELECT 1")
-            cursor.fetchone()
+                    conn = psycopg2.connect(
+                        host='127.0.0.1',
+                        port=port,
+                        database=self.config['cloud_sql'].get('database', 'postgres'),
+                        user=self.config['cloud_sql'].get('user', 'postgres'),
+                        password=self.config['cloud_sql'].get('password', ''),
+                        connect_timeout=timeout
+                    )
 
-            # Success!
-            current_time = datetime.now()
-            self.last_successful_query = current_time
-            self.last_connection_check = current_time
-            self.consecutive_failures = 0
-            health_data['connection_active'] = True
+                    # Execute test query
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT 1")
+                    cursor.fetchone()
 
-            # Track in history
-            self.connection_history.append({
-                'timestamp': current_time.isoformat(),
-                'success': True
-            })
-            if len(self.connection_history) > self.health_window:
-                self.connection_history.pop(0)
+                    # Success!
+                    current_time = datetime.now()
+                    self.last_successful_query = current_time
+                    self.last_connection_check = current_time
+                    self.consecutive_failures = 0
+                    health_data['connection_active'] = True
+                    if attempt > 0:
+                        logger.info(f"[CLOUDSQL] ✅ Connection succeeded on retry {attempt + 1}")
 
-            logger.info(f"[CLOUDSQL] ✅ Connection healthy (query successful)")
+                    # Track in history
+                    self.connection_history.append({
+                        'timestamp': current_time.isoformat(),
+                        'success': True
+                    })
+                    if len(self.connection_history) > self.health_window:
+                        self.connection_history.pop(0)
+
+                    logger.info(f"[CLOUDSQL] ✅ Connection healthy (query successful)")
+                    break  # Exit retry loop on success
+
+                except Exception as e:
+                    last_error = e
+                    if attempt < max_retries - 1:
+                        wait_time = (attempt + 1) * 2  # 2s, 4s
+                        logger.debug(f"[CLOUDSQL] Connection attempt {attempt + 1} failed, retrying in {wait_time}s: {e}")
+                        await asyncio.sleep(wait_time)
+                        # Close failed connection if any
+                        if cursor:
+                            try:
+                                cursor.close()
+                            except:
+                                pass
+                        if conn:
+                            try:
+                                conn.close()
+                            except:
+                                pass
+                        conn = None
+                        cursor = None
+                    else:
+                        # Final attempt failed, raise the error
+                        raise last_error
 
         except Exception as e:
             logger.error(f"[CLOUDSQL] ❌ Connection failed: {e}")

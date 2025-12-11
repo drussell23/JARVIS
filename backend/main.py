@@ -154,6 +154,14 @@ if sys.platform == "darwin":  # macOS specific
     os.environ["OBJC_DISABLE_INITIALIZE_FORK_SAFETY"] = "YES"
     os.environ["PYTHONUNBUFFERED"] = "1"
 
+# Enable HuggingFace/Transformers offline mode to prevent network timeouts
+# Models are already cached locally - no need for network requests
+# This prevents "ReadTimeoutError" when checking for model updates
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+os.environ["HF_DATASETS_OFFLINE"] = "1"
+os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"  # Also disable telemetry
+
 # Clean up leaked semaphores from previous runs FIRST
 if sys.platform == "darwin":  # macOS specific
     try:
