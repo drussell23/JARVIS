@@ -4167,21 +4167,28 @@ async def _decode_audio_robust(audio_base64: str, mime_type: str = "audio/webm")
     """
     Decode and convert audio to WAV format with multiple fallback strategies.
 
+    🆕 ENHANCED: Handles concatenated MediaRecorder chunks that may not have proper WebM headers.
+    MediaRecorder from browsers outputs chunks where only the first chunk has full headers.
+
     Strategies (in order):
     1. Check if already WAV - return as-is
-    2. FFmpeg pipe conversion (fastest)
-    3. FFmpeg temp file conversion (most compatible)
-    4. Return raw audio for torchaudio to handle
+    2. FFmpeg with explicit format hint (for concatenated chunks)
+    3. FFmpeg pipe conversion (for standard formats)
+    4. FFmpeg temp file conversion (most compatible)
+    5. Raw Opus/PCM to WAV conversion (for headerless data)
+    6. Return raw audio for torchaudio to handle
     """
     import tempfile
     import shutil
+    import struct
 
     logger.info(f"[ROBUST-AUDIO] Starting audio decode: base64_len={len(audio_base64)}, mime={mime_type}")
 
     # Step 1: Base64 decode
     try:
         raw = base64.b64decode(audio_base64)
-        logger.info(f"[ROBUST-AUDIO] Base64 decoded: {len(raw)} bytes, magic={raw[:4].hex() if len(raw) >= 4 else 'N/A'}")
+        magic_hex = raw[:4].hex() if len(raw) >= 4 else 'N/A'
+        logger.info(f"[ROBUST-AUDIO] Base64 decoded: {len(raw)} bytes, magic={magic_hex}")
     except Exception as e:
         logger.error(f"[ROBUST-AUDIO] Base64 decode FAILED: {e}")
         return None
@@ -4197,17 +4204,63 @@ async def _decode_audio_robust(audio_base64: str, mime_type: str = "audio/webm")
 
     # Detect format from magic bytes
     format_hint = "unknown"
-    if raw[:4] == b'\x1aE\xdf\xa3':  # WebM/Matroska
+    ffmpeg_format = None  # Explicit format for FFmpeg -f option
+
+    if raw[:4] == b'\x1aE\xdf\xa3':  # WebM/Matroska EBML header
         format_hint = "webm"
+        ffmpeg_format = "webm"
     elif raw[:4] == b'OggS':  # Ogg container
         format_hint = "ogg"
+        ffmpeg_format = "ogg"
     elif raw[:4] == b'fLaC':  # FLAC
         format_hint = "flac"
+        ffmpeg_format = "flac"
     elif raw[:3] == b'ID3' or (raw[0] == 0xff and (raw[1] & 0xe0) == 0xe0):  # MP3
         format_hint = "mp3"
-    logger.info(f"[ROBUST-AUDIO] Detected format: {format_hint}")
+        ffmpeg_format = "mp3"
+    else:
+        # 🆕 Check if this might be raw Opus or concatenated WebM chunks
+        # MediaRecorder chunks without proper headers often start with Opus frame data
+        # The magic 43c38100 suggests truncated/concatenated WebM chunks
+        if 'webm' in mime_type.lower() or 'opus' in mime_type.lower():
+            format_hint = "opus_chunks"
+            ffmpeg_format = "webm"  # Try as WebM first
+            logger.info(f"[ROBUST-AUDIO] Treating as WebM/Opus chunks based on MIME type")
 
-    # Step 3: Try FFmpeg pipe conversion
+    logger.info(f"[ROBUST-AUDIO] Detected format: {format_hint}, ffmpeg_format: {ffmpeg_format}")
+
+    # 🆕 NEW Strategy: FFmpeg with explicit input format hint for concatenated WebM chunks
+    def _ffmpeg_format_hint_convert(input_format: str):
+        """Convert using explicit input format hint - critical for concatenated MediaRecorder chunks."""
+        try:
+            # Use explicit format flag (-f) to tell FFmpeg what the input format is
+            # This helps when magic bytes are missing or corrupted
+            cmd = [
+                'ffmpeg', '-hide_banner', '-loglevel', 'warning',
+                '-f', input_format,  # Explicit input format
+                '-i', 'pipe:0',
+                '-f', 'wav', '-ar', '16000', '-ac', '1', '-acodec', 'pcm_s16le',
+                'pipe:1'
+            ]
+            logger.debug(f"[ROBUST-AUDIO] FFmpeg format hint cmd: {' '.join(cmd)}")
+
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            )
+            wav_out, stderr = proc.communicate(input=raw, timeout=10.0)
+
+            if proc.returncode == 0 and len(wav_out) > 44:
+                return wav_out, None
+            else:
+                return None, stderr.decode('utf-8', errors='ignore')
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            return None, f"FFmpeg {input_format} format hint timeout"
+        except Exception as e:
+            return None, str(e)
+
+    # Step 3: Try FFmpeg pipe conversion (auto-detect format)
     def _ffmpeg_pipe_convert():
         """Convert via stdin/stdout pipe."""
         try:
@@ -4286,10 +4339,193 @@ async def _decode_audio_robust(audio_base64: str, mime_type: str = "audio/webm")
             if temp_out and os.path.exists(temp_out.name):
                 os.unlink(temp_out.name)
 
+    # 🆕 NEW Strategy: Try to synthesize a valid WebM header for headerless chunks
+    def _try_webm_header_synthesis():
+        """
+        For concatenated MediaRecorder chunks missing EBML header, try to synthesize one.
+        MediaRecorder WebM uses Opus codec - we synthesize minimal EBML + Segment headers.
+        """
+        try:
+            # Check if data looks like Opus frames (common for MediaRecorder chunks)
+            # Opus TOC byte often has specific patterns
+            if len(raw) < 10:
+                return None, "Data too short for header synthesis"
+
+            # Minimal WebM header with Opus audio
+            # This is a simplified EBML header that FFmpeg can parse
+            webm_header = bytes([
+                # EBML Header
+                0x1a, 0x45, 0xdf, 0xa3,  # EBML ID
+                0x93,  # Size (19 bytes follow)
+                0x42, 0x86, 0x81, 0x01,  # EBMLVersion = 1
+                0x42, 0xf7, 0x81, 0x01,  # EBMLReadVersion = 1
+                0x42, 0xf2, 0x81, 0x04,  # EBMLMaxIDLength = 4
+                0x42, 0xf3, 0x81, 0x08,  # EBMLMaxSizeLength = 8
+                0x42, 0x82, 0x84, 0x77, 0x65, 0x62, 0x6d,  # DocType = "webm"
+                0x42, 0x87, 0x81, 0x02,  # DocTypeVersion = 2
+                0x42, 0x85, 0x81, 0x02,  # DocTypeReadVersion = 2
+            ])
+
+            # For complex synthesis, just return None and let other strategies handle it
+            # Full WebM synthesis is complex - prefer FFmpeg's format guessing
+            return None, "Full WebM synthesis not implemented - using fallback"
+
+        except Exception as e:
+            return None, str(e)
+
+    # 🆕 NEW Strategy: Create a proper WebM file with reconstructed container
+    def _ffmpeg_matroska_demux():
+        """Try Matroska demuxer explicitly for WebM-like content."""
+        temp_in = None
+        temp_out = None
+        try:
+            temp_in = tempfile.NamedTemporaryFile(suffix='.webm', delete=False)
+            temp_out = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+            temp_in.write(raw)
+            temp_in.close()
+            temp_out.close()
+
+            # Try with matroska demuxer and error tolerance
+            result = subprocess.run(
+                [
+                    'ffmpeg', '-y', '-hide_banner', '-loglevel', 'warning',
+                    '-err_detect', 'ignore_err',  # Ignore demux errors
+                    '-f', 'matroska',  # Explicit matroska format
+                    '-i', temp_in.name,
+                    '-f', 'wav', '-ar', '16000', '-ac', '1', '-acodec', 'pcm_s16le',
+                    temp_out.name
+                ],
+                capture_output=True, timeout=10.0
+            )
+
+            if result.returncode == 0 and os.path.exists(temp_out.name):
+                with open(temp_out.name, 'rb') as f:
+                    wav_data = f.read()
+                if len(wav_data) > 44:
+                    return wav_data, None
+
+            return None, result.stderr.decode('utf-8', errors='ignore')
+
+        except subprocess.TimeoutExpired:
+            return None, "FFmpeg matroska timeout"
+        except Exception as e:
+            return None, str(e)
+        finally:
+            if temp_in and os.path.exists(temp_in.name):
+                os.unlink(temp_in.name)
+            if temp_out and os.path.exists(temp_out.name):
+                os.unlink(temp_out.name)
+
+    # 🆕 NEW Strategy: Raw Opus to WAV using libopus
+    def _opus_decode_raw():
+        """Try to decode raw Opus packets using ffmpeg's opus decoder."""
+        temp_in = None
+        temp_out = None
+        try:
+            temp_in = tempfile.NamedTemporaryFile(suffix='.opus', delete=False)
+            temp_out = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+            temp_in.write(raw)
+            temp_in.close()
+            temp_out.close()
+
+            # Try Ogg container (Opus is often in Ogg)
+            result = subprocess.run(
+                [
+                    'ffmpeg', '-y', '-hide_banner', '-loglevel', 'warning',
+                    '-acodec', 'libopus',  # Opus decoder
+                    '-i', temp_in.name,
+                    '-f', 'wav', '-ar', '16000', '-ac', '1', '-acodec', 'pcm_s16le',
+                    temp_out.name
+                ],
+                capture_output=True, timeout=10.0
+            )
+
+            if result.returncode == 0 and os.path.exists(temp_out.name):
+                with open(temp_out.name, 'rb') as f:
+                    wav_data = f.read()
+                if len(wav_data) > 44:
+                    return wav_data, None
+
+            return None, result.stderr.decode('utf-8', errors='ignore')
+
+        except subprocess.TimeoutExpired:
+            return None, "FFmpeg opus timeout"
+        except Exception as e:
+            return None, str(e)
+        finally:
+            if temp_in and os.path.exists(temp_in.name):
+                os.unlink(temp_in.name)
+            if temp_out and os.path.exists(temp_out.name):
+                os.unlink(temp_out.name)
+
+    # 🆕 NEW Strategy: Try multiple format hints in sequence
+    def _try_multiple_formats():
+        """Try multiple format guesses for unrecognized data."""
+        formats_to_try = ['webm', 'matroska', 'ogg', 'opus', 'data']
+        for fmt in formats_to_try:
+            try:
+                proc = subprocess.Popen(
+                    [
+                        'ffmpeg', '-hide_banner', '-loglevel', 'warning',
+                        '-f', fmt,
+                        '-i', 'pipe:0',
+                        '-f', 'wav', '-ar', '16000', '-ac', '1', '-acodec', 'pcm_s16le',
+                        'pipe:1'
+                    ],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+                )
+                wav_out, stderr = proc.communicate(input=raw, timeout=5.0)
+
+                if proc.returncode == 0 and len(wav_out) > 44:
+                    logger.info(f"[ROBUST-AUDIO] Format {fmt} worked!")
+                    return wav_out, None
+            except subprocess.TimeoutExpired:
+                if proc:
+                    proc.kill()
+            except Exception:
+                pass
+
+        return None, "All format guesses failed"
+
     # Try strategies in order
     loop = asyncio.get_event_loop()
 
-    # Strategy 1: FFmpeg pipe (fast)
+    # 🆕 Strategy 0: If format_hint indicates concatenated chunks, try explicit format first
+    if format_hint == "opus_chunks" and ffmpeg_format:
+        try:
+            logger.info(f"[ROBUST-AUDIO] Trying FFmpeg with explicit format hint: {ffmpeg_format}")
+            wav_data, err = await asyncio.wait_for(
+                loop.run_in_executor(None, lambda: _ffmpeg_format_hint_convert(ffmpeg_format)),
+                timeout=10.0
+            )
+            if wav_data:
+                logger.info(f"[ROBUST-AUDIO] FFmpeg format hint SUCCESS: {len(wav_data)} bytes WAV")
+                return wav_data
+            else:
+                logger.warning(f"[ROBUST-AUDIO] FFmpeg format hint failed: {err}")
+        except asyncio.TimeoutError:
+            logger.warning("[ROBUST-AUDIO] FFmpeg format hint timeout")
+        except Exception as e:
+            logger.warning(f"[ROBUST-AUDIO] FFmpeg format hint error: {e}")
+
+        # Try matroska demuxer for WebM chunks
+        try:
+            logger.info("[ROBUST-AUDIO] Trying Matroska demuxer with error tolerance...")
+            wav_data, err = await asyncio.wait_for(
+                loop.run_in_executor(None, _ffmpeg_matroska_demux),
+                timeout=12.0
+            )
+            if wav_data:
+                logger.info(f"[ROBUST-AUDIO] Matroska demux SUCCESS: {len(wav_data)} bytes WAV")
+                return wav_data
+            else:
+                logger.warning(f"[ROBUST-AUDIO] Matroska demux failed: {err}")
+        except asyncio.TimeoutError:
+            logger.warning("[ROBUST-AUDIO] Matroska demux timeout")
+        except Exception as e:
+            logger.warning(f"[ROBUST-AUDIO] Matroska demux error: {e}")
+
+    # Strategy 1: FFmpeg pipe (fast, auto-detect)
     try:
         logger.info("[ROBUST-AUDIO] Trying FFmpeg pipe conversion...")
         wav_data, err = await asyncio.wait_for(
@@ -4323,7 +4559,41 @@ async def _decode_audio_robust(audio_base64: str, mime_type: str = "audio/webm")
     except Exception as e:
         logger.warning(f"[ROBUST-AUDIO] FFmpeg file error: {e}")
 
-    # Strategy 3: Return raw for torchaudio to handle
+    # Strategy 3: Try multiple format hints
+    try:
+        logger.info("[ROBUST-AUDIO] Trying multiple format guesses...")
+        wav_data, err = await asyncio.wait_for(
+            loop.run_in_executor(None, _try_multiple_formats),
+            timeout=30.0
+        )
+        if wav_data:
+            logger.info(f"[ROBUST-AUDIO] Multi-format guess SUCCESS: {len(wav_data)} bytes WAV")
+            return wav_data
+        else:
+            logger.warning(f"[ROBUST-AUDIO] Multi-format guess failed: {err}")
+    except asyncio.TimeoutError:
+        logger.warning("[ROBUST-AUDIO] Multi-format guess timeout")
+    except Exception as e:
+        logger.warning(f"[ROBUST-AUDIO] Multi-format guess error: {e}")
+
+    # Strategy 4: Raw Opus decode
+    try:
+        logger.info("[ROBUST-AUDIO] Trying raw Opus decode...")
+        wav_data, err = await asyncio.wait_for(
+            loop.run_in_executor(None, _opus_decode_raw),
+            timeout=10.0
+        )
+        if wav_data:
+            logger.info(f"[ROBUST-AUDIO] Raw Opus decode SUCCESS: {len(wav_data)} bytes WAV")
+            return wav_data
+        else:
+            logger.warning(f"[ROBUST-AUDIO] Raw Opus decode failed: {err}")
+    except asyncio.TimeoutError:
+        logger.warning("[ROBUST-AUDIO] Raw Opus timeout")
+    except Exception as e:
+        logger.warning(f"[ROBUST-AUDIO] Raw Opus error: {e}")
+
+    # Strategy 5: Return raw for torchaudio to handle
     logger.warning(f"[ROBUST-AUDIO] All conversions failed, returning raw {len(raw)} bytes for torchaudio")
     return raw
 

@@ -262,6 +262,10 @@ class ContinuousAudioBuffer {
   /**
    * Get the buffered audio as a single blob
    * Optionally specify how far back to go (default: all buffered audio)
+   *
+   * 🆕 CRITICAL FIX: Always include the first chunk (contains WebM/EBML header)
+   * MediaRecorder chunks only have valid headers in the first chunk.
+   * Concatenating chunks without the first one produces invalid WebM files.
    */
   getBufferedAudio(durationMs = null) {
     if (this.audioChunks.length === 0) {
@@ -270,28 +274,42 @@ class ContinuousAudioBuffer {
     }
 
     let chunks = this.audioChunks;
+    let actualStartIndex = 0;
 
     // If duration specified, only get that much audio
-    if (durationMs !== null) {
+    // BUT: Always include the first chunk (has EBML header) for valid WebM
+    if (durationMs !== null && this.audioChunks.length > 1) {
       const now = Date.now();
       const startTime = now - durationMs;
 
       // Find chunks that fall within the time window
-      const startIndex = this.chunkTimestamps.findIndex(t => t >= startTime);
-      if (startIndex > 0) {
-        chunks = this.audioChunks.slice(startIndex);
+      const timeBasedStartIndex = this.chunkTimestamps.findIndex(t => t >= startTime);
+
+      if (timeBasedStartIndex > 0) {
+        // 🔧 CRITICAL: Always include chunk 0 (contains WebM EBML header)
+        // Then include the requested time-based chunks
+        // This ensures the resulting blob is a valid WebM file
+        const headerChunk = this.audioChunks[0];
+        const dataChunks = this.audioChunks.slice(timeBasedStartIndex);
+
+        // Combine header chunk with time-windowed data chunks
+        chunks = [headerChunk, ...dataChunks];
+        actualStartIndex = timeBasedStartIndex;
+
+        console.log(`[ContinuousAudioBuffer] 🔧 Including header chunk + ${dataChunks.length} data chunks for valid WebM`);
       }
     }
 
     const blob = new Blob(chunks, { type: this.mimeType });
-    console.log(`[ContinuousAudioBuffer] Retrieved ${chunks.length} chunks, ${blob.size} bytes`);
+    console.log(`[ContinuousAudioBuffer] Retrieved ${chunks.length} chunks (start: ${actualStartIndex}), ${blob.size} bytes`);
 
     return {
       blob,
       mimeType: this.mimeType,
       durationMs: chunks.length * this.chunkIntervalMs,
       sampleRate: this.sampleRate,
-      chunkCount: chunks.length
+      chunkCount: chunks.length,
+      includesHeader: true  // 🆕 Indicate valid structure
     };
   }
 
