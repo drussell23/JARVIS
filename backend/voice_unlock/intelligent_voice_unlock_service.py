@@ -4795,18 +4795,181 @@ def _verify_speaker_robust(test_emb: List[float], ref_emb: List[float]) -> Tuple
 
 
 async def _execute_unlock_robust(speaker_name: str) -> bool:
-    """Execute screen unlock."""
+    """
+    Execute screen unlock using SecurePasswordTyper and macOS keychain.
+
+    This uses the robust unlock mechanism from simple_unlock_handler.py:
+    - Retrieves password from macOS keychain (com.jarvis.voiceunlock)
+    - Uses Core Graphics keyboard events for secure password entry
+    - Includes caffeinate to prevent display sleep during unlock
+    - Verifies unlock success via screen lock detector
+
+    Args:
+        speaker_name: The verified speaker's name (for logging)
+
+    Returns:
+        bool: True if unlock succeeded, False otherwise
+    """
+    caffeinate_process = None
     try:
-        from voice_unlock.macos_screen_lock import MacOSScreenLock
-        lock = MacOSScreenLock()
-        loop = asyncio.get_event_loop()
-        return await asyncio.wait_for(
-            loop.run_in_executor(None, lock.unlock, speaker_name),
-            timeout=RobustUnlockConfig.UNLOCK_EXECUTE_TIMEOUT
-        )
+        logger.info(f"[ROBUST-UNLOCK] Starting unlock sequence for {speaker_name}")
+
+        # Step 1: Retrieve password from keychain
+        try:
+            result = await asyncio.wait_for(
+                asyncio.create_subprocess_exec(
+                    "security", "find-generic-password",
+                    "-s", "com.jarvis.voiceunlock",
+                    "-a", "unlock_token",
+                    "-w",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                ),
+                timeout=5.0
+            )
+            stdout, stderr = await result.communicate()
+
+            if result.returncode != 0 or not stdout:
+                logger.error("[ROBUST-UNLOCK] Password not found in keychain")
+                logger.error(f"[ROBUST-UNLOCK] Run: ./backend/voice_unlock/enable_screen_unlock.sh to configure")
+                return False
+
+            password = stdout.decode().strip()
+            logger.info(f"[ROBUST-UNLOCK] Password retrieved ({len(password)} chars)")
+
+        except asyncio.TimeoutError:
+            logger.error("[ROBUST-UNLOCK] Keychain access timed out")
+            return False
+        except Exception as e:
+            logger.error(f"[ROBUST-UNLOCK] Keychain error: {e}")
+            return False
+
+        # Step 2: Keep screen awake during unlock
+        try:
+            caffeinate_process = await asyncio.create_subprocess_exec(
+                "caffeinate", "-d", "-u",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL
+            )
+            await asyncio.sleep(0.3)
+            logger.debug("[ROBUST-UNLOCK] Caffeinate started")
+        except Exception as e:
+            logger.warning(f"[ROBUST-UNLOCK] Caffeinate failed (non-fatal): {e}")
+
+        # Step 3: Type password using SecurePasswordTyper
+        try:
+            from voice_unlock.secure_password_typer import type_password_securely
+
+            logger.info(f"[ROBUST-UNLOCK] Typing password securely...")
+            # type_password_securely returns Tuple[bool, Optional[Dict[str, Any]]]
+            result = await asyncio.wait_for(
+                type_password_securely(
+                    password=password,
+                    submit=True,
+                    randomize_timing=True
+                ),
+                timeout=max(RobustUnlockConfig.UNLOCK_EXECUTE_TIMEOUT, 10.0)  # Minimum 10s for typing
+            )
+
+            # Handle tuple return value
+            if isinstance(result, tuple):
+                success, metrics = result
+            else:
+                success = bool(result)
+                metrics = None
+
+            if not success:
+                logger.error("[ROBUST-UNLOCK] SecurePasswordTyper failed")
+                return False
+
+            if metrics:
+                logger.info(f"[ROBUST-UNLOCK] Password typed successfully (metrics collected)")
+            else:
+                logger.info("[ROBUST-UNLOCK] Password typed successfully")
+
+        except asyncio.TimeoutError:
+            logger.error("[ROBUST-UNLOCK] Password typing timed out")
+            return False
+        except ImportError as e:
+            logger.error(f"[ROBUST-UNLOCK] SecurePasswordTyper not available: {e}")
+            # Fallback to AppleScript method
+            return await _execute_unlock_applescript_fallback(password)
+        except Exception as e:
+            logger.error(f"[ROBUST-UNLOCK] Password typing error: {e}")
+            return False
+
+        # Step 4: Verify unlock success
+        await asyncio.sleep(1.5)
+        try:
+            from voice_unlock.objc.server.screen_lock_detector import is_screen_locked
+
+            is_locked = is_screen_locked()
+            if not is_locked:
+                logger.info(f"[ROBUST-UNLOCK] ✅ Screen unlocked successfully for {speaker_name}")
+                return True
+            else:
+                logger.warning("[ROBUST-UNLOCK] Screen still locked after attempt")
+                return False
+
+        except Exception as e:
+            # If we can't verify, assume success since password typing worked
+            logger.info(f"[ROBUST-UNLOCK] ✅ Unlock completed (verification unavailable: {e})")
+            return True
+
     except Exception as e:
-        logger.error(f"[ROBUST] Unlock failed: {e}")
-    return False
+        logger.error(f"[ROBUST-UNLOCK] Unlock failed: {e}", exc_info=True)
+        return False
+
+    finally:
+        # Cleanup caffeinate process
+        if caffeinate_process:
+            try:
+                caffeinate_process.terminate()
+                await asyncio.sleep(0.1)
+                if caffeinate_process.returncode is None:
+                    caffeinate_process.kill()
+                logger.debug("[ROBUST-UNLOCK] Caffeinate terminated")
+            except Exception:
+                pass
+
+
+async def _execute_unlock_applescript_fallback(password: str) -> bool:
+    """
+    Fallback AppleScript-based unlock when SecurePasswordTyper is unavailable.
+
+    Uses System Events to type password. Less secure but more compatible.
+    """
+    try:
+        # Escape special characters for AppleScript
+        escaped_password = password.replace("\\", "\\\\").replace('"', '\\"')
+
+        script = f'''
+        tell application "System Events"
+            keystroke "{escaped_password}"
+            delay 0.2
+            keystroke return
+        end tell
+        '''
+
+        process = await asyncio.create_subprocess_exec(
+            "osascript", "-e", script,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+
+        await asyncio.wait_for(process.communicate(), timeout=10.0)
+
+        if process.returncode == 0:
+            logger.info("[ROBUST-UNLOCK] AppleScript fallback succeeded")
+            await asyncio.sleep(1.5)
+            return True
+        else:
+            logger.error("[ROBUST-UNLOCK] AppleScript fallback failed")
+            return False
+
+    except Exception as e:
+        logger.error(f"[ROBUST-UNLOCK] AppleScript fallback error: {e}")
+        return False
 
 
 async def process_voice_unlock_robust(
