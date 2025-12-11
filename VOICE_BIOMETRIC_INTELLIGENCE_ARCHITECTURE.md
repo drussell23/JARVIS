@@ -99,9 +99,9 @@ flowchart TB
     end
 
     subgraph "💾 Data Layer"
-        SQLITE[(SQLite<br/>Local Cache)]
-        CLOUDSQL[(Cloud SQL<br/>PostgreSQL)]
-        CHROMA[(ChromaDB<br/>Vector Store)]
+        SQLITE[("SQLite<br/>Local Cache")]
+        CLOUDSQL[("Cloud SQL<br/>PostgreSQL")]
+        CHROMA[("ChromaDB<br/>Vector Store")]
     end
 
     subgraph "🖥️ Frontend Layer"
@@ -119,14 +119,20 @@ flowchart TB
     VTL --> AS
     RA --> AS
     DED --> AS
-    VBI --> BF --> CF
+    VBI --> BF
+    BF --> CF
     
-    ECAPA <--> SQLITE
-    ECAPA <--> CLOUDSQL
-    BF <--> CHROMA
+    ECAPA --> SQLITE
+    SQLITE --> ECAPA
+    ECAPA --> CLOUDSQL
+    CLOUDSQL --> ECAPA
+    BF --> CHROMA
+    CHROMA --> BF
     
-    VBI <--WebSocket--> WS
-    WS --> REACT --> PROG
+    VBI --> WS
+    WS --> VBI
+    WS --> REACT
+    REACT --> PROG
 
     style VBI fill:#4caf50,stroke:#2e7d32,stroke-width:3px,color:#fff
     style ECAPA fill:#2196f3,stroke:#1565c0,stroke-width:2px,color:#fff
@@ -410,7 +416,7 @@ flowchart TB
         subgraph "Bayesian Fusion"
             LIKE[Likelihood<br/>Computation]
             PRIOR[Prior<br/>Aggregation]
-            POST[Posterior<br/>P(Owner|Evidence)]
+            POST["Posterior<br/>P Owner given Evidence"]
         end
         
         subgraph "Output"
