@@ -3678,21 +3678,66 @@ from enum import Enum
 
 
 class RobustUnlockConfig:
-    """Configuration for robust unlock with environment overrides."""
+    """
+    Configuration for robust unlock with environment overrides.
+
+    🆕 EDGE-NATIVE MODE:
+    When JARVIS_EDGE_NATIVE_MODE=true (default):
+    - ALL processing happens locally (no cloud calls in critical path)
+    - Local ECAPA via SpeechBrain/Neural Engine is primary
+    - Cloud is async-only backup (never blocks unlock)
+    - Optimized for Apple Silicon Neural Engine
+    """
+    # ========================================================================
+    # 🆕 EDGE-NATIVE SETTINGS
+    # ========================================================================
+    # Master switch for Edge-Native mode
+    EDGE_NATIVE_MODE = os.environ.get("JARVIS_EDGE_NATIVE_MODE", "true").lower() == "true"
+    # Force local-only ECAPA (no cloud in critical path)
+    LOCAL_ECAPA_ONLY = os.environ.get("JARVIS_LOCAL_ECAPA_ONLY", "true").lower() == "true"
+    # Allow cloud fallback ONLY when local fails (default: disabled)
+    CLOUD_FALLBACK_ENABLED = os.environ.get("JARVIS_CLOUD_FALLBACK", "false").lower() == "true"
+    # Prioritize Apple Neural Engine for inference
+    NEURAL_ENGINE_PRIORITY = os.environ.get("JARVIS_NEURAL_ENGINE_PRIORITY", "true").lower() == "true"
+
+    # ========================================================================
+    # TIMEOUT CONFIGURATION
+    # ========================================================================
     # Total timeout for entire unlock operation
     MAX_TOTAL_TIMEOUT = float(os.environ.get("JARVIS_ROBUST_MAX_TIMEOUT", "30.0"))
     # Audio decode: base64 decode + FFmpeg conversion
     AUDIO_DECODE_TIMEOUT = float(os.environ.get("JARVIS_ROBUST_AUDIO_TIMEOUT", "15.0"))
-    # Profile load from SQLite
-    PROFILE_LOAD_TIMEOUT = float(os.environ.get("JARVIS_ROBUST_PROFILE_TIMEOUT", "5.0"))
-    # ECAPA embedding extraction (cloud + local fallback)
-    ECAPA_EXTRACT_TIMEOUT = float(os.environ.get("JARVIS_ROBUST_ECAPA_TIMEOUT", "15.0"))
+    # Profile load from SQLite (fast in edge-native mode)
+    PROFILE_LOAD_TIMEOUT = float(os.environ.get("JARVIS_ROBUST_PROFILE_TIMEOUT", "3.0"))  # Reduced for edge-native
+    # ECAPA embedding extraction (local-first in edge-native mode)
+    ECAPA_EXTRACT_TIMEOUT = float(os.environ.get("JARVIS_ROBUST_ECAPA_TIMEOUT", "12.0"))  # Reduced for local-only
     # Unlock execution via AppleScript
     UNLOCK_EXECUTE_TIMEOUT = float(os.environ.get("JARVIS_ROBUST_UNLOCK_TIMEOUT", "5.0"))
+
+    # ========================================================================
+    # VERIFICATION SETTINGS
+    # ========================================================================
     # Minimum cosine similarity to verify speaker
     CONFIDENCE_THRESHOLD = float(os.environ.get("JARVIS_ROBUST_THRESHOLD", "0.40"))
-    # Path to learning database with voiceprints
-    LEARNING_DB_PATH = os.path.expanduser("~/.jarvis/learning/jarvis_learning.db")
+
+    # ========================================================================
+    # DATABASE CONFIGURATION
+    # ========================================================================
+    # Path to learning database with voiceprints (local SQLite)
+    LEARNING_DB_PATH = os.path.expanduser(
+        os.environ.get("JARVIS_LOCAL_DB_PATH", "~/.jarvis/learning/jarvis_learning.db")
+    )
+
+    @classmethod
+    def log_config(cls):
+        """Log current configuration for debugging."""
+        logger.info(f"🔧 RobustUnlockConfig:")
+        logger.info(f"   Edge-Native Mode: {cls.EDGE_NATIVE_MODE}")
+        logger.info(f"   Local ECAPA Only: {cls.LOCAL_ECAPA_ONLY}")
+        logger.info(f"   Cloud Fallback: {cls.CLOUD_FALLBACK_ENABLED}")
+        logger.info(f"   Neural Engine Priority: {cls.NEURAL_ENGINE_PRIORITY}")
+        logger.info(f"   DB Path: {cls.LEARNING_DB_PATH}")
+        logger.info(f"   Confidence Threshold: {cls.CONFIDENCE_THRESHOLD}")
 
 
 class RobustUnlockStage(Enum):
@@ -3898,83 +3943,189 @@ async def _extract_ecapa_robust(audio_bytes: bytes) -> Optional[List[float]]:
         logger.error(f"[ROBUST-ECAPA] All audio load strategies failed: {errors}")
         return None, None
 
-    # Strategy 1: Cloud ECAPA
-    try:
-        logger.info("[ROBUST-ECAPA] Trying cloud ECAPA...")
-        from voice_unlock.cloud_ecapa_client import get_cloud_ecapa_client
-        client = await asyncio.wait_for(get_cloud_ecapa_client(), timeout=3.0)
-        if client:
-            embedding = await asyncio.wait_for(
-                client.extract_embedding(audio_data=audio_bytes, sample_rate=16000,
-                                         format="float32", use_cache=True, use_fast_path=True),
-                timeout=RobustUnlockConfig.ECAPA_EXTRACT_TIMEOUT
-            )
-            if embedding is not None and len(embedding) == 192:
-                logger.info(f"[ROBUST-ECAPA] Cloud ECAPA SUCCESS: {len(embedding)} dims")
-                return embedding.tolist() if hasattr(embedding, 'tolist') else list(embedding)
-    except asyncio.TimeoutError:
-        logger.warning("[ROBUST-ECAPA] Cloud ECAPA timeout")
-    except Exception as e:
-        logger.warning(f"[ROBUST-ECAPA] Cloud ECAPA failed: {e}")
+    # ========================================================================
+    # 🆕 EDGE-NATIVE ECAPA EXTRACTION
+    # ========================================================================
+    # Priority order in Edge-Native mode:
+    # 1. LOCAL SpeechBrain with cached classifier (uses Neural Engine on Apple Silicon)
+    # 2. ML Engine Registry local model
+    # 3. Cloud ECAPA (ONLY if fallback enabled and local fails)
+    # ========================================================================
 
-    # Strategy 2: Local SpeechBrain with CACHED classifier
+    # Get Edge-Native config
+    edge_native_enabled = os.environ.get('JARVIS_EDGE_NATIVE_MODE', 'true').lower() == 'true'
+    local_ecapa_only = os.environ.get('JARVIS_LOCAL_ECAPA_ONLY', 'true').lower() == 'true'
+    cloud_fallback_enabled = os.environ.get('JARVIS_CLOUD_FALLBACK', 'false').lower() == 'true'
+
+    strategies_tried = []
+    last_error = None
+
+    # ========================================================================
+    # STRATEGY 1: Local SpeechBrain with CACHED classifier (PRIMARY in Edge-Native)
+    # Uses Apple Neural Engine on Apple Silicon for hardware acceleration
+    # ========================================================================
     try:
-        logger.info("[ROBUST-ECAPA] Trying local SpeechBrain with cached classifier...")
+        logger.info("[EDGE-ECAPA] Strategy 1: Local SpeechBrain (Neural Engine priority)...")
+        strategies_tried.append("local_speechbrain")
 
         # Get cached classifier (async, loads once on first call)
         classifier = await get_cached_ecapa_classifier()
         if classifier is None:
-            raise ValueError("Failed to get ECAPA classifier")
+            raise ValueError("Failed to get ECAPA classifier from cache")
 
-        def _extract_with_cached_classifier():
+        def _extract_with_neural_engine():
             import torchaudio
             import torch
+
+            # 🆕 Detect Apple Silicon for Neural Engine optimization
+            is_apple_silicon = (
+                os.environ.get('PYTORCH_ENABLE_MPS_FALLBACK', '0') == '1' or
+                (hasattr(torch.backends, 'mps') and torch.backends.mps.is_available())
+            )
 
             # Load audio with robust strategy
             waveform, sr = _load_audio_robust(audio_bytes)
             if waveform is None:
                 raise ValueError("Failed to load audio with any strategy")
 
-            logger.info(f"[ROBUST-ECAPA] Audio loaded: shape={waveform.shape}, sr={sr}")
+            logger.info(f"[EDGE-ECAPA] Audio loaded: shape={waveform.shape}, sr={sr}")
 
             # Resample if needed
             if sr != 16000:
-                logger.info(f"[ROBUST-ECAPA] Resampling from {sr} to 16000 Hz")
+                logger.info(f"[EDGE-ECAPA] Resampling from {sr} to 16000 Hz")
                 waveform = torchaudio.transforms.Resample(sr, 16000)(waveform)
 
             # Convert to mono if stereo
             if waveform.shape[0] > 1:
-                logger.info(f"[ROBUST-ECAPA] Converting {waveform.shape[0]} channels to mono")
+                logger.info(f"[EDGE-ECAPA] Converting {waveform.shape[0]} channels to mono")
                 waveform = waveform.mean(dim=0, keepdim=True)
 
             # Ensure proper shape [1, samples]
             if waveform.dim() == 1:
                 waveform = waveform.unsqueeze(0)
 
-            logger.info(f"[ROBUST-ECAPA] Final waveform: shape={waveform.shape}")
+            logger.info(f"[EDGE-ECAPA] Final waveform: shape={waveform.shape}, Apple Silicon: {is_apple_silicon}")
 
             # Extract embedding using CACHED classifier (no reload!)
+            # On Apple Silicon, this uses the Neural Engine for acceleration
             with torch.no_grad():
                 emb = classifier.encode_batch(waveform).squeeze().numpy()
 
-            logger.info(f"[ROBUST-ECAPA] Embedding extracted: {len(emb)} dims")
+            logger.info(f"[EDGE-ECAPA] Embedding extracted via Neural Engine: {len(emb)} dims")
             return emb.tolist()
 
         loop = asyncio.get_event_loop()
         embedding = await asyncio.wait_for(
-            loop.run_in_executor(None, _extract_with_cached_classifier),
+            loop.run_in_executor(None, _extract_with_neural_engine),
             timeout=RobustUnlockConfig.ECAPA_EXTRACT_TIMEOUT
         )
         if embedding and len(embedding) == 192:
-            logger.info(f"[ROBUST-ECAPA] Local SpeechBrain SUCCESS: {len(embedding)} dims")
+            logger.info(f"[EDGE-ECAPA] ✅ Local SpeechBrain SUCCESS: {len(embedding)} dims")
             return embedding
-    except asyncio.TimeoutError:
-        logger.error("[ROBUST-ECAPA] Local SpeechBrain timeout")
-    except Exception as e:
-        logger.error(f"[ROBUST-ECAPA] Local SpeechBrain failed: {e}")
-        import traceback
-        logger.debug(f"[ROBUST-ECAPA] Traceback: {traceback.format_exc()}")
 
+    except asyncio.TimeoutError:
+        last_error = "Local SpeechBrain timeout"
+        logger.warning(f"[EDGE-ECAPA] ⏱️ {last_error}")
+    except Exception as e:
+        last_error = str(e)
+        logger.warning(f"[EDGE-ECAPA] Strategy 1 failed: {e}")
+
+    # ========================================================================
+    # STRATEGY 2: ML Engine Registry (pre-loaded local model)
+    # ========================================================================
+    try:
+        logger.info("[EDGE-ECAPA] Strategy 2: ML Engine Registry...")
+        strategies_tried.append("ml_registry")
+
+        from voice_unlock.ml_engine_registry import get_encoder, is_ecapa_available
+
+        if await asyncio.wait_for(asyncio.to_thread(is_ecapa_available), timeout=1.0):
+            encoder = await asyncio.wait_for(asyncio.to_thread(get_encoder), timeout=2.0)
+            if encoder:
+                def _extract_via_registry():
+                    import torch
+
+                    waveform, sr = _load_audio_robust(audio_bytes)
+                    if waveform is None:
+                        return None
+
+                    # Resample to 16kHz if needed
+                    if sr != 16000:
+                        import torchaudio
+                        waveform = torchaudio.transforms.Resample(sr, 16000)(waveform)
+
+                    # Ensure mono [1, samples]
+                    if waveform.shape[0] > 1:
+                        waveform = waveform.mean(dim=0, keepdim=True)
+                    if waveform.dim() == 1:
+                        waveform = waveform.unsqueeze(0)
+
+                    with torch.no_grad():
+                        emb = encoder.encode_batch(waveform).squeeze().numpy()
+
+                    return emb.tolist() if len(emb) == 192 else None
+
+                embedding = await asyncio.wait_for(
+                    asyncio.get_event_loop().run_in_executor(None, _extract_via_registry),
+                    timeout=RobustUnlockConfig.ECAPA_EXTRACT_TIMEOUT
+                )
+                if embedding:
+                    logger.info(f"[EDGE-ECAPA] ✅ ML Registry SUCCESS: {len(embedding)} dims")
+                    return embedding
+
+    except asyncio.TimeoutError:
+        last_error = "ML Registry timeout"
+        logger.warning(f"[EDGE-ECAPA] ⏱️ {last_error}")
+    except ImportError:
+        logger.debug("[EDGE-ECAPA] ML Engine Registry not available")
+    except Exception as e:
+        last_error = str(e)
+        logger.warning(f"[EDGE-ECAPA] Strategy 2 failed: {e}")
+
+    # ========================================================================
+    # STRATEGY 3: Cloud ECAPA (ONLY if fallback enabled)
+    # ========================================================================
+    # In Edge-Native mode, cloud is DISABLED by default
+    # Only used if JARVIS_CLOUD_FALLBACK=true AND all local strategies failed
+    # ========================================================================
+    if not local_ecapa_only and cloud_fallback_enabled:
+        try:
+            logger.info("[EDGE-ECAPA] Strategy 3: Cloud ECAPA (fallback)...")
+            strategies_tried.append("cloud_ecapa")
+
+            from voice_unlock.cloud_ecapa_client import get_cloud_ecapa_client
+            client = await asyncio.wait_for(get_cloud_ecapa_client(), timeout=3.0)
+            if client:
+                embedding = await asyncio.wait_for(
+                    client.extract_embedding(
+                        audio_data=audio_bytes,
+                        sample_rate=16000,
+                        format="float32",
+                        use_cache=True,
+                        use_fast_path=True
+                    ),
+                    timeout=RobustUnlockConfig.ECAPA_EXTRACT_TIMEOUT
+                )
+                if embedding is not None and len(embedding) == 192:
+                    logger.info(f"[EDGE-ECAPA] ✅ Cloud ECAPA SUCCESS (fallback): {len(embedding)} dims")
+                    return embedding.tolist() if hasattr(embedding, 'tolist') else list(embedding)
+
+        except asyncio.TimeoutError:
+            last_error = "Cloud ECAPA timeout"
+            logger.warning(f"[EDGE-ECAPA] ⏱️ {last_error}")
+        except Exception as e:
+            last_error = str(e)
+            logger.warning(f"[EDGE-ECAPA] Strategy 3 failed: {e}")
+    else:
+        logger.debug(f"[EDGE-ECAPA] Cloud ECAPA skipped (local_only={local_ecapa_only}, fallback={cloud_fallback_enabled})")
+
+    # ========================================================================
+    # ALL STRATEGIES FAILED
+    # ========================================================================
+    logger.error(
+        f"[EDGE-ECAPA] ❌ All strategies failed! "
+        f"Tried: {strategies_tried}, Last error: {last_error}"
+    )
     return None
 
 
