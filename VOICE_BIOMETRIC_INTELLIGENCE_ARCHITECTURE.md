@@ -1,32 +1,5 @@
 # 🔐 Voice Biometric Intelligence (VBI) Architecture Documentation
 
-<!-- Mermaid.js for Diagrams -->
-<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
-<script>
-  mermaid.initialize({ 
-    startOnLoad: true, 
-    theme: 'default',
-    themeVariables: { 
-      primaryColor: '#4caf50',
-      primaryTextColor: '#fff',
-      primaryBorderColor: '#2e7d32',
-      lineColor: '#0277bd',
-      secondaryColor: '#fff3e0',
-      tertiaryColor: '#f3e5f5',
-      fontFamily: 'Arial, sans-serif'
-    },
-    flowchart: {
-      curve: 'basis',
-      padding: 20
-    },
-    sequence: {
-      actorMargin: 50,
-      boxMargin: 10,
-      messageMargin: 35
-    }
-  });
-</script>
-
 <!-- MathJax for Mathematical Equations -->
 <script>
   MathJax = {
@@ -45,11 +18,11 @@
 <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
 
 <div style="background: #e3f2fd; padding: 15px; border-radius: 8px; border-left: 4px solid #2196f3; margin: 20px 0;">
-  <strong>📊 Diagram Rendering:</strong> All diagrams in this document use Mermaid.js and will render as visual diagrams when viewed in a compatible markdown viewer (GitHub, VS Code with Mermaid extension, or any viewer with Mermaid.js support).
-</div>
-
-<div style="background: #fff3e0; padding: 15px; border-radius: 8px; border-left: 4px solid #ff9800; margin: 20px 0;">
-  <strong>🔢 Mathematical Notation:</strong> All equations use MathJax for proper mathematical symbol rendering. Equations will display with proper mathematical notation (Greek letters, subscripts, superscripts, integrals, summations, etc.) when viewed in a compatible viewer.
+  <strong>📊 Visual Rendering:</strong>
+  <ul style="margin: 10px 0 0 0;">
+    <li><strong>Diagrams:</strong> All diagrams use standard Mermaid.js syntax and will render as visual flowcharts, sequence diagrams, and state diagrams in GitHub, VS Code with Mermaid extension, and other compatible viewers.</li>
+    <li><strong>Mathematics:</strong> All equations use MathJax/LaTeX syntax and will display with proper mathematical notation (Greek letters, subscripts, superscripts, integrals, summations, etc.) when viewed in compatible viewers.</li>
+  </ul>
 </div>
 
 ## Advanced Voice Authentication System for JARVIS AI Agent
@@ -109,7 +82,7 @@ The **Voice Biometric Intelligence (VBI)** system is JARVIS's advanced voice aut
 
 ### High-Level Architecture
 
-<div class="mermaid">
+```mermaid
 flowchart TB
     subgraph "🎤 Audio Input Layer"
         MIC[Microphone Input]
@@ -175,11 +148,11 @@ flowchart TB
     style ECAPA fill:#2196f3,stroke:#1565c0,stroke-width:2px,color:#fff
     style AS fill:#ff5722,stroke:#d84315,stroke-width:2px,color:#fff
     style BF fill:#9c27b0,stroke:#6a1b9a,stroke-width:2px,color:#fff
-</div>
+```
 
 ### Detailed Component Flow
 
-<div class="mermaid">
+```mermaid
 sequenceDiagram
     autonumber
     participant User as 👤 User
@@ -231,7 +204,7 @@ sequenceDiagram
     
     API-->>Frontend: Success response
     Frontend->>User: ✅ Screen Unlocked
-</div>
+```
 
 ---
 
@@ -243,7 +216,7 @@ The central orchestrator that coordinates all voice authentication components.
 
 **File:** `backend/voice_unlock/voice_biometric_intelligence.py`
 
-<div class="mermaid">
+```mermaid
 classDiagram
     class VoiceBiometricIntelligence {
         +verify_and_announce(audio_data, context)
@@ -287,7 +260,7 @@ classDiagram
     VoiceBiometricIntelligence --> VBIResult
     VoiceBiometricIntelligence --> VBIConfig
     VBIResult --> ConfidenceLevel
-</div>
+```
 
 #### Key Features:
 
@@ -303,7 +276,7 @@ State-of-the-art neural network for speaker embedding extraction.
 
 **Architecture:**
 
-<div class="mermaid">
+```mermaid
 flowchart LR
     subgraph "ECAPA-TDNN Architecture"
         INPUT[Audio Input<br/>16kHz, 3.2s]
@@ -335,7 +308,7 @@ flowchart LR
     RES3 --> CA --> ASP --> FC --> EMBED
 
     style EMBED fill:#4caf50,stroke:#2e7d32,stroke-width:2px,color:#fff
-</div>
+```
 
 **Key Specifications:**
 
@@ -353,7 +326,7 @@ flowchart LR
 
 Advanced anti-spoofing system with 7-layer detection.
 
-<div class="mermaid">
+```mermaid
 flowchart TB
     subgraph "🛡️ PAVA: 7-Layer Anti-Spoofing Detection"
         AUDIO[Audio Input]
@@ -414,7 +387,7 @@ flowchart TB
     style L6 fill:#e0f7fa,stroke:#00838f
     style L7 fill:#ffebee,stroke:#c62828
     style FUSION fill:#4caf50,stroke:#2e7d32,stroke-width:2px,color:#fff
-</div>
+```
 
 **Detection Capabilities:**
 
@@ -432,7 +405,7 @@ flowchart TB
 
 Multi-factor probability fusion with adaptive priors.
 
-<div class="mermaid">
+```mermaid
 flowchart TB
     subgraph "Bayesian Confidence Fusion Engine"
         subgraph "Input Signals"
@@ -477,7 +450,7 @@ flowchart TB
 
     style POST fill:#9c27b0,stroke:#6a1b9a,stroke-width:2px,color:#fff
     style CONF fill:#4caf50,stroke:#2e7d32,stroke-width:2px,color:#fff
-</div>
+```
 
 **Fusion Formula:**
 
@@ -496,7 +469,7 @@ Where:
 
 ### Voice Unlock Flow - Complete Pipeline
 
-<div class="mermaid">
+```mermaid
 stateDiagram-v2
     [*] --> Listening: Wake Word Detected
     
@@ -531,13 +504,13 @@ stateDiagram-v2
     
     ScreenUnlocked --> [*]: Complete
     UnlockFailed --> [*]: Error Handling
-</div>
+```
 
 ### Adaptive Threshold Learning
 
 The system continuously learns and adjusts its verification threshold:
 
-<div class="mermaid">
+```mermaid
 flowchart TB
     subgraph "Adaptive Threshold System"
         INPUT[New Verification<br/>Attempt]
@@ -577,7 +550,7 @@ flowchart TB
     end
 
     style OUTPUT fill:#4caf50,stroke:#2e7d32,stroke-width:2px,color:#fff
-</div>
+```
 
 ---
 
@@ -624,7 +597,7 @@ results = await asyncio.gather(
 - L3 Database Cache: <200ms for enrolled users
 - L4 Continuous Learning: Improves over time
 
-<div class="mermaid">
+```mermaid
 flowchart LR
     subgraph "4-Layer Cache Architecture"
         REQ[Request] --> L1{L1: Session<br/>Cache}
@@ -642,7 +615,7 @@ flowchart LR
     style L2 fill:#8bc34a,stroke:#558b2f,color:#fff
     style L3 fill:#cddc39,stroke:#9e9d24,color:#000
     style L4 fill:#ffeb3b,stroke:#f9a825,color:#000
-</div>
+```
 
 ### ✅ 4. Real-time Progress Updates via WebSocket
 
@@ -739,7 +712,7 @@ flowchart LR
 - Background cache population
 - Progressive component loading
 
-<div class="mermaid">
+```mermaid
 flowchart LR
     subgraph "Cold Start Optimization"
         BOOT[System Boot] --> PARALLEL
@@ -756,7 +729,7 @@ flowchart LR
         M3 --> READY
         M4 --> READY
     end
-</div>
+```
 
 ### Bottleneck 2: Cloud Fallback Latency
 
@@ -806,7 +779,7 @@ flowchart LR
 - Cloud fallback for reliability
 - Cost optimization with intelligent routing
 
-<div class="mermaid">
+```mermaid
 flowchart TB
     subgraph "Hybrid Routing Decision"
         REQ[Voice Request]
@@ -823,7 +796,7 @@ flowchart TB
         CACHE -->|Yes| INSTANT[Instant Response<br/>~1ms]
         CACHE -->|No| FULL[Full Verification<br/>~500ms]
     end
-</div>
+```
 
 ### Decision 2: WebSocket for Real-time Progress
 
@@ -903,7 +876,7 @@ flowchart TB
 
 ### Schema Overview
 
-<div class="mermaid">
+```mermaid
 erDiagram
     SPEAKER_PROFILES ||--o{ VOICE_SAMPLES : contains
     SPEAKER_PROFILES ||--o{ UNLOCK_ATTEMPTS : generates
@@ -990,7 +963,7 @@ erDiagram
 
 ### React Component Architecture
 
-<div class="mermaid">
+```mermaid
 flowchart TB
     subgraph "Frontend Component Tree"
         APP[App.js]
@@ -1009,7 +982,7 @@ flowchart TB
         WS_HOOK --> CONN[Connection<br/>Service]
         WS_HOOK --> MSG[Message<br/>Handler]
     end
-</div>
+```
 
 ### VBI Progress Display Logic
 
@@ -1057,7 +1030,7 @@ case 'vbi_progress':
 
 ### Connection Flow
 
-<div class="mermaid">
+```mermaid
 sequenceDiagram
     participant Client as React Frontend
     participant WS as WebSocket Server
@@ -1093,7 +1066,7 @@ sequenceDiagram
     
     VBI-->>WS: {type: "voice_unlock", success: true, speaker_name: "Derek"}
     WS-->>Client: Forward result
-</div>
+```
 
 ### Message Schema
 
@@ -1126,7 +1099,7 @@ interface VoiceUnlockMessage {
 
 ### ECAPA Docker Backend
 
-<div class="mermaid">
+```mermaid
 flowchart TB
     subgraph "Docker ECAPA Architecture"
         subgraph "Host Machine"
@@ -1146,7 +1119,7 @@ flowchart TB
         
         DOCKER --> ECAPA_API
     end
-</div>
+```
 
 ### Docker Compose Configuration
 
@@ -1181,7 +1154,7 @@ services:
 
 ### Intelligent Backend Orchestration
 
-<div class="mermaid">
+```mermaid
 flowchart TD
     START[JARVIS Startup] --> PROBE[Probe Available Backends]
     
@@ -1221,7 +1194,7 @@ flowchart TD
     USE_CLOUD --> CONFIG
     USE_LOCAL --> CONFIG
     CONFIG --> READY[Ready for<br/>Voice Auth]
-</div>
+```
 
 ---
 
@@ -1229,7 +1202,7 @@ flowchart TD
 
 ### Threat Model
 
-<div class="mermaid">
+```mermaid
 flowchart TB
     subgraph "Security Threat Model"
         subgraph "Attack Vectors"
@@ -1254,7 +1227,7 @@ flowchart TB
         A4 --> D4
         A5 --> D5
     end
-</div>
+```
 
 ### Security Best Practices
 
@@ -1284,7 +1257,7 @@ flowchart TB
 
 ### Latency Breakdown
 
-<div class="mermaid">
+```mermaid
 pie title "Verification Latency Breakdown (Cached Path)"
     "L1 Cache Lookup" : 1
     "Embedding Comparison" : 10
@@ -1852,7 +1825,7 @@ Res2Net splits channels into scales for multi-resolution processing:
     K_i(x_i) & i = 2 \\
     K_i(x_i + y_{i-1}) & 2 < i \leq s
     \end{cases}$$
-  </div>
+```
 </div>
 
 Where:
@@ -1995,7 +1968,7 @@ Given two speaker embeddings $e_1, e_2 \in \mathbb{R}^{192}$:
 <div style="background: linear-gradient(135deg, #ffffff 0%, #f5f5f5 100%); padding: 25px; border-radius: 8px; text-align: center; margin: 20px 0; border: 2px solid #ff9800; box-shadow: 0 2px 8px rgba(0,0,0,0.1);">
   <div style="font-size: 1.3em; color: #e65100; font-weight: bold;">
     $$\text{sim}(e_1, e_2) = \frac{e_1 \cdot e_2}{\|e_1\| \cdot \|e_2\|} = \frac{\sum_{i=1}^{192} e_1^{(i)} \cdot e_2^{(i)}}{\sqrt{\sum_{i=1}^{192} (e_1^{(i)})^2} \cdot \sqrt{\sum_{i=1}^{192} (e_2^{(i)})^2}}$$
-  </div>
+```
 </div>
 
 **Properties:**
@@ -2049,7 +2022,7 @@ $$\text{Decision} = \begin{cases}
   <div style="background: linear-gradient(135deg, #ffffff 0%, #f5f5f5 100%); padding: 25px; border-radius: 8px; text-align: center; margin: 15px 0; border: 2px solid #9c27b0; box-shadow: 0 2px 8px rgba(0,0,0,0.1);">
     <div style="font-size: 1.5em; color: #7b1fa2; font-weight: bold; margin: 0;">
       $$P(\text{Owner} | \text{Evidence}) = \frac{P(\text{Evidence} | \text{Owner}) \cdot P(\text{Owner})}{P(\text{Evidence})}$$
-    </div>
+```
   </div>
   
   <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 15px; margin-top: 20px;">
@@ -2083,7 +2056,7 @@ VBI combines multiple evidence sources:
 <div style="background: linear-gradient(135deg, #ffffff 0%, #f5f5f5 100%); padding: 20px; border-radius: 8px; text-align: center; margin: 15px 0; border: 2px solid #9c27b0; box-shadow: 0 2px 8px rgba(0,0,0,0.1);">
   <div style="font-size: 1.4em; color: #7b1fa2; font-weight: bold;">
     $$P(\text{Evidence} | \text{Owner}) = \prod_{i=1}^{n} P(E_i | \text{Owner})$$
-  </div>
+```
 </div>
 
 **Evidence Sources:**
@@ -2134,7 +2107,7 @@ P(Owner) = 0.15(0.85) + 0.25(0.95) + 0.20(0.90) + 0.20(0.92) + 0.20(0.95)
 <div style="background: linear-gradient(135deg, #ffffff 0%, #f5f5f5 100%); padding: 25px; border-radius: 8px; text-align: center; margin: 15px 0; border: 2px solid #9c27b0; box-shadow: 0 2px 8px rgba(0,0,0,0.1);">
   <div style="font-size: 1.3em; color: #7b1fa2; font-weight: bold;">
     $$P(\text{Owner} | E) = \frac{P(E | \text{Owner}) \cdot P(\text{Owner})}{P(E | \text{Owner}) \cdot P(\text{Owner}) + P(E | \text{Impostor}) \cdot P(\text{Impostor})}$$
-  </div>
+```
 </div>
 
 **Full Example:**
@@ -2565,12 +2538,12 @@ $$\tau^* : \frac{f_{genuine}(\tau^*)}{f_{impostor}(\tau^*)} = \frac{w_{FAR}}{w_{
         <strong>||e_enrolled||</strong><br/>
         <code>||e_enrolled||² = 0.4823</code><br/>
         <code>||e_enrolled|| = 0.6945</code>
-      </div>
+```
       <div style="background: #fff3e0; padding: 10px; border-radius: 5px;">
         <strong>||e_test||</strong><br/>
         <code>||e_test||² = 0.4149</code><br/>
         <code>||e_test|| = 0.6441</code>
-      </div>
+```
     </div>
   </div>
   
@@ -3182,7 +3155,7 @@ success = not screen_locked
     <div style="background: white; padding: 15px; border-radius: 5px;">
       <strong style="color: #2196f3;">🏠 Reverberation</strong><br/>
       <small>Depends on physical room characteristics</small>
-    </div>
+```
     <div style="background: white; padding: 15px; border-radius: 5px;">
       <strong style="color: #ff9800;">🌊 Doppler Effect</strong><br/>
       <small>Requires physical movement</small>
