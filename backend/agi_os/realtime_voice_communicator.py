@@ -120,6 +120,8 @@ class RealTimeVoiceCommunicator:
         self._is_speaking = False
         self._current_message: Optional[SpeechMessage] = None
         self._speech_task: Optional[asyncio.Task] = None
+        self._immediate_speech_lock: asyncio.Lock = asyncio.Lock()  # Prevents voice overlap
+        self._current_speech_process: Optional[asyncio.subprocess.Process] = None
 
         # State management
         self._running = False
@@ -760,7 +762,8 @@ class RealTimeVoiceCommunicator:
         self,
         text: str,
         mode: VoiceMode = VoiceMode.NORMAL,
-        timeout: float = 15.0
+        timeout: float = 15.0,
+        interrupt: bool = False
     ) -> bool:
         """
         Speak immediately without queuing - for real-time VBI feedback.
@@ -768,10 +771,14 @@ class RealTimeVoiceCommunicator:
         This bypasses the queue for time-critical VBI narration where
         immediate auditory feedback is essential.
 
+        Uses a lock to prevent voice overlap - only one speech at a time.
+        If interrupt=True, kills any current speech before starting.
+
         Args:
             text: Text to speak
             mode: Voice mode
             timeout: Maximum time to wait for speech
+            interrupt: If True, kill current speech before starting
 
         Returns:
             True if speech completed, False if failed/timed out
@@ -779,35 +786,53 @@ class RealTimeVoiceCommunicator:
         if self._muted:
             return True
 
-        try:
-            config = self._mode_configs.get(mode, self._mode_configs[VoiceMode.NORMAL])
-
-            cmd = [
-                'say',
-                '-v', config.voice,
-                '-r', str(config.rate),
-                text
-            ]
-
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL
-            )
-
-            await asyncio.wait_for(process.wait(), timeout=timeout)
-            return True
-
-        except asyncio.TimeoutError:
-            logger.warning("Immediate speech timed out: %s", text[:50])
+        # If interrupt mode, kill any current speech
+        if interrupt and self._current_speech_process:
             try:
-                process.kill()
-            except:
+                self._current_speech_process.kill()
+                await asyncio.sleep(0.1)  # Brief pause for cleanup
+            except Exception:
                 pass
-            return False
-        except Exception as e:
-            logger.error("Immediate speech error: %s - %s", e, text[:50])
-            return False
+
+        # Acquire lock to prevent overlapping speech
+        async with self._immediate_speech_lock:
+            try:
+                config = self._mode_configs.get(mode, self._mode_configs[VoiceMode.NORMAL])
+
+                cmd = [
+                    'say',
+                    '-v', config.voice,
+                    '-r', str(config.rate),
+                    text
+                ]
+
+                process = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL
+                )
+
+                # Store reference for interrupt capability
+                self._current_speech_process = process
+
+                await asyncio.wait_for(process.wait(), timeout=timeout)
+
+                self._current_speech_process = None
+                return True
+
+            except asyncio.TimeoutError:
+                logger.warning("Immediate speech timed out: %s", text[:50])
+                try:
+                    if self._current_speech_process:
+                        self._current_speech_process.kill()
+                    self._current_speech_process = None
+                except:
+                    pass
+                return False
+            except Exception as e:
+                logger.error("Immediate speech error: %s - %s", e, text[:50])
+                self._current_speech_process = None
+                return False
 
     async def vbi_stage_feedback(
         self,
@@ -832,33 +857,38 @@ class RealTimeVoiceCommunicator:
             speaker_name = await self.get_owner_name()
 
         # Dynamic, human-like responses based on stage
+        # IMPORTANT: Streamlined to avoid redundant/overlapping speech
+        # Only speak at KEY stages to prevent "hallucinations"
         feedback_map = {
-            # Initial stages - brief acknowledgment
+            # Initial stage - acknowledge command
             "init": f"Just a moment, {speaker_name}.",
-            "audio_decode": None,  # Silent - too fast to narrate
-            "ecapa_extract": "Analyzing your voice.",
 
-            # Verification stage - confidence-aware
-            "verification": self._get_verification_feedback(confidence, speaker_name),
+            # Silent stages - too fast or redundant
+            "audio_decode": None,
+            "ecapa_extract": None,  # Silent - very fast, no need to narrate
+            "verification": None,  # Silent - avoid double-speaking before unlock
 
-            # Unlock execution stages
-            "unlock_execute": f"Voice confirmed. Unlocking for you, {speaker_name}.",
+            # Unlock stage - ONLY speak here (combines verification + unlock)
+            "unlock_execute": f"Voice verified, {speaker_name}. Unlocking now.",
+
+            # Silent unlock substages
             "keychain": None,  # Silent - security
             "wake": None,  # Silent - too fast
-            "typing": "Authenticating now.",
+            "typing": None,  # Silent - already said "unlocking"
             "verify": None,  # Silent - handled by complete
 
-            # Completion
+            # Completion - success message
             "complete": self._get_completion_feedback(confidence, speaker_name),
 
-            # Failures
+            # Failures - only speak on failure
             "failed": self._get_failure_feedback(confidence),
-            "error": "I encountered an issue. Please try again.",
+            "error": "I couldn't verify your voice. Please try again.",
         }
 
         text = feedback_map.get(stage)
         if text:
-            await self.speak_immediate(text, mode=VoiceMode.CONVERSATIONAL)
+            # Use interrupt=True to kill any in-progress speech before new message
+            await self.speak_immediate(text, mode=VoiceMode.CONVERSATIONAL, interrupt=True)
 
     def _get_verification_feedback(self, confidence: float, speaker_name: str) -> str:
         """Get dynamic feedback based on verification confidence."""
@@ -873,40 +903,18 @@ class RealTimeVoiceCommunicator:
         else:
             return "Analyzing voice pattern."
 
-    def _get_completion_feedback(self, confidence: float, speaker_name: str) -> str:
-        """Get dynamic completion message based on confidence."""
-        hour = datetime.now().hour
+    def _get_completion_feedback(self, confidence: float, speaker_name: str) -> Optional[str]:
+        """
+        Get dynamic completion message based on confidence.
 
-        # Time-aware greetings
-        if 5 <= hour < 12:
-            time_greeting = "Good morning"
-        elif 12 <= hour < 17:
-            time_greeting = "Good afternoon"
-        elif 17 <= hour < 22:
-            time_greeting = "Good evening"
-        else:
-            time_greeting = "Hello"
-
-        # Confidence-aware responses
-        if confidence >= 0.90:
-            responses = [
-                f"Of course, {speaker_name}. Welcome back.",
-                f"{time_greeting}, {speaker_name}. Unlocked.",
-                f"Welcome back, {speaker_name}.",
-            ]
-        elif confidence >= 0.70:
-            responses = [
-                f"Verified. Welcome, {speaker_name}.",
-                f"Unlocked for you, {speaker_name}.",
-            ]
-        else:
-            responses = [
-                f"Verification complete. Welcome, {speaker_name}.",
-                f"Access granted, {speaker_name}.",
-            ]
-
-        import random
-        return random.choice(responses)
+        NOTE: Returns None to avoid redundant speech - the unlock_execute stage
+        already says "Voice verified, unlocking now" which is sufficient.
+        Completion feedback is only spoken if we want to add extra info.
+        """
+        # For smooth VBI experience, don't double-speak after unlock
+        # The unlock_execute stage already provides confirmation
+        # Return None to stay silent on completion
+        return None
 
     def _get_failure_feedback(self, confidence: float) -> str:
         """Get helpful feedback on verification failure."""

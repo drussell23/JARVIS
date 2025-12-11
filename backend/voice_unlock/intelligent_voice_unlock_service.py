@@ -4072,23 +4072,121 @@ async def _extract_ecapa_robust(audio_bytes: bytes) -> Optional[List[float]]:
                 errors.append(f"scipy: {e}")
                 logger.debug(f"[ROBUST-ECAPA] scipy failed: {e}")
 
-        # Strategy 4: librosa as last resort
-        try:
-            logger.info("[ROBUST-ECAPA] Trying librosa load...")
-            import librosa
-            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
-                f.write(audio_data)
-                temp_path = f.name
-            y, sr = librosa.load(temp_path, sr=None)
-            os.unlink(temp_path)
-            waveform = torch.from_numpy(y).unsqueeze(0)
-            logger.info(f"[ROBUST-ECAPA] librosa load SUCCESS: shape={waveform.shape}, sr={sr}")
-            return waveform, sr
-        except Exception as e:
-            errors.append(f"librosa: {e}")
-            logger.debug(f"[ROBUST-ECAPA] librosa failed: {e}")
-            if 'temp_path' in locals() and os.path.exists(temp_path):
+        # Strategy 4: librosa as last resort for WAV-like data
+        if audio_data[:4] == b'RIFF':
+            try:
+                logger.info("[ROBUST-ECAPA] Trying librosa load...")
+                import librosa
+                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
+                    f.write(audio_data)
+                    temp_path = f.name
+                y, sr = librosa.load(temp_path, sr=None)
                 os.unlink(temp_path)
+                waveform = torch.from_numpy(y).unsqueeze(0)
+                logger.info(f"[ROBUST-ECAPA] librosa load SUCCESS: shape={waveform.shape}, sr={sr}")
+                return waveform, sr
+            except Exception as e:
+                errors.append(f"librosa: {e}")
+                logger.debug(f"[ROBUST-ECAPA] librosa failed: {e}")
+                if 'temp_path' in locals() and os.path.exists(temp_path):
+                    os.unlink(temp_path)
+
+        # Strategy 5: FFmpeg conversion for non-WAV formats (WebM, Ogg, etc.)
+        # This is the most robust strategy for browser-captured audio
+        if audio_data[:4] != b'RIFF':
+            try:
+                logger.info("[ROBUST-ECAPA] 🔧 Trying FFmpeg conversion (non-WAV detected)...")
+                import subprocess
+
+                # Detect format from magic bytes
+                if audio_data[:4] == b'\x1aE\xdf\xa3':
+                    in_ext = '.webm'
+                    in_format = 'webm'
+                elif audio_data[:4] == b'OggS':
+                    in_ext = '.ogg'
+                    in_format = 'ogg'
+                else:
+                    in_ext = '.webm'  # Default to WebM for browser audio
+                    in_format = 'webm'
+
+                logger.info(f"[ROBUST-ECAPA] Detected format: {in_format}, will convert to WAV")
+
+                # Create temp files
+                temp_in = tempfile.NamedTemporaryFile(suffix=in_ext, delete=False)
+                temp_out = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+                temp_in.write(audio_data)
+                temp_in.close()
+                temp_out.close()
+
+                # FFmpeg conversion with error tolerance for browser audio
+                ffmpeg_strategies = [
+                    # Strategy A: Generic with error tolerance
+                    [
+                        'ffmpeg', '-y', '-hide_banner', '-loglevel', 'warning',
+                        '-err_detect', 'ignore_err',
+                        '-fflags', '+discardcorrupt+genpts',
+                        '-i', temp_in.name,
+                        '-vn',
+                        '-f', 'wav', '-ar', '16000', '-ac', '1', '-acodec', 'pcm_s16le',
+                        temp_out.name
+                    ],
+                    # Strategy B: Force input format
+                    [
+                        'ffmpeg', '-y', '-hide_banner', '-loglevel', 'warning',
+                        '-err_detect', 'ignore_err',
+                        '-f', in_format,
+                        '-i', temp_in.name,
+                        '-f', 'wav', '-ar', '16000', '-ac', '1', '-acodec', 'pcm_s16le',
+                        temp_out.name
+                    ],
+                    # Strategy C: Matroska demuxer (WebM is Matroska)
+                    [
+                        'ffmpeg', '-y', '-hide_banner', '-loglevel', 'warning',
+                        '-err_detect', 'ignore_err',
+                        '-f', 'matroska',
+                        '-i', temp_in.name,
+                        '-f', 'wav', '-ar', '16000', '-ac', '1', '-acodec', 'pcm_s16le',
+                        temp_out.name
+                    ],
+                ]
+
+                wav_data = None
+                for i, cmd in enumerate(ffmpeg_strategies):
+                    strategy_name = ['generic', in_format, 'matroska'][i]
+                    try:
+                        result = subprocess.run(cmd, capture_output=True, timeout=10.0)
+                        if result.returncode == 0 and os.path.exists(temp_out.name):
+                            with open(temp_out.name, 'rb') as f:
+                                wav_data = f.read()
+                            if len(wav_data) > 44:
+                                logger.info(f"[ROBUST-ECAPA] FFmpeg ({strategy_name}) SUCCESS: {len(wav_data)} bytes WAV")
+                                break
+                    except subprocess.TimeoutExpired:
+                        logger.debug(f"[ROBUST-ECAPA] FFmpeg ({strategy_name}) timeout")
+                    except Exception as ffmpeg_err:
+                        logger.debug(f"[ROBUST-ECAPA] FFmpeg ({strategy_name}) failed: {ffmpeg_err}")
+
+                # Cleanup temp files
+                if os.path.exists(temp_in.name):
+                    os.unlink(temp_in.name)
+                if os.path.exists(temp_out.name):
+                    os.unlink(temp_out.name)
+
+                # Load the converted WAV
+                if wav_data and len(wav_data) > 44:
+                    try:
+                        waveform, sr = torchaudio.load(io.BytesIO(wav_data))
+                        logger.info(f"[ROBUST-ECAPA] FFmpeg+torchaudio SUCCESS: shape={waveform.shape}, sr={sr}")
+                        return waveform, sr
+                    except Exception as load_err:
+                        errors.append(f"FFmpeg+torchaudio: {load_err}")
+                        logger.debug(f"[ROBUST-ECAPA] FFmpeg WAV load failed: {load_err}")
+                else:
+                    errors.append("FFmpeg: All conversion strategies failed")
+
+            except Exception as e:
+                errors.append(f"FFmpeg conversion: {e}")
+                logger.debug(f"[ROBUST-ECAPA] FFmpeg conversion error: {e}")
 
         logger.error(f"[ROBUST-ECAPA] All audio load strategies failed: {errors}")
         return None, None
@@ -5268,10 +5366,40 @@ async def process_voice_unlock_robust(
             except Exception as e:
                 logger.debug(f"Voice feedback error: {e}")
 
-    async def progress(stage: str, pct: int, msg: str, confidence: float = 0.0):
+    async def progress(stage: str, pct: int, msg: str, success: bool = None, confidence: float = 0.0):
+        """
+        Send progress update to callback.
+
+        Args:
+            stage: Current stage name
+            pct: Progress percentage (0-100)
+            msg: Human-readable message
+            success: Stage completion status (True=✅, False=❌, None=in progress)
+            confidence: Verification confidence (optional)
+        """
         if progress_callback:
             try:
-                data = {"type": "vbi_progress", "stage": stage, "progress": pct, "message": msg, "timestamp": time.time()}
+                # Add success indicator to message
+                if success is True:
+                    display_msg = f"✅ {msg}"
+                elif success is False:
+                    display_msg = f"❌ {msg}"
+                else:
+                    display_msg = msg
+
+                data = {
+                    "type": "vbi_progress",
+                    "stage": stage,
+                    "progress": pct,
+                    "message": display_msg,
+                    "raw_message": msg,  # Original message without emoji
+                    "success": success,
+                    "timestamp": time.time()
+                }
+
+                if confidence > 0:
+                    data["confidence"] = confidence
+
                 if asyncio.iscoroutinefunction(progress_callback):
                     await progress_callback(data)
                 else:
@@ -5357,13 +5485,17 @@ async def process_voice_unlock_robust(
 
             logger.info(f"[ROBUST] Audio decoded successfully: {len(audio_bytes)} bytes")
 
+            # ✅ Audio decode SUCCESS
             stages.append({"stage": "audio_decode", "success": True})
+            await progress("audio_decode", 25, f"Audio decoded ({len(audio_bytes)} bytes)", success=True)
 
             if isinstance(ref_emb, Exception) or not ref_emb:
                 logger.warning(f"[ROBUST] No reference embedding: {ref_emb}")
+                await progress("profile_load", 30, "No voice profile found", success=False)
             else:
                 stages.append({"stage": "profile_load", "success": True, "dim": len(ref_emb), "speaker": verified_speaker})
                 logger.info(f"[ROBUST] Reference embedding: {len(ref_emb)} dims for {verified_speaker}")
+                await progress("profile_load", 30, f"Voice profile loaded for {verified_speaker}", success=True)
 
             # 🎙️ STAGE: ECAPA Extract - Voice: "Analyzing your voice."
             await progress("ecapa_extract", 45, "Extracting voiceprint...")
@@ -5371,13 +5503,18 @@ async def process_voice_unlock_robust(
             test_emb = await _extract_ecapa_robust(audio_bytes)
 
             if not test_emb:
+                # ❌ ECAPA Extract FAILED
+                await progress("ecapa_extract", 45, "Failed to extract voiceprint", success=False)
                 await voice_feedback("failed", confidence=0.0)
                 return result(False, "Failed to extract voiceprint", err="ECAPA failed")
 
+            # ✅ ECAPA Extract SUCCESS
             stages.append({"stage": "ecapa_extract", "success": True, "dim": len(test_emb)})
-            await progress("verification", 75, "Verifying speaker...")
+            await progress("ecapa_extract", 55, f"Voiceprint extracted ({len(test_emb)} dims)", success=True)
+            await progress("verification", 65, "Verifying speaker...")
 
             if not ref_emb:
+                await progress("verification", 70, "No voice profile to compare", success=False)
                 await voice_feedback("failed", confidence=0.0)
                 return result(False, "No voice profile found", conf=0.0, err="No reference embedding")
 
@@ -5388,12 +5525,16 @@ async def process_voice_unlock_robust(
             await voice_feedback("verification", confidence=conf, speaker=verified_speaker)
 
             if not verified:
-                await progress("verification", 80, f"Failed: {conf:.1%}")
+                # ❌ Verification FAILED
+                await progress("verification", 80, f"Voice not verified ({conf:.1%})", success=False)
                 await voice_feedback("failed", confidence=conf)
                 return result(False, f"Voice not verified ({conf:.1%})", conf=conf)
 
+            # ✅ Verification SUCCESS
+            await progress("verification", 80, f"Voice verified ({conf:.1%})", success=True, confidence=conf)
+
             # 🎙️ STAGE: Unlock Execute - Voice: "Voice confirmed. Unlocking for you, {speaker}."
-            await progress("unlock_execute", 90, f"Voice verified ({conf:.1%}). Unlocking for {verified_speaker}...")
+            await progress("unlock_execute", 90, f"Unlocking for {verified_speaker}...")
             await voice_feedback("unlock_execute", confidence=conf, speaker=verified_speaker)
 
             # Pass progress callback and confidence for transparent substage updates
@@ -5405,12 +5546,19 @@ async def process_voice_unlock_robust(
             stages.append({"stage": "unlock_execute", "success": unlocked})
 
             if not unlocked:
-                await progress("unlock_execute", 90, "Screen unlock failed")
+                # ❌ Unlock FAILED
+                await progress("unlock_execute", 90, "Screen unlock failed", success=False)
                 await voice_feedback("failed", confidence=conf)
                 return result(False, "Screen unlock failed", speaker=verified_speaker, conf=conf, err="Unlock execution failed")
 
+            # ✅ Unlock SUCCESS
+            await progress("unlock_execute", 95, f"Screen unlocked for {verified_speaker}", success=True)
+
             # 🎙️ STAGE: Complete - Voice: "Of course, {speaker}. Welcome back." (time-aware)
             await voice_feedback("complete", confidence=conf, speaker=verified_speaker)
+
+            # ✅ Complete SUCCESS
+            await progress("complete", 100, f"Welcome back, {verified_speaker}!", success=True, confidence=conf)
 
             return result(True, f"Of course, {verified_speaker}. Welcome back.", speaker=verified_speaker, conf=conf)
 
