@@ -407,6 +407,105 @@ class ContinuousAudioBuffer {
   }
 
   /**
+   * 🆕 CRITICAL: Capture fresh audio with VALID WebM container
+   * This creates a NEW MediaRecorder to capture audio for a specified duration,
+   * producing a valid, self-contained WebM file with proper headers.
+   *
+   * Use this for voice biometric verification instead of getBufferedAudio()
+   * which concatenates chunks and produces invalid WebM.
+   *
+   * @param {number} durationMs - How long to record (default: 2000ms)
+   * @returns {Promise<{blob, audio, mimeType, durationMs, sampleRate}>}
+   */
+  async captureFreshAudio(durationMs = 2000) {
+    console.log(`[ContinuousAudioBuffer] 🎤 Capturing fresh audio for ${durationMs}ms...`);
+
+    if (!this.audioStream || !this.isRunning) {
+      console.error('[ContinuousAudioBuffer] Cannot capture - no active audio stream');
+      return null;
+    }
+
+    return new Promise((resolve, reject) => {
+      const chunks = [];
+      let recorder = null;
+
+      try {
+        // Create a fresh MediaRecorder for this capture
+        recorder = new MediaRecorder(
+          this.audioStream,
+          this.mimeType ? { mimeType: this.mimeType } : {}
+        );
+
+        recorder.ondataavailable = (event) => {
+          if (event.data.size > 0) {
+            chunks.push(event.data);
+          }
+        };
+
+        recorder.onstop = async () => {
+          if (chunks.length === 0) {
+            console.warn('[ContinuousAudioBuffer] Fresh capture produced no chunks');
+            resolve(null);
+            return;
+          }
+
+          // Create a single blob - this will have valid WebM headers
+          const blob = new Blob(chunks, { type: this.mimeType });
+          console.log(`[ContinuousAudioBuffer] ✅ Fresh capture complete: ${chunks.length} chunks, ${blob.size} bytes`);
+
+          // Convert to base64
+          const reader = new FileReader();
+          reader.onloadend = () => {
+            const base64 = reader.result.split(',')[1];
+            resolve({
+              blob,
+              audio: base64,
+              base64Length: base64?.length || 0,
+              mimeType: this.mimeType,
+              durationMs: durationMs,
+              sampleRate: this.sampleRate,
+              chunkCount: chunks.length,
+              isFreshCapture: true  // Flag to indicate this is a valid recording
+            });
+          };
+          reader.onerror = () => {
+            console.error('[ContinuousAudioBuffer] Base64 conversion failed');
+            resolve(null);
+          };
+          reader.readAsDataURL(blob);
+        };
+
+        recorder.onerror = (event) => {
+          console.error('[ContinuousAudioBuffer] Fresh capture recorder error:', event.error);
+          reject(event.error);
+        };
+
+        // Start recording
+        recorder.start();
+        console.log(`[ContinuousAudioBuffer] Fresh recorder started, waiting ${durationMs}ms...`);
+
+        // Stop after duration
+        setTimeout(() => {
+          if (recorder && recorder.state === 'recording') {
+            recorder.stop();
+          }
+        }, durationMs);
+
+      } catch (error) {
+        console.error('[ContinuousAudioBuffer] Fresh capture failed:', error);
+        reject(error);
+      }
+    });
+  }
+
+  /**
+   * 🆕 Get fresh audio as base64 - wrapper for easier use
+   */
+  async getFreshAudioBase64(durationMs = 2000) {
+    return this.captureFreshAudio(durationMs);
+  }
+
+  /**
    * Get current status and metrics
    */
   getStatus() {

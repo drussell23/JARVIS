@@ -3289,25 +3289,42 @@ const JarvisVoice = () => {
       }
     };
 
-    // Try to get audio from continuous buffer in background (don't block)
-    // This allows biometric verification while not slowing down the command
+    // 🆕 CRITICAL FIX: Use fresh audio capture for voice biometric verification
+    // The old getBufferedAudioBase64() concatenates MediaRecorder chunks which produces
+    // invalid WebM files (broken headers). Fresh capture creates a valid WebM container.
     if (continuousAudioBufferRef.current && continuousAudioBufferRef.current.isRunning) {
       try {
-        // Get last 2 seconds - shorter window for faster response
-        const bufferedAudio = await Promise.race([
-          continuousAudioBufferRef.current.getBufferedAudioBase64(2000),
-          new Promise((_, reject) => setTimeout(() => reject(new Error('Audio buffer timeout')), 100)) // 100ms timeout
+        console.log('🎤 [Priority] Starting fresh audio capture for voice biometrics...');
+
+        // Use getFreshAudioBase64 which creates a NEW MediaRecorder for valid WebM
+        // 2 seconds is enough for voice biometric verification
+        const freshAudio = await Promise.race([
+          continuousAudioBufferRef.current.getFreshAudioBase64(2000),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('Fresh capture timeout')), 2500))
         ]);
-        if (bufferedAudio && bufferedAudio.audio && bufferedAudio.audio.length > 500) {
-          message.audio_data = bufferedAudio.audio;
-          message.sample_rate = bufferedAudio.sampleRate;
-          message.mime_type = bufferedAudio.mimeType;
-          message.audio_source = 'continuous_buffer_priority';
-          console.log(`🎤 [Priority] Got quick audio: ${bufferedAudio.base64Length} chars`);
+
+        if (freshAudio && freshAudio.audio && freshAudio.audio.length > 500) {
+          message.audio_data = freshAudio.audio;
+          message.sample_rate = freshAudio.sampleRate;
+          message.mime_type = freshAudio.mimeType;
+          message.audio_source = 'fresh_capture';  // Flag to indicate valid WebM
+          console.log(`🎤 [Priority] ✅ Got fresh audio: ${freshAudio.base64Length} chars (valid WebM)`);
         }
       } catch (e) {
-        // Audio timeout is OK - we'll send without audio
-        console.log('🎤 [Priority] Audio skipped for speed (will use backend buffer)');
+        // Fresh capture timeout - fall back to buffered audio (may have issues)
+        console.log('🎤 [Priority] Fresh capture timeout, trying buffered audio...');
+        try {
+          const bufferedAudio = await continuousAudioBufferRef.current.getBufferedAudioBase64(2000);
+          if (bufferedAudio && bufferedAudio.audio && bufferedAudio.audio.length > 500) {
+            message.audio_data = bufferedAudio.audio;
+            message.sample_rate = bufferedAudio.sampleRate;
+            message.mime_type = bufferedAudio.mimeType;
+            message.audio_source = 'continuous_buffer_fallback';
+            console.log(`🎤 [Priority] Got fallback buffered audio: ${bufferedAudio.base64Length} chars`);
+          }
+        } catch (e2) {
+          console.log('🎤 [Priority] All audio capture failed');
+        }
       }
     }
 
