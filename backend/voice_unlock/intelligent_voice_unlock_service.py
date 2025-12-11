@@ -3802,12 +3802,14 @@ async def prewarm_ecapa_classifier():
 
 
 async def _load_speaker_embedding_direct(speaker_name: str = "Derek") -> Optional[List[float]]:
-    """Load speaker embedding directly from SQLite database."""
+    """Load speaker embedding directly from SQLite database with detailed diagnostics."""
     import numpy as np
 
     db_path = RobustUnlockConfig.LEARNING_DB_PATH
+    logger.info(f"[ROBUST-PROFILE] Loading profile for '{speaker_name}' from: {db_path}")
+
     if not os.path.exists(db_path):
-        logger.warning(f"[ROBUST] Database not found: {db_path}")
+        logger.warning(f"[ROBUST-PROFILE] Database not found: {db_path}")
         return None
 
     try:
@@ -3820,25 +3822,51 @@ async def _load_speaker_embedding_direct(speaker_name: str = "Derek") -> Optiona
                 ("voice_profiles", "embedding", "speaker_name"),
             ]
             embedding = None
+            matched_query = None
+
             for table, emb_col, name_col in queries:
                 try:
                     cursor.execute(f"""
-                        SELECT {emb_col} FROM {table}
+                        SELECT {emb_col}, {name_col}, total_samples FROM {table}
                         WHERE {name_col} LIKE ? OR {name_col} LIKE ? LIMIT 1
                     """, (f"%{speaker_name}%", f"%{speaker_name.lower()}%"))
                     row = cursor.fetchone()
                     if row and row[0]:
                         raw = row[0]
+                        profile_name = row[1] if len(row) > 1 else "unknown"
+                        total_samples = row[2] if len(row) > 2 else "unknown"
+
+                        logger.info(f"[ROBUST-PROFILE] Found profile: {profile_name} ({total_samples} samples)")
+                        logger.info(f"[ROBUST-PROFILE]   From table: {table}.{emb_col}")
+                        logger.info(f"[ROBUST-PROFILE]   Raw data type: {type(raw)}, size: {len(raw) if hasattr(raw, '__len__') else 'N/A'}")
+
                         if isinstance(raw, bytes):
                             try:
                                 embedding = np.frombuffer(raw, dtype=np.float32).tolist()
+                                logger.info(f"[ROBUST-PROFILE]   Decoded embedding: {len(embedding)} dims")
                                 if len(embedding) == 192:
+                                    matched_query = f"{table}.{emb_col}"
+                                    # Log first few values for debugging
+                                    logger.info(f"[ROBUST-PROFILE]   First 5 values: {embedding[:5]}")
+                                    logger.info(f"[ROBUST-PROFILE]   Embedding norm: {np.linalg.norm(np.array(embedding)):.4f}")
                                     break
-                            except:
-                                pass
-                except sqlite3.Error:
+                                else:
+                                    logger.warning(f"[ROBUST-PROFILE]   Wrong dimension: {len(embedding)} (expected 192)")
+                            except Exception as e:
+                                logger.error(f"[ROBUST-PROFILE]   Decode error: {e}")
+                        else:
+                            logger.warning(f"[ROBUST-PROFILE]   Not bytes: {type(raw)}")
+                except sqlite3.Error as e:
+                    logger.debug(f"[ROBUST-PROFILE] Query {table}.{emb_col} failed: {e}")
                     continue
+
             conn.close()
+
+            if embedding and matched_query:
+                logger.info(f"[ROBUST-PROFILE] ✅ Successfully loaded from {matched_query}")
+            else:
+                logger.warning(f"[ROBUST-PROFILE] ❌ No valid embedding found for '{speaker_name}'")
+
             return embedding
 
         loop = asyncio.get_event_loop()
@@ -3847,9 +3875,9 @@ async def _load_speaker_embedding_direct(speaker_name: str = "Derek") -> Optiona
             timeout=RobustUnlockConfig.PROFILE_LOAD_TIMEOUT
         )
     except asyncio.TimeoutError:
-        logger.error("[ROBUST] Profile load timeout")
+        logger.error("[ROBUST-PROFILE] Profile load timeout")
     except Exception as e:
-        logger.error(f"[ROBUST] Profile load error: {e}")
+        logger.error(f"[ROBUST-PROFILE] Profile load error: {e}")
     return None
 
 
@@ -4033,7 +4061,15 @@ async def _extract_ecapa_robust(audio_bytes: bytes) -> Optional[List[float]]:
             with torch.no_grad():
                 emb = classifier.encode_batch(waveform).squeeze().numpy()
 
-            logger.info(f"[EDGE-ECAPA] Embedding extracted via Neural Engine: {len(emb)} dims")
+            # 🔍 DIAGNOSTIC LOGGING - Critical for debugging embedding consistency
+            logger.info(f"[EDGE-ECAPA] ═══════════════════════════════════════════════════")
+            logger.info(f"[EDGE-ECAPA] Embedding extracted: {len(emb)} dims")
+            logger.info(f"[EDGE-ECAPA]   norm={np.linalg.norm(emb):.4f}")
+            logger.info(f"[EDGE-ECAPA]   min={emb.min():.4f}, max={emb.max():.4f}")
+            logger.info(f"[EDGE-ECAPA]   mean={emb.mean():.4f}, std={emb.std():.4f}")
+            logger.info(f"[EDGE-ECAPA]   first_5={emb[:5].tolist()}")
+            logger.info(f"[EDGE-ECAPA] ═══════════════════════════════════════════════════")
+
             return emb.tolist()
 
         logger.info("[EDGE-ECAPA] Running extraction in executor...")
@@ -4599,15 +4635,55 @@ async def _decode_audio_robust(audio_base64: str, mime_type: str = "audio/webm")
 
 
 def _verify_speaker_robust(test_emb: List[float], ref_emb: List[float]) -> Tuple[bool, float]:
-    """Verify speaker using cosine similarity."""
+    """Verify speaker using cosine similarity with detailed diagnostics."""
     import numpy as np
+
     test = np.array(test_emb, dtype=np.float32)
     ref = np.array(ref_emb, dtype=np.float32)
-    test_n = test / (np.linalg.norm(test) + 1e-10)
-    ref_n = ref / (np.linalg.norm(ref) + 1e-10)
+
+    # 🔍 DIAGNOSTIC LOGGING - Critical for debugging low similarity scores
+    logger.info(f"[ROBUST-VERIFY] ═══════════════════════════════════════════════════")
+    logger.info(f"[ROBUST-VERIFY] Test embedding: dims={len(test)}, norm={np.linalg.norm(test):.4f}")
+    logger.info(f"[ROBUST-VERIFY]   min={test.min():.4f}, max={test.max():.4f}, mean={test.mean():.4f}, std={test.std():.4f}")
+    logger.info(f"[ROBUST-VERIFY]   first_5={test[:5].tolist()}")
+    logger.info(f"[ROBUST-VERIFY] Ref embedding: dims={len(ref)}, norm={np.linalg.norm(ref):.4f}")
+    logger.info(f"[ROBUST-VERIFY]   min={ref.min():.4f}, max={ref.max():.4f}, mean={ref.mean():.4f}, std={ref.std():.4f}")
+    logger.info(f"[ROBUST-VERIFY]   first_5={ref[:5].tolist()}")
+
+    # Check for zero embeddings (indicates extraction failure)
+    test_norm = np.linalg.norm(test)
+    ref_norm = np.linalg.norm(ref)
+
+    if test_norm < 1e-6:
+        logger.error("[ROBUST-VERIFY] ⚠️ TEST EMBEDDING IS NEAR-ZERO! Extraction likely failed.")
+        return False, 0.0
+
+    if ref_norm < 1e-6:
+        logger.error("[ROBUST-VERIFY] ⚠️ REFERENCE EMBEDDING IS NEAR-ZERO! Database profile may be corrupted.")
+        return False, 0.0
+
+    # Normalize embeddings
+    test_n = test / (test_norm + 1e-10)
+    ref_n = ref / (ref_norm + 1e-10)
+
+    # Compute cosine similarity
     sim = float(np.dot(test_n, ref_n))
+
+    # Additional diagnostic: L2 distance
+    l2_dist = float(np.linalg.norm(test_n - ref_n))
+
+    # Check if embeddings are suspiciously different
+    if sim < 0.5:
+        logger.warning(f"[ROBUST-VERIFY] ⚠️ LOW SIMILARITY ({sim:.4f}) - possible causes:")
+        logger.warning(f"[ROBUST-VERIFY]   1. Different ECAPA model versions used for enrollment vs verification")
+        logger.warning(f"[ROBUST-VERIFY]   2. Audio quality issue (noise, distortion)")
+        logger.warning(f"[ROBUST-VERIFY]   3. Different speaker")
+        logger.warning(f"[ROBUST-VERIFY]   L2 distance between normalized vectors: {l2_dist:.4f}")
+
     verified = sim >= RobustUnlockConfig.CONFIDENCE_THRESHOLD
-    logger.info(f"[ROBUST] Verification: sim={sim:.4f}, threshold={RobustUnlockConfig.CONFIDENCE_THRESHOLD}, verified={verified}")
+    logger.info(f"[ROBUST-VERIFY] Result: sim={sim:.4f}, L2_dist={l2_dist:.4f}, threshold={RobustUnlockConfig.CONFIDENCE_THRESHOLD}, verified={verified}")
+    logger.info(f"[ROBUST-VERIFY] ═══════════════════════════════════════════════════")
+
     return verified, sim
 
 
