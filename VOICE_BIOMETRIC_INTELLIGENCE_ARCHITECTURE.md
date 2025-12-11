@@ -71,20 +71,20 @@ flowchart TB
 
     subgraph "🧠 VBI Core Engine"
         VBI[Voice Biometric Intelligence<br/>v4.0.0]
-        
+
         subgraph "Speaker Verification"
             ECAPA[ECAPA-TDNN<br/>192D Embeddings]
             CS[Cosine Similarity<br/>Score Calculation]
             AT[Adaptive Threshold<br/>Dynamic Adjustment]
         end
-        
+
         subgraph "Physics-Aware Authentication"
             VTL[Vocal Tract Length<br/>Verification]
             RA[Reverberation<br/>Analysis]
             DED[Doppler Effect<br/>Detection]
             AS[Anti-Spoofing<br/>7-Layer Detection]
         end
-        
+
         subgraph "Bayesian Fusion"
             BF[Multi-Factor<br/>Probability Fusion]
             AP[Adaptive Priors<br/>Historical Learning]
@@ -115,14 +115,14 @@ flowchart TB
     DED --> AS
     VBI --> BF
     BF --> CF
-    
+
     ECAPA --> SQLITE
     SQLITE --> ECAPA
     ECAPA --> CLOUDSQL
     CLOUDSQL --> ECAPA
     BF --> CHROMA
     CHROMA --> BF
-    
+
     VBI --> WS
     WS --> VBI
     WS --> REACT
@@ -152,40 +152,40 @@ sequenceDiagram
     User->>Frontend: "Hey JARVIS, unlock my screen"
     Frontend->>WS: Send audio + command
     WS->>API: WebSocket message
-    
+
     Note over API,VBI: Stage 1: Audio Preprocessing
     API->>VBI: Process voice unlock request
     VBI->>VBI: Audio preprocessing<br/>(bandpass, normalize, SNR)
     VBI-->>WS: Progress: 15% - Audio captured
-    
+
     Note over VBI,ECAPA: Stage 2: Speaker Embedding
     VBI->>ECAPA: Extract speaker embedding
     ECAPA->>ECAPA: Generate<br/>192D vector
     ECAPA-->>VBI: Embedding ready
     VBI-->>WS: Progress: 35% - Embedding extracted
-    
+
     Note over VBI,DB: Stage 3: Speaker Verification
     VBI->>DB: Retrieve enrolled profiles
     DB-->>VBI: Derek's reference embeddings
     VBI->>VBI: Cosine<br/>similarity calculation
     VBI-->>WS: Progress: 55% - Speaker matched
-    
+
     Note over VBI,PAVA: Stage 4: Anti-Spoofing
     VBI->>PAVA: Analyze for spoofing
     PAVA->>PAVA: 7-layer<br/>detection
     PAVA-->>VBI: Liveness<br/>score: 0.97
     VBI-->>WS: Progress: 75% - Liveness confirmed
-    
+
     Note over VBI: Stage 5: Bayesian Fusion
     VBI->>VBI: Fuse all<br/> confidence scores
     VBI->>VBI: Apply<br/>adaptive threshold
     VBI-->>WS: Progress: 90% - Verification complete
-    
+
     Note over VBI,TTS: Stage 6: Response
     VBI->>TTS: "Voice verified, Derek. 98% confidence."
     VBI-->>WS: Progress: 100% - Welcome, Derek!
     VBI->>API: Execute<br/>screen unlock
-    
+
     API-->>Frontend: Success response
     Frontend->>User: ✅ Screen Unlocked
 ```
@@ -212,7 +212,7 @@ classDiagram
         -_apply_bayesian_fusion(scores)
         -_generate_announcement(result)
     }
-    
+
     class VBIResult {
         +verified: bool
         +speaker_name: str
@@ -223,7 +223,7 @@ classDiagram
         +warnings: List[str]
         +anti_spoof_score: float
     }
-    
+
     class ConfidenceLevel {
         >
         HIGH
@@ -232,7 +232,7 @@ classDiagram
         INSUFFICIENT
         UNKNOWN
     }
-    
+
     class VBIConfig {
         +confidence_threshold: float
         +anti_spoofing_enabled: bool
@@ -240,7 +240,7 @@ classDiagram
         +adaptive_learning_enabled: bool
         +cloud_first_mode: bool
     }
-    
+
     VoiceBiometricIntelligence --> VBIResult
     VoiceBiometricIntelligence --> VBIConfig
     VBIResult --> ConfidenceLevel
@@ -264,29 +264,29 @@ State-of-the-art neural network for speaker embedding extraction.
 flowchart LR
     subgraph "ECAPA-TDNN Architecture"
         INPUT[Audio <br/>Input16kHz, 3.2s]
-        
+
         subgraph "Feature Extraction"
             MEL[Mel <br/>Spectrogram80 bins]
             FBANK[Filter Banks<br/>Preprocessing]
         end
-        
+
         subgraph "SE-Res2Block Layers"
             RES1[SE-Res2<br/>Block 1512 channels]
             RES2[SE-Res2<br/>Block 2512 channels]
             RES3[SE-Res2<br/>Block 3512 channels]
         end
-        
+
         subgraph "Channel Attention"
             CA[Channel & Context<br/>Attention]
             ASP[Attentive Statistics<br/>Pooling]
         end
-        
+
         subgraph "Output"
             FC[Fully <br/>Connected192 dimensions]
             EMBED[Speaker EmbeddingL2 <br/>Normalized]
         end
     end
-    
+
     INPUT --> MEL --> FBANK
     FBANK --> RES1 --> RES2 --> RES3
     RES3 --> CA --> ASP --> FC --> EMBED
@@ -314,38 +314,38 @@ Advanced anti-spoofing system with 7-layer detection.
 flowchart TB
     subgraph "🛡️ PAVA: 7-Layer Anti-Spoofing Detection"
         AUDIO[Audio <br/>Input]
-        
+
         subgraph "Layer 1: Acoustic Analysis"
             L1[Vocal Tract Length<br/>Estimation]
         end
-        
+
         subgraph "Layer 2: Environmental"
             L2[Reverberation<br/>Analysis]
         end
-        
+
         subgraph "Layer 3: Physical"
             L3[Doppler Effect<br/>Detection]
         end
-        
+
         subgraph "Layer 4: Spectral"
             L4[Spectral Flatness<br/>Verification]
         end
-        
+
         subgraph "Layer 5: Temporal"
             L5[Pitch Variation<br/>Naturalness]
         end
-        
+
         subgraph "Layer 6: Behavioral"
             L6[Speaking Pattern<br/>Consistency]
         end
-        
+
         subgraph "Layer 7: ML Detection"
             L7[Neural Spoof<br/>Classifier]
         end
-        
+
         FUSION[Weighted FusionAnti-Spoof <br/>Score]
         RESULT{LivenessConfirmed?}
-        
+
         AUDIO --> L1
         AUDIO --> L2
         AUDIO --> L3
@@ -399,25 +399,25 @@ flowchart TB
             S4[Environmental<br/>Score: 0.88]
             S5[Historical Pattern<br/>Score: 0.94]
         end
-        
+
         subgraph "Prior Probabilities"
             P1[Time-of-Day Prior<br/>Morning: 0.85]
             P2[Location Prior<br/>Home: 0.95]
             P3[Device PriorMac<br/>Book: 0.90]
             P4[Behavioral PriorRegular <br/>User: 0.92]
         end
-        
+
         subgraph "Bayesian Fusion"
             LIKE[Likelihood<br/>Computation]
             PRIOR[Prior<br/>Aggregation]
             POST["PosteriorP Owner given <br/>Evidence"]
         end
-        
+
         subgraph "Output"
             CONF[Final <br/>Confidence98%]
             DEC{Decision}
         end
-        
+
         S1 --> LIKE
         S2 --> LIKE
         S3 --> LIKE
@@ -456,34 +456,36 @@ Where:
 ```mermaid
 stateDiagram-v2
     [*] --> Listening: Wake Word Detected
-    
+
     Listening --> AudioCapture: Start Recording
     AudioCapture --> Preprocessing: 3.2s Audio Captured
-    
+
     Preprocessing --> EmbeddingExtraction: Audio Normalized
-    
+
     state "Parallel Processing" as PP {
         EmbeddingExtraction --> SpeakerVerification
         EmbeddingExtraction --> AntiSpoofing
         EmbeddingExtraction --> VoiceQuality
     }
-    
+
     SpeakerVerification --> BayesianFusion
     AntiSpoofing --> BayesianFusion
     VoiceQuality --> BayesianFusion
-    
+
     BayesianFusion --> ThresholdCheck: Confidence Calculated
-    
+
     ThresholdCheck --> OwnerVerified: >= 40% (Adaptive)
-    ThresholdCheck --> NotVerified:  Announcement: "Voice verified, Derek"
+    ThresholdCheck --> NotVerified: < 40%
+
+    OwnerVerified --> Announcement: "Voice verified, Derek"
     NotVerified --> RetryGuidance: Suggest Improvements
-    
+
     Announcement --> ExecuteUnlock: Proceed
     RetryGuidance --> [*]: Retry
-    
+
     ExecuteUnlock --> ScreenUnlocked: Success
     ExecuteUnlock --> UnlockFailed: Failure
-    
+
     ScreenUnlocked --> [*]: Complete
     UnlockFailed --> [*]: Error Handling
 ```
@@ -496,32 +498,33 @@ The system continuously learns and adjusts its verification threshold:
 flowchart TB
     subgraph "Adaptive Threshold System"
         INPUT[New Verification<br/>Attempt]
-        
+
         subgraph "Historical Analysis"
             HIST[Last 50 <br/>Attempts]
             AVG[Average Confidence<br/>Calculation]
             TREND[Trend <br/>Analysis]
         end
-        
+
         subgraph "Threshold Adjustment"
-            CHECK{Avg Confidencevs Threshold}
+            CHECK{Avg Confidence<br/>vs Threshold}
             UP[Increase <br/>Threshold+0.5%]
             DOWN[Decrease <br/>Threshold-1.0%]
             KEEP[Keep <br/>Current]
         end
-        
+
         subgraph "Safety Bounds"
             MIN[Minimum: 35%]
             MAX[Maximum: 60%]
             CLAMP[Clamp to <br/>Bounds]
         end
-        
+
         OUTPUT[New <br/>Threshold]
-        
+
         INPUT --> HIST --> AVG --> TREND
         TREND --> CHECK
         CHECK -->|Avg > Threshold + 15%| DOWN
-        CHECK -->|Avg |Otherwise| KEEP
+        CHECK -->|Avg < Threshold + 5%| UP
+        CHECK -->|Otherwise| KEEP
         DOWN --> CLAMP
         UP --> CLAMP
         KEEP --> CLAMP
@@ -574,15 +577,24 @@ results = await asyncio.gather(
 
 **Why it worked:**
 - L1 Session Cache: ~1ms instant recognition
-- L2 Preloaded Profiles:  L1{L1: SessionCache}
+- L2 Preloaded Profiles: <50ms for known speakers
+- L3 Database Cache: <200ms for enrolled users
+- L4 Continuous Learning: Improves over time
+
+```mermaid
+flowchart LR
+    subgraph "4-Layer Cache Architecture"
+        REQ[Request] --> L1{L1: Session<br/>Cache}
         L1 -->|Hit ~1ms| RESULT[Result]
-        L1 -->|Miss| L2{L2: PreloadedProfiles}
-        L2 -->|Hit |Miss| L3{L3: DatabaseCache}
-        L3 -->|Hit |Miss| L4[L4: FullVerification]
-        L4 --> LEARN[Learn &Cache]
+        L1 -->|Miss| L2{L2: Preloaded<br/>Profiles}
+        L2 -->|Hit<br/><50ms| RESULT
+        L2 -->|Miss| L3{L3: Database<br/>Cache}
+        L3 -->|Hit<br/><200ms| RESULT
+        L3 -->|Miss| L4[L4: Full<br/>Verification]
+        L4 --> LEARN[Learn &<br/>Cache]
         LEARN --> RESULT
     end
-    
+
     style L1 fill:#4caf50,stroke:#2e7d32,color:#fff
     style L2 fill:#8bc34a,stroke:#558b2f,color:#fff
     style L3 fill:#cddc39,stroke:#9e9d24,color:#000
@@ -688,14 +700,14 @@ results = await asyncio.gather(
 flowchart LR
     subgraph "Cold Start Optimization"
         BOOT[System <br/>Boot] --> PARALLEL
-        
+
         subgraph "Parallel Initialization"
-            PARALLEL --> M1[Load ECAPA~500ms]
-            PARALLEL --> M2[Connect DB~200ms]
-            PARALLEL --> M3[Warm <br/>Cache~300ms]
-            PARALLEL --> M4[Init Web<br/>Socket~100ms]
+            PARALLEL --> M1[Load ECAPA<br/>~500ms]
+            PARALLEL --> M2[Connect DB<br/>~200ms]
+            PARALLEL --> M3[Warm Cache<br/>~300ms]
+            PARALLEL --> M4[Init WebSocket<br/>~100ms]
         end
-        
+
         M1 --> READY[Ready for<br/>Requests]
         M2 --> READY
         M3 --> READY
@@ -755,18 +767,18 @@ flowchart LR
 flowchart TB
     subgraph "Hybrid Routing Decision"
         REQ[Voice <br/>Request]
-        
-        CHECK{MemoryPressure?}
-        
+
+        CHECK{Memory<br/>Pressure?}
+
         REQ --> CHECK
-        
-        CHECK -->|~100ms]
-        CHECK -->|70-85%| HYBRID[Hybrid <br/>Mode~200ms]
-        CHECK -->|> 85%| CLOUD[Cloud <br/>Only~300ms]
-        
+
+        CHECK -->|< 70%| LOCAL[Process Locally<br/>~100ms]
+        CHECK -->|70-85%| HYBRID[Hybrid <br/>Mode<br/>~200ms]
+        CHECK -->|> 85%| CLOUD[Cloud <br/>Only<br/>~300ms]
+
         LOCAL --> CACHE{In Cache?}
-        CACHE -->|Yes| INSTANT[Instant <br/>Response~1ms]
-        CACHE -->|No| FULL[Full <br/>Verification~500ms]
+        CACHE -->|Yes| INSTANT[Instant <br/>Response<br/>~1ms]
+        CACHE -->|No| FULL[Full <br/>Verification<br/>~500ms]
     end
 ```
 
@@ -789,15 +801,15 @@ flowchart TB
 **Rationale:**
 - Better performance on short utterances ( JV[JarvisVoice.jsMain Voice Component]
         APP --> VBI_DISPLAY[VBI DisplayProgress Visualization]
-        
+
         JV --> AUDIO[Audio CaptureHooks]
         JV --> WS_HOOK[WebSocketHook]
         JV --> STATE[StateManagement]
-        
+
         VBI_DISPLAY --> PROGRESS[Progress Bar0-100%]
         VBI_DISPLAY --> STAGES[Stage Indicatorsaudio_decode, verify, etc.]
         VBI_DISPLAY --> RESULT[Result DisplaySuccess/Failure]
-        
+
         WS_HOOK --> CONN[ConnectionService]
         WS_HOOK --> MSG[MessageHandler]
     end
@@ -809,43 +821,43 @@ flowchart TB
 // JarvisVoice.js - VBI Progress Handler
 case 'vbi_progress':
     const { stage, progress, speaker, confidence, error, success } = data;
-    
+
     // Compute display status
     const hasExplicitSuccess = data.success === true;
     const hasError = !!data.error;
     const isCompleteWithSpeaker = stage === 'complete' && data.speaker;
     const isSuccess = hasExplicitSuccess || isCompleteWithSpeaker;
-    
+
     const displayStatus = hasError ? 'failed' 
         : isSuccess ? 'success' 
         : progress >WS: Connect ws://localhost:8010/ws
     WS-->>Client: Connection Established
-    
+
     Note over Client,WS: Heartbeat Loop
     loop Every 30s
         Client->>WS: ping
         WS-->>Client: pong
     end
-    
+
     Note over Client,VBI: Voice Unlock Flow
     Client->>WS: {type: "voice_command", audio: blob, command: "unlock"}
     WS->>VBI: Process voice unlock
-    
+
     VBI-->>WS: {type: "vbi_progress", stage: "audio_decode", progress: 15}
     WS-->>Client: Forward progress
-    
+
     VBI-->>WS: {type: "vbi_progress", stage: "embedding", progress: 35}
     WS-->>Client: Forward progress
-    
+
     VBI-->>WS: {type: "vbi_progress", stage: "verify", progress: 55}
     WS-->>Client: Forward progress
-    
+
     VBI-->>WS: {type: "vbi_progress", stage: "anti_spoof", progress: 75}
     WS-->>Client: Forward progress
-    
+
     VBI-->>WS: {type: "vbi_progress", stage: "complete", progress: 100, speaker: "Derek", confidence: 0.98}
     WS-->>Client: Forward progress
-    
+
     VBI-->>WS: {type: "voice_unlock", success: true, speaker_name: "Derek"}
     WS-->>Client: Forward result
 ```
@@ -888,17 +900,17 @@ flowchart TB
             JARVIS[JARVIS Backend<br/>FastAPI]
             DOCKER[Docker <br/>Daemon]
         end
-        
+
         subgraph "Docker Container"
             ECAPA_API[ECAPA REST API<br/>Port 8765]
             ECAPA_MODEL[ECAPA-TDNN<br/>Model]
             TORCH[PyTorch<br/>Runtime]
         end
-        
+
         JARVIS -->|HTTP POST /extract| ECAPA_API
         ECAPA_API --> ECAPA_MODEL
         ECAPA_MODEL --> TORCH
-        
+
         DOCKER --> ECAPA_API
     end
 ```
@@ -939,41 +951,43 @@ services:
 ```mermaid
 flowchart TD
     START[JARVIS <br/>Startup] --> PROBE[Probe Available <br/>Backends]
-    
-    PROBE --> DOCKER_CHECK{DockerAvailable?}
-    PROBE --> CLOUD_CHECK{Cloud RunAvailable?}
-    PROBE --> LOCAL_CHECK{Local ECAPAAvailable?}
-    
-    DOCKER_CHECK -->|Yes| DOCKER_HEALTH{DockerHealthy?}
+
+    PROBE --> DOCKER_CHECK{Docker<br/>Available?}
+    PROBE --> CLOUD_CHECK{Cloud Run<br/>Available?}
+    PROBE --> LOCAL_CHECK{Local ECAPA<br/>Available?}
+
+    DOCKER_CHECK -->|Yes| DOCKER_HEALTH{Docker<br/>Healthy?}
     DOCKER_CHECK -->|No| SKIP_DOCKER[Skip <br/>Docker]
-    
+
     DOCKER_HEALTH -->|Yes, 15ms| DOCKER_READY[Docker <br/>Ready]
     DOCKER_HEALTH -->|No| DOCKER_START[Auto-Start <br/>Docker]
     DOCKER_START --> DOCKER_READY
-    
-    CLOUD_CHECK -->|Yes| CLOUD_HEALTH{Cloud RunHealthy?}
+
+    CLOUD_CHECK -->|Yes| CLOUD_HEALTH{Cloud Run<br/>Healthy?}
     CLOUD_CHECK -->|No| SKIP_CLOUD[Skip <br/>Cloud]
-    
+
     CLOUD_HEALTH -->|Yes, 234ms| CLOUD_READY[Cloud <br/>Ready]
     CLOUD_HEALTH -->|No| SKIP_CLOUD
-    
+
     LOCAL_CHECK -->|RAM > 2GB| LOCAL_READY[Local <br/>Ready]
-    LOCAL_CHECK -->|RAM  SELECT[Select Best <br/>Backend]
+    LOCAL_CHECK -->|RAM < 2GB| SKIP_LOCAL[Skip <br/>Local]
+
+    DOCKER_READY --> SELECT[Select Best <br/>Backend]
     CLOUD_READY --> SELECT
     LOCAL_READY --> SELECT
     SKIP_DOCKER --> SELECT
     SKIP_CLOUD --> SELECT
     SKIP_LOCAL --> SELECT
-    
-    SELECT --> PRIORITY{PrioritySelection}
-    PRIORITY -->|1| USE_DOCKER[Use DockerLowest <br/>Latency]
+
+    SELECT --> PRIORITY{Priority<br/>Selection}
+    PRIORITY -->|1| USE_DOCKER[Use Docker<br/>Lowest Latency]
     PRIORITY -->|2| USE_CLOUD[Use Cloud Run<br/>Reliable]
     PRIORITY -->|3| USE_LOCAL[Use Local<br/>Fallback]
-    
-    USE_DOCKER --> CONFIG[ConfigureJARVIS_ECAPA_BACKEND]
+
+    USE_DOCKER --> CONFIG[Configure<br/>JARVIS_ECAPA_BACKEND]
     USE_CLOUD --> CONFIG
     USE_LOCAL --> CONFIG
-    CONFIG --> READY[Ready forVoice <br/>Auth]
+    CONFIG --> READY[Ready for<br/>Voice Auth]
 ```
 
 ---
@@ -992,7 +1006,7 @@ flowchart TB
             A4[Man-in-Middle<br/>Intercepting audio]
             A5[Brute Force<br/>Multiple attempts]
         end
-        
+
         subgraph "Defenses"
             D1[PAVA Anti-<br/>Spoofing99.7% detection]
             D2[Environmental Fingerprint<br/>Detect playback]
@@ -1000,7 +1014,7 @@ flowchart TB
             D4[TLS Encryption<br/>Secure transport]
             D5[Rate <br/>Limiting5 attempts/minute]
         end
-        
+
         A1 --> D1
         A2 --> D2
         A3 --> D1
@@ -1089,18 +1103,12 @@ pie title "Verification Latency Breakdown (Cached Path)"
 When Derek says "Hey JARVIS, unlock my screen," the analog sound wave is digitized:
 
 📐 Sampling Theorem (Nyquist-Shannon)
-  
-  
 
 $$f_s \geq 2 \cdot f_{max}$$
 
-  
-  
-    
       $f_s$
       Sampling frequency = 16,000 Hz (VBI standard)
-    
-    
+
       $f_{max}$
       Maximum frequency in human speech = ~8,000 Hz
 
@@ -1118,34 +1126,24 @@ $$f_s \geq 2 \cdot f_{max}$$
 The audio signal is transformed from time domain to frequency domain:
 
 🔄 Time → Frequency Transformation
-  
-  
 
 $$X[k] = \sum_{n=0}^{N-1} x[n] \cdot e^{-j \frac{2\pi kn}{N}}$$
 
-  
-  
-    
       $x[n]$
 
       *Time-domain audio samples*
 
-    
 $X[k]$
 
       *Frequency-domain coefficients*
 
-    
 $N$
 
       *51,200 samples (3.2s at 16kHz)*
 
-    
 $k$
 
       *Frequency bin index*
-
-  
 
 💻 Implementation in VBI:
   # 3.2 seconds of audio at 16kHz
@@ -1158,50 +1156,35 @@ magnitude_spectrum = np.abs(audio_fft)
 🧠 Human Perception Insight: Human hearing is non-linear - we perceive pitch logarithmically. The Mel scale converts linear frequency to perceptual frequency.
 
 📈 Mel Scale Conversion
-    
 
 $$m = 2595 \cdot \log_{10}\left(1 + \frac{f}{700}\right)$$
 
-  
-  
 📉 Inverse Mel Scale
-    
 
 $$f = 700 \cdot \left(10^{m/2595} - 1\right)$$
 
 🎚️ VBI Uses 80 Mel Filterbanks
-  
-  
-    
-      
-        
+
           Mel Bank
           Center Frequency (Hz)
           Bandwidth (Hz)
-        
-      
-      
-        
+
           1
           85
           50
-        
-        
+
           20
           500
           120
-        
-        
+
           40
           1,200
           280
-        
-        
+
           60
           3,000
           650
-        
-        
+
           80
           7,500
           1,500
@@ -1215,75 +1198,57 @@ $$f = 700 \cdot \left(10^{m/2595} - 1\right)$$
 > 
 >       Insufficient resolution
 
-    
 > 80 filterbanks
 > 
 >       98.0% accuracy
 > 
 >       *✅ Optimal*
 
-    
 128 filterbanks
 
       *98.1% accuracy*
 
       Diminishing returns
 
-  
-
 #### 1.4 Mel-Frequency Cepstral Coefficients (MFCCs)
 
 After applying Mel filterbanks, we compute MFCCs:
 
 🎵 MFCC Formula
-  
-  
 
 $$c_n = \sum_{m=1}^{M} \log(S_m) \cdot \cos\left(\frac{\pi n (m - 0.5)}{M}\right)$$
 
-  
-  
-    
       $c_n$
 
       *n-th cepstral coefficient*
 
-    
 $S_m$
 
       *Energy in m-th Mel filterbank*
 
-    
 $M$
 
       *Number of filterbanks (80)*
 
-  
-
 🔍 Physical Interpretation:
-  
-    
+
       Low-order (1-4)
 
       *Vocal tract shape*
 
       Speaker identity
 
-    
 Mid-order (5-13)
 
       *Phonetic content*
 
       What is said
 
-    
 High-order (14+)
 
       *Fine spectral details*
 
       Nuanced features
-
-  
 
 > 📊 Section 1 Summary: Signal Processing Fundamentals
 >   
@@ -1298,7 +1263,7 @@ High-order (14+)
 ### 2. ECAPA-TDNN Neural Network Mathematics
 
 🧠 Neural Network Architecture
-  
+
     ECAPA-TDNN uses advanced attention mechanisms and multi-scale features to extract 192-dimensional speaker embeddings with 98% accuracy.
 
 #### 2.1 Time-Delay Neural Network (TDNN) Fundamentals
@@ -1306,60 +1271,44 @@ High-order (14+)
 TDNN processes temporal context using 1D convolutions:
 
 ⏱️ TDNN Convolution
-  
-  
-    
+
       $$y_t = \sum_{i=-k}^{k} w_i \cdot x_{t+i} + b$$
 
-  
-  
 $x_t$
 
       *Input at time $t$*
 
-    
 $w_i$
 
       *Learnable weights*
 
-    
 $k$
 
       *Context window size*
 
-    
 $b$
 
       *Bias term*
 
-  
-
 📐 VBI Context Windows:
-  
-    
-      
+
         Layer 1
 
         [-2, -1, 0, 1, 2]
 
         *5 frames = 50ms*
 
-      
 Layer 2
 
         [-2, 0, 2]
 
         *Dilated: 9 frames = 90ms*
 
-      
 Layer 3
 
         [-3, 0, 3]
 
         *Dilated: 15 frames = 150ms*
-
-    
-  
 
 #### 2.2 Squeeze-Excitation (SE) Block
 
@@ -1394,7 +1343,6 @@ $$\tilde{x}_c = s_c \cdot x_c$$
 > 
 >       *accuracy*
 
-    
 With SE
 
       98.0%
@@ -1402,8 +1350,6 @@ With SE
       *accuracy*
 
       +2.8% improvement
-
-  
 
 #### 2.3 Res2Net Multi-Scale Features
 
@@ -1421,29 +1367,24 @@ $$y_i = \begin{cases}
 > 
 >       *30ms*
 
-    
 Scale 2
 
       7 frames
 
       *70ms*
 
-    
 Scale 3
 
       15 frames
 
       *150ms*
 
-    
 Scale 4
 
       31 frames
 
       *310ms*
 
-  
-  
 > ✅ Captures both phoneme-level (30ms) and word-level (310ms) speaker characteristics
 
 #### 2.4 Attentive Statistics Pooling
@@ -1517,10 +1458,10 @@ Mathematical proof of margin benefit:
 ```
 Without margin (softmax):
   P(correct) = exp(s·cos(θ)) / Σexp(s·cos(θ_j))
-  
+
 With margin (AAM-softmax):
   P(correct) = exp(s·cos(θ+m)) / [exp(s·cos(θ+m)) + Σexp(s·cos(θ_j))]
-  
+
 Since cos(θ+m)  📊 Multi-Factor Probability Fusion
 >   
 >     Bayesian fusion combines multiple evidence sources (ECAPA similarity, anti-spoofing, voice quality, environment, behavior) with adaptive priors to achieve 98% confidence.
@@ -1528,41 +1469,32 @@ Since cos(θ+m)  📊 Multi-Factor Probability Fusion
 #### 4.1 Bayes' Theorem for Speaker Verification
 
 🎯 Bayes' Theorem Formula
-  
-  
-    
+
       $$P(\text{Owner} | \text{Evidence}) = \frac{P(\text{Evidence} | \text{Owner}) \cdot P(\text{Owner})}{P(\text{Evidence})}$$
 
-  
-  
 $P(\text{Owner})$
 
       *Prior probability*
 
       Based on context (time, location, device)
 
-    
 $P(\text{Evidence} | \text{Owner})$
 
       *Likelihood*
 
       From verification scores
 
-    
 $P(\text{Evidence})$
 
       *Marginal probability*
 
       Normalizing constant
 
-    
 $P(\text{Owner} | \text{Evidence})$
 
       *Posterior (final confidence)*
 
       🎯 This is what we calculate!
-
-  
 
 #### 4.2 Multi-Factor Likelihood
 
@@ -1733,13 +1665,9 @@ $$\text{Pass} \iff z_{VTL}  0.7$)
 >       Derek's enrolled embedding (first 10 dimensions shown):
 >       e_enrolled = [0.23, -0.15, 0.42, 0.08, -0.31, 0.19, -0.27, 0.35, 0.11, -0.22, ...]
 
-    
 Test embedding from "unlock my screen":
       e_test = [0.21, -0.14, 0.39, 0.10, -0.28, 0.17, -0.25, 0.33, 0.09, -0.20, ...]
 
-  
-  
-  
 ❓ Question: Calculate the cosine similarity and determine if this passes verification (threshold = 0.40).
 
 > ✅ Step-by-Step Solution
@@ -1751,18 +1679,15 @@ Test embedding from "unlock my screen":
 >     = 0.0483 + 0.0210 + 0.1638 + 0.0080 + 0.0868 + 0.0323 + 0.0675 + 0.1155 + 0.0099 + 0.0440
 >     = 0.5971
 
-  
-  
 Step 2: Compute Norms
-    
-      
+
         ||e_enrolled||
 
         ||e_enrolled||² = 0.4823
 
         ||e_enrolled|| = 0.6945
 ```
-      
+
         ||e_test||
 
         ||e_test||² = 0.4149
@@ -1770,20 +1695,13 @@ Step 2: Compute Norms
         ||e_test|| = 0.6441
 ```
 
-  
-  
-  
 Step 3: Cosine Similarity
     sim = 0.5971 / (0.6945 × 0.6441) = 0.5971 / 0.4474 = 1.335
-    
+
       ℹ️ Note: The above calculation is for illustration. With full 192D L2-normalized embeddings:
-      
+
         Full cosine similarity: 0.847 (actual VBI output)
 
-    
-  
-  
-  
 > ✅ Conclusion: 0.847 > 0.40 → PASS ✓
 
 ---
@@ -2332,191 +2250,52 @@ success = not screen_locked
 
 ### R&D Summary: Why VBI Works
 
-🎯 Why VBI Achieves 98% Accuracy
-  
-    The VBI system combines mathematically proven foundations, physical principles, and defense-in-depth architecture to achieve industry-leading accuracy.
+> **🎯 Why VBI Achieves 98% Accuracy**
+> 
+> The VBI system combines mathematically proven foundations, physical principles, and defense-in-depth architecture to achieve industry-leading accuracy.
 
 #### 1. Mathematical Foundation
 
-📐 Built on Proven Mathematics
-  The VBI system is built on mathematically proven foundations:
-  
-  
-    
-      Cosine Similarity
+The VBI system is built on **mathematically proven** foundations:
 
-      *Optimal metric for normalized embeddings*
-
-      (Proof 1)
-
-    
-Bayesian Fusion
-
-      *Provably improves accuracy*
-
-      (Proof 2)
-
-    
-Adaptive Thresholding
-
-      *Minimizes total error rate*
-
-      (Proof 3)
-
-  
+- **Cosine Similarity** - Optimal metric for normalized embeddings (Proof 1)
+- **Bayesian Fusion** - Provably improves accuracy over single sources (Proof 2)
+- **Adaptive Thresholding** - Minimizes total error rate (Proof 3)
 
 #### 2. Physical Grounding
 
-> 🔬 Physics-Based Security
->   PAVA leverages fundamental physics that cannot be spoofed:
->   
->   
->     
->       🎤 Vocal Tract Length
-> 
->       *Anatomically fixed for each person*
+PAVA leverages **fundamental physics** that cannot be spoofed:
 
-    
-🏠 Reverberation
-
-      *Depends on physical room characteristics*
-```
-    
-      🌊 Doppler Effect
-
-      *Requires physical movement*
-
-    
-> 📊 Jitter/Shimmer
-> 
->       *Arise from biological voice production*
-
-  
+- **Vocal Tract Length** - Anatomically fixed for each person
+- **Reverberation** - Depends on physical room characteristics
+- **Doppler Effect** - Requires physical movement
+- **Jitter/Shimmer** - Arise from biological voice production
 
 #### 3. Defense in Depth
 
-🛡️ Multi-Layer Security Architecture
-  
-  
-    
-      
-        Layer 1: ECAPA-TDNN
+Multiple independent verification layers:
 
-        95% accuracy (alone)
-
-      
-+
-
-      
-Layer 2: Anti-Spoofing
-
-        99% detection rate
-
-      
-+
-
-      
-Layer 3: Contextual Priors
-
-        92% base probability
-
-      
-=
-
-      
-Combined Result
-
-        98% accuracy
-
-        *with 99.7% spoof detection*
-
-    
-  
+- **Layer 1: ECAPA-TDNN** (95% accuracy alone)
+- **Layer 2: Anti-Spoofing** (99% detection)
+- **Layer 3: Contextual Priors** (92% base)
+- **= Combined: 98% accuracy with 99.7% spoof detection**
 
 #### 4. Continuous Learning
 
-📈 Adaptive Improvement Over Time
-  The system improves with every use:
-  
-  
-    
-      Week 1
+The system improves with every use:
 
-      94%
-
-      Learning Derek's voice
-
-    
-Week 4
-
-      96%
-
-      Patterns established
-
-    
-> Week 12
-> 
->       98%
-> 
->       *Fully adapted ✅*
-
-  
+- **Week 1:** 94% accuracy (learning Derek's voice)
+- **Week 4:** 96% accuracy (patterns established)
+- **Week 12:** 98% accuracy (fully adapted ✅)
 
 #### 5. Fail-Safe Design
 
-🛡️ Graceful Degradation
-  Even with component failures, security is maintained:
-  
-  
-    
-      
-        ECAPA fails
+Even with component failures, security is maintained:
 
-        *→ Use cached embedding (last 24h)*
-
-      
-PAVA fails
-
-        *→ Require higher ECAPA threshold (0.60)*
-
-      
-Bayesian fails
-
-        *→ Use simple threshold decision*
-
-      
-All ML fails
-
-        *→ Fallback to password-only*
-
-    
-  
-
----
-
-🎓 Mathematics & Physics Section Complete
-  
-    You've explored the mathematical foundations, physical principles, proofs, and real-world examples that make VBI achieve 98% accuracy with 99.7% spoof detection.
-  
-  
-    
-      10 Sections
-
-      *Comprehensive coverage*
-
-    
-3 Proofs
-
-      *Mathematical rigor*
-
-    
-4 Problems
-
-      *Practice examples*
-
-  
-
----
+- **If ECAPA fails** → Use cached embedding (last 24h)
+- **If PAVA fails** → Require higher ECAPA threshold (0.60)
+- **If Bayesian fails** → Use simple threshold decision
+- **If all ML fails** → Fallback to password-only
 
 ---
 
