@@ -733,6 +733,29 @@ class RealTimeVoiceCommunicator:
 
     # ============== VBI (Voice Biometric Intelligence) Methods ==============
 
+    async def get_owner_name(self) -> str:
+        """
+        Get the current owner's name dynamically via OwnerIdentityService.
+
+        Falls back to macOS system user or "there" if unavailable.
+
+        Returns:
+            Owner's first name for personalized greetings
+        """
+        try:
+            from agi_os.owner_identity_service import get_owner_name
+            name = await asyncio.wait_for(get_owner_name(), timeout=1.0)
+            return name if name else "there"
+        except Exception as e:
+            logger.debug(f"Failed to get owner name: {e}")
+            # Fallback to macOS username
+            try:
+                import os
+                username = os.environ.get('USER', 'there')
+                return username.split('.')[0].title()
+            except:
+                return "there"
+
     async def speak_immediate(
         self,
         text: str,
@@ -790,7 +813,7 @@ class RealTimeVoiceCommunicator:
         self,
         stage: str,
         confidence: float = 0.0,
-        speaker_name: str = "Derek"
+        speaker_name: Optional[str] = None
     ) -> None:
         """
         Provide real-time voice feedback during VBI authentication stages.
@@ -802,8 +825,12 @@ class RealTimeVoiceCommunicator:
             stage: Current VBI stage (init, audio_decode, ecapa_extract, verification,
                    unlock_execute, keychain, wake, typing, verify, complete, failed)
             confidence: Verification confidence score (0.0 to 1.0)
-            speaker_name: Identified speaker name
+            speaker_name: Identified speaker name (auto-detected if None)
         """
+        # Get dynamic speaker name if not provided
+        if speaker_name is None:
+            speaker_name = await self.get_owner_name()
+
         # Dynamic, human-like responses based on stage
         feedback_map = {
             # Initial stages - brief acknowledgment
@@ -890,14 +917,22 @@ class RealTimeVoiceCommunicator:
         else:
             return "Voice not recognized. Please ensure you're the registered user."
 
-    async def vbi_lock_feedback(self, stage: str, speaker_name: str = "Derek") -> None:
+    async def vbi_lock_feedback(
+        self,
+        stage: str,
+        speaker_name: Optional[str] = None
+    ) -> None:
         """
         Provide voice feedback during screen lock.
 
         Args:
             stage: Lock stage (init, locking, complete, failed)
-            speaker_name: User's name
+            speaker_name: User's name (auto-detected if None)
         """
+        # Get dynamic speaker name if not provided
+        if speaker_name is None:
+            speaker_name = await self.get_owner_name()
+
         feedback_map = {
             "init": f"Locking the screen, {speaker_name}.",
             "locking": None,  # Silent - action in progress

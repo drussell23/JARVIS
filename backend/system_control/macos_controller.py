@@ -1211,7 +1211,7 @@ class MacOSController:
         self,
         progress_callback: Optional[Callable[[Dict[str, Any]], Any]] = None,
         enable_voice_feedback: bool = True,
-        speaker_name: str = "Derek"
+        speaker_name: Optional[str] = None
     ) -> Tuple[bool, str]:
         """
         Lock the macOS screen - optimized for speed with transparent progress
@@ -1220,7 +1220,7 @@ class MacOSController:
         Args:
             progress_callback: Optional callback for transparent progress updates
             enable_voice_feedback: Enable Daniel's voice narration
-            speaker_name: User's name for personalized feedback
+            speaker_name: User's name for personalized feedback (auto-detected if None)
 
         Returns:
             Tuple of (success, message)
@@ -1237,6 +1237,15 @@ class MacOSController:
             except Exception as e:
                 logger.debug(f"Voice feedback unavailable: {e}")
                 voice = None
+
+        # Get dynamic speaker name if not provided
+        if speaker_name is None and voice:
+            try:
+                speaker_name = await asyncio.wait_for(voice.get_owner_name(), timeout=1.0)
+            except Exception:
+                speaker_name = "there"
+        elif speaker_name is None:
+            speaker_name = "there"
 
         async def voice_feedback(stage: str):
             """Fire-and-forget voice feedback."""

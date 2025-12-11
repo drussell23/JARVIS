@@ -3801,9 +3801,116 @@ async def prewarm_ecapa_classifier():
     return False
 
 
-async def _load_speaker_embedding_direct(speaker_name: str = "Derek") -> Optional[List[float]]:
+async def _load_primary_speaker_profile() -> Optional[Dict[str, Any]]:
+    """
+    Load the primary speaker profile dynamically from SQLite database.
+
+    Returns dict with:
+        - name: Speaker's name (dynamically detected)
+        - embedding: Voice embedding (192 dims)
+        - total_samples: Number of voice samples
+
+    Uses OwnerIdentityService for intelligent name detection with fallback to
+    database primary user or first available profile.
+    """
+    import numpy as np
+
+    # Try to get owner name from identity service
+    owner_name = None
+    try:
+        from agi_os.owner_identity_service import get_owner_name
+        owner_name = await asyncio.wait_for(get_owner_name(), timeout=1.0)
+    except Exception as e:
+        logger.debug(f"[ROBUST-PROFILE] Owner identity lookup failed: {e}")
+
+    db_path = RobustUnlockConfig.LEARNING_DB_PATH
+
+    if not os.path.exists(db_path):
+        logger.warning(f"[ROBUST-PROFILE] Database not found: {db_path}")
+        return None
+
+    try:
+        def _load():
+            conn = sqlite3.connect(db_path, timeout=2.0)
+            cursor = conn.cursor()
+
+            # Try to find profile matching owner_name, or get primary/first user
+            queries = [
+                # First try matching by owner name if available
+                ("speaker_profiles", "voiceprint_embedding", "speaker_name"),
+                ("speaker_profiles", "embedding", "speaker_name"),
+                ("voice_profiles", "embedding", "speaker_name"),
+            ]
+
+            for table, emb_col, name_col in queries:
+                try:
+                    # If we have owner name, search for it; otherwise get primary or first user
+                    if owner_name:
+                        cursor.execute(f"""
+                            SELECT {emb_col}, {name_col}, total_samples FROM {table}
+                            WHERE {name_col} LIKE ? OR {name_col} LIKE ? LIMIT 1
+                        """, (f"%{owner_name}%", f"%{owner_name.lower()}%"))
+                    else:
+                        # Get primary user or first available
+                        cursor.execute(f"""
+                            SELECT {emb_col}, {name_col}, total_samples FROM {table}
+                            WHERE is_primary_user = 1 OR is_primary = 1 LIMIT 1
+                        """)
+                        row = cursor.fetchone()
+                        if not row:
+                            cursor.execute(f"""
+                                SELECT {emb_col}, {name_col}, total_samples FROM {table}
+                                ORDER BY total_samples DESC LIMIT 1
+                            """)
+
+                    row = cursor.fetchone()
+                    if row and row[0]:
+                        raw = row[0]
+                        profile_name = row[1] if len(row) > 1 else owner_name or "User"
+                        total_samples = row[2] if len(row) > 2 else 0
+
+                        if isinstance(raw, bytes):
+                            embedding = np.frombuffer(raw, dtype=np.float32).tolist()
+                            if len(embedding) == 192:
+                                logger.info(f"[ROBUST-PROFILE] Loaded: {profile_name} ({total_samples} samples)")
+                                conn.close()
+                                return {
+                                    "name": profile_name,
+                                    "embedding": embedding,
+                                    "total_samples": total_samples
+                                }
+                except sqlite3.Error:
+                    continue
+
+            conn.close()
+            return None
+
+        loop = asyncio.get_event_loop()
+        result = await asyncio.wait_for(
+            loop.run_in_executor(None, _load),
+            timeout=RobustUnlockConfig.PROFILE_LOAD_TIMEOUT
+        )
+        return result
+
+    except asyncio.TimeoutError:
+        logger.error("[ROBUST-PROFILE] Profile load timed out")
+        return None
+    except Exception as e:
+        logger.error(f"[ROBUST-PROFILE] Profile load error: {e}")
+        return None
+
+
+async def _load_speaker_embedding_direct(speaker_name: Optional[str] = None) -> Optional[List[float]]:
     """Load speaker embedding directly from SQLite database with detailed diagnostics."""
     import numpy as np
+
+    # If no speaker name, try to get from identity service
+    if speaker_name is None:
+        try:
+            from agi_os.owner_identity_service import get_owner_name
+            speaker_name = await asyncio.wait_for(get_owner_name(), timeout=1.0)
+        except Exception:
+            speaker_name = "User"
 
     db_path = RobustUnlockConfig.LEARNING_DB_PATH
     logger.info(f"[ROBUST-PROFILE] Loading profile for '{speaker_name}' from: {db_path}")
@@ -5140,13 +5247,23 @@ async def process_voice_unlock_robust(
             logger.debug(f"[ROBUST] Voice feedback unavailable: {e}")
             voice = None
 
-    async def voice_feedback(stage: str, confidence: float = 0.0, speaker: str = "Derek"):
+    # Get dynamic owner name (will be updated after verification with actual speaker)
+    dynamic_owner_name = None
+    if voice:
+        try:
+            dynamic_owner_name = await asyncio.wait_for(voice.get_owner_name(), timeout=1.0)
+        except Exception:
+            dynamic_owner_name = None
+
+    async def voice_feedback(stage: str, confidence: float = 0.0, speaker: Optional[str] = None):
         """Fire-and-forget voice feedback - never blocks VBI flow."""
         if voice:
             try:
+                # Use provided speaker name or dynamic owner name or let vbi_stage_feedback detect
+                name = speaker or dynamic_owner_name
                 # Run voice feedback in background task to not block
                 asyncio.create_task(
-                    voice.vbi_stage_feedback(stage, confidence, speaker)
+                    voice.vbi_stage_feedback(stage, confidence, name)
                 )
             except Exception as e:
                 logger.debug(f"Voice feedback error: {e}")
@@ -5196,21 +5313,31 @@ async def process_voice_unlock_robust(
 
             logger.info(f"[ROBUST] Audio data preview: {audio_data[:50]}...")
 
-            # 🎙️ STAGE: Init - Voice: "Just a moment, Derek."
+            # 🎙️ STAGE: Init - Voice: "Just a moment, {owner}."
             await progress("init", 5, "Starting...")
             await voice_feedback("init")
 
-            # Parallel: decode audio + load profile
+            # Parallel: decode audio + load primary profile
             await progress("audio_decode", 15, "Decoding audio...")
             audio_task = asyncio.create_task(_decode_audio_robust(audio_data, mime_type))
-            profile_task = asyncio.create_task(_load_speaker_embedding_direct("Derek"))
+            # Load primary user profile (dynamically detected)
+            profile_task = asyncio.create_task(_load_primary_speaker_profile())
 
             try:
-                audio_bytes, ref_emb = await asyncio.gather(audio_task, profile_task, return_exceptions=True)
+                audio_bytes, profile_result = await asyncio.gather(audio_task, profile_task, return_exceptions=True)
             except Exception as e:
                 logger.error(f"[ROBUST] Parallel gather failed: {e}")
                 await voice_feedback("error")
                 return result(False, f"Parallel load failed: {e}", err=str(e))
+
+            # Extract reference embedding and speaker name from profile
+            ref_emb = None
+            verified_speaker = dynamic_owner_name or "there"
+            if isinstance(profile_result, dict):
+                ref_emb = profile_result.get("embedding")
+                verified_speaker = profile_result.get("name", verified_speaker)
+            elif isinstance(profile_result, (list, tuple)) and len(profile_result) > 0:
+                ref_emb = profile_result
 
             # Check audio decode result
             if isinstance(audio_bytes, Exception):
@@ -5235,8 +5362,8 @@ async def process_voice_unlock_robust(
             if isinstance(ref_emb, Exception) or not ref_emb:
                 logger.warning(f"[ROBUST] No reference embedding: {ref_emb}")
             else:
-                stages.append({"stage": "profile_load", "success": True, "dim": len(ref_emb)})
-                logger.info(f"[ROBUST] Reference embedding: {len(ref_emb)} dims")
+                stages.append({"stage": "profile_load", "success": True, "dim": len(ref_emb), "speaker": verified_speaker})
+                logger.info(f"[ROBUST] Reference embedding: {len(ref_emb)} dims for {verified_speaker}")
 
             # 🎙️ STAGE: ECAPA Extract - Voice: "Analyzing your voice."
             await progress("ecapa_extract", 45, "Extracting voiceprint...")
@@ -5257,21 +5384,21 @@ async def process_voice_unlock_robust(
             verified, conf = _verify_speaker_robust(test_emb, ref_emb)
             stages.append({"stage": "verification", "success": verified, "confidence": conf})
 
-            # 🎙️ STAGE: Verification - Voice varies by confidence
-            await voice_feedback("verification", confidence=conf, speaker="Derek")
+            # 🎙️ STAGE: Verification - Voice varies by confidence (use verified speaker name)
+            await voice_feedback("verification", confidence=conf, speaker=verified_speaker)
 
             if not verified:
                 await progress("verification", 80, f"Failed: {conf:.1%}")
                 await voice_feedback("failed", confidence=conf)
                 return result(False, f"Voice not verified ({conf:.1%})", conf=conf)
 
-            # 🎙️ STAGE: Unlock Execute - Voice: "Voice confirmed. Unlocking for you, Derek."
-            await progress("unlock_execute", 90, f"Voice verified ({conf:.1%}). Unlocking for Derek...")
-            await voice_feedback("unlock_execute", confidence=conf, speaker="Derek")
+            # 🎙️ STAGE: Unlock Execute - Voice: "Voice confirmed. Unlocking for you, {speaker}."
+            await progress("unlock_execute", 90, f"Voice verified ({conf:.1%}). Unlocking for {verified_speaker}...")
+            await voice_feedback("unlock_execute", confidence=conf, speaker=verified_speaker)
 
             # Pass progress callback and confidence for transparent substage updates
             unlocked = await _execute_unlock_robust(
-                speaker_name="Derek",
+                speaker_name=verified_speaker,
                 progress_callback=progress_callback,
                 confidence=conf
             )
@@ -5280,12 +5407,12 @@ async def process_voice_unlock_robust(
             if not unlocked:
                 await progress("unlock_execute", 90, "Screen unlock failed")
                 await voice_feedback("failed", confidence=conf)
-                return result(False, "Screen unlock failed", speaker="Derek", conf=conf, err="Unlock execution failed")
+                return result(False, "Screen unlock failed", speaker=verified_speaker, conf=conf, err="Unlock execution failed")
 
-            # 🎙️ STAGE: Complete - Voice: "Of course, Derek. Welcome back." (time-aware)
-            await voice_feedback("complete", confidence=conf, speaker="Derek")
+            # 🎙️ STAGE: Complete - Voice: "Of course, {speaker}. Welcome back." (time-aware)
+            await voice_feedback("complete", confidence=conf, speaker=verified_speaker)
 
-            return result(True, f"Of course, Derek. Welcome back.", speaker="Derek", conf=conf)
+            return result(True, f"Of course, {verified_speaker}. Welcome back.", speaker=verified_speaker, conf=conf)
 
         res = await asyncio.wait_for(_unlock(), timeout=RobustUnlockConfig.MAX_TOTAL_TIMEOUT)
         logger.info(f"[ROBUST] RESULT: {'SUCCESS' if res['success'] else 'FAILED'} in {res['total_duration_ms']:.0f}ms")
