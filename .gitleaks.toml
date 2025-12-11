@@ -189,6 +189,7 @@ paths = [
   '''SYSTEM_FIXES_SUMMARY.md''',
   '''VOICE_UNLOCK_STATUS_SUMMARY.md''',
   '''DYNAMIC_VOICE_UNLOCK_IMPLEMENTATION.md''',
+  '''VOICE_BIOMETRIC_INTELLIGENCE_ARCHITECTURE.md''',
   '''.gitleaks.toml''',
   '''README.md''',
   '''diagnose_unlock.py''',

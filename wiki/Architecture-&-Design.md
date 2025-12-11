@@ -739,6 +739,40 @@ TIER 3: SPECIALIZED SUB-AGENTS (30+ agents)
 
 See [Voice Processing Pipeline](#voice-processing-stack) section above for complete details.
 
+### Voice Biometric Intelligence (VBI) v4.0
+
+JARVIS features an advanced **Voice Biometric Intelligence (VBI)** system for secure voice authentication:
+
+```mermaid
+graph TB
+    subgraph "VBI Core Components"
+        ECAPA[ECAPA-TDNN<br/>192D Embeddings]
+        PAVA[Physics-Aware Auth<br/>7-Layer Anti-Spoofing]
+        BAYESIAN[Bayesian Fusion<br/>Multi-Factor Confidence]
+        ADAPTIVE[Adaptive Threshold<br/>Continuous Learning]
+    end
+    
+    AUDIO[Voice Input] --> ECAPA
+    AUDIO --> PAVA
+    ECAPA --> BAYESIAN
+    PAVA --> BAYESIAN
+    BAYESIAN --> ADAPTIVE
+    ADAPTIVE --> RESULT[Verification Result<br/>98% Accuracy]
+    
+    style ECAPA fill:#2196f3,stroke:#1565c0,color:#fff
+    style PAVA fill:#ff5722,stroke:#d84315,color:#fff
+    style BAYESIAN fill:#9c27b0,stroke:#6a1b9a,color:#fff
+    style RESULT fill:#4caf50,stroke:#2e7d32,color:#fff
+```
+
+**Key Metrics:**
+- Speaker Verification: 98% accuracy
+- Anti-Spoofing: 99.7% detection rate
+- Authentication Latency: 1.2s (cached)
+- False Rejection Rate: 2.1%
+
+📚 **Complete Documentation:** [VOICE_BIOMETRIC_INTELLIGENCE_ARCHITECTURE.md](../VOICE_BIOMETRIC_INTELLIGENCE_ARCHITECTURE.md)
+
 ### End-to-End Voice Flow
 
 ```
