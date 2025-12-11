@@ -3858,7 +3858,22 @@ async def _extract_ecapa_robust(audio_bytes: bytes) -> Optional[List[float]]:
     import numpy as np
     import tempfile
 
-    logger.info(f"[ROBUST-ECAPA] Starting extraction: {len(audio_bytes)} bytes audio")
+    # Validate input
+    if audio_bytes is None:
+        logger.error("[ROBUST-ECAPA] audio_bytes is None!")
+        return None
+
+    if not isinstance(audio_bytes, bytes):
+        logger.error(f"[ROBUST-ECAPA] audio_bytes is not bytes: {type(audio_bytes)}")
+        return None
+
+    if len(audio_bytes) < 100:
+        logger.error(f"[ROBUST-ECAPA] audio_bytes too short: {len(audio_bytes)}")
+        return None
+
+    # Log audio info
+    magic_bytes = audio_bytes[:4].hex() if len(audio_bytes) >= 4 else "N/A"
+    logger.info(f"[ROBUST-ECAPA] Starting extraction: {len(audio_bytes)} bytes, magic={magic_bytes}")
 
     # Helper: Load audio with multiple strategies
     def _load_audio_robust(audio_data: bytes):
@@ -3969,23 +3984,30 @@ async def _extract_ecapa_robust(audio_bytes: bytes) -> Optional[List[float]]:
         strategies_tried.append("local_speechbrain")
 
         # Get cached classifier (async, loads once on first call)
+        logger.info("[EDGE-ECAPA] Getting cached classifier...")
         classifier = await get_cached_ecapa_classifier()
         if classifier is None:
             raise ValueError("Failed to get ECAPA classifier from cache")
+        logger.info(f"[EDGE-ECAPA] Classifier obtained: {type(classifier)}")
 
         def _extract_with_neural_engine():
             import torchaudio
             import torch
+
+            logger.info(f"[EDGE-ECAPA] _extract_with_neural_engine called, audio_bytes={len(audio_bytes)} bytes")
 
             # 🆕 Detect Apple Silicon for Neural Engine optimization
             is_apple_silicon = (
                 os.environ.get('PYTORCH_ENABLE_MPS_FALLBACK', '0') == '1' or
                 (hasattr(torch.backends, 'mps') and torch.backends.mps.is_available())
             )
+            logger.info(f"[EDGE-ECAPA] Apple Silicon detected: {is_apple_silicon}")
 
             # Load audio with robust strategy
+            logger.info("[EDGE-ECAPA] Calling _load_audio_robust...")
             waveform, sr = _load_audio_robust(audio_bytes)
             if waveform is None:
+                logger.error("[EDGE-ECAPA] _load_audio_robust returned None!")
                 raise ValueError("Failed to load audio with any strategy")
 
             logger.info(f"[EDGE-ECAPA] Audio loaded: shape={waveform.shape}, sr={sr}")
@@ -4014,21 +4036,31 @@ async def _extract_ecapa_robust(audio_bytes: bytes) -> Optional[List[float]]:
             logger.info(f"[EDGE-ECAPA] Embedding extracted via Neural Engine: {len(emb)} dims")
             return emb.tolist()
 
-        loop = asyncio.get_event_loop()
+        logger.info("[EDGE-ECAPA] Running extraction in executor...")
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = asyncio.get_event_loop()
+
         embedding = await asyncio.wait_for(
             loop.run_in_executor(None, _extract_with_neural_engine),
             timeout=RobustUnlockConfig.ECAPA_EXTRACT_TIMEOUT
         )
+        logger.info(f"[EDGE-ECAPA] Extraction completed, embedding={embedding is not None}, len={len(embedding) if embedding else 0}")
         if embedding and len(embedding) == 192:
             logger.info(f"[EDGE-ECAPA] ✅ Local SpeechBrain SUCCESS: {len(embedding)} dims")
             return embedding
+        else:
+            logger.warning(f"[EDGE-ECAPA] Extraction returned invalid embedding: {type(embedding)}, len={len(embedding) if embedding else 'None'}")
 
     except asyncio.TimeoutError:
         last_error = "Local SpeechBrain timeout"
         logger.warning(f"[EDGE-ECAPA] ⏱️ {last_error}")
     except Exception as e:
         last_error = str(e)
-        logger.warning(f"[EDGE-ECAPA] Strategy 1 failed: {e}")
+        import traceback
+        logger.error(f"[EDGE-ECAPA] Strategy 1 failed: {e}")
+        logger.error(f"[EDGE-ECAPA] Strategy 1 traceback:\n{traceback.format_exc()}")
 
     # ========================================================================
     # STRATEGY 2: ML Engine Registry (pre-loaded local model)
@@ -4080,7 +4112,9 @@ async def _extract_ecapa_robust(audio_bytes: bytes) -> Optional[List[float]]:
         logger.debug("[EDGE-ECAPA] ML Engine Registry not available")
     except Exception as e:
         last_error = str(e)
-        logger.warning(f"[EDGE-ECAPA] Strategy 2 failed: {e}")
+        import traceback
+        logger.error(f"[EDGE-ECAPA] Strategy 2 failed: {e}")
+        logger.error(f"[EDGE-ECAPA] Strategy 2 traceback:\n{traceback.format_exc()}")
 
     # ========================================================================
     # STRATEGY 3: Cloud ECAPA (ONLY if fallback enabled)
