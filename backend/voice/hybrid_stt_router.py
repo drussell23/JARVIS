@@ -20,6 +20,7 @@ PERFORMANCE OPTIMIZATIONS:
 import asyncio
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -492,6 +493,154 @@ class HybridSTTRouter:
         logger.info(f"   Strategy: {self.config.default_strategy.value}")
         logger.info(f"   Models configured: {len(self.config.models)}")
         logger.info(f"   Circuit breakers: {len(self._circuit_breakers)}")
+
+    # =============================================================================
+    # INTENT-AWARE CONSENSUS (Screen lock/unlock disambiguation)
+    # =============================================================================
+    @staticmethod
+    def _tokenize_words(text: str) -> List[str]:
+        """Tokenize into lowercase word tokens (avoids substring pitfalls like 'unlock' containing 'lock')."""
+        if not text:
+            return []
+        return re.findall(r"[a-z']+", text.lower())
+
+    @classmethod
+    def _extract_screen_intent(cls, text: str) -> Optional[str]:
+        """Return 'lock', 'unlock', or None based on token-level intent detection."""
+        tokens = set(cls._tokenize_words(text))
+        if "unlock" in tokens:
+            return "unlock"
+        if "lock" in tokens:
+            return "lock"
+        return None
+
+    def _select_diverse_local_models(
+        self,
+        resources: "SystemResources",
+        exclude_engine: Optional[STTEngine],
+        max_models: int = 2,
+    ) -> List[ModelConfig]:
+        """
+        Pick a small set of diverse *local* models for fast consensus.
+
+        Config-driven (no hardcoded model names) and tries to avoid reusing the same engine
+        as the primary model whenever possible.
+        """
+        candidates: List[ModelConfig] = []
+        for model in self.config.models.values():
+            if model.requires_internet:
+                continue
+            if exclude_engine and model.engine == exclude_engine:
+                continue
+            if resources.available_ram_gb < model.ram_required_gb:
+                continue
+            # Keep consensus fast: respect configured local latency budget when available
+            if getattr(model, "avg_latency_ms", 0.0) and model.avg_latency_ms > self.config.max_local_latency_ms:
+                continue
+            candidates.append(model)
+
+        def score(m: ModelConfig) -> float:
+            # Prefer accuracy, lightly penalize latency
+            return (m.expected_accuracy or 0.0) - (m.avg_latency_ms or 0.0) / 1000.0
+
+        candidates.sort(key=score, reverse=True)
+        return candidates[:max_models]
+
+    async def _apply_screen_intent_consensus(
+        self,
+        audio_data: bytes,
+        current: "STTResult",
+        resources: "SystemResources",
+        primary_model: Optional[ModelConfig],
+    ) -> "STTResult":
+        """
+        If transcription indicates a screen lock/unlock intent, run a fast, parallel
+        multi-engine consensus to reduce "lock" ↔ "unlock" confusions.
+        """
+        intent = self._extract_screen_intent(current.text)
+        if intent not in ("lock", "unlock"):
+            return current
+
+        consensus_enabled = os.getenv("JARVIS_STT_SCREEN_CONSENSUS", "true").lower() == "true"
+        if not consensus_enabled:
+            current.metadata = current.metadata or {}
+            current.metadata["screen_intent"] = intent
+            current.metadata["screen_intent_consensus"] = {"enabled": False}
+            return current
+
+        try:
+            timeout_sec = float(os.getenv("JARVIS_STT_SCREEN_CONSENSUS_TIMEOUT_SEC", "1.8"))
+        except ValueError:
+            timeout_sec = 1.8
+
+        exclude_engine = primary_model.engine if primary_model else current.engine
+        extra_models = self._select_diverse_local_models(
+            resources=resources, exclude_engine=exclude_engine, max_models=2
+        )
+
+        if not extra_models:
+            current.metadata = current.metadata or {}
+            current.metadata["screen_intent"] = intent
+            current.metadata["screen_intent_consensus"] = {"enabled": True, "skipped": "no_diverse_models"}
+            return current
+
+        tasks = [
+            self._transcribe_with_engine(audio_data, m, timeout_sec=timeout_sec) for m in extra_models
+        ]
+        gathered = await asyncio.gather(*tasks, return_exceptions=True)
+
+        alternatives: List["STTResult"] = [current]
+        for r in gathered:
+            if isinstance(r, STTResult) and r.text:
+                alternatives.append(r)
+
+        votes: Dict[str, List["STTResult"]] = {"lock": [], "unlock": []}
+        for r in alternatives:
+            r_intent = self._extract_screen_intent(r.text)
+            if r_intent in ("lock", "unlock"):
+                votes[r_intent].append(r)
+
+        chosen = current
+        chosen_intent = intent
+
+        lock_votes = len(votes["lock"])
+        unlock_votes = len(votes["unlock"])
+        if lock_votes or unlock_votes:
+            if lock_votes != unlock_votes:
+                majority_intent = "lock" if lock_votes > unlock_votes else "unlock"
+                chosen = max(votes[majority_intent], key=lambda x: x.confidence)
+                chosen_intent = majority_intent
+            else:
+                combined = votes["lock"] + votes["unlock"]
+                chosen = max(combined, key=lambda x: x.confidence)
+                chosen_intent = self._extract_screen_intent(chosen.text) or intent
+
+        chosen.metadata = chosen.metadata or {}
+        chosen.metadata["screen_intent"] = chosen_intent
+        chosen.metadata["screen_intent_consensus"] = {
+            "enabled": True,
+            "timeout_sec": timeout_sec,
+            "votes": {"lock": lock_votes, "unlock": unlock_votes},
+            "candidates": [
+                {
+                    "engine": getattr(r.engine, "value", str(r.engine)),
+                    "model": getattr(r, "model_name", None),
+                    "text": r.text,
+                    "confidence": r.confidence,
+                    "intent": self._extract_screen_intent(r.text),
+                }
+                for r in alternatives
+            ],
+            "chosen": {
+                "engine": getattr(chosen.engine, "value", str(chosen.engine)),
+                "model": chosen.model_name,
+                "text": chosen.text,
+                "confidence": chosen.confidence,
+                "intent": chosen_intent,
+            },
+        }
+
+        return chosen
 
     async def initialize(self) -> bool:
         """
@@ -1233,6 +1382,19 @@ class HybridSTTRouter:
                         audio_duration_ms=0,
                         metadata={"error": str(e), "reason": "audio_validation_failed"}
                     )
+
+        # Intent-aware consensus for screen lock/unlock (reduces "lock" ↔ "unlock" confusion)
+        # Never blocks overall transcription correctness if consensus fails.
+        try:
+            if final_result and final_result.text and mode in ("command", "general", "unlock"):
+                final_result = await self._apply_screen_intent_consensus(
+                    audio_data=audio_data,
+                    current=final_result,
+                    resources=resources,
+                    primary_model=primary_model,
+                )
+        except Exception as e:
+            logger.debug(f"Screen intent consensus skipped due to error: {e}")
 
         # Calculate total latency
         total_latency_ms = (time.time() - start_time) * 1000

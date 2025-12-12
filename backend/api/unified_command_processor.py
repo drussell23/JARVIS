@@ -4603,9 +4603,15 @@ class UnifiedCommandProcessor:
                     if isinstance(result, dict):
                         # Add command_type if not present
                         if "command_type" not in result:
-                            result["command_type"] = (
-                                "screen_lock" if "lock" in command_lower else "screen_unlock"
-                            )
+                            import re
+
+                            tokens = set(re.findall(r"[a-z']+", command_lower))
+                            if "unlock" in tokens:
+                                result["command_type"] = "screen_unlock"
+                            elif "lock" in tokens:
+                                result["command_type"] = "screen_lock"
+                            else:
+                                result["command_type"] = "screen_control"
                         return result
                     else:
                         # Fallback to macos_controller if the unlock handler returns unexpected format

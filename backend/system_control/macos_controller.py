@@ -1513,13 +1513,17 @@ class MacOSController:
         command_lower = command.lower()
 
         # Handle lock/unlock screen commands
-        if "lock" in command_lower and "screen" in command_lower:
-            success, message = await self.lock_screen()
-            return {"success": success, "response": message, "command_type": "screen_lock"}
+        # IMPORTANT: Token-based matching to avoid substring collisions ("unlock" contains "lock")
+        import re
 
-        if "unlock" in command_lower and "screen" in command_lower:
-            success, message = await self.unlock_screen()
-            return {"success": success, "response": message, "command_type": "screen_unlock"}
+        tokens = set(re.findall(r"[a-z']+", command_lower))
+        if "screen" in tokens or "mac" in tokens or "computer" in tokens:
+            if "unlock" in tokens:
+                success, message = await self.unlock_screen()
+                return {"success": success, "response": message, "command_type": "screen_unlock"}
+            if "lock" in tokens:
+                success, message = await self.lock_screen()
+                return {"success": success, "response": message, "command_type": "screen_lock"}
 
         # Handle application commands
         if any(word in command_lower for word in ["open", "launch", "start", "run"]):

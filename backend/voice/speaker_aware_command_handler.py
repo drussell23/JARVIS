@@ -372,6 +372,34 @@ class SpeakerAwareCommandHandler:
         if not context.screen_locked:
             return {"attempted": False, "reason": "screen_already_unlocked"}
 
+        # IMPORTANT: Never auto-unlock for explicit LOCK requests.
+        # Token-based check avoids substring collisions ("unlock" contains "lock").
+        try:
+            import re
+
+            tokens = set(re.findall(r"[a-z']+", (transcription or "").lower()))
+            is_explicit_lock = ("lock" in tokens) and ("unlock" not in tokens)
+            if is_explicit_lock:
+                return {"attempted": False, "reason": "lock_command_no_unlock"}
+        except Exception:
+            # If tokenization fails, continue to next safety gate
+            pass
+
+        # Context-aware gating: only unlock when the *command* actually requires screen access.
+        # This prevents accidental unlocks for voice-only commands while the screen is locked.
+        try:
+            from context_intelligence.detectors.screen_lock_detector import get_screen_lock_detector
+
+            detector = get_screen_lock_detector()
+            screen_ctx = await detector.check_screen_context(
+                transcription, speaker_name=speaker_ctx.speaker_name
+            )
+            if not screen_ctx.get("requires_unlock"):
+                return {"attempted": False, "reason": "command_does_not_require_unlock"}
+        except Exception:
+            # If context intelligence isn't available, fall back to existing behavior
+            pass
+
         # Check if speaker is verified owner
         if not speaker_ctx.is_owner or not speaker_ctx.verified:
             return {

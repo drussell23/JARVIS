@@ -35,6 +35,7 @@ Example:
 
 import asyncio
 import logging
+import re
 import sys
 import time
 from collections import defaultdict
@@ -1308,6 +1309,31 @@ class AdvancedAsyncPipeline:
                 # Handle dictionary changed size during iteration
                 pass
 
+    async def process_command_async(
+        self,
+        text: str,
+        user_name: str = "Sir",
+        priority: int = 0,
+        metadata: Optional[Dict[str, Any]] = None,
+        audio_data: Optional[bytes] = None,
+        speaker_name: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Backwards-compatible alias for voice/WebSocket integrations.
+
+        Several integrations call `process_command_async()`; the canonical entry point is
+        `process_async()`. This wrapper keeps the API stable and ensures audio/speaker
+        context can be passed through (critical for robust lock/unlock handling).
+        """
+        return await self.process_async(
+            text=text,
+            user_name=user_name,
+            priority=priority,
+            metadata=metadata,
+            audio_data=audio_data,
+            speaker_name=speaker_name,
+        )
+
     def _record_performance(self, context: PipelineContext) -> None:
         """Record performance metrics for the completed command.
 
@@ -1411,7 +1437,8 @@ class AdvancedAsyncPipeline:
         text_lower = text.lower()
 
         # Determine action type for logging
-        is_lock = "lock" in text_lower and "unlock" not in text_lower
+        tokens = set(re.findall(r"[a-z']+", text_lower))
+        is_lock = ("lock" in tokens) and ("unlock" not in tokens)
         action_type = "LOCK" if is_lock else "UNLOCK"
 
         # Start VBI health monitor operation tracking
@@ -1484,7 +1511,28 @@ class AdvancedAsyncPipeline:
                 step_start = time.time()
                 if is_lock:
                     logger.info(f"🔒 [LOCK-UNLOCK-EXECUTE] Calling controller.lock_screen()...")
-                    success, message = await controller.lock_screen()
+                    # For LOCK (non-security-critical), try fast speaker recognition for transparency
+                    # without delaying the lock operation.
+                    lock_speaker_name = speaker_name
+                    if audio_data and not lock_speaker_name:
+                        try:
+                            from backend.voice.speaker_verification_service import (
+                                get_speaker_verification_service,
+                            )
+
+                            speaker_service = await asyncio.wait_for(
+                                get_speaker_verification_service(), timeout=0.6
+                            )
+                            verification = await asyncio.wait_for(
+                                speaker_service.verify_speaker(audio_data), timeout=0.6
+                            )
+                            if verification.get("verified") and verification.get("speaker_name"):
+                                lock_speaker_name = verification["speaker_name"]
+                        except Exception:
+                            # Best-effort only; never block lock for speaker ID failures
+                            pass
+
+                    success, message = await controller.lock_screen(speaker_name=lock_speaker_name)
                     action = "locked"
                 else:  # unlock
                     # =====================================================================

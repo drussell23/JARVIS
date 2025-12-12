@@ -2956,6 +2956,7 @@ class JARVISVoiceAPI:
                             audio_data=audio_bytes,
                             strategy=strategy,
                             speaker_name=None,  # Auto-detect speaker via voice recognition
+                            mode="command",  # Optimize for short imperative commands (lock/unlock/etc.)
                         )
 
                         # Store audio data and speaker for voice verification
@@ -3001,7 +3002,9 @@ class JARVISVoiceAPI:
                                 try:
                                     # Use async pipeline for enhanced context-aware processing
                                     pipeline_result = await self.pipeline.process_command_async(
-                                        command_text
+                                        command_text,
+                                        audio_data=audio_bytes,
+                                        speaker_name=result.speaker_identified,
                                     )
 
                                     response_text = pipeline_result.get(

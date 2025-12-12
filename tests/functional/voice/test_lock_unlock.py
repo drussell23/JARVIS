@@ -41,10 +41,10 @@ async def test_lock_unlock():
         cmd_type, score = await processor._classify_command("lock my screen")
         print(f"   Classification: {cmd_type.name} (score: {score:.2f})")
 
-        if cmd_type.name == "VOICE_UNLOCK":
-            print("   ✅ Command correctly classified as VOICE_UNLOCK")
+        if cmd_type.name == "SCREEN_LOCK":
+            print("   ✅ Command correctly classified as SCREEN_LOCK")
         else:
-            print(f"   ⚠️  Command classified as {cmd_type.name} instead of VOICE_UNLOCK")
+            print(f"   ⚠️  Command classified as {cmd_type.name} instead of SCREEN_LOCK")
 
     except Exception as e:
         print(f"   ❌ Error: {e}")
