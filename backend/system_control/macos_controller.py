@@ -1294,7 +1294,7 @@ class MacOSController:
                     # 🎙️ Voice: "Screen locked. See you soon, Derek."
                     await voice_feedback("complete")
                     logger.info(f"[FAST LOCK] Screen locked successfully using AppleScript in {duration_ms:.0f}ms")
-                    return True, f"Locking the screen now, {speaker_name}. See you soon."
+                    return True, f"🔒 Locking the screen now, {speaker_name}. See you soon."
             except Exception as e:
                 logger.debug(f"AppleScript method failed: {e}")
 
@@ -1315,7 +1315,7 @@ class MacOSController:
                     await _progress("complete", 100, f"Screen locked ({duration_ms:.0f}ms)")
                     await voice_feedback("complete")
                     logger.info(f"Screen locked successfully using CGSession in {duration_ms:.0f}ms")
-                    return True, f"Locking the screen now, {speaker_name}. See you soon."
+                    return True, f"🔒 Locking the screen now, {speaker_name}. See you soon."
 
             # Fallback Method 2: Use pmset command directly
             await _progress("pmset", 70, "Trying pmset...")
@@ -1327,17 +1327,17 @@ class MacOSController:
                 await _progress("complete", 100, f"Screen locked ({duration_ms:.0f}ms)")
                 await voice_feedback("complete")
                 logger.info(f"Screen locked successfully using pmset in {duration_ms:.0f}ms")
-                return True, f"Locking the screen now, {speaker_name}. See you soon."
+                return True, f"🔒 Locking the screen now, {speaker_name}. See you soon."
 
             await _progress("failed", 90, "Lock methods exhausted")
             await voice_feedback("failed")
-            return False, "Unable to lock screen. Please use Control+Command+Q manually."
+            return False, "❌ Unable to lock screen. Please use Control+Command+Q manually."
 
         except Exception as e:
             logger.error(f"Error locking screen: {e}")
             await _progress("error", 90, f"Lock error: {e}")
             await voice_feedback("failed")
-            return False, f"Failed to lock screen: {str(e)}"
+            return False, f"❌ Failed to lock screen: {str(e)}"
 
     async def unlock_screen(self, password: Optional[str] = None) -> Tuple[bool, str]:
         """
