@@ -1935,6 +1935,20 @@ const JarvisVoice = () => {
         }
         break;
 
+      case 'screen_lock':
+      case 'screen_unlock': {
+        // Handle direct screen control events (some backends emit these instead of command_response/response)
+        const msg = data.response || data.message || data.text || '';
+        if (msg) {
+          setResponse(msg);
+          if (data.speak && msg) {
+            speakResponse(msg);
+          }
+        }
+        setIsProcessing(false);
+        break;
+      }
+
       case 'command_response':
         // Handle new async pipeline responses
         console.log('WebSocket command_response received:', data);

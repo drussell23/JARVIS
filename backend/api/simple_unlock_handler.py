@@ -1054,7 +1054,15 @@ async def _try_macos_controller_lock(context: Dict[str, Any]) -> Tuple[bool, str
             stderr=asyncio.subprocess.PIPE,
         )
 
-        await process.communicate()
+        try:
+            await asyncio.wait_for(process.communicate(), timeout=2.5)
+        except asyncio.TimeoutError:
+            try:
+                process.kill()
+                await process.wait()
+            except Exception:
+                pass
+            return False, "AppleScript lock timed out"
 
         if process.returncode == 0:
             logger.info("[LOCK] ✅ Screen locked via AppleScript Command+Control+Q")
@@ -1070,7 +1078,22 @@ async def _try_macos_controller_lock(context: Dict[str, Any]) -> Tuple[bool, str
 async def _try_screensaver_lock(context: Dict[str, Any]) -> Tuple[bool, str]:
     """Try screensaver lock method (fallback)."""
     try:
-        subprocess.run(["open", "-a", "ScreenSaverEngine"], check=True)
+        process = await asyncio.create_subprocess_exec(
+            "open",
+            "-a",
+            "ScreenSaverEngine",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        try:
+            await asyncio.wait_for(process.wait(), timeout=2.5)
+        except asyncio.TimeoutError:
+            try:
+                process.kill()
+                await process.wait()
+            except Exception:
+                pass
+            return False, "Screensaver start timed out"
         return True, "Screensaver started"
     except Exception as e:
         return False, f"Screensaver failed: {str(e)}"
@@ -1079,7 +1102,21 @@ async def _try_screensaver_lock(context: Dict[str, Any]) -> Tuple[bool, str]:
 async def _try_system_lock_command(context: Dict[str, Any]) -> Tuple[bool, str]:
     """Try system command lock method (fallback)."""
     try:
-        subprocess.run(["pmset", "displaysleepnow"], check=True)
+        process = await asyncio.create_subprocess_exec(
+            "pmset",
+            "displaysleepnow",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        try:
+            await asyncio.wait_for(process.wait(), timeout=3.5)
+        except asyncio.TimeoutError:
+            try:
+                process.kill()
+                await process.wait()
+            except Exception:
+                pass
+            return False, "pmset displaysleepnow timed out"
         return True, "Display sleep activated"
     except Exception as e:
         return False, f"System lock failed: {str(e)}"

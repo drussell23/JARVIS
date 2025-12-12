@@ -1135,7 +1135,12 @@ class UnifiedWebSocketManager:
                     try:
                         text_intent = "unlock" if "unlock" in tokens else ("lock" if "lock" in tokens else None)
 
-                        if audio_data_received and text_intent in ("lock", "unlock"):
+                        # IMPORTANT:
+                        # Only perform *audio* intent verification for UNLOCK (security-sensitive).
+                        # The current Whisper intent helper (`voice.whisper_audio_fix`) runs synchronously
+                        # and can block the event loop on cold start; doing that for LOCK can cause the
+                        # UI to hang at "🔒 Locking..." and prevents the lock from executing.
+                        if audio_data_received and text_intent == "unlock":
                             import base64
 
                             # Decode audio bytes (base64 payload from frontend)

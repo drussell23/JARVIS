@@ -1225,14 +1225,17 @@ class MacOSController:
         Returns:
             Tuple of (success, message)
         """
+        import shutil
         import time
-        start_time = time.time()
+
+        start_time = time.perf_counter()
 
         # Initialize voice communicator for real-time feedback (non-blocking)
         voice = None
         if enable_voice_feedback:
             try:
                 from agi_os.realtime_voice_communicator import get_voice_communicator
+
                 voice = await asyncio.wait_for(get_voice_communicator(), timeout=1.0)
             except Exception as e:
                 logger.debug(f"Voice feedback unavailable: {e}")
@@ -1251,9 +1254,7 @@ class MacOSController:
             """Fire-and-forget voice feedback."""
             if voice:
                 try:
-                    asyncio.create_task(
-                        voice.vbi_lock_feedback(stage, speaker_name)
-                    )
+                    asyncio.create_task(voice.vbi_lock_feedback(stage, speaker_name))
                 except Exception as e:
                     logger.debug(f"Voice feedback error: {e}")
 
@@ -1266,7 +1267,7 @@ class MacOSController:
                         "stage": stage,
                         "progress": pct,
                         "message": msg,
-                        "timestamp": time.time()
+                        "timestamp": time.time(),
                     }
                     if asyncio.iscoroutinefunction(progress_callback):
                         await progress_callback(data)
@@ -1275,66 +1276,200 @@ class MacOSController:
                 except Exception as e:
                     logger.debug(f"Progress callback error: {e}")
 
+        def _is_locked_now() -> Optional[bool]:
+            """Best-effort lock state check. Returns None if unavailable."""
+            try:
+                from voice_unlock.objc.server.screen_lock_detector import is_screen_locked
+
+                return bool(is_screen_locked())
+            except Exception:
+                return None
+
+        async def _wait_for_lock_state(target_locked: bool, timeout_s: float = 1.8) -> Optional[bool]:
+            """Poll lock state until it matches target or times out."""
+            deadline = time.perf_counter() + timeout_s
+            last = None
+            while time.perf_counter() < deadline:
+                state = _is_locked_now()
+                if state is None:
+                    return None
+                last = state
+                if state == target_locked:
+                    return state
+                await asyncio.sleep(0.06)
+            return last
+
+        async def _run_subprocess(cmd: List[str], timeout_s: float) -> Tuple[bytes, bytes, int]:
+            """Run subprocess with strict timeout + cancellation kill."""
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+            try:
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+                return stdout or b"", stderr or b"", int(proc.returncode or 0)
+            except asyncio.TimeoutError:
+                try:
+                    proc.kill()
+                    await proc.wait()
+                except Exception:
+                    pass
+                return b"", b"Timeout", -1
+            except asyncio.CancelledError:
+                try:
+                    proc.kill()
+                    await proc.wait()
+                except Exception:
+                    pass
+                raise
+            except Exception as e:
+                try:
+                    proc.kill()
+                    await proc.wait()
+                except Exception:
+                    pass
+                return b"", str(e).encode(), -1
+
+        async def _attempt_method(
+            method: str,
+            cmd: List[str],
+            cmd_timeout_s: float,
+            verify_timeout_s: float = 2.0,
+        ) -> Dict[str, Any]:
+            """Attempt a lock method and verify lock state."""
+            await _progress(method, 0, f"Trying {method}...")
+            stdout, stderr, rc = await _run_subprocess(cmd, timeout_s=cmd_timeout_s)
+            verified = await _wait_for_lock_state(True, timeout_s=verify_timeout_s)
+            ok = (verified is True) or (verified is None and rc == 0)
+            return {
+                "method": method,
+                "returncode": rc,
+                "stdout": stdout.decode(errors="replace") if stdout else "",
+                "stderr": stderr.decode(errors="replace") if stderr else "",
+                "verified_locked": verified,
+                "success": ok,
+            }
+
         try:
-            # 🎙️ Voice: "Locking the screen, Derek."
+            # If already locked, be explicit and fast.
+            locked_now = _is_locked_now()
+            if locked_now is True:
+                await _progress("already_locked", 100, "Screen already locked")
+                return True, f"🔒 Your screen is already locked, {speaker_name}."
+
             await _progress("init", 10, "Locking screen...")
             await voice_feedback("init")
 
-            # FAST PATH: Go straight to AppleScript (most reliable and fastest)
-            from api.jarvis_voice_api import async_osascript
+            # ------------------------------------------------------------------
+            # Strategy set: dynamic, async, and verified (no hangs; no false OK)
+            # ------------------------------------------------------------------
+            cgsession_path = "/System/Library/CoreServices/Menu Extras/User.menu/Contents/Resources/CGSession"
+            have_cgsession = os.path.exists(cgsession_path)
+            have_osascript = bool(shutil.which("osascript"))
+            have_pmset = bool(shutil.which("pmset"))
+            have_launchctl = bool(shutil.which("launchctl"))
+            have_open = bool(shutil.which("open"))
 
-            await _progress("applescript", 30, "Sending lock command...")
+            # Build CGSession command (handles root/non-root dynamically)
+            cgsession_cmd: Optional[List[str]] = None
+            if have_cgsession:
+                if os.geteuid() == 0 and have_launchctl:
+                    try:
+                        console_uid = os.stat("/dev/console").st_uid
+                        cgsession_cmd = ["launchctl", "asuser", str(console_uid), cgsession_path, "-suspend"]
+                    except Exception:
+                        cgsession_cmd = [cgsession_path, "-suspend"]
+                else:
+                    cgsession_cmd = [cgsession_path, "-suspend"]
 
-            script = 'tell application "System Events" to keystroke "q" using {command down, control down}'
-            try:
-                stdout, stderr, returncode = await async_osascript(script, timeout=2.0)
-                if returncode == 0:
-                    duration_ms = (time.time() - start_time) * 1000
-                    await _progress("complete", 100, f"Screen locked ({duration_ms:.0f}ms)")
-                    # 🎙️ Voice: "Screen locked. See you soon, Derek."
-                    await voice_feedback("complete")
-                    logger.info(f"[FAST LOCK] Screen locked successfully using AppleScript in {duration_ms:.0f}ms")
-                    return True, f"🔒 Locking the screen now, {speaker_name}. See you soon."
-            except Exception as e:
-                logger.debug(f"AppleScript method failed: {e}")
+            # AppleScript shortcut (may require Accessibility; treated as best-effort)
+            osascript_cmd: Optional[List[str]] = None
+            if have_osascript:
+                script = 'tell application "System Events" to keystroke "q" using {command down, control down}'
+                osascript_cmd = ["osascript", "-e", script]
 
-            # Fallback Method 1: Use CGSession directly (most reliable)
-            await _progress("cgsession", 50, "Trying CGSession...")
-            from api.jarvis_voice_api import async_subprocess_run
+            pmset_cmd: Optional[List[str]] = ["pmset", "displaysleepnow"] if have_pmset else None
+            # Screensaver is a reliable lock trigger *when* the system is configured to require a password
+            # immediately after screensaver starts (dynamic system setting; no hardcoding).
+            screensaver_cmd: Optional[List[str]] = ["open", "-a", "ScreenSaverEngine"] if have_open else None
 
-            cgsession_path = (
-                "/System/Library/CoreServices/Menu Extras/User.menu/Contents/Resources/CGSession"
-            )
-            if os.path.exists(cgsession_path):
-                # Direct async execution
-                stdout, stderr, returncode = await async_subprocess_run(
-                    [cgsession_path, "-suspend"], timeout=5.0
+            # Run best candidates in parallel; return on first verified lock.
+            await _progress("dispatch", 25, "Dispatching lock strategies...")
+
+            candidates: List[Tuple[str, List[str], float, float]] = []
+            if cgsession_cmd:
+                candidates.append(("cgsession", cgsession_cmd, 4.0, 2.0))
+            if osascript_cmd:
+                candidates.append(("osascript", osascript_cmd, 2.0, 2.0))
+            if pmset_cmd:
+                candidates.append(("pmset", pmset_cmd, 3.5, 2.0))
+            if screensaver_cmd:
+                candidates.append(("screensaver", screensaver_cmd, 2.5, 2.5))
+
+            if not candidates:
+                await _progress("failed", 90, "No lock strategies available")
+                await voice_feedback("failed")
+                return False, "❌ No lock methods available on this system."
+
+            tasks: List[asyncio.Task] = []
+            for method, cmd, cmd_timeout_s, verify_timeout_s in candidates:
+                tasks.append(
+                    asyncio.create_task(
+                        _attempt_method(
+                            method=method,
+                            cmd=cmd,
+                            cmd_timeout_s=cmd_timeout_s,
+                            verify_timeout_s=verify_timeout_s,
+                        )
+                    )
                 )
-                if returncode == 0:
-                    duration_ms = (time.time() - start_time) * 1000
-                    await _progress("complete", 100, f"Screen locked ({duration_ms:.0f}ms)")
-                    await voice_feedback("complete")
-                    logger.info(f"Screen locked successfully using CGSession in {duration_ms:.0f}ms")
-                    return True, f"🔒 Locking the screen now, {speaker_name}. See you soon."
 
-            # Fallback Method 2: Use pmset command directly
-            await _progress("pmset", 70, "Trying pmset...")
-            stdout, stderr, returncode = await async_subprocess_run(
-                ["pmset", "displaysleepnow"], timeout=5.0
-            )
-            if returncode == 0:
-                duration_ms = (time.time() - start_time) * 1000
-                await _progress("complete", 100, f"Screen locked ({duration_ms:.0f}ms)")
-                await voice_feedback("complete")
-                logger.info(f"Screen locked successfully using pmset in {duration_ms:.0f}ms")
-                return True, f"🔒 Locking the screen now, {speaker_name}. See you soon."
+            deadline = time.perf_counter() + 6.5  # hard cap for the whole lock operation
+            pending = set(tasks)
+            failures: List[Dict[str, Any]] = []
 
-            await _progress("failed", 90, "Lock methods exhausted")
+            while pending and time.perf_counter() < deadline:
+                done, pending = await asyncio.wait(
+                    pending,
+                    timeout=max(0.0, deadline - time.perf_counter()),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for t in done:
+                    try:
+                        res = t.result()
+                    except Exception as e:
+                        failures.append({"success": False, "method": "unknown", "error": str(e)})
+                        continue
+
+                    if res.get("success"):
+                        # Cancel other tasks (they kill their subprocess on cancellation).
+                        for p in pending:
+                            p.cancel()
+                        await asyncio.gather(*pending, return_exceptions=True)
+
+                        duration_ms = (time.perf_counter() - start_time) * 1000
+                        await _progress("complete", 100, f"Screen locked ({duration_ms:.0f}ms) via {res.get('method')}")
+                        await voice_feedback("complete")
+                        logger.info(
+                            f"[LOCK] ✅ Locked via {res.get('method')} in {duration_ms:.0f}ms "
+                            f"(verified={res.get('verified_locked')})"
+                        )
+                        return True, f"🔒 Locking the screen now, {speaker_name}. See you soon."
+                    failures.append(res)
+
+            # Ensure tasks are cleaned up
+            for p in pending:
+                p.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+
+            duration_ms = (time.perf_counter() - start_time) * 1000
+            await _progress("failed", 95, f"Lock failed ({duration_ms:.0f}ms)")
             await voice_feedback("failed")
-            return False, "❌ Unable to lock screen. Please use Control+Command+Q manually."
+            logger.warning(f"[LOCK] ❌ Failed to lock screen after {duration_ms:.0f}ms | attempts={failures}")
+            return False, "❌ Unable to lock screen (no method verified lock state)."
 
         except Exception as e:
-            logger.error(f"Error locking screen: {e}")
+            duration_ms = (time.perf_counter() - start_time) * 1000
+            logger.error(f"Error locking screen: {e}", exc_info=True)
             await _progress("error", 90, f"Lock error: {e}")
             await voice_feedback("failed")
             return False, f"❌ Failed to lock screen: {str(e)}"

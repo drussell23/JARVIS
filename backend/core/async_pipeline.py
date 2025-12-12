@@ -1511,28 +1511,13 @@ class AdvancedAsyncPipeline:
                 step_start = time.time()
                 if is_lock:
                     logger.info(f"🔒 [LOCK-UNLOCK-EXECUTE] Calling controller.lock_screen()...")
-                    # For LOCK (non-security-critical), try fast speaker recognition for transparency
-                    # without delaying the lock operation.
-                    lock_speaker_name = speaker_name
-                    if audio_data and not lock_speaker_name:
-                        try:
-                            from backend.voice.speaker_verification_service import (
-                                get_speaker_verification_service,
-                            )
-
-                            speaker_service = await asyncio.wait_for(
-                                get_speaker_verification_service(), timeout=0.6
-                            )
-                            verification = await asyncio.wait_for(
-                                speaker_service.verify_speaker(audio_data), timeout=0.6
-                            )
-                            if verification.get("verified") and verification.get("speaker_name"):
-                                lock_speaker_name = verification["speaker_name"]
-                        except Exception:
-                            # Best-effort only; never block lock for speaker ID failures
-                            pass
-
-                    success, message = await controller.lock_screen(speaker_name=lock_speaker_name)
+                    # IMPORTANT: Never let "transparency" speaker identification block locking.
+                    # Some speaker verification implementations are CPU-bound and can starve the event loop,
+                    # causing the UI to hang at "🔒 Locking..." and preventing the lock from executing.
+                    #
+                    # We pass through any already-known speaker name, otherwise we let the controller
+                    # fall back to dynamic owner naming (or "there") without delaying the lock.
+                    success, message = await controller.lock_screen(speaker_name=speaker_name)
                     action = "locked"
                 else:  # unlock
                     # =====================================================================

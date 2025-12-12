@@ -9,9 +9,66 @@ Each handler is async, timeout-safe, and reports detailed results.
 
 import asyncio
 import logging
-from typing import Any, Dict
+import os
+import shutil
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+def _is_locked_now() -> Optional[bool]:
+    """Best-effort screen lock status. Returns None if unavailable."""
+    try:
+        from voice_unlock.objc.server.screen_lock_detector import is_screen_locked
+
+        return bool(is_screen_locked())
+    except Exception:
+        return None
+
+
+async def _wait_for_locked(timeout_s: float = 1.5) -> Optional[bool]:
+    """Poll for locked state. Returns True/False or None if detector unavailable."""
+    deadline = asyncio.get_running_loop().time() + timeout_s
+    last: Optional[bool] = None
+    while asyncio.get_running_loop().time() < deadline:
+        state = _is_locked_now()
+        if state is None:
+            return None
+        last = state
+        if state is True:
+            return True
+        await asyncio.sleep(0.06)
+    return last
+
+
+async def _run_subprocess(cmd: List[str], timeout_s: float) -> Tuple[bytes, bytes, int]:
+    """Run a subprocess with strict timeout + cancellation kill."""
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+        return stdout or b"", stderr or b"", int(proc.returncode or 0)
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+            await proc.wait()
+        except Exception:
+            pass
+        return b"", b"Timeout", -1
+    except asyncio.CancelledError:
+        try:
+            proc.kill()
+            await proc.wait()
+        except Exception:
+            pass
+        raise
+    except Exception as e:
+        try:
+            proc.kill()
+            await proc.wait()
+        except Exception:
+            pass
+        return b"", str(e).encode(), -1
 
 
 async def applescript_handler(action: str, context: Dict[str, Any], **kwargs) -> Dict[str, Any]:
@@ -73,39 +130,72 @@ async def applescript_handler(action: str, context: Dict[str, Any], **kwargs) ->
                 }
 
         elif action == "lock_screen":
-            # Use Command+Control+Q to lock screen (native macOS shortcut)
-            script = """
-            tell application "System Events"
-                keystroke "q" using {command down, control down}
-            end tell
-            """
+            # Prefer a non-interactive lock that doesn't depend on Accessibility permissions.
+            # Verify lock state when possible to avoid false positives.
+            if _is_locked_now() is True:
+                return {"success": True, "method": "already_locked", "action": action}
 
-            # Execute AppleScript
-            process = await asyncio.create_subprocess_exec(
-                "osascript",
-                "-e",
-                script,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
+            attempted: List[str] = []
 
-            stdout, stderr = await process.communicate()
+            # Method 1: CGSession -suspend (best effort, typically most reliable)
+            cgsession_path = "/System/Library/CoreServices/Menu Extras/User.menu/Contents/Resources/CGSession"
+            have_cgsession = os.path.exists(cgsession_path)
+            have_launchctl = bool(shutil.which("launchctl"))
 
-            if process.returncode == 0:
-                logger.info(f"[APPLESCRIPT] ✅ {action} succeeded")
-                return {
-                    "success": True,
-                    "method": "applescript",
-                    "action": action,
-                }
-            else:
-                error_msg = stderr.decode().strip() if stderr else "unknown error"
-                logger.error(f"[APPLESCRIPT] ❌ Failed: {error_msg}")
-                return {
-                    "success": False,
-                    "error": "applescript_failed",
-                    "message": error_msg,
-                }
+            if have_cgsession:
+                attempted.append("cgsession")
+                if os.geteuid() == 0 and have_launchctl:
+                    try:
+                        console_uid = os.stat("/dev/console").st_uid
+                        cmd = ["launchctl", "asuser", str(console_uid), cgsession_path, "-suspend"]
+                    except Exception:
+                        cmd = [cgsession_path, "-suspend"]
+                else:
+                    cmd = [cgsession_path, "-suspend"]
+
+                _stdout, _stderr, rc = await _run_subprocess(cmd, timeout_s=4.0)
+                verified = await _wait_for_locked(timeout_s=2.0)
+                if verified is True or (verified is None and rc == 0):
+                    logger.info(f"[APPLESCRIPT] ✅ {action} succeeded via CGSession (verified={verified})")
+                    return {"success": True, "method": "cgsession", "action": action}
+
+            # Method 2: AppleScript shortcut (may require Accessibility permission)
+            if shutil.which("osascript"):
+                attempted.append("osascript")
+                script = 'tell application "System Events" to keystroke "q" using {command down, control down}'
+                _stdout, stderr, rc = await _run_subprocess(["osascript", "-e", script], timeout_s=2.0)
+                verified = await _wait_for_locked(timeout_s=2.0)
+                if verified is True or (verified is None and rc == 0):
+                    logger.info(f"[APPLESCRIPT] ✅ {action} succeeded via osascript (verified={verified})")
+                    return {"success": True, "method": "applescript_shortcut", "action": action}
+
+                error_msg = stderr.decode(errors="replace").strip() if stderr else "unknown error"
+                logger.error(f"[APPLESCRIPT] ❌ Lock shortcut failed: {error_msg}")
+
+            # Method 3: pmset displaysleepnow (non-UI, generally available)
+            if shutil.which("pmset"):
+                attempted.append("pmset")
+                _stdout, _stderr, rc = await _run_subprocess(["pmset", "displaysleepnow"], timeout_s=3.5)
+                verified = await _wait_for_locked(timeout_s=2.5)
+                if verified is True or (verified is None and rc == 0):
+                    logger.info(f"[APPLESCRIPT] ✅ {action} succeeded via pmset (verified={verified})")
+                    return {"success": True, "method": "pmset", "action": action}
+
+            # Method 4: Start screensaver (locks if system security requires authentication)
+            if shutil.which("open"):
+                attempted.append("screensaver")
+                _stdout, _stderr, rc = await _run_subprocess(["open", "-a", "ScreenSaverEngine"], timeout_s=2.5)
+                verified = await _wait_for_locked(timeout_s=2.5)
+                if verified is True or (verified is None and rc == 0):
+                    logger.info(f"[APPLESCRIPT] ✅ {action} succeeded via screensaver (verified={verified})")
+                    return {"success": True, "method": "screensaver", "action": action}
+
+            return {
+                "success": False,
+                "error": "lock_failed",
+                "message": "Unable to lock screen (no method verified lock state)",
+                "attempted_methods": attempted,
+            }
 
         else:
             return {
@@ -253,30 +343,11 @@ async def system_api_handler(action: str, context: Dict[str, Any], **kwargs) -> 
 
     try:
         if action == "lock_screen":
-            # Use AppleScript with Command+Control+Q (reliable macOS shortcut)
-            script = """
-            tell application "System Events"
-                keystroke "q" using {command down, control down}
-            end tell
-            """
-
-            process = await asyncio.create_subprocess_exec(
-                "osascript",
-                "-e",
-                script,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-
-            await process.communicate()
-
-            if process.returncode == 0:
-                logger.info(f"[SYSTEM-API] ✅ {action} succeeded")
-                return {
-                    "success": True,
-                    "method": "system_api",
-                    "action": action,
-                }
+            # Keep lock behavior consistent with the AppleScript transport, but label as system_api.
+            result = await applescript_handler(action, context, **kwargs)
+            if result.get("success"):
+                result["method"] = "system_api"
+            return result
 
         elif action == "unlock_screen":
             # Delegate to AppleScript handler which has MacOSKeychainUnlock

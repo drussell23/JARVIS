@@ -3068,23 +3068,10 @@ class UnifiedCommandProcessor:
                     owner_name = await _get_owner_name()
                     
                     # If we have audio data, try to identify the speaker for transparency
+                    # IMPORTANT: Do not run speaker verification inline for LOCK.
+                    # Some verification paths are CPU-bound and can starve the event loop,
+                    # which manifests as the frontend hanging on "🔒 Locking..." and the lock never executing.
                     speaker_identified = None
-                    if self.current_audio_data:
-                        try:
-                            from voice.speaker_verification_service import get_speaker_verification_service
-                            speaker_service = await asyncio.wait_for(
-                                get_speaker_verification_service(),
-                                timeout=3.0  # Quick timeout for lock (not security-critical)
-                            )
-                            verification = await asyncio.wait_for(
-                                speaker_service.verify_speaker(self.current_audio_data, None),
-                                timeout=3.0
-                            )
-                            if verification.get("verified"):
-                                speaker_identified = verification.get("speaker_name")
-                                logger.info(f"[SCREEN_LOCK] Speaker identified: {speaker_identified}")
-                        except Exception as e:
-                            logger.debug(f"[SCREEN_LOCK] Speaker identification skipped: {e}")
                     
                     # Execute the lock command
                     result = await handle_unlock_command(command_text)
