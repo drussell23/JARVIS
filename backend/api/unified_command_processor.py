@@ -1068,7 +1068,10 @@ class UnifiedCommandProcessor:
         logger.info(f"[UNIFIED] Classified as {command_type.value} (confidence: {confidence})")
 
         # Step 3: Check system context FIRST (screen lock, active apps, etc.)
-        system_context = await self._get_full_system_context()
+        # IMPORTANT: Use fast non-blocking system context retrieval
+        # _get_full_system_context can be slow if it queries window servers or accessibility APIs
+        # We'll use a lighter version for initial command routing
+        system_context = await self._get_fast_system_context()
         logger.info(
             f"[UNIFIED] System context: screen_locked={system_context.get('screen_locked')}, active_apps={len(system_context.get('active_apps', []))}"
         )
@@ -2609,6 +2612,31 @@ class UnifiedCommandProcessor:
                 "network_connected": True,
                 "timestamp": datetime.now().isoformat(),
             }
+
+    async def _get_fast_system_context(self) -> Dict[str, Any]:
+        """
+        Get lightweight system context for fast command routing.
+        Avoids heavy AppleScript calls or window server queries.
+        """
+        try:
+            # Check screen lock using non-blocking methods
+            from core.transport_handlers import _is_locked_now
+            
+            is_locked = _is_locked_now()
+            
+            # If detection failed/unavailable, assume unlocked to avoid blocking operations
+            if is_locked is None:
+                is_locked = False
+                
+            return {
+                "screen_locked": is_locked,
+                "active_apps": [], # Skip app list for speed
+                "timestamp": datetime.now().isoformat(),
+                "fast_mode": True
+            }
+        except Exception as e:
+            logger.warning(f"Fast system context failed: {e}")
+            return {"screen_locked": False, "active_apps": [], "fast_mode": True}
 
     async def _execute_command(
         self,

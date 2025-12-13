@@ -49,7 +49,17 @@ else:
         
         # Method 2: Check if screensaver is active
         screensaver_cmd = """osascript -e 'tell application "System Events" to get running of screen saver'"""
-        result = subprocess.run(screensaver_cmd, shell=True, capture_output=True, text=True)
+        # Use sysadminctl as a faster/safer check first
+        sysadmin_cmd = ["/usr/sbin/sysadminctl", "-screenLock", "status"]
+        try:
+            sys_result = subprocess.run(sysadmin_cmd, capture_output=True, text=True, timeout=1.0)
+            if sys_result.returncode == 0 and "locked" in sys_result.stderr.lower():
+                 logger.debug("Screen locked detected via sysadminctl")
+                 return True
+        except Exception:
+            pass
+
+        result = subprocess.run(screensaver_cmd, shell=True, capture_output=True, text=True, timeout=2.0)
         
         if result.returncode == 0 and result.stdout.strip().lower() == 'true':
             logger.debug("Screen locked detected via screensaver")

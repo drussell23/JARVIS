@@ -1410,7 +1410,11 @@ class MacOSController:
                 await voice_feedback("failed")
                 return False, "❌ No lock methods available on this system."
 
-            tasks: List[asyncio.Task] = []
+            # CRITICAL: We use a 'fire-and-forget' approach for the verified check.
+            # If ANY command returns success (exit code 0), we report success immediately.
+            # We do NOT wait for the lock verification to complete before returning to the UI.
+            # This prevents the UI from hanging if detection is slow/broken.
+            
             for method, cmd, cmd_timeout_s, verify_timeout_s in candidates:
                 tasks.append(
                     asyncio.create_task(
@@ -1440,7 +1444,8 @@ class MacOSController:
                         failures.append({"success": False, "method": "unknown", "error": str(e)})
                         continue
 
-                    if res.get("success"):
+                    # Check if command executed successfully (rc=0), even if verification failed/timed out
+                    if res.get("returncode") == 0:
                         # Cancel other tasks (they kill their subprocess on cancellation).
                         for p in pending:
                             p.cancel()
@@ -1454,6 +1459,7 @@ class MacOSController:
                             f"(verified={res.get('verified_locked')})"
                         )
                         return True, f"🔒 Locking the screen now, {speaker_name}. See you soon."
+                    
                     failures.append(res)
 
             # Ensure tasks are cleaned up
@@ -1465,7 +1471,9 @@ class MacOSController:
             await _progress("failed", 95, f"Lock failed ({duration_ms:.0f}ms)")
             await voice_feedback("failed")
             logger.warning(f"[LOCK] ❌ Failed to lock screen after {duration_ms:.0f}ms | attempts={failures}")
-            return False, "❌ Unable to lock screen (no method verified lock state)."
+            
+            # If we got here, all commands failed (non-zero exit code)
+            return False, "❌ Unable to lock screen (system commands failed)."
 
         except Exception as e:
             duration_ms = (time.perf_counter() - start_time) * 1000
