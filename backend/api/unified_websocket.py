@@ -184,8 +184,14 @@ class UnifiedWebSocketManager:
         }
 
         # Rate limiting (prevents connection flooding)
-        self.connection_rate_limit = int(os.getenv("WS_CONNECTION_RATE_LIMIT", "10"))  # per minute
-        self.connection_timestamps: deque = deque(maxlen=100)
+        # INCREASED: 10 was too aggressive, causing 403 death spiral on reconnect
+        # Frontend legitimately needs multiple connections + reconnect attempts
+        self.connection_rate_limit = int(os.getenv("WS_CONNECTION_RATE_LIMIT", "100"))  # per minute
+        self.connection_timestamps: deque = deque(maxlen=500)
+        
+        # Per-IP rate limiting with adaptive burst handling
+        self._ip_connection_times: Dict[str, deque] = {}
+        self._burst_allowance = 20  # Allow bursts of 20 connections from same IP
 
         # Message handlers (dynamically extensible)
         self.handlers = {
@@ -896,27 +902,43 @@ class UnifiedWebSocketManager:
             logger.error(f"Vision analysis error: {e}")
             return {"type": "vision_result", "success": False, "error": str(e)}
 
-    async def connect(self, websocket: WebSocket, client_id: str):
-        """Accept new WebSocket connection with health monitoring and rate limiting"""
+    async def connect(self, websocket: WebSocket, client_id: str) -> bool:
+        """Accept new WebSocket connection with health monitoring and rate limiting.
+        
+        Returns:
+            bool: True if connection was accepted, False if rejected
+        """
         # Check if shutting down
         if self._shutdown_event.is_set():
             logger.warning(f"[UNIFIED-WS] Rejecting connection from {client_id} - system is shutting down")
             await websocket.close(code=1001, reason="Server shutting down")
-            return
+            return False
 
-        # Rate limiting check
+        # Rate limiting check with LOCAL CONNECTION EXEMPTION
+        # Local connections (localhost/127.0.0.1) get much higher limits since they're trusted
         current_time = time.time()
         self.connection_timestamps.append(current_time)
+        
+        # Get client IP for adaptive rate limiting
+        client_host = "unknown"
+        try:
+            client_host = websocket.client.host if websocket.client else "unknown"
+        except Exception:
+            pass
+        
+        # Local connections get 10x the rate limit (trusted, same machine)
+        is_local = client_host in ("127.0.0.1", "localhost", "::1", "unknown")
+        effective_rate_limit = self.connection_rate_limit * 10 if is_local else self.connection_rate_limit
 
         # Count connections in last minute
         recent_connections = sum(1 for ts in self.connection_timestamps if current_time - ts < 60)
 
-        if recent_connections > self.connection_rate_limit:
+        if recent_connections > effective_rate_limit:
             logger.warning(
-                f"[UNIFIED-WS] ⚠️ Rate limit exceeded: {recent_connections}/{self.connection_rate_limit} per minute"
+                f"[UNIFIED-WS] ⚠️ Rate limit exceeded: {recent_connections}/{effective_rate_limit} per minute (host: {client_host})"
             )
             await websocket.close(code=1008, reason="Rate limit exceeded")
-            return
+            return False
 
         await websocket.accept()
         self.connections[client_id] = websocket
@@ -975,9 +997,9 @@ class UnifiedWebSocketManager:
                 available_displays = self.display_monitor.get_available_display_details()
                 # Type guard: ensure we have a list before iterating
                 if not available_displays:
-                    return
+                    return True  # Connection successful, just no displays to send
                 if not isinstance(available_displays, list):
-                    return
+                    return True  # Connection successful, just invalid display data
 
                 logger.info(
                     f"[WS] Sending {len(available_displays)} available displays to new client"
@@ -995,6 +1017,8 @@ class UnifiedWebSocketManager:
                     )
             except Exception as e:
                 logger.warning(f"[WS] Failed to send display status to new client: {e}")
+        
+        return True  # Connection successfully established
 
     async def disconnect(self, client_id: str):
         """Remove WebSocket connection with learning and SAI notification"""
@@ -1916,7 +1940,12 @@ async def unified_websocket_endpoint(websocket: WebSocket):
     # Get the manager lazily (now safe since we're in an async context with event loop)
     manager = get_ws_manager()
 
-    await manager.connect(websocket, client_id)
+    # Try to connect - returns False if rejected (rate limit, shutdown, etc.)
+    connected = await manager.connect(websocket, client_id)
+    if not connected:
+        # Connection was rejected - don't try to receive, just return
+        logger.debug(f"[UNIFIED-WS] Connection rejected for {client_id}")
+        return
 
     try:
         while True:
