@@ -1024,8 +1024,9 @@ class UnifiedCommandProcessor:
                 speaker_verification_result = None
         else:
             # Fallback to basic speaker verification if no audio
+            # Also skipped if command is explicit screen lock to avoid blocking
             speaker_verification_result = None
-            if self.speaker_verification:
+            if self.speaker_verification and command_type != CommandType.SCREEN_LOCK:
                 try:
                     speaker_verification_result = await self.speaker_verification.verify_speaker(
                         audio_data, speaker_name
