@@ -16137,8 +16137,6 @@ async def main():
                         # Don't set browser_opened - user needs to open manually
                         # But set the flag to prevent duplicate attempts later
                         globals()['_browser_opened_this_startup'] = True
-                        except Exception:
-                            print(f"{Colors.YELLOW}   ⚠️  Auto-open failed. Navigate to: {loading_server_url}{Colors.ENDC}")
                 else:
                     print(f"{Colors.YELLOW}   ⚠️  Loading server health check failed (server may still be starting){Colors.ENDC}")
                     print(f"{Colors.CYAN}   ℹ️  Attempting to open Chrome Incognito anyway...{Colors.ENDC}")
