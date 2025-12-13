@@ -11124,7 +11124,7 @@ if (typeof localStorage !== 'undefined') {
         
         return False
 
-    async def open_browser_smart(self, custom_url: str = None, force: bool = False):
+    async def open_browser_smart(self, custom_url: str = None, force: bool = False, update_only: bool = False):
         """Open browser intelligently with advanced features.
         
         Features:
@@ -11134,19 +11134,25 @@ if (typeof localStorage !== 'undefined') {
         - Preferred browser selection
         - Smart fallbacks
         - Duplicate tab prevention via session tracking
+        - Update-only mode for URL changes without creating new tabs
 
         Args:
             custom_url: Optional custom URL to open (e.g., loading page)
             force: Force open even if browser was already opened this session
+            update_only: Only update existing tab URL, never create new tab (for restart flows)
         """
         # Prevent duplicate tabs by checking if we already opened browser this session
         # This prevents the loading server AND the startup completion from both opening tabs
         # Check both instance flag AND global flag (for when browser opened before manager created)
         global _browser_opened_this_startup
+        
+        # CRITICAL: If browser was already opened this startup and not forcing, RETURN EARLY
+        # The loading page handles its own redirect to the main app via JavaScript
+        # We don't need to open or update anything - it will cause duplicate tabs
         if (self._browser_opened_this_session or _browser_opened_this_startup) and not force:
-            logger.info("🔒 Browser already opened this session, will only update existing tab URL")
-            # Still fall through to tab reuse logic to update URL in existing tab
-            # But the fallback at the end won't open a NEW tab
+            logger.info("🔒 Browser already opened this session - skipping to prevent duplicate tabs")
+            logger.info("   (Loading page will redirect to main app automatically)")
+            return  # EARLY RETURN - don't fall through to any browser opening logic
         
         if custom_url:
             url = custom_url
@@ -13361,11 +13367,30 @@ except Exception as e:
 
             # Handle browser opening based on restart status
             if self.is_restart:
-                # During restart: Clean up duplicate tabs and show loading page
-                await self.open_browser_smart()  # Will redirect to localhost:3001 (loading page)
-                print(f"{Colors.GREEN}✓ Redirected existing tabs to loading page{Colors.ENDC}")
+                # =========================================================================
+                # RESTART FLOW: Browser already opened by restart sequence
+                # =========================================================================
+                # During restart, the browser is opened BEFORE StartupManager is created
+                # (in the main() restart flow around line 15865-15972).
+                # The loading page (port 3001) displays progress, then redirects to
+                # the main app (port 3000) via JavaScript when startup completes.
+                # 
+                # We do NOT call open_browser_smart() here because:
+                # 1. Browser is already open with the loading page
+                # 2. Loading page will automatically redirect to main app
+                # 3. Calling open_browser_smart() would create duplicate tabs
+                # =========================================================================
+                global _browser_opened_this_startup
+                if _browser_opened_this_startup:
+                    logger.info("🔒 Restart: Browser already opened, loading page will redirect automatically")
+                    print(f"{Colors.GREEN}✓ Loading page will redirect to main app when ready{Colors.ENDC}")
+                else:
+                    # Edge case: browser wasn't opened earlier, open now
+                    await self.open_browser_smart()
+                    print(f"{Colors.GREEN}✓ Opened browser to loading page{Colors.ENDC}")
 
-                # Broadcast startup completion if progress broadcaster exists
+                # Broadcast startup completion to loading server
+                # This triggers the loading page's redirect to the main app
                 if hasattr(self, '_startup_progress') and self._startup_progress:
                     await self._startup_progress.broadcast_complete(
                         success=True,
