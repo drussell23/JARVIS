@@ -974,8 +974,14 @@ class UnifiedCommandProcessor:
         # Track command frequency
         self.command_stats[command_text.lower()] += 1
 
+        # Step 1: Classify command intent EARLY to optimize processing path
+        # This allows us to skip expensive verification for commands that don't need it (like screen lock)
+        command_type, confidence = await self._classify_command(command_text)
+        logger.info(f"[UNIFIED] Classified as {command_type.value} (confidence: {confidence})")
+
         # NEW: Use speaker-aware command handler with CAI/SAI if audio provided
-        if audio_data:
+        # OPTIMIZATION: Skip heavy VBI for screen lock commands to avoid "Processing..." hang
+        if audio_data and command_type != CommandType.SCREEN_LOCK:
             try:
                 from voice.speaker_aware_command_handler import get_speaker_aware_handler
 
@@ -1063,9 +1069,9 @@ class UnifiedCommandProcessor:
             except Exception as e:
                 logger.warning(f"[UNIFIED] Query complexity classification failed: {e}")
 
-        # Step 2: Classify command intent
-        command_type, confidence = await self._classify_command(command_text)
-        logger.info(f"[UNIFIED] Classified as {command_type.value} (confidence: {confidence})")
+        # Step 2: Classify command intent (Already done above)
+        # command_type, confidence = await self._classify_command(command_text)
+        # logger.info(f"[UNIFIED] Classified as {command_type.value} (confidence: {confidence})")
 
         # Step 3: Check system context FIRST (screen lock, active apps, etc.)
         # IMPORTANT: Use fast non-blocking system context retrieval
