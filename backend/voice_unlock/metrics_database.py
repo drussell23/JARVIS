@@ -3172,14 +3172,17 @@ class MetricsDatabase:
             is_tv = display_context.get('is_tv_connected', False)
 
             # Determine display identifier
+            external_display = display_context.get('external_display')
+            primary_display = display_context.get('primary_display') or {}
+            
             if is_tv and display_context.get('tv_name'):
                 display_identifier = display_context['tv_name']
                 display_type = 'TV'
-            elif display_context.get('external_display', {}).get('name'):
-                display_identifier = display_context['external_display']['name']
+            elif external_display and external_display.get('name'):
+                display_identifier = external_display['name']
                 display_type = 'MONITOR'
             else:
-                display_identifier = display_context.get('primary_display', {}).get('name', 'Built-in Display')
+                display_identifier = primary_display.get('name', 'Built-in Display')
                 display_type = 'BUILTIN'
 
             # Get resolution

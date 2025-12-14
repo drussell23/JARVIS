@@ -410,16 +410,27 @@ class DisplayDetector:
         context = DisplayContext()
 
         try:
-            # Method 1: Core Graphics (fast, accurate for display list)
-            if self._cg_available:
-                displays = await self._detect_via_core_graphics()
-                context.displays = displays
-                context.detection_method = "core_graphics"
-            else:
-                # Fallback to System Profiler
-                displays = await self._detect_via_system_profiler()
-                context.displays = displays
-                context.detection_method = "system_profiler"
+            # Enforce strict total timeout for detection
+            async def _run_detection():
+                # Method 1: Core Graphics (fast, accurate for display list)
+                if self._cg_available:
+                    displays = await self._detect_via_core_graphics()
+                    context.displays = displays
+                    context.detection_method = "core_graphics"
+                else:
+                    # Fallback to System Profiler
+                    displays = await self._detect_via_system_profiler()
+                    context.displays = displays
+                    context.detection_method = "system_profiler"
+                return displays
+
+            try:
+                # 🛡️ SAFETY: 2.0s hard timeout for display detection
+                await asyncio.wait_for(_run_detection(), timeout=2.0)
+            except asyncio.TimeoutError:
+                logger.warning("⏱️ Display detection TIMED OUT (2.0s limit) - proceeding with default context")
+                context.detection_method = "timeout"
+                return context
 
             # Analyze display configuration
             context.total_displays = len(context.displays)
@@ -500,11 +511,16 @@ class DisplayDetector:
             display_array = (ctypes.c_uint32 * max_displays)()
             display_count = ctypes.c_uint32()
 
-            result = self._cg.CGGetActiveDisplayList(
-                max_displays,
-                display_array,
-                ctypes.byref(display_count)
-            )
+            # 🛡️ SAFETY: Run ctypes in thread pool to prevent blocking main loop
+            # if WindowServer is slow
+            def _get_active_displays():
+                return self._cg.CGGetActiveDisplayList(
+                    max_displays,
+                    display_array,
+                    ctypes.byref(display_count)
+                )
+
+            result = await asyncio.to_thread(_get_active_displays)
 
             if result != 0:
                 logger.error(f"CGGetActiveDisplayList failed with code {result}")
@@ -569,12 +585,13 @@ class DisplayDetector:
 
         # Try to get name from ioreg
         try:
+            # 🛡️ SAFETY: Time-bound execution
             proc = await asyncio.create_subprocess_exec(
                 "ioreg", "-lw0", "-r", "-c", "IODisplayConnect",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE
             )
-            stdout, _ = await proc.communicate()
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=1.5)
             output = stdout.decode()
 
             # Parse for display names
@@ -596,12 +613,13 @@ class DisplayDetector:
         displays = []
 
         try:
+            # 🛡️ SAFETY: Time-bound subprocess execution
             proc = await asyncio.create_subprocess_exec(
                 "system_profiler", "SPDisplaysDataType", "-json",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE
             )
-            stdout, _ = await proc.communicate()
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=3.0)
 
             data = json.loads(stdout.decode())
             graphics_data = data.get("SPDisplaysDataType", [])

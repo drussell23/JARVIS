@@ -1316,13 +1316,38 @@ async def type_password_with_display_awareness(
             get_optimal_typing_strategy,
             TypingStrategy,
             DisplayContext,
+            TypingConfig,
         )
 
         logger.info("🖥️ [SAI] Running Display-Aware Situational Intelligence...")
 
         # Get optimal strategy from SAI
         detection_start = time.time()
-        typing_config, display_context, reasoning = await get_optimal_typing_strategy()
+        try:
+            # 🛡️ SAFETY: Fail-safe timeout for strategy detection
+            # If detection hangs (e.g. unresponsive WindowServer or subprocess), we shouldn't block unlock
+            logger.debug("🖥️ [SAI] Starting optimal strategy detection with 2.5s timeout...")
+            typing_config, display_context, reasoning = await asyncio.wait_for(
+                get_optimal_typing_strategy(),
+                timeout=2.5
+            )
+        except asyncio.TimeoutError:
+            logger.warning("🖥️ [SAI] Detection TIMED OUT - defaulting to Core Graphics")
+            # Create minimal default context
+            typing_config = TypingConfig(
+                strategy=TypingStrategy.CORE_GRAPHICS_FAST,
+                base_keystroke_delay_ms=50,
+                key_press_duration_ms=40,
+                shift_register_delay_ms=30,
+                wake_delay_ms=500,
+                submit_delay_ms=100,
+                retry_count=3,
+                use_applescript_fallback=True
+            )
+            display_context = DisplayContext()
+            display_context_dict = display_context.to_dict()
+            reasoning = ["TIMEOUT fallback"]
+            
         detection_time_ms = (time.time() - detection_start) * 1000
 
         # Store detection metrics
@@ -1468,25 +1493,26 @@ async def _store_display_tracking_data(
 
         # 3. Update display success history (per-display learning)
         # Determine display identifier
+        external_display = display_context.get('external_display')
+        primary_display = display_context.get('primary_display') or {}
+        
         if is_tv and tv_name:
             display_identifier = tv_name
             display_type = 'TV'
-        elif display_context.get('external_display', {}).get('name'):
-            display_identifier = display_context['external_display']['name']
+        elif external_display and external_display.get('name'):
+            display_identifier = external_display['name']
             display_type = 'MONITOR'
         else:
-            display_identifier = display_context.get('primary_display', {}).get('name', 'Built-in Display')
+            display_identifier = primary_display.get('name', 'Built-in Display')
             display_type = 'BUILTIN'
 
         # Get resolution
         if is_tv and tv_info:
             resolution = f"{tv_info.get('width', 0)}x{tv_info.get('height', 0)}"
-        elif display_context.get('external_display'):
-            ext = display_context['external_display']
-            resolution = f"{ext.get('width', 0)}x{ext.get('height', 0)}"
+        elif external_display:
+            resolution = f"{external_display.get('width', 0)}x{external_display.get('height', 0)}"
         else:
-            primary = display_context.get('primary_display', {})
-            resolution = f"{primary.get('width', 0)}x{primary.get('height', 0)}"
+            resolution = f"{primary_display.get('width', 0)}x{primary_display.get('height', 0)}"
 
         history_id = await db.update_display_success_history(
             display_identifier=display_identifier,
