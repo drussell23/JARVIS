@@ -2344,19 +2344,50 @@ class JARVISVoiceAPI:
                                 # Continue to normal processing if this fails
 
                             # =========================================================================
-                            # ULTRA FAST PATH v1.0: Screen lock commands bypass ALL context processing
-                            # This prevents infinite loops and import errors in context handlers
+                            # ULTRA FAST PATH v2.0: Screen lock commands bypass ALL context processing
+                            # Robust wake phrase removal + flexible lock detection
                             # =========================================================================
-                            command_lower = command_text.lower().strip()
-                            if "lock" in command_lower and "unlock" not in command_lower and ("screen" in command_lower or "mac" in command_lower or "computer" in command_lower):
-                                logger.info(f"[JARVIS WS] 🔒 LOCK command detected - DIRECT EXECUTION (bypassing context handlers)")
+                            import re
+
+                            # Strip wake phrases (handles typos from voice recognition)
+                            wake_patterns = [
+                                r'\bhey\s+jarvis\b', r'\bhey\s+jarvus\b', r'\bhey\s+drivers\b',
+                                r'\bhey\s+jarvas\b', r'\bokay\s+jarvis\b', r'\byo\s+jarvis\b',
+                                r'\bjarvis\b', r'\bjarvus\b', r'\bdrivers\b'
+                            ]
+
+                            cleaned_command = command_text.lower().strip()
+                            wake_phrase_detected = None
+
+                            for pattern in wake_patterns:
+                                match = re.search(pattern, cleaned_command, re.IGNORECASE)
+                                if match:
+                                    wake_phrase_detected = match.group(0)
+                                    cleaned_command = re.sub(pattern, '', cleaned_command, count=1, flags=re.IGNORECASE)
+                                    cleaned_command = re.sub(r'\s+', ' ', cleaned_command).strip()
+                                    break
+
+                            # Detect lock command (flexible pattern matching)
+                            has_lock = re.search(r'\block\b', cleaned_command)
+                            has_unlock = re.search(r'\bunlock\b', cleaned_command)
+                            has_target = re.search(r'\b(screen|mac|computer|it|this)\b', cleaned_command)
+
+                            is_lock_command = has_lock and not has_unlock and (has_target or len(cleaned_command.split()) <= 3)
+
+                            if is_lock_command:
+                                logger.info(f"[JARVIS WS] 🔒 LOCK command detected - DIRECT EXECUTION")
+                                logger.info(f"[JARVIS WS]    Original: '{command_text}'")
+                                logger.info(f"[JARVIS WS]    Cleaned:  '{cleaned_command}'")
+                                if wake_phrase_detected:
+                                    logger.info(f"[JARVIS WS]    Wake phrase removed: '{wake_phrase_detected}'")
 
                                 try:
                                     from .unified_command_processor import get_unified_processor
                                     processor = get_unified_processor(self.api_key)
 
+                                    # Use cleaned command (wake phrase removed) for processing
                                     result = await asyncio.wait_for(
-                                        processor.process_command(command_text, websocket, audio_data=self.last_audio_data, speaker_name=self.last_speaker_name),
+                                        processor.process_command(cleaned_command, websocket, audio_data=self.last_audio_data, speaker_name=self.last_speaker_name),
                                         timeout=10.0
                                     )
                                     logger.info(f"[JARVIS WS] ✅ Lock command completed successfully")
