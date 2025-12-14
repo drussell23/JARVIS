@@ -130,14 +130,19 @@ async def applescript_handler(action: str, context: Dict[str, Any], **kwargs) ->
                 }
 
         elif action == "lock_screen":
-            # Prefer a non-interactive lock that doesn't depend on Accessibility permissions.
-            # Verify lock state when possible to avoid false positives.
-            if _is_locked_now() is True:
-                return {"success": True, "method": "already_locked", "action": action}
-
+            # =================================================================
+            # FAST LOCK v2.0 - Fire-and-forget, NO blocking verification
+            # =================================================================
+            # The _wait_for_locked() function uses synchronous subprocess calls
+            # that block the event loop, causing the UI to hang on "Locking..."
+            # 
+            # Solution: Execute lock command and return immediately if successful.
+            # Do NOT poll for lock verification - trust the command return code.
+            # =================================================================
+            
             attempted: List[str] = []
 
-            # Method 1: CGSession -suspend (best effort, typically most reliable)
+            # Method 1: CGSession -suspend (most reliable, no UI/Accessibility needed)
             cgsession_path = "/System/Library/CoreServices/Menu Extras/User.menu/Contents/Resources/CGSession"
             have_cgsession = os.path.exists(cgsession_path)
             have_launchctl = bool(shutil.which("launchctl"))
@@ -153,47 +158,48 @@ async def applescript_handler(action: str, context: Dict[str, Any], **kwargs) ->
                 else:
                     cmd = [cgsession_path, "-suspend"]
 
-                _stdout, _stderr, rc = await _run_subprocess(cmd, timeout_s=4.0)
-                verified = await _wait_for_locked(timeout_s=2.0)
-                if verified is True or (verified is None and rc == 0):
-                    logger.info(f"[APPLESCRIPT] ✅ {action} succeeded via CGSession (verified={verified})")
+                _stdout, _stderr, rc = await _run_subprocess(cmd, timeout_s=3.0)
+                # FAST: Return immediately if command succeeded (rc == 0)
+                # Do NOT wait for verification - it blocks the event loop!
+                if rc == 0:
+                    logger.info(f"[APPLESCRIPT] ✅ {action} succeeded via CGSession (rc=0, no blocking verification)")
                     return {"success": True, "method": "cgsession", "action": action}
 
-            # Method 2: AppleScript shortcut (may require Accessibility permission)
+            # Method 2: AppleScript shortcut (requires Accessibility permission)
             if shutil.which("osascript"):
                 attempted.append("osascript")
                 script = 'tell application "System Events" to keystroke "q" using {command down, control down}'
                 _stdout, stderr, rc = await _run_subprocess(["osascript", "-e", script], timeout_s=2.0)
-                verified = await _wait_for_locked(timeout_s=2.0)
-                if verified is True or (verified is None and rc == 0):
-                    logger.info(f"[APPLESCRIPT] ✅ {action} succeeded via osascript (verified={verified})")
+                # FAST: Return immediately if command succeeded
+                if rc == 0:
+                    logger.info(f"[APPLESCRIPT] ✅ {action} succeeded via osascript (rc=0, no blocking verification)")
                     return {"success": True, "method": "applescript_shortcut", "action": action}
 
                 error_msg = stderr.decode(errors="replace").strip() if stderr else "unknown error"
-                logger.error(f"[APPLESCRIPT] ❌ Lock shortcut failed: {error_msg}")
+                logger.debug(f"[APPLESCRIPT] osascript lock failed: {error_msg}")
 
             # Method 3: pmset displaysleepnow (non-UI, generally available)
             if shutil.which("pmset"):
                 attempted.append("pmset")
-                _stdout, _stderr, rc = await _run_subprocess(["pmset", "displaysleepnow"], timeout_s=3.5)
-                verified = await _wait_for_locked(timeout_s=2.5)
-                if verified is True or (verified is None and rc == 0):
-                    logger.info(f"[APPLESCRIPT] ✅ {action} succeeded via pmset (verified={verified})")
+                _stdout, _stderr, rc = await _run_subprocess(["pmset", "displaysleepnow"], timeout_s=2.0)
+                # FAST: Return immediately if command succeeded
+                if rc == 0:
+                    logger.info(f"[APPLESCRIPT] ✅ {action} succeeded via pmset (rc=0, no blocking verification)")
                     return {"success": True, "method": "pmset", "action": action}
 
-            # Method 4: Start screensaver (locks if system security is configured to require auth immediately)
+            # Method 4: Start screensaver (locks if system security requires auth immediately)
             if shutil.which("open"):
                 attempted.append("screensaver")
-                _stdout, _stderr, rc = await _run_subprocess(["open", "-a", "ScreenSaverEngine"], timeout_s=2.5)
-                verified = await _wait_for_locked(timeout_s=2.5)
-                if verified is True or (verified is None and rc == 0):
-                    logger.info(f"[APPLESCRIPT] ✅ {action} succeeded via screensaver (verified={verified})")
+                _stdout, _stderr, rc = await _run_subprocess(["open", "-a", "ScreenSaverEngine"], timeout_s=2.0)
+                # FAST: Return immediately if command succeeded
+                if rc == 0:
+                    logger.info(f"[APPLESCRIPT] ✅ {action} succeeded via screensaver (rc=0, no blocking verification)")
                     return {"success": True, "method": "screensaver", "action": action}
 
             return {
                 "success": False,
                 "error": "lock_failed",
-                "message": "Unable to lock screen (no method verified lock state)",
+                "message": "Unable to lock screen (all methods failed)",
                 "attempted_methods": attempted,
             }
 

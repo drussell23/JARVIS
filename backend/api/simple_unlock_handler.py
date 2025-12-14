@@ -1038,7 +1038,10 @@ async def _try_unlock_methods(context: Dict[str, Any]) -> Dict[str, Any]:
 
 
 async def _try_macos_controller_lock(context: Dict[str, Any]) -> Tuple[bool, str]:
-    """Try AppleScript Command+Control+Q lock method (fastest and most reliable)."""
+    """Try AppleScript Command+Control+Q lock method (fastest and most reliable).
+    
+    FAST v2.0: Returns immediately on success, NO blocking verification.
+    """
     try:
         script = """
         tell application "System Events"
