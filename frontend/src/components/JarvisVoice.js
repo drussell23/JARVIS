@@ -3184,12 +3184,16 @@ const JarvisVoice = () => {
       console.log(`🚀 Priority command sent in ${Date.now() - commandStartTime}ms`);
       if (effectiveCommandType === 'lock') {
         setResponse('🔒 Locking...');
+        // Locking can interrupt the UI/WS (screen locks, browser suspends, etc.).
+        // Don't leave the UI stuck in a "processing" state if the backend response never arrives.
+        setIsProcessing(false);
       } else if (effectiveCommandType === 'unlock') {
         setResponse('🔓 Unlocking...');
+        setIsProcessing(true);
       } else {
         setResponse('⚡ Processing...');
+        setIsProcessing(true);
       }
-      setIsProcessing(true);
     } catch (sendError) {
       console.error('[WS] Failed to send priority command:', sendError);
       sendTextCommand(command);

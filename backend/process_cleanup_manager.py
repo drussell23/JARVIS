@@ -2083,9 +2083,13 @@ class ProcessCleanupManager:
         if not cloud_url:
             # Explicit opt-in only: do not assume a Cloud Run endpoint.
             return False
-        # Handle if URL already has /api/ml suffix
-        base_url = cloud_url.rstrip('/').replace('/api/ml', '')
-        health_url = f"{base_url}/health"
+        # Handle if URL already has /api/ml suffix (or /api/ml/*)
+        base_url = cloud_url.rstrip('/')
+        if "/api/ml" in base_url:
+            base_url = base_url.split("/api/ml", 1)[0]
+
+        # Prefer ECAPA service-specific health first, then fall back to root /health.
+        health_urls = [f"{base_url}/api/ml/health", f"{base_url}/health"]
         
         # Strategy 1: Try aiohttp with generous timeout for cold start
         try:
@@ -2095,18 +2099,20 @@ class ProcessCleanupManager:
                 connector=aiohttp.TCPConnector(ssl=False, limit=1),
                 timeout=aiohttp.ClientTimeout(total=15, connect=10)
             ) as session:
-                async with session.get(health_url) as resp:
-                    if resp.status == 200:
+                for url in health_urls:
+                    async with session.get(url) as resp:
+                        if resp.status != 200:
+                            continue
                         data = await resp.json()
-                        is_ready = data.get("ecapa_ready", False)
-                        if is_ready:
+                        if "ecapa_ready" not in data:
+                            # Not the ECAPA service schema (likely wrong endpoint)
+                            continue
+                        if data.get("ecapa_ready", False):
                             logger.info(f"☁️  Cloud Run is ready (ecapa_ready: True)")
                             return True
-                        else:
-                            logger.warning(f"☁️  Cloud Run responded but ECAPA not ready")
-                            return False
-                    else:
-                        logger.warning(f"☁️  Cloud Run health returned {resp.status}")
+                        # Schema present, explicitly not ready
+                        logger.warning(f"☁️  Cloud Run responded but ECAPA not ready")
+                        return False
         except asyncio.TimeoutError:
             logger.warning(f"☁️  Cloud Run health check timeout (cold start?)")
         except Exception as e:
@@ -2116,11 +2122,14 @@ class ProcessCleanupManager:
         try:
             import httpx
             async with httpx.AsyncClient(timeout=15.0, verify=False) as client:
-                resp = await client.get(health_url)
-                if resp.status_code == 200:
+                for url in health_urls:
+                    resp = await client.get(url)
+                    if resp.status_code != 200:
+                        continue
                     data = resp.json()
-                    is_ready = data.get("ecapa_ready", False)
-                    if is_ready:
+                    if "ecapa_ready" not in data:
+                        continue
+                    if data.get("ecapa_ready", False):
                         logger.info(f"☁️  Cloud Run ready via httpx")
                         return True
         except ImportError:
@@ -2135,10 +2144,14 @@ class ProcessCleanupManager:
             
             def sync_check():
                 try:
-                    resp = requests.get(health_url, timeout=15, verify=False)
-                    if resp.status_code == 200:
+                    for url in health_urls:
+                        resp = requests.get(url, timeout=15, verify=False)
+                        if resp.status_code != 200:
+                            continue
                         data = resp.json()
-                        return data.get("ecapa_ready", False)
+                        if "ecapa_ready" not in data:
+                            continue
+                        return bool(data.get("ecapa_ready", False))
                 except Exception as e:
                     logger.debug(f"Sync Cloud Run check failed: {e}")
                 return False

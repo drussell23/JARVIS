@@ -190,6 +190,17 @@ class TransportManager:
         # Get prioritized list of methods
         methods = self._select_transport_methods()
 
+        # Screen control actions should strongly prefer local execution paths.
+        # This avoids unnecessary loopback HTTP calls and prevents accidental recursion.
+        if action in ("lock_screen", "unlock_screen") and methods:
+            preferred = [
+                TransportMethod.APPLESCRIPT,
+                TransportMethod.SYSTEM_API,
+                TransportMethod.HTTP_REST,
+                TransportMethod.UNIFIED_WEBSOCKET,
+            ]
+            methods = [m for m in preferred if m in methods] + [m for m in methods if m not in preferred]
+
         if not methods:
             logger.error("[TRANSPORT] No healthy transport methods available")
             return {

@@ -56,44 +56,32 @@ async def unlock_screen(request: ScreenActionRequest, req: Request) -> ScreenAct
     - {"method": "keychain", "reason": "voice_authenticated", "authenticated_user": "Derek"}
     """
     import time
+
+    # IMPORTANT: This REST endpoint must NOT call `handle_unlock_command()`.
+    # `handle_unlock_command()` uses the TransportManager, which includes an HTTP REST transport
+    # that calls *this* endpoint. That creates recursion and can manifest as the frontend hanging
+    # on "🔒 Locking..." / "🔓 Unlocking...".
     start_time = time.time()
 
     try:
-        from api.simple_unlock_handler import handle_unlock_command
+        from macos_keychain_unlock import MacOSKeychainUnlock
 
-        # Build command from request
-        command = "unlock my screen"
+        unlock_service = MacOSKeychainUnlock()
 
-        # Get jarvis instance if available
-        jarvis_instance = getattr(req.app.state, "jarvis_instance", None)
+        # If a trusted caller already authenticated the user, pass it through for better messaging.
+        verified = request.authenticated_user or None
 
-        # Execute unlock
-        result = await handle_unlock_command(command, jarvis_instance)
-
+        result = await unlock_service.unlock_screen(verified_speaker=verified)
         latency = (time.time() - start_time) * 1000
 
         return ScreenActionResponse(
-            success=result.get("success", False),
+            success=bool(result.get("success", False)),
             action="unlock",
             method=request.method or result.get("method", "keychain"),
-            latency_ms=result.get("latency_ms", latency),
-            verified_speaker=request.authenticated_user or result.get("verified_speaker"),
-            message=result.get("message") or f"Screen unlock requested via {request.method or 'default'} method",
+            latency_ms=float(result.get("latency_ms", latency) or latency),
+            verified_speaker=verified or result.get("verified_speaker") or result.get("verified_speaker_name"),
+            message=result.get("message") or result.get("response") or "Unlock requested.",
             error=result.get("error"),
-        )
-
-    except ImportError:
-        # Fallback when unlock handler isn't available - simulate success for testing
-        latency = (time.time() - start_time) * 1000
-        logger.warning("[SCREEN-API] simple_unlock_handler not available, returning simulated success")
-        return ScreenActionResponse(
-            success=True,
-            action="unlock",
-            method=request.method or "simulated",
-            latency_ms=latency,
-            verified_speaker=request.authenticated_user,
-            message=f"Screen unlock simulated (reason: {request.reason or 'api_request'})",
-            error=None,
         )
 
     except Exception as e:
@@ -109,26 +97,31 @@ async def lock_screen(request: ScreenActionRequest, req: Request) -> ScreenActio
     This endpoint provides HTTP fallback when WebSocket is unavailable.
     Automatically selects the best available transport method.
     """
+    import time
+
+    # IMPORTANT: This REST endpoint must NOT call `handle_unlock_command()` for the same
+    # recursion reason described in unlock_screen().
+    start_time = time.time()
+
     try:
-        from api.simple_unlock_handler import handle_unlock_command
+        from system_control.macos_controller import MacOSController
 
-        # Build command from request
-        command = "lock my screen"
+        controller = MacOSController()
 
-        # Get jarvis instance if available
-        jarvis_instance = getattr(req.app.state, "jarvis_instance", None)
+        # Best-effort personalization (do not block lock execution)
+        speaker = request.authenticated_user or None
+        success, message = await controller.lock_screen(enable_voice_feedback=False, speaker_name=speaker)
 
-        # Execute lock
-        result = await handle_unlock_command(command, jarvis_instance)
+        latency = (time.time() - start_time) * 1000
 
         return ScreenActionResponse(
-            success=result.get("success", False),
+            success=bool(success),
             action="lock",
-            method=result.get("method"),
-            latency_ms=result.get("latency_ms"),
-            verified_speaker=result.get("verified_speaker"),
-            message=result.get("message"),
-            error=result.get("error"),
+            method=request.method or "system_api",
+            latency_ms=latency,
+            verified_speaker=speaker,
+            message=message or "Lock requested.",
+            error=None if success else "lock_failed",
         )
 
     except Exception as e:

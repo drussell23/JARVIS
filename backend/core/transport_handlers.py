@@ -131,22 +131,28 @@ async def applescript_handler(action: str, context: Dict[str, Any], **kwargs) ->
 
         elif action == "lock_screen":
             # =================================================================
-            # FAST LOCK v2.0 - Fire-and-forget, NO blocking verification
+            # FAST LOCK v3.0 - Non-blocking, cancellation-safe, and no recursion
             # =================================================================
-            # The _wait_for_locked() function uses synchronous subprocess calls
-            # that block the event loop, causing the UI to hang on "Locking..."
-            # 
-            # Solution: Execute lock command and return immediately if successful.
-            # Do NOT poll for lock verification - trust the command return code.
+            # Goal: return a result quickly so the frontend never hangs on "🔒 Locking...".
+            #
+            # Strategy:
+            # - Try non-UI methods first (CGSession / pmset / screensaver) in PARALLEL
+            # - Only attempt AppleScript keystroke as a last resort (may prompt for Accessibility)
+            # - Trust return codes; do NOT block on lock-state verification
             # =================================================================
-            
-            attempted: List[str] = []
 
-            # Method 1: CGSession -suspend (most reliable, no UI/Accessibility needed)
+            attempted: List[str] = []
+            failures: List[Dict[str, Any]] = []
+
+            # Build candidates
             cgsession_path = "/System/Library/CoreServices/Menu Extras/User.menu/Contents/Resources/CGSession"
             have_cgsession = os.path.exists(cgsession_path)
             have_launchctl = bool(shutil.which("launchctl"))
 
+            primary: List[Tuple[str, List[str], float]] = []
+            secondary: List[Tuple[str, List[str], float]] = []
+
+            # CGSession -suspend (most reliable, no UI/Accessibility needed)
             if have_cgsession:
                 attempted.append("cgsession")
                 if os.geteuid() == 0 and have_launchctl:
@@ -157,50 +163,115 @@ async def applescript_handler(action: str, context: Dict[str, Any], **kwargs) ->
                         cmd = [cgsession_path, "-suspend"]
                 else:
                     cmd = [cgsession_path, "-suspend"]
+                primary.append(("cgsession", cmd, 3.0))
 
-                _stdout, _stderr, rc = await _run_subprocess(cmd, timeout_s=3.0)
-                # FAST: Return immediately if command succeeded (rc == 0)
-                # Do NOT wait for verification - it blocks the event loop!
-                if rc == 0:
-                    logger.info(f"[APPLESCRIPT] ✅ {action} succeeded via CGSession (rc=0, no blocking verification)")
-                    return {"success": True, "method": "cgsession", "action": action}
+            # pmset displaysleepnow (non-UI, generally available)
+            if shutil.which("pmset"):
+                attempted.append("pmset")
+                primary.append(("pmset", ["pmset", "displaysleepnow"], 2.0))
 
-            # Method 2: AppleScript shortcut (requires Accessibility permission)
+            # Screensaver (locks if system requires re-auth immediately)
+            if shutil.which("open"):
+                attempted.append("screensaver")
+                primary.append(("screensaver", ["open", "-a", "ScreenSaverEngine"], 2.0))
+
+            # AppleScript keystroke (may require Accessibility)
             if shutil.which("osascript"):
                 attempted.append("osascript")
                 script = 'tell application "System Events" to keystroke "q" using {command down, control down}'
-                _stdout, stderr, rc = await _run_subprocess(["osascript", "-e", script], timeout_s=2.0)
-                # FAST: Return immediately if command succeeded
-                if rc == 0:
-                    logger.info(f"[APPLESCRIPT] ✅ {action} succeeded via osascript (rc=0, no blocking verification)")
-                    return {"success": True, "method": "applescript_shortcut", "action": action}
+                secondary.append(("osascript", ["osascript", "-e", script], 2.0))
 
-                error_msg = stderr.decode(errors="replace").strip() if stderr else "unknown error"
-                logger.debug(f"[APPLESCRIPT] osascript lock failed: {error_msg}")
+            if not primary and not secondary:
+                return {
+                    "success": False,
+                    "error": "lock_failed",
+                    "message": "Unable to lock screen (no lock methods available)",
+                    "attempted_methods": attempted,
+                }
 
-            # Method 3: pmset displaysleepnow (non-UI, generally available)
-            if shutil.which("pmset"):
-                attempted.append("pmset")
-                _stdout, _stderr, rc = await _run_subprocess(["pmset", "displaysleepnow"], timeout_s=2.0)
-                # FAST: Return immediately if command succeeded
-                if rc == 0:
-                    logger.info(f"[APPLESCRIPT] ✅ {action} succeeded via pmset (rc=0, no blocking verification)")
-                    return {"success": True, "method": "pmset", "action": action}
+            async def _run_group(candidates: List[Tuple[str, List[str], float]], group_timeout_s: float) -> Optional[Dict[str, Any]]:
+                """Run candidates in parallel; return first success result dict or None."""
+                if not candidates:
+                    return None
 
-            # Method 4: Start screensaver (locks if system security requires auth immediately)
-            if shutil.which("open"):
-                attempted.append("screensaver")
-                _stdout, _stderr, rc = await _run_subprocess(["open", "-a", "ScreenSaverEngine"], timeout_s=2.0)
-                # FAST: Return immediately if command succeeded
-                if rc == 0:
-                    logger.info(f"[APPLESCRIPT] ✅ {action} succeeded via screensaver (rc=0, no blocking verification)")
-                    return {"success": True, "method": "screensaver", "action": action}
+                loop = asyncio.get_running_loop()
+                deadline = loop.time() + group_timeout_s
+
+                task_to_method: Dict[asyncio.Task, Tuple[str, List[str]]] = {}
+                pending: set = set()
+                for method, cmd, timeout_s in candidates:
+                    t = asyncio.create_task(_run_subprocess(cmd, timeout_s=timeout_s))
+                    task_to_method[t] = (method, cmd)
+                    pending.add(t)
+
+                try:
+                    while pending and loop.time() < deadline:
+                        done, pending = await asyncio.wait(
+                            pending,
+                            timeout=max(0.0, deadline - loop.time()),
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        if not done:
+                            break
+
+                        for t in done:
+                            method, _cmd = task_to_method.get(t, ("unknown", []))
+                            try:
+                                stdout, stderr, rc = t.result()
+                            except asyncio.CancelledError:
+                                raise
+                            except Exception as e:
+                                failures.append({"method": method, "error": str(e)})
+                                continue
+
+                            if rc == 0:
+                                # Cancel remaining attempts
+                                for p in pending:
+                                    p.cancel()
+                                await asyncio.gather(*pending, return_exceptions=True)
+
+                                logger.info(
+                                    f"[APPLESCRIPT] ✅ {action} succeeded via {method} "
+                                    f"(rc=0, parallel fast path)"
+                                )
+                                return {"success": True, "method": method, "action": action}
+
+                            # Record failure details (useful for debugging without blocking)
+                            failures.append(
+                                {
+                                    "method": method,
+                                    "returncode": rc,
+                                    "stderr": stderr.decode(errors="replace").strip() if stderr else "",
+                                }
+                            )
+
+                finally:
+                    for p in pending:
+                        p.cancel()
+                    await asyncio.gather(*pending, return_exceptions=True)
+
+                return None
+
+            # Run primary non-UI methods first (fast + avoids Accessibility prompts)
+            # Keep within TransportManager's default applescript timeout (5s)
+            primary_result = await _run_group(primary, group_timeout_s=3.0)
+            if primary_result:
+                return primary_result
+
+            # If primary failed, try AppleScript as last resort
+            secondary_result = await _run_group(secondary, group_timeout_s=1.7)
+            if secondary_result:
+                # Normalize method name for backward compatibility
+                if secondary_result.get("method") == "osascript":
+                    secondary_result["method"] = "applescript_shortcut"
+                return secondary_result
 
             return {
                 "success": False,
                 "error": "lock_failed",
                 "message": "Unable to lock screen (all methods failed)",
                 "attempted_methods": attempted,
+                "failures": failures,
             }
 
         else:
@@ -210,6 +281,8 @@ async def applescript_handler(action: str, context: Dict[str, Any], **kwargs) ->
                 "message": f"Unknown action: {action}",
             }
 
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         logger.error(f"[APPLESCRIPT] Exception: {e}", exc_info=True)
         return {
@@ -245,21 +318,34 @@ async def http_rest_handler(action: str, context: Dict[str, Any], **kwargs) -> D
     logger.info(f"[HTTP-REST] Executing {action}")
 
     try:
+        # Allow task cancellation to propagate (important for wait_for timeouts)
+        # NOTE: In Python 3.9, CancelledError subclasses Exception, so we must re-raise explicitly.
+        # (No-op here; included for symmetry with other handlers.)
         import aiohttp
 
+        backend_port = os.getenv("BACKEND_PORT", "8010")
+        base_url = f"http://localhost:{backend_port}"
+
         endpoint_map = {
-            "unlock_screen": "http://localhost:8000/api/screen/unlock",
-            "lock_screen": "http://localhost:8000/api/screen/lock",
+            "unlock_screen": f"{base_url}/api/screen/unlock",
+            "lock_screen": f"{base_url}/api/screen/lock",
         }
 
         endpoint = endpoint_map.get(action)
         if not endpoint:
             return {"success": False, "error": "unknown_action"}
 
+        request_action = "unlock" if action == "unlock_screen" else ("lock" if action == "lock_screen" else action)
+        authenticated_user = context.get("verified_speaker_name") or context.get("speaker_name")
+
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 endpoint,
-                json={"action": action, "context": context},
+                json={
+                    "action": request_action,
+                    "authenticated_user": authenticated_user,
+                    "context": context,
+                },
                 timeout=aiohttp.ClientTimeout(total=3.0),
             ) as response:
                 if response.status == 200:
@@ -275,6 +361,8 @@ async def http_rest_handler(action: str, context: Dict[str, Any], **kwargs) -> D
                         "message": f"HTTP {response.status}: {error_text}",
                     }
 
+    except asyncio.CancelledError:
+        raise
     except asyncio.TimeoutError:
         logger.warning("[HTTP-REST] Request timed out")
         return {"success": False, "error": "http_timeout"}
@@ -329,6 +417,8 @@ async def unified_websocket_handler(
             "action": action,
         }
 
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         logger.error(f"[UNIFIED-WS] Exception: {e}", exc_info=True)
         return {
@@ -349,11 +439,29 @@ async def system_api_handler(action: str, context: Dict[str, Any], **kwargs) -> 
 
     try:
         if action == "lock_screen":
-            # Keep lock behavior consistent with the AppleScript transport, but label as system_api.
-            result = await applescript_handler(action, context, **kwargs)
-            if result.get("success"):
-                result["method"] = "system_api"
-            return result
+            # Use the macOS controller directly (more robust than routing back to AppleScript here).
+            try:
+                from system_control.macos_controller import MacOSController
+
+                controller = MacOSController()
+                speaker = context.get("verified_speaker_name") or context.get("speaker_name")
+                success, message = await controller.lock_screen(
+                    enable_voice_feedback=False,
+                    speaker_name=speaker,
+                )
+                return {
+                    "success": bool(success),
+                    "method": "system_api",
+                    "action": action,
+                    "message": message,
+                }
+            except Exception as e:
+                # Fallback to AppleScript transport behavior if controller isn't usable.
+                logger.debug(f"[SYSTEM-API] macos_controller lock failed, falling back: {e}")
+                result = await applescript_handler(action, context, **kwargs)
+                if result.get("success"):
+                    result["method"] = "system_api"
+                return result
 
         elif action == "unlock_screen":
             # Delegate to AppleScript handler which has MacOSKeychainUnlock
@@ -366,6 +474,8 @@ async def system_api_handler(action: str, context: Dict[str, Any], **kwargs) -> 
             "message": f"Unknown action: {action}",
         }
 
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         logger.error(f"[SYSTEM-API] Exception: {e}", exc_info=True)
         return {
