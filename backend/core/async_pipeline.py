@@ -1554,37 +1554,48 @@ class AdvancedAsyncPipeline:
                             }
 
                             # Run enhanced verification (includes reasoning, pattern storage, tracing)
-                            vbi_result = await vbi.verify_and_announce(
-                                audio_data=audio_data,
-                                context=vbi_context,
-                                speak=False,  # Don't speak here, we'll handle response
-                            )
+                            # CRITICAL: Add timeout to prevent VBI from hanging the entire pipeline
+                            try:
+                                vbi_result = await asyncio.wait_for(
+                                    vbi.verify_and_announce(
+                                        audio_data=audio_data,
+                                        context=vbi_context,
+                                        speak=False,  # Don't speak here, we'll handle response
+                                    ),
+                                    timeout=10.0  # 10 second max for VBI verification
+                                )
+                            except asyncio.TimeoutError:
+                                logger.warning("⏱️ [VBI-TIMEOUT] VBI verification timed out after 10s")
+                                vbi_result = None
+                                vbi_verified = False
 
-                            vbi_verified = vbi_result.verified
-                            vbi_confidence = vbi_result.confidence
-                            vbi_announcement = vbi_result.announcement
+                            # Only process VBI result if we got one (not timed out)
+                            if vbi_result is not None:
+                                vbi_verified = vbi_result.verified
+                                vbi_confidence = vbi_result.confidence
+                                vbi_announcement = vbi_result.announcement
 
-                            logger.info(
-                                f"🔐 [VBI-RESULT] verified={vbi_verified}, confidence={vbi_confidence:.1%}, "
-                                f"level={vbi_result.level.value if hasattr(vbi_result.level, 'value') else str(vbi_result.level)}, "
-                                f"method={vbi_result.verification_method.value if hasattr(vbi_result.verification_method, 'value') else str(vbi_result.verification_method)}"
-                            )
+                                logger.info(
+                                    f"🔐 [VBI-RESULT] verified={vbi_verified}, confidence={vbi_confidence:.1%}, "
+                                    f"level={vbi_result.level.value if hasattr(vbi_result.level, 'value') else str(vbi_result.level)}, "
+                                    f"method={vbi_result.verification_method.value if hasattr(vbi_result.verification_method, 'value') else str(vbi_result.verification_method)}"
+                                )
 
-                            if vbi_result.spoofing_detected:
-                                logger.warning(f"🚨 [VBI-SECURITY] Spoofing detected: {vbi_result.spoofing_reason}")
-                                return False, f"Security alert: {vbi_result.spoofing_reason}", "blocked", step_times
+                                if vbi_result.spoofing_detected:
+                                    logger.warning(f"🚨 [VBI-SECURITY] Spoofing detected: {vbi_result.spoofing_reason}")
+                                    return False, f"Security alert: {vbi_result.spoofing_reason}", "blocked", step_times
 
-                            if vbi_verified:
-                                # Use VBI result for unlock
-                                logger.info(f"✅ [VBI-VERIFIED] Voice verified via VBI - proceeding with unlock")
-                                step_times["vbi_verify"] = (time.time() - step_start) * 1000
+                                if vbi_verified:
+                                    # Use VBI result for unlock
+                                    logger.info(f"✅ [VBI-VERIFIED] Voice verified via VBI - proceeding with unlock")
+                                    step_times["vbi_verify"] = (time.time() - step_start) * 1000
 
-                                # Track enhanced module usage
-                                step_times["vbi_stats"] = {
-                                    "reasoning_used": vbi._stats.get('reasoning_invocations', 0) > 0,
-                                    "patterns_stored": vbi._stats.get('pattern_stores', 0) > 0,
-                                    "drift_detected": vbi._stats.get('drift_detections', 0) > 0,
-                                }
+                                    # Track enhanced module usage
+                                    step_times["vbi_stats"] = {
+                                        "reasoning_used": vbi._stats.get('reasoning_invocations', 0) > 0,
+                                        "patterns_stored": vbi._stats.get('pattern_stores', 0) > 0,
+                                        "drift_detected": vbi._stats.get('drift_detections', 0) > 0,
+                                    }
 
                         except ImportError as e:
                             logger.debug(f"🔐 [VBI-UNAVAILABLE] VBI not available: {e}")
@@ -1601,10 +1612,17 @@ class AdvancedAsyncPipeline:
 
                         unlock_service = get_intelligent_unlock_service()
 
-                        # Initialize if needed
+                        # Initialize if needed (with timeout)
                         if not unlock_service.initialized:
                             logger.info("🔓 [LOCK-UNLOCK-INIT] Initializing unlock service...")
-                            await unlock_service.initialize()
+                            try:
+                                await asyncio.wait_for(
+                                    unlock_service.initialize(),
+                                    timeout=5.0  # 5 second max for initialization
+                                )
+                            except asyncio.TimeoutError:
+                                logger.error("⏱️ [LOCK-UNLOCK-INIT] Service initialization timed out")
+                                raise Exception("Unlock service initialization timed out")
 
                         # Process unlock with audio data and context
                         context = {
@@ -1639,18 +1657,24 @@ class AdvancedAsyncPipeline:
                                 "unlock_allowed": True,
                                 "reason": f"VBI verified at {vbi_result.confidence:.1%} confidence"
                             }
-                            result = await unlock_service._perform_unlock(
-                                speaker_name=vbi_result.speaker_name or speaker_name or user_name,
-                                context_analysis=context_analysis,
-                                scenario_analysis=scenario_analysis
+                            result = await asyncio.wait_for(
+                                unlock_service._perform_unlock(
+                                    speaker_name=vbi_result.speaker_name or speaker_name or user_name,
+                                    context_analysis=context_analysis,
+                                    scenario_analysis=scenario_analysis
+                                ),
+                                timeout=15.0  # 15 second max for unlock execution
                             )
                             # Use VBI announcement if available
                             if vbi_result.announcement:
                                 result["message"] = vbi_result.announcement
                         elif audio_data:
-                            result = await unlock_service.process_voice_unlock_command(
-                                audio_data=audio_data,
-                                context=context
+                            result = await asyncio.wait_for(
+                                unlock_service.process_voice_unlock_command(
+                                    audio_data=audio_data,
+                                    context=context
+                                ),
+                                timeout=20.0  # 20 second max for full unlock flow
                             )
                         else:
                             # Text-only unlock (no audio available)
@@ -1669,10 +1693,13 @@ class AdvancedAsyncPipeline:
                                 "unlock_allowed": True,
                                 "reason": "text_command_from_authenticated_session"
                             }
-                            result = await unlock_service._perform_unlock(
-                                speaker_name=speaker_name or user_name,
-                                context_analysis=context_analysis,
-                                scenario_analysis=scenario_analysis
+                            result = await asyncio.wait_for(
+                                unlock_service._perform_unlock(
+                                    speaker_name=speaker_name or user_name,
+                                    context_analysis=context_analysis,
+                                    scenario_analysis=scenario_analysis
+                                ),
+                                timeout=15.0  # 15 second max for text unlock
                             )
 
                         success = result.get("success", False)
