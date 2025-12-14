@@ -4176,6 +4176,38 @@ async def process_command(request: dict):
     """Simple command endpoint for testing"""
     command = request.get("command", "")
 
+    # =========================================================================
+    # ULTRA FAST PATH v1.0: Screen lock commands bypass ALL context processing
+    # This prevents infinite loops and import errors in context handlers
+    # =========================================================================
+    command_lower = command.lower().strip()
+    if "lock" in command_lower and "unlock" not in command_lower and ("screen" in command_lower or "mac" in command_lower or "computer" in command_lower):
+        logger.info(f"[MAIN] 🔒 LOCK command detected - DIRECT EXECUTION (bypassing context handlers)")
+
+        try:
+            from api.unified_command_processor import UnifiedCommandProcessor
+            processor = UnifiedCommandProcessor()
+            result = await asyncio.wait_for(
+                processor.process_command(command),
+                timeout=10.0
+            )
+            logger.info(f"[MAIN] ✅ Lock command completed successfully")
+            return result
+        except asyncio.TimeoutError:
+            logger.error("[MAIN] ❌ Lock command timed out")
+            return {
+                "success": False,
+                "response": "Lock command timed out. Please try again.",
+                "error": "timeout"
+            }
+        except Exception as e:
+            logger.error(f"[MAIN] ❌ Lock command failed: {e}")
+            return {
+                "success": False,
+                "response": f"Failed to lock screen: {str(e)}",
+                "error": str(e)
+            }
+
     # Trigger intelligent preloading (Phase 2) if available
     if hasattr(app.state, "component_manager") and app.state.component_manager:
         mgr = app.state.component_manager

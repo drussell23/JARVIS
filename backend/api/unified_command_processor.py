@@ -830,21 +830,50 @@ class UnifiedCommandProcessor:
             if not INTELLIGENT_ROUTER_AVAILABLE:
                 logger.warning("[UNIFIED] Intelligent Vision Router not available")
 
-        # Initialize Speaker Verification Service
+        # =========================================================================
+        # ROBUST SPEAKER VERIFICATION INITIALIZATION v2.0
+        # Timeout-protected to prevent event loop blocking
+        # =========================================================================
         if not self._speaker_verification_initialized:
             try:
                 from voice.contextual_message_generator import get_message_generator
                 from voice.speaker_verification_service import get_speaker_verification_service
 
-                self.speaker_verification = await get_speaker_verification_service()
+                logger.info("[UNIFIED] 🎤 Initializing Speaker Verification Service...")
+                logger.info("[UNIFIED]    ⏱️  Timeout: 10 seconds")
+
+                # CRITICAL: Wrap in asyncio.wait_for to prevent indefinite hangs
+                # The speaker verification can hang on 0-byte audio or slow ML model loading
+                try:
+                    self.speaker_verification = await asyncio.wait_for(
+                        get_speaker_verification_service(),
+                        timeout=10.0
+                    )
+                except asyncio.TimeoutError:
+                    logger.error("[UNIFIED] ❌ Speaker Verification Service timed out (10s)")
+                    logger.warning("[UNIFIED]    This usually means VBI/ECAPA hung on initialization")
+                    logger.warning("[UNIFIED]    Continuing WITHOUT speaker verification")
+                    raise  # Re-raise to be caught by outer exception handler
+
                 self.message_generator = get_message_generator()
-                await self.message_generator.initialize()
+
+                # Message generator initialization is lightweight, but still add timeout for safety
+                await asyncio.wait_for(
+                    self.message_generator.initialize(),
+                    timeout=5.0
+                )
 
                 self._speaker_verification_initialized = True
 
                 logger.info("[UNIFIED] ✅ Speaker Verification Service initialized")
                 logger.info("[UNIFIED] ✅ Contextual Message Generator initialized")
 
+            except asyncio.TimeoutError:
+                logger.error("[UNIFIED] ❌ Speaker verification initialization TIMEOUT")
+                logger.warning("[UNIFIED]    Commands will work, but speaker identification disabled")
+                self.speaker_verification = None
+                self.message_generator = None
+                self._speaker_verification_initialized = False
             except Exception as e:
                 logger.warning(f"[UNIFIED] Speaker verification not available: {e}", exc_info=True)
                 self.speaker_verification = None
@@ -967,29 +996,87 @@ class UnifiedCommandProcessor:
             logger.info("[UNIFIED] No audio data provided for this command")
 
         # =========================================================================
-        # CRITICAL: Classify command FIRST before any heavy initialization!
-        # This allows SCREEN_LOCK commands to bypass VBI/ECAPA entirely
+        # CRITICAL FIX v2.0: Classify command FIRST before ANY initialization!
+        # _classify_command is lightweight (no VBI/ECAPA) - safe to call early
         # =========================================================================
-        command_type, confidence = await self._classify_command(command_text)
-        logger.info(f"[UNIFIED] Classified as {command_type.value} (confidence: {confidence})")
+        try:
+            command_type, confidence = await self._classify_command(command_text)
+            logger.info(f"[UNIFIED] ✅ Classified as {command_type.value} (confidence: {confidence:.2f})")
+        except Exception as e:
+            logger.warning(f"[UNIFIED] Classification failed: {e} - defaulting to UNKNOWN")
+            command_type = CommandType.UNKNOWN
+            confidence = 0.0
 
         # Track command frequency
         self.command_stats[command_text.lower()] += 1
 
         # =========================================================================
-        # FAST PATH: SCREEN_LOCK commands skip heavy resolver initialization
-        # This prevents VBI/ECAPA from blocking the lock command
+        # FAST PATH v3.0: SCREEN_LOCK commands COMPLETELY bypass everything
+        # Jump directly to lock execution without touching VBI/ECAPA/Context handlers
         # =========================================================================
         if command_type == CommandType.SCREEN_LOCK:
-            logger.info("[UNIFIED] 🔒 SCREEN_LOCK detected - using FAST PATH (skipping VBI)")
-            # Skip directly to lock execution without heavy initialization
-            # We'll do lightweight speaker identification inline if needed
+            logger.info("[UNIFIED] 🔒 SCREEN_LOCK detected - ULTRA FAST PATH")
+            logger.info("[UNIFIED]    ⚡ Bypassing ALL heavyweight processing")
+            logger.info("[UNIFIED]    🚀 Executing lock directly...")
+
+            try:
+                # Get owner name for personalized response (fast, cached)
+                from api.simple_unlock_handler import _get_owner_name
+                speaker_name = await asyncio.wait_for(_get_owner_name(), timeout=1.0)
+            except:
+                speaker_name = "there"
+
+            # Execute lock command directly
+            try:
+                from api.simple_unlock_handler import handle_unlock_command
+                result = await asyncio.wait_for(
+                    handle_unlock_command(command_text),
+                    timeout=5.0
+                )
+
+                logger.info(f"[UNIFIED] ✅ Lock executed successfully")
+
+                # Return immediately - don't continue through normal processing
+                return {
+                    "success": result.get("success", True),
+                    "response": result.get("response", f"Locking your screen now, {speaker_name}. See you soon!"),
+                    "command_type": "screen_lock",
+                    "fast_path": True,
+                    **result
+                }
+            except asyncio.TimeoutError:
+                logger.error("[UNIFIED] ❌ Lock command timed out")
+                return {
+                    "success": False,
+                    "response": "Lock command timed out. Please try again.",
+                    "command_type": "screen_lock",
+                    "error": "timeout"
+                }
+            except Exception as e:
+                logger.error(f"[UNIFIED] ❌ Lock failed: {e}")
+                return {
+                    "success": False,
+                    "response": f"Failed to lock screen: {str(e)}",
+                    "command_type": "screen_lock",
+                    "error": str(e)
+                }
+
+        # NORMAL PATH: For all non-SCREEN_LOCK commands
         else:
             # Ensure resolvers are initialized (lazy init on first use)
-            # Only for non-SCREEN_LOCK commands that may need VBI
+            # ONLY for non-SCREEN_LOCK commands that may need VBI/ECAPA
             if not self._resolvers_initialized:
-                logger.info("[UNIFIED] Lazy-initializing resolvers on first command...")
-                await self._initialize_resolvers()
+                logger.info("[UNIFIED] 📦 Non-lock command - initializing resolvers (VBI, ECAPA, etc.)")
+                try:
+                    await asyncio.wait_for(self._initialize_resolvers(), timeout=15.0)
+                    logger.info("[UNIFIED] ✅ Resolvers initialized successfully")
+                except asyncio.TimeoutError:
+                    logger.error("[UNIFIED] ❌ Resolver initialization timed out (15s)")
+                    logger.warning("[UNIFIED] Continuing without resolvers - degraded functionality")
+                    self._resolvers_initialized = False  # Mark as failed
+                except Exception as e:
+                    logger.error(f"[UNIFIED] ❌ Resolver initialization failed: {e}")
+                    self._resolvers_initialized = False
 
         # NEW: Use speaker-aware command handler with CAI/SAI if audio provided
         # OPTIMIZATION: Skip heavy VBI for screen lock commands to avoid "Processing..." hang
