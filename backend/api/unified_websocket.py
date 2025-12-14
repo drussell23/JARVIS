@@ -1085,6 +1085,73 @@ class UnifiedWebSocketManager:
         """
         msg_type = message.get("type", "")
 
+        # ═══════════════════════════════════════════════════════════════════════
+        # ⚡ ULTRA-FAST LOCK GUARD - Execute lock IMMEDIATELY, bypass everything
+        # ═══════════════════════════════════════════════════════════════════════
+        # This MUST be the FIRST thing we check because:
+        # 1. Audio intent verification can block the event loop (Whisper cold start)
+        # 2. Memory pressure checks can hang if system is overloaded
+        # 3. Lock commands are security-critical and must never hang
+        # ═══════════════════════════════════════════════════════════════════════
+        if msg_type in ("command", "voice_command", "jarvis_command"):
+            command_text = message.get("text", message.get("command", "")).lower()
+            # Token-based detection to avoid substring issues
+            import re
+            tokens = set(re.findall(r"[a-z']+", command_text))
+            
+            # LOCK command = has "lock" but NOT "unlock"
+            is_ultra_fast_lock = ("lock" in tokens) and ("unlock" not in tokens) and (
+                "screen" in command_text or "mac" in command_text or "computer" in command_text
+            )
+            
+            if is_ultra_fast_lock:
+                logger.info("=" * 70)
+                logger.info("⚡ ULTRA-FAST LOCK GUARD ACTIVATED")
+                logger.info(f"   Command: '{command_text}'")
+                logger.info("   Bypassing ALL processing - executing lock directly")
+                logger.info("=" * 70)
+                
+                try:
+                    from system_control.macos_controller import MacOSController
+                    controller = MacOSController()
+                    
+                    # Execute lock with 5-second timeout - never hang
+                    lock_start = time.time()
+                    lock_result = await asyncio.wait_for(
+                        controller.lock_screen(),
+                        timeout=5.0
+                    )
+                    lock_elapsed = time.time() - lock_start
+                    
+                    logger.info(f"✅ Screen locked in {lock_elapsed:.2f}s via ULTRA-FAST path")
+                    
+                    return {
+                        "type": "command_response",
+                        "response": "Screen locked, Sir.",
+                        "success": lock_result.get("success", True) if isinstance(lock_result, dict) else True,
+                        "speak": True,
+                        "ultra_fast_path": True,
+                        "execution_time_ms": int(lock_elapsed * 1000),
+                    }
+                except asyncio.TimeoutError:
+                    logger.error("⏱️ ULTRA-FAST lock timed out after 5s")
+                    return {
+                        "type": "command_response",
+                        "response": "Lock command timed out. Please try again.",
+                        "success": False,
+                        "speak": True,
+                        "error": "timeout",
+                    }
+                except Exception as lock_err:
+                    logger.error(f"❌ ULTRA-FAST lock failed: {lock_err}")
+                    return {
+                        "type": "command_response",
+                        "response": f"Lock failed: {lock_err}",
+                        "success": False,
+                        "speak": True,
+                        "error": str(lock_err),
+                    }
+
         # Check if message type should use pipeline processing
         pipeline_types = {
             "command",
