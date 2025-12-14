@@ -320,13 +320,14 @@ class MacOSController:
     def _check_screen_lock_status(self) -> bool:
         """
         Check if screen is currently locked
-
+        
         Returns:
             bool: True if screen is locked, False otherwise
         """
         try:
             from voice_unlock.objc.server.screen_lock_detector import is_screen_locked
-
+            
+            # Use the synchronous wrapper which handles the loop logic safely
             self._is_locked = is_screen_locked()
             self._screen_lock_checked = True
             return self._is_locked
@@ -1276,12 +1277,12 @@ class MacOSController:
                 except Exception as e:
                     logger.debug(f"Progress callback error: {e}")
 
-        def _is_locked_now() -> Optional[bool]:
-            """Best-effort lock state check. Returns None if unavailable."""
+        async def _is_locked_now() -> Optional[bool]:
+            """Best-effort async lock state check. Returns None if unavailable."""
             try:
-                from voice_unlock.objc.server.screen_lock_detector import is_screen_locked
+                from voice_unlock.objc.server.screen_lock_detector import async_is_screen_locked
 
-                return bool(is_screen_locked())
+                return await async_is_screen_locked()
             except Exception:
                 return None
 
@@ -1290,7 +1291,7 @@ class MacOSController:
             deadline = time.perf_counter() + timeout_s
             last = None
             while time.perf_counter() < deadline:
-                state = _is_locked_now()
+                state = await _is_locked_now()
                 if state is None:
                     return None
                 last = state
@@ -1351,7 +1352,8 @@ class MacOSController:
 
         try:
             # If already locked, be explicit and fast.
-            locked_now = _is_locked_now()
+            # If already locked, be explicit and fast.
+            locked_now = await _is_locked_now()
             if locked_now is True:
                 await _progress("already_locked", 100, "Screen already locked")
                 return True, f"🔒 Your screen is already locked, {speaker_name}."

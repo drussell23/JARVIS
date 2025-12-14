@@ -2139,10 +2139,32 @@ class IntelligentVoiceUnlockService:
         # 🔒 FULL VERIFICATION: Only if unified cache didn't provide instant match
         if not unified_cache_hit:
             try:
-                verification_passed, verification_confidence = await asyncio.wait_for(
+                # Result can be (True/False, confidence) OR (None, 0.0) if engine available
+                verification_result = await asyncio.wait_for(
                     self._verify_speaker_identity(audio_data, speaker_identified),
-                    timeout=BIOMETRIC_TIMEOUT  # 10 second timeout (was 30s!)
+                    timeout=BIOMETRIC_TIMEOUT
                 )
+                verification_passed, verification_confidence = verification_result
+                
+                # Check for "Unavailable" state (None)
+                if verification_passed is None:
+                    logger.warning("⚠️ Speaker engine unavailable - attempting Physics-Only fallback")
+                    
+                    # Fallback: Verify using Physics (PAVA) only
+                    physics_passed, physics_conf = await self._verify_with_physics_only(
+                        audio_data, context
+                    )
+                    
+                    if physics_passed:
+                        verification_passed = True
+                        verification_confidence = physics_conf
+                        logger.info(f"✅ Physics-Only Verification Successful (conf: {physics_conf:.2f})")
+                        # Add metadata for diagnostics
+                        diagnostics.add_event("fallback_success", {"method": "physics_only", "confidence": physics_conf})
+                    else:
+                        verification_passed = False
+                        verification_confidence = 0.0
+                        logger.warning("❌ Physics-Only Fallback Failed")
             except asyncio.TimeoutError:
                 logger.error(f"⏱️ Biometric verification timed out after {BIOMETRIC_TIMEOUT}s")
                 stage_biometric.complete(success=False, error_message="Verification timeout")
@@ -2864,10 +2886,11 @@ class IntelligentVoiceUnlockService:
 
     async def _verify_speaker_identity(
         self, audio_data: bytes, speaker_name: str
-    ) -> Tuple[bool, float]:
+    ) -> Tuple[Optional[bool], float]:
         """Verify speaker identity with high threshold (anti-spoofing)"""
         if not self.speaker_engine:
-            return False, 0.0
+            # Return None to indicate engine is unavailable (not failed)
+            return None, 0.0
 
         try:
             # New SpeakerVerificationService - returns dict with adaptive thresholds
@@ -2889,6 +2912,38 @@ class IntelligentVoiceUnlockService:
 
         except Exception as e:
             logger.error(f"Speaker verification failed: {e}")
+            return False, 0.0
+
+    async def _verify_with_physics_only(self, audio_data: bytes, context: Dict[str, Any]) -> Tuple[bool, float]:
+        """
+        Fallback verification using only PAVA (Physics-Aware Voice Authentication).
+        Used when ECAPA-TDNN is unavailable (e.g. library missing).
+        """
+        try:
+            # Lazy load PAVA
+            from voice_unlock.core.anti_spoofing import get_anti_spoofing_detector
+            detector = get_anti_spoofing_detector()
+            
+            if not detector:
+                return False, 0.0
+                
+            # Run checks
+            is_human, reason, details = detector.detect_spoofing(audio_data, context)
+            
+            # Should be human (not spoof)
+            if is_human:
+                # Calculate confidence based on physics metrics
+                confidence = 0.0
+                if details:
+                   confidence = details.get('confidence', 0.8)
+                
+                return True, confidence
+            else:
+                logger.warning(f"Physics fallback rejected: {reason}")
+                return False, 0.0
+                
+        except Exception as e:
+            logger.error(f"Physics fallback error: {e}")
             return False, 0.0
 
     async def _analyze_verification_failure(
@@ -5593,3 +5648,4 @@ async def process_voice_unlock_robust(
     except Exception as e:
         logger.error(f"[ROBUST] Error: {e}\n{traceback.format_exc()}")
         return result(False, f"Voice unlock error: {e}", err=str(e))
+
