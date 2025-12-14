@@ -3134,9 +3134,14 @@ const JarvisVoice = () => {
     };
 
     // 🆕 CRITICAL FIX: Use fresh audio capture for voice biometric verification
+    // EXCEPT for lock/unlock commands which bypass speaker verification on backend
     // The old getBufferedAudioBase64() concatenates MediaRecorder chunks which produces
     // invalid WebM files (broken headers). Fresh capture creates a valid WebM container.
-    if (continuousAudioBufferRef.current && continuousAudioBufferRef.current.isRunning) {
+
+    // Skip audio capture entirely for lock/unlock commands (ultra-fast path)
+    const skipAudioForCommand = effectiveCommandType === 'lock' || effectiveCommandType === 'unlock';
+
+    if (!skipAudioForCommand && continuousAudioBufferRef.current && continuousAudioBufferRef.current.isRunning) {
       try {
         console.log('🎤 [Priority] Starting fresh audio capture for voice biometrics...');
 
@@ -3170,6 +3175,8 @@ const JarvisVoice = () => {
           console.log('🎤 [Priority] All audio capture failed');
         }
       }
+    } else if (skipAudioForCommand) {
+      console.log(`⚡ [Priority] Skipping audio capture for ${effectiveCommandType} command - backend bypasses verification`);
     }
 
     try {
