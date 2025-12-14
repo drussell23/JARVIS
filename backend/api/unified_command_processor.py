@@ -966,18 +966,30 @@ class UnifiedCommandProcessor:
         else:
             logger.info("[UNIFIED] No audio data provided for this command")
 
-        # Ensure resolvers are initialized (lazy init on first use)
-        if not self._resolvers_initialized:
-            logger.info("[UNIFIED] Lazy-initializing resolvers on first command...")
-            await self._initialize_resolvers()
+        # =========================================================================
+        # CRITICAL: Classify command FIRST before any heavy initialization!
+        # This allows SCREEN_LOCK commands to bypass VBI/ECAPA entirely
+        # =========================================================================
+        command_type, confidence = await self._classify_command(command_text)
+        logger.info(f"[UNIFIED] Classified as {command_type.value} (confidence: {confidence})")
 
         # Track command frequency
         self.command_stats[command_text.lower()] += 1
 
-        # Step 1: Classify command intent EARLY to optimize processing path
-        # This allows us to skip expensive verification for commands that don't need it (like screen lock)
-        command_type, confidence = await self._classify_command(command_text)
-        logger.info(f"[UNIFIED] Classified as {command_type.value} (confidence: {confidence})")
+        # =========================================================================
+        # FAST PATH: SCREEN_LOCK commands skip heavy resolver initialization
+        # This prevents VBI/ECAPA from blocking the lock command
+        # =========================================================================
+        if command_type == CommandType.SCREEN_LOCK:
+            logger.info("[UNIFIED] 🔒 SCREEN_LOCK detected - using FAST PATH (skipping VBI)")
+            # Skip directly to lock execution without heavy initialization
+            # We'll do lightweight speaker identification inline if needed
+        else:
+            # Ensure resolvers are initialized (lazy init on first use)
+            # Only for non-SCREEN_LOCK commands that may need VBI
+            if not self._resolvers_initialized:
+                logger.info("[UNIFIED] Lazy-initializing resolvers on first command...")
+                await self._initialize_resolvers()
 
         # NEW: Use speaker-aware command handler with CAI/SAI if audio provided
         # OPTIMIZATION: Skip heavy VBI for screen lock commands to avoid "Processing..." hang
@@ -3092,50 +3104,74 @@ class UnifiedCommandProcessor:
                         **result,
                     }
             elif command_type == CommandType.SCREEN_LOCK:
-                # Handle LOCK screen commands with owner recognition and transparency
-                # Lock commands don't need voice verification, but we recognize the owner
-                logger.info(f"[SCREEN_LOCK] Processing lock command with owner recognition")
+                # =========================================================================
+                # FAST LOCK PATH v2.0 - No VBI, No ECAPA, No Blocking
+                # =========================================================================
+                # Lock commands use FAST speaker identification:
+                # 1. Use cached speaker name from recent transcription (fastest)
+                # 2. Fall back to owner name from database (cached)
+                # 3. NEVER trigger VBI/ECAPA (causes event loop blocking)
+                # =========================================================================
+                logger.info(f"[SCREEN_LOCK] 🔒 FAST PATH: Processing lock with lightweight speaker ID")
                 
                 try:
-                    from api.simple_unlock_handler import handle_unlock_command, _get_owner_name
+                    # =========================================================
+                    # FAST SPEAKER IDENTIFICATION (No VBI)
+                    # =========================================================
+                    speaker_name = None
                     
-                    # Get owner name for personalized response
-                    owner_name = await _get_owner_name()
+                    # Priority 1: Use speaker name from recent transcription (already identified)
+                    if self.current_speaker_name:
+                        speaker_name = self.current_speaker_name
+                        logger.info(f"[SCREEN_LOCK] Speaker from transcription: {speaker_name}")
+                    elif speaker_name:
+                        speaker_name = speaker_name
+                        logger.info(f"[SCREEN_LOCK] Speaker from parameter: {speaker_name}")
                     
-                    # If we have audio data, try to identify the speaker for transparency
-                    # IMPORTANT: Do not run speaker verification inline for LOCK.
-                    # Some verification paths are CPU-bound and can starve the event loop,
-                    # which manifests as the frontend hanging on "🔒 Locking..." and the lock never executing.
-                    speaker_identified = None
+                    # Priority 2: Get owner name from database (cached, fast)
+                    if not speaker_name:
+                        try:
+                            from api.simple_unlock_handler import _get_owner_name
+                            speaker_name = await asyncio.wait_for(_get_owner_name(), timeout=1.0)
+                            logger.info(f"[SCREEN_LOCK] Speaker from database: {speaker_name}")
+                        except asyncio.TimeoutError:
+                            speaker_name = "there"
+                            logger.warning("[SCREEN_LOCK] Owner name lookup timed out, using fallback")
+                        except Exception as e:
+                            speaker_name = "there"
+                            logger.warning(f"[SCREEN_LOCK] Owner name lookup failed: {e}")
                     
-                    # Execute the lock command
-                    result = await handle_unlock_command(command_text)
+                    # =========================================================
+                    # EXECUTE LOCK - Direct, Fast, Non-Blocking
+                    # =========================================================
+                    from core.transport_handlers import applescript_handler
                     
-                    # Generate personalized response with transparency
-                    if result.get("success"):
-                        if speaker_identified:
-                            response = f"Of course, {speaker_identified}. Locking your screen now. See you soon!"
-                        else:
-                            response = f"Locking your screen now, {owner_name}. See you soon!"
+                    # Execute lock directly via transport handler (bypasses all VBI)
+                    lock_result = await applescript_handler("lock_screen", {})
+                    
+                    if lock_result.get("success"):
+                        response = f"Of course, {speaker_name}. Locking your screen now. See you soon!"
+                        logger.info(f"[SCREEN_LOCK] ✅ Screen locked for {speaker_name}")
                         
                         return {
                             "success": True,
                             "response": response,
                             "command_type": "screen_lock",
                             "type": "screen_lock",
-                            "speaker_identified": speaker_identified,
-                            "owner_name": owner_name,
+                            "speaker_identified": speaker_name,
                             "action": "lock_screen",
-                            **result,
+                            "method": lock_result.get("method", "direct"),
                         }
                     else:
+                        response = f"I couldn't lock the screen, {speaker_name}. Try pressing Control+Command+Q."
+                        logger.warning(f"[SCREEN_LOCK] ❌ Lock failed: {lock_result.get('error')}")
+                        
                         return {
                             "success": False,
-                            "response": result.get("message", f"I couldn't lock the screen, {owner_name}. Try pressing Control+Command+Q."),
+                            "response": response,
                             "command_type": "screen_lock",
                             "type": "screen_lock",
-                            "error": result.get("error"),
-                            **result,
+                            "error": lock_result.get("error", "lock_failed"),
                         }
                         
                 except Exception as e:
