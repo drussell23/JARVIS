@@ -218,8 +218,7 @@ class VBIConfig:
         # ==========================================================================
         cloud_cfg = self._json_config.get('cloud_first', {})
         self.cloud_first_enabled = self._get_bool_config(
-            # Cost-safe default: cloud-first must be explicitly enabled.
-            'JARVIS_VBI_CLOUD_FIRST', cloud_cfg.get('enabled', False)
+            'JARVIS_VBI_CLOUD_FIRST', cloud_cfg.get('enabled', True)
         )
         self.force_local = self._get_bool_config(
             'JARVIS_VBI_FORCE_LOCAL', cloud_cfg.get('force_local', False)
@@ -230,16 +229,10 @@ class VBIConfig:
         
         # Cloud endpoints
         endpoints_cfg = self._json_config.get('cloud_endpoints', {})
-        raw_endpoint = os.getenv('JARVIS_CLOUD_ML_ENDPOINT', endpoints_cfg.get('primary', ''))
-        raw_endpoint = (raw_endpoint or "").strip()
-        # Accept either base URL or api URL (.../api/ml)
-        if raw_endpoint.endswith("/api/ml"):
-            raw_endpoint = raw_endpoint.rsplit("/api/ml", 1)[0]
-        self.cloud_endpoint = raw_endpoint or None
-
-        # If no endpoint is configured, force cloud-first OFF
-        if not self.cloud_endpoint:
-            self.cloud_first_enabled = False
+        self.cloud_endpoint = os.getenv(
+            'JARVIS_CLOUD_ML_ENDPOINT',
+            endpoints_cfg.get('primary', 'https://jarvis-ml-888774109345.us-central1.run.app')
+        )
         
         # Timeouts from JSON config
         timeouts_cfg = self._json_config.get('timeouts', {})
@@ -2054,6 +2047,13 @@ class VoiceBiometricIntelligence:
                 except Exception as e:
                     logger.warning(f"Behavioral analysis error: {e}")
 
+            # Fuse confidences
+            result.fused_confidence = self._fuse_confidences(result)
+            result.confidence = result.fused_confidence
+
+            # Determine recognition level
+            result.level = self._determine_level(result)
+
             # Get spoofing result with physics analysis
             physics_details = None
             if physics_task and physics_task in done and not physics_task.cancelled():
@@ -2076,22 +2076,14 @@ class VoiceBiometricIntelligence:
             if physics_details:
                 result.physics_analysis = physics_details
                 result.physics_confidence = physics_details.get('physics_confidence', 0.0)
-
-            # Fuse confidences (Now has access to physics!)
-            result.fused_confidence = await self._fuse_confidences(result)
-            result.confidence = result.fused_confidence
-
-            # Determine recognition level
-            result.level = self._determine_level(result)
-            
-            if physics_details:
                 result.vtl_verified = physics_details.get('vtl_verified', False)
                 result.liveness_passed = physics_details.get('liveness_passed', False)
 
             # =================================================================
             # BAYESIAN FUSION (v3.0) - Multi-factor authentication decision
             # =================================================================
-            # Already applied in _fuse_confidences()
+            # Run Bayesian fusion after all evidence is collected
+            self._apply_bayesian_fusion(result)
 
             if result.spoofing_detected:
                 result.level = RecognitionLevel.SPOOFING
@@ -2240,16 +2232,10 @@ class VoiceBiometricIntelligence:
             
             # Fallback: Try direct HTTP health check
             import aiohttp
-            cloud_url = (
-                os.getenv('ECAPA_CLOUD_RUN_URL')
-                or os.getenv('JARVIS_CLOUD_ML_ENDPOINT')
-                or ''
+            cloud_url = os.getenv(
+                'ECAPA_CLOUD_RUN_URL',
+                'https://jarvis-ml-888774109345.us-central1.run.app'
             )
-            cloud_url = (cloud_url or "").strip()
-            if cloud_url.endswith("/api/ml"):
-                cloud_url = cloud_url.rsplit("/api/ml", 1)[0]
-            if not cloud_url:
-                return False
             
             async with aiohttp.ClientSession() as session:
                 async with session.get(
@@ -2492,16 +2478,10 @@ class VoiceBiometricIntelligence:
                 pass
             
             # Fallback: Direct HTTP call to Cloud Run
-            cloud_run_url = (
-                os.getenv('ECAPA_CLOUD_RUN_URL')
-                or os.getenv('JARVIS_CLOUD_ML_ENDPOINT')
-                or ''
+            cloud_run_url = os.getenv(
+                'ECAPA_CLOUD_RUN_URL',
+                'https://jarvis-ml-888774109345.us-central1.run.app'
             )
-            cloud_run_url = (cloud_run_url or "").strip()
-            if cloud_run_url.endswith("/api/ml"):
-                cloud_run_url = cloud_run_url.rsplit("/api/ml", 1)[0]
-            if not cloud_run_url:
-                return None
             
             import aiohttp
             
@@ -3235,74 +3215,49 @@ class VoiceBiometricIntelligence:
 
         return behavioral
 
-    async def _fuse_confidences(self, result: VerificationResult) -> float:
+    def _fuse_confidences(self, result: VerificationResult) -> float:
         """
-        ENHANCED v3.0: Bayesian multi-factor confidence fusion.
-        
-        Uses the specialized BayesianConfidenceFusion engine to combine:
-        - Voice confidence (ECAPA-TDNN)
-        - Physics confidence (PAVA)
-        - Behavioral confidence
-        - Context confidence
-        
-        Gracefully handles missing data (e.g. ECAPA unavailable) via
-        adaptive exclusion in the fusion engine.
+        ENHANCED v2.0: Intelligent multi-factor confidence fusion with
+        low-confidence recovery.
+
+        KEY FEATURES:
+        - Dynamic weight adjustment based on signal quality
+        - Low-confidence recovery when behavioral is very strong
+        - Environment-aware fusion (noisy = trust behavioral more)
+        - Bayesian-style probability combination
+        - Audio quality factor integration
         """
-        try:
-            # 1. Get Fusion Engine
-            fusion_engine = _get_bayesian_fusion()
-            if not fusion_engine:
-                 # Fallback to legacy logic if engine somehow missing
-                 logger.warning("Bayesian fusion engine missing, using legacy fallback")
-                 if not self._config.use_behavioral_fusion:
-                     return result.voice_confidence
-                 return (result.voice_confidence * 0.7) + (result.behavioral.behavioral_confidence * 0.3)
-
-            # 2. Prepare Evidence
-            # Handle ML confidence: if 0.0 and engine missing (implied), pass None?
-            # Actually, the caller might have set 0.0. 
-            # If we want to treat 0.0 as "unavailable" for adaptive exclusion, we can pass None.
-            # But BayesianFusion v2.6 treats <= 0.02 as unavailable. So 0.0 works fine.
-            ml_conf = result.voice_confidence
-            
-            # Physics confidence
-            physics_conf = result.physics_confidence if result.physics_confidence > 0 else None
-            
-            # Behavioral
-            beh_conf = result.behavioral.behavioral_confidence
-            
-            # Context
-            ctx_conf = 0.8 # Default context confidence if not explicitly calculated
-            if hasattr(result, 'context_analysis'):
-                 # extract if available
-                 pass
-
-            # 3. Fuse
-            fusion_result = fusion_engine.fuse(
-                ml_confidence=ml_conf,
-                physics_confidence=physics_conf,
-                behavioral_confidence=beh_conf,
-                context_confidence=ctx_conf,
-                ml_details={"speaker": result.speaker_name},
-                physics_details=result.physics_analysis
-            )
-            
-            # 4. Update Result
-            result.bayesian_decision = fusion_result.decision.value
-            result.bayesian_authentic_prob = fusion_result.posterior_authentic
-            result.bayesian_reasoning = fusion_result.reasoning
-            result.dominant_factor = fusion_result.dominant_factor
-            
-            logger.info(f"🧬 Bayesian Fusion: P(Auth)={fusion_result.posterior_authentic:.1%}, Decision={fusion_result.decision.value}, Dominant={fusion_result.dominant_factor}")
-            
-            # Return posterior probability as the fused confidence
-            return fusion_result.posterior_authentic
-            
-        except Exception as e:
-            logger.error(f"Bayesian fusion error: {e}")
-            # Fallback
+        if not self._config.use_behavioral_fusion:
             return result.voice_confidence
 
+        voice_conf = result.voice_confidence
+        behavioral_conf = result.behavioral.behavioral_confidence
+        audio_quality = self._get_audio_quality_factor(result)
+
+        # =================================================================
+        # DYNAMIC WEIGHT CALCULATION
+        # =================================================================
+        # Base weights (configurable via environment)
+        base_voice_weight = float(os.getenv('VBI_FUSION_VOICE_WEIGHT', '0.65'))
+        base_behavioral_weight = float(os.getenv('VBI_FUSION_BEHAVIORAL_WEIGHT', '0.35'))
+
+        # Adjust weights based on signal quality
+        # If audio quality is poor, trust behavioral more
+        if audio_quality < 0.5:
+            # Poor audio - shift weight toward behavioral
+            voice_weight = base_voice_weight * (0.5 + audio_quality)  # 0.325 to 0.4875
+            behavioral_weight = 1.0 - voice_weight
+            logger.debug(
+                f"Audio quality low ({audio_quality:.2f}), adjusted weights: "
+                f"voice={voice_weight:.2f}, behavioral={behavioral_weight:.2f}"
+            )
+        elif audio_quality > 0.8:
+            # Excellent audio - trust voice more
+            voice_weight = min(0.85, base_voice_weight * 1.2)
+            behavioral_weight = 1.0 - voice_weight
+        else:
+            voice_weight = base_voice_weight
+            behavioral_weight = base_behavioral_weight
 
         # =================================================================
         # LOW-CONFIDENCE RECOVERY

@@ -184,14 +184,8 @@ class UnifiedWebSocketManager:
         }
 
         # Rate limiting (prevents connection flooding)
-        # INCREASED: 10 was too aggressive, causing 403 death spiral on reconnect
-        # Frontend legitimately needs multiple connections + reconnect attempts
-        self.connection_rate_limit = int(os.getenv("WS_CONNECTION_RATE_LIMIT", "100"))  # per minute
-        self.connection_timestamps: deque = deque(maxlen=500)
-        
-        # Per-IP rate limiting with adaptive burst handling
-        self._ip_connection_times: Dict[str, deque] = {}
-        self._burst_allowance = 20  # Allow bursts of 20 connections from same IP
+        self.connection_rate_limit = int(os.getenv("WS_CONNECTION_RATE_LIMIT", "10"))  # per minute
+        self.connection_timestamps: deque = deque(maxlen=100)
 
         # Message handlers (dynamically extensible)
         self.handlers = {
@@ -902,43 +896,27 @@ class UnifiedWebSocketManager:
             logger.error(f"Vision analysis error: {e}")
             return {"type": "vision_result", "success": False, "error": str(e)}
 
-    async def connect(self, websocket: WebSocket, client_id: str) -> bool:
-        """Accept new WebSocket connection with health monitoring and rate limiting.
-        
-        Returns:
-            bool: True if connection was accepted, False if rejected
-        """
+    async def connect(self, websocket: WebSocket, client_id: str):
+        """Accept new WebSocket connection with health monitoring and rate limiting"""
         # Check if shutting down
         if self._shutdown_event.is_set():
             logger.warning(f"[UNIFIED-WS] Rejecting connection from {client_id} - system is shutting down")
             await websocket.close(code=1001, reason="Server shutting down")
-            return False
+            return
 
-        # Rate limiting check with LOCAL CONNECTION EXEMPTION
-        # Local connections (localhost/127.0.0.1) get much higher limits since they're trusted
+        # Rate limiting check
         current_time = time.time()
         self.connection_timestamps.append(current_time)
-        
-        # Get client IP for adaptive rate limiting
-        client_host = "unknown"
-        try:
-            client_host = websocket.client.host if websocket.client else "unknown"
-        except Exception:
-            pass
-        
-        # Local connections get 10x the rate limit (trusted, same machine)
-        is_local = client_host in ("127.0.0.1", "localhost", "::1", "unknown")
-        effective_rate_limit = self.connection_rate_limit * 10 if is_local else self.connection_rate_limit
 
         # Count connections in last minute
         recent_connections = sum(1 for ts in self.connection_timestamps if current_time - ts < 60)
 
-        if recent_connections > effective_rate_limit:
+        if recent_connections > self.connection_rate_limit:
             logger.warning(
-                f"[UNIFIED-WS] ⚠️ Rate limit exceeded: {recent_connections}/{effective_rate_limit} per minute (host: {client_host})"
+                f"[UNIFIED-WS] ⚠️ Rate limit exceeded: {recent_connections}/{self.connection_rate_limit} per minute"
             )
             await websocket.close(code=1008, reason="Rate limit exceeded")
-            return False
+            return
 
         await websocket.accept()
         self.connections[client_id] = websocket
@@ -997,9 +975,9 @@ class UnifiedWebSocketManager:
                 available_displays = self.display_monitor.get_available_display_details()
                 # Type guard: ensure we have a list before iterating
                 if not available_displays:
-                    return True  # Connection successful, just no displays to send
+                    return
                 if not isinstance(available_displays, list):
-                    return True  # Connection successful, just invalid display data
+                    return
 
                 logger.info(
                     f"[WS] Sending {len(available_displays)} available displays to new client"
@@ -1017,8 +995,6 @@ class UnifiedWebSocketManager:
                     )
             except Exception as e:
                 logger.warning(f"[WS] Failed to send display status to new client: {e}")
-        
-        return True  # Connection successfully established
 
     async def disconnect(self, client_id: str):
         """Remove WebSocket connection with learning and SAI notification"""
@@ -1085,73 +1061,6 @@ class UnifiedWebSocketManager:
         """
         msg_type = message.get("type", "")
 
-        # ═══════════════════════════════════════════════════════════════════════
-        # ⚡ ULTRA-FAST LOCK GUARD - Execute lock IMMEDIATELY, bypass everything
-        # ═══════════════════════════════════════════════════════════════════════
-        # This MUST be the FIRST thing we check because:
-        # 1. Audio intent verification can block the event loop (Whisper cold start)
-        # 2. Memory pressure checks can hang if system is overloaded
-        # 3. Lock commands are security-critical and must never hang
-        # ═══════════════════════════════════════════════════════════════════════
-        if msg_type in ("command", "voice_command", "jarvis_command"):
-            command_text = message.get("text", message.get("command", "")).lower()
-            # Token-based detection to avoid substring issues
-            import re
-            tokens = set(re.findall(r"[a-z']+", command_text))
-            
-            # LOCK command = has "lock" but NOT "unlock"
-            is_ultra_fast_lock = ("lock" in tokens) and ("unlock" not in tokens) and (
-                "screen" in command_text or "mac" in command_text or "computer" in command_text
-            )
-            
-            if is_ultra_fast_lock:
-                logger.info("=" * 70)
-                logger.info("⚡ ULTRA-FAST LOCK GUARD ACTIVATED")
-                logger.info(f"   Command: '{command_text}'")
-                logger.info("   Bypassing ALL processing - executing lock directly")
-                logger.info("=" * 70)
-                
-                try:
-                    from system_control.macos_controller import MacOSController
-                    controller = MacOSController()
-                    
-                    # Execute lock with 5-second timeout - never hang
-                    lock_start = time.time()
-                    lock_result = await asyncio.wait_for(
-                        controller.lock_screen(),
-                        timeout=5.0
-                    )
-                    lock_elapsed = time.time() - lock_start
-                    
-                    logger.info(f"✅ Screen locked in {lock_elapsed:.2f}s via ULTRA-FAST path")
-                    
-                    return {
-                        "type": "command_response",
-                        "response": "Screen locked, Sir.",
-                        "success": lock_result.get("success", True) if isinstance(lock_result, dict) else True,
-                        "speak": True,
-                        "ultra_fast_path": True,
-                        "execution_time_ms": int(lock_elapsed * 1000),
-                    }
-                except asyncio.TimeoutError:
-                    logger.error("⏱️ ULTRA-FAST lock timed out after 5s")
-                    return {
-                        "type": "command_response",
-                        "response": "Lock command timed out. Please try again.",
-                        "success": False,
-                        "speak": True,
-                        "error": "timeout",
-                    }
-                except Exception as lock_err:
-                    logger.error(f"❌ ULTRA-FAST lock failed: {lock_err}")
-                    return {
-                        "type": "command_response",
-                        "response": f"Lock failed: {lock_err}",
-                        "success": False,
-                        "speak": True,
-                        "error": str(lock_err),
-                    }
-
         # Check if message type should use pipeline processing
         pipeline_types = {
             "command",
@@ -1211,73 +1120,18 @@ class UnifiedWebSocketManager:
                     # CRITICAL: "lock my screen" is NOT an unlock command - it's a LOCK command!
                     # Only UNLOCK commands need voice biometric verification
                     # LOCK commands should go through standard JARVIS API (no VBI needed)
-                    import re
-
                     command_lower = command_text.lower()
-                    tokens = set(re.findall(r"[a-z']+", command_lower))
-
-                    # -----------------------------------------------------------------
-                    # AUDIO-VERIFIED INTENT (prevents "lock" → "unlock" misfires)
-                    # -----------------------------------------------------------------
-                    # The frontend may send a text transcript that is occasionally wrong.
-                    # For security-sensitive actions (unlock) we validate the *spoken* intent
-                    # using the attached audio (when available) and override the command
-                    # text to a canonical form if audio strongly disagrees.
-                    try:
-                        text_intent = "unlock" if "unlock" in tokens else ("lock" if "lock" in tokens else None)
-
-                        # IMPORTANT:
-                        # Only perform *audio* intent verification for UNLOCK (security-sensitive).
-                        # The current Whisper intent helper (`voice.whisper_audio_fix`) runs synchronously
-                        # and can block the event loop on cold start; doing that for LOCK can cause the
-                        # UI to hang at "🔒 Locking..." and prevents the lock from executing.
-                        if audio_data_received and text_intent == "unlock":
-                            import base64
-
-                            # Decode audio bytes (base64 payload from frontend)
-                            audio_bytes = base64.b64decode(audio_data_received)
-
-                            # Fast STT intent check (command-mode prompt; no unlock bias)
-                            from voice.whisper_audio_fix import transcribe_with_whisper
-
-                            intent_timeout = float(os.getenv("WS_AUDIO_INTENT_TIMEOUT_SEC", "2.0"))
-                            audio_text = await asyncio.wait_for(
-                                transcribe_with_whisper(
-                                    audio_data=audio_bytes,
-                                    sample_rate=sample_rate_received or 16000,
-                                    mode="command",
-                                ),
-                                timeout=intent_timeout,
-                            )
-
-                            audio_tokens = set(re.findall(r"[a-z']+", (audio_text or "").lower()))
-                            audio_intent = (
-                                "unlock" if "unlock" in audio_tokens else ("lock" if "lock" in audio_tokens else None)
-                            )
-
-                            if audio_intent and audio_intent != text_intent:
-                                logger.warning(
-                                    f"[WS] ⚠️ Intent mismatch (text={text_intent}, audio={audio_intent}) "
-                                    f"| original='{command_text}' | audio_stt='{audio_text}'"
-                                )
-                                # Override to canonical command to ensure correct routing
-                                command_text = f"{audio_intent} my screen"
-                                command_lower = command_text.lower()
-                                tokens = set(re.findall(r"[a-z']+", command_lower))
-                    except Exception as _intent_err:
-                        # Never block command handling due to intent verification failures
-                        logger.debug(f"[WS] Audio intent verification skipped: {_intent_err}")
                     
                     # First check if it's a LOCK command (has "lock" but NOT "unlock")
                     is_lock_command = (
-                        ("lock" in tokens)
-                        and ("unlock" not in tokens)
-                        and (("screen" in command_lower) or ("mac" in command_lower) or ("computer" in command_lower))
+                        "lock" in command_lower and 
+                        "unlock" not in command_lower and
+                        ("screen" in command_lower or "mac" in command_lower or "computer" in command_lower)
                     )
                     
                     # UNLOCK command detection (only if NOT a lock command)
                     is_unlock_command = not is_lock_command and (
-                        ("unlock" in tokens) or
+                        "unlock" in command_lower or
                         any(
                             keyword in command_lower
                             for keyword in ["screen unlock", "voice unlock", "let me in"]
@@ -1289,45 +1143,6 @@ class UnifiedWebSocketManager:
                         logger.info(f"[WS] 🔒 Detected LOCK command: '{command_text}' - routing to standard API")
                     elif is_unlock_command:
                         logger.info(f"[WS] 🔓 Detected UNLOCK command: '{command_text}' - routing to VBI")
-
-                    # ═══════════════════════════════════════════════════════════════
-                    # ⚡ MEMORY GUARD: Execute lock directly if memory is critical
-                    # This prevents event loop freezing when system is under pressure
-                    # ═══════════════════════════════════════════════════════════════
-                    if is_lock_command:
-                        try:
-                            import psutil
-                            mem = psutil.virtual_memory()
-                            if mem.percent >= 85:
-                                logger.warning(
-                                    f"[WS] ⚠️ Critical memory ({mem.percent:.1f}%), "
-                                    f"executing lock directly to prevent freeze"
-                                )
-                                # Direct lock execution - bypass heavy processing
-                                from system_control.macos_controller import MacOSController
-                                controller = MacOSController()
-                                lock_result = await asyncio.wait_for(
-                                    controller.lock_screen(),
-                                    timeout=5.0
-                                )
-                                return {
-                                    "type": "command_response",
-                                    "response": "Screen locked, Sir. Memory pressure was critical so I used fast path.",
-                                    "success": lock_result.get("success", True) if isinstance(lock_result, dict) else True,
-                                    "speak": True,
-                                    "memory_guard_activated": True,
-                                }
-                        except asyncio.TimeoutError:
-                            logger.error("[WS] ⏱️ Direct lock timed out after 5s")
-                            return {
-                                "type": "command_response",
-                                "response": "Screen lock timed out. The system is under heavy load.",
-                                "success": False,
-                                "speak": True,
-                            }
-                        except Exception as mem_guard_err:
-                            logger.debug(f"[WS] Memory guard check failed: {mem_guard_err}")
-                            # Fall through to normal processing
 
                     if is_unlock_command and audio_data_received:
                         # ============================================================
@@ -2046,12 +1861,7 @@ async def unified_websocket_endpoint(websocket: WebSocket):
     # Get the manager lazily (now safe since we're in an async context with event loop)
     manager = get_ws_manager()
 
-    # Try to connect - returns False if rejected (rate limit, shutdown, etc.)
-    connected = await manager.connect(websocket, client_id)
-    if not connected:
-        # Connection was rejected - don't try to receive, just return
-        logger.debug(f"[UNIFIED-WS] Connection rejected for {client_id}")
-        return
+    await manager.connect(websocket, client_id)
 
     try:
         while True:

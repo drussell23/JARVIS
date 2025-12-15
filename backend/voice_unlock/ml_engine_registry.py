@@ -61,55 +61,6 @@ import traceback
 logger = logging.getLogger(__name__)
 
 # =============================================================================
-# Cloud endpoint utilities (shared by cloud routing + verification)
-# =============================================================================
-
-def _normalize_cloud_base_url(raw: str) -> Optional[str]:
-    """
-    Normalize a configured cloud endpoint to a BASE URL.
-
-    Accepts inputs like:
-      - https://xyz.run.app
-      - https://xyz.run.app/api/ml
-      - https://xyz.run.app/api/ml/speaker_verify
-      - http://localhost:8010/api/ml/speaker_embedding
-
-    Returns:
-      - https://xyz.run.app
-      - http://localhost:8010
-
-    Notes:
-    - We intentionally discard query/fragment.
-    - We intentionally strip '/api/ml' and anything after it. The registry uses
-      base URLs for '/health' and '/api/ml/*' probes.
-    """
-    raw = (raw or "").strip()
-    if not raw:
-        return None
-
-    # Best-effort scheme normalization (developers sometimes set 'localhost:8010')
-    if "://" not in raw:
-        raw = f"http://{raw}"
-
-    try:
-        from urllib.parse import urlsplit, urlunsplit
-
-        parts = urlsplit(raw)
-        path = parts.path or ""
-        if "/api/ml" in path:
-            path = path.split("/api/ml", 1)[0]
-        path = path.rstrip("/")
-        if path in ("", "/"):
-            path = ""
-        return urlunsplit((parts.scheme, parts.netloc, path, "", ""))
-    except Exception:
-        # Fallback to simple string ops (should be rare)
-        base = raw
-        if "/api/ml" in base:
-            base = base.split("/api/ml", 1)[0]
-        return base.rstrip("/") or None
-
-# =============================================================================
 # CONFIGURATION - All configurable via environment variables
 # =============================================================================
 
@@ -637,19 +588,11 @@ class ECAPATDNNWrapper(MLEngineWrapper):
         self._encoder_loaded = False
 
     async def _load_impl(self) -> Any:
-        """
-        Load ECAPA-TDNN speaker encoder.
-
-        Uses asyncio.to_thread() to prevent blocking the event loop during
-        the potentially long model download/loading process. This ensures
-        WebSocket progress updates continue flowing to the frontend.
-
-        The actual PyTorch operations (inference/warmup) remain synchronous
-        for Apple Silicon stability - only the I/O-bound loading is threaded.
-        """
+        """Load ECAPA-TDNN speaker encoder."""
+        from concurrent.futures import ThreadPoolExecutor
         import torch
 
-        logger.info(f"   [{self.name}] Importing SpeechBrain (async threaded)...")
+        logger.info(f"   [{self.name}] Importing SpeechBrain...")
 
         def _load_sync():
             from speechbrain.inference.speaker import EncoderClassifier
@@ -661,7 +604,6 @@ class ECAPATDNNWrapper(MLEngineWrapper):
             cache_dir.mkdir(parents=True, exist_ok=True)
 
             logger.info(f"   [{self.name}] Loading from: speechbrain/spkrec-ecapa-voxceleb")
-            logger.info(f"   [{self.name}] Cache dir: {cache_dir}")
 
             model = EncoderClassifier.from_hparams(
                 source="speechbrain/spkrec-ecapa-voxceleb",
@@ -669,21 +611,13 @@ class ECAPATDNNWrapper(MLEngineWrapper):
                 run_opts=run_opts,
             )
 
-            logger.info(f"   [{self.name}] Model loaded successfully")
             return model
 
-        # CRITICAL FIX: Use asyncio.to_thread() to prevent event loop blocking
-        # This allows WebSocket progress updates to continue during loading.
-        # The synchronous PyTorch inference operations remain on main thread
-        # for Apple Silicon stability - only the I/O-bound loading is threaded.
-        try:
-            model = await asyncio.wait_for(
-                asyncio.to_thread(_load_sync),
-                timeout=MLConfig.MODEL_LOAD_TIMEOUT
-            )
-        except asyncio.TimeoutError:
-            logger.error(f"   [{self.name}] Model loading timed out after {MLConfig.MODEL_LOAD_TIMEOUT}s")
-            raise TimeoutError(f"ECAPA model loading timed out after {MLConfig.MODEL_LOAD_TIMEOUT}s")
+        # Run synchronously on main thread (macOS stability)
+        # loop = asyncio.get_running_loop()
+        # with ThreadPoolExecutor(max_workers=1, thread_name_prefix="ecapa_loader") as executor:
+        #    model = await loop.run_in_executor(executor, _load_sync)
+        model = _load_sync()
 
         self._encoder_loaded = True
         return model
@@ -756,13 +690,8 @@ class SpeechBrainSTTWrapper(MLEngineWrapper):
         super().__init__("speechbrain_stt")
 
     async def _load_impl(self) -> Any:
-        """
-        Load SpeechBrain Wav2Vec2 ASR model.
-
-        Uses asyncio.to_thread() to prevent blocking the event loop during
-        the potentially long model download/loading process. This ensures
-        WebSocket progress updates continue flowing to the frontend.
-        """
+        """Load SpeechBrain Wav2Vec2 ASR model."""
+        from concurrent.futures import ThreadPoolExecutor
         import torch
         import sys
         import platform
@@ -781,7 +710,6 @@ class SpeechBrainSTTWrapper(MLEngineWrapper):
 
             logger.info(f"   [{self.name}] Loading from: speechbrain/asr-wav2vec2-commonvoice-en")
             logger.info(f"   [{self.name}] Device: {device}")
-            logger.info(f"   [{self.name}] Cache dir: {cache_dir}")
 
             model = EncoderDecoderASR.from_hparams(
                 source="speechbrain/asr-wav2vec2-commonvoice-en",
@@ -789,19 +717,13 @@ class SpeechBrainSTTWrapper(MLEngineWrapper):
                 run_opts=run_opts,
             )
 
-            logger.info(f"   [{self.name}] Model loaded successfully")
             return model
 
-        # CRITICAL FIX: Use asyncio.to_thread() to prevent event loop blocking
-        # This allows WebSocket progress updates to continue during loading.
-        try:
-            model = await asyncio.wait_for(
-                asyncio.to_thread(_load_sync),
-                timeout=MLConfig.MODEL_LOAD_TIMEOUT
-            )
-        except asyncio.TimeoutError:
-            logger.error(f"   [{self.name}] Model loading timed out after {MLConfig.MODEL_LOAD_TIMEOUT}s")
-            raise TimeoutError(f"SpeechBrain STT model loading timed out after {MLConfig.MODEL_LOAD_TIMEOUT}s")
+        # Run synchronously on main thread (macOS stability)
+        # loop = asyncio.get_running_loop()
+        # with ThreadPoolExecutor(max_workers=1, thread_name_prefix="stt_loader") as executor:
+        #    model = await loop.run_in_executor(executor, _load_sync)
+        model = _load_sync()
 
         return model
 
@@ -865,19 +787,13 @@ class WhisperWrapper(MLEngineWrapper):
         self._model_name = os.getenv("JARVIS_WHISPER_MODEL", "base.en")
 
     async def _load_impl(self) -> Any:
-        """
-        Load Whisper model.
-
-        Uses asyncio.to_thread() to prevent blocking the event loop during
-        the potentially long model download/loading process. This ensures
-        WebSocket progress updates continue flowing to the frontend.
-        """
+        """Load Whisper model."""
+        from concurrent.futures import ThreadPoolExecutor
 
         def _load_sync():
             import whisper
 
             logger.info(f"   [{self.name}] Loading model: {self._model_name}")
-            logger.info(f"   [{self.name}] Cache dir: {MLConfig.CACHE_DIR / 'whisper'}")
 
             # Download and load model
             model = whisper.load_model(
@@ -885,19 +801,13 @@ class WhisperWrapper(MLEngineWrapper):
                 download_root=str(MLConfig.CACHE_DIR / "whisper")
             )
 
-            logger.info(f"   [{self.name}] Model loaded successfully")
             return model
 
-        # CRITICAL FIX: Use asyncio.to_thread() to prevent event loop blocking
-        # This allows WebSocket progress updates to continue during loading.
-        try:
-            model = await asyncio.wait_for(
-                asyncio.to_thread(_load_sync),
-                timeout=MLConfig.MODEL_LOAD_TIMEOUT
-            )
-        except asyncio.TimeoutError:
-            logger.error(f"   [{self.name}] Model loading timed out after {MLConfig.MODEL_LOAD_TIMEOUT}s")
-            raise TimeoutError(f"Whisper model loading timed out after {MLConfig.MODEL_LOAD_TIMEOUT}s")
+        # Run synchronously on main thread (macOS stability)
+        # loop = asyncio.get_running_loop()
+        # with ThreadPoolExecutor(max_workers=1, thread_name_prefix="whisper_loader") as executor:
+        #    model = await loop.run_in_executor(executor, _load_sync)
+        model = _load_sync()
 
         return model
 
@@ -1176,9 +1086,7 @@ class MLEngineRegistry:
                 await self._activate_cloud_routing()
 
                 # CRITICAL FIX: Verify cloud backend is actually ready before marking as ready
-                # Cloud-first startup should WAIT for the ECAPA service to become ready
-                # (cold starts are expected for Cloud Run / Spot VMs).
-                cloud_ready, cloud_reason = await self._verify_cloud_backend_ready(wait_for_ecapa=True)
+                cloud_ready, cloud_reason = await self._verify_cloud_backend_ready()
 
                 if cloud_ready:
                     # Cloud verified - mark as ready
@@ -1235,9 +1143,7 @@ class MLEngineRegistry:
             await self._activate_cloud_routing()
 
             # CRITICAL FIX: Verify cloud backend is actually ready before marking as ready
-            # Memory-pressure cloud routing should WAIT for readiness to avoid falling back to local
-            # and blowing RAM. (Still bounded by JARVIS_ECAPA_WAIT_TIMEOUT.)
-            cloud_ready, cloud_reason = await self._verify_cloud_backend_ready(wait_for_ecapa=True)
+            cloud_ready, cloud_reason = await self._verify_cloud_backend_ready()
 
             if cloud_ready:
                 self._status.prewarm_completed = True
@@ -1721,38 +1627,28 @@ class MLEngineRegistry:
                 if startup_manager.is_cloud_ml_active:
                     # Get endpoint from active cloud backend
                     endpoint = await startup_manager.get_ml_endpoint("speaker_verify")
-                    # Normalize: accept either base URL or api URL (/api/ml/*)
-                    self._cloud_endpoint = _normalize_cloud_base_url(endpoint or "")
-                    logger.info(f"   Cloud endpoint from MemoryAwareStartup: {self._cloud_endpoint}")
+                    self._cloud_endpoint = endpoint
+                    logger.info(f"   Cloud endpoint from MemoryAwareStartup: {endpoint}")
                 else:
                     # Activate cloud backend
                     if self._startup_decision:
                         result = await startup_manager.activate_cloud_ml_backend()
                         if result.get("success"):
                             # Note: No /api/ml suffix - service routes are at root level
-                            self._cloud_endpoint = _normalize_cloud_base_url(f"http://{result.get('ip')}:8010")
+                            self._cloud_endpoint = f"http://{result.get('ip')}:8010"
                             logger.info(f"   Cloud backend activated: {self._cloud_endpoint}")
             except ImportError:
                 logger.debug("MemoryAwareStartup not available")
 
             # Fallback: Use environment variable or default GCP endpoint
             if not self._cloud_endpoint:
-                # Cloud endpoint must be explicitly configured.
-                # Accept either base URL (https://...run.app) or api URL (/api/ml/*).
-                raw = (
-                    os.getenv("JARVIS_CLOUD_ML_ENDPOINT")
-                    or os.getenv("JARVIS_CLOUD_ECAPA_ENDPOINT")
-                    or os.getenv("JARVIS_ML_CLOUD_ENDPOINT")
-                    or os.getenv("CLOUD_RUN_ECAPA_URL")
-                    or ""
-                ).strip()
-                self._cloud_endpoint = _normalize_cloud_base_url(raw)
-                if self._cloud_endpoint:
-                    logger.info(f"   Using cloud endpoint: {self._cloud_endpoint}")
-                else:
-                    logger.info("   Cloud routing not enabled (JARVIS_CLOUD_ML_ENDPOINT not set)")
-                    self._use_cloud = False
-                    return False
+                # Cloud Run URLs - dynamically discovered from environment
+                # Updated 2024-12 to new Cloud Run URL format
+                self._cloud_endpoint = os.getenv(
+                    "JARVIS_CLOUD_ML_ENDPOINT",
+                    "https://jarvis-ml-888774109345.us-central1.run.app"
+                )
+                logger.info(f"   Using cloud endpoint: {self._cloud_endpoint}")
 
             self._use_cloud = True
             logger.info("☁️  Cloud routing activated for ML operations")
@@ -1795,47 +1691,16 @@ class MLEngineRegistry:
         # Dynamic configuration from environment
         timeout = timeout or float(os.getenv("JARVIS_ECAPA_CLOUD_TIMEOUT", "15.0"))
         retry_count = retry_count or int(os.getenv("JARVIS_ECAPA_CLOUD_RETRIES", "3"))
-        # Cost-safe defaults: fallback + extraction tests must be explicitly enabled.
-        # NOTE: Keep defaults consistent with the rest of the registry (fallback is usually ON).
         fallback_enabled = os.getenv("JARVIS_ECAPA_CLOUD_FALLBACK_ENABLED", "true").lower() == "true"
-        test_extraction = (
-            test_extraction
-            if test_extraction is not None
-            else os.getenv("JARVIS_ECAPA_CLOUD_TEST_EXTRACTION", "false").lower() == "true"
-        )
+        test_extraction = test_extraction if test_extraction is not None else os.getenv("JARVIS_ECAPA_CLOUD_TEST_EXTRACTION", "true").lower() == "true"
 
-        # Wait for ECAPA to become ready (handles cold starts).
-        # Default is "auto": wait ONLY if the endpoint looks like the ECAPA cloud service
-        # (i.e. it returns an 'ecapa_ready' field). Auto mode uses a shorter cap to avoid
-        # blocking interactive flows (unlock) for a full cold-start window.
-        wait_auto = False
-        if wait_for_ecapa is None:
-            wait_mode = os.getenv("JARVIS_ECAPA_WAIT_FOR_READY", "auto").strip().lower()
-            if wait_mode in ("1", "true", "yes", "y", "on"):
-                wait_for_ecapa = True
-            elif wait_mode in ("0", "false", "no", "n", "off"):
-                wait_for_ecapa = False
-            else:
-                wait_for_ecapa = True
-                wait_auto = True
+        # NEW: Wait for ECAPA to become ready (handles cold starts)
+        wait_for_ecapa = wait_for_ecapa if wait_for_ecapa is not None else os.getenv("JARVIS_ECAPA_WAIT_FOR_READY", "true").lower() == "true"
         ecapa_wait_timeout = ecapa_wait_timeout or float(os.getenv("JARVIS_ECAPA_WAIT_TIMEOUT", "60.0"))  # 60s for pre-baked cache cold start
-        if wait_auto:
-            auto_cap = float(os.getenv("JARVIS_ECAPA_AUTO_WAIT_TIMEOUT", "12.0"))
-            ecapa_wait_timeout = min(ecapa_wait_timeout, auto_cap)
         ecapa_poll_interval = float(os.getenv("JARVIS_ECAPA_POLL_INTERVAL", "3.0"))
 
         if not self._cloud_endpoint:
             return False, "Cloud endpoint not configured"
-
-        # Normalize to base URL in case a caller provided /api/ml/*.
-        normalized_base = _normalize_cloud_base_url(self._cloud_endpoint) or self._cloud_endpoint
-        self._cloud_endpoint = normalized_base
-
-        # Cooldown to avoid log spam if the endpoint is clearly misconfigured (wrong service/schema).
-        mismatch_until = getattr(self, "_cloud_schema_mismatch_until", 0.0) or 0.0
-        if time.time() < mismatch_until:
-            last_reason = getattr(self, "_cloud_schema_mismatch_reason", "Cloud endpoint schema mismatch")
-            return False, last_reason
 
         logger.info(f"🔍 Verifying cloud backend: {self._cloud_endpoint}")
         logger.info(f"   Wait for ECAPA: {wait_for_ecapa}, Timeout: {ecapa_wait_timeout}s")
@@ -1845,101 +1710,58 @@ class MLEngineRegistry:
         # =====================================================================
         # PHASE 1: Health check (verify endpoint is reachable)
         # =====================================================================
-        base = self._cloud_endpoint.rstrip("/")
-        # Prefer the ECAPA service-specific health path first (more reliable),
-        # then fall back to root /health (Cloud service supports both).
-        health_candidates: List[Tuple[str, str]] = [
-            ("api_ml_health", f"{base}/api/ml/health"),
-            ("root_health", f"{base}/health"),
-        ]
+        health_endpoint = f"{self._cloud_endpoint.rstrip('/')}/health"
         endpoint_reachable = False
         ecapa_ready = False
         reason = "Unknown error"
         last_health_data = {}
-        health_url_used: Optional[str] = None
-        health_schema_ok = False  # True iff response includes 'ecapa_ready'
-        schema_mismatch_detected = False
-        attempts_used = 0
 
         for attempt in range(1, retry_count + 1):
-            attempts_used = attempt
             try:
                 async with aiohttp.ClientSession() as session:
-                    for candidate_name, url in health_candidates:
-                        try:
-                            async with session.get(
-                                url,
-                                timeout=aiohttp.ClientTimeout(total=timeout),
-                                headers={"Accept": "application/json"},
-                            ) as response:
-                                # Some endpoints won't exist on some deployments (404/405).
-                                if response.status in (404, 405):
-                                    continue
-
-                                if response.status != 200:
-                                    reason = f"Cloud health returned HTTP {response.status} ({candidate_name})"
-                                    logger.warning(f"⚠️ Attempt {attempt}/{retry_count}: {reason}")
-                                    continue
-
+                    async with session.get(
+                        health_endpoint,
+                        timeout=aiohttp.ClientTimeout(total=timeout),
+                        headers={"Accept": "application/json"}
+                    ) as response:
+                        if response.status == 200:
+                            try:
+                                data = await response.json()
+                                last_health_data = data
                                 endpoint_reachable = True
-                                health_url_used = url
 
-                                try:
-                                    data = await response.json()
-                                    last_health_data = data
-                                except Exception:
-                                    # JSON parse failed but HTTP 200 - endpoint reachable.
-                                    reason = f"Cloud health returned non-JSON payload ({candidate_name})"
-                                    logger.warning(f"⚠️ {reason}")
-                                    continue
-
-                                # IMPORTANT: We only trust endpoints that expose the ECAPA readiness schema.
-                                if "ecapa_ready" not in data:
-                                    # If neither candidate includes ecapa_ready, this is likely the wrong service
-                                    # (e.g. pointing at the main JARVIS backend instead of ecapa_cloud_service).
-                                    reason = (
-                                        f"Cloud health payload missing 'ecapa_ready' ({candidate_name}). "
-                                        f"This endpoint does not look like the ECAPA service."
-                                    )
-                                    logger.warning(f"⚠️ {reason}")
-                                    schema_mismatch_detected = True
-                                    break
-
-                                health_schema_ok = True
-                                ecapa_ready = bool(data.get("ecapa_ready", False))
-                                if ecapa_ready:
+                                # Check if ECAPA is already ready
+                                if data.get("ecapa_ready", False):
+                                    ecapa_ready = True
                                     load_source = data.get("load_source", "unknown")
-                                    logger.info(f"✅ Cloud ECAPA ready! Source: {load_source}")
+                                    logger.info(f"✅ Cloud ECAPA already ready! Source: {load_source}")
+                                    break
                                 else:
-                                    status = data.get("status", data.get("startup_state", "unknown"))
-                                    logger.info(f"☁️  Cloud reachable, ECAPA not ready yet (status: {status})")
+                                    status = data.get("status", "unknown")
+                                    logger.info(f"☁️  Cloud endpoint reachable, ECAPA initializing (status: {status})")
+                                    break  # Exit retry loop, proceed to wait phase
 
-                                break  # candidate loop
+                            except Exception:
+                                # JSON parse failed but HTTP 200 - endpoint reachable
+                                endpoint_reachable = True
+                                logger.info("✅ Cloud backend responded (non-JSON)")
+                                break
+                        else:
+                            reason = f"Cloud returned HTTP {response.status}"
+                            logger.warning(f"⚠️ Attempt {attempt}/{retry_count}: {reason}")
 
-                        except asyncio.TimeoutError:
-                            reason = f"Cloud health timed out after {timeout}s ({candidate_name})"
-                            logger.warning(f"⏱️ Attempt {attempt}/{retry_count}: {reason}")
-                        except aiohttp.ClientError as e:
-                            reason = f"Cloud connection error ({candidate_name}): {e}"
-                            logger.warning(f"🔌 Attempt {attempt}/{retry_count}: {reason}")
-                        except Exception as e:
-                            reason = f"Cloud verification error ({candidate_name}): {e}"
-                            logger.warning(f"❌ Attempt {attempt}/{retry_count}: {reason}")
-
-                    # If we reached a definitive schema mismatch, don't retry.
-                    if schema_mismatch_detected:
-                        break
-
-                    # If schema is OK and we got an answer (ready or not), don't retry Phase 1.
-                    if endpoint_reachable and health_schema_ok:
-                        break
-
+            except asyncio.TimeoutError:
+                reason = f"Cloud health check timed out after {timeout}s"
+                logger.warning(f"⏱️ Attempt {attempt}/{retry_count}: {reason}")
+            except aiohttp.ClientError as e:
+                reason = f"Cloud connection error: {e}"
+                logger.warning(f"🔌 Attempt {attempt}/{retry_count}: {reason}")
             except Exception as e:
                 reason = f"Cloud verification error: {e}"
                 logger.warning(f"❌ Attempt {attempt}/{retry_count}: {reason}")
 
-            # Exponential backoff between retries (only for actual connectivity issues)
-            if attempt < retry_count and not endpoint_reachable:
+            # Exponential backoff between retries
+            if attempt < retry_count:
                 backoff = min(2 ** (attempt - 1), 5)
                 logger.info(f"   Retrying in {backoff}s...")
                 await asyncio.sleep(backoff)
@@ -1947,9 +1769,7 @@ class MLEngineRegistry:
         # =====================================================================
         # PHASE 2: Wait for ECAPA to become ready (handles cold starts)
         # =====================================================================
-        # Only wait if the endpoint actually exposes the ECAPA readiness schema.
-        # (Prevents hanging on the wrong service.)
-        if endpoint_reachable and health_schema_ok and not ecapa_ready and wait_for_ecapa:
+        if endpoint_reachable and not ecapa_ready and wait_for_ecapa:
             logger.info(f"⏳ Waiting for Cloud ECAPA to initialize (max {ecapa_wait_timeout}s)...")
             wait_start = time.time()
 
@@ -1957,19 +1777,13 @@ class MLEngineRegistry:
                 try:
                     async with aiohttp.ClientSession() as session:
                         async with session.get(
-                            (health_url_used or f"{base}/health"),
+                            health_endpoint,
                             timeout=aiohttp.ClientTimeout(total=timeout),
                             headers={"Accept": "application/json"}
                         ) as response:
                             if response.status == 200:
                                 data = await response.json()
                                 last_health_data = data
-
-                                # Abort waiting if schema disappears (wrong endpoint).
-                                if "ecapa_ready" not in data:
-                                    reason = "Cloud health payload missing 'ecapa_ready' while waiting"
-                                    logger.warning(f"⚠️ {reason}")
-                                    break
 
                                 if data.get("ecapa_ready", False):
                                     ecapa_ready = True
@@ -1999,34 +1813,16 @@ class MLEngineRegistry:
                 logger.warning(f"⏱️ {reason}")
 
         # Determine if health check passed
-        health_check_passed = endpoint_reachable and health_schema_ok and ecapa_ready
+        health_check_passed = endpoint_reachable and ecapa_ready
 
-        if schema_mismatch_detected:
-            # Cache schema mismatch briefly to prevent repeated noisy logs.
-            cooldown_s = float(os.getenv("JARVIS_ECAPA_CLOUD_SCHEMA_COOLDOWN", "60.0"))
-            self._cloud_schema_mismatch_until = time.time() + cooldown_s
-            self._cloud_schema_mismatch_reason = (
-                "Cloud endpoint responded, but does not expose ECAPA readiness ('ecapa_ready'). "
-                "This usually means JARVIS_CLOUD_ML_ENDPOINT points at the wrong service."
-            )
-            reason = self._cloud_schema_mismatch_reason
-            # Safety: disable cloud routing to avoid repeatedly trying a wrong endpoint.
-            self._use_cloud = False
-
-        if endpoint_reachable and health_schema_ok and not ecapa_ready and not wait_for_ecapa:
-            status = last_health_data.get("status", last_health_data.get("startup_state", "unknown"))
-            reason = (
-                f"Cloud reachable but ECAPA not ready (status: {status}). "
-                "Enable waiting via JARVIS_ECAPA_WAIT_FOR_READY=true if you want to block until ready."
-            )
+        if not health_check_passed and not ecapa_ready and endpoint_reachable:
+            reason = f"Cloud endpoint reachable but ECAPA not ready after {ecapa_wait_timeout}s"
 
         # If health check failed, return early
         if not health_check_passed:
             self._cloud_verified = False
-            # If local fallback exists, don't scream ERROR; treat cloud as unavailable/degraded.
-            log = logger.warning if (fallback_enabled or self._cloud_fallback_enabled) else logger.error
-            log(f"☁️  Cloud verification not ready (attempts={attempts_used}/{retry_count})")
-            log(f"   Reason: {reason}")
+            logger.error(f"❌ Cloud health check FAILED after {retry_count} attempts")
+            logger.error(f"   Last error: {reason}")
             if fallback_enabled:
                 logger.warning("🔄 Cloud verification failed - fallback to local ECAPA enabled")
             return False, reason
@@ -2166,27 +1962,37 @@ class MLEngineRegistry:
         # Ensure we have a cloud endpoint configured
         if not self._cloud_endpoint:
             # Try to get from environment variable
-            raw = (
-                os.getenv("JARVIS_CLOUD_ECAPA_ENDPOINT")
-                or os.getenv("JARVIS_ML_CLOUD_ENDPOINT")
-                or os.getenv("JARVIS_CLOUD_ML_ENDPOINT")
-                or os.getenv("CLOUD_RUN_ECAPA_URL")
+            self._cloud_endpoint = os.getenv(
+                "JARVIS_CLOUD_ECAPA_ENDPOINT",
+                os.getenv("JARVIS_ML_CLOUD_ENDPOINT", None)
             )
-            raw = (raw or "").strip()
-            self._cloud_endpoint = _normalize_cloud_base_url(raw)
 
             if not self._cloud_endpoint:
-                logger.error("❌ No cloud endpoint available for fallback")
-                logger.error(
-                    "   Set one of: JARVIS_CLOUD_ML_ENDPOINT, JARVIS_CLOUD_ECAPA_ENDPOINT, CLOUD_RUN_ECAPA_URL"
-                )
-                return False
+                # Try GCP Cloud Run default URL format
+                project_id = os.getenv("GCP_PROJECT_ID", "jarvis-473803")
+                region = os.getenv("GCP_REGION", "us-central1")
+                service_name = os.getenv("GCP_ECAPA_SERVICE", "jarvis-ml")
+
+                # GCP Cloud Run URL format: https://{service}-{random_suffix}.a.run.app
+                # We need to discover this or have it configured
+                logger.warning("   No cloud endpoint configured - checking for Cloud Run URL...")
+
+                # Common Cloud Run URL patterns to try
+                cloud_run_urls = [
+                    os.getenv("CLOUD_RUN_ECAPA_URL"),
+                    f"https://{service_name}-pvalxny6iq-uc.a.run.app",  # Known production URL
+                    f"https://{service_name}-888774109345.{region}.run.app",
+                ]
+
+                for url in cloud_run_urls:
+                    if url:
+                        self._cloud_endpoint = url
+                        logger.info(f"   Trying cloud endpoint: {url}")
+                        break
 
         if not self._cloud_endpoint:
             logger.error("❌ No cloud endpoint available for fallback")
-            logger.error(
-                "   Set one of: JARVIS_CLOUD_ML_ENDPOINT, JARVIS_CLOUD_ECAPA_ENDPOINT, CLOUD_RUN_ECAPA_URL"
-            )
+            logger.error("   Set JARVIS_CLOUD_ECAPA_ENDPOINT environment variable")
             return False
 
         logger.info(f"   Cloud endpoint: {self._cloud_endpoint}")
@@ -2200,7 +2006,6 @@ class MLEngineRegistry:
             cloud_ready, verify_msg = await self._verify_cloud_backend_ready(
                 timeout=float(os.getenv("JARVIS_ECAPA_CLOUD_TIMEOUT", "15.0")),
                 retry_count=int(os.getenv("JARVIS_ECAPA_CLOUD_RETRIES", "3")),
-                wait_for_ecapa=True,  # Fallback-to-cloud should wait for readiness
                 test_extraction=True  # Always test extraction for fallback
             )
 
@@ -2430,10 +2235,8 @@ class MLEngineRegistry:
         Args:
             endpoint: Cloud ML API endpoint URL
         """
-        self._cloud_endpoint = _normalize_cloud_base_url(endpoint) or endpoint
+        self._cloud_endpoint = endpoint
         self._use_cloud = True
-        # Force re-verification after manual changes
-        self._cloud_verified = False
         logger.info(f"☁️  Cloud endpoint set to: {endpoint}")
 
     async def switch_to_cloud(self, reason: str = "Manual switch") -> bool:

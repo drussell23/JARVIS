@@ -10878,14 +10878,13 @@ if (typeof localStorage !== 'undefined') {
 
     async def _open_incognito_browser(self, url: str, preferred_browser: str = None) -> bool:
         """
-        Open URL in Incognito/Private browsing mode with intelligent window reuse.
+        Open URL in Incognito/Private browsing mode.
         
         This is essential for development as it:
         - Bypasses all cached CSS, JS, and assets
         - Starts with fresh localStorage/sessionStorage
         - No service worker interference
         - Guaranteed to see the latest frontend changes
-        - REUSES existing incognito windows to prevent tab accumulation
         
         Args:
             url: URL to open
@@ -10899,12 +10898,11 @@ if (typeof localStorage !== 'undefined') {
             return await self._open_incognito_non_macos(url, preferred_browser)
         
         # macOS: Use AppleScript for precise control
-        # Priority order: Chrome (best incognito support, most reliable) > Safari > Arc
+        # Priority order if no preference: Chrome (best incognito support) > Safari > Arc
         browser_order = []
         if preferred_browser:
             browser_order = [preferred_browser.lower()]
         else:
-            # Chrome is the default and preferred browser for JARVIS
             browser_order = ["chrome", "safari", "arc"]
         
         for browser in browser_order:
@@ -10919,210 +10917,50 @@ if (typeof localStorage !== 'undefined') {
         return False
     
     async def _try_incognito_browser(self, url: str, browser: str) -> bool:
-        """
-        Try to open an incognito window in the specified browser.
-        
-        CHROME INCOGNITO STRATEGY (Robust, Async, Dynamic):
-        1. First, check if Chrome has ANY existing incognito windows
-        2. If yes, find JARVIS tabs in incognito windows and reuse them
-        3. If no JARVIS tab found but incognito window exists, add new tab to that window
-        4. If no incognito window exists, create one
-        5. Close duplicate JARVIS tabs in incognito to prevent accumulation
-        
-        This ensures:
-        - Only ONE incognito window for JARVIS (reuse pattern)
-        - No duplicate tabs
-        - Works whether Chrome is running or not
-        - Works whether incognito window exists or not
-        """
+        """Try to open an incognito window in the specified browser."""
         
         if browser == "chrome":
-            # =========================================================================
-            # CHROME INCOGNITO - ADVANCED REUSE STRATEGY
-            # =========================================================================
-            # AppleScript that intelligently manages Chrome Incognito windows:
-            # - Detects existing incognito windows
-            # - Reuses existing JARVIS tabs in incognito
-            # - Creates new incognito window only if needed
-            # - Prevents duplicate tabs
-            # =========================================================================
-            
-            # Define JARVIS URL patterns dynamically (localhost ports used by JARVIS)
-            jarvis_ports = [3000, 3001, 8010, 8001, 8888]
-            jarvis_patterns_str = ", ".join([f'"localhost:{p}", "127.0.0.1:{p}"' for p in jarvis_ports])
-            
-            applescript = f'''
-            -- =========================================================================
-            -- JARVIS Chrome Incognito Manager v2.0
-            -- Robust, Dynamic, Reuse-First Strategy
-            -- =========================================================================
-            
-            -- =========================================================================
-            -- JARVIS Chrome Incognito Manager v3.0
-            -- AGGRESSIVE: Closes ALL JARVIS tabs first, then opens exactly ONE
-            -- =========================================================================
-            
-            tell application "Google Chrome"
-                set jarvisPatterns to {{{jarvis_patterns_str}}}
-                set targetURL to "{url}"
-                set foundIncognitoWindow to missing value
-                set closedCount to 0
-                
-                -- =====================================================================
-                -- PHASE 1: AGGRESSIVE CLEANUP - Close ALL JARVIS tabs in incognito
-                -- We do multiple passes to ensure all are closed (handles index shifting)
-                -- =====================================================================
-                repeat 3 times
-                    repeat with w in windows
-                        try
-                            if mode of w is "incognito" then
-                                -- Remember this window for later
-                                if foundIncognitoWindow is missing value then
-                                    set foundIncognitoWindow to w
-                                end if
-                                
-                                -- Close JARVIS tabs in reverse order (handles index shifting)
-                                set tabCount to count of tabs of w
-                                repeat with i from tabCount to 1 by -1
-                                    try
-                                        set t to tab i of w
-                                        set tabURL to URL of t
-                                        
-                                        -- Check if this is a JARVIS tab
-                                        repeat with pattern in jarvisPatterns
-                                            if tabURL contains pattern then
-                                                -- Close this tab
-                                                close t
-                                                set closedCount to closedCount + 1
-                                                exit repeat
-                                            end if
-                                        end repeat
-                                    end try
-                                end repeat
-                            end if
-                        end try
-                    end repeat
-                    
-                    -- Small delay between passes
-                    delay 0.1
-                end repeat
-                
-                -- =====================================================================
-                -- PHASE 2: Open exactly ONE tab with target URL
-                -- =====================================================================
-                if foundIncognitoWindow is not missing value then
-                    try
-                        set tabCount to count of tabs of foundIncognitoWindow
-                        if tabCount > 0 then
-                            tell foundIncognitoWindow
-                                set newTab to make new tab with properties {{URL:targetURL}}
-                                set active tab index to (count of tabs)
-                            end tell
-                            set index of foundIncognitoWindow to 1
-                            activate
-                            return "NEW_TAB_IN_EXISTING:closed_" & closedCount
-                        else
-                            tell foundIncognitoWindow
-                                make new tab with properties {{URL:targetURL}}
-                            end tell
-                            set index of foundIncognitoWindow to 1
-                            activate
-                            return "NEW_TAB_IN_EXISTING:closed_" & closedCount
-                        end if
-                    on error
-                        set incognitoWindow to make new window with properties {{mode:"incognito"}}
-                        delay 0.3
-                        tell incognitoWindow
-                            set URL of active tab to targetURL
-                        end tell
-                        activate
-                        return "NEW_INCOGNITO_WINDOW:closed_" & closedCount
-                    end try
-                else
-                    set incognitoWindow to make new window with properties {{mode:"incognito"}}
-                    delay 0.3
-                    tell incognitoWindow
-                        set URL of active tab to targetURL
-                    end tell
-                    activate
-                    return "NEW_INCOGNITO_WINDOW:closed_" & closedCount
-                end if
-            end tell
-            '''
-            
+            # Chrome: Most reliable approach - always use command line with --incognito flag
+            # This works whether Chrome is running or not
             try:
-                logger.info("🔒 Chrome Incognito: Checking for existing windows to reuse...")
+                logger.info("🔒 Opening Chrome Incognito via command line...")
                 
+                # Use open -na to open new instance with incognito flag
+                # The -n flag opens a new instance, -a specifies the app
                 process = await asyncio.create_subprocess_exec(
-                    "osascript", "-e", applescript,
+                    '/usr/bin/open', '-na', 'Google Chrome', '--args', '--incognito', url,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE
                 )
-                stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=15)
+                stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=10)
                 
-                result = stdout.decode().strip() if stdout else ""
-                error = stderr.decode().strip() if stderr else ""
-                
-                logger.debug(f"Chrome Incognito AppleScript: returncode={process.returncode}, result='{result}', error='{error}'")
-                
-                if process.returncode == 0 and result:
-                    # Parse closed count from result (e.g., "NEW_TAB_IN_EXISTING:closed_3")
-                    closed_count = 0
-                    if ":closed_" in result:
-                        try:
-                            closed_count = int(result.split(":closed_")[1])
-                        except:
-                            pass
-                    
-                    if "NEW_TAB_IN_EXISTING" in result:
-                        if closed_count > 0:
-                            print(f"{Colors.GREEN}🔒 Chrome Incognito: Cleaned up {closed_count} duplicate tab(s), opened in existing window{Colors.ENDC}")
-                        else:
-                            print(f"{Colors.GREEN}🔒 Chrome Incognito: Opened in existing incognito window{Colors.ENDC}")
-                        logger.info(f"✅ Chrome Incognito: existing window (closed {closed_count} duplicates)")
-                        
-                    elif "NEW_INCOGNITO_WINDOW" in result:
-                        if closed_count > 0:
-                            print(f"{Colors.GREEN}🔒 Chrome Incognito: Cleaned up {closed_count} duplicate tab(s), created new window{Colors.ENDC}")
-                        else:
-                            print(f"{Colors.GREEN}🔒 Chrome Incognito: Created new incognito window{Colors.ENDC}")
-                        logger.info(f"✅ Chrome Incognito: new window (closed {closed_count} duplicates)")
-                        
-                    else:
-                        print(f"{Colors.GREEN}🔒 Chrome Incognito: Ready{Colors.ENDC}")
-                        logger.info(f"✅ Chrome Incognito operation completed: {result}")
-                    
+                if process.returncode == 0:
+                    print(f"{Colors.GREEN}🔒 Opened JARVIS in Chrome Incognito window{Colors.ENDC}")
+                    logger.info(f"✅ Chrome Incognito opened successfully")
+                    # Give Chrome a moment to open the incognito window
+                    await asyncio.sleep(1)
                     return True
-                    
                 else:
-                    # AppleScript failed, try command line fallback
-                    if error:
-                        logger.warning(f"Chrome Incognito AppleScript failed: {error}")
+                    error = stderr.decode() if stderr else "Unknown error"
+                    logger.warning(f"Chrome Incognito command failed: {error}")
                     
-                    # Fallback: Use command line to open new incognito window
-                    logger.info("🔒 Falling back to command line Chrome Incognito...")
-                    process = await asyncio.create_subprocess_exec(
-                        '/usr/bin/open', '-na', 'Google Chrome', '--args', '--incognito', url,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE
-                    )
-                    stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=10)
-                    
-                    if process.returncode == 0:
-                        print(f"{Colors.GREEN}🔒 Chrome Incognito: Opened via command line{Colors.ENDC}")
-                        logger.info("✅ Chrome Incognito opened via command line fallback")
-                        await asyncio.sleep(0.5)
-                        return True
-                    else:
-                        logger.warning(f"Chrome Incognito command line failed: {stderr.decode() if stderr else 'Unknown'}")
-                        return False
-                        
             except asyncio.TimeoutError:
-                logger.warning("Chrome Incognito operation timed out")
-                return False
+                logger.warning("Chrome Incognito command timed out")
             except Exception as e:
                 logger.warning(f"Chrome Incognito failed: {e}")
-                return False
+            
+            # Fallback to AppleScript if command line failed
+            applescript = f'''
+            tell application "Google Chrome"
+                set incognitoWindow to make new window with properties {{mode:"incognito"}}
+                delay 0.3
+                tell incognitoWindow
+                    set URL of active tab to "{url}"
+                end tell
+                activate
+            end tell
+            return "success"
+            '''
             
         elif browser == "safari":
             # Safari: Private window
@@ -11286,7 +11124,7 @@ if (typeof localStorage !== 'undefined') {
         
         return False
 
-    async def open_browser_smart(self, custom_url: str = None, force: bool = False, update_only: bool = False):
+    async def open_browser_smart(self, custom_url: str = None, force: bool = False):
         """Open browser intelligently with advanced features.
         
         Features:
@@ -11296,25 +11134,19 @@ if (typeof localStorage !== 'undefined') {
         - Preferred browser selection
         - Smart fallbacks
         - Duplicate tab prevention via session tracking
-        - Update-only mode for URL changes without creating new tabs
 
         Args:
             custom_url: Optional custom URL to open (e.g., loading page)
             force: Force open even if browser was already opened this session
-            update_only: Only update existing tab URL, never create new tab (for restart flows)
         """
         # Prevent duplicate tabs by checking if we already opened browser this session
         # This prevents the loading server AND the startup completion from both opening tabs
         # Check both instance flag AND global flag (for when browser opened before manager created)
         global _browser_opened_this_startup
-        
-        # CRITICAL: If browser was already opened this startup and not forcing, RETURN EARLY
-        # The loading page handles its own redirect to the main app via JavaScript
-        # We don't need to open or update anything - it will cause duplicate tabs
         if (self._browser_opened_this_session or _browser_opened_this_startup) and not force:
-            logger.info("🔒 Browser already opened this session - skipping to prevent duplicate tabs")
-            logger.info("   (Loading page will redirect to main app automatically)")
-            return  # EARLY RETURN - don't fall through to any browser opening logic
+            logger.info("🔒 Browser already opened this session, will only update existing tab URL")
+            # Still fall through to tab reuse logic to update URL in existing tab
+            # But the fallback at the end won't open a NEW tab
         
         if custom_url:
             url = custom_url
@@ -11330,143 +11162,254 @@ if (typeof localStorage !== 'undefined') {
         if self.is_restart:
             await asyncio.sleep(0.5)
         
-        # =========================================================================
-        # CHROME INCOGNITO - ALWAYS PREFERRED
-        # =========================================================================
-        # JARVIS always opens in Chrome Incognito for development because:
-        # - Bypasses all cached CSS, JS, and assets
-        # - Fresh localStorage/sessionStorage every time
-        # - No service worker interference
-        # - Guaranteed to see the latest frontend changes
-        # - The _open_incognito_browser function handles window/tab reuse
-        # =========================================================================
+        # Use Incognito mode if enabled (bypasses cache for fresh frontend)
+        use_incognito = getattr(self, 'use_incognito', False)
+        preferred_browser = getattr(self, 'preferred_browser', None)
         
-        # Check if user explicitly disabled incognito (rare case)
-        disable_incognito = getattr(self, 'disable_incognito', False)
-        preferred_browser = getattr(self, 'preferred_browser', 'chrome')  # Default to Chrome
-        
-        if not disable_incognito:
-            logger.info(f"🔒 Opening in Chrome Incognito mode (always preferred for JARVIS)")
+        if use_incognito:
+            logger.info(f"🔒 Opening in Incognito mode (cache-free for development)")
             result = await self._open_incognito_browser(url, preferred_browser)
             if result:
-                self._browser_opened_this_session = True
-                _browser_opened_this_startup = True
-                return  # Success, don't fall through to normal browser logic
-            else:
-                logger.warning("Chrome Incognito failed, falling back to normal browser mode")
+                return  # Success, don't fall through
 
-        # =========================================================================
-        # FALLBACK: Chrome Incognito via AppleScript (NEVER regular Chrome)
-        # =========================================================================
-        # This fallback ONLY uses Chrome Incognito. We do NOT open regular Chrome,
-        # Safari, or any other browser. JARVIS requires Chrome Incognito for:
-        # - Cache-free development experience
-        # - Fresh localStorage/sessionStorage
-        # - No service worker interference
-        # =========================================================================
+        # Try to reuse existing tab on macOS using AppleScript
         if platform.system() == "Darwin":
-            # Define JARVIS URL patterns
-            jarvis_ports = [3000, 3001, 8010, 8001, 8888]
-            jarvis_patterns_str = ", ".join([f'"localhost:{p}", "127.0.0.1:{p}"' for p in jarvis_ports])
+            # List of URL patterns that indicate JARVIS tabs (localhost only to avoid matching github.com/user/JARVIS)
+            # Include ALL JARVIS-related ports: frontend, API, loading server, websocket router, event UI
+            jarvis_patterns = [
+                "localhost:3000",   # Frontend
+                "127.0.0.1:3000",
+                "localhost:3001",   # Loading server
+                "127.0.0.1:3001",
+                "localhost:8010",   # Main API
+                "127.0.0.1:8010",
+                "localhost:8001",   # WebSocket router
+                "127.0.0.1:8001",
+                "localhost:8888",   # Event UI
+                "127.0.0.1:8888",
+            ]
 
-            # Log what we're doing
+            # Log what we're looking for
             action = "restart" if self.is_restart else "startup"
-            logger.info(f"🔒 Fallback: Chrome Incognito-only AppleScript on {action}")
+            logger.info(f"🔍 Looking for existing JARVIS tabs on {action} with patterns: {jarvis_patterns}")
 
-            # AppleScript that ONLY works with Chrome Incognito windows
-            # Will NOT open regular Chrome - only incognito
-            applescript = f'''
-            -- =========================================================================
-            -- JARVIS Chrome Incognito Fallback (NEVER regular Chrome)
-            -- =========================================================================
-            
-            on isJarvisURL(theURL, patterns)
-                repeat with pattern in patterns
-                    if theURL contains pattern then
-                        return true
-                    end if
-                end repeat
-                return false
-            end isJarvisURL
-            
-            tell application "Google Chrome"
-                set jarvisPatterns to {{{jarvis_patterns_str}}}
-                set targetURL to "{url}"
-                set foundIncognitoWindow to missing value
-                set foundJarvisTab to missing value
-                set tabsToClose to {{}}
-                
-                -- PHASE 1: Scan ONLY incognito windows for JARVIS tabs
-                repeat with w in windows
-                    try
-                        set windowMode to mode of w
-                        
-                        -- CRITICAL: Only process INCOGNITO windows
-                        if windowMode is "incognito" then
-                            if foundIncognitoWindow is missing value then
-                                set foundIncognitoWindow to w
-                            end if
-                            
-                            set tabCount to count of tabs of w
-                            repeat with i from 1 to tabCount
-                                set t to tab i of w
-                                set tabURL to URL of t
-                                
-                                if my isJarvisURL(tabURL, jarvisPatterns) then
-                                    if foundJarvisTab is missing value then
-                                        set foundJarvisTab to t
-                                        set foundIncognitoWindow to w
-                                    else
-                                        set end of tabsToClose to {{w, i}}
+            # Build AppleScript conditions - must contain localhost or 127.0.0.1 to avoid false positives
+            url_conditions = " or ".join([f'(tabURL contains "{pattern}")' for pattern in jarvis_patterns])
+
+            # AppleScript to close duplicate JARVIS tabs and reuse one
+            # Simpler, more reliable approach
+            pattern_list = '", "'.join(jarvis_patterns)
+            applescript = f"""
+            tell application "System Events"
+                set browserList to {{}}
+
+                -- Check which browsers are running
+                if exists process "Google Chrome" then set end of browserList to "Google Chrome"
+                if exists process "Safari" then set end of browserList to "Safari"
+                if exists process "Arc" then set end of browserList to "Arc"
+
+                -- Process each browser
+                repeat with browserName in browserList
+                    if browserName is "Google Chrome" then
+                        tell application "Google Chrome"
+                            set jarvisPatterns to {{"{pattern_list}"}}
+                            set foundFirst to false
+                            set totalClosed to 0
+
+                            repeat with w in windows
+                                set tabsToClose to {{}}
+                                set tabCount to count of tabs of w
+
+                                repeat with i from 1 to tabCount
+                                    set t to tab i of w
+                                    set tabURL to URL of t
+                                    set isJarvis to false
+
+                                    -- Check if this is a JARVIS tab
+                                    repeat with pattern in jarvisPatterns
+                                        if tabURL contains pattern then
+                                            set isJarvis to true
+                                            exit repeat
+                                        end if
+                                    end repeat
+
+                                    if isJarvis then
+                                        if not foundFirst then
+                                            -- Keep this one and update to target URL
+                                            set foundFirst to true
+                                            set URL of t to "{url}"
+                                            set active tab index of w to i
+                                            set index of w to 1
+                                        else
+                                            -- Mark for closure
+                                            set end of tabsToClose to i
+                                        end if
                                     end if
+                                end repeat
+
+                                -- Close marked tabs in reverse order
+                                if (count of tabsToClose) > 0 then
+                                    repeat with i from (count of tabsToClose) to 1 by -1
+                                        try
+                                            set tabIndex to item i of tabsToClose
+                                            close tab tabIndex of w
+                                            set totalClosed to totalClosed + 1
+                                        end try
+                                    end repeat
                                 end if
                             end repeat
-                        end if
-                    on error
-                    end try
+
+                            if foundFirst then
+                                activate
+                                return "REUSED_TAB_CHROME:" & totalClosed
+                            end if
+                        end tell
+
+                    else if browserName is "Safari" then
+                        tell application "Safari"
+                            set jarvisPatterns to {{"{pattern_list}"}}
+                            set foundFirst to false
+                            set totalClosed to 0
+
+                            repeat with w in windows
+                                set tabsToClose to {{}}
+                                set tabCount to count of tabs of w
+
+                                repeat with i from 1 to tabCount
+                                    set t to tab i of w
+                                    set tabURL to URL of t
+                                    set isJarvis to false
+
+                                    repeat with pattern in jarvisPatterns
+                                        if tabURL contains pattern then
+                                            set isJarvis to true
+                                            exit repeat
+                                        end if
+                                    end repeat
+
+                                    if isJarvis then
+                                        if not foundFirst then
+                                            set foundFirst to true
+                                            set URL of t to "{url}"
+                                            set current tab of w to t
+                                            set index of w to 1
+                                        else
+                                            set end of tabsToClose to i
+                                        end if
+                                    end if
+                                end repeat
+
+                                if (count of tabsToClose) > 0 then
+                                    repeat with i from (count of tabsToClose) to 1 by -1
+                                        try
+                                            set tabIndex to item i of tabsToClose
+                                            close tab tabIndex of w
+                                            set totalClosed to totalClosed + 1
+                                        end try
+                                    end repeat
+                                end if
+                            end repeat
+
+                            if foundFirst then
+                                activate
+                                return "REUSED_TAB_SAFARI:" & totalClosed
+                            end if
+                        end tell
+
+                    else if browserName is "Arc" then
+                        tell application "Arc"
+                            set jarvisPatterns to {{"{pattern_list}"}}
+                            set foundFirst to false
+                            set totalClosed to 0
+
+                            repeat with w in windows
+                                set tabsToClose to {{}}
+                                set tabCount to count of tabs of w
+
+                                repeat with i from 1 to tabCount
+                                    set t to tab i of w
+                                    set tabURL to URL of t
+                                    set isJarvis to false
+
+                                    repeat with pattern in jarvisPatterns
+                                        if tabURL contains pattern then
+                                            set isJarvis to true
+                                            exit repeat
+                                        end if
+                                    end repeat
+
+                                    if isJarvis then
+                                        if not foundFirst then
+                                            set foundFirst to true
+                                            set URL of t to "{url}"
+                                            set index of w to 1
+                                        else
+                                            set end of tabsToClose to i
+                                        end if
+                                    end if
+                                end repeat
+
+                                if (count of tabsToClose) > 0 then
+                                    repeat with i from (count of tabsToClose) to 1 by -1
+                                        try
+                                            set tabIndex to item i of tabsToClose
+                                            close tab tabIndex of w
+                                            set totalClosed to totalClosed + 1
+                                        end try
+                                    end repeat
+                                end if
+                            end repeat
+
+                            if foundFirst then
+                                activate
+                                return "REUSED_TAB_ARC:" & totalClosed
+                            end if
+                        end tell
+                    end if
                 end repeat
-                
-                -- PHASE 2: Close duplicate JARVIS tabs in incognito
-                if (count of tabsToClose) > 0 then
-                    repeat with i from (count of tabsToClose) to 1 by -1
-                        try
-                            set tabInfo to item i of tabsToClose
-                            set targetWindow to item 1 of tabInfo
-                            set tabIndex to item 2 of tabInfo
-                            close tab tabIndex of targetWindow
-                        end try
-                    end repeat
-                end if
-                
-                -- PHASE 3: Navigate (ONLY in incognito)
-                if foundJarvisTab is not missing value then
-                    set URL of foundJarvisTab to targetURL
-                    set active tab index of foundIncognitoWindow to (index of foundJarvisTab)
-                    set index of foundIncognitoWindow to 1
-                    activate
-                    return "REUSED_INCOGNITO_TAB"
-                    
-                else if foundIncognitoWindow is not missing value then
-                    tell foundIncognitoWindow
-                        set newTab to make new tab with properties {{URL:targetURL}}
-                        set active tab index to (count of tabs)
+            end tell
+
+            -- If no tab was found in any browser, create a new one
+            tell application "System Events"
+                if (count of browserList) > 0 then
+                    set preferredBrowser to item 1 of browserList
+                    tell application preferredBrowser
+                        if preferredBrowser is "Google Chrome" then
+                            if (count of windows) = 0 then
+                                make new window
+                            end if
+                            tell window 1
+                                set newTab to make new tab with properties {{URL:"{url}"}}
+                                set active tab index to index of newTab
+                            end tell
+                            activate
+                            return "NEW_TAB_CHROME:0"
+                        else if preferredBrowser is "Safari" then
+                            if (count of windows) = 0 then
+                                make new document
+                            end if
+                            tell window 1
+                                set current tab to make new tab with properties {{URL:"{url}"}}
+                            end tell
+                            activate
+                            return "NEW_TAB_SAFARI:0"
+                        else if preferredBrowser is "Arc" then
+                            if (count of windows) = 0 then
+                                make new window
+                            end if
+                            tell window 1
+                                make new tab with properties {{URL:"{url}"}}
+                            end tell
+                            activate
+                            return "NEW_TAB_ARC:0"
+                        end if
                     end tell
-                    set index of foundIncognitoWindow to 1
-                    activate
-                    return "NEW_TAB_IN_INCOGNITO"
-                    
                 else
-                    -- No incognito window exists - CREATE ONE (never use regular Chrome)
-                    set incognitoWindow to make new window with properties {{mode:"incognito"}}
-                    delay 0.3
-                    tell incognitoWindow
-                        set URL of active tab to targetURL
-                    end tell
-                    activate
-                    return "NEW_INCOGNITO_WINDOW"
+                    open location "{url}"
+                    return "NEW_TAB_DEFAULT:0"
                 end if
             end tell
-            '''
+            """
 
             try:
                 # Run AppleScript with better error handling
@@ -11482,85 +11425,43 @@ if (typeof localStorage !== 'undefined') {
                 if process.returncode != 0 and stderr:
                     logger.debug(f"AppleScript warning (non-fatal): {stderr.decode()}")
 
-                # Log successful operation (all results are Chrome Incognito)
+                # Log successful operation and whether we reused or created a tab
                 if stdout:
                     result = stdout.decode().strip()
-                    if "REUSED_INCOGNITO_TAB" in result:
-                        logger.info("✅ Reused existing Chrome Incognito JARVIS tab")
-                        print(f"{Colors.GREEN}🔒 Chrome Incognito: Reused existing JARVIS tab{Colors.ENDC}")
+                    if "REUSED_TAB" in result:
+                        parts = result.split(":")
+                        browser = parts[0].split("_")[-1]
+                        tabs_closed = int(parts[1]) if len(parts) > 1 else 0
+
+                        logger.info(f"✅ Reused existing JARVIS tab in {browser}, closed {tabs_closed} duplicates")
+                        if tabs_closed > 0:
+                            print(f"{Colors.GREEN}✓ Reused existing JARVIS tab in {browser} (closed {tabs_closed} duplicate{'s' if tabs_closed > 1 else ''}){Colors.ENDC}")
+                        else:
+                            print(f"{Colors.GREEN}✓ Reused existing JARVIS tab in {browser}{Colors.ENDC}")
                         self._browser_opened_this_session = True
-                        _browser_opened_this_startup = True
-                    elif "NEW_TAB_IN_INCOGNITO" in result:
-                        logger.info("🔒 Added new tab to existing Chrome Incognito window")
-                        print(f"{Colors.GREEN}🔒 Chrome Incognito: Added tab to existing window{Colors.ENDC}")
+                        _browser_opened_this_startup = True  # Set global flag too
+                    elif "NEW_TAB" in result:
+                        browser = result.split(":")[0].split("_")[-1]
+                        logger.info(f"🌐 Created new tab in {browser}")
+                        print(f"{Colors.BLUE}➕ Created new JARVIS tab in {browser}{Colors.ENDC}")
                         self._browser_opened_this_session = True
-                        _browser_opened_this_startup = True
-                    elif "NEW_INCOGNITO_WINDOW" in result:
-                        logger.info("🔒 Created new Chrome Incognito window")
-                        print(f"{Colors.GREEN}🔒 Chrome Incognito: Created new window{Colors.ENDC}")
-                        self._browser_opened_this_session = True
-                        _browser_opened_this_startup = True
+                        _browser_opened_this_startup = True  # Set global flag too
                     else:
-                        logger.info(f"Chrome Incognito operation completed: {result}")
+                        logger.info(f"Browser tab operation completed: {result}")
                         self._browser_opened_this_session = True
-                        _browser_opened_this_startup = True
+                        _browser_opened_this_startup = True  # Set global flag too
 
                 return
             except Exception as e:
-                # Fall through to command line Chrome Incognito
-                logger.debug(f"AppleScript failed, trying command line: {e}")
+                # Fall back to webbrowser if AppleScript fails
+                logger.debug(f"AppleScript failed (using fallback): {e}")
 
-        # =========================================================================
-        # FALLBACK: Chrome Incognito via command line (NEVER regular browser)
-        # =========================================================================
-        # JARVIS MUST open in Chrome Incognito for proper development experience.
-        # We do NOT fall back to regular Chrome or other browsers.
-        # =========================================================================
+        # Fallback for other platforms or if AppleScript fails
+        # Only open if we haven't already opened a browser this session
         if not self._browser_opened_this_session and not _browser_opened_this_startup:
-            if platform.system() == "Darwin":
-                # macOS: Use open command with --incognito flag
-                try:
-                    logger.info("🔒 Final fallback: Chrome Incognito via command line")
-                    process = await asyncio.create_subprocess_exec(
-                        '/usr/bin/open', '-na', 'Google Chrome', '--args', '--incognito', url,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE
-                    )
-                    stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=10)
-                    if process.returncode == 0:
-                        print(f"{Colors.GREEN}🔒 Chrome Incognito opened via command line fallback{Colors.ENDC}")
-                        self._browser_opened_this_session = True
-                        _browser_opened_this_startup = True
-                    else:
-                        print(f"{Colors.YELLOW}⚠️  Could not open Chrome Incognito. Please open manually:{Colors.ENDC}")
-                        print(f"{Colors.CYAN}   {url}{Colors.ENDC}")
-                except Exception as e:
-                    logger.warning(f"Chrome Incognito fallback failed: {e}")
-                    print(f"{Colors.YELLOW}⚠️  Could not open Chrome Incognito. Please open manually:{Colors.ENDC}")
-                    print(f"{Colors.CYAN}   {url}{Colors.ENDC}")
-            else:
-                # Non-macOS: Try Chrome with --incognito flag
-                import shutil
-                chrome_paths = ["google-chrome", "chromium-browser", "chromium", "chrome"]
-                opened = False
-                for chrome in chrome_paths:
-                    if shutil.which(chrome):
-                        try:
-                            process = await asyncio.create_subprocess_exec(
-                                chrome, "--incognito", url,
-                                stdout=asyncio.subprocess.DEVNULL,
-                                stderr=asyncio.subprocess.DEVNULL
-                            )
-                            print(f"{Colors.GREEN}🔒 Chrome Incognito opened{Colors.ENDC}")
-                            self._browser_opened_this_session = True
-                            _browser_opened_this_startup = True
-                            opened = True
-                            break
-                        except Exception:
-                            continue
-                if not opened:
-                    print(f"{Colors.YELLOW}⚠️  Could not open Chrome Incognito. Please open manually:{Colors.ENDC}")
-                    print(f"{Colors.CYAN}   {url}{Colors.ENDC}")
+            webbrowser.open(url)
+            self._browser_opened_this_session = True
+            _browser_opened_this_startup = True  # Set global flag too
         else:
             logger.info(f"🔒 Skipping fallback browser open - already opened this session")
 
@@ -13460,30 +13361,11 @@ except Exception as e:
 
             # Handle browser opening based on restart status
             if self.is_restart:
-                # =========================================================================
-                # RESTART FLOW: Browser already opened by restart sequence
-                # =========================================================================
-                # During restart, the browser is opened BEFORE StartupManager is created
-                # (in the main() restart flow around line 15865-15972).
-                # The loading page (port 3001) displays progress, then redirects to
-                # the main app (port 3000) via JavaScript when startup completes.
-                # 
-                # We do NOT call open_browser_smart() here because:
-                # 1. Browser is already open with the loading page
-                # 2. Loading page will automatically redirect to main app
-                # 3. Calling open_browser_smart() would create duplicate tabs
-                # =========================================================================
-                global _browser_opened_this_startup
-                if _browser_opened_this_startup:
-                    logger.info("🔒 Restart: Browser already opened, loading page will redirect automatically")
-                    print(f"{Colors.GREEN}✓ Loading page will redirect to main app when ready{Colors.ENDC}")
-                else:
-                    # Edge case: browser wasn't opened earlier, open now
-                    await self.open_browser_smart()
-                    print(f"{Colors.GREEN}✓ Opened browser to loading page{Colors.ENDC}")
+                # During restart: Clean up duplicate tabs and show loading page
+                await self.open_browser_smart()  # Will redirect to localhost:3001 (loading page)
+                print(f"{Colors.GREEN}✓ Redirected existing tabs to loading page{Colors.ENDC}")
 
-                # Broadcast startup completion to loading server
-                # This triggers the loading page's redirect to the main app
+                # Broadcast startup completion if progress broadcaster exists
                 if hasattr(self, '_startup_progress') and self._startup_progress:
                     await self._startup_progress.broadcast_complete(
                         success=True,
@@ -14625,76 +14507,6 @@ async def main():
 
     args = parser.parse_args()
 
-    # =========================================================================
-    # LOADING SERVER INTEGRATION - Dynamic Progress Reporting
-    # =========================================================================
-    # Start loading server and create progress reporter for real-time updates
-    # to the loading page. Fully async, parallel, dynamic with no hardcoding.
-    # Configuration from environment: LOADING_SERVER_HOST, LOADING_SERVER_PORT
-    # =========================================================================
-    
-    _progress_reporter = None
-    _loading_server_started = False
-    
-    async def _start_loading_server_integration():
-        """Start loading server and initialize progress reporter (async, non-blocking)."""
-        nonlocal _progress_reporter, _loading_server_started
-        
-        try:
-            from loading_server import (
-                start_loading_server_background,
-                StartupProgressReporter,
-            )
-            
-            # Start loading server in background (will use existing if already running)
-            _loading_server_started = await start_loading_server_background()
-            
-            if _loading_server_started:
-                _progress_reporter = StartupProgressReporter()
-                await _progress_reporter.report(
-                    "init",
-                    "Loading server connected - Starting JARVIS...",
-                    2
-                )
-                logger.info("📡 Loading server integration initialized")
-            else:
-                logger.warning("⚠️ Loading server not available - progress updates disabled")
-                
-        except ImportError as e:
-            logger.debug(f"Loading server module not available: {e}")
-        except Exception as e:
-            logger.warning(f"Loading server initialization failed: {e}")
-    
-    async def _report_progress(stage: str, message: str, progress: float, metadata: dict = None):
-        """Fire-and-forget progress report (never blocks startup)."""
-        if _progress_reporter:
-            try:
-                await _progress_reporter.report(stage, message, progress, metadata, fire_and_forget=True)
-            except Exception as e:
-                logger.debug(f"Progress report failed: {e}")
-    
-    async def _report_complete(message: str = "JARVIS is online!", redirect_url: str = None):
-        """Report startup complete with redirect."""
-        if _progress_reporter:
-            try:
-                # Use frontend port from args if available
-                frontend_url = redirect_url or f"http://localhost:{args.frontend_port if hasattr(args, 'frontend_port') else 3000}"
-                await _progress_reporter.complete(message, frontend_url)
-            except Exception as e:
-                logger.debug(f"Completion report failed: {e}")
-    
-    async def _report_failure(message: str, error: str = None):
-        """Report startup failure."""
-        if _progress_reporter:
-            try:
-                await _progress_reporter.fail(message, error)
-            except Exception as e:
-                logger.debug(f"Failure report failed: {e}")
-    
-    # Start loading server integration FIRST (must be ready before progress updates)
-    # This is awaited (not fire-and-forget) to ensure server is up before cleanup begins
-    await _start_loading_server_integration()
-
     # Automatic Goal Inference Configuration (if not specified via command line or environment)
     import os
 
@@ -14708,7 +14520,6 @@ async def main():
         print(
             f"{Colors.CYAN}   (Override with --goal-preset or JARVIS_GOAL_PRESET environment variable){Colors.ENDC}"
         )
-
 
     # Auto-configure automation if not specified
     if (
@@ -14983,11 +14794,7 @@ async def main():
                     print(f"{Colors.GREEN}   ✨ FORCE RESTART - All old processes terminated!{Colors.ENDC}")
                     print(f"{Colors.GREEN}   ✅ Fresh async code will be loaded:{Colors.ENDC}")
                     print(f"{Colors.GREEN}      • encode_batch wrapped in asyncio.to_thread(){Colors.ENDC}")
-                    cloud_hint = os.getenv("JARVIS_CLOUD_ML_ENDPOINT", "").strip()
-                    if cloud_hint:
-                        print(f"{Colors.GREEN}      • Cloud Run configured: {cloud_hint}{Colors.ENDC}")
-                    else:
-                        print(f"{Colors.GREEN}      • Cloud Run: not configured (set JARVIS_CLOUD_ML_ENDPOINT to enable){Colors.ENDC}")
+                    print(f"{Colors.GREEN}      • Cloud Run fallback: https://jarvis-ml-888774109345.us-central1.run.app{Colors.ENDC}")
                     print(f"{Colors.GREEN}      • No more 'Processing...' event loop blocking!{Colors.ENDC}")
                 else:
                     print(f"{Colors.YELLOW}   ✨ Code changes detected - cleaned up old processes!{Colors.ENDC}")
@@ -15090,56 +14897,26 @@ async def main():
 
     # Helper function to broadcast progress to loading server
     async def broadcast_to_loading_server(stage, message, progress, metadata=None):
-        """Send progress update to loading server via HTTP (redirected to robust reporter)"""
-        # Redirect to the robust, non-blocking reporter we added earlier
-        if '_report_progress' in locals() or '_report_progress' in globals():
-            await _report_progress(stage, message, progress, metadata)
-        else:
-            # Fallback if reporter not available
-            pass
-
-    # Helper for robust parallel process cleanup
-    async def _kill_process_async(proc_info):
-        """Asynchronously kill a process with SIGTERM then SIGKILL (Robust & Safe)"""
-        pid = proc_info["pid"]
-        name = proc_info.get("type", "unknown")
-        
-        # ULTRA-SAFE GUARD: Double check exclusion just in case
-        if "loading_server" in proc_info.get("cmdline", ""):
-            return "skipped"
-
+        """Send progress update to loading server via HTTP"""
         try:
-            import signal
-            import psutil
-            # Check if exists
-            if not psutil.pid_exists(pid):
-                return "already_dead"
+            import aiohttp
+            url = "http://localhost:3001/api/update-progress"
+            data = {
+                "stage": stage,
+                "message": message,
+                "progress": progress,
+                "timestamp": datetime.now().isoformat()
+            }
+            if metadata:
+                data["metadata"] = metadata
 
-            # SIGTERM (Graceful)
-            os.kill(pid, signal.SIGTERM)
-            
-            # Wait up to 2 seconds for graceful exit (async polling)
-            for _ in range(20):
-                await asyncio.sleep(0.1)
-                if not psutil.pid_exists(pid):
-                    return "terminated"
-            
-            # SIGKILL (Force)
-            if psutil.pid_exists(pid):
-                os.kill(pid, signal.SIGKILL)
-                await asyncio.sleep(0.1)
-                
-            if not psutil.pid_exists(pid):
-                return "killed"
-                
-            return "failed"
-            
-        except ProcessLookupError:
-            return "already_dead"
-        except PermissionError:
-            return "permission_denied"
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json=data, timeout=aiohttp.ClientTimeout(total=1)) as resp:
+                    if resp.status == 200:
+                        print(f"  {Colors.CYAN}📊 Progress: {progress}% - {message}{Colors.ENDC}")
         except Exception as e:
-            return f"error: {str(e)}"
+            # Silently fail - loading server might not be ready yet
+            pass
 
     # Handle restart mode (explicit --restart flag)
     # Ensure CloudSQL proxy is running (for voice biometrics)
@@ -15186,11 +14963,15 @@ async def main():
     force_docker = getattr(args, 'local_docker', False) or os.getenv("JARVIS_USE_LOCAL_DOCKER", "").lower() == "true"
     skip_docker = getattr(args, 'no_docker', False) or os.getenv("JARVIS_SKIP_DOCKER", "").lower() == "true"
     docker_rebuild = getattr(args, 'docker_rebuild', False)
-    # Cost-safe default: Cloud Run is explicit opt-in.
-    prefer_cloud = os.getenv("JARVIS_PREFER_CLOUD_RUN", "false").lower() == "true"
+    prefer_cloud = os.getenv("JARVIS_PREFER_CLOUD_RUN", "true").lower() == "true"
 
-    # Get Cloud Run endpoint from environment (explicit opt-in; no hardcoded defaults)
-    cloud_run_endpoint = os.getenv("JARVIS_CLOUD_ML_ENDPOINT", "").strip()
+    # Get Cloud Run endpoint from environment
+    # Note: Cloud Run URLs use project NUMBER (888774109345), not project ID (jarvis-473803)
+    gcp_project_number = os.getenv("GCP_PROJECT_NUMBER", "888774109345")
+    cloud_run_endpoint = os.getenv(
+        "JARVIS_CLOUD_ML_ENDPOINT",
+        f"https://jarvis-ml-{gcp_project_number}.us-central1.run.app/api/ml"
+    )
 
     # ─────────────────────────────────────────────────────────────────────────
     # PHASE 1: Concurrent Backend Probing (async for speed)
@@ -15269,11 +15050,6 @@ async def main():
     async def probe_cloud_run_backend() -> dict:
         """Probe Cloud Run ECAPA backend availability and health."""
         result = {"available": False, "healthy": False, "endpoint": cloud_run_endpoint, "latency_ms": None, "error": None}
-
-        # If not configured, don't probe (prevents accidental cloud traffic)
-        if not cloud_run_endpoint:
-            result["error"] = "Cloud Run not configured (set JARVIS_CLOUD_ML_ENDPOINT)"
-            return result
 
         try:
             import aiohttp
@@ -15541,14 +15317,14 @@ async def main():
     try:
         from voice_unlock.cloud_ecapa_client import CloudECAPAClient, get_cloud_ecapa_client
 
-        # Get cloud ML endpoint from environment (explicit opt-in; no hardcoding)
-        cloud_ml_endpoint = os.getenv("JARVIS_CLOUD_ML_ENDPOINT", "").strip()
-
-        # Check if cloud backend is enabled (explicit opt-in)
-        cloud_enabled = (
-            bool(cloud_ml_endpoint)
-            and os.getenv("JARVIS_PREFER_CLOUD_RUN", "false").lower() == "true"
+        # Get cloud ML endpoint from environment (dynamic, no hardcoding)
+        cloud_ml_endpoint = os.getenv(
+            "JARVIS_CLOUD_ML_ENDPOINT",
+            "https://jarvis-ml-jarvis-473803.us-central1.run.app/api/ml"
         )
+
+        # Check if cloud backend is enabled
+        cloud_enabled = os.getenv("JARVIS_PREFER_CLOUD_RUN", "true").lower() == "true"
 
         if cloud_enabled:
             print(f"{Colors.CYAN}   Initializing CloudECAPAClient v18.2.0...{Colors.ENDC}")
@@ -15583,10 +15359,7 @@ async def main():
                 print(f"{Colors.YELLOW}   ⚠️  CloudECAPAClient could not be created{Colors.ENDC}")
                 print(f"{Colors.YELLOW}   → Voice unlock will use local processing{Colors.ENDC}")
         else:
-            if not cloud_ml_endpoint:
-                print(f"{Colors.CYAN}   Cloud ECAPA disabled (no JARVIS_CLOUD_ML_ENDPOINT configured){Colors.ENDC}")
-            else:
-                print(f"{Colors.CYAN}   Cloud ECAPA disabled (JARVIS_PREFER_CLOUD_RUN=false){Colors.ENDC}")
+            print(f"{Colors.CYAN}   Cloud ECAPA disabled (JARVIS_PREFER_CLOUD_RUN=false){Colors.ENDC}")
             print(f"{Colors.CYAN}   → Voice unlock will use local ECAPA encoder{Colors.ENDC}")
 
     except ImportError as e:
@@ -15766,118 +15539,115 @@ async def main():
         # We MUST wait for the ECAPA model to be loaded during startup,
         # not during the unlock request when user is waiting.
         # ═══════════════════════════════════════════════════════════════════════════
-        # Cost-safe: blocking Cloud Run warmup is explicit opt-in.
-        # This can generate billable Cloud Run traffic and should not run unless requested.
-        wait_for_cloud_ready = os.getenv("ECAPA_STARTUP_WAIT_FOR_READY", "false").lower() == "true"
-        cloud_endpoint = os.getenv("JARVIS_CLOUD_ML_ENDPOINT", "").strip()
-
-        if not wait_for_cloud_ready:
-            print(f"{Colors.CYAN}   Step 2/5: Cloud Run warmup skipped (ECAPA_STARTUP_WAIT_FOR_READY=false){Colors.ENDC}")
-            cloud_ecapa_ready = False
-        elif not cloud_endpoint:
-            print(f"{Colors.CYAN}   Step 2/5: Cloud Run warmup skipped (no JARVIS_CLOUD_ML_ENDPOINT configured){Colors.ENDC}")
-            cloud_ecapa_ready = False
-        else:
-            print(f"{Colors.CYAN}   Step 2/5: WAITING for Cloud Run ECAPA to be ready (blocking)...{Colors.ENDC}")
+        print(f"{Colors.CYAN}   Step 2/5: WAITING for Cloud Run ECAPA to be ready (blocking)...{Colors.ENDC}")
         
-        if wait_for_cloud_ready and cloud_endpoint:
-            # Configuration for wait-for-ready
-            ECAPA_WAIT_TIMEOUT = float(os.getenv("ECAPA_STARTUP_WAIT_TIMEOUT", "90"))  # Max 90s to wait
-            ECAPA_POLL_INTERVAL = float(os.getenv("ECAPA_STARTUP_POLL_INTERVAL", "3"))  # Poll every 3s
-            ECAPA_PREWARM_ENDPOINT = os.getenv("ECAPA_PREWARM_ENDPOINT", "/api/ml/prewarm")  # Trigger model load
-
-            cloud_ecapa_ready = False
-            cloud_wait_start = time.time()
-
+        # Default Cloud Run endpoint (updated 2024-12 to new URL format)
+        default_cloud_url = "https://jarvis-ml-888774109345.us-central1.run.app"
+        cloud_endpoint = os.getenv("JARVIS_CLOUD_ML_ENDPOINT", default_cloud_url)
+        
+        # Configuration for wait-for-ready
+        ECAPA_WAIT_TIMEOUT = float(os.getenv("ECAPA_STARTUP_WAIT_TIMEOUT", "90"))  # Max 90s to wait
+        ECAPA_POLL_INTERVAL = float(os.getenv("ECAPA_STARTUP_POLL_INTERVAL", "3"))  # Poll every 3s
+        ECAPA_PREWARM_ENDPOINT = os.getenv("ECAPA_PREWARM_ENDPOINT", "/api/ml/prewarm")  # Trigger model load
+        
+        cloud_ecapa_ready = False
+        cloud_wait_start = time.time()
+        
+        try:
+            import aiohttp
+            
+            # Properly strip /api/ml suffix if present
+            cloud_url = cloud_endpoint.rstrip('/')
+            if cloud_url.endswith('/api/ml'):
+                cloud_url = cloud_url[:-7]  # Remove '/api/ml'
+            health_url = f"{cloud_url}/health"
+            prewarm_url = f"{cloud_url}{ECAPA_PREWARM_ENDPOINT}"
+            
+            print(f"{Colors.CYAN}      → Health endpoint: {health_url}{Colors.ENDC}")
+            print(f"{Colors.CYAN}      → Pre-warm endpoint: {prewarm_url}{Colors.ENDC}")
+            print(f"{Colors.CYAN}      → Max wait time: {ECAPA_WAIT_TIMEOUT}s{Colors.ENDC}")
+            
+            # FIRST: Trigger pre-warm to force model loading
+            print(f"{Colors.CYAN}      🔥 Triggering ECAPA model pre-warm...{Colors.ENDC}")
             try:
-                import aiohttp
-
-                # Properly strip /api/ml suffix if present
-                cloud_url = cloud_endpoint.rstrip('/')
-                if cloud_url.endswith('/api/ml'):
-                    cloud_url = cloud_url[:-7]  # Remove '/api/ml'
-                health_url = f"{cloud_url}/health"
-                prewarm_url = f"{cloud_url}{ECAPA_PREWARM_ENDPOINT}"
-
-                print(f"{Colors.CYAN}      → Health endpoint: {health_url}{Colors.ENDC}")
-                print(f"{Colors.CYAN}      → Pre-warm endpoint: {prewarm_url}{Colors.ENDC}")
-                print(f"{Colors.CYAN}      → Max wait time: {ECAPA_WAIT_TIMEOUT}s{Colors.ENDC}")
-
-                # FIRST: Trigger pre-warm to force model loading
-                print(f"{Colors.CYAN}      🔥 Triggering ECAPA model pre-warm...{Colors.ENDC}")
-                try:
-                    async with aiohttp.ClientSession() as session:
-                        async with session.post(
-                            prewarm_url,
-                            json={"warmup": True},
-                            timeout=aiohttp.ClientTimeout(total=30)
+                async with aiohttp.ClientSession() as session:
+                    # Fire off prewarm request (this triggers model loading on cloud)
+                    async with session.post(
+                        prewarm_url,
+                        json={"warmup": True},
+                        timeout=aiohttp.ClientTimeout(total=30)
+                    ) as resp:
+                        if resp.status == 200:
+                            prewarm_data = await resp.json()
+                            print(f"{Colors.GREEN}      ✓ Pre-warm triggered: {prewarm_data.get('message', 'OK')}{Colors.ENDC}")
+                        else:
+                            print(f"{Colors.YELLOW}      → Pre-warm returned {resp.status} (model may load on-demand){Colors.ENDC}")
+            except Exception as prewarm_err:
+                print(f"{Colors.YELLOW}      → Pre-warm request failed: {prewarm_err} (model may load on-demand){Colors.ENDC}")
+            
+            # SECOND: Poll until ECAPA is ready or timeout
+            print(f"{Colors.CYAN}      ⏳ Waiting for ECAPA model to be fully loaded...{Colors.ENDC}")
+            poll_attempt = 0
+            last_status = None
+            
+            async with aiohttp.ClientSession() as session:
+                while (time.time() - cloud_wait_start) < ECAPA_WAIT_TIMEOUT:
+                    poll_attempt += 1
+                    elapsed = time.time() - cloud_wait_start
+                    
+                    try:
+                        async with session.get(
+                            health_url, 
+                            timeout=aiohttp.ClientTimeout(total=10)
                         ) as resp:
                             if resp.status == 200:
-                                prewarm_data = await resp.json()
-                                print(f"{Colors.GREEN}      ✓ Pre-warm triggered: {prewarm_data.get('message', 'OK')}{Colors.ENDC}")
-                            else:
-                                print(f"{Colors.YELLOW}      → Pre-warm returned {resp.status} (model may load on-demand){Colors.ENDC}")
-                except Exception as prewarm_err:
-                    print(f"{Colors.YELLOW}      → Pre-warm request failed: {prewarm_err} (model may load on-demand){Colors.ENDC}")
-
-                # SECOND: Poll until ECAPA is ready or timeout
-                print(f"{Colors.CYAN}      ⏳ Waiting for ECAPA model to be fully loaded...{Colors.ENDC}")
-                poll_attempt = 0
-                last_status = None
-
-                async with aiohttp.ClientSession() as session:
-                    while (time.time() - cloud_wait_start) < ECAPA_WAIT_TIMEOUT:
-                        poll_attempt += 1
-                        elapsed = time.time() - cloud_wait_start
-
-                        try:
-                            async with session.get(
-                                health_url,
-                                timeout=aiohttp.ClientTimeout(total=10)
-                            ) as resp:
-                                if resp.status == 200:
-                                    health_data = await resp.json()
-                                    ecapa_ready = health_data.get("ecapa_ready", False)
-                                    status = health_data.get("status", "unknown")
-                                    load_source = health_data.get("load_source", "unknown")
-                                    load_time = health_data.get("load_time_ms", 0)
-
-                                    if ecapa_ready:
-                                        cloud_ecapa_ready = True
-                                        ecapa_verification_result["cloud_ecapa_tested"] = True
-                                        total_wait = time.time() - cloud_wait_start
-
-                                        print(f"\n{Colors.GREEN}   ✅ Cloud Run ECAPA is READY!{Colors.ENDC}")
-                                        print(f"{Colors.GREEN}      → Status: {status}{Colors.ENDC}")
-                                        print(f"{Colors.GREEN}      → Load source: {load_source}{Colors.ENDC}")
-                                        print(f"{Colors.GREEN}      → Model load time: {load_time:.0f}ms{Colors.ENDC}")
-                                        print(f"{Colors.GREEN}      → Total startup wait: {total_wait:.1f}s{Colors.ENDC}")
-                                        break
-                                    else:
-                                        if status != last_status:
-                                            print(f"{Colors.YELLOW}      → [{elapsed:.0f}s] Status: {status} (waiting...){Colors.ENDC}")
-                                            last_status = status
-                                        else:
-                                            print(f"{Colors.CYAN}      → [{elapsed:.0f}s] Poll #{poll_attempt}: {status}{Colors.ENDC}", end='\r')
+                                health_data = await resp.json()
+                                ecapa_ready = health_data.get("ecapa_ready", False)
+                                status = health_data.get("status", "unknown")
+                                load_source = health_data.get("load_source", "unknown")
+                                load_time = health_data.get("load_time_ms", 0)
+                                
+                                if ecapa_ready:
+                                    # SUCCESS! ECAPA is ready
+                                    cloud_ecapa_ready = True
+                                    ecapa_verification_result["cloud_ecapa_tested"] = True
+                                    total_wait = time.time() - cloud_wait_start
+                                    
+                                    print(f"\n{Colors.GREEN}   ✅ Cloud Run ECAPA is READY!{Colors.ENDC}")
+                                    print(f"{Colors.GREEN}      → Status: {status}{Colors.ENDC}")
+                                    print(f"{Colors.GREEN}      → Load source: {load_source}{Colors.ENDC}")
+                                    print(f"{Colors.GREEN}      → Model load time: {load_time:.0f}ms{Colors.ENDC}")
+                                    print(f"{Colors.GREEN}      → Total startup wait: {total_wait:.1f}s{Colors.ENDC}")
+                                    break
                                 else:
-                                    print(f"{Colors.YELLOW}      → [{elapsed:.0f}s] Health returned {resp.status}{Colors.ENDC}")
-
-                        except asyncio.TimeoutError:
-                            print(f"{Colors.YELLOW}      → [{elapsed:.0f}s] Poll timed out (cold start?){Colors.ENDC}")
-                        except Exception as poll_err:
-                            print(f"{Colors.YELLOW}      → [{elapsed:.0f}s] Poll error: {poll_err}{Colors.ENDC}")
-
-                        await asyncio.sleep(ECAPA_POLL_INTERVAL)
-
-                if not cloud_ecapa_ready:
-                    total_wait = time.time() - cloud_wait_start
-                    ecapa_verification_result["errors"].append(f"Cloud ECAPA not ready after {total_wait:.0f}s")
-                    print(f"\n{Colors.YELLOW}   ⚠️  Cloud Run ECAPA did not become ready within {ECAPA_WAIT_TIMEOUT}s{Colors.ENDC}")
-                    print(f"{Colors.YELLOW}      → Will attempt local fallback or retry during verification{Colors.ENDC}")
-
-            except Exception as e:
-                ecapa_verification_result["errors"].append(f"Cloud ECAPA error: {str(e)}")
-                print(f"{Colors.YELLOW}   ⚠️  Cloud Run ECAPA not available: {e}{Colors.ENDC}")
+                                    # Not ready yet - update status indicator
+                                    if status != last_status:
+                                        print(f"{Colors.YELLOW}      → [{elapsed:.0f}s] Status: {status} (waiting...){Colors.ENDC}")
+                                        last_status = status
+                                    else:
+                                        # Show progress dots
+                                        print(f"{Colors.CYAN}      → [{elapsed:.0f}s] Poll #{poll_attempt}: {status}{Colors.ENDC}", end='\r')
+                            else:
+                                print(f"{Colors.YELLOW}      → [{elapsed:.0f}s] Health returned {resp.status}{Colors.ENDC}")
+                                
+                    except asyncio.TimeoutError:
+                        print(f"{Colors.YELLOW}      → [{elapsed:.0f}s] Poll timed out (cold start?){Colors.ENDC}")
+                    except Exception as poll_err:
+                        print(f"{Colors.YELLOW}      → [{elapsed:.0f}s] Poll error: {poll_err}{Colors.ENDC}")
+                    
+                    # Wait before next poll
+                    await asyncio.sleep(ECAPA_POLL_INTERVAL)
+            
+            # Check if we timed out
+            if not cloud_ecapa_ready:
+                total_wait = time.time() - cloud_wait_start
+                ecapa_verification_result["errors"].append(f"Cloud ECAPA not ready after {total_wait:.0f}s")
+                print(f"\n{Colors.YELLOW}   ⚠️  Cloud Run ECAPA did not become ready within {ECAPA_WAIT_TIMEOUT}s{Colors.ENDC}")
+                print(f"{Colors.YELLOW}      → Will attempt local fallback or retry during verification{Colors.ENDC}")
+                
+        except Exception as e:
+            ecapa_verification_result["errors"].append(f"Cloud ECAPA error: {str(e)}")
+            print(f"{Colors.YELLOW}   ⚠️  Cloud Run ECAPA not available: {e}{Colors.ENDC}")
 
         # Step 3: Test Local ECAPA (ML Engine Registry)
         print(f"{Colors.CYAN}   Step 3/5: Testing local ECAPA via ML Engine Registry...{Colors.ENDC}")
@@ -16076,195 +15846,132 @@ async def main():
                 if server_ready:
                     print(f"{Colors.GREEN}   ✓ Loading server started on {loading_server_url}{Colors.ENDC}")
 
-                    # =========================================================================
-                    # CHROME INCOGNITO - ALWAYS USED FOR RESTART
-                    # =========================================================================
-                    # Uses Chrome Incognito with AGGRESSIVE duplicate cleanup:
-                    # 1. Close ALL existing JARVIS tabs in ALL incognito windows first
-                    # 2. Then either reuse an existing incognito window or create new one
-                    # 3. Navigate to loading page in a SINGLE tab
-                    # =========================================================================
-                    print(f"{Colors.CYAN}🔒 Opening Chrome Incognito with loading page...{Colors.ENDC}")
+                    # Clean up existing JARVIS tabs and redirect to loading page
+                    print(f"{Colors.CYAN}🌐 Opening Chrome with loading page...{Colors.ENDC}")
                     
                     browser_opened = False
                     try:
-                        # AppleScript for Chrome Incognito with AGGRESSIVE duplicate cleanup
-                        # This script closes ALL JARVIS tabs first, then opens exactly ONE
-                        incognito_script = '''
-                        -- =========================================================================
-                        -- JARVIS Chrome Incognito Restart Manager v3.0
-                        -- AGGRESSIVE: Closes ALL JARVIS tabs first, then opens exactly ONE
-                        -- =========================================================================
-                        
+                        # Use AppleScript to close duplicate tabs and show loading page
+                        cleanup_script = """
                         tell application "Google Chrome"
                             set jarvisPatterns to {"localhost:3000", "localhost:3001", "localhost:8010", "localhost:8001", "localhost:8888", "127.0.0.1:3000", "127.0.0.1:3001", "127.0.0.1:8010", "127.0.0.1:8001", "127.0.0.1:8888"}
-                            set targetURL to "http://localhost:3001/"
-                            set foundIncognitoWindow to missing value
-                            set closedCount to 0
-                            
-                            -- =====================================================================
-                            -- PHASE 1: AGGRESSIVE CLEANUP - Close ALL JARVIS tabs in incognito
-                            -- We do multiple passes to ensure all are closed (handles index shifting)
-                            -- =====================================================================
-                            repeat 3 times
-                                repeat with w in windows
-                                    try
-                                        if mode of w is "incognito" then
-                                            -- Remember this window for later
-                                            if foundIncognitoWindow is missing value then
-                                                set foundIncognitoWindow to w
-                                            end if
-                                            
-                                            -- Close JARVIS tabs in reverse order (handles index shifting)
-                                            set tabCount to count of tabs of w
-                                            repeat with i from tabCount to 1 by -1
-                                                try
-                                                    set t to tab i of w
-                                                    set tabURL to URL of t
-                                                    
-                                                    -- Check if this is a JARVIS tab
-                                                    repeat with pattern in jarvisPatterns
-                                                        if tabURL contains pattern then
-                                                            -- Close this tab
-                                                            close t
-                                                            set closedCount to closedCount + 1
-                                                            exit repeat
-                                                        end if
-                                                    end repeat
-                                                end try
-                                            end repeat
+                            set foundFirst to false
+                            set totalClosed to 0
+
+                            repeat with w in windows
+                                set tabsToClose to {}
+                                set tabCount to count of tabs of w
+
+                                repeat with i from 1 to tabCount
+                                    set t to tab i of w
+                                    set tabURL to URL of t
+                                    set isJarvis to false
+
+                                    -- Check if this is a JARVIS tab
+                                    repeat with pattern in jarvisPatterns
+                                        if tabURL contains pattern then
+                                            set isJarvis to true
+                                            exit repeat
                                         end if
-                                    end try
-                                end repeat
-                                
-                                -- Small delay between passes
-                                delay 0.1
-                            end repeat
-                            
-                            -- =====================================================================
-                            -- PHASE 2: Open exactly ONE tab with loading page
-                            -- =====================================================================
-                            if foundIncognitoWindow is not missing value then
-                                -- Check if window still has tabs (might have closed all)
-                                try
-                                    set tabCount to count of tabs of foundIncognitoWindow
-                                    if tabCount > 0 then
-                                        -- Add new tab to existing incognito window
-                                        tell foundIncognitoWindow
-                                            set newTab to make new tab with properties {URL:targetURL}
-                                            set active tab index to (count of tabs)
-                                        end tell
-                                        set index of foundIncognitoWindow to 1
-                                        activate
-                                        return "NEW_TAB_IN_INCOGNITO:closed_" & closedCount
-                                    else
-                                        -- Window has no tabs, set URL of the empty tab area
-                                        tell foundIncognitoWindow
-                                            make new tab with properties {URL:targetURL}
-                                        end tell
-                                        set index of foundIncognitoWindow to 1
-                                        activate
-                                        return "NEW_TAB_IN_INCOGNITO:closed_" & closedCount
+                                    end repeat
+
+                                    if isJarvis then
+                                        if not foundFirst then
+                                            -- Keep this one and redirect to loading page
+                                            set foundFirst to true
+                                            set URL of t to "http://localhost:3001/"
+                                            set active tab index of w to i
+                                            set index of w to 1
+                                        else
+                                            -- Mark for closure
+                                            set end of tabsToClose to i
+                                        end if
                                     end if
-                                on error
-                                    -- Window might have closed, create new one
-                                    set incognitoWindow to make new window with properties {mode:"incognito"}
-                                    delay 0.3
-                                    tell incognitoWindow
-                                        set URL of active tab to targetURL
-                                    end tell
-                                    activate
-                                    return "NEW_INCOGNITO_WINDOW:closed_" & closedCount
-                                end try
-                            else
-                                -- No incognito window found, create one
-                                set incognitoWindow to make new window with properties {mode:"incognito"}
-                                delay 0.3
-                                tell incognitoWindow
-                                    set URL of active tab to targetURL
+                                end repeat
+
+                                -- Close marked tabs in reverse order
+                                if (count of tabsToClose) > 0 then
+                                    repeat with i from (count of tabsToClose) to 1 by -1
+                                        try
+                                            set tabIndex to item i of tabsToClose
+                                            close tab tabIndex of w
+                                            set totalClosed to totalClosed + 1
+                                        end try
+                                    end repeat
+                                end if
+                            end repeat
+
+                            -- If no JARVIS tab was found, create one
+                            if not foundFirst then
+                                if (count of windows) = 0 then
+                                    make new window
+                                end if
+                                tell window 1
+                                    set newTab to make new tab with properties {URL:"http://localhost:3001/"}
+                                    set active tab index to index of newTab
                                 end tell
-                                activate
-                                return "NEW_INCOGNITO_WINDOW:closed_" & closedCount
                             end if
+
+                            activate
                         end tell
-                        '''
+                        """
                         result = subprocess.run(
-                            ["osascript", "-e", incognito_script], 
+                            ["osascript", "-e", cleanup_script], 
                             stdout=subprocess.PIPE, 
                             stderr=subprocess.PIPE, 
-                            timeout=10
+                            timeout=5
                         )
                         if result.returncode == 0:
                             browser_opened = True
-                            globals()['_browser_opened_this_startup'] = True
-                            output = result.stdout.decode().strip()
-                            
-                            # Parse closed count from output (e.g., "NEW_TAB_IN_INCOGNITO:closed_3")
-                            closed_count = 0
-                            if ":closed_" in output:
-                                try:
-                                    closed_count = int(output.split(":closed_")[1])
-                                except:
-                                    pass
-                            
-                            if "NEW_TAB_IN_INCOGNITO" in output:
-                                if closed_count > 0:
-                                    print(f"{Colors.GREEN}   ✓ Chrome Incognito: Cleaned up {closed_count} duplicate tab(s), opened loading page{Colors.ENDC}")
-                                else:
-                                    print(f"{Colors.GREEN}   ✓ Chrome Incognito: Opened loading page in existing window{Colors.ENDC}")
-                            elif "NEW_INCOGNITO_WINDOW" in output:
-                                if closed_count > 0:
-                                    print(f"{Colors.GREEN}   ✓ Chrome Incognito: Cleaned up {closed_count} duplicate tab(s), created new window{Colors.ENDC}")
-                                else:
-                                    print(f"{Colors.GREEN}   ✓ Chrome Incognito: Created new window with loading page{Colors.ENDC}")
-                            else:
-                                print(f"{Colors.GREEN}   ✓ Chrome Incognito: Loading page ready{Colors.ENDC}")
+                            globals()['_browser_opened_this_startup'] = True  # Set global flag
+                            print(f"{Colors.GREEN}   ✓ Chrome opened with loading page{Colors.ENDC}")
                         else:
-                            error_output = result.stderr.decode().strip() if result.stderr else "Unknown error"
-                            print(f"{Colors.YELLOW}   ⚠️  Incognito AppleScript failed: {error_output[:100]}{Colors.ENDC}")
+                            print(f"{Colors.YELLOW}   ⚠️  AppleScript returned non-zero, trying fallback...{Colors.ENDC}")
                     except subprocess.TimeoutExpired:
-                        print(f"{Colors.YELLOW}   ⚠️  Incognito AppleScript timed out, trying fallback...{Colors.ENDC}")
+                        print(f"{Colors.YELLOW}   ⚠️  AppleScript timed out, trying fallback...{Colors.ENDC}")
                     except Exception as e:
-                        print(f"{Colors.YELLOW}   ⚠️  Incognito AppleScript failed: {e}, trying fallback...{Colors.ENDC}")
+                        print(f"{Colors.YELLOW}   ⚠️  AppleScript failed: {e}, trying fallback...{Colors.ENDC}")
                     
-                    # Fallback: Use command line to open Chrome Incognito
+                    # Fallback: Use webbrowser module or open command
                     if not browser_opened:
                         try:
+                            # Try open command with Chrome specifically
                             result = subprocess.run(
-                                ["/usr/bin/open", "-na", "Google Chrome", "--args", "--incognito", loading_server_url],
+                                ["open", "-a", "Google Chrome", loading_server_url],
                                 stdout=subprocess.DEVNULL, 
                                 stderr=subprocess.DEVNULL,
-                                timeout=5
+                                timeout=3
                             )
                             if result.returncode == 0:
                                 browser_opened = True
-                                globals()['_browser_opened_this_startup'] = True
-                                print(f"{Colors.GREEN}   ✓ Chrome Incognito opened via command line{Colors.ENDC}")
-                        except Exception as e:
-                            print(f"{Colors.YELLOW}   ⚠️  Command line fallback failed: {e}{Colors.ENDC}")
+                                globals()['_browser_opened_this_startup'] = True  # Set global flag
+                                print(f"{Colors.GREEN}   ✓ Chrome opened via 'open' command{Colors.ENDC}")
+                        except Exception:
+                            pass
                     
-                    # Final fallback: Print URL for manual opening (NEVER use regular browser)
-                    # JARVIS MUST run in Chrome Incognito for proper development experience
                     if not browser_opened:
-                        print(f"{Colors.YELLOW}   ⚠️  Could not open Chrome Incognito automatically.{Colors.ENDC}")
-                        print(f"{Colors.CYAN}   📋 Please open Chrome Incognito manually and navigate to:{Colors.ENDC}")
-                        print(f"{Colors.GREEN}      {loading_server_url}{Colors.ENDC}")
-                        # Don't set browser_opened - user needs to open manually
-                        # But set the flag to prevent duplicate attempts later
-                        globals()['_browser_opened_this_startup'] = True
+                        try:
+                            # Final fallback: webbrowser module
+                            import webbrowser
+                            webbrowser.open(loading_server_url)
+                            browser_opened = True
+                            globals()['_browser_opened_this_startup'] = True  # Set global flag
+                            print(f"{Colors.GREEN}   ✓ Browser opened via webbrowser module{Colors.ENDC}")
+                        except Exception:
+                            print(f"{Colors.YELLOW}   ⚠️  Auto-open failed. Navigate to: {loading_server_url}{Colors.ENDC}")
                 else:
                     print(f"{Colors.YELLOW}   ⚠️  Loading server health check failed (server may still be starting){Colors.ENDC}")
-                    print(f"{Colors.CYAN}   ℹ️  Attempting to open Chrome Incognito anyway...{Colors.ENDC}")
+                    # Try to open anyway - the loading page might still work
+                    print(f"{Colors.CYAN}   ℹ️  Attempting to open browser anyway...{Colors.ENDC}")
                     try:
-                        # Try to open Chrome Incognito even if loading server isn't verified yet
-                        result = subprocess.run(
-                            ["/usr/bin/open", "-na", "Google Chrome", "--args", "--incognito", loading_server_url],
+                        subprocess.run(
+                            ["open", "-a", "Google Chrome", loading_server_url],
                             stdout=subprocess.DEVNULL, 
                             stderr=subprocess.DEVNULL,
-                            timeout=5
+                            timeout=3
                         )
-                        globals()['_browser_opened_this_startup'] = True
-                        print(f"{Colors.GREEN}   ✓ Chrome Incognito opened (loading server will show when ready){Colors.ENDC}")
+                        globals()['_browser_opened_this_startup'] = True  # Set global flag
+                        print(f"{Colors.GREEN}   ✓ Chrome opened (loading server will show when ready){Colors.ENDC}")
                     except Exception:
                         print(f"{Colors.CYAN}   ℹ️  If needed, manually open: {loading_server_url}{Colors.ENDC}")
 
@@ -16409,10 +16116,6 @@ async def main():
                         cmdline_str = " ".join(cmdline).lower()
 
                         # Enhanced matching: catch all variants
-                        # EXCLUDE loading_server.py from cleanup (it must persist)
-                        if "loading_server" in cmdline_str:
-                            continue
-
                         is_start_system = "python" in cmdline_str and "start_system.py" in cmdline_str
                         is_backend = (
                             "python" in cmdline_str
@@ -16468,31 +16171,40 @@ async def main():
                 killed_count = 0
                 failed_count = 0
 
-                # Robust Parallel Cleanup
-                print(f"  {Colors.CYAN}→ Executing parallel shutdown on {len(jarvis_processes)} processes...{Colors.ENDC}")
-                
-                # Create async kill tasks
-                kill_tasks = [_kill_process_async(p) for p in jarvis_processes]
-                results = await asyncio.gather(*kill_tasks)
-                
-                # Process results
-                killed_count = 0
-                failed_count = 0
-                
-                for proc, res in zip(jarvis_processes, results):
-                    if res in ["terminated", "killed", "already_dead"]:
-                        status_icon = f"{Colors.GREEN}✓{Colors.ENDC}"
+                for proc in jarvis_processes:
+                    try:
+                        # Try SIGTERM first (graceful)
+                        print(f"  → Terminating PID {proc['pid']}...", end="", flush=True)
+                        os.kill(proc["pid"], signal.SIGTERM)
+                        time.sleep(0.5)
+
+                        # Check if still alive, use SIGKILL if needed
+                        if psutil.pid_exists(proc["pid"]):
+                            print(f" forcing...", end="", flush=True)
+                            os.kill(proc["pid"], signal.SIGKILL)
+                            time.sleep(0.3)
+
+                        # Verify it's actually dead
+                        if psutil.pid_exists(proc["pid"]):
+                            print(f" {Colors.FAIL}✗ Still alive{Colors.ENDC}")
+                            failed_count += 1
+                        else:
+                            print(f" {Colors.GREEN}✓{Colors.ENDC}")
+                            killed_count += 1
+
+                    except ProcessLookupError:
+                        # Already dead
+                        print(f" {Colors.GREEN}✓ (already dead){Colors.ENDC}")
                         killed_count += 1
-                    elif res == "skipped":
-                        status_icon = f"{Colors.BLUE}ℹ (skipped){Colors.ENDC}"
-                    else:
-                        status_icon = f"{Colors.FAIL}✗ {res}{Colors.ENDC}"
+                    except PermissionError:
+                        print(f" {Colors.FAIL}✗ Permission denied{Colors.ENDC}")
                         failed_count += 1
-                        
-                    print(f"  {status_icon} PID {proc['pid']} ({proc['type']}): {res}")
+                    except Exception as e:
+                        print(f" {Colors.FAIL}✗ {str(e)[:50]}{Colors.ENDC}")
+                        failed_count += 1
 
                 print(f"\n{Colors.YELLOW}⏳ Waiting for processes to terminate...{Colors.ENDC}")
-                await asyncio.sleep(2)
+                time.sleep(2)
 
                 # Final verification
                 still_alive = []

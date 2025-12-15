@@ -1,19 +1,16 @@
 /**
- * JARVIS Advanced Loading Manager v4.2 - Matrix Theme
- *
+ * JARVIS Advanced Loading Manager v4.1
+ * 
  * ARCHITECTURE: Display-only client that trusts start_system.py as authority
- *
+ * 
  * Flow: start_system.py → loading_server.py → loading-manager.js (here)
- *
+ * 
  * This component does NOT independently verify system readiness.
  * It displays progress received from the loading server and redirects
  * when told to. start_system.py is responsible for verifying frontend
  * is ready before sending "complete".
  *
  * Features:
- * - Matrix-style UI with cyan/teal color scheme
- * - SVG circular progress indicator with animated rings
- * - Matrix rain background animation (canvas-based)
  * - Smooth 1-100% progress with real-time updates
  * - Detailed stage tracking matching backend broadcast stages
  * - Voice biometric system initialization feedback
@@ -21,7 +18,7 @@
  * - Memory-aware mode selection display
  * - Recent speaker cache initialization
  * - WebSocket + HTTP polling fallback
- * - Epic cinematic completion animation with Matrix effects
+ * - Epic cinematic completion animation
  * - Quick sanity check before redirect (safety net only)
  */
 
@@ -44,7 +41,7 @@ class JARVISLoadingManager {
             },
             polling: {
                 enabled: true,
-                interval: 1000,  // Poll every 1000ms to avoid rate limiting
+                interval: 300,  // Poll every 300ms for smooth updates
                 timeout: 3000
             },
             smoothProgress: {
@@ -370,17 +367,173 @@ class JARVISLoadingManager {
 
     /**
      * Create the detailed status panel dynamically
-     * DISABLED: Clean Matrix design doesn't use detailed panel overlay
-     * The target design shows only: Title + Progress Circle + Status Text
      */
     createDetailedStatusPanel() {
-        // Disabled for clean Matrix design matching target screenshot
-        // The minimal design is more elegant without the detailed overlay
-        return;
+        if (document.getElementById('detailed-status')) return;
+
+        const panel = document.createElement('div');
+        panel.id = 'detailed-status';
+        panel.innerHTML = `
+            <div class="phase-indicator" id="phase-indicator">
+                <span class="phase-label">Phase:</span>
+                <span class="phase-value">Cleanup</span>
+            </div>
+            <div class="stage-header">
+                <span id="stage-icon" class="stage-icon">⚡</span>
+                <span id="stage-name" class="stage-name">System Initialization</span>
+            </div>
+            <div id="substep-list" class="substep-list"></div>
+            <div class="system-info">
+                <div id="memory-status" class="memory-status">
+                    <span class="info-label">Memory:</span>
+                    <span class="info-value">Analyzing...</span>
+                </div>
+                <div id="mode-indicator" class="mode-indicator">
+                    <span class="info-label">Mode:</span>
+                    <span class="info-value">Detecting...</span>
+                </div>
+            </div>
+        `;
+        panel.style.cssText = `
+            position: absolute;
+            bottom: 120px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: rgba(0, 20, 0, 0.85);
+            border: 1px solid rgba(0, 255, 65, 0.3);
+            border-radius: 12px;
+            padding: 16px 24px;
+            min-width: 360px;
+            max-width: 520px;
+            font-family: 'SF Mono', Monaco, monospace;
+            font-size: 12px;
+            color: #00ff41;
+            box-shadow: 0 4px 20px rgba(0, 255, 65, 0.2);
+            z-index: 100;
+        `;
+
+        const style = document.createElement('style');
+        style.textContent = `
+            .phase-indicator {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                margin-bottom: 12px;
+                padding-bottom: 8px;
+                border-bottom: 1px solid rgba(0, 255, 65, 0.2);
+                font-size: 10px;
+                text-transform: uppercase;
+                letter-spacing: 1px;
+            }
+            .phase-label {
+                opacity: 0.6;
+            }
+            .phase-value {
+                font-weight: 600;
+                padding: 2px 8px;
+                background: rgba(0, 255, 65, 0.1);
+                border-radius: 4px;
+            }
+            .phase-value.cleanup { color: #ffaa00; }
+            .phase-value.starting { color: #00aaff; }
+            .phase-value.initialization { color: #00ff88; }
+            .phase-value.ready { color: #00ffff; }
+            .phase-value.complete { color: #00ff41; }
+            .phase-value.error { color: #ff4444; }
+            .stage-header {
+                display: flex;
+                align-items: center;
+                gap: 10px;
+                margin-bottom: 12px;
+                font-size: 14px;
+                font-weight: 600;
+            }
+            .stage-icon {
+                font-size: 18px;
+            }
+            .substep-list {
+                display: flex;
+                flex-direction: column;
+                gap: 6px;
+                margin-bottom: 12px;
+                padding-left: 28px;
+            }
+            .substep {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                font-size: 11px;
+                opacity: 0.6;
+                transition: opacity 0.3s ease;
+            }
+            .substep.active {
+                opacity: 1;
+                color: #00ff88;
+            }
+            .substep.completed {
+                opacity: 0.8;
+                color: #00aa44;
+            }
+            .substep-indicator {
+                width: 6px;
+                height: 6px;
+                border-radius: 50%;
+                background: rgba(0, 255, 65, 0.3);
+                transition: all 0.3s ease;
+            }
+            .substep.active .substep-indicator {
+                background: #00ff88;
+                box-shadow: 0 0 8px #00ff88;
+                animation: pulse 1s ease-in-out infinite;
+            }
+            .substep.completed .substep-indicator {
+                background: #00aa44;
+            }
+            @keyframes pulse {
+                0%, 100% { transform: scale(1); }
+                50% { transform: scale(1.3); }
+            }
+            .system-info {
+                display: flex;
+                justify-content: space-between;
+                padding-top: 12px;
+                border-top: 1px solid rgba(0, 255, 65, 0.2);
+                font-size: 10px;
+            }
+            .info-label {
+                opacity: 0.6;
+                margin-right: 6px;
+            }
+            .info-value {
+                font-weight: 500;
+            }
+            .memory-status .info-value.low { color: #ff4444; }
+            .memory-status .info-value.medium { color: #ffaa00; }
+            .memory-status .info-value.good { color: #00ff88; }
+            .mode-indicator .info-value.minimal { color: #ffaa00; }
+            .mode-indicator .info-value.standard { color: #00ff88; }
+            .mode-indicator .info-value.full { color: #00ffff; }
+        `;
+        document.head.appendChild(style);
+
+        const progressContainer = document.querySelector('.progress-container');
+        if (progressContainer && progressContainer.parentNode) {
+            progressContainer.parentNode.insertBefore(panel, progressContainer);
+        } else {
+            document.querySelector('.loading-container')?.appendChild(panel);
+        }
+
+        this.elements.detailedStatus = panel;
+        this.elements.stageIcon = document.getElementById('stage-icon');
+        this.elements.stageName = document.getElementById('stage-name');
+        this.elements.substepList = document.getElementById('substep-list');
+        this.elements.memoryStatus = document.getElementById('memory-status');
+        this.elements.modeIndicator = document.getElementById('mode-indicator');
+        this.elements.phaseIndicator = document.getElementById('phase-indicator');
     }
 
     async init() {
-        console.log('[JARVIS] Loading Manager v4.2 (Matrix Theme) starting...');
+        console.log('[JARVIS] Loading Manager v4.1 starting...');
         console.log(`[Config] Loading server: ${this.config.hostname}:${this.config.loadingServerPort}`);
         console.log('[Mode] DISPLAY - trusts start_system.py as authority');
 
@@ -571,12 +724,26 @@ class JARVISLoadingManager {
     }
 
     createParticles() {
-        // Matrix Rain is now handled by the canvas in loading.html
-        // This method is kept for backwards compatibility but does nothing
-        // The Matrix rain animation provides a superior visual effect
         const container = document.getElementById('particles');
         if (!container) return;
-        // Particles are replaced by Matrix rain canvas animation
+
+        const particleCount = 50;
+        for (let i = 0; i < particleCount; i++) {
+            const particle = document.createElement('div');
+            particle.className = 'particle';
+
+            const size = Math.random() * 3 + 1;
+            particle.style.width = `${size}px`;
+            particle.style.height = `${size}px`;
+            particle.style.left = `${Math.random() * 100}%`;
+
+            const duration = Math.random() * 10 + 10;
+            const delay = Math.random() * 5;
+            particle.style.animationDuration = `${duration}s`;
+            particle.style.animationDelay = `${delay}s`;
+
+            container.appendChild(particle);
+        }
     }
 
     async connectWebSocket() {
@@ -597,10 +764,6 @@ class JARVISLoadingManager {
                 this.state.connected = true;
                 this.state.reconnectAttempts = 0;
                 this.updateStatusText('Connected', 'connected');
-                // Update connection indicator in loading.html
-                if (typeof window.updateConnectionStatus === 'function') {
-                    window.updateConnectionStatus(true, 'Connected');
-                }
             };
 
             this.state.ws.onmessage = (event) => {
@@ -621,10 +784,6 @@ class JARVISLoadingManager {
             this.state.ws.onclose = () => {
                 console.log('[WebSocket] Disconnected');
                 this.state.connected = false;
-                // Update connection indicator in loading.html
-                if (typeof window.updateConnectionStatus === 'function') {
-                    window.updateConnectionStatus(false, 'Reconnecting...');
-                }
                 this.scheduleReconnect();
             };
 
@@ -790,9 +949,93 @@ class JARVISLoadingManager {
     }
 
     updateDetailedStatus() {
-        // Disabled for clean Matrix design - no detailed status panel
-        // Status is shown via the main status message element instead
-        return;
+        // Get stage definition or create dynamic one
+        let stageDef = this.stageDefinitions[this.state.stage];
+        if (!stageDef) {
+            const componentName = this.state.stage || 'unknown';
+            const formattedName = this.state.displayLabel || componentName
+                .replace(/_/g, ' ')
+                .replace(/\b\w/g, c => c.toUpperCase());
+            stageDef = {
+                name: formattedName,
+                icon: this._getComponentIcon(componentName),
+                phase: this._inferPhase(this.state.targetProgress),
+                substeps: [this.state.displaySublabel || `Initializing ${formattedName}...`]
+            };
+        }
+
+        // Update phase indicator
+        if (this.elements.phaseIndicator) {
+            const phaseValue = this.elements.phaseIndicator.querySelector('.phase-value');
+            if (phaseValue) {
+                const phase = stageDef.phase || this.state.phase;
+                const phaseNames = {
+                    'cleanup': 'Cleanup',
+                    'starting': 'Starting',
+                    'initialization': 'Initialization',
+                    'ready': 'Ready',
+                    'complete': 'Complete',
+                    'error': 'Error'
+                };
+                phaseValue.textContent = phaseNames[phase] || phase;
+                phaseValue.className = `phase-value ${phase}`;
+            }
+        }
+
+        // Update stage header
+        if (this.elements.stageIcon) {
+            this.elements.stageIcon.textContent = stageDef.icon;
+        }
+        if (this.elements.stageName) {
+            this.elements.stageName.textContent = stageDef.name;
+        }
+
+        // Update substeps
+        if (this.elements.substepList && stageDef.substeps) {
+            const substepsHtml = stageDef.substeps.map((substep, idx) => {
+                let className = 'substep';
+                if (idx < this.state.currentSubstep) {
+                    className += ' completed';
+                } else if (idx === this.state.currentSubstep) {
+                    className += ' active';
+                }
+                return `
+                    <div class="${className}">
+                        <span class="substep-indicator"></span>
+                        <span>${substep}</span>
+                    </div>
+                `;
+            }).join('');
+            this.elements.substepList.innerHTML = substepsHtml;
+        }
+
+        // Update memory status
+        if (this.elements.memoryStatus && this.state.memoryInfo) {
+            const mem = this.state.memoryInfo;
+            let memClass = 'good';
+            if (mem.pressure > 70) memClass = 'low';
+            else if (mem.pressure > 40) memClass = 'medium';
+
+            const memValue = this.elements.memoryStatus.querySelector('.info-value');
+            if (memValue) {
+                memValue.textContent = `${mem.availableGb?.toFixed(1) || '?'}GB (${Math.round(mem.pressure || 0)}% used)`;
+                memValue.className = `info-value ${memClass}`;
+            }
+        }
+
+        // Update mode indicator
+        if (this.elements.modeIndicator && this.state.memoryMode) {
+            const modeValue = this.elements.modeIndicator.querySelector('.info-value');
+            if (modeValue) {
+                const modeText = this.state.memoryMode.replace(/_/g, ' ').toUpperCase();
+                let modeClass = 'standard';
+                if (this.state.memoryMode.includes('minimal')) modeClass = 'minimal';
+                else if (this.state.memoryMode.includes('full')) modeClass = 'full';
+
+                modeValue.textContent = modeText;
+                modeValue.className = `info-value ${modeClass}`;
+            }
+        }
     }
 
     _inferPhase(progress) {
@@ -832,21 +1075,20 @@ class JARVISLoadingManager {
         this.elements.progressBar.style.width = `${displayProgress}%`;
         this.elements.progressPercentage.textContent = `${displayProgress}%`;
 
-        // Matrix theme - cyan/teal gradient throughout
-        // Phase-based intensity rather than color change
+        // Phase-based color
         if (displayProgress < 40) {
-            // Cleanup phase - dim cyan
-            this.elements.progressBar.style.background = 'linear-gradient(90deg, #0099bb 0%, #00aacc 100%)';
+            // Cleanup phase - orange
+            this.elements.progressBar.style.background = 'linear-gradient(90deg, #ff8800 0%, #ffaa00 100%)';
         } else if (displayProgress < 50) {
-            // Starting phase - medium cyan
-            this.elements.progressBar.style.background = 'linear-gradient(90deg, #00bbdd 0%, #00ccee 100%)';
+            // Starting phase - blue
+            this.elements.progressBar.style.background = 'linear-gradient(90deg, #0088ff 0%, #00aaff 100%)';
         } else if (displayProgress < 95) {
-            // Initialization phase - bright cyan/teal
-            this.elements.progressBar.style.background = 'linear-gradient(90deg, #00d4ff 0%, #00ffcc 100%)';
+            // Initialization phase - green
+            this.elements.progressBar.style.background = 'linear-gradient(90deg, #00aa44 0%, #00ff41 100%)';
         } else {
-            // Ready/Complete phase - bright teal with intense glow
-            this.elements.progressBar.style.background = 'linear-gradient(90deg, #00ffcc 0%, #00ff88 100%)';
-            this.elements.progressBar.style.boxShadow = '0 0 30px rgba(0, 255, 204, 0.8)';
+            // Ready/Complete phase - bright green with glow
+            this.elements.progressBar.style.background = 'linear-gradient(90deg, #00ff41 0%, #00ff88 100%)';
+            this.elements.progressBar.style.boxShadow = '0 0 20px rgba(0, 255, 65, 0.8)';
         }
     }
 
@@ -874,93 +1116,47 @@ class JARVISLoadingManager {
 
         console.log('[Complete] ✓ Received completion from authority (start_system.py)');
         
-        // Update UI to show completion is starting
-        this.elements.subtitle.textContent = 'FINALIZING';
-        this.elements.statusMessage.textContent = 'Verifying system readiness...';
-        this.updateStatusText('Verifying...', 'verifying');
+        // Update UI to show completion
+        this.elements.subtitle.textContent = 'SYSTEM READY';
+        this.elements.statusMessage.textContent = message || 'JARVIS is online!';
+        this.updateStatusText('System ready', 'ready');
         this.state.progress = 100;
         this.state.targetProgress = 100;
         this.updateProgressBar();
 
-        // =========================================================================
-        // ROBUST SYSTEM VERIFICATION BEFORE REDIRECT
-        // =========================================================================
-        // We verify BOTH backend AND frontend are fully ready before redirecting.
-        // This ensures the user lands on a fully functional JARVIS interface.
-        // =========================================================================
-        
-        const backendPort = this.config.backendPort || 8010;
-        const backendUrl = `${this.config.httpProtocol}//${this.config.hostname}:${backendPort}`;
-        const wsUrl = `ws://${this.config.hostname}:${backendPort}`;
-        
-        let systemReady = false;
-        let retryCount = 0;
-        const maxRetries = 5;
-        
-        while (!systemReady && retryCount < maxRetries) {
-            retryCount++;
-            console.log(`[Complete] System verification attempt ${retryCount}/${maxRetries}...`);
-            
-            // Check 1: Backend health
-            const backendOk = await this.checkBackendHealth();
-            if (!backendOk) {
-                console.warn('[Complete] Backend not ready yet...');
-                this.elements.statusMessage.textContent = 'Waiting for backend...';
-                await this.sleep(1000);
-                continue;
-            }
-            
-            // Check 2: Frontend accessible
-            const frontendOk = await this.checkFrontendReady();
-            if (!frontendOk) {
-                console.warn('[Complete] Frontend not ready yet...');
-                this.elements.statusMessage.textContent = 'Waiting for frontend...';
-                await this.sleep(1000);
-                continue;
-            }
-            
-            // Check 3: WebSocket connectivity (quick test)
-            const wsOk = await this.testWebSocket(`${wsUrl}/ws`);
-            if (!wsOk) {
-                console.warn('[Complete] WebSocket not ready yet...');
-                this.elements.statusMessage.textContent = 'Waiting for WebSocket...';
-                await this.sleep(1000);
-                continue;
-            }
-            
-            // All checks passed!
-            systemReady = true;
-            console.log('[Complete] ✅ Full system verification passed!');
+        // Quick sanity check - just verify frontend is reachable before redirect
+        // We trust start_system.py already verified this, this is just a safety net
+        const frontendOk = await this.checkFrontendReady();
+        if (!frontendOk) {
+            console.warn('[Complete] Frontend sanity check failed, brief wait...');
+            this.elements.statusMessage.textContent = 'Finalizing...';
+            await this.sleep(2000);
         }
-        
-        if (!systemReady) {
-            console.warn('[Complete] System verification timed out, proceeding anyway...');
-            this.elements.statusMessage.textContent = 'Finalizing (verification timeout)...';
-            await this.sleep(1000);
-        }
-
-        // Update UI to show ready state
-        this.elements.subtitle.textContent = 'SYSTEM READY';
-        this.elements.statusMessage.textContent = message || 'JARVIS is online!';
-        this.updateStatusText('System ready', 'ready');
 
         console.log('[Complete] Proceeding with redirect...');
         
         // CRITICAL: Persist backend readiness state for main app
         // This prevents "CONNECTING TO BACKEND..." showing after loading completes
+        const backendPort = this.config.backendPort || 8010;
+        const backendUrl = `${this.config.httpProtocol}//${this.config.hostname}:${backendPort}`;
+        const wsUrl = `ws://${this.config.hostname}:${backendPort}`;
+        
         try {
             localStorage.setItem('jarvis_backend_verified', 'true');
             localStorage.setItem('jarvis_backend_url', backendUrl);
             localStorage.setItem('jarvis_backend_ws_url', wsUrl);
             localStorage.setItem('jarvis_backend_verified_at', Date.now().toString());
             localStorage.setItem('jarvis_backend_port', backendPort.toString());
-            localStorage.setItem('jarvis_system_ready', 'true');
             console.log('[Complete] ✓ Backend readiness state persisted for main app');
         } catch (e) {
             console.warn('[Complete] Could not persist backend state:', e);
         }
         
         this.cleanup();
+
+        this.elements.subtitle.textContent = 'SYSTEM READY';
+        this.elements.statusMessage.textContent = message || 'JARVIS is online!';
+        this.updateStatusText('System ready', 'ready');
 
         this.playEpicCompletionAnimation(redirectUrl);
     }
@@ -1068,87 +1264,57 @@ class JARVISLoadingManager {
     }
 
     async playEpicCompletionAnimation(redirectUrl) {
-        console.log('[Completion] Starting epic completion animation...');
-
-        // Addendum 4: Trigger "ACCESS GRANTED" success state sequence
-        // This changes colors to success green, updates title, and holds for 800ms
-        if (typeof window.triggerSuccessState === 'function') {
-            console.log('[Completion] Triggering ACCESS GRANTED success state...');
-            await window.triggerSuccessState();
-        }
-
-        // Use Matrix transition from loading.html if available
-        if (typeof window.triggerMatrixTransition === 'function') {
-            console.log('[Completion] Using Matrix transition...');
-            await window.triggerMatrixTransition(redirectUrl);
-            return; // Matrix transition handles redirect
-        }
-
-        // Fallback: Legacy transition
-        console.log('[Completion] Using fallback transition...');
-        const container = document.querySelector('.loading-container') || document.getElementById('loading-container');
+        const container = document.querySelector('.loading-container');
         const reactor = this.elements.reactor;
-        const matrixCanvas = document.getElementById('matrix-canvas');
 
-        // Create success green energy rings after success state
+        const totalDuration = 3000;
+
+        // Phase 1: Power surge
         if (reactor) {
+            reactor.style.transition = 'all 0.3s ease-out';
+            reactor.style.transform = 'translate(-50%, -50%) scale(1.5)';
+            reactor.style.filter = 'drop-shadow(0 0 80px rgba(0, 255, 65, 1)) brightness(2)';
+
             for (let i = 0; i < 3; i++) {
-                setTimeout(() => this.createEnergyRing(reactor, '#00ff41', i), i * 150);
+                setTimeout(() => this.createEnergyRing(reactor, '#00ff41', i), i * 200);
             }
         }
 
-        // Brief intensify of matrix rain
-        if (matrixCanvas) {
-            matrixCanvas.style.transition = 'opacity 0.3s ease-out';
-            matrixCanvas.style.opacity = '1';
-        }
+        await this.sleep(600);
 
-        await this.sleep(500);
-
-        // Phase 2: Fade out with green success glow
+        // Phase 2: Fade out
         if (container) {
-            container.style.transition = 'all 1s ease-out';
+            container.style.transition = 'opacity 1s ease-out';
             container.style.opacity = '0';
-            container.style.transform = 'scale(1.05)';
-            container.style.filter = 'blur(10px) brightness(1.2)';
         }
         if (reactor) {
             reactor.style.transition = 'all 1s ease-out';
-            reactor.style.transform = 'scale(1.3)';
+            reactor.style.transform = 'translate(-50%, -50%) scale(2)';
             reactor.style.opacity = '0';
-            reactor.style.filter = 'drop-shadow(0 0 80px rgba(0, 255, 65, 1))';
-        }
-        if (matrixCanvas) {
-            matrixCanvas.style.transition = 'opacity 1.2s ease-out';
-            matrixCanvas.style.opacity = '0';
         }
 
-        await this.sleep(1200);
+        await this.sleep(1500);
 
-        // Phase 3: Navigate with dark overlay
+        // Phase 3: Navigate
         const overlay = document.createElement('div');
         overlay.style.cssText = `
             position: fixed; top: 0; left: 0; width: 100%; height: 100%;
-            background: #0a0a12; opacity: 0;
-            transition: opacity 0.4s ease-in; z-index: 10001;
+            background: #000; opacity: 0;
+            transition: opacity 0.5s ease-in; z-index: 10001;
         `;
         document.body.appendChild(overlay);
         setTimeout(() => overlay.style.opacity = '1', 10);
 
-        await this.sleep(400);
+        await this.sleep(500);
         window.location.href = redirectUrl;
     }
 
     createEnergyRing(reactor, color, index) {
-        // Dynamic sizing to match current reactor size
-        const reactorSize = reactor ? reactor.offsetWidth : 320;
-        const ringSize = Math.round(reactorSize * 0.9375); // Match CSS .ring-outer ratio
-        
         const ring = document.createElement('div');
         ring.style.cssText = `
             position: absolute; top: 50%; left: 50%;
             transform: translate(-50%, -50%);
-            width: ${ringSize}px; height: ${ringSize}px;
+            width: 300px; height: 300px;
             border: 3px solid ${color}; border-radius: 50%;
             opacity: 1; animation: expandRing 1s ease-out forwards;
             pointer-events: none;
