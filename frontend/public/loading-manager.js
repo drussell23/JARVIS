@@ -44,7 +44,7 @@ class JARVISLoadingManager {
             },
             polling: {
                 enabled: true,
-                interval: 300,  // Poll every 300ms for smooth updates
+                interval: 1000,  // Poll every 1000ms to avoid rate limiting
                 timeout: 3000
             },
             smoothProgress: {
@@ -1140,11 +1140,15 @@ class JARVISLoadingManager {
     }
 
     createEnergyRing(reactor, color, index) {
+        // Dynamic sizing to match current reactor size
+        const reactorSize = reactor ? reactor.offsetWidth : 320;
+        const ringSize = Math.round(reactorSize * 0.9375); // Match CSS .ring-outer ratio
+        
         const ring = document.createElement('div');
         ring.style.cssText = `
             position: absolute; top: 50%; left: 50%;
             transform: translate(-50%, -50%);
-            width: 300px; height: 300px;
+            width: ${ringSize}px; height: ${ringSize}px;
             border: 3px solid ${color}; border-radius: 50%;
             opacity: 1; animation: expandRing 1s ease-out forwards;
             pointer-events: none;
