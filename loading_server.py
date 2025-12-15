@@ -555,6 +555,22 @@ async def serve_loading_manager(request: web.Request) -> web.Response:
     return web.FileResponse(loading_js)
 
 
+async def serve_static_file(request: web.Request) -> web.Response:
+    """Serve static files from frontend/public directory."""
+    filename = request.match_info.get('filename', '')
+
+    # Security: prevent path traversal
+    if '..' in filename or filename.startswith('/'):
+        return web.Response(text="Invalid path", status=400)
+
+    file_path = config.frontend_path / filename
+
+    if not file_path.exists() or not file_path.is_file():
+        return web.Response(text=f"File not found: {filename}", status=404)
+
+    return web.FileResponse(file_path)
+
+
 async def health_check(request: web.Request) -> web.Response:
     """Health check endpoint with detailed status."""
     system_ready, reason = await health_checker.check_all_parallel()
@@ -809,6 +825,9 @@ def create_app() -> web.Application:
     app.router.add_get('/loading.html', serve_loading_page)
     app.router.add_get('/preview', serve_preview_page)
     app.router.add_get('/loading-manager.js', serve_loading_manager)
+
+    # Static files (favicon, images, etc.) - catch-all for static assets
+    app.router.add_get('/{filename:.*\\.(svg|png|jpg|jpeg|ico|css|woff|woff2|ttf)}', serve_static_file)
 
     # Health and metrics
     app.router.add_get('/health', health_check)
