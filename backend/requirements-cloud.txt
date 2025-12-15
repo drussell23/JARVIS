@@ -1,6 +1,6 @@
 fastapi==0.120.2
 uvicorn[standard]==0.27.0
-transformers==4.36.2
+transformers==4.57.3
 torch==2.1.2
 accelerate==0.25.0
 sentencepiece==0.1.99
