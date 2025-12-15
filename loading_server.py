@@ -49,6 +49,124 @@ logger = logging.getLogger('loading_server')
 
 
 # =============================================================================
+# Dynamic Path Resolver - No Hardcoding
+# =============================================================================
+
+class DynamicPathResolver:
+    """
+    Dynamically resolves paths for static files without hardcoding.
+    Uses multiple strategies to find the correct path at runtime.
+    """
+
+    def __init__(self):
+        self._cache: Dict[str, Path] = {}
+        self._base_paths: List[Path] = []
+        self._initialized = False
+
+    def initialize(self):
+        """Initialize base paths dynamically based on runtime context."""
+        if self._initialized:
+            return
+
+        # Strategy 1: Environment variable (highest priority)
+        env_path = os.getenv('FRONTEND_PATH')
+        if env_path:
+            self._base_paths.append(Path(env_path))
+
+        # Strategy 2: Relative to this script file
+        script_dir = Path(__file__).resolve().parent
+        self._base_paths.append(script_dir / 'frontend' / 'public')
+
+        # Strategy 3: Relative to current working directory
+        cwd = Path.cwd()
+        self._base_paths.append(cwd / 'frontend' / 'public')
+
+        # Strategy 4: Walk up directory tree to find project root
+        project_root = self._find_project_root(script_dir)
+        if project_root:
+            self._base_paths.append(project_root / 'frontend' / 'public')
+
+        # Strategy 5: Check common development paths relative to home
+        home = Path.home()
+        for subdir in ['Documents/repos', 'Projects', 'Development', 'code', 'dev']:
+            potential = home / subdir
+            if potential.exists():
+                # Find any JARVIS-AI-Agent directory
+                for item in potential.iterdir():
+                    if item.is_dir() and 'jarvis' in item.name.lower():
+                        self._base_paths.append(item / 'frontend' / 'public')
+
+        # Deduplicate while preserving order
+        seen = set()
+        unique_paths = []
+        for p in self._base_paths:
+            p_str = str(p.resolve()) if p.exists() else str(p)
+            if p_str not in seen:
+                seen.add(p_str)
+                unique_paths.append(p)
+        self._base_paths = unique_paths
+
+        self._initialized = True
+        logger.info(f"[PathResolver] Initialized with {len(self._base_paths)} search paths")
+
+    def _find_project_root(self, start_path: Path, max_depth: int = 10) -> Optional[Path]:
+        """Walk up directory tree to find project root (contains .git or package.json)."""
+        current = start_path
+        for _ in range(max_depth):
+            if (current / '.git').exists() or (current / 'package.json').exists():
+                return current
+            if current.parent == current:
+                break
+            current = current.parent
+        return None
+
+    def resolve(self, filename: str) -> Optional[Path]:
+        """
+        Resolve a filename to its full path, checking cache first.
+        Returns None if file not found in any search path.
+        """
+        # Check cache
+        if filename in self._cache:
+            cached = self._cache[filename]
+            if cached.exists():
+                return cached
+            # Cache invalidated, remove it
+            del self._cache[filename]
+
+        self.initialize()
+
+        # Search all base paths
+        for base in self._base_paths:
+            full_path = base / filename
+            if full_path.exists() and full_path.is_file():
+                self._cache[filename] = full_path
+                logger.debug(f"[PathResolver] Resolved {filename} -> {full_path}")
+                return full_path
+
+        logger.warning(f"[PathResolver] Could not resolve: {filename}")
+        logger.debug(f"[PathResolver] Searched paths: {self._base_paths}")
+        return None
+
+    def get_base_path(self) -> Optional[Path]:
+        """Get the first valid base path that contains loading.html."""
+        self.initialize()
+        for base in self._base_paths:
+            if (base / 'loading.html').exists():
+                return base
+        return self._base_paths[0] if self._base_paths else None
+
+    @property
+    def search_paths(self) -> List[Path]:
+        """Get all search paths for debugging."""
+        self.initialize()
+        return self._base_paths.copy()
+
+
+# Global path resolver instance
+path_resolver = DynamicPathResolver()
+
+
+# =============================================================================
 # Dynamic Configuration
 # =============================================================================
 
@@ -78,15 +196,15 @@ class ServerConfig:
     rate_limit_requests: int = field(default_factory=lambda: int(os.getenv('RATE_LIMIT_REQUESTS', '100')))
     rate_limit_window: float = field(default_factory=lambda: float(os.getenv('RATE_LIMIT_WINDOW', '60.0')))
 
-    # Paths - Use frontend/public as single source of truth for loading files
-    # Resolve absolute path to handle subprocess execution from different working directories
-    frontend_path: Path = field(default_factory=lambda: Path(os.getenv(
-        'FRONTEND_PATH',
-        str(Path(__file__).resolve().parent / 'frontend' / 'public')
-    )))
-
-    def __post_init__(self):
-        self.frontend_path = Path(self.frontend_path)
+    # Paths - Dynamically resolved, no hardcoding
+    @property
+    def frontend_path(self) -> Path:
+        """Dynamically resolve frontend path."""
+        base = path_resolver.get_base_path()
+        if base:
+            return base
+        # Fallback to env or script-relative path
+        return Path(os.getenv('FRONTEND_PATH', Path(__file__).resolve().parent / 'frontend' / 'public'))
 
 
 config = ServerConfig()
@@ -521,95 +639,56 @@ async def rate_limit_middleware(request: web.Request, handler: Callable) -> web.
 # =============================================================================
 
 async def serve_loading_page(request: web.Request) -> web.Response:
-    """Serve the main loading page."""
-    loading_html = config.frontend_path / "loading.html"
+    """Serve the main loading page using dynamic path resolution."""
+    resolved = path_resolver.resolve("loading.html")
 
-    if not loading_html.exists():
-        # Try alternative paths
-        alt_paths = [
-            Path(__file__).resolve().parent / 'frontend' / 'public' / 'loading.html',
-            Path.cwd() / 'frontend' / 'public' / 'loading.html',
-            Path('/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/frontend/public/loading.html'),
-        ]
+    if resolved:
+        return web.FileResponse(resolved)
 
-        for alt_path in alt_paths:
-            if alt_path.exists():
-                logger.info(f"[Static] Found loading.html at fallback: {alt_path}")
-                return web.FileResponse(alt_path)
-
-        logger.error(f"[Static] Loading page not found at: {loading_html}")
-        logger.error(f"[Static] Config frontend_path: {config.frontend_path}")
-        logger.error(f"[Static] __file__: {__file__}")
-        return web.Response(
-            text=f"Loading page not found. Searched: {loading_html} and {len(alt_paths)} fallbacks.",
-            status=404
-        )
-
-    return web.FileResponse(loading_html)
+    # Log detailed error for debugging
+    logger.error(f"[Static] Loading page not found")
+    logger.error(f"[Static] Search paths: {path_resolver.search_paths}")
+    return web.Response(
+        text=f"Loading page not found. Searched {len(path_resolver.search_paths)} locations.",
+        status=404
+    )
 
 
 async def serve_preview_page(request: web.Request) -> web.Response:
-    """Serve the preview loading page."""
-    preview_html = config.frontend_path / "loading_preview.html"
+    """Serve the preview loading page using dynamic path resolution."""
+    resolved = path_resolver.resolve("loading_preview.html")
 
-    if not preview_html.exists():
-        return web.Response(
-            text="Preview page not found.",
-            status=404
-        )
+    if resolved:
+        return web.FileResponse(resolved)
 
-    return web.FileResponse(preview_html)
+    return web.Response(text="Preview page not found.", status=404)
 
 
 async def serve_loading_manager(request: web.Request) -> web.Response:
-    """Serve the loading manager JavaScript."""
-    loading_js = config.frontend_path / "loading-manager.js"
+    """Serve the loading manager JavaScript using dynamic path resolution."""
+    resolved = path_resolver.resolve("loading-manager.js")
 
-    if not loading_js.exists():
-        # Try alternative paths
-        alt_paths = [
-            Path(__file__).resolve().parent / 'frontend' / 'public' / 'loading-manager.js',
-            Path.cwd() / 'frontend' / 'public' / 'loading-manager.js',
-            Path('/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/frontend/public/loading-manager.js'),
-        ]
+    if resolved:
+        return web.FileResponse(resolved)
 
-        for alt_path in alt_paths:
-            if alt_path.exists():
-                logger.info(f"[Static] Found loading-manager.js at fallback: {alt_path}")
-                return web.FileResponse(alt_path)
-
-        logger.error(f"[Static] Loading manager not found at: {loading_js}")
-        return web.Response(text="Loading manager not found.", status=404)
-
-    return web.FileResponse(loading_js)
+    logger.error(f"[Static] Loading manager not found")
+    return web.Response(text="Loading manager not found.", status=404)
 
 
 async def serve_static_file(request: web.Request) -> web.Response:
-    """Serve static files from frontend/public directory."""
+    """Serve static files using dynamic path resolution."""
     filename = request.match_info.get('filename', '')
 
     # Security: prevent path traversal
     if '..' in filename or filename.startswith('/'):
         return web.Response(text="Invalid path", status=400)
 
-    file_path = config.frontend_path / filename
+    resolved = path_resolver.resolve(filename)
 
-    if not file_path.exists() or not file_path.is_file():
-        # Try alternative paths
-        alt_bases = [
-            Path(__file__).resolve().parent / 'frontend' / 'public',
-            Path.cwd() / 'frontend' / 'public',
-            Path('/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/frontend/public'),
-        ]
+    if resolved:
+        return web.FileResponse(resolved)
 
-        for alt_base in alt_bases:
-            alt_path = alt_base / filename
-            if alt_path.exists() and alt_path.is_file():
-                return web.FileResponse(alt_path)
-
-        return web.Response(text=f"File not found: {filename}", status=404)
-
-    return web.FileResponse(file_path)
+    return web.Response(text=f"File not found: {filename}", status=404)
 
 
 async def health_check(request: web.Request) -> web.Response:
@@ -908,20 +987,22 @@ async def start_server(host: str = '0.0.0.0', port: Optional[int] = None):
     site = web.TCPSite(runner, host, port)
     await site.start()
 
-    # Verify frontend path and log startup info
-    loading_html = config.frontend_path / "loading.html"
-    path_status = "✓" if loading_html.exists() else "✗"
+    # Initialize path resolver and verify paths
+    path_resolver.initialize()
+    resolved_loading = path_resolver.resolve("loading.html")
+    resolved_manager = path_resolver.resolve("loading-manager.js")
 
     logger.info(f"{'='*60}")
-    logger.info(f" JARVIS Loading Server v3.0 - Production Ready")
+    logger.info(f" JARVIS Loading Server v3.0 - Dynamic & Robust")
     logger.info(f"{'='*60}")
     logger.info(f" Server:      http://{host}:{port}")
     logger.info(f" WebSocket:   ws://{host}:{port}/ws/startup-progress")
     logger.info(f" HTTP API:    http://{host}:{port}/api/startup-progress")
     logger.info(f"{'='*60}")
-    logger.info(f" Frontend:    {config.frontend_path}")
-    logger.info(f" Loading.html: {path_status} {loading_html}")
-    logger.info(f" __file__:    {Path(__file__).resolve()}")
+    logger.info(f" Path Resolution:")
+    logger.info(f"   loading.html:      {'✓' if resolved_loading else '✗'} {resolved_loading or 'NOT FOUND'}")
+    logger.info(f"   loading-manager.js: {'✓' if resolved_manager else '✗'} {resolved_manager or 'NOT FOUND'}")
+    logger.info(f"   Search paths:      {len(path_resolver.search_paths)}")
     logger.info(f"{'='*60}")
     logger.info(f" CORS:        Enabled for all origins")
     logger.info(f" Rate Limit:  {config.rate_limit_requests} req/{config.rate_limit_window}s")
