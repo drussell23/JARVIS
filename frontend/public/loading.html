@@ -17,6 +17,7 @@
             --cyber-cyan: #00d4ff;
             --cyber-cyan-dim: #0099bb;
             --cyber-teal: #00ffcc;
+            --success-green: #00ff41;
             --panel-bg: rgba(10, 15, 25, 0.85);
             --panel-border: rgba(0, 212, 255, 0.3);
             --panel-border-bright: rgba(0, 212, 255, 0.6);
@@ -76,6 +77,16 @@
                 0 0 40px rgba(0, 212, 255, 0.15),
                 0 0 80px rgba(0, 212, 255, 0.1),
                 inset 0 0 60px rgba(0, 20, 40, 0.3);
+            transition: box-shadow 0.5s ease-out, border-color 0.5s ease-out;
+        }
+
+        /* Success state glow */
+        .loading-container.success-state {
+            border-color: var(--success-green);
+            box-shadow:
+                0 0 60px rgba(0, 255, 65, 0.4),
+                0 0 120px rgba(0, 255, 65, 0.2),
+                inset 0 0 60px rgba(0, 40, 20, 0.3);
         }
 
         /* Dynamic Title */
@@ -91,6 +102,16 @@
                 0 0 40px var(--glow-cyan);
             margin-bottom: 40px;
             text-transform: uppercase;
+            transition: color 0.3s ease-out, text-shadow 0.3s ease-out;
+        }
+
+        /* Success title state */
+        .system-title.success-state {
+            color: var(--success-green);
+            text-shadow:
+                0 0 10px var(--success-green),
+                0 0 30px var(--success-green),
+                0 0 60px var(--success-green);
         }
 
         /* Circular Progress Container */
@@ -108,23 +129,23 @@
             transform: rotate(-90deg);
         }
 
-        /* Outer Decorative Ring */
+        /* Outer Decorative Ring - Mechanical Easing */
         .ring-outer-deco {
             fill: none;
             stroke: var(--panel-border);
             stroke-width: 1;
             stroke-dasharray: 8 4;
-            animation: rotateSlow 30s linear infinite;
+            animation: mechanicalRotateSlow 8s cubic-bezier(0.4, 0.0, 0.2, 1) infinite;
             transform-origin: center;
         }
 
-        /* Middle Ring */
+        /* Middle Ring - Heavy Mechanical Easing (Addendum 2) */
         .ring-middle {
             fill: none;
             stroke: var(--cyber-cyan-dim);
             stroke-width: 2;
             opacity: 0.6;
-            animation: rotateReverse 20s linear infinite;
+            animation: mechanicalRotateReverse 5s cubic-bezier(0.25, 0.1, 0.25, 1.0) infinite;
             transform-origin: center;
         }
 
@@ -144,23 +165,34 @@
             stroke-linecap: round;
             stroke-dasharray: 565.48;
             stroke-dashoffset: 565.48;
-            transition: stroke-dashoffset 0.5s ease-out;
+            transition: stroke-dashoffset 0.5s ease-out, stroke 0.3s ease-out;
             filter: url(#glowFilter);
         }
 
-        /* Inner Glow Ring */
+        /* Success state for progress arc */
+        .progress-arc.success-state {
+            stroke: var(--success-green);
+            filter: url(#successGlowFilter);
+        }
+
+        /* Inner Glow Ring - Mechanical Easing */
         .ring-inner-glow {
             fill: none;
             stroke: var(--cyber-cyan);
             stroke-width: 1;
             opacity: 0.4;
-            animation: pulseGlow 2s ease-in-out infinite;
+            animation: mechanicalPulseGlow 4s cubic-bezier(0.4, 0.0, 0.6, 1) infinite;
         }
 
         /* Tech Segments on outer ring */
         .tech-segment {
             fill: var(--cyber-cyan);
             opacity: 0.8;
+            transition: fill 0.3s ease-out;
+        }
+
+        .tech-segment.success-state {
+            fill: var(--success-green);
         }
 
         /* Center Content */
@@ -181,6 +213,76 @@
                 0 0 20px var(--glow-cyan),
                 0 0 40px var(--glow-cyan);
             line-height: 1;
+            transition: color 0.3s ease-out, text-shadow 0.3s ease-out;
+        }
+
+        /* Success state for percentage */
+        .progress-percentage.success-state {
+            color: var(--success-green);
+            text-shadow:
+                0 0 30px var(--success-green),
+                0 0 60px var(--success-green);
+        }
+
+        /* Chromatic Aberration Effect (Addendum 3) */
+        @keyframes chromaticAberration {
+            0% {
+                text-shadow:
+                    -2px 0 rgba(255, 0, 0, 0.7),
+                    2px 0 rgba(0, 100, 255, 0.7),
+                    0 0 20px var(--glow-cyan);
+                transform: translate(-50%, -50%) translateX(1px);
+            }
+            25% {
+                text-shadow:
+                    -3px 0 rgba(255, 0, 0, 0.5),
+                    3px 0 rgba(0, 100, 255, 0.5),
+                    0 0 20px var(--glow-cyan);
+                transform: translate(-50%, -50%) translateX(-1px);
+            }
+            50% {
+                text-shadow:
+                    -1px 0 rgba(255, 0, 0, 0.3),
+                    1px 0 rgba(0, 100, 255, 0.3),
+                    0 0 20px var(--glow-cyan);
+                transform: translate(-50%, -50%) translateX(0);
+            }
+            100% {
+                text-shadow:
+                    0 0 20px var(--glow-cyan),
+                    0 0 40px var(--glow-cyan);
+                transform: translate(-50%, -50%);
+            }
+        }
+
+        .chromatic-glitch {
+            animation: chromaticAberration 0.2s ease-out forwards;
+        }
+
+        /* Status message chromatic aberration */
+        @keyframes statusChromaticAberration {
+            0% {
+                text-shadow:
+                    -2px 0 rgba(255, 0, 0, 0.5),
+                    2px 0 rgba(0, 100, 255, 0.5),
+                    0 0 10px var(--glow-green);
+                transform: translateX(1px);
+            }
+            50% {
+                text-shadow:
+                    -1px 0 rgba(255, 0, 0, 0.3),
+                    1px 0 rgba(0, 100, 255, 0.3),
+                    0 0 10px var(--glow-green);
+                transform: translateX(-1px);
+            }
+            100% {
+                text-shadow: 0 0 10px var(--glow-green);
+                transform: translateX(0);
+            }
+        }
+
+        .status-chromatic-glitch {
+            animation: statusChromaticAberration 0.2s ease-out forwards;
         }
 
         #subtitle {
@@ -206,7 +308,13 @@
             letter-spacing: 1px;
             text-shadow: 0 0 10px var(--glow-green);
             min-height: 1.5em;
-            animation: textPulse 2s ease-in-out infinite;
+            transition: color 0.3s ease-out, text-shadow 0.3s ease-out;
+        }
+
+        /* Success state for status message */
+        .status-message.success-state {
+            color: var(--success-green);
+            text-shadow: 0 0 20px var(--success-green);
         }
 
         /* Connection Status */
@@ -328,7 +436,31 @@
             display: none;
         }
 
-        /* Animations */
+        /* Animations - Addendum 2: Mechanical Easing */
+        @keyframes mechanicalRotateSlow {
+            0% { transform: rotate(0deg); }
+            15% { transform: rotate(30deg); }
+            50% { transform: rotate(180deg); }
+            85% { transform: rotate(330deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        @keyframes mechanicalRotateReverse {
+            0% { transform: rotate(360deg); }
+            10% { transform: rotate(324deg); }
+            30% { transform: rotate(252deg); }
+            70% { transform: rotate(108deg); }
+            90% { transform: rotate(36deg); }
+            100% { transform: rotate(0deg); }
+        }
+
+        @keyframes mechanicalPulseGlow {
+            0%, 100% { opacity: 0.3; transform: scale(1); }
+            25% { opacity: 0.5; transform: scale(1.01); }
+            50% { opacity: 0.7; transform: scale(1.02); }
+            75% { opacity: 0.5; transform: scale(1.01); }
+        }
+
         @keyframes rotateSlow {
             from { transform: rotate(0deg); }
             to { transform: rotate(360deg); }
@@ -357,6 +489,20 @@
         @keyframes circuitPulse {
             0%, 100% { opacity: 0.2; }
             50% { opacity: 0.6; }
+        }
+
+        /* Success pulse animation */
+        @keyframes successPulse {
+            0%, 100% {
+                box-shadow: 0 0 60px rgba(0, 255, 65, 0.4);
+            }
+            50% {
+                box-shadow: 0 0 100px rgba(0, 255, 65, 0.7);
+            }
+        }
+
+        .success-pulse {
+            animation: successPulse 0.4s ease-in-out 2;
         }
 
         /* Responsive */
@@ -445,7 +591,7 @@
     </div>
 
     <!-- Main Loading Container -->
-    <div class="loading-container">
+    <div class="loading-container" id="loading-container">
         <!-- Dynamic Title -->
         <h1 class="system-title" id="system-title">SYSTEM RESTART</h1>
 
@@ -459,10 +605,25 @@
                         <stop offset="50%" style="stop-color:#00d4ff;stop-opacity:1" />
                         <stop offset="100%" style="stop-color:#00ff88;stop-opacity:1" />
                     </linearGradient>
+                    <!-- Success gradient -->
+                    <linearGradient id="successGradient" x1="0%" y1="0%" x2="100%" y2="0%">
+                        <stop offset="0%" style="stop-color:#00ff41;stop-opacity:1" />
+                        <stop offset="100%" style="stop-color:#00ff88;stop-opacity:1" />
+                    </linearGradient>
                     <!-- Glow filter -->
                     <filter id="glowFilter" x="-50%" y="-50%" width="200%" height="200%">
                         <feGaussianBlur stdDeviation="4" result="coloredBlur"/>
                         <feMerge>
+                            <feMergeNode in="coloredBlur"/>
+                            <feMergeNode in="coloredBlur"/>
+                            <feMergeNode in="SourceGraphic"/>
+                        </feMerge>
+                    </filter>
+                    <!-- Success glow filter (more intense) -->
+                    <filter id="successGlowFilter" x="-50%" y="-50%" width="200%" height="200%">
+                        <feGaussianBlur stdDeviation="8" result="coloredBlur"/>
+                        <feMerge>
+                            <feMergeNode in="coloredBlur"/>
                             <feMergeNode in="coloredBlur"/>
                             <feMergeNode in="coloredBlur"/>
                             <feMergeNode in="SourceGraphic"/>
@@ -523,7 +684,7 @@
     <!-- Hidden particles div for JS compatibility -->
     <div id="particles"></div>
 
-    <!-- Matrix Rain Animation Script -->
+    <!-- Matrix Rain Animation Script with Addendum 1: Realistic Depth & Glitch Effects -->
     <script>
         class MatrixRain {
             constructor(canvas) {
@@ -532,6 +693,8 @@
                 this.columns = [];
                 this.fontSize = 14;
                 this.characters = '01';
+                this.brightLeaderChance = 0.20; // 20% of columns have bright cyan-white leaders
+                this.glitchChance = 0.003; // Chance per character per frame to glitch
                 this.init();
                 this.animate();
 
@@ -546,19 +709,25 @@
                 this.columns = [];
 
                 for (let i = 0; i < columnCount; i++) {
+                    const hasBrightLeader = Math.random() < this.brightLeaderChance;
                     this.columns.push({
                         x: i * this.fontSize,
                         y: Math.random() * this.canvas.height,
                         speed: Math.random() * 2 + 1,
                         chars: [],
-                        length: Math.floor(Math.random() * 15) + 5
+                        length: Math.floor(Math.random() * 15) + 5,
+                        hasBrightLeader: hasBrightLeader,
+                        glitchOffset: 0, // Horizontal glitch offset
+                        glitchTimer: 0
                     });
 
                     // Initialize character array for this column
                     for (let j = 0; j < this.columns[i].length; j++) {
                         this.columns[i].chars.push({
                             char: this.getRandomChar(),
-                            opacity: 1 - (j / this.columns[i].length)
+                            opacity: 1 - (j / this.columns[i].length),
+                            glitching: false,
+                            glitchX: 0
                         });
                     }
                 }
@@ -576,6 +745,18 @@
                 this.ctx.font = `${this.fontSize}px 'Share Tech Mono', monospace`;
 
                 for (let col of this.columns) {
+                    // Update glitch state for column
+                    if (col.glitchTimer > 0) {
+                        col.glitchTimer--;
+                        if (col.glitchTimer === 0) {
+                            col.glitchOffset = 0;
+                        }
+                    } else if (Math.random() < 0.001) {
+                        // Start a new glitch
+                        col.glitchOffset = (Math.random() - 0.5) * 6;
+                        col.glitchTimer = Math.floor(Math.random() * 3) + 1;
+                    }
+
                     // Draw each character in the column
                     for (let i = 0; i < col.chars.length; i++) {
                         const y = col.y - (i * this.fontSize);
@@ -583,18 +764,45 @@
                         if (y < -this.fontSize * col.length) continue;
                         if (y > this.canvas.height + this.fontSize) continue;
 
-                        // First character is brightest (head of the trail)
+                        // Calculate x position with potential glitch
+                        let charGlitchX = 0;
+                        if (Math.random() < this.glitchChance) {
+                            col.chars[i].glitching = true;
+                            col.chars[i].glitchX = (Math.random() - 0.5) * 4;
+                        } else if (col.chars[i].glitching) {
+                            col.chars[i].glitching = false;
+                            col.chars[i].glitchX = 0;
+                        }
+                        charGlitchX = col.chars[i].glitchX + col.glitchOffset;
+
+                        const drawX = col.x + charGlitchX;
+
+                        // Addendum 1: Bright white-cyan leader for 20% of columns
                         if (i === 0) {
-                            this.ctx.fillStyle = '#ffffff';
-                            this.ctx.shadowBlur = 10;
-                            this.ctx.shadowColor = '#00ff41';
+                            if (col.hasBrightLeader) {
+                                // Bright white-cyan leader
+                                this.ctx.fillStyle = '#e0ffff';
+                                this.ctx.shadowBlur = 15;
+                                this.ctx.shadowColor = '#00ffff';
+                            } else {
+                                // Standard bright white-green leader
+                                this.ctx.fillStyle = '#ffffff';
+                                this.ctx.shadowBlur = 10;
+                                this.ctx.shadowColor = '#00ff41';
+                            }
+                        } else if (i === 1 && col.hasBrightLeader) {
+                            // Second character also brighter for bright leader columns
+                            const opacity = col.chars[i].opacity * 0.9;
+                            this.ctx.fillStyle = `rgba(0, 255, 200, ${opacity})`;
+                            this.ctx.shadowBlur = 5;
+                            this.ctx.shadowColor = '#00ffcc';
                         } else {
                             const opacity = col.chars[i].opacity * 0.8;
                             this.ctx.fillStyle = `rgba(0, 255, 65, ${opacity})`;
                             this.ctx.shadowBlur = 0;
                         }
 
-                        this.ctx.fillText(col.chars[i].char, col.x, y);
+                        this.ctx.fillText(col.chars[i].char, drawX, y);
 
                         // Randomly change character
                         if (Math.random() < 0.02) {
@@ -610,13 +818,18 @@
                         col.y = 0;
                         col.speed = Math.random() * 2 + 1;
                         col.length = Math.floor(Math.random() * 15) + 5;
+                        col.hasBrightLeader = Math.random() < this.brightLeaderChance;
+                        col.glitchOffset = 0;
+                        col.glitchTimer = 0;
 
                         // Reset characters
                         col.chars = [];
                         for (let j = 0; j < col.length; j++) {
                             col.chars.push({
                                 char: this.getRandomChar(),
-                                opacity: 1 - (j / col.length)
+                                opacity: 1 - (j / col.length),
+                                glitching: false,
+                                glitchX: 0
                             });
                         }
                     }
@@ -643,6 +856,67 @@
             }
         }
 
+        // Addendum 3: Chromatic Aberration Effect on data updates
+        function triggerChromaticGlitch(element, isPercentage = false) {
+            if (!element) return;
+
+            // Remove existing animation class
+            element.classList.remove('chromatic-glitch', 'status-chromatic-glitch');
+
+            // Force reflow to restart animation
+            void element.offsetWidth;
+
+            // Add appropriate animation class
+            if (isPercentage) {
+                element.classList.add('chromatic-glitch');
+            } else {
+                element.classList.add('status-chromatic-glitch');
+            }
+
+            // Remove class after animation completes
+            setTimeout(() => {
+                element.classList.remove('chromatic-glitch', 'status-chromatic-glitch');
+            }, 200);
+        }
+
+        // Addendum 4: Success State Transition Sequence
+        let successStateTriggered = false;
+
+        function triggerSuccessState() {
+            if (successStateTriggered) return Promise.resolve();
+            successStateTriggered = true;
+
+            return new Promise((resolve) => {
+                const container = document.getElementById('loading-container');
+                const title = document.getElementById('system-title');
+                const percentage = document.getElementById('progress-percentage');
+                const statusMessage = document.getElementById('status-message');
+                const progressCircle = document.getElementById('progress-circle');
+                const techSegments = document.querySelectorAll('.tech-segment');
+
+                // Instant color change to success green
+                container.classList.add('success-state', 'success-pulse');
+                title.classList.add('success-state');
+                title.textContent = 'ACCESS GRANTED';
+                percentage.classList.add('success-state');
+                statusMessage.classList.add('success-state');
+                statusMessage.textContent = 'System Ready - Redirecting...';
+                progressCircle.classList.add('success-state');
+                progressCircle.style.stroke = '#00ff41';
+
+                // Update tech segments
+                techSegments.forEach(seg => seg.classList.add('success-state'));
+
+                // Trigger intense chromatic glitch on title
+                triggerChromaticGlitch(percentage, true);
+
+                // Hold for 800ms then resolve
+                setTimeout(() => {
+                    resolve();
+                }, 800);
+            });
+        }
+
         // Update title based on URL or startup type
         function updateDynamicTitle() {
             const title = document.getElementById('system-title');
@@ -659,9 +933,13 @@
             }
         }
 
+        // Track last values to detect changes
+        let lastPercentageValue = '';
+        let lastStatusMessage = '';
+
         // Hook into the loading manager's progress updates
-        const originalSetAttribute = Element.prototype.setAttribute;
         const progressPercentageEl = document.getElementById('progress-percentage');
+        const statusMessageEl = document.getElementById('status-message');
 
         // Create a MutationObserver to watch for style changes on progress-bar
         const progressBar = document.getElementById('progress-bar');
@@ -683,16 +961,28 @@
             observer.observe(progressBar, { attributes: true });
         }
 
-        // Also watch the percentage text element for direct updates
+        // Watch the percentage text element for direct updates
         if (progressPercentageEl) {
             const textObserver = new MutationObserver((mutations) => {
                 mutations.forEach((mutation) => {
                     if (mutation.type === 'childList' || mutation.type === 'characterData') {
                         const text = progressPercentageEl.textContent;
+
+                        // Trigger chromatic aberration on change
+                        if (text !== lastPercentageValue) {
+                            triggerChromaticGlitch(progressPercentageEl, true);
+                            lastPercentageValue = text;
+                        }
+
                         const match = text.match(/(\d+)/);
                         if (match) {
                             const percentage = parseInt(match[1]);
                             updateProgressCircle(percentage);
+
+                            // Check for 100% completion
+                            if (percentage >= 100 && !successStateTriggered) {
+                                triggerSuccessState();
+                            }
                         }
                     }
                 });
@@ -704,6 +994,33 @@
                 subtree: true
             });
         }
+
+        // Watch status message for changes
+        if (statusMessageEl) {
+            const statusObserver = new MutationObserver((mutations) => {
+                mutations.forEach((mutation) => {
+                    if (mutation.type === 'childList' || mutation.type === 'characterData') {
+                        const text = statusMessageEl.textContent;
+
+                        // Trigger chromatic aberration on change
+                        if (text !== lastStatusMessage) {
+                            triggerChromaticGlitch(statusMessageEl, false);
+                            lastStatusMessage = text;
+                        }
+                    }
+                });
+            });
+
+            statusObserver.observe(statusMessageEl, {
+                childList: true,
+                characterData: true,
+                subtree: true
+            });
+        }
+
+        // Expose success state function globally for loading-manager.js
+        window.triggerSuccessState = triggerSuccessState;
+        window.successStateTriggered = () => successStateTriggered;
 
         // Initialize
         updateDynamicTitle();

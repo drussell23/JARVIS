@@ -1304,58 +1304,59 @@ class JARVISLoadingManager {
         const reactor = this.elements.reactor;
         const matrixCanvas = document.getElementById('matrix-canvas');
 
-        const totalDuration = 3000;
+        // Addendum 4: Trigger "ACCESS GRANTED" success state sequence
+        // This changes colors to success green, updates title, and holds for 800ms
+        if (typeof window.triggerSuccessState === 'function') {
+            console.log('[Completion] Triggering ACCESS GRANTED success state...');
+            await window.triggerSuccessState();
+        }
 
-        // Phase 1: Power surge with Matrix theme
+        // Create success green energy rings after success state
         if (reactor) {
-            reactor.style.transition = 'all 0.3s ease-out';
-            reactor.style.transform = 'scale(1.2)';
-            reactor.style.filter = 'drop-shadow(0 0 60px rgba(0, 212, 255, 1)) brightness(1.5)';
-
-            // Create cyan energy rings
             for (let i = 0; i < 3; i++) {
-                setTimeout(() => this.createEnergyRing(reactor, '#00d4ff', i), i * 200);
+                setTimeout(() => this.createEnergyRing(reactor, '#00ff41', i), i * 150);
             }
         }
 
-        // Intensify matrix rain briefly
+        // Brief intensify of matrix rain
         if (matrixCanvas) {
             matrixCanvas.style.transition = 'opacity 0.3s ease-out';
             matrixCanvas.style.opacity = '1';
         }
 
-        await this.sleep(600);
+        await this.sleep(500);
 
-        // Phase 2: Fade out with glow
+        // Phase 2: Fade out with green success glow
         if (container) {
             container.style.transition = 'all 1s ease-out';
             container.style.opacity = '0';
-            container.style.transform = 'scale(1.1)';
-            container.style.filter = 'blur(10px)';
+            container.style.transform = 'scale(1.05)';
+            container.style.filter = 'blur(10px) brightness(1.2)';
         }
         if (reactor) {
             reactor.style.transition = 'all 1s ease-out';
-            reactor.style.transform = 'scale(1.5)';
+            reactor.style.transform = 'scale(1.3)';
             reactor.style.opacity = '0';
+            reactor.style.filter = 'drop-shadow(0 0 80px rgba(0, 255, 65, 1))';
         }
         if (matrixCanvas) {
-            matrixCanvas.style.transition = 'opacity 1s ease-out';
-            matrixCanvas.style.opacity = '0.3';
+            matrixCanvas.style.transition = 'opacity 1.2s ease-out';
+            matrixCanvas.style.opacity = '0';
         }
 
-        await this.sleep(1500);
+        await this.sleep(1200);
 
         // Phase 3: Navigate with dark overlay
         const overlay = document.createElement('div');
         overlay.style.cssText = `
             position: fixed; top: 0; left: 0; width: 100%; height: 100%;
             background: #0a0a12; opacity: 0;
-            transition: opacity 0.5s ease-in; z-index: 10001;
+            transition: opacity 0.4s ease-in; z-index: 10001;
         `;
         document.body.appendChild(overlay);
         setTimeout(() => overlay.style.opacity = '1', 10);
 
-        await this.sleep(500);
+        await this.sleep(400);
         window.location.href = redirectUrl;
     }
 
