@@ -5,1074 +5,641 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>JARVIS - System Initialization</title>
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
-    <link rel="alternate icon" href="/favicon.ico" type="image/x-icon" />
     <meta name="theme-color" content="#0a0a12" />
-    <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;600;700;900&family=Rajdhani:wght@300;400;500;600;700&family=Share+Tech+Mono&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;600;700;900&family=Share+Tech+Mono&display=swap" rel="stylesheet">
     <style>
         :root {
-            /* Matrix Color Palette */
             --matrix-green: #00ff41;
-            --matrix-green-dim: #00aa2e;
-            --matrix-dark-green: #003300;
             --cyber-cyan: #00d4ff;
-            --cyber-cyan-dim: #0099bb;
             --cyber-teal: #00ffcc;
             --success-green: #00ff41;
-            --panel-bg: rgba(10, 15, 25, 0.85);
-            --panel-border: rgba(0, 212, 255, 0.3);
-            --panel-border-bright: rgba(0, 212, 255, 0.6);
-            --glow-cyan: rgba(0, 212, 255, 0.5);
-            --glow-green: rgba(0, 255, 65, 0.4);
+            --segment-lit: #00ff88;
+            --segment-dim: rgba(0, 150, 130, 0.35);
             --bg-dark: #0a0a12;
-            --text-primary: #e0f7ff;
-            --text-secondary: #7fdbff;
         }
 
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
 
         html, body {
-            width: 100%;
-            height: 100%;
+            width: 100%; height: 100%;
             overflow: hidden;
             background: var(--bg-dark);
         }
 
         body {
-            font-family: 'Rajdhani', sans-serif;
+            font-family: 'Orbitron', sans-serif;
             display: flex;
             justify-content: center;
             align-items: center;
-            color: var(--text-primary);
+            color: #e0f7ff;
         }
 
-        /* Matrix Rain Canvas */
+        /* Matrix Rain Canvas - z-index 1 */
         #matrix-canvas {
             position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            z-index: 0;
-            opacity: 0.7;
+            top: 0; left: 0;
+            width: 100%; height: 100%;
+            z-index: 1;
         }
 
-        /* Glass Panel Container with 3D Perspective Tilt */
+        /* =====================================================
+           DIRECTIVE 4: 3D HUD Perspective & High Transparency
+           - perspective(1000px) rotateX(15deg) rotateY(5deg)
+           - rgba(10, 20, 30, 0.4) so matrix is visible THROUGH
+           ===================================================== */
         .loading-container {
             position: relative;
             z-index: 10;
-            background: var(--panel-bg);
-            border: 1px solid var(--panel-border);
-            border-radius: 20px;
-            padding: 60px 80px;
-            min-width: 580px;
-            max-width: 680px;
+            background: rgba(10, 20, 30, 0.4);
+            border: 1px solid rgba(0, 212, 255, 0.5);
+            border-radius: 14px;
+            padding: 45px 60px 40px;
+            min-width: 600px;
             text-align: center;
-            backdrop-filter: blur(15px);
-            -webkit-backdrop-filter: blur(15px);
-            /* 3D perspective tilt effect matching target design */
-            transform: perspective(1200px) rotateX(2deg) rotateY(-3deg);
+            transform: perspective(1000px) rotateX(15deg) rotateY(5deg);
             transform-style: preserve-3d;
+            backdrop-filter: blur(6px);
+            -webkit-backdrop-filter: blur(6px);
             box-shadow:
-                /* Main glow */
-                0 0 40px rgba(0, 212, 255, 0.2),
-                0 0 80px rgba(0, 212, 255, 0.1),
-                /* Edge highlights for 3D effect */
-                inset 2px 0 20px rgba(0, 212, 255, 0.15),
-                inset -2px 0 20px rgba(0, 212, 255, 0.1),
-                inset 0 2px 20px rgba(0, 212, 255, 0.15),
-                inset 0 -2px 20px rgba(0, 212, 255, 0.1),
-                /* Depth shadow */
-                10px 15px 40px rgba(0, 0, 0, 0.5);
-            transition: box-shadow 0.5s ease-out, border-color 0.5s ease-out, transform 0.5s ease-out;
+                0 0 60px rgba(0, 212, 255, 0.15),
+                0 30px 60px rgba(0, 0, 0, 0.5);
         }
 
-        /* Glowing edge accents on the panel */
+        /* Right edge glow */
         .loading-container::before {
             content: '';
             position: absolute;
-            top: -1px;
-            right: -1px;
-            bottom: -1px;
+            top: 10%; right: -2px; bottom: 10%;
             width: 3px;
             background: linear-gradient(180deg,
-                transparent 10%,
-                rgba(0, 212, 255, 0.6) 30%,
-                rgba(0, 255, 204, 0.8) 50%,
-                rgba(0, 212, 255, 0.6) 70%,
-                transparent 90%);
-            border-radius: 0 20px 20px 0;
-            filter: blur(2px);
-            pointer-events: none;
+                transparent 0%,
+                rgba(0, 255, 220, 0.9) 25%,
+                rgba(0, 255, 255, 1) 50%,
+                rgba(0, 255, 220, 0.9) 75%,
+                transparent 100%);
+            box-shadow: 0 0 20px rgba(0, 255, 220, 0.8);
         }
 
+        /* Bottom edge glow */
         .loading-container::after {
             content: '';
             position: absolute;
-            top: -1px;
-            left: 10%;
-            right: 10%;
+            bottom: -2px; left: 15%; right: 15%;
             height: 2px;
             background: linear-gradient(90deg,
-                transparent 0%,
-                rgba(0, 212, 255, 0.4) 30%,
-                rgba(0, 255, 204, 0.6) 50%,
-                rgba(0, 212, 255, 0.4) 70%,
-                transparent 100%);
-            filter: blur(1px);
-            pointer-events: none;
+                transparent, rgba(0, 255, 220, 0.7) 50%, transparent);
+            box-shadow: 0 0 12px rgba(0, 212, 255, 0.5);
         }
 
-        /* Success state glow */
         .loading-container.success-state {
             border-color: var(--success-green);
-            box-shadow:
-                0 0 60px rgba(0, 255, 65, 0.4),
-                0 0 120px rgba(0, 255, 65, 0.2),
-                inset 0 0 60px rgba(0, 40, 20, 0.3);
+            box-shadow: 0 0 80px rgba(0, 255, 65, 0.3), 0 30px 60px rgba(0, 0, 0, 0.5);
         }
 
-        /* Dynamic Title */
+        /* Title */
         .system-title {
-            font-family: 'Orbitron', sans-serif;
-            font-size: 2rem;
+            font-size: 1.9rem;
             font-weight: 600;
             letter-spacing: 8px;
             color: var(--cyber-cyan);
-            text-shadow:
-                0 0 10px var(--cyber-cyan),
-                0 0 20px var(--glow-cyan),
-                0 0 40px var(--glow-cyan);
+            text-shadow: 0 0 12px var(--cyber-cyan), 0 0 30px rgba(0, 212, 255, 0.5);
             margin-bottom: 40px;
             text-transform: uppercase;
-            transition: color 0.3s ease-out, text-shadow 0.3s ease-out;
         }
-
-        /* Success title state */
         .system-title.success-state {
             color: var(--success-green);
-            text-shadow:
-                0 0 10px var(--success-green),
-                0 0 30px var(--success-green),
-                0 0 60px var(--success-green);
+            text-shadow: 0 0 20px var(--success-green), 0 0 50px var(--success-green);
         }
 
-        /* Circular Progress Container - Larger to match target design */
-        .progress-circle-container {
+        /* Progress Circle Container */
+        .progress-container {
             position: relative;
-            width: 320px;
-            height: 320px;
-            margin: 0 auto 50px;
+            width: 260px;
+            height: 260px;
+            margin: 0 auto 35px;
         }
 
-        /* SVG Progress Circle */
         .progress-svg {
             width: 100%;
             height: 100%;
-            transform: rotate(-90deg);
         }
 
-        /* Outer Decorative Ring - Mechanical Easing */
-        .ring-outer-deco {
+        /* =====================================================
+           DIRECTIVE 1: Trapezoidal Segments
+           ===================================================== */
+        .trap-segment {
+            fill: var(--segment-dim);
+            transition: fill 0.3s, filter 0.3s;
+        }
+        .trap-segment.lit {
+            fill: var(--segment-lit);
+            filter: drop-shadow(0 0 4px var(--segment-lit));
+        }
+        .trap-segment.success {
+            fill: var(--success-green);
+            filter: drop-shadow(0 0 6px var(--success-green));
+        }
+
+        /* =====================================================
+           DIRECTIVE 2: Triangular Chevron Arrows
+           ===================================================== */
+        .chevron-tri {
+            fill: var(--cyber-cyan);
+            filter: drop-shadow(0 0 5px var(--cyber-cyan));
+        }
+        .chevron-tri.success {
+            fill: var(--success-green);
+            filter: drop-shadow(0 0 6px var(--success-green));
+        }
+
+        /* =====================================================
+           DIRECTIVE 3: Dashed Inner Track
+           ===================================================== */
+        .dashed-inner-track {
             fill: none;
-            stroke: var(--panel-border);
+            stroke: rgba(0, 200, 210, 0.45);
             stroke-width: 1;
-            stroke-dasharray: 8 4;
-            animation: mechanicalRotateSlow 8s cubic-bezier(0.4, 0.0, 0.2, 1) infinite;
-            transform-origin: center;
+            stroke-dasharray: 5 3;
         }
 
-        /* Middle Ring - Heavy Mechanical Easing (Addendum 2) */
-        .ring-middle {
+        /* Progress arc background */
+        .progress-bg {
             fill: none;
-            stroke: var(--cyber-cyan-dim);
-            stroke-width: 2;
-            opacity: 0.6;
-            animation: mechanicalRotateReverse 5s cubic-bezier(0.25, 0.1, 0.25, 1.0) infinite;
-            transform-origin: center;
+            stroke: rgba(0, 180, 200, 0.12);
+            stroke-width: 7;
         }
 
-        /* Progress Track */
-        .progress-track {
-            fill: none;
-            stroke: rgba(0, 212, 255, 0.15);
-            stroke-width: 8;
-            stroke-linecap: round;
-        }
-
-        /* Progress Arc - circumference = 2 * π * 100 = 628.32 */
+        /* Main progress arc (r=80, circumference = 2*PI*80 = 502.65) */
         .progress-arc {
             fill: none;
-            stroke: url(#progressGradient);
-            stroke-width: 8;
+            stroke: var(--cyber-teal);
+            stroke-width: 7;
             stroke-linecap: round;
-            stroke-dasharray: 628.32;
-            stroke-dashoffset: 628.32;
-            transition: stroke-dashoffset 0.5s ease-out, stroke 0.3s ease-out;
-            filter: url(#glowFilter);
+            stroke-dasharray: 502.65;
+            stroke-dashoffset: 502.65;
+            filter: drop-shadow(0 0 10px var(--cyber-teal));
+            transition: stroke-dashoffset 0.4s ease-out;
         }
-
-        /* Success state for progress arc */
-        .progress-arc.success-state {
+        .progress-arc.success {
             stroke: var(--success-green);
-            filter: url(#successGlowFilter);
+            filter: drop-shadow(0 0 14px var(--success-green));
         }
 
-        /* Inner Glow Ring - Mechanical Easing */
-        .ring-inner-glow {
+        /* Decorative rings */
+        .deco-ring {
             fill: none;
-            stroke: var(--cyber-cyan);
+            stroke: rgba(0, 200, 220, 0.2);
             stroke-width: 1;
-            opacity: 0.4;
-            animation: mechanicalPulseGlow 4s cubic-bezier(0.4, 0.0, 0.6, 1) infinite;
         }
 
-        /* Tech Segments on outer ring */
-        .tech-segment {
-            fill: var(--cyber-cyan);
-            opacity: 0.8;
-            transition: fill 0.3s ease-out;
-        }
-
-        .tech-segment.success-state {
-            fill: var(--success-green);
-        }
-
-        /* Center Content */
-        .progress-center {
+        /* Center content */
+        .center-content {
             position: absolute;
-            top: 50%;
-            left: 50%;
+            top: 50%; left: 50%;
             transform: translate(-50%, -50%);
             text-align: center;
         }
-
-        .progress-percentage {
-            font-family: 'Orbitron', sans-serif;
-            font-size: 4rem;
-            font-weight: 700;
-            color: var(--cyber-cyan);
-            text-shadow:
-                0 0 20px var(--glow-cyan),
-                0 0 40px var(--glow-cyan);
+        .percentage {
+            font-size: 3rem;
+            font-weight: 600;
+            color: var(--cyber-teal);
+            text-shadow: 0 0 15px rgba(0, 212, 255, 0.6);
             line-height: 1;
-            transition: color 0.3s ease-out, text-shadow 0.3s ease-out;
         }
-
-        /* Success state for percentage */
-        .progress-percentage.success-state {
+        .percentage.success-state {
             color: var(--success-green);
-            text-shadow:
-                0 0 30px var(--success-green),
-                0 0 60px var(--success-green);
+            text-shadow: 0 0 25px var(--success-green);
         }
-
-        /* Chromatic Aberration Effect (Addendum 3) */
-        @keyframes chromaticAberration {
-            0% {
-                text-shadow:
-                    -2px 0 rgba(255, 0, 0, 0.7),
-                    2px 0 rgba(0, 100, 255, 0.7),
-                    0 0 20px var(--glow-cyan);
-                transform: translate(-50%, -50%) translateX(1px);
-            }
-            25% {
-                text-shadow:
-                    -3px 0 rgba(255, 0, 0, 0.5),
-                    3px 0 rgba(0, 100, 255, 0.5),
-                    0 0 20px var(--glow-cyan);
-                transform: translate(-50%, -50%) translateX(-1px);
-            }
-            50% {
-                text-shadow:
-                    -1px 0 rgba(255, 0, 0, 0.3),
-                    1px 0 rgba(0, 100, 255, 0.3),
-                    0 0 20px var(--glow-cyan);
-                transform: translate(-50%, -50%) translateX(0);
-            }
-            100% {
-                text-shadow:
-                    0 0 20px var(--glow-cyan),
-                    0 0 40px var(--glow-cyan);
-                transform: translate(-50%, -50%);
-            }
-        }
-
-        .chromatic-glitch {
-            animation: chromaticAberration 0.2s ease-out forwards;
-        }
-
-        /* Status message chromatic aberration */
-        @keyframes statusChromaticAberration {
-            0% {
-                text-shadow:
-                    -2px 0 rgba(255, 0, 0, 0.5),
-                    2px 0 rgba(0, 100, 255, 0.5),
-                    0 0 10px var(--glow-green);
-                transform: translateX(1px);
-            }
-            50% {
-                text-shadow:
-                    -1px 0 rgba(255, 0, 0, 0.3),
-                    1px 0 rgba(0, 100, 255, 0.3),
-                    0 0 10px var(--glow-green);
-                transform: translateX(-1px);
-            }
-            100% {
-                text-shadow: 0 0 10px var(--glow-green);
-                transform: translateX(0);
-            }
-        }
-
-        .status-chromatic-glitch {
-            animation: statusChromaticAberration 0.2s ease-out forwards;
-        }
-
-        #subtitle {
+        .subtitle {
             font-family: 'Share Tech Mono', monospace;
-            font-size: 0.7rem;
-            color: var(--text-secondary);
+            font-size: 0.55rem;
+            color: var(--cyber-cyan);
             letter-spacing: 2px;
-            margin-top: 8px;
-            text-transform: uppercase;
-            opacity: 0.8;
+            margin-top: 5px;
+            opacity: 0.75;
         }
 
-        /* Hidden progress bar (for JS compatibility) */
-        #progress-bar {
-            display: none;
-        }
+        #progress-bar { display: none; }
 
         /* Status Message */
-        .status-message {
+        .status-msg {
             font-family: 'Share Tech Mono', monospace;
-            font-size: 1.1rem;
+            font-size: 0.9rem;
             color: var(--cyber-teal);
-            letter-spacing: 1px;
-            text-shadow: 0 0 10px var(--glow-green);
-            min-height: 1.5em;
-            transition: color 0.3s ease-out, text-shadow 0.3s ease-out;
+            text-shadow: 0 0 8px rgba(0, 255, 200, 0.4);
         }
+        .status-msg.success-state { color: var(--success-green); }
 
-        /* Success state for status message */
-        .status-message.success-state {
-            color: var(--success-green);
-            text-shadow: 0 0 20px var(--success-green);
-        }
-
-        /* Connection Status */
-        .connection-status {
+        /* Connection indicator */
+        .conn-status {
             position: fixed;
-            top: 20px;
-            right: 20px;
+            top: 18px; right: 18px;
             display: flex;
             align-items: center;
-            gap: 10px;
-            padding: 10px 20px;
-            background: rgba(0, 20, 30, 0.8);
-            border: 1px solid var(--panel-border);
-            border-radius: 8px;
+            gap: 8px;
+            padding: 7px 14px;
+            background: rgba(0, 20, 30, 0.85);
+            border: 1px solid rgba(0, 212, 255, 0.3);
+            border-radius: 5px;
             font-family: 'Share Tech Mono', monospace;
-            font-size: 0.8rem;
+            font-size: 0.65rem;
             z-index: 100;
         }
-
-        .status-indicator {
-            width: 10px;
-            height: 10px;
+        .conn-dot {
+            width: 6px; height: 6px;
             border-radius: 50%;
-            background: var(--matrix-green);
-            box-shadow: 0 0 10px var(--matrix-green);
-            animation: blink 1.5s ease-in-out infinite;
+            background: #ffaa00;
+            box-shadow: 0 0 6px #ffaa00;
         }
+        .conn-dot.connected { background: var(--matrix-green); box-shadow: 0 0 6px var(--matrix-green); }
 
-        .status-indicator.connecting { background: #ffaa00; box-shadow: 0 0 10px #ffaa00; }
-        .status-indicator.connected { background: var(--matrix-green); animation: none; }
-        .status-indicator.disconnected { background: #ff4444; box-shadow: 0 0 10px #ff4444; }
-        .status-indicator.starting { background: #ffaa00; }
-        .status-indicator.loading { background: var(--cyber-cyan); }
-        .status-indicator.initializing { background: var(--cyber-teal); }
-        .status-indicator.verifying { background: var(--cyber-cyan); animation: blink 0.5s infinite; }
-        .status-indicator.finalizing { background: var(--matrix-green); animation: blink 0.3s infinite; }
-        .status-indicator.ready { background: var(--matrix-green); animation: none; box-shadow: 0 0 15px var(--matrix-green); }
-        .status-indicator.error { background: #ff4444; animation: none; }
-
-        #status-text {
-            color: var(--text-secondary);
-        }
-
-        /* Circuit Board Decoration */
-        .circuit-decoration {
+        /* Circuit traces */
+        .circuit-svg {
             position: fixed;
             bottom: 0;
-            left: 0;
-            width: 300px;
-            height: 200px;
-            opacity: 0.3;
+            opacity: 0.4;
             z-index: 5;
             pointer-events: none;
         }
+        .circuit-svg.left { left: 0; width: 200px; height: 140px; }
+        .circuit-svg.right { right: 0; width: 160px; height: 110px; }
+        .circuit-line { stroke: var(--cyber-cyan); stroke-width: 1.5; fill: none; }
+        .circuit-node { fill: var(--cyber-cyan); }
 
-        .circuit-line {
-            stroke: var(--cyber-cyan);
-            stroke-width: 1.5;
-            fill: none;
-            stroke-linecap: round;
-        }
-
-        .circuit-node {
-            fill: var(--cyber-cyan);
-        }
-
-        .circuit-pulse {
-            animation: circuitPulse 3s ease-in-out infinite;
-        }
-
-        /* Error Container */
-        .error-container {
+        /* Error */
+        .error-box {
             display: none;
             position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
+            inset: 0;
             background: rgba(20, 0, 0, 0.95);
             z-index: 1000;
             justify-content: center;
             align-items: center;
             flex-direction: column;
         }
+        .error-box.visible { display: flex; }
+        .error-title { font-size: 1.8rem; color: #ff4444; margin-bottom: 15px; }
+        .error-msg { font-family: 'Share Tech Mono'; color: #ff8888; max-width: 450px; text-align: center; }
 
-        .error-container.visible {
-            display: flex;
+        /* Chromatic glitch */
+        @keyframes chromatic {
+            0% { text-shadow: -3px 0 #ff0050, 3px 0 #00d4ff; }
+            50% { text-shadow: 3px 0 #ff0050, -3px 0 #00d4ff; }
+            100% { text-shadow: 0 0 15px rgba(0, 212, 255, 0.6); }
         }
-
-        .error-icon {
-            font-size: 5rem;
-            margin-bottom: 20px;
-        }
-
-        .error-title {
-            font-family: 'Orbitron', sans-serif;
-            font-size: 2rem;
-            color: #ff4444;
-            text-shadow: 0 0 20px rgba(255, 68, 68, 0.5);
-            margin-bottom: 20px;
-        }
-
-        .error-message {
-            font-family: 'Share Tech Mono', monospace;
-            font-size: 1rem;
-            color: #ff8888;
-            max-width: 500px;
-            text-align: center;
-            line-height: 1.6;
-        }
-
-        /* Arc Reactor class for JS compatibility */
-        .arc-reactor {
-            position: relative;
-        }
-
-        /* Particles container for JS compatibility */
-        #particles {
-            display: none;
-        }
-
-        /* Animations - Addendum 2: Mechanical Easing */
-        @keyframes mechanicalRotateSlow {
-            0% { transform: rotate(0deg); }
-            15% { transform: rotate(30deg); }
-            50% { transform: rotate(180deg); }
-            85% { transform: rotate(330deg); }
-            100% { transform: rotate(360deg); }
-        }
-
-        @keyframes mechanicalRotateReverse {
-            0% { transform: rotate(360deg); }
-            10% { transform: rotate(324deg); }
-            30% { transform: rotate(252deg); }
-            70% { transform: rotate(108deg); }
-            90% { transform: rotate(36deg); }
-            100% { transform: rotate(0deg); }
-        }
-
-        @keyframes mechanicalPulseGlow {
-            0%, 100% { opacity: 0.3; transform: scale(1); }
-            25% { opacity: 0.5; transform: scale(1.01); }
-            50% { opacity: 0.7; transform: scale(1.02); }
-            75% { opacity: 0.5; transform: scale(1.01); }
-        }
-
-        @keyframes rotateSlow {
-            from { transform: rotate(0deg); }
-            to { transform: rotate(360deg); }
-        }
-
-        @keyframes rotateReverse {
-            from { transform: rotate(360deg); }
-            to { transform: rotate(0deg); }
-        }
-
-        @keyframes pulseGlow {
-            0%, 100% { opacity: 0.3; }
-            50% { opacity: 0.7; }
-        }
-
-        @keyframes textPulse {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.7; }
-        }
-
-        @keyframes blink {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.3; }
-        }
-
-        @keyframes circuitPulse {
-            0%, 100% { opacity: 0.2; }
-            50% { opacity: 0.6; }
-        }
-
-        /* Success pulse animation */
-        @keyframes successPulse {
-            0%, 100% {
-                box-shadow: 0 0 60px rgba(0, 255, 65, 0.4);
-            }
-            50% {
-                box-shadow: 0 0 100px rgba(0, 255, 65, 0.7);
-            }
-        }
-
-        .success-pulse {
-            animation: successPulse 0.4s ease-in-out 2;
-        }
+        .glitch { animation: chromatic 0.2s ease-out; }
 
         /* Responsive */
-        @media (max-width: 600px) {
+        @media (max-width: 650px) {
             .loading-container {
-                min-width: auto;
-                width: 90%;
-                padding: 30px 25px;
-                margin: 20px;
+                min-width: auto; width: 94%; padding: 25px 18px;
+                transform: perspective(800px) rotateX(10deg) rotateY(3deg);
             }
-
-            .system-title {
-                font-size: 1.3rem;
-                letter-spacing: 4px;
-            }
-
-            .progress-circle-container {
-                width: 200px;
-                height: 200px;
-            }
-
-            .progress-percentage {
-                font-size: 2.5rem;
-            }
-
-            .status-message {
-                font-size: 0.9rem;
-            }
-
-            .circuit-decoration {
-                display: none;
-            }
+            .system-title { font-size: 1.2rem; letter-spacing: 4px; }
+            .progress-container { width: 190px; height: 190px; }
+            .percentage { font-size: 2rem; }
+            .circuit-svg { display: none; }
         }
+
+        .arc-reactor { position: relative; }
+        #particles { display: none; }
     </style>
 </head>
 <body>
-    <!-- Matrix Rain Canvas -->
     <canvas id="matrix-canvas"></canvas>
 
-    <!-- Circuit Board Decoration -->
-    <svg class="circuit-decoration" viewBox="0 0 300 200">
-        <defs>
-            <filter id="circuitGlow">
-                <feGaussianBlur stdDeviation="2" result="coloredBlur"/>
-                <feMerge>
-                    <feMergeNode in="coloredBlur"/>
-                    <feMergeNode in="SourceGraphic"/>
-                </feMerge>
-            </filter>
-        </defs>
-        <g filter="url(#circuitGlow)">
-            <!-- Horizontal lines -->
-            <path class="circuit-line circuit-pulse" d="M0 180 H80 L100 160 H150"/>
-            <path class="circuit-line" d="M0 150 H50 L70 130 H120 L140 150 H180" style="animation-delay: 0.5s"/>
-            <path class="circuit-line circuit-pulse" d="M0 120 H40 V100 H90 L110 80 H160" style="animation-delay: 1s"/>
-            <path class="circuit-line" d="M0 80 H30 L50 60 H100 V40 H140" style="animation-delay: 1.5s"/>
+    <!-- Circuit Left -->
+    <svg class="circuit-svg left" viewBox="0 0 200 140">
+        <path class="circuit-line" d="M0 120 H45 L65 100 H100 L120 120 H160"/>
+        <path class="circuit-line" d="M0 90 H30 L50 70 H85 L105 50 H140"/>
+        <path class="circuit-line" d="M0 60 H20 V45 H55 L75 25 H120"/>
+        <path class="circuit-line" d="M35 140 V110 L55 90 V65"/>
+        <path class="circuit-line" d="M80 140 V105 L100 85 V55"/>
+        <circle class="circuit-node" cx="45" cy="120" r="2.5"/>
+        <circle class="circuit-node" cx="65" cy="100" r="2"/>
+        <circle class="circuit-node" cx="100" cy="120" r="2"/>
+        <circle class="circuit-node" cx="50" cy="70" r="2"/>
+        <circle class="circuit-node" cx="105" cy="50" r="2.5"/>
+        <circle class="circuit-node" cx="55" cy="45" r="2"/>
+        <circle class="circuit-node" cx="75" cy="25" r="2"/>
+        <circle class="circuit-node" cx="55" cy="90" r="2"/>
+        <circle class="circuit-node" cx="100" cy="85" r="2"/>
+    </svg>
 
-            <!-- Vertical lines -->
-            <path class="circuit-line circuit-pulse" d="M60 200 V160 L80 140 V100" style="animation-delay: 0.3s"/>
-            <path class="circuit-line" d="M120 200 V170 L140 150 V110 L160 90" style="animation-delay: 0.8s"/>
-
-            <!-- Nodes -->
-            <circle class="circuit-node" cx="80" cy="180" r="3"/>
-            <circle class="circuit-node" cx="100" cy="160" r="2"/>
-            <circle class="circuit-node" cx="150" cy="160" r="3"/>
-            <circle class="circuit-node" cx="50" cy="150" r="2"/>
-            <circle class="circuit-node" cx="70" cy="130" r="3"/>
-            <circle class="circuit-node" cx="180" cy="150" r="2"/>
-            <circle class="circuit-node" cx="40" cy="120" r="2"/>
-            <circle class="circuit-node" cx="90" cy="100" r="3"/>
-            <circle class="circuit-node" cx="160" cy="80" r="2"/>
-            <circle class="circuit-node" cx="50" cy="60" r="2"/>
-            <circle class="circuit-node" cx="100" cy="40" r="3"/>
-            <circle class="circuit-node" cx="140" cy="40" r="2"/>
-            <circle class="circuit-node" cx="60" cy="160" r="2"/>
-            <circle class="circuit-node" cx="80" cy="140" r="3"/>
-            <circle class="circuit-node" cx="120" cy="170" r="2"/>
-            <circle class="circuit-node" cx="160" cy="90" r="3"/>
-        </g>
+    <!-- Circuit Right -->
+    <svg class="circuit-svg right" viewBox="0 0 160 110">
+        <path class="circuit-line" d="M160 95 H120 L100 75 H65 L45 95 H10"/>
+        <path class="circuit-line" d="M160 65 H130 L110 45 H75 L55 65 H25"/>
+        <path class="circuit-line" d="M120 110 V80 L100 60 V35"/>
+        <circle class="circuit-node" cx="120" cy="95" r="2"/>
+        <circle class="circuit-node" cx="100" cy="75" r="2.5"/>
+        <circle class="circuit-node" cx="45" cy="95" r="2"/>
+        <circle class="circuit-node" cx="110" cy="45" r="2"/>
+        <circle class="circuit-node" cx="55" cy="65" r="2"/>
+        <circle class="circuit-node" cx="100" cy="60" r="2"/>
     </svg>
 
     <!-- Connection Status -->
-    <div class="connection-status">
-        <div class="status-indicator connecting" id="status-indicator"></div>
+    <div class="conn-status">
+        <div class="conn-dot" id="status-indicator"></div>
         <span id="status-text">Connecting...</span>
     </div>
 
-    <!-- Main Loading Container -->
+    <!-- Main Panel -->
     <div class="loading-container" id="loading-container">
-        <!-- Dynamic Title -->
         <h1 class="system-title" id="system-title">SYSTEM RESTART</h1>
 
-        <!-- Circular Progress Indicator -->
-        <div class="progress-circle-container arc-reactor">
-            <svg class="progress-svg" viewBox="0 0 320 320">
+        <div class="progress-container arc-reactor">
+            <svg class="progress-svg" viewBox="0 0 260 260" id="progress-svg">
                 <defs>
-                    <!-- Gradient for progress arc -->
-                    <linearGradient id="progressGradient" x1="0%" y1="0%" x2="100%" y2="0%">
-                        <stop offset="0%" style="stop-color:#00ffcc;stop-opacity:1" />
-                        <stop offset="50%" style="stop-color:#00d4ff;stop-opacity:1" />
-                        <stop offset="100%" style="stop-color:#00ff88;stop-opacity:1" />
-                    </linearGradient>
-                    <!-- Success gradient -->
-                    <linearGradient id="successGradient" x1="0%" y1="0%" x2="100%" y2="0%">
-                        <stop offset="0%" style="stop-color:#00ff41;stop-opacity:1" />
-                        <stop offset="100%" style="stop-color:#00ff88;stop-opacity:1" />
-                    </linearGradient>
-                    <!-- Glow filter -->
-                    <filter id="glowFilter" x="-50%" y="-50%" width="200%" height="200%">
-                        <feGaussianBlur stdDeviation="4" result="coloredBlur"/>
-                        <feMerge>
-                            <feMergeNode in="coloredBlur"/>
-                            <feMergeNode in="coloredBlur"/>
-                            <feMergeNode in="SourceGraphic"/>
-                        </feMerge>
-                    </filter>
-                    <!-- Success glow filter (more intense) -->
-                    <filter id="successGlowFilter" x="-50%" y="-50%" width="200%" height="200%">
-                        <feGaussianBlur stdDeviation="8" result="coloredBlur"/>
-                        <feMerge>
-                            <feMergeNode in="coloredBlur"/>
-                            <feMergeNode in="coloredBlur"/>
-                            <feMergeNode in="coloredBlur"/>
-                            <feMergeNode in="SourceGraphic"/>
-                        </feMerge>
+                    <filter id="glow">
+                        <feGaussianBlur stdDeviation="3" result="blur"/>
+                        <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
                     </filter>
                 </defs>
 
-                <!-- Outer Decorative Ring with tech segments -->
-                <circle class="ring-outer-deco" cx="160" cy="160" r="155"/>
+                <!-- Outer decorative ring -->
+                <circle class="deco-ring" cx="130" cy="130" r="125"/>
 
-                <!-- Tech segment markers around outer ring -->
-                <g id="tech-segments">
-                    <rect class="tech-segment" x="157" y="2" width="6" height="14" rx="1"/>
-                    <rect class="tech-segment" x="157" y="304" width="6" height="14" rx="1"/>
-                    <rect class="tech-segment" x="2" y="157" width="14" height="6" rx="1"/>
-                    <rect class="tech-segment" x="304" y="157" width="14" height="6" rx="1"/>
-                    <!-- Diagonal markers -->
-                    <rect class="tech-segment" x="268" y="48" width="8" height="4" rx="1" transform="rotate(45 272 50)"/>
-                    <rect class="tech-segment" x="48" y="268" width="8" height="4" rx="1" transform="rotate(45 52 270)"/>
-                    <rect class="tech-segment" x="48" y="48" width="8" height="4" rx="1" transform="rotate(-45 52 50)"/>
-                    <rect class="tech-segment" x="268" y="268" width="8" height="4" rx="1" transform="rotate(-45 272 270)"/>
+                <!-- DIRECTIVE 1: 24 Trapezoidal Segments (generated by JS) -->
+                <g id="trap-ring"></g>
+
+                <!-- Middle decorative ring -->
+                <circle class="deco-ring" cx="130" cy="130" r="100"/>
+
+                <!-- DIRECTIVE 2: 4 Triangular Chevrons at N/E/S/W inside the ring -->
+                <g id="chevrons">
+                    <!-- North (0°) - pointing DOWN toward center -->
+                    <polygon class="chevron-tri" points="130,42 122,58 130,52 138,58"/>
+                    <!-- East (90°) - pointing LEFT toward center -->
+                    <polygon class="chevron-tri" points="218,130 202,122 208,130 202,138"/>
+                    <!-- South (180°) - pointing UP toward center -->
+                    <polygon class="chevron-tri" points="130,218 122,202 130,208 138,202"/>
+                    <!-- West (270°) - pointing RIGHT toward center -->
+                    <polygon class="chevron-tri" points="42,130 58,122 52,130 58,138"/>
                 </g>
 
-                <!-- Middle Ring -->
-                <circle class="ring-middle" cx="160" cy="160" r="130"/>
+                <!-- Progress arc background -->
+                <circle class="progress-bg" cx="130" cy="130" r="80" transform="rotate(-90 130 130)"/>
 
-                <!-- Progress Track -->
-                <circle class="progress-track" cx="160" cy="160" r="100"/>
+                <!-- Main Progress Arc at r=80 -->
+                <circle class="progress-arc" id="progress-circle" cx="130" cy="130" r="80" transform="rotate(-90 130 130)"/>
 
-                <!-- Progress Arc -->
-                <circle class="progress-arc" id="progress-circle" cx="160" cy="160" r="100"/>
+                <!-- DIRECTIVE 3: Dashed Inner Track (decorative, INSIDE the progress arc at r=65) -->
+                <circle class="dashed-inner-track" cx="130" cy="130" r="65"/>
 
-                <!-- Inner Glow Ring -->
-                <circle class="ring-inner-glow" cx="160" cy="160" r="72"/>
+                <!-- Inner decorative ring -->
+                <circle class="deco-ring" cx="130" cy="130" r="50" style="opacity:0.35"/>
             </svg>
 
-            <!-- Center Content -->
-            <div class="progress-center">
-                <div class="progress-percentage" id="progress-percentage">0%</div>
-                <div id="subtitle">INITIALIZING</div>
+            <div class="center-content">
+                <div class="percentage" id="progress-percentage">0%</div>
+                <div class="subtitle" id="subtitle">INITIALIZING</div>
             </div>
         </div>
 
-        <!-- Hidden progress bar for JS compatibility -->
-        <div id="progress-bar" style="width: 0%;"></div>
-
-        <!-- Status Message -->
-        <div class="status-message" id="status-message">Initializing JARVIS systems...</div>
+        <div id="progress-bar" style="width:0%"></div>
+        <div class="status-msg" id="status-message">Loading Modules...</div>
     </div>
 
-    <!-- Error Container -->
-    <div class="error-container" id="error-container">
-        <div class="error-icon">⚠️</div>
+    <!-- Error -->
+    <div class="error-box" id="error-container">
         <div class="error-title">SYSTEM FAILURE</div>
-        <div class="error-message" id="error-message">An error occurred during initialization.</div>
+        <div class="error-msg" id="error-message">An error occurred.</div>
     </div>
-
-    <!-- Hidden particles div for JS compatibility -->
     <div id="particles"></div>
 
-    <!-- Matrix Rain Animation Script with Addendum 1: Realistic Depth & Glitch Effects -->
     <script>
+        // =====================================================
+        // Matrix Rain
+        // =====================================================
         class MatrixRain {
             constructor(canvas) {
                 this.canvas = canvas;
                 this.ctx = canvas.getContext('2d');
-                this.columns = [];
                 this.fontSize = 14;
-                this.characters = '01';
-                this.brightLeaderChance = 0.20; // 20% of columns have bright cyan-white leaders
-                this.glitchChance = 0.003; // Chance per character per frame to glitch
+                this.chars = '01';
+                this.cols = [];
+                this.brightChance = 0.18;
                 this.init();
                 this.animate();
-
                 window.addEventListener('resize', () => this.init());
             }
-
             init() {
                 this.canvas.width = window.innerWidth;
                 this.canvas.height = window.innerHeight;
-
-                const columnCount = Math.floor(this.canvas.width / this.fontSize);
-                this.columns = [];
-
-                for (let i = 0; i < columnCount; i++) {
-                    const hasBrightLeader = Math.random() < this.brightLeaderChance;
-                    this.columns.push({
+                const n = Math.floor(this.canvas.width / this.fontSize);
+                this.cols = [];
+                for (let i = 0; i < n; i++) {
+                    this.cols.push({
                         x: i * this.fontSize,
                         y: Math.random() * this.canvas.height,
-                        speed: Math.random() * 2 + 1,
-                        chars: [],
-                        length: Math.floor(Math.random() * 15) + 5,
-                        hasBrightLeader: hasBrightLeader,
-                        glitchOffset: 0, // Horizontal glitch offset
-                        glitchTimer: 0
+                        speed: Math.random() * 1.4 + 0.5,
+                        len: Math.floor(Math.random() * 16) + 6,
+                        bright: Math.random() < this.brightChance,
+                        chars: Array.from({length: 22}, () => this.chars[Math.floor(Math.random() * 2)])
                     });
-
-                    // Initialize character array for this column
-                    for (let j = 0; j < this.columns[i].length; j++) {
-                        this.columns[i].chars.push({
-                            char: this.getRandomChar(),
-                            opacity: 1 - (j / this.columns[i].length),
-                            glitching: false,
-                            glitchX: 0
-                        });
-                    }
                 }
             }
-
-            getRandomChar() {
-                return this.characters[Math.floor(Math.random() * this.characters.length)];
-            }
-
             draw() {
-                // Semi-transparent black to create trail effect
-                this.ctx.fillStyle = 'rgba(10, 10, 18, 0.05)';
+                this.ctx.fillStyle = 'rgba(10, 10, 18, 0.055)';
                 this.ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
-
-                this.ctx.font = `${this.fontSize}px 'Share Tech Mono', monospace`;
-
-                for (let col of this.columns) {
-                    // Update glitch state for column
-                    if (col.glitchTimer > 0) {
-                        col.glitchTimer--;
-                        if (col.glitchTimer === 0) {
-                            col.glitchOffset = 0;
-                        }
-                    } else if (Math.random() < 0.001) {
-                        // Start a new glitch
-                        col.glitchOffset = (Math.random() - 0.5) * 6;
-                        col.glitchTimer = Math.floor(Math.random() * 3) + 1;
-                    }
-
-                    // Draw each character in the column
-                    for (let i = 0; i < col.chars.length; i++) {
-                        const y = col.y - (i * this.fontSize);
-
-                        if (y < -this.fontSize * col.length) continue;
-                        if (y > this.canvas.height + this.fontSize) continue;
-
-                        // Calculate x position with potential glitch
-                        let charGlitchX = 0;
-                        if (Math.random() < this.glitchChance) {
-                            col.chars[i].glitching = true;
-                            col.chars[i].glitchX = (Math.random() - 0.5) * 4;
-                        } else if (col.chars[i].glitching) {
-                            col.chars[i].glitching = false;
-                            col.chars[i].glitchX = 0;
-                        }
-                        charGlitchX = col.chars[i].glitchX + col.glitchOffset;
-
-                        const drawX = col.x + charGlitchX;
-
-                        // Addendum 1: Bright white-cyan leader for 20% of columns
+                this.ctx.font = this.fontSize + 'px monospace';
+                for (let c of this.cols) {
+                    for (let i = 0; i < c.len; i++) {
+                        const y = c.y - i * this.fontSize;
+                        if (y < -20 || y > this.canvas.height + 20) continue;
                         if (i === 0) {
-                            if (col.hasBrightLeader) {
-                                // Bright white-cyan leader
-                                this.ctx.fillStyle = '#e0ffff';
-                                this.ctx.shadowBlur = 15;
-                                this.ctx.shadowColor = '#00ffff';
-                            } else {
-                                // Standard bright white-green leader
-                                this.ctx.fillStyle = '#ffffff';
-                                this.ctx.shadowBlur = 10;
-                                this.ctx.shadowColor = '#00ff41';
-                            }
-                        } else if (i === 1 && col.hasBrightLeader) {
-                            // Second character also brighter for bright leader columns
-                            const opacity = col.chars[i].opacity * 0.9;
-                            this.ctx.fillStyle = `rgba(0, 255, 200, ${opacity})`;
-                            this.ctx.shadowBlur = 5;
-                            this.ctx.shadowColor = '#00ffcc';
+                            this.ctx.fillStyle = c.bright ? '#fff' : '#cfc';
+                            this.ctx.shadowBlur = c.bright ? 14 : 7;
+                            this.ctx.shadowColor = c.bright ? '#0ff' : '#0f0';
                         } else {
-                            const opacity = col.chars[i].opacity * 0.8;
-                            this.ctx.fillStyle = `rgba(0, 255, 65, ${opacity})`;
+                            const f = 1 - i / c.len;
+                            this.ctx.fillStyle = c.bright && i < 3
+                                ? `rgba(140,255,220,${f * 0.85})`
+                                : `rgba(0,255,65,${f * 0.6})`;
                             this.ctx.shadowBlur = 0;
                         }
-
-                        this.ctx.fillText(col.chars[i].char, drawX, y);
-
-                        // Randomly change character
-                        if (Math.random() < 0.02) {
-                            col.chars[i].char = this.getRandomChar();
-                        }
+                        const g = Math.random() < 0.003 ? (Math.random() - 0.5) * 5 : 0;
+                        this.ctx.fillText(c.chars[i] || '0', c.x + g, y);
+                        if (Math.random() < 0.015) c.chars[i] = this.chars[Math.floor(Math.random() * 2)];
                     }
-
-                    // Move column down
-                    col.y += col.speed;
-
-                    // Reset when off screen
-                    if (col.y - (col.length * this.fontSize) > this.canvas.height) {
-                        col.y = 0;
-                        col.speed = Math.random() * 2 + 1;
-                        col.length = Math.floor(Math.random() * 15) + 5;
-                        col.hasBrightLeader = Math.random() < this.brightLeaderChance;
-                        col.glitchOffset = 0;
-                        col.glitchTimer = 0;
-
-                        // Reset characters
-                        col.chars = [];
-                        for (let j = 0; j < col.length; j++) {
-                            col.chars.push({
-                                char: this.getRandomChar(),
-                                opacity: 1 - (j / col.length),
-                                glitching: false,
-                                glitchX: 0
-                            });
-                        }
+                    c.y += c.speed;
+                    if (c.y - c.len * this.fontSize > this.canvas.height) {
+                        c.y = 0;
+                        c.speed = Math.random() * 1.4 + 0.5;
+                        c.len = Math.floor(Math.random() * 16) + 6;
+                        c.bright = Math.random() < this.brightChance;
                     }
                 }
             }
+            animate() { this.draw(); requestAnimationFrame(() => this.animate()); }
+        }
 
-            animate() {
-                this.draw();
-                requestAnimationFrame(() => this.animate());
+        // =====================================================
+        // DIRECTIVE 1: Generate 24 Trapezoidal Segments
+        // =====================================================
+        function generateTrapezoids() {
+            const g = document.getElementById('trap-ring');
+            const cx = 130, cy = 130;
+            const innerR = 105, outerR = 118;
+            const num = 24;
+            const gap = 4; // degrees gap between segments
+            const segAngle = (360 / num) - gap;
+
+            for (let i = 0; i < num; i++) {
+                const startDeg = i * (360 / num) + gap / 2;
+                const endDeg = startDeg + segAngle;
+                const startRad = (startDeg - 90) * Math.PI / 180;
+                const endRad = (endDeg - 90) * Math.PI / 180;
+
+                // 4 corners of trapezoid
+                const x1 = cx + innerR * Math.cos(startRad);
+                const y1 = cy + innerR * Math.sin(startRad);
+                const x2 = cx + outerR * Math.cos(startRad);
+                const y2 = cy + outerR * Math.sin(startRad);
+                const x3 = cx + outerR * Math.cos(endRad);
+                const y3 = cy + outerR * Math.sin(endRad);
+                const x4 = cx + innerR * Math.cos(endRad);
+                const y4 = cy + innerR * Math.sin(endRad);
+
+                const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+                path.setAttribute('class', 'trap-segment');
+                path.setAttribute('d', `M${x1.toFixed(2)},${y1.toFixed(2)} L${x2.toFixed(2)},${y2.toFixed(2)} L${x3.toFixed(2)},${y3.toFixed(2)} L${x4.toFixed(2)},${y4.toFixed(2)} Z`);
+                path.dataset.idx = i;
+                g.appendChild(path);
             }
         }
 
-        // Initialize Matrix Rain
-        const matrixCanvas = document.getElementById('matrix-canvas');
-        const matrixRain = new MatrixRain(matrixCanvas);
+        // =====================================================
+        // Progress Update
+        // =====================================================
+        const CIRC = 2 * Math.PI * 80; // r=80 (progress arc radius)
 
-        // Progress circle animation helper
-        function updateProgressCircle(percentage) {
-            const circle = document.getElementById('progress-circle');
-            if (circle) {
-                const circumference = 2 * Math.PI * 100; // r = 100 (updated for larger circle)
-                const offset = circumference - (percentage / 100) * circumference;
-                circle.style.strokeDashoffset = offset;
+        function updateProgress(pct) {
+            const arc = document.getElementById('progress-circle');
+            if (arc) {
+                arc.style.strokeDasharray = CIRC;
+                arc.style.strokeDashoffset = CIRC - (pct / 100) * CIRC;
             }
+            // Light segments
+            const segs = document.querySelectorAll('.trap-segment');
+            const lit = Math.floor((pct / 100) * segs.length);
+            segs.forEach((s, i) => {
+                if (i < lit) s.classList.add('lit');
+                else s.classList.remove('lit');
+            });
         }
 
-        // Addendum 3: Chromatic Aberration Effect on data updates
-        function triggerChromaticGlitch(element, isPercentage = false) {
-            if (!element) return;
-
-            // Remove existing animation class
-            element.classList.remove('chromatic-glitch', 'status-chromatic-glitch');
-
-            // Force reflow to restart animation
-            void element.offsetWidth;
-
-            // Add appropriate animation class
-            if (isPercentage) {
-                element.classList.add('chromatic-glitch');
-            } else {
-                element.classList.add('status-chromatic-glitch');
-            }
-
-            // Remove class after animation completes
-            setTimeout(() => {
-                element.classList.remove('chromatic-glitch', 'status-chromatic-glitch');
-            }, 200);
+        // =====================================================
+        // Chromatic Glitch
+        // =====================================================
+        function glitch(el) {
+            if (!el) return;
+            el.classList.remove('glitch');
+            void el.offsetWidth;
+            el.classList.add('glitch');
+            setTimeout(() => el.classList.remove('glitch'), 200);
         }
 
-        // Addendum 4: Success State Transition Sequence
-        let successStateTriggered = false;
-
+        // =====================================================
+        // Success State
+        // =====================================================
+        let successDone = false;
         function triggerSuccessState() {
-            if (successStateTriggered) return Promise.resolve();
-            successStateTriggered = true;
-
-            return new Promise((resolve) => {
-                const container = document.getElementById('loading-container');
+            if (successDone) return Promise.resolve();
+            successDone = true;
+            return new Promise(res => {
+                const cont = document.getElementById('loading-container');
                 const title = document.getElementById('system-title');
-                const percentage = document.getElementById('progress-percentage');
-                const statusMessage = document.getElementById('status-message');
-                const progressCircle = document.getElementById('progress-circle');
-                const techSegments = document.querySelectorAll('.tech-segment');
+                const pct = document.getElementById('progress-percentage');
+                const msg = document.getElementById('status-message');
+                const arc = document.getElementById('progress-circle');
+                const segs = document.querySelectorAll('.trap-segment');
+                const chevs = document.querySelectorAll('.chevron-tri');
 
-                // Instant color change to success green
-                container.classList.add('success-state', 'success-pulse');
+                cont.classList.add('success-state');
                 title.classList.add('success-state');
                 title.textContent = 'ACCESS GRANTED';
-                percentage.classList.add('success-state');
-                statusMessage.classList.add('success-state');
-                statusMessage.textContent = 'System Ready - Redirecting...';
-                progressCircle.classList.add('success-state');
-                progressCircle.style.stroke = '#00ff41';
-
-                // Update tech segments
-                techSegments.forEach(seg => seg.classList.add('success-state'));
-
-                // Trigger intense chromatic glitch on title
-                triggerChromaticGlitch(percentage, true);
-
-                // Hold for 800ms then resolve
-                setTimeout(() => {
-                    resolve();
-                }, 800);
+                pct.classList.add('success-state');
+                msg.classList.add('success-state');
+                msg.textContent = 'System Ready';
+                arc.classList.add('success');
+                segs.forEach(s => { s.classList.add('lit', 'success'); });
+                chevs.forEach(c => c.classList.add('success'));
+                glitch(pct);
+                setTimeout(res, 800);
             });
         }
+        window.triggerSuccessState = triggerSuccessState;
 
-        // Update title based on URL or startup type
-        function updateDynamicTitle() {
-            const title = document.getElementById('system-title');
-            const urlParams = new URLSearchParams(window.location.search);
-            const mode = urlParams.get('mode');
+        // =====================================================
+        // Dynamic Title
+        // =====================================================
+        function setTitle() {
+            const t = document.getElementById('system-title');
+            const p = new URLSearchParams(location.search);
+            const m = p.get('mode');
+            if (m === 'restart' || location.href.includes('restart')) t.textContent = 'SYSTEM RESTART';
+            else if (m === 'init') t.textContent = 'SYSTEM INITIALIZATION';
+            else t.textContent = 'SYSTEM STARTUP';
+        }
 
-            if (mode === 'restart' || window.location.href.includes('restart')) {
-                title.textContent = 'SYSTEM RESTART';
-            } else if (mode === 'init' || mode === 'fresh') {
-                title.textContent = 'SYSTEM INITIALIZATION';
-            } else {
-                // Default - check subtitle for context
-                title.textContent = 'SYSTEM STARTUP';
+        // =====================================================
+        // Observers
+        // =====================================================
+        let lastPct = '';
+        function setupObservers() {
+            const pctEl = document.getElementById('progress-percentage');
+            const msgEl = document.getElementById('status-message');
+            const bar = document.getElementById('progress-bar');
+
+            if (bar) {
+                new MutationObserver(ms => {
+                    ms.forEach(m => {
+                        if (m.attributeName === 'style') {
+                            const w = bar.style.width;
+                            const v = parseFloat(w);
+                            if (!isNaN(v)) updateProgress(v);
+                        }
+                    });
+                }).observe(bar, { attributes: true });
+            }
+
+            if (pctEl) {
+                new MutationObserver(() => {
+                    const t = pctEl.textContent;
+                    if (t !== lastPct) {
+                        glitch(pctEl);
+                        lastPct = t;
+                        const match = t.match(/(\d+)/);
+                        if (match) {
+                            const v = parseInt(match[1]);
+                            updateProgress(v);
+                            if (v >= 100 && !successDone) triggerSuccessState();
+                        }
+                    }
+                }).observe(pctEl, { childList: true, characterData: true, subtree: true });
+            }
+
+            if (msgEl) {
+                new MutationObserver(() => glitch(msgEl))
+                    .observe(msgEl, { childList: true, characterData: true, subtree: true });
             }
         }
 
-        // Track last values to detect changes
-        let lastPercentageValue = '';
-        let lastStatusMessage = '';
-
-        // Hook into the loading manager's progress updates
-        const progressPercentageEl = document.getElementById('progress-percentage');
-        const statusMessageEl = document.getElementById('status-message');
-
-        // Create a MutationObserver to watch for style changes on progress-bar
-        const progressBar = document.getElementById('progress-bar');
-        if (progressBar) {
-            const observer = new MutationObserver((mutations) => {
-                mutations.forEach((mutation) => {
-                    if (mutation.type === 'attributes' && mutation.attributeName === 'style') {
-                        const width = progressBar.style.width;
-                        if (width) {
-                            const percentage = parseFloat(width);
-                            if (!isNaN(percentage)) {
-                                updateProgressCircle(percentage);
-                            }
-                        }
-                    }
-                });
-            });
-
-            observer.observe(progressBar, { attributes: true });
-        }
-
-        // Watch the percentage text element for direct updates
-        if (progressPercentageEl) {
-            const textObserver = new MutationObserver((mutations) => {
-                mutations.forEach((mutation) => {
-                    if (mutation.type === 'childList' || mutation.type === 'characterData') {
-                        const text = progressPercentageEl.textContent;
-
-                        // Trigger chromatic aberration on change
-                        if (text !== lastPercentageValue) {
-                            triggerChromaticGlitch(progressPercentageEl, true);
-                            lastPercentageValue = text;
-                        }
-
-                        const match = text.match(/(\d+)/);
-                        if (match) {
-                            const percentage = parseInt(match[1]);
-                            updateProgressCircle(percentage);
-
-                            // Check for 100% completion
-                            if (percentage >= 100 && !successStateTriggered) {
-                                triggerSuccessState();
-                            }
-                        }
-                    }
-                });
-            });
-
-            textObserver.observe(progressPercentageEl, {
-                childList: true,
-                characterData: true,
-                subtree: true
-            });
-        }
-
-        // Watch status message for changes
-        if (statusMessageEl) {
-            const statusObserver = new MutationObserver((mutations) => {
-                mutations.forEach((mutation) => {
-                    if (mutation.type === 'childList' || mutation.type === 'characterData') {
-                        const text = statusMessageEl.textContent;
-
-                        // Trigger chromatic aberration on change
-                        if (text !== lastStatusMessage) {
-                            triggerChromaticGlitch(statusMessageEl, false);
-                            lastStatusMessage = text;
-                        }
-                    }
-                });
-            });
-
-            statusObserver.observe(statusMessageEl, {
-                childList: true,
-                characterData: true,
-                subtree: true
-            });
-        }
-
-        // Expose success state function globally for loading-manager.js
-        window.triggerSuccessState = triggerSuccessState;
-        window.successStateTriggered = () => successStateTriggered;
-
-        // Initialize
-        updateDynamicTitle();
+        // =====================================================
+        // Init
+        // =====================================================
+        document.addEventListener('DOMContentLoaded', () => {
+            new MatrixRain(document.getElementById('matrix-canvas'));
+            generateTrapezoids();
+            setTitle();
+            setupObservers();
+            updateProgress(0);
+        });
     </script>
 
-    <!-- Loading Manager Script -->
     <script src="/loading-manager.js"></script>
 </body>
 </html>
