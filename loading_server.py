@@ -79,7 +79,7 @@ class ServerConfig:
     rate_limit_window: float = field(default_factory=lambda: float(os.getenv('RATE_LIMIT_WINDOW', '60.0')))
 
     # Paths
-    frontend_path: Path = field(default_factory=lambda: Path(os.getenv('FRONTEND_PATH', Path(__file__).parent / 'frontend' / 'public')))
+    frontend_path: Path = field(default_factory=lambda: Path(os.getenv('FRONTEND_PATH', Path(__file__).parent / 'landing-page')))
 
     def __post_init__(self):
         self.frontend_path = Path(self.frontend_path)
