@@ -1,5 +1,5 @@
 /**
- * Dynamic WebSocket Client v3.0
+ * Dynamic WebSocket Client v3.1
  * =============================
  * Fully async, non-blocking WebSocket client with:
  * - Non-blocking connection with proper timeouts
@@ -8,8 +8,218 @@
  * - Offline queue with TTL and automatic flush
  * - Health-weighted connection selection
  * - Self-learning message schema validation
+ * - Global connection locking to prevent duplicates
+ * - Cross-tab/window coordination via BroadcastChannel
  * - Zero hardcoding - fully dynamic
  */
+
+// ============================================================================
+// GLOBAL CONNECTION LOCK (Prevents duplicate connections across instances)
+// ============================================================================
+
+/**
+ * Global lock to prevent duplicate WebSocket connections.
+ * Uses a WeakMap pattern to track active connections by URL.
+ */
+const globalConnectionLock = {
+  // Map of URL -> { connecting: boolean, connection: WebSocket|null, waiters: [] }
+  _locks: new Map(),
+
+  // Get or create lock for a URL
+  getLock(url) {
+    if (!this._locks.has(url)) {
+      this._locks.set(url, {
+        connecting: false,
+        connection: null,
+        waiters: [],
+        instanceId: null
+      });
+    }
+    return this._locks.get(url);
+  },
+
+  // Attempt to acquire lock for connection
+  async acquire(url, instanceId) {
+    const lock = this.getLock(url);
+
+    // If there's already a healthy connection, return it
+    if (lock.connection && lock.connection.readyState === WebSocket.OPEN) {
+      console.log(`[WS-LOCK] Reusing existing connection for ${url}`);
+      return { acquired: false, existingConnection: lock.connection };
+    }
+
+    // If another instance is connecting, wait for it
+    if (lock.connecting && lock.instanceId !== instanceId) {
+      console.log(`[WS-LOCK] Waiting for existing connection attempt to ${url}`);
+      return new Promise((resolve) => {
+        const timeout = setTimeout(() => {
+          // Remove from waiters and allow this instance to try
+          const idx = lock.waiters.indexOf(resolve);
+          if (idx > -1) lock.waiters.splice(idx, 1);
+          resolve({ acquired: true, existingConnection: null });
+        }, 10000); // 10s timeout
+
+        lock.waiters.push((result) => {
+          clearTimeout(timeout);
+          resolve(result);
+        });
+      });
+    }
+
+    // Acquire the lock
+    lock.connecting = true;
+    lock.instanceId = instanceId;
+    return { acquired: true, existingConnection: null };
+  },
+
+  // Release lock with result
+  release(url, connection) {
+    const lock = this.getLock(url);
+    lock.connecting = false;
+    lock.connection = connection;
+
+    // Notify waiters
+    const result = { acquired: false, existingConnection: connection };
+    lock.waiters.forEach(waiter => waiter(result));
+    lock.waiters = [];
+  },
+
+  // Mark connection as closed
+  connectionClosed(url) {
+    const lock = this.getLock(url);
+    lock.connection = null;
+  }
+};
+
+// ============================================================================
+// CROSS-TAB COORDINATION (Prevents duplicate connections in incognito/multi-tab)
+// ============================================================================
+
+/**
+ * Coordinate WebSocket connections across browser tabs/windows.
+ * Uses BroadcastChannel API if available.
+ */
+class CrossTabCoordinator {
+  constructor() {
+    this.channel = null;
+    this.tabId = `tab_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
+    this.leaderTabId = null;
+    this.isLeader = false;
+    this.callbacks = new Map();
+
+    this._initialize();
+  }
+
+  _initialize() {
+    if (typeof BroadcastChannel !== 'undefined') {
+      try {
+        this.channel = new BroadcastChannel('jarvis_ws_coordination');
+
+        this.channel.onmessage = (event) => {
+          this._handleMessage(event.data);
+        };
+
+        // Announce this tab
+        this._broadcast({ type: 'tab_announce', tabId: this.tabId });
+
+        // Elect leader after short delay
+        setTimeout(() => {
+          if (!this.leaderTabId) {
+            this.isLeader = true;
+            this.leaderTabId = this.tabId;
+            this._broadcast({ type: 'leader_elected', tabId: this.tabId });
+          }
+        }, 500);
+
+        console.log(`[WS-COORD] Cross-tab coordination initialized (tab: ${this.tabId})`);
+      } catch (e) {
+        console.warn('[WS-COORD] BroadcastChannel not available:', e.message);
+      }
+    }
+  }
+
+  _broadcast(message) {
+    if (this.channel) {
+      try {
+        this.channel.postMessage({ ...message, from: this.tabId, timestamp: Date.now() });
+      } catch (e) {
+        // Channel might be closed
+      }
+    }
+  }
+
+  _handleMessage(data) {
+    switch (data.type) {
+      case 'tab_announce':
+        // Another tab announced itself
+        if (this.isLeader) {
+          this._broadcast({ type: 'leader_elected', tabId: this.tabId });
+        }
+        break;
+
+      case 'leader_elected':
+        // A leader was elected
+        if (data.tabId !== this.tabId) {
+          this.isLeader = false;
+          this.leaderTabId = data.tabId;
+        }
+        break;
+
+      case 'ws_connected':
+        // Leader connected to WebSocket
+        if (data.url) {
+          const callback = this.callbacks.get(`connection_${data.url}`);
+          if (callback) callback(data);
+        }
+        break;
+    }
+  }
+
+  /**
+   * Check if this tab should handle the WebSocket connection
+   */
+  shouldConnect() {
+    // In incognito, always allow connection (no cross-tab coordination)
+    if (this._isIncognito()) {
+      return true;
+    }
+    // Otherwise, only leader should connect
+    return this.isLeader || !this.leaderTabId;
+  }
+
+  _isIncognito() {
+    // Heuristic detection - not 100% reliable
+    try {
+      const fs = window.RequestFileSystem || window.webkitRequestFileSystem;
+      if (fs) {
+        return new Promise((resolve) => {
+          fs(window.TEMPORARY, 100, () => resolve(false), () => resolve(true));
+        });
+      }
+    } catch (e) {
+      // Not available
+    }
+    return false;
+  }
+
+  notifyConnection(url, success) {
+    this._broadcast({ type: 'ws_connected', url, success });
+  }
+
+  destroy() {
+    if (this.channel) {
+      try {
+        this.channel.close();
+      } catch (e) {
+        // Already closed
+      }
+      this.channel = null;
+    }
+  }
+}
+
+// Singleton coordinator
+const crossTabCoordinator = new CrossTabCoordinator();
 
 // ============================================================================
 // UTILITIES
@@ -45,6 +255,9 @@ const ConnectionState = {
 
 class DynamicWebSocketClient {
   constructor(config = {}) {
+    // Generate unique instance ID for lock coordination
+    this.instanceId = `client_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
+
     // Configuration
     this.config = {
       autoDiscover: false,
@@ -58,6 +271,7 @@ class DynamicWebSocketClient {
       messageTimeout: 5000,
       maxQueueSize: 500,
       queueTTL: 5 * 60 * 1000, // 5 minutes
+      useGlobalLock: true, // Use global lock to prevent duplicate connections
       ...config
     };
 
@@ -65,28 +279,30 @@ class DynamicWebSocketClient {
     this.connections = new Map(); // endpoint -> WebSocket
     this.connectionStates = new Map(); // endpoint -> ConnectionState
     this.connectionMetrics = new Map(); // endpoint -> metrics
-    
+
     // Endpoints configuration
     this.endpoints = [];
-    
+
     // Message handling
     this.messageHandlers = new Map(); // type -> handlers[]
     this.pendingACKs = new Map(); // messageId -> { resolve, reject, timeout }
     this.learnedSchemas = new Map(); // type -> schema
-    
+
     // Offline queue
     this.offlineQueue = [];
-    
+
     // Reconnection tracking
     this.reconnectAttempts = new Map(); // endpoint -> attempts
     this.reconnectTimers = new Map(); // endpoint -> timerId
-    
+
     // Heartbeat
     this.heartbeatTimers = new Map(); // endpoint -> timerId
     this.lastPong = new Map(); // endpoint -> timestamp
-    
+
     // State
     this.isDestroyed = false;
+
+    console.log(`[WS-CLIENT] Created instance ${this.instanceId}`);
   }
 
   // ==========================================================================
@@ -107,20 +323,34 @@ class DynamicWebSocketClient {
     let url = endpointUrl;
     if (!endpointUrl.startsWith('ws://') && !endpointUrl.startsWith('wss://')) {
       // It's a capability name, find matching endpoint
-      const endpoint = this.endpoints.find(ep => 
+      const endpoint = this.endpoints.find(ep =>
         ep.capabilities?.includes(endpointUrl)
       );
       url = endpoint?.path || this.endpoints[0]?.path;
-      
+
       if (!url) {
         throw new Error(`No endpoint found for capability: ${endpointUrl}`);
       }
     }
 
-    // Check if already connected
+    // Check if already connected (local instance check)
     const existing = this.connections.get(url);
     if (existing?.readyState === WebSocket.OPEN) {
+      console.log(`[WS-CLIENT] Reusing existing local connection for ${url}`);
       return existing;
+    }
+
+    // Use global lock to prevent duplicate connections across instances
+    if (this.config.useGlobalLock) {
+      const lockResult = await globalConnectionLock.acquire(url, this.instanceId);
+
+      if (!lockResult.acquired && lockResult.existingConnection) {
+        // Another instance already has a connection, reuse it
+        console.log(`[WS-CLIENT] Using shared connection for ${url}`);
+        this.connections.set(url, lockResult.existingConnection);
+        this.connectionStates.set(url, ConnectionState.CONNECTED);
+        return lockResult.existingConnection;
+      }
     }
 
     // Close any existing connection in bad state
@@ -132,9 +362,23 @@ class DynamicWebSocketClient {
 
     try {
       const ws = await this._createConnection(url);
+
+      // Release lock with successful connection
+      if (this.config.useGlobalLock) {
+        globalConnectionLock.release(url, ws);
+        crossTabCoordinator.notifyConnection(url, true);
+      }
+
       return ws;
     } catch (error) {
       this.connectionStates.set(url, ConnectionState.FAILED);
+
+      // Release lock on failure
+      if (this.config.useGlobalLock) {
+        globalConnectionLock.release(url, null);
+        crossTabCoordinator.notifyConnection(url, false);
+      }
+
       throw error;
     }
   }
@@ -207,14 +451,19 @@ class DynamicWebSocketClient {
    */
   _handleClose(url, event) {
     console.log(`🔌 WebSocket closed: ${url} (code: ${event.code})`);
-    
+
     this._stopHeartbeat(url);
     this.connections.delete(url);
     this.connectionStates.set(url, ConnectionState.DISCONNECTED);
-    
+
+    // Notify global lock that connection is closed
+    if (this.config.useGlobalLock) {
+      globalConnectionLock.connectionClosed(url);
+    }
+
     // Emit disconnected event
     this._emit('disconnected', { endpoint: url, code: event.code });
-    
+
     // Attempt reconnection unless destroyed or clean close
     if (!this.isDestroyed && event.code !== 1000) {
       this._scheduleReconnect(url);

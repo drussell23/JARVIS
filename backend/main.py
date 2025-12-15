@@ -3204,6 +3204,116 @@ except Exception as e:
     )
     logger.warning("⚠️  Using minimal fallback CORS configuration")
 
+
+# ═══════════════════════════════════════════════════════════════
+# WEBSOCKET ORIGIN VALIDATION MIDDLEWARE
+# ═══════════════════════════════════════════════════════════════
+# This middleware ensures WebSocket connections are properly allowed
+# in development mode, fixing 403 errors during handshake
+
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import Response
+
+class WebSocketOriginMiddleware(BaseHTTPMiddleware):
+    """
+    Custom middleware to handle WebSocket origin validation.
+
+    FastAPI's CORSMiddleware doesn't properly handle WebSocket upgrade
+    requests in all cases. This middleware ensures development origins
+    are allowed and logs connection attempts for debugging.
+    """
+
+    def __init__(self, app, allowed_origins: set = None, allow_all_in_dev: bool = True):
+        super().__init__(app)
+        self.allowed_origins = allowed_origins or set()
+        self.allow_all_in_dev = allow_all_in_dev
+        self.is_production = IS_PRODUCTION
+
+        # Build set of allowed origins for fast lookup
+        self._build_origin_set()
+
+    def _build_origin_set(self):
+        """Build comprehensive origin set dynamically."""
+        self.origin_set = set(self.allowed_origins)
+
+        if not self.is_production:
+            # In development, allow common localhost variations
+            dev_ports = [3000, 3001, 5173, 8000, 8010, 8080]
+            for port in dev_ports:
+                self.origin_set.add(f"http://localhost:{port}")
+                self.origin_set.add(f"http://127.0.0.1:{port}")
+                self.origin_set.add(f"https://localhost:{port}")
+                self.origin_set.add(f"https://127.0.0.1:{port}")
+
+            # Add special origins
+            self.origin_set.add("null")  # For file:// origins
+            self.origin_set.add("")      # For missing origin (some clients)
+
+            # Add IPv6 localhost
+            for port in dev_ports:
+                self.origin_set.add(f"http://[::1]:{port}")
+                self.origin_set.add(f"https://[::1]:{port}")
+
+    def _is_origin_allowed(self, origin: str) -> bool:
+        """Check if origin is allowed."""
+        if not origin:
+            # Allow missing origin in development
+            return not self.is_production
+
+        # Check exact match
+        if origin in self.origin_set:
+            return True
+
+        # In development, allow any localhost origin
+        if not self.is_production:
+            origin_lower = origin.lower()
+            if any(local in origin_lower for local in ['localhost', '127.0.0.1', '[::1]']):
+                return True
+
+        return False
+
+    async def dispatch(self, request: Request, call_next):
+        # Check if this is a WebSocket upgrade request
+        is_websocket = (
+            request.headers.get("upgrade", "").lower() == "websocket" or
+            request.scope.get("type") == "websocket"
+        )
+
+        if is_websocket:
+            origin = request.headers.get("origin", "")
+
+            # Log WebSocket connection attempt (useful for debugging)
+            logger.debug(f"[WS-ORIGIN] WebSocket upgrade from origin: '{origin}' path: {request.url.path}")
+
+            # Validate origin
+            if not self._is_origin_allowed(origin):
+                logger.warning(f"[WS-ORIGIN] Rejected WebSocket from unauthorized origin: '{origin}'")
+                # Return 403 for unauthorized origins
+                return Response(
+                    content="Forbidden: Origin not allowed",
+                    status_code=403,
+                    media_type="text/plain"
+                )
+
+            # Log successful validation
+            if origin:
+                logger.debug(f"[WS-ORIGIN] Allowed WebSocket from origin: '{origin}'")
+
+        return await call_next(request)
+
+# Add WebSocket origin middleware (runs before CORS)
+try:
+    app.add_middleware(
+        WebSocketOriginMiddleware,
+        allowed_origins=set(allowed_origins),
+        allow_all_in_dev=not IS_PRODUCTION
+    )
+    logger.info("✅ WebSocket origin validation middleware configured")
+except Exception as e:
+    logger.warning(f"⚠️  Could not add WebSocket origin middleware: {e}")
+
+
 # ═══════════════════════════════════════════════════════════════
 # VOICE UNLOCK API - Mount at module level for proper route registration
 # ═══════════════════════════════════════════════════════════════
