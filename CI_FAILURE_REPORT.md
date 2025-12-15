@@ -1,0 +1,78 @@
+# CI/CD Failure Analysis Report
+
+## Executive Summary
+
+- **Workflow**: PR Automation & Validation
+- **Run Number**: #955
+- **Branch**: `dependabot/npm_and_yarn/frontend/react-6045c185b5`
+- **Commit**: `b2d35c0a13514c393df573d458e0bb1096f1cfe3`
+- **Status**: ❌ FAILED
+- **Timestamp**: 2025-12-15T10:03:39Z
+- **Triggered By**: @dependabot[bot]
+- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/20228151835)
+
+## Failure Overview
+
+Total Failed Jobs: **1**
+
+| # | Job Name | Category | Severity | Duration |
+|---|----------|----------|----------|----------|
+| 1 | Validate PR Title | timeout | high | 4s |
+
+## Detailed Analysis
+
+### 1. Validate PR Title
+
+**Status**: ❌ failure
+**Category**: Timeout
+**Severity**: HIGH
+**Started**: 2025-12-15T10:14:21Z
+**Completed**: 2025-12-15T10:14:25Z
+**Duration**: 4 seconds
+**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/20228151835/job/58064384399)
+
+#### Failed Steps
+
+- **Step 2**: Validate Conventional Commits
+
+#### Error Analysis
+
+**Detected Error Patterns:**
+
+- Pattern: `ERROR|Error|error`
+  - Occurrences: 2
+  - Sample matches:
+    - Line 20: `2025-12-15T10:14:23.2747525Z   subjectPatternError: The PR title must start with a capital letter.`
+    - Line 32: `2025-12-15T10:14:23.7126729Z ##[error]The PR title must start with a capital letter.`
+
+- Pattern: `timeout|timed out`
+  - Occurrences: 2
+  - Sample matches:
+    - Line 24: `- fix: Resolve database connection timeout`
+    - Line 36: `- fix: Resolve database connection timeout`
+
+#### Suggested Fixes
+
+1. Consider increasing timeout values or optimizing slow operations
+2. Check service availability and network connectivity
+
+---
+
+## Action Items
+
+- [ ] Review detailed logs for each failed job
+- [ ] Implement suggested fixes
+- [ ] Add or update tests to prevent regression
+- [ ] Verify fixes locally before pushing
+- [ ] Update CI/CD configuration if needed
+
+## Additional Resources
+
+- [Workflow File](.github/workflows/)
+- [CI/CD Documentation](../../docs/ci-cd/)
+- [Troubleshooting Guide](../../docs/troubleshooting/)
+
+---
+
+📊 *Report generated on 2025-12-15T10:28:41.256863*
+🤖 *JARVIS CI/CD Auto-PR Manager*
