@@ -17,6 +17,8 @@
             --glow-cyan: rgba(0, 255, 255, 0.8);
             --glow-green: rgba(0, 255, 65, 0.8);
             --bg-dark: #0a0a12;
+            --reactor-blue: #00d4ff;
+            --reactor-glow: rgba(0, 212, 255, 0.6);
         }
 
         * {
@@ -45,11 +47,11 @@
             width: 100vw;
             height: 100vh;
             z-index: 1;
-            opacity: 0.4;
+            opacity: 0.3;
             pointer-events: none;
         }
 
-        /* Main Container - Matrix rain canvas provides background */
+        /* Main Container */
         .loading-screen-container {
             position: fixed;
             top: 0;
@@ -61,45 +63,227 @@
             flex-direction: column;
             justify-content: center;
             align-items: center;
-            animation: breathe 4s ease-in-out infinite;
             z-index: 2;
         }
 
-        @keyframes breathe {
+        /* J.A.R.V.I.S. Main Title */
+        .jarvis-main-title {
+            position: absolute;
+            top: 12%;
+            left: 50%;
+            transform: translateX(-50%);
+            font-family: 'Orbitron', sans-serif;
+            font-size: 3.5rem;
+            font-weight: 700;
+            color: var(--neon-green);
+            letter-spacing: 0.3em;
+            text-shadow:
+                0 0 10px var(--glow-green),
+                0 0 20px var(--glow-green),
+                0 0 40px var(--glow-green);
+            animation: titlePulse 3s ease-in-out infinite;
+        }
 
-            0%,
-            100% {
-                filter: brightness(1) drop-shadow(0 0 10px rgba(0, 255, 255, 0.3));
+        @keyframes titlePulse {
+            0%, 100% { opacity: 1; text-shadow: 0 0 10px var(--glow-green), 0 0 20px var(--glow-green), 0 0 40px var(--glow-green); }
+            50% { opacity: 0.9; text-shadow: 0 0 15px var(--glow-green), 0 0 30px var(--glow-green), 0 0 60px var(--glow-green); }
+        }
+
+        /* System Startup Subtitle */
+        #dynamic-title {
+            position: absolute;
+            top: 20%;
+            left: 50%;
+            transform: translateX(-50%);
+            font-family: 'Share Tech Mono', monospace;
+            font-size: 1rem;
+            font-weight: 400;
+            color: var(--neon-green);
+            letter-spacing: 0.4em;
+            text-transform: uppercase;
+            opacity: 0.7;
+            transition: all 0.5s ease;
+        }
+
+        /* ==================== ARC REACTOR ==================== */
+        .arc-reactor-wrapper {
+            position: relative;
+            --reactor-size: clamp(240px, 45vmin, 320px);
+            /* Overall reactor position tweak (useful if the whole reactor feels off-center) */
+            --reactor-offset-x: 0px;
+            --reactor-offset-y: 0px;
+            /* Fine-tune overlay alignment without changing the reactor geometry */
+            --overlay-offset-x: 0px;
+            --overlay-offset-y: -12px;
+            width: var(--reactor-size);
+            height: var(--reactor-size);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            transform: translate(var(--reactor-offset-x), var(--reactor-offset-y));
+        }
+
+        .arc-reactor {
+            position: absolute;
+            width: 100%;
+            height: 100%;
+            top: 0;
+            left: 0;
+        }
+
+        /* Outer Ring */
+        .reactor-ring {
+            position: absolute;
+            border-radius: 50%;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+        }
+
+        .ring-outer {
+            width: calc(var(--reactor-size) * 0.9375);
+            height: calc(var(--reactor-size) * 0.9375);
+            border: 3px solid var(--neon-green);
+            opacity: 0.4;
+            box-shadow:
+                0 0 20px var(--glow-green),
+                inset 0 0 20px var(--glow-green);
+            animation: ringRotate 30s linear infinite;
+        }
+
+        .ring-middle {
+            width: calc(var(--reactor-size) * 0.75);
+            height: calc(var(--reactor-size) * 0.75);
+            border: 2px solid var(--neon-green);
+            opacity: 0.5;
+            box-shadow:
+                0 0 15px var(--glow-green),
+                inset 0 0 15px var(--glow-green);
+            animation: ringRotate 20s linear infinite reverse;
+        }
+
+        .ring-inner {
+            width: calc(var(--reactor-size) * 0.5625);
+            height: calc(var(--reactor-size) * 0.5625);
+            border: 2px solid var(--neon-green);
+            opacity: 0.6;
+            box-shadow:
+                0 0 10px var(--glow-green),
+                inset 0 0 10px var(--glow-green);
+            animation: ringRotate 15s linear infinite;
+        }
+
+        @keyframes ringRotate {
+            from { transform: translate(-50%, -50%) rotate(0deg); }
+            to { transform: translate(-50%, -50%) rotate(360deg); }
+        }
+
+        /* Core glow */
+        .reactor-core {
+            position: absolute;
+            width: calc(var(--reactor-size) * 0.375);
+            height: calc(var(--reactor-size) * 0.375);
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            border-radius: 50%;
+            background: radial-gradient(circle,
+                rgba(0, 255, 65, 0.3) 0%,
+                rgba(0, 255, 65, 0.1) 50%,
+                transparent 70%);
+            box-shadow:
+                0 0 60px var(--glow-green),
+                0 0 100px var(--glow-green);
+            animation: corePulse 2s ease-in-out infinite;
+        }
+
+        @keyframes corePulse {
+            0%, 100% {
+                transform: translate(-50%, -50%) scale(1);
+                box-shadow: 0 0 60px var(--glow-green), 0 0 100px var(--glow-green);
             }
-
             50% {
-                filter: brightness(1.15) drop-shadow(0 0 40px rgba(0, 255, 255, 0.6));
+                transform: translate(-50%, -50%) scale(1.1);
+                box-shadow: 0 0 80px var(--glow-green), 0 0 140px var(--glow-green);
             }
         }
 
-        /* Dynamic Text Overlay Container - positioned relative to image */
+        /* Core center dot */
+        .reactor-center {
+            position: absolute;
+            width: calc(var(--reactor-size) * 0.0625);
+            height: calc(var(--reactor-size) * 0.0625);
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            border-radius: 50%;
+            background: var(--neon-green);
+            box-shadow:
+                0 0 20px var(--neon-green),
+                0 0 40px var(--neon-green),
+                0 0 60px var(--neon-green);
+            animation: centerGlow 1.5s ease-in-out infinite;
+        }
+
+        @keyframes centerGlow {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.7; }
+        }
+
+        /* Ring segments/notches */
+        .ring-segments {
+            position: absolute;
+            width: calc(var(--reactor-size) * 0.8125);
+            height: calc(var(--reactor-size) * 0.8125);
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            animation: ringRotate 25s linear infinite reverse;
+        }
+
+        .ring-segment {
+            position: absolute;
+            width: calc(var(--reactor-size) * 0.025);
+            height: calc(var(--reactor-size) * 0.078125);
+            background: var(--neon-green);
+            border-radius: calc(var(--reactor-size) * 0.0125);
+            box-shadow: 0 0 10px var(--glow-green);
+            opacity: 0.8;
+        }
+
+        /* Position 8 segments around the ring */
+        .ring-segment:nth-child(1) { top: 0; left: 50%; transform: translateX(-50%); }
+        .ring-segment:nth-child(2) { top: 15%; right: 15%; transform: rotate(45deg); }
+        .ring-segment:nth-child(3) { top: 50%; right: 0; transform: translateY(-50%) rotate(90deg); }
+        .ring-segment:nth-child(4) { bottom: 15%; right: 15%; transform: rotate(135deg); }
+        .ring-segment:nth-child(5) { bottom: 0; left: 50%; transform: translateX(-50%) rotate(180deg); }
+        .ring-segment:nth-child(6) { bottom: 15%; left: 15%; transform: rotate(225deg); }
+        .ring-segment:nth-child(7) { top: 50%; left: 0; transform: translateY(-50%) rotate(270deg); }
+        .ring-segment:nth-child(8) { top: 15%; left: 15%; transform: rotate(315deg); }
+
+        /* Percentage overlay - centered in reactor */
         .dynamic-overlay {
             position: absolute;
             top: 50%;
             left: 50%;
-            transform: translate(-50%, -50%);
+            transform:
+                translate(-50%, -50%)
+                translate(var(--overlay-offset-x), var(--overlay-offset-y));
             text-align: center;
             z-index: 10;
-            /* Adjust these to fine-tune position over the ring */
-            margin-top: -15px;
+            pointer-events: none;
         }
 
-        /* Percentage Display - Positioned at center of ring */
         #dynamic-percentage {
             font-family: 'Orbitron', monospace;
-            font-size: 4rem;
+            font-size: clamp(2rem, calc(var(--reactor-size) * 0.12), 3rem);
             font-weight: 700;
             color: var(--neon-green);
+            line-height: 1;
             text-shadow:
                 0 0 10px var(--glow-green),
                 0 0 20px var(--glow-green),
-                0 0 40px var(--glow-green),
-                0 0 80px var(--glow-green);
+                0 0 40px var(--glow-green);
             letter-spacing: 0.05em;
             transition: all 0.3s ease;
         }
@@ -115,52 +299,75 @@
             50% { transform: scale(1.1); }
         }
 
-        /* Subtitle under percentage */
         #dynamic-subtitle {
             font-family: 'Share Tech Mono', monospace;
-            font-size: 0.7rem;
-            color: var(--neon-cyan);
+            font-size: 0.65rem;
+            color: var(--neon-green);
             letter-spacing: 3px;
             margin-top: 5px;
-            opacity: 0.8;
+            opacity: 0.7;
             transition: all 0.3s ease;
         }
 
-        /* Status Text - Below the ring */
+        /* Progress Bar */
+        .progress-container {
+            position: absolute;
+            bottom: 28%;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 400px;
+            max-width: 80vw;
+        }
+
+        .progress-bar-bg {
+            width: 100%;
+            height: 8px;
+            background: rgba(0, 255, 65, 0.1);
+            border-radius: 4px;
+            border: 1px solid rgba(0, 255, 65, 0.3);
+            overflow: hidden;
+        }
+
+        .progress-bar-fill {
+            height: 100%;
+            width: 0%;
+            background: linear-gradient(90deg, var(--neon-green), #00ff88);
+            border-radius: 4px;
+            box-shadow: 0 0 15px var(--glow-green);
+            transition: width 0.3s ease;
+        }
+
+        /* Status Text */
         #dynamic-status {
             position: absolute;
-            top: 68%;
+            bottom: 22%;
             left: 50%;
             transform: translateX(-50%);
             font-family: 'Orbitron', monospace;
-            font-size: 1.1rem;
+            font-size: 0.9rem;
             font-weight: 400;
             color: var(--neon-green);
-            text-shadow:
-                0 0 5px var(--glow-green),
-                0 0 15px var(--glow-green);
-            letter-spacing: 0.1em;
+            text-shadow: 0 0 5px var(--glow-green);
+            letter-spacing: 0.08em;
             white-space: nowrap;
+            text-align: center;
+            max-width: 90vw;
+            overflow: hidden;
+            text-overflow: ellipsis;
             transition: all 0.3s ease;
         }
 
-        /* Title - "SYSTEM RESTART" - positioned at top of the panel */
-        #dynamic-title {
+        /* Connected to server text */
+        .server-status {
             position: absolute;
-            top: 26%;
+            bottom: 16%;
             left: 50%;
             transform: translateX(-50%);
-            font-family: 'Orbitron', monospace;
-            font-size: 1.8rem;
-            font-weight: 600;
-            color: var(--neon-cyan);
-            text-shadow:
-                0 0 10px var(--glow-cyan),
-                0 0 20px var(--glow-cyan),
-                0 0 40px var(--glow-cyan);
-            letter-spacing: 0.4em;
-            text-transform: uppercase;
-            transition: all 0.5s ease;
+            font-family: 'Share Tech Mono', monospace;
+            font-size: 0.75rem;
+            color: var(--neon-green);
+            opacity: 0.6;
+            letter-spacing: 0.1em;
         }
 
         /* Connection Status Indicator */
@@ -273,19 +480,58 @@
         <span id="status-text">Connecting...</span>
     </div>
 
-    <!-- Main Loading Screen Container with Background Image -->
+    <!-- Main Loading Screen Container -->
     <div class="loading-screen-container" id="loading-container">
-        <!-- Title -->
-        <h2 id="dynamic-title">SYSTEM RESTART</h2>
+        <!-- J.A.R.V.I.S. Main Title -->
+        <h1 class="jarvis-main-title">J.A.R.V.I.S.</h1>
 
-        <!-- Dynamic Overlay for Percentage -->
-        <div class="dynamic-overlay">
-            <h1 id="dynamic-percentage">0%</h1>
-            <div id="dynamic-subtitle">INITIALIZING</div>
+        <!-- System Startup Subtitle -->
+        <h2 id="dynamic-title">SYSTEM STARTUP</h2>
+
+        <!-- Arc Reactor with Percentage -->
+        <div class="arc-reactor-wrapper">
+            <div class="arc-reactor">
+                <!-- Concentric Rings -->
+                <div class="reactor-ring ring-outer"></div>
+                <div class="reactor-ring ring-middle"></div>
+                <div class="reactor-ring ring-inner"></div>
+
+                <!-- Ring Segments -->
+                <div class="ring-segments">
+                    <div class="ring-segment"></div>
+                    <div class="ring-segment"></div>
+                    <div class="ring-segment"></div>
+                    <div class="ring-segment"></div>
+                    <div class="ring-segment"></div>
+                    <div class="ring-segment"></div>
+                    <div class="ring-segment"></div>
+                    <div class="ring-segment"></div>
+                </div>
+
+                <!-- Core Glow -->
+                <div class="reactor-core"></div>
+                <div class="reactor-center"></div>
+            </div>
+
+            <!-- Percentage Overlay - Centered in Reactor -->
+            <div class="dynamic-overlay">
+                <h1 id="dynamic-percentage">0%</h1>
+                <div id="dynamic-subtitle">INITIALIZING</div>
+            </div>
+        </div>
+
+        <!-- Progress Bar -->
+        <div class="progress-container">
+            <div class="progress-bar-bg">
+                <div class="progress-bar-fill" id="progress-bar-visual"></div>
+            </div>
         </div>
 
         <!-- Status Text -->
-        <p id="dynamic-status">Loading Modules...</p>
+        <p id="dynamic-status">Initializing JARVIS Systems...</p>
+
+        <!-- Server Connection Status -->
+        <p class="server-status" id="server-status">Connected to server</p>
     </div>
 
     <!-- Hidden elements for loading-manager.js compatibility -->
@@ -439,10 +685,17 @@
             return new Promise(res => {
                 const pct = document.getElementById('dynamic-percentage');
                 const title = document.getElementById('dynamic-title');
+                const mainTitle = document.querySelector('.jarvis-main-title');
                 const status = document.getElementById('dynamic-status');
                 const subtitle = document.getElementById('dynamic-subtitle');
                 const indicator = document.getElementById('status-indicator');
                 const statusText = document.getElementById('status-text');
+                const progressBarVisual = document.getElementById('progress-bar-visual');
+                const serverStatus = document.getElementById('server-status');
+                const reactorCore = document.querySelector('.reactor-core');
+                const reactorCenter = document.querySelector('.reactor-center');
+                const rings = document.querySelectorAll('.reactor-ring');
+                const segments = document.querySelectorAll('.ring-segment');
 
                 if (pct) pct.classList.add('success');
                 if (title) {
@@ -450,10 +703,32 @@
                     title.style.color = '#00ff41';
                     title.style.textShadow = '0 0 20px #00ff41, 0 0 40px #00ff41, 0 0 60px #00ff41';
                 }
-                if (status) status.textContent = 'System Ready';
+                if (status) status.textContent = 'System Ready - All Services Online';
                 if (subtitle) subtitle.textContent = 'COMPLETE';
                 if (indicator) indicator.classList.add('connected');
                 if (statusText) statusText.textContent = 'Connected';
+                if (progressBarVisual) {
+                    progressBarVisual.style.width = '100%';
+                    progressBarVisual.style.boxShadow = '0 0 30px var(--glow-green)';
+                }
+                if (serverStatus) serverStatus.textContent = 'All systems operational';
+
+                // Intensify reactor glow
+                if (reactorCore) {
+                    reactorCore.style.boxShadow = '0 0 100px var(--glow-green), 0 0 150px var(--glow-green)';
+                }
+                if (reactorCenter) {
+                    reactorCenter.style.transform = 'translate(-50%, -50%) scale(1.2)';
+                    reactorCenter.style.boxShadow = '0 0 30px var(--neon-green), 0 0 60px var(--neon-green), 0 0 90px var(--neon-green)';
+                }
+                rings.forEach(ring => {
+                    ring.style.opacity = '0.8';
+                    ring.style.boxShadow = '0 0 30px var(--glow-green), inset 0 0 30px var(--glow-green)';
+                });
+                segments.forEach(seg => {
+                    seg.style.opacity = '1';
+                    seg.style.boxShadow = '0 0 20px var(--glow-green)';
+                });
 
                 // Intensify background matrix
                 if (backgroundMatrix) {
@@ -477,6 +752,8 @@
             const displayPct = document.getElementById('dynamic-percentage');
             const displayStatus = document.getElementById('dynamic-status');
             const subtitle = document.getElementById('dynamic-subtitle');
+            const progressBarVisual = document.getElementById('progress-bar-visual');
+            const serverStatus = document.getElementById('server-status');
 
             // Update subtitle based on progress
             function updateSubtitle(progress) {
@@ -490,6 +767,13 @@
                 else subtitle.textContent = 'COMPLETE';
             }
 
+            // Update visual progress bar
+            function updateProgressBar(progress) {
+                if (progressBarVisual) {
+                    progressBarVisual.style.width = progress + '%';
+                }
+            }
+
             // Observe hidden percentage and sync to visible element
             if (hiddenPct && displayPct) {
                 new MutationObserver(() => {
@@ -499,6 +783,7 @@
                     if (match) {
                         const v = parseInt(match[1]);
                         updateSubtitle(v);
+                        updateProgressBar(v);
                         if (v >= 100 && !successDone) {
                             triggerSuccessState();
                         }
@@ -523,6 +808,7 @@
                             if (!isNaN(v)) {
                                 displayPct.textContent = Math.round(v) + '%';
                                 updateSubtitle(v);
+                                updateProgressBar(v);
                                 if (v >= 100 && !successDone) {
                                     triggerSuccessState();
                                 }
@@ -636,12 +922,16 @@
         function updateConnectionStatus(connected, text) {
             const indicator = document.getElementById('status-indicator');
             const statusText = document.getElementById('status-text');
+            const serverStatus = document.getElementById('server-status');
 
             if (indicator) {
                 indicator.classList.toggle('connected', connected);
             }
             if (statusText && text) {
                 statusText.textContent = text;
+            }
+            if (serverStatus) {
+                serverStatus.textContent = connected ? 'Connected to server' : 'Connecting...';
             }
         }
         window.updateConnectionStatus = updateConnectionStatus;
