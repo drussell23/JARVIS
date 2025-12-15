@@ -1,0 +1,581 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>JARVIS - System Startup</title>
+    <link
+        href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Rajdhani:wght@300;400;700&display=swap"
+        rel="stylesheet">
+    <style>
+        :root {
+            --matrix-green: #00ff41;
+            --matrix-green-dark: #00aa2e;
+            --matrix-green-glow: rgba(0, 255, 65, 0.5);
+            --matrix-green-dim: rgba(0, 255, 65, 0.2);
+            --glass-bg: rgba(0, 20, 10, 0.7);
+            --glass-border: rgba(0, 255, 65, 0.3);
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            background: #000;
+            color: var(--matrix-green);
+            font-family: 'Rajdhani', sans-serif;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            overflow: hidden;
+        }
+
+        #matrix-canvas {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: 0;
+            opacity: 0.15;
+        }
+
+        .hud-container {
+            position: relative;
+            z-index: 10;
+            background: var(--glass-bg);
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            border: 1px solid var(--glass-border);
+            border-radius: 20px;
+            padding: 50px 60px;
+            max-width: 700px;
+            width: 90%;
+            box-shadow: 0 0 60px rgba(0, 255, 65, 0.1), inset 0 0 60px rgba(0, 255, 65, 0.03), 0 25px 50px rgba(0, 0, 0, 0.5);
+        }
+
+        .hud-container::before,
+        .hud-container::after {
+            content: '';
+            position: absolute;
+            width: 30px;
+            height: 30px;
+            border: 2px solid var(--matrix-green);
+        }
+
+        .hud-container::before {
+            top: 15px;
+            left: 15px;
+            border-right: none;
+            border-bottom: none;
+        }
+
+        .hud-container::after {
+            bottom: 15px;
+            right: 15px;
+            border-left: none;
+            border-top: none;
+        }
+
+        .loading-content {
+            text-align: center;
+        }
+
+        .jarvis-logo {
+            font-family: 'Orbitron', monospace;
+            font-size: clamp(2.5rem, 10vw, 4.5rem);
+            font-weight: 900;
+            color: var(--matrix-green);
+            text-shadow: 0 0 20px var(--matrix-green), 0 0 40px var(--matrix-green), 0 0 60px var(--matrix-green-dark);
+            margin-bottom: 8px;
+            letter-spacing: 0.15em;
+        }
+
+        .subtitle {
+            font-size: 1rem;
+            color: var(--matrix-green-dark);
+            margin-bottom: 40px;
+            letter-spacing: 0.4em;
+            text-transform: uppercase;
+            font-family: 'Orbitron', monospace;
+        }
+
+        .arc-reactor {
+            width: 400px;
+            height: 400px;
+            margin: 0 auto 40px;
+            position: relative;
+        }
+
+        .reactor-ring {
+            position: absolute;
+            border-radius: 50%;
+            border: 2px solid transparent;
+        }
+
+        .reactor-ring:nth-child(1) {
+            width: 400px;
+            height: 400px;
+            top: 0;
+            left: 0;
+            border-color: var(--matrix-green) transparent transparent transparent;
+            animation: rotate 5s linear infinite;
+            box-shadow: 0 0 40px var(--matrix-green-glow), inset 0 0 30px var(--matrix-green-dim);
+        }
+
+        .reactor-ring:nth-child(2) {
+            width: 330px;
+            height: 330px;
+            top: 35px;
+            left: 35px;
+            border-color: transparent var(--matrix-green-dark) transparent transparent;
+            animation: rotate 4s linear infinite reverse;
+            box-shadow: 0 0 25px var(--matrix-green-glow);
+        }
+
+        .reactor-ring:nth-child(3) {
+            width: 260px;
+            height: 260px;
+            top: 70px;
+            left: 70px;
+            border-color: transparent transparent var(--matrix-green) transparent;
+            animation: rotate 3s linear infinite;
+            box-shadow: 0 0 25px var(--matrix-green-glow);
+        }
+
+        .reactor-ring:nth-child(4) {
+            width: 190px;
+            height: 190px;
+            top: 105px;
+            left: 105px;
+            border-color: transparent transparent transparent var(--matrix-green-dark);
+            animation: rotate 2.5s linear infinite reverse;
+            box-shadow: 0 0 20px var(--matrix-green-glow);
+        }
+
+        .reactor-ring:nth-child(5) {
+            width: 120px;
+            height: 120px;
+            top: 140px;
+            left: 140px;
+            border-color: var(--matrix-green) transparent var(--matrix-green) transparent;
+            animation: rotate 2s linear infinite;
+            box-shadow: 0 0 20px var(--matrix-green-glow);
+        }
+
+        .reactor-core {
+            position: absolute;
+            width: 80px;
+            height: 80px;
+            top: 160px;
+            left: 160px;
+            background: radial-gradient(circle, #fff 0%, var(--matrix-green) 25%, var(--matrix-green-dark) 60%, transparent 100%);
+            border-radius: 50%;
+            box-shadow: 0 0 50px var(--matrix-green), 0 0 100px var(--matrix-green), 0 0 150px var(--matrix-green-dark);
+            animation: corePulse 1.5s ease-in-out infinite;
+        }
+
+        .reactor-core::after {
+            content: '';
+            position: absolute;
+            width: 34px;
+            height: 34px;
+            top: 23px;
+            left: 23px;
+            background: #fff;
+            border-radius: 50%;
+            box-shadow: 0 0 40px #fff, 0 0 80px var(--matrix-green);
+        }
+
+        .progress-percentage {
+            font-size: 5rem;
+            font-weight: 900;
+            color: var(--matrix-green);
+            margin-bottom: 10px;
+            font-family: 'Orbitron', monospace;
+            text-shadow: 0 0 20px var(--matrix-green), 0 0 40px var(--matrix-green-glow);
+            letter-spacing: 0.1em;
+        }
+
+        .progress-container {
+            width: 100%;
+            height: 8px;
+            background: rgba(0, 0, 0, 0.6);
+            border: 1px solid var(--matrix-green-dim);
+            border-radius: 4px;
+            overflow: hidden;
+            box-shadow: 0 0 20px var(--matrix-green-dim);
+            margin-bottom: 15px;
+        }
+
+        .progress-bar {
+            height: 100%;
+            background: linear-gradient(90deg, var(--matrix-green-dark) 0%, var(--matrix-green) 50%, var(--matrix-green-dark) 100%);
+            background-size: 200% 100%;
+            animation: shimmer 1.5s infinite linear;
+            width: 0%;
+            transition: width 0.3s ease-out;
+            box-shadow: 0 0 15px var(--matrix-green);
+            border-radius: 4px;
+        }
+
+        .progress-text {
+            font-size: 0.95rem;
+            margin: 12px 0 20px;
+            color: var(--matrix-green);
+            text-shadow: 0 0 10px var(--matrix-green-glow);
+            font-family: 'Orbitron', monospace;
+            letter-spacing: 0.08em;
+        }
+
+        .status-container {
+            display: flex;
+            justify-content: center;
+            gap: 6px;
+            flex-wrap: wrap;
+        }
+
+        .status-item {
+            padding: 8px 14px;
+            background: rgba(0, 0, 0, 0.4);
+            border: 1px solid var(--matrix-green-dim);
+            border-radius: 4px;
+            transition: all 0.3s ease;
+            min-width: 70px;
+        }
+
+        .status-item.active {
+            background: rgba(0, 255, 65, 0.12);
+            border-color: var(--matrix-green);
+            box-shadow: 0 0 15px var(--matrix-green-dim);
+        }
+
+        .status-item.complete {
+            background: rgba(0, 255, 65, 0.06);
+            border-color: var(--matrix-green-dark);
+            opacity: 0.7;
+        }
+
+        .status-icon {
+            margin-bottom: 4px;
+            height: 16px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .status-icon svg {
+            width: 14px;
+            height: 14px;
+            fill: var(--matrix-green);
+            stroke: var(--matrix-green);
+        }
+
+        .status-label {
+            font-size: 0.65rem;
+            text-transform: uppercase;
+            letter-spacing: 0.15em;
+            color: var(--matrix-green);
+            font-family: 'Orbitron', monospace;
+        }
+
+        .error-state {
+            display: none;
+            color: #ff4444;
+            margin-top: 20px;
+            padding: 15px;
+            border: 1px solid #ff4444;
+            border-radius: 8px;
+            background: rgba(255, 68, 68, 0.1);
+        }
+
+        .error-state.show {
+            display: block;
+        }
+
+        .details-section {
+            margin-top: 15px;
+            padding: 12px;
+            background: rgba(0, 0, 0, 0.4);
+            border: 1px solid var(--matrix-green-dim);
+            border-radius: 6px;
+            text-align: left;
+            max-height: 120px;
+            overflow-y: auto;
+        }
+
+        .detail-item {
+            font-size: 0.8rem;
+            color: var(--matrix-green-dark);
+            margin: 3px 0;
+            font-family: 'Courier New', monospace;
+        }
+
+        @keyframes rotate {
+            from {
+                transform: rotate(0deg);
+            }
+
+            to {
+                transform: rotate(360deg);
+            }
+        }
+
+        @keyframes corePulse {
+
+            0%,
+            100% {
+                transform: scale(1);
+                box-shadow: 0 0 50px var(--matrix-green), 0 0 100px var(--matrix-green), 0 0 150px var(--matrix-green-dark);
+            }
+
+            50% {
+                transform: scale(1.08);
+                box-shadow: 0 0 70px var(--matrix-green), 0 0 140px var(--matrix-green), 0 0 200px var(--matrix-green-dark);
+            }
+        }
+
+        @keyframes shimmer {
+            0% {
+                background-position: 200% 0;
+            }
+
+            100% {
+                background-position: -200% 0;
+            }
+        }
+
+        ::-webkit-scrollbar {
+            width: 4px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: transparent;
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: var(--matrix-green-dark);
+            border-radius: 2px;
+        }
+
+        @media (max-width: 600px) {
+            .hud-container {
+                padding: 30px 25px;
+            }
+
+            .arc-reactor {
+                width: 250px;
+                height: 250px;
+            }
+
+            .reactor-ring:nth-child(1) {
+                width: 250px;
+                height: 250px;
+            }
+
+            .reactor-ring:nth-child(2) {
+                width: 205px;
+                height: 205px;
+                top: 22px;
+                left: 22px;
+            }
+
+            .reactor-ring:nth-child(3) {
+                width: 160px;
+                height: 160px;
+                top: 45px;
+                left: 45px;
+            }
+
+            .reactor-ring:nth-child(4) {
+                width: 115px;
+                height: 115px;
+                top: 67px;
+                left: 67px;
+            }
+
+            .reactor-ring:nth-child(5) {
+                width: 70px;
+                height: 70px;
+                top: 90px;
+                left: 90px;
+            }
+
+            .reactor-core {
+                width: 50px;
+                height: 50px;
+                top: 100px;
+                left: 100px;
+            }
+
+            .reactor-core::after {
+                width: 22px;
+                height: 22px;
+                top: 14px;
+                left: 14px;
+            }
+
+            .progress-percentage {
+                font-size: 3.5rem;
+            }
+        }
+    </style>
+</head>
+
+<body>
+    <canvas id="matrix-canvas"></canvas>
+
+    <div class="hud-container">
+        <div class="loading-content">
+            <div class="jarvis-logo">J.A.R.V.I.S.</div>
+            <div class="subtitle">System Startup</div>
+
+            <div class="arc-reactor">
+                <div class="reactor-ring"></div>
+                <div class="reactor-ring"></div>
+                <div class="reactor-ring"></div>
+                <div class="reactor-ring"></div>
+                <div class="reactor-ring"></div>
+                <div class="reactor-core"></div>
+            </div>
+
+            <div class="progress-percentage" id="progress-percentage">0%</div>
+
+            <div class="progress-container">
+                <div class="progress-bar" id="progress-bar"></div>
+            </div>
+
+            <div class="progress-text" id="progress-text">Initializing system...</div>
+
+            <div class="status-container">
+                <div class="status-item" id="status-detecting">
+                    <div class="status-icon"><svg viewBox="0 0 24 24" fill="none">
+                            <circle cx="12" cy="12" r="9" stroke-width="2" />
+                            <circle cx="12" cy="12" r="3" />
+                        </svg></div>
+                    <div class="status-label">Scan</div>
+                </div>
+                <div class="status-item" id="status-killing">
+                    <div class="status-icon"><svg viewBox="0 0 24 24" fill="none">
+                            <path d="M18 6L6 18M6 6l12 12" stroke-width="2" />
+                        </svg></div>
+                    <div class="status-label">Term</div>
+                </div>
+                <div class="status-item" id="status-cleanup">
+                    <div class="status-icon"><svg viewBox="0 0 24 24" fill="none">
+                            <path d="M3 6h18M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2m3 0v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6h14"
+                                stroke-width="2" />
+                        </svg></div>
+                    <div class="status-label">Clean</div>
+                </div>
+                <div class="status-item" id="status-starting">
+                    <div class="status-icon"><svg viewBox="0 0 24 24">
+                            <polygon points="5,3 19,12 5,21" />
+                        </svg></div>
+                    <div class="status-label">Init</div>
+                </div>
+                <div class="status-item" id="status-complete">
+                    <div class="status-icon"><svg viewBox="0 0 24 24" fill="none">
+                            <polyline points="20,6 9,17 4,12" stroke-width="2" />
+                        </svg></div>
+                    <div class="status-label">Done</div>
+                </div>
+            </div>
+
+            <div class="error-state" id="error-state">
+                <h3>⚠ Startup Failed</h3>
+                <p id="error-message"></p>
+            </div>
+
+            <div class="details-section" id="details-section" style="display: none;">
+                <div id="details-content"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const canvas = document.getElementById('matrix-canvas');
+        const ctx = canvas.getContext('2d');
+
+        function resizeCanvas() { canvas.width = window.innerWidth; canvas.height = window.innerHeight; }
+        resizeCanvas();
+        window.addEventListener('resize', resizeCanvas);
+
+        const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789アイウエオカキクケコサシスセソタチツテトナニヌネノ';
+        const charArray = chars.split('');
+        const fontSize = 16;
+        let columns = Math.floor(canvas.width / fontSize);
+        let drops = [];
+
+        function initDrops() {
+            columns = Math.floor(canvas.width / fontSize);
+            drops = [];
+            for (let i = 0; i < columns; i++) drops[i] = Math.random() * -100;
+        }
+        initDrops();
+        window.addEventListener('resize', initDrops);
+
+        function drawMatrix() {
+            ctx.fillStyle = 'rgba(0, 0, 0, 0.04)';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            ctx.font = fontSize + 'px monospace';
+
+            for (let i = 0; i < drops.length; i++) {
+                const char = charArray[Math.floor(Math.random() * charArray.length)];
+                const x = i * fontSize;
+                const y = drops[i] * fontSize;
+                const brightness = Math.random();
+                ctx.fillStyle = brightness > 0.97 ? '#ffffff' : brightness > 0.8 ? '#00ff41' : '#00aa2e';
+                ctx.fillText(char, x, y);
+                if (y > canvas.height && Math.random() > 0.98) drops[i] = 0;
+                drops[i]++;
+            }
+        }
+        setInterval(drawMatrix, 60);
+
+        let ws, reconnectAttempts = 0;
+        const maxReconnectAttempts = 10;
+
+        function connectWebSocket() {
+            const wsUrl = `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.hostname}:8010/ws/startup-progress`;
+            ws = new WebSocket(wsUrl);
+
+            ws.onopen = () => { reconnectAttempts = 0; setInterval(() => { if (ws.readyState === WebSocket.OPEN) ws.send('ping'); }, 10000); };
+            ws.onmessage = (e) => { try { const d = JSON.parse(e.data); if (d.type !== 'pong') updateProgress(d); } catch (err) { } };
+            ws.onclose = () => { if (reconnectAttempts++ < maxReconnectAttempts) setTimeout(connectWebSocket, 2000); else showError('Connection lost. Refresh page.'); };
+        }
+
+        function updateProgress(data) {
+            const { stage, message, progress, details, success, redirect_url } = data;
+            document.getElementById('progress-bar').style.width = `${progress}%`;
+            document.getElementById('progress-percentage').textContent = `${progress}%`;
+            document.getElementById('progress-text').textContent = message;
+
+            ['detecting', 'killing', 'cleanup', 'starting', 'complete'].forEach((s, i, arr) => {
+                const el = document.getElementById(`status-${s}`);
+                el.classList.remove('active', 'complete');
+                if (s === stage) el.classList.add('active');
+                else if (arr.indexOf(s) < arr.indexOf(stage)) el.classList.add('complete');
+            });
+
+            if (details) {
+                document.getElementById('details-section').style.display = 'block';
+                document.getElementById('details-content').innerHTML = Object.entries(details).map(([k, v]) => `<div class="detail-item">${k}: ${v}</div>`).join('');
+            }
+
+            if (stage === 'complete' && success) setTimeout(() => { if (redirect_url) window.location.href = redirect_url; }, 2000);
+            else if (stage === 'failed' || (stage === 'complete' && !success)) showError(message);
+        }
+
+        function showError(msg) { document.getElementById('error-state').classList.add('show'); document.getElementById('error-message').textContent = msg; }
+
+        window.addEventListener('load', connectWebSocket);
+    </script>
+</body>
+
+</html>
