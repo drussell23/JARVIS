@@ -373,21 +373,20 @@ class WhisperAudioHandler:
             self._model_load_event.clear()
 
             try:
-                logger.info("Loading Whisper model (synchronous on main thread)...")
+                logger.info("Loading Whisper model (async via thread pool)...")
 
                 def _load_model_sync():
                     """Synchronous model loading function."""
                     return whisper.load_model("base")
 
-                # Run synchronously to prevent segfaults on macOS
-                # loop = asyncio.get_running_loop()
-                # self.model = await asyncio.wait_for(
-                #    loop.run_in_executor(self._executor, _load_model_sync),
-                #    timeout=timeout
-                # )
-                self.model = _load_model_sync()
+                # Run in thread pool to avoid blocking event loop
+                # asyncio.to_thread() is macOS-safe and prevents event loop freeze
+                self.model = await asyncio.wait_for(
+                    asyncio.to_thread(_load_model_sync),
+                    timeout=timeout
+                )
 
-                logger.info("Whisper model loaded (sync)")
+                logger.info("Whisper model loaded (async)")
                 return True
 
             except Exception as e:
@@ -656,9 +655,9 @@ class WhisperAudioHandler:
                 logger.info(f"   Raw Whisper result: {result}")
                 return result["text"].strip() # Strip leading/trailing whitespace from text
 
-            # Run synchronously on main thread (macOS stability)
-            # text = await asyncio.to_thread(_transcribe_sync)
-            text = _transcribe_sync()
+            # Run in thread pool to avoid blocking event loop
+            # asyncio.to_thread() is macOS-safe and prevents event loop freeze
+            text = await asyncio.to_thread(_transcribe_sync)
 
             logger.info(f"✅ Transcribed: '{text}'")
 
