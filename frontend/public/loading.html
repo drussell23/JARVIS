@@ -37,6 +37,18 @@
             font-family: 'Orbitron', sans-serif;
         }
 
+        /* Matrix Rain Canvas - Background layer */
+        #matrix-canvas {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100vw;
+            height: 100vh;
+            z-index: 1;
+            opacity: 0.4;
+            pointer-events: none;
+        }
+
         /* Main Container with Background Image */
         .loading-screen-container {
             position: fixed;
@@ -53,6 +65,7 @@
             justify-content: center;
             align-items: center;
             animation: breathe 4s ease-in-out infinite;
+            z-index: 2;
         }
 
         @keyframes breathe {
@@ -91,11 +104,18 @@
                 0 0 40px var(--glow-green),
                 0 0 80px var(--glow-green);
             letter-spacing: 0.05em;
+            transition: all 0.3s ease;
         }
 
         #dynamic-percentage.success {
             color: #00ff41;
-            text-shadow: 0 0 30px #00ff41, 0 0 60px #00ff41;
+            text-shadow: 0 0 30px #00ff41, 0 0 60px #00ff41, 0 0 100px #00ff41;
+            animation: pulseGlow 0.5s ease-in-out 3;
+        }
+
+        @keyframes pulseGlow {
+            0%, 100% { transform: scale(1); }
+            50% { transform: scale(1.1); }
         }
 
         /* Subtitle under percentage */
@@ -106,6 +126,7 @@
             letter-spacing: 3px;
             margin-top: 5px;
             opacity: 0.8;
+            transition: all 0.3s ease;
         }
 
         /* Status Text - Below the ring */
@@ -123,6 +144,7 @@
                 0 0 15px var(--glow-green);
             letter-spacing: 0.1em;
             white-space: nowrap;
+            transition: all 0.3s ease;
         }
 
         /* Title - "SYSTEM RESTART" - positioned at top of the panel */
@@ -141,6 +163,7 @@
                 0 0 40px var(--glow-cyan);
             letter-spacing: 0.4em;
             text-transform: uppercase;
+            transition: all 0.5s ease;
         }
 
         /* Connection Status Indicator */
@@ -167,6 +190,7 @@
             border-radius: 50%;
             background: #ffaa00;
             box-shadow: 0 0 6px #ffaa00;
+            transition: all 0.3s ease;
         }
 
         .conn-dot.connected {
@@ -203,14 +227,14 @@
             text-align: center;
         }
 
-        /* Transition overlay for warp effect */
+        /* Matrix Transition Overlay */
         .transition-overlay {
             position: fixed;
             top: 0;
             left: 0;
             width: 100vw;
             height: 100vh;
-            background: radial-gradient(circle, transparent 0%, #000 100%);
+            background: transparent;
             opacity: 0;
             pointer-events: none;
             z-index: 200;
@@ -219,6 +243,16 @@
 
         .transition-overlay.active {
             opacity: 1;
+            pointer-events: all;
+        }
+
+        /* Matrix transition canvas */
+        #transition-matrix-canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
         }
 
         /* Hidden elements for JS compatibility with loading-manager.js */
@@ -233,6 +267,9 @@
 </head>
 
 <body>
+    <!-- Matrix Rain Background Canvas -->
+    <canvas id="matrix-canvas"></canvas>
+
     <!-- Connection Status -->
     <div class="conn-status">
         <div class="conn-dot" id="status-indicator"></div>
@@ -266,10 +303,121 @@
         <div class="error-msg" id="error-message">An error occurred.</div>
     </div>
 
-    <!-- Transition Overlay -->
-    <div class="transition-overlay" id="transition-overlay"></div>
+    <!-- Transition Overlay with Matrix Canvas -->
+    <div class="transition-overlay" id="transition-overlay">
+        <canvas id="transition-matrix-canvas"></canvas>
+    </div>
 
     <script>
+        // =====================================================
+        // Matrix Rain Animation System
+        // =====================================================
+        class MatrixRain {
+            constructor(canvasId, options = {}) {
+                this.canvas = document.getElementById(canvasId);
+                if (!this.canvas) return;
+
+                this.ctx = this.canvas.getContext('2d');
+                this.options = {
+                    fontSize: options.fontSize || 14,
+                    color: options.color || '#00ff41',
+                    fadeColor: options.fadeColor || 'rgba(10, 10, 18, 0.05)',
+                    speed: options.speed || 1,
+                    density: options.density || 0.98,
+                    characters: options.characters || 'JARVISACCESS0123456789@#$%&*GRANTED',
+                    ...options
+                };
+
+                this.columns = [];
+                this.animationId = null;
+                this.isRunning = false;
+
+                this.resize();
+                window.addEventListener('resize', () => this.resize());
+            }
+
+            resize() {
+                this.canvas.width = window.innerWidth;
+                this.canvas.height = window.innerHeight;
+
+                const columnCount = Math.floor(this.canvas.width / this.options.fontSize);
+                this.columns = [];
+                for (let i = 0; i < columnCount; i++) {
+                    this.columns.push({
+                        y: Math.random() * this.canvas.height,
+                        speed: 0.5 + Math.random() * this.options.speed
+                    });
+                }
+            }
+
+            draw() {
+                // Fade effect
+                this.ctx.fillStyle = this.options.fadeColor;
+                this.ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
+
+                // Draw characters
+                this.ctx.fillStyle = this.options.color;
+                this.ctx.font = `${this.options.fontSize}px 'Share Tech Mono', monospace`;
+
+                for (let i = 0; i < this.columns.length; i++) {
+                    const col = this.columns[i];
+                    const char = this.options.characters[Math.floor(Math.random() * this.options.characters.length)];
+                    const x = i * this.options.fontSize;
+
+                    // Draw with glow effect for some characters
+                    if (Math.random() > 0.95) {
+                        this.ctx.shadowColor = this.options.color;
+                        this.ctx.shadowBlur = 10;
+                    } else {
+                        this.ctx.shadowBlur = 0;
+                    }
+
+                    this.ctx.fillText(char, x, col.y);
+
+                    // Move column down
+                    col.y += this.options.fontSize * col.speed;
+
+                    // Reset column if off screen
+                    if (col.y > this.canvas.height && Math.random() > this.options.density) {
+                        col.y = 0;
+                        col.speed = 0.5 + Math.random() * this.options.speed;
+                    }
+                }
+            }
+
+            start() {
+                if (this.isRunning) return;
+                this.isRunning = true;
+
+                const animate = () => {
+                    if (!this.isRunning) return;
+                    this.draw();
+                    this.animationId = requestAnimationFrame(animate);
+                };
+                animate();
+            }
+
+            stop() {
+                this.isRunning = false;
+                if (this.animationId) {
+                    cancelAnimationFrame(this.animationId);
+                    this.animationId = null;
+                }
+            }
+
+            intensify() {
+                // Speed up and brighten for transition
+                this.options.speed = 3;
+                this.options.fadeColor = 'rgba(10, 10, 18, 0.02)';
+                this.options.color = '#00ff88';
+                this.resize();
+            }
+        }
+
+        // Initialize background matrix rain
+        let backgroundMatrix = null;
+        let transitionMatrix = null;
+
         // =====================================================
         // Dynamic Title based on URL params
         // =====================================================
@@ -286,6 +434,8 @@
         // Success State
         // =====================================================
         let successDone = false;
+        let transitionInProgress = false;
+
         function triggerSuccessState() {
             if (successDone) return Promise.resolve();
             successDone = true;
@@ -294,14 +444,25 @@
                 const title = document.getElementById('dynamic-title');
                 const status = document.getElementById('dynamic-status');
                 const subtitle = document.getElementById('dynamic-subtitle');
+                const indicator = document.getElementById('status-indicator');
+                const statusText = document.getElementById('status-text');
 
                 if (pct) pct.classList.add('success');
                 if (title) {
                     title.textContent = 'ACCESS GRANTED';
                     title.style.color = '#00ff41';
+                    title.style.textShadow = '0 0 20px #00ff41, 0 0 40px #00ff41, 0 0 60px #00ff41';
                 }
                 if (status) status.textContent = 'System Ready';
                 if (subtitle) subtitle.textContent = 'COMPLETE';
+                if (indicator) indicator.classList.add('connected');
+                if (statusText) statusText.textContent = 'Connected';
+
+                // Intensify background matrix
+                if (backgroundMatrix) {
+                    backgroundMatrix.options.color = '#00ff41';
+                    backgroundMatrix.options.speed = 2;
+                }
 
                 setTimeout(res, 800);
             });
@@ -318,6 +479,19 @@
 
             const displayPct = document.getElementById('dynamic-percentage');
             const displayStatus = document.getElementById('dynamic-status');
+            const subtitle = document.getElementById('dynamic-subtitle');
+
+            // Update subtitle based on progress
+            function updateSubtitle(progress) {
+                if (!subtitle) return;
+                if (progress < 20) subtitle.textContent = 'CLEANUP';
+                else if (progress < 40) subtitle.textContent = 'PREPARING';
+                else if (progress < 60) subtitle.textContent = 'STARTING';
+                else if (progress < 80) subtitle.textContent = 'LOADING';
+                else if (progress < 95) subtitle.textContent = 'FINALIZING';
+                else if (progress < 100) subtitle.textContent = 'READY';
+                else subtitle.textContent = 'COMPLETE';
+            }
 
             // Observe hidden percentage and sync to visible element
             if (hiddenPct && displayPct) {
@@ -327,7 +501,10 @@
                     const match = t.match(/(\d+)/);
                     if (match) {
                         const v = parseInt(match[1]);
-                        if (v >= 100 && !successDone) triggerSuccessState();
+                        updateSubtitle(v);
+                        if (v >= 100 && !successDone) {
+                            triggerSuccessState();
+                        }
                     }
                 }).observe(hiddenPct, { childList: true, characterData: true, subtree: true });
             }
@@ -348,7 +525,10 @@
                             const v = parseFloat(w);
                             if (!isNaN(v)) {
                                 displayPct.textContent = Math.round(v) + '%';
-                                if (v >= 100 && !successDone) triggerSuccessState();
+                                updateSubtitle(v);
+                                if (v >= 100 && !successDone) {
+                                    triggerSuccessState();
+                                }
                             }
                         }
                     });
@@ -357,25 +537,117 @@
         }
 
         // =====================================================
-        // Transition Effect
+        // Matrix Transition Effect
         // =====================================================
-        function triggerTransition(redirectUrl) {
+        async function triggerMatrixTransition(redirectUrl) {
+            if (transitionInProgress) return;
+            transitionInProgress = true;
+
+            console.log('[Transition] Starting Matrix transition to:', redirectUrl);
+
             const overlay = document.getElementById('transition-overlay');
             const container = document.getElementById('loading-container');
+            const matrixCanvas = document.getElementById('matrix-canvas');
 
-            if (overlay) overlay.classList.add('active');
-            if (container) {
-                container.style.animation = 'none';
-                container.style.transition = 'transform 0.8s ease-in, filter 0.8s ease-in';
-                container.style.transform = 'scale(1.3)';
-                container.style.filter = 'brightness(2) blur(8px)';
+            // Initialize transition matrix
+            transitionMatrix = new MatrixRain('transition-matrix-canvas', {
+                fontSize: 16,
+                color: '#00ff41',
+                fadeColor: 'rgba(0, 0, 0, 0.1)',
+                speed: 4,
+                density: 0.95,
+                characters: 'ACCESSGRANTED01JARVIS'
+            });
+
+            // Phase 1: Show transition overlay and start intense matrix
+            if (overlay) {
+                overlay.classList.add('active');
+                transitionMatrix.start();
             }
 
-            setTimeout(() => {
-                window.location.href = redirectUrl;
-            }, 1000);
+            // Phase 2: Fade out main content while matrix intensifies
+            await sleep(200);
+
+            if (container) {
+                container.style.transition = 'all 0.8s ease-out';
+                container.style.opacity = '0';
+                container.style.transform = 'scale(1.1)';
+                container.style.filter = 'blur(10px) brightness(1.5)';
+            }
+
+            if (backgroundMatrix) {
+                backgroundMatrix.intensify();
+            }
+
+            // Phase 3: Full matrix takeover
+            await sleep(600);
+
+            if (matrixCanvas) {
+                matrixCanvas.style.transition = 'opacity 0.5s ease-out';
+                matrixCanvas.style.opacity = '1';
+            }
+
+            // Phase 4: Create warp/zoom effect
+            await sleep(400);
+
+            const transitionCanvas = document.getElementById('transition-matrix-canvas');
+            if (transitionCanvas) {
+                transitionCanvas.style.transition = 'all 0.6s ease-in';
+                transitionCanvas.style.transform = 'scale(1.5)';
+                transitionCanvas.style.filter = 'brightness(2) blur(3px)';
+            }
+
+            // Phase 5: Final fade to black and redirect
+            await sleep(400);
+
+            // Create final black overlay
+            const finalOverlay = document.createElement('div');
+            finalOverlay.style.cssText = `
+                position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+                background: #0a0a12; opacity: 0;
+                transition: opacity 0.4s ease-in; z-index: 10001;
+            `;
+            document.body.appendChild(finalOverlay);
+
+            await sleep(50);
+            finalOverlay.style.opacity = '1';
+
+            await sleep(400);
+
+            // Redirect
+            console.log('[Transition] Redirecting to:', redirectUrl);
+            window.location.href = redirectUrl;
+        }
+
+        // Legacy transition function - now uses Matrix transition
+        function triggerTransition(redirectUrl) {
+            triggerMatrixTransition(redirectUrl);
         }
         window.triggerTransition = triggerTransition;
+        window.triggerMatrixTransition = triggerMatrixTransition;
+
+        // =====================================================
+        // Utility Functions
+        // =====================================================
+        function sleep(ms) {
+            return new Promise(resolve => setTimeout(resolve, ms));
+        }
+
+        // =====================================================
+        // Connection Status Updates
+        // =====================================================
+        function updateConnectionStatus(connected, text) {
+            const indicator = document.getElementById('status-indicator');
+            const statusText = document.getElementById('status-text');
+
+            if (indicator) {
+                indicator.classList.toggle('connected', connected);
+            }
+            if (statusText && text) {
+                statusText.textContent = text;
+            }
+        }
+        window.updateConnectionStatus = updateConnectionStatus;
 
         // =====================================================
         // Init
@@ -383,6 +655,18 @@
         document.addEventListener('DOMContentLoaded', () => {
             setTitle();
             setupObservers();
+
+            // Start background matrix rain
+            backgroundMatrix = new MatrixRain('matrix-canvas', {
+                fontSize: 14,
+                color: '#00ff41',
+                fadeColor: 'rgba(10, 10, 18, 0.05)',
+                speed: 1,
+                density: 0.98
+            });
+            backgroundMatrix.start();
+
+            console.log('[Loading] Matrix rain initialized');
         });
     </script>
 
