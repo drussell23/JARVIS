@@ -33,7 +33,7 @@ scipy==1.11.4
 # Audio processing dependencies
 noisereduce==3.0.3
 librosa==0.10.1
-numba==0.58.1  # Required by librosa
+numba==0.63.1  # Required by librosa
 audioread==3.0.1
 resampy==0.4.2
 
