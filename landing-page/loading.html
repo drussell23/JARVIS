@@ -543,10 +543,17 @@
 
         <!-- Arc Reactor with Heartbeat Animation -->
         <div class="arc-reactor">
-            <div class="reactor-outer-ring"></div>
-            <div class="reactor-middle-ring"></div>
-            <div class="reactor-inner-ring"></div>
+            <!-- Reactor Core (Glowing Center) -->
             <div class="reactor-core"></div>
+
+            <!-- Inner Ring (Fastest) -->
+            <div class="reactor-ring ring-inner"></div>
+
+            <!-- Middle Ring -->
+            <div class="reactor-ring ring-middle"></div>
+
+            <!-- Outer Ring (Slowest) -->
+            <div class="reactor-ring ring-outer"></div>
         </div>
 
         <!-- Progress Percentage -->
@@ -610,11 +617,11 @@
                 // Vary the green shade for depth
                 const brightness = Math.random() * 0.5 + 0.5;
                 ctx.fillStyle = `rgba(0, ${Math.floor(255 * brightness)}, ${Math.floor(65 * brightness)}, ${brightness})`;
-                
+
                 const text = alphabet.charAt(Math.floor(Math.random() * alphabet.length));
                 const x = i * fontSize;
                 const y = rainDrops[i] * fontSize;
-                
+
                 ctx.fillText(text, x, y);
 
                 // Reset drop when it goes off screen
@@ -673,7 +680,7 @@
                 // Try all endpoints
                 const endpoint = this.serverEndpoints[this.currentEndpointIndex];
                 console.log(`[WS] Connecting to: ${endpoint} (attempt ${this.reconnectAttempts + 1})`);
-                
+
                 this.updateConnectionStatus('reconnecting', `Connecting to server...`);
 
                 try {
@@ -691,13 +698,13 @@
                     this.isConnected = true;
                     this.reconnectAttempts = 0;
                     this.updateConnectionStatus('connected', 'Connected to server');
-                    
+
                     // Hide error state if shown
                     document.getElementById('error-state').classList.remove('show');
-                    
+
                     // Start heartbeat
                     this.startHeartbeat();
-                    
+
                     // Start health check
                     this.startHealthCheck();
                 };
@@ -739,7 +746,7 @@
                     progressBar.style.width = `${progress}%`;
                     progressPercentage.textContent = `${Math.round(progress)}%`;
                 }
-                
+
                 if (message) {
                     progressText.textContent = message;
                 }
@@ -756,18 +763,18 @@
 
             handleConnectionFailure() {
                 this.reconnectAttempts++;
-                
+
                 // Try next endpoint
                 this.currentEndpointIndex = (this.currentEndpointIndex + 1) % this.serverEndpoints.length;
-                
+
                 if (this.reconnectAttempts < this.maxReconnectAttempts) {
                     const delay = this.getBackoffDelay();
                     const endpoint = this.serverEndpoints[this.currentEndpointIndex];
-                    
-                    console.log(`[WS] Reconnecting in ${Math.round(delay/1000)}s to ${endpoint}...`);
-                    this.updateConnectionStatus('reconnecting', 
+
+                    console.log(`[WS] Reconnecting in ${Math.round(delay / 1000)}s to ${endpoint}...`);
+                    this.updateConnectionStatus('reconnecting',
                         `Reconnecting... (${this.reconnectAttempts}/${this.maxReconnectAttempts})`);
-                    
+
                     setTimeout(() => this.connect(), delay);
                 } else {
                     this.showError('Lost connection to server. Click Retry to reconnect.');

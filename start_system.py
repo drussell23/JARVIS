@@ -15094,26 +15094,56 @@ async def main():
 
     # Helper function to broadcast progress to loading server
     async def broadcast_to_loading_server(stage, message, progress, metadata=None):
-        """Send progress update to loading server via HTTP"""
-        try:
-            import aiohttp
-            url = "http://localhost:3001/api/update-progress"
-            data = {
-                "stage": stage,
-                "message": message,
-                "progress": progress,
-                "timestamp": datetime.now().isoformat()
-            }
-            if metadata:
-                data["metadata"] = metadata
-
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=data, timeout=aiohttp.ClientTimeout(total=1)) as resp:
-                    if resp.status == 200:
-                        print(f"  {Colors.CYAN}📊 Progress: {progress}% - {message}{Colors.ENDC}")
-        except Exception as e:
-            # Silently fail - loading server might not be ready yet
+        """Send progress update to loading server via HTTP (redirected to robust reporter)"""
+        # Redirect to the robust, non-blocking reporter we added earlier
+        if '_report_progress' in locals() or '_report_progress' in globals():
+            await _report_progress(stage, message, progress, metadata)
+        else:
+            # Fallback if reporter not available
             pass
+
+    # Helper for robust parallel process cleanup
+    async def _kill_process_async(proc_info):
+        """Asynchronously kill a process with SIGTERM then SIGKILL (Robust & Safe)"""
+        pid = proc_info["pid"]
+        name = proc_info.get("type", "unknown")
+        
+        # ULTRA-SAFE GUARD: Double check exclusion just in case
+        if "loading_server" in proc_info.get("cmdline", ""):
+            return "skipped"
+
+        try:
+            import signal
+            import psutil
+            # Check if exists
+            if not psutil.pid_exists(pid):
+                return "already_dead"
+
+            # SIGTERM (Graceful)
+            os.kill(pid, signal.SIGTERM)
+            
+            # Wait up to 2 seconds for graceful exit (async polling)
+            for _ in range(20):
+                await asyncio.sleep(0.1)
+                if not psutil.pid_exists(pid):
+                    return "terminated"
+            
+            # SIGKILL (Force)
+            if psutil.pid_exists(pid):
+                os.kill(pid, signal.SIGKILL)
+                await asyncio.sleep(0.1)
+                
+            if not psutil.pid_exists(pid):
+                return "killed"
+                
+            return "failed"
+            
+        except ProcessLookupError:
+            return "already_dead"
+        except PermissionError:
+            return "permission_denied"
+        except Exception as e:
+            return f"error: {str(e)}"
 
     # Handle restart mode (explicit --restart flag)
     # Ensure CloudSQL proxy is running (for voice biometrics)
@@ -16383,6 +16413,10 @@ async def main():
                         cmdline_str = " ".join(cmdline).lower()
 
                         # Enhanced matching: catch all variants
+                        # EXCLUDE loading_server.py from cleanup (it must persist)
+                        if "loading_server" in cmdline_str:
+                            continue
+
                         is_start_system = "python" in cmdline_str and "start_system.py" in cmdline_str
                         is_backend = (
                             "python" in cmdline_str
@@ -16438,40 +16472,31 @@ async def main():
                 killed_count = 0
                 failed_count = 0
 
-                for proc in jarvis_processes:
-                    try:
-                        # Try SIGTERM first (graceful)
-                        print(f"  → Terminating PID {proc['pid']}...", end="", flush=True)
-                        os.kill(proc["pid"], signal.SIGTERM)
-                        time.sleep(0.5)
-
-                        # Check if still alive, use SIGKILL if needed
-                        if psutil.pid_exists(proc["pid"]):
-                            print(f" forcing...", end="", flush=True)
-                            os.kill(proc["pid"], signal.SIGKILL)
-                            time.sleep(0.3)
-
-                        # Verify it's actually dead
-                        if psutil.pid_exists(proc["pid"]):
-                            print(f" {Colors.FAIL}✗ Still alive{Colors.ENDC}")
-                            failed_count += 1
-                        else:
-                            print(f" {Colors.GREEN}✓{Colors.ENDC}")
-                            killed_count += 1
-
-                    except ProcessLookupError:
-                        # Already dead
-                        print(f" {Colors.GREEN}✓ (already dead){Colors.ENDC}")
+                # Robust Parallel Cleanup
+                print(f"  {Colors.CYAN}→ Executing parallel shutdown on {len(jarvis_processes)} processes...{Colors.ENDC}")
+                
+                # Create async kill tasks
+                kill_tasks = [_kill_process_async(p) for p in jarvis_processes]
+                results = await asyncio.gather(*kill_tasks)
+                
+                # Process results
+                killed_count = 0
+                failed_count = 0
+                
+                for proc, res in zip(jarvis_processes, results):
+                    if res in ["terminated", "killed", "already_dead"]:
+                        status_icon = f"{Colors.GREEN}✓{Colors.ENDC}"
                         killed_count += 1
-                    except PermissionError:
-                        print(f" {Colors.FAIL}✗ Permission denied{Colors.ENDC}")
+                    elif res == "skipped":
+                        status_icon = f"{Colors.BLUE}ℹ (skipped){Colors.ENDC}"
+                    else:
+                        status_icon = f"{Colors.FAIL}✗ {res}{Colors.ENDC}"
                         failed_count += 1
-                    except Exception as e:
-                        print(f" {Colors.FAIL}✗ {str(e)[:50]}{Colors.ENDC}")
-                        failed_count += 1
+                        
+                    print(f"  {status_icon} PID {proc['pid']} ({proc['type']}): {res}")
 
                 print(f"\n{Colors.YELLOW}⏳ Waiting for processes to terminate...{Colors.ENDC}")
-                time.sleep(2)
+                await asyncio.sleep(2)
 
                 # Final verification
                 still_alive = []
