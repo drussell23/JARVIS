@@ -1061,6 +1061,59 @@ class UnifiedWebSocketManager:
         """
         msg_type = message.get("type", "")
 
+        # =========================================================================
+        # 🔇 SELF-VOICE SUPPRESSION - Prevent JARVIS from hearing its own voice
+        # =========================================================================
+        # This is the ROOT LEVEL check - we reject audio messages that arrive:
+        # 1. While JARVIS is speaking (prevents hearing its own voice)
+        # 2. While a VBI session is active (prevents processing during unlock)
+        #
+        # The check happens HERE (at WebSocket receive) because:
+        # 1. This is before ANY audio processing
+        # 2. This catches ALL audio messages regardless of type
+        # 3. This prevents wasted compute on self-voice audio
+        # =========================================================================
+        has_audio = message.get("audio_data") is not None
+        if has_audio:
+            # Check 1: Is a VBI session active? (Blocks ALL audio during unlock)
+            try:
+                from voice_unlock.intelligent_voice_unlock_service import is_vbi_session_active
+                if is_vbi_session_active():
+                    logger.warning(
+                        f"🔇 [VBI-SESSION-BLOCK] Rejecting audio - VBI session is active"
+                    )
+                    return {
+                        "success": False,
+                        "type": "vbi_session_active",
+                        "message": "Audio rejected - VBI unlock in progress",
+                        "should_retry": False
+                    }
+            except Exception as e:
+                logger.debug(f"[VBI-SESSION] Check failed: {e}")
+
+            # Check 2: Is JARVIS speaking?
+            try:
+                from agi_os.realtime_voice_communicator import get_voice_communicator
+                voice_comm = await asyncio.wait_for(get_voice_communicator(), timeout=0.3)
+
+                if voice_comm and (voice_comm.is_speaking or voice_comm.is_processing_speech):
+                    # JARVIS is currently speaking - this audio is likely echo
+                    logger.warning(
+                        f"🔇 [SELF-VOICE-SUPPRESSION] Rejecting audio message - "
+                        f"JARVIS is speaking (is_speaking={voice_comm.is_speaking}, "
+                        f"is_processing={voice_comm.is_processing_speech})"
+                    )
+                    return {
+                        "success": False,
+                        "type": "self_voice_suppressed",
+                        "message": "Audio rejected - JARVIS is currently speaking",
+                        "should_retry": False
+                    }
+            except asyncio.TimeoutError:
+                logger.debug("[SELF-VOICE] Voice communicator check timed out")
+            except Exception as e:
+                logger.debug(f"[SELF-VOICE] Check failed: {e}")
+
         # Check if message type should use pipeline processing
         pipeline_types = {
             "command",

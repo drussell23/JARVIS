@@ -823,6 +823,16 @@ class RealTimeVoiceCommunicator:
         # Acquire lock to prevent overlapping speech
         async with self._immediate_speech_lock:
             try:
+                # =========================================================
+                # 🔇 CRITICAL: Set is_speaking BEFORE speech starts
+                # =========================================================
+                # This flag is checked by self-voice suppression to reject
+                # audio input that arrives while JARVIS is speaking.
+                # Setting it BEFORE speech ensures no audio leaks through.
+                # =========================================================
+                self._is_speaking = True
+                self._current_message = text  # Track what we're saying
+
                 config = self._mode_configs.get(mode, self._mode_configs[VoiceMode.NORMAL])
 
                 cmd = [
@@ -831,6 +841,8 @@ class RealTimeVoiceCommunicator:
                     '-r', str(config.rate),
                     text
                 ]
+
+                logger.debug(f"🔊 [SPEAKING] Starting: {text[:50]}...")
 
                 process = await asyncio.create_subprocess_exec(
                     *cmd,
@@ -843,7 +855,20 @@ class RealTimeVoiceCommunicator:
 
                 await asyncio.wait_for(process.wait(), timeout=timeout)
 
+                logger.debug(f"🔊 [SPEAKING] Finished: {text[:50]}...")
                 self._current_speech_process = None
+
+                # =========================================================
+                # 🔇 POST-SPEECH BUFFER: Keep is_speaking=True briefly
+                # =========================================================
+                # The microphone might still pick up the tail end of JARVIS's
+                # speech (echo/reverb) even after the TTS process completes.
+                # Keep the flag set for 300ms to reject any trailing audio.
+                # =========================================================
+                await asyncio.sleep(0.3)
+
+                self._is_speaking = False  # Clear flag after buffer
+                self._current_message = None
                 return True
 
             except asyncio.TimeoutError:
@@ -854,10 +879,14 @@ class RealTimeVoiceCommunicator:
                     self._current_speech_process = None
                 except:
                     pass
+                self._is_speaking = False  # Always clear flag on error
+                self._current_message = None
                 return False
             except Exception as e:
                 logger.error("Immediate speech error: %s - %s", e, text[:50])
                 self._current_speech_process = None
+                self._is_speaking = False  # Always clear flag on error
+                self._current_message = None
                 return False
 
     async def vbi_stage_feedback(

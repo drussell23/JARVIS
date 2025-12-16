@@ -835,7 +835,18 @@ class HybridSTTRouter:
 
         # Check Whisper (local, accurate, medium resource)
         # Note: numba (Whisper dependency) can have circular import issues
+        # We use lazy import to avoid triggering the circular import at discover time
         try:
+            # Pre-import numba to avoid circular import when whisper loads
+            try:
+                import numba
+                _ = numba.__version__  # Force initialization to complete
+            except ImportError:
+                pass  # numba not installed - that's OK
+            except Exception as e:
+                logger.debug(f"   numba pre-init issue (non-fatal): {e}")
+
+            # Now try importing whisper
             import whisper
             discovered['whisper_local'] = {
                 'type': 'local',
@@ -844,9 +855,18 @@ class HybridSTTRouter:
             }
             logger.info("   ✓ Whisper (local) engine available")
         except ImportError as e:
-            logger.debug(f"   ✗ Whisper local not available: {e}")
+            error_msg = str(e)
+            if "circular import" in error_msg or "numba" in error_msg.lower() or "get_hashable_key" in error_msg:
+                logger.warning(
+                    f"   ⚠️ Whisper unavailable due to numba circular import: {e}. "
+                    "This is a known issue with certain numba versions. "
+                    "Try: pip install --upgrade numba llvmlite. "
+                    "Continuing without local Whisper - other engines will be used."
+                )
+            else:
+                logger.debug(f"   ✗ Whisper local not available: {e}")
         except Exception as e:
-            # Handle numba circular import and other initialization errors gracefully
+            # Handle other initialization errors gracefully
             error_msg = str(e)
             if "circular import" in error_msg or "numba" in error_msg.lower():
                 logger.warning(

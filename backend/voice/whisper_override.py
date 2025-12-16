@@ -1,14 +1,47 @@
 #!/usr/bin/env python3
 """
 Whisper STT Override - Forces JARVIS to use Whisper for transcription
+
+NUMBA CIRCULAR IMPORT FIX:
+- Uses lazy import to avoid numba.core.utils circular import errors
+- Defers whisper import until first use
 """
 
 import asyncio
-import whisper
 import numpy as np
 import tempfile
 import soundfile as sf
 from pathlib import Path
+
+# CRITICAL: DO NOT import whisper at module level!
+# whisper -> torch -> numba can trigger circular import errors
+# Use lazy import in initialize() instead
+_whisper_module = None
+
+
+def _lazy_import_whisper():
+    """
+    Lazy import of whisper module to avoid circular import issues with numba.
+    """
+    global _whisper_module
+    if _whisper_module is None:
+        try:
+            # Pre-import numba to avoid circular import
+            try:
+                import numba
+                _ = numba.__version__
+            except ImportError:
+                pass
+            except Exception:
+                pass
+
+            import whisper as whisper_mod
+            _whisper_module = whisper_mod
+        except Exception as e:
+            print(f"❌ Failed to import whisper: {e}")
+            raise
+    return _whisper_module
+
 
 class WhisperSTTOverride:
     """Direct Whisper implementation to bypass routing issues"""
@@ -18,9 +51,10 @@ class WhisperSTTOverride:
         self.model_size = model_size
 
     def initialize(self):
-        """Load Whisper model"""
+        """Load Whisper model using lazy import"""
         if self.model is None:
             print(f"Loading Whisper {self.model_size} model...")
+            whisper = _lazy_import_whisper()
             self.model = whisper.load_model(self.model_size)
             print("✅ Whisper model loaded")
 

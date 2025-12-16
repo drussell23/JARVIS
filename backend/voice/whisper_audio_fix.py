@@ -7,11 +7,19 @@ INTEGRATED FEATURES:
 - Audio windowing/truncation to prevent hallucinations (5s global, 2s unlock)
 - Silence and noise removal BEFORE Whisper sees audio
 - Ultra-low latency for command and unlock flows
+
+NUMBA CIRCULAR IMPORT FIX:
+- Whisper depends on torch -> numba, and certain numba versions have
+  circular import bugs when imported at module level
+- We use LAZY IMPORTS to defer whisper import until first use
+- This prevents the circular import from blocking module initialization
 """
 
 import base64
 import numpy as np
-import whisper
+# CRITICAL: DO NOT import whisper at module level!
+# whisper -> torch -> numba can trigger circular import errors
+# Use lazy import in load_model() instead
 import tempfile
 import logging
 import asyncio
@@ -20,6 +28,83 @@ import io
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
+
+# Lazy-loaded whisper module
+_whisper_module = None
+_whisper_import_error = None
+_whisper_import_lock = threading.Lock()
+
+
+def _lazy_import_whisper():
+    """
+    Lazy import of whisper module to avoid circular import issues with numba.
+
+    The numba.core.utils circular import issue occurs when:
+    1. whisper imports torch
+    2. torch imports numba
+    3. numba.core.utils imports from numba.core which hasn't finished initializing
+
+    By deferring the import until first use (and catching the error gracefully),
+    we allow the rest of the system to function even if whisper fails to load.
+
+    Returns:
+        The whisper module, or None if import failed
+
+    Raises:
+        ImportError: If whisper import failed with the stored error
+    """
+    global _whisper_module, _whisper_import_error
+
+    with _whisper_import_lock:
+        # Already loaded successfully
+        if _whisper_module is not None:
+            return _whisper_module
+
+        # Already failed - re-raise the stored error
+        if _whisper_import_error is not None:
+            raise ImportError(f"Whisper import previously failed: {_whisper_import_error}")
+
+        # First import attempt
+        try:
+            # Pre-import numba components in correct order to avoid circular import
+            try:
+                import numba
+                # Force numba initialization to complete before whisper uses it
+                _ = numba.__version__
+            except ImportError:
+                # numba not installed - that's fine, whisper can work without it
+                pass
+            except Exception as e:
+                # numba has issues - log but continue
+                logging.getLogger(__name__).warning(
+                    f"numba initialization issue (non-fatal): {e}"
+                )
+
+            # Now import whisper
+            import whisper as whisper_mod
+            _whisper_module = whisper_mod
+            logging.getLogger(__name__).info("✅ Whisper module loaded successfully (lazy import)")
+            return _whisper_module
+
+        except ImportError as e:
+            error_msg = str(e)
+            _whisper_import_error = error_msg
+
+            # Check for known numba circular import issue
+            if "circular import" in error_msg or "numba" in error_msg.lower() or "get_hashable_key" in error_msg:
+                logging.getLogger(__name__).error(
+                    f"❌ Whisper import failed due to numba circular import: {e}. "
+                    "This is a known issue with certain numba versions. "
+                    "Try: pip install --upgrade numba llvmlite"
+                )
+            else:
+                logging.getLogger(__name__).error(f"❌ Whisper import failed: {e}")
+
+            raise
+        except Exception as e:
+            _whisper_import_error = str(e)
+            logging.getLogger(__name__).error(f"❌ Unexpected error importing whisper: {e}")
+            raise ImportError(f"Whisper import failed: {e}")
 
 try:
     import librosa
@@ -309,6 +394,8 @@ class WhisperAudioHandler:
         Load Whisper model synchronously (for backward compatibility).
 
         WARNING: This is a blocking call. In async contexts, use load_model_async() instead.
+
+        Uses lazy import to avoid numba circular import issues.
         """
         if self.model is not None:
             return self.model
@@ -319,8 +406,17 @@ class WhisperAudioHandler:
                 return self.model
 
             logger.info("Loading Whisper model (synchronous)...")
-            self.model = whisper.load_model("base")
-            logger.info("Whisper model loaded")
+            try:
+                # Use lazy import to avoid circular import issues
+                whisper = _lazy_import_whisper()
+                self.model = whisper.load_model("base")
+                logger.info("✅ Whisper model loaded")
+            except ImportError as e:
+                logger.error(f"❌ Cannot load Whisper model: {e}")
+                raise
+            except Exception as e:
+                logger.error(f"❌ Whisper model loading failed: {e}")
+                raise
 
         return self.model
 
@@ -330,6 +426,8 @@ class WhisperAudioHandler:
 
         Uses a thread pool executor to offload the CPU-bound model loading
         to a background thread, keeping the event loop responsive.
+
+        Uses lazy import to avoid numba circular import issues.
 
         Args:
             timeout: Maximum time to wait for model loading (default: MODEL_LOAD_TIMEOUT)
@@ -376,7 +474,11 @@ class WhisperAudioHandler:
                 logger.info("Loading Whisper model (async via thread pool)...")
 
                 def _load_model_sync():
-                    """Synchronous model loading function."""
+                    """
+                    Synchronous model loading function.
+                    Uses lazy import to avoid numba circular import issues.
+                    """
+                    whisper = _lazy_import_whisper()
                     return whisper.load_model("base")
 
                 # Run in thread pool to avoid blocking event loop
@@ -386,11 +488,22 @@ class WhisperAudioHandler:
                     timeout=timeout
                 )
 
-                logger.info("Whisper model loaded (async)")
+                logger.info("✅ Whisper model loaded (async)")
                 return True
 
+            except ImportError as e:
+                error_msg = str(e)
+                if "circular import" in error_msg or "numba" in error_msg.lower():
+                    logger.error(
+                        f"❌ Whisper import failed due to numba circular import: {e}. "
+                        "This is a known issue with certain numba versions. "
+                        "Try: pip install --upgrade numba llvmlite"
+                    )
+                else:
+                    logger.error(f"❌ Cannot load Whisper model - import failed: {e}")
+                return False
             except Exception as e:
-                logger.error(f"Failed to load Whisper model: {e}")
+                logger.error(f"❌ Failed to load Whisper model: {e}")
                 return False
             finally:
                 self._model_loading = False

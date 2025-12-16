@@ -2,6 +2,10 @@
 Whisper Local STT Engine
 OpenAI Whisper running locally with CoreML optimization (macOS)
 Balanced accuracy and performance for medium-RAM scenarios
+
+NUMBA CIRCULAR IMPORT FIX:
+- Uses lazy import to avoid numba.core.utils circular import errors
+- Defers whisper import until initialize() is called
 """
 
 import asyncio
@@ -16,6 +20,67 @@ from ..stt_config import STTEngine
 from .base_engine import BaseSTTEngine, STTResult
 
 logger = logging.getLogger(__name__)
+
+# Lazy-loaded whisper module
+_whisper_module = None
+_whisper_import_error = None
+
+
+def _lazy_import_whisper():
+    """
+    Lazy import of whisper module to avoid circular import issues with numba.
+
+    The numba.core.utils circular import issue occurs when:
+    1. whisper imports torch
+    2. torch imports numba
+    3. numba.core.utils imports from numba.core which hasn't finished initializing
+
+    Returns:
+        The whisper module
+
+    Raises:
+        ImportError: If whisper import failed
+    """
+    global _whisper_module, _whisper_import_error
+
+    if _whisper_module is not None:
+        return _whisper_module
+
+    if _whisper_import_error is not None:
+        raise ImportError(f"Whisper import previously failed: {_whisper_import_error}")
+
+    try:
+        # Pre-import numba components in correct order to avoid circular import
+        try:
+            import numba
+            _ = numba.__version__
+        except ImportError:
+            pass
+        except Exception as e:
+            logger.warning(f"numba initialization issue (non-fatal): {e}")
+
+        import whisper as whisper_mod
+        _whisper_module = whisper_mod
+        logger.info("✅ Whisper module loaded successfully (lazy import)")
+        return _whisper_module
+
+    except ImportError as e:
+        error_msg = str(e)
+        _whisper_import_error = error_msg
+
+        if "circular import" in error_msg or "numba" in error_msg.lower() or "get_hashable_key" in error_msg:
+            logger.error(
+                f"❌ Whisper import failed due to numba circular import: {e}. "
+                "Try: pip install --upgrade numba llvmlite"
+            )
+        else:
+            logger.error(f"❌ Whisper import failed: {e}")
+        raise
+
+    except Exception as e:
+        _whisper_import_error = str(e)
+        logger.error(f"❌ Unexpected error importing whisper: {e}")
+        raise ImportError(f"Whisper import failed: {e}")
 
 
 class WhisperLocalEngine(BaseSTTEngine):
@@ -46,8 +111,8 @@ class WhisperLocalEngine(BaseSTTEngine):
         logger.info(f"   Model size: {self.model_size}")
 
         try:
-            # Import whisper (lazy import)
-            import whisper
+            # Use lazy import to avoid numba circular import issues
+            whisper = _lazy_import_whisper()
 
             # Ensure models directory exists
             self.models_dir.mkdir(parents=True, exist_ok=True)
@@ -68,8 +133,18 @@ class WhisperLocalEngine(BaseSTTEngine):
             self.initialized = True
             logger.info(f"✅ Whisper Local initialized: {self.model_config.name}")
 
+        except ImportError as e:
+            error_msg = str(e)
+            if "circular import" in error_msg or "numba" in error_msg.lower():
+                logger.error(
+                    f"❌ Whisper initialization failed due to numba circular import: {e}. "
+                    "This is a known issue. Try: pip install --upgrade numba llvmlite"
+                )
+            else:
+                logger.error(f"❌ Whisper import failed: {e}")
+            raise
         except Exception as e:
-            logger.error(f"Failed to initialize Whisper Local: {e}")
+            logger.error(f"❌ Failed to initialize Whisper Local: {e}")
             raise
 
     def _get_optimal_device(self) -> str:

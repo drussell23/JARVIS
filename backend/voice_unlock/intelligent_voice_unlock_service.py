@@ -26,6 +26,7 @@ import hashlib
 import logging
 import os
 import subprocess
+import time
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from collections import defaultdict
@@ -73,6 +74,42 @@ COLD_START_TIMEOUT_MULTIPLIER = _get_timeout("JARVIS_COLD_START_MULTIPLIER", 2.0
 # Track model warmup state for adaptive timeouts
 _models_warmed_up = False
 _first_unlock_attempt = True
+
+# =============================================================================
+# VBI SESSION STATE - Global flags for audio suppression during VBI
+# =============================================================================
+# These flags are used by the WebSocket handler to reject ALL new audio
+# while a VBI session is active, preventing self-voice feedback loops.
+_VBI_SESSION_ACTIVE = False
+_VBI_SESSION_START_TIME = 0.0
+_VBI_DISPLAY_KEEPER_PROC = None
+
+
+def is_vbi_session_active() -> bool:
+    """Check if a VBI session is currently active (blocks new audio)."""
+    global _VBI_SESSION_ACTIVE, _VBI_SESSION_START_TIME
+    if not _VBI_SESSION_ACTIVE:
+        return False
+    # Auto-expire after 60 seconds (safety)
+    if time.time() - _VBI_SESSION_START_TIME > 60:
+        _VBI_SESSION_ACTIVE = False
+        return False
+    return True
+
+
+def end_vbi_session():
+    """End the VBI session and cleanup resources."""
+    global _VBI_SESSION_ACTIVE, _VBI_DISPLAY_KEEPER_PROC
+    _VBI_SESSION_ACTIVE = False
+    logger.info("🔓 [VBI-SESSION] Ended - audio input unblocked")
+    # Kill display keeper if still running
+    if _VBI_DISPLAY_KEEPER_PROC:
+        try:
+            _VBI_DISPLAY_KEEPER_PROC.terminate()
+            logger.debug("🖥️ [DISPLAY-KEEPER] Terminated")
+        except Exception:
+            pass
+        _VBI_DISPLAY_KEEPER_PROC = None
 
 
 # =============================================================================
@@ -5537,56 +5574,88 @@ async def process_voice_unlock_robust(
     Returns:
         Dict with success, response, confidence, etc.
     """
+    # =========================================================================
+    # 🔇 GLOBAL VBI SESSION FLAG - Prevents ALL new audio during VBI
+    # =========================================================================
+    # This flag is checked by the WebSocket handler to reject new audio
+    # while a VBI session is active. This prevents JARVIS from hearing
+    # its own voice OR the user speaking again during the unlock process.
+    # =========================================================================
+    global _VBI_SESSION_ACTIVE, _VBI_SESSION_START_TIME
+    _VBI_SESSION_ACTIVE = True
+    _VBI_SESSION_START_TIME = time.time()
+    logger.info("🔒 [VBI-SESSION] Started - blocking new audio input")
+
+    # =========================================================================
+    # 🖥️ DISPLAY KEEPER - Keep screen ON during entire VBI process
+    # =========================================================================
+    # Start caffeinate IMMEDIATELY to prevent screen from going black
+    # -d: Prevent display sleep
+    # -u: Declare user activity (wake display)
+    # -t 60: Auto-terminate after 60 seconds (safety)
+    # =========================================================================
+    display_keeper_proc = None
+    try:
+        display_keeper_proc = await asyncio.create_subprocess_exec(
+            "caffeinate", "-d", "-u", "-t", "60",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL
+        )
+        logger.info("🖥️ [DISPLAY-KEEPER] Started - screen will stay ON during VBI")
+    except Exception as e:
+        logger.warning(f"🖥️ [DISPLAY-KEEPER] Failed to start: {e}")
+
     start = time.time()
     stages = []
 
-    # Initialize voice communicator for real-time feedback (non-blocking)
-    voice = None
-    if enable_voice_feedback:
-        try:
-            from agi_os.realtime_voice_communicator import get_voice_communicator
-            voice = await asyncio.wait_for(get_voice_communicator(), timeout=2.0)
-        except Exception as e:
-            logger.debug(f"[ROBUST] Voice feedback unavailable: {e}")
-            voice = None
+    try:
+        # Initialize voice communicator for real-time feedback (non-blocking)
+        voice = None
+        if enable_voice_feedback:
+            try:
+                from agi_os.realtime_voice_communicator import get_voice_communicator
+                voice = await asyncio.wait_for(get_voice_communicator(), timeout=2.0)
+            except Exception as e:
+                logger.debug(f"[ROBUST] Voice feedback unavailable: {e}")
+                voice = None
 
-    # =========================================================================
-    # 🔇 SELF-VOICE SUPPRESSION - Prevent JARVIS from hearing its own voice
-    # =========================================================================
-    # If JARVIS is currently speaking, this audio is likely JARVIS's own voice
-    # being picked up by the microphone. Reject it immediately to prevent
-    # feedback loops and "hallucinations".
-    # =========================================================================
-    if voice and voice.is_speaking:
-        logger.warning("🔇 [SELF-VOICE-SUPPRESSION] Rejecting audio - JARVIS is currently speaking")
-        return {
-            "success": False,
-            "response": None,  # Silent rejection - don't speak or it creates more echo
-            "speaker_name": "Unknown",
-            "confidence": 0.0,
-            "total_duration_ms": (time.time() - start) * 1000,
-            "error": "self_voice_suppression",
-            "trace_id": f"echo_reject_{int(time.time())}",
-            "stages": [{"stage": "self_voice_check", "success": False, "reason": "jarvis_speaking"}],
-            "handler": "robust_v1_echo_suppressed"
-        }
+        # =========================================================================
+        # 🔇 SELF-VOICE SUPPRESSION - Prevent JARVIS from hearing its own voice
+        # =========================================================================
+        # If JARVIS is currently speaking, this audio is likely JARVIS's own voice
+        # being picked up by the microphone. Reject it immediately to prevent
+        # feedback loops and "hallucinations".
+        # =========================================================================
+        if voice and voice.is_speaking:
+            logger.warning("🔇 [SELF-VOICE-SUPPRESSION] Rejecting audio - JARVIS is currently speaking")
+            return {
+                "success": False,
+                "response": None,  # Silent rejection - don't speak or it creates more echo
+                "speaker_name": "Unknown",
+                "confidence": 0.0,
+                "total_duration_ms": (time.time() - start) * 1000,
+                "error": "self_voice_suppression",
+                "trace_id": f"echo_reject_{int(time.time())}",
+                "stages": [{"stage": "self_voice_check", "success": False, "reason": "jarvis_speaking"}],
+                "handler": "robust_v1_echo_suppressed"
+            }
 
-    # Get dynamic owner name (will be updated after verification with actual speaker)
-    dynamic_owner_name = None
-    if voice:
-        try:
-            dynamic_owner_name = await asyncio.wait_for(voice.get_owner_name(), timeout=1.0)
-        except Exception:
-            dynamic_owner_name = None
-
-    async def voice_feedback(stage: str, confidence: float = 0.0, speaker: Optional[str] = None):
-        """Fire-and-forget voice feedback - doesn't block VBI flow."""
+        # Get dynamic owner name (will be updated after verification with actual speaker)
+        dynamic_owner_name = None
         if voice:
             try:
-                name = speaker or dynamic_owner_name
-                asyncio.create_task(voice.vbi_stage_feedback(stage, confidence, name))
-            except:
-                pass
+                dynamic_owner_name = await asyncio.wait_for(voice.get_owner_name(), timeout=1.0)
+            except Exception:
+                dynamic_owner_name = None
+
+        async def voice_feedback(stage: str, confidence: float = 0.0, speaker: Optional[str] = None):
+            """Fire-and-forget voice feedback - doesn't block VBI flow."""
+            if voice:
+                try:
+                    name = speaker or dynamic_owner_name
+                    asyncio.create_task(voice.vbi_stage_feedback(stage, confidence, name))
+                except:
+                    pass
 
     async def speak_and_wait(text: str, timeout: float = 8.0):
         """
@@ -6213,3 +6282,17 @@ async def process_voice_unlock_robust(
     except Exception as e:
         logger.error(f"[ROBUST] Error: {e}\n{traceback.format_exc()}")
         return result(False, f"Voice unlock error: {e}", err=str(e))
+    finally:
+        # =========================================================================
+        # 🧹 CLEANUP - Always run regardless of success/failure/timeout
+        # =========================================================================
+        # 1. End VBI session (unblock new audio)
+        # 2. Kill display keeper process
+        # =========================================================================
+        end_vbi_session()
+        if display_keeper_proc:
+            try:
+                display_keeper_proc.terminate()
+                logger.debug("🖥️ [DISPLAY-KEEPER] Terminated in finally block")
+            except Exception:
+                pass
