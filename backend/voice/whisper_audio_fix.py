@@ -44,6 +44,23 @@ class WhisperConfig:
     """
     Dynamic configuration for Whisper import and model loading.
     All values can be overridden via environment variables.
+
+    Environment Variables:
+        WHISPER_MODEL_SIZE: Model size (tiny, base, small, medium, large) - default: 'base'
+        WHISPER_DEVICE: Device selection (auto, cpu, cuda, mps) - default: 'auto'
+        WHISPER_FP16: Use FP16 precision - default: false
+        WHISPER_FORCE_MPS: Force MPS even if sparse probe fails - default: false
+        WHISPER_MPS_SPARSE_FALLBACK: Action on MPS sparse failure ('cpu' or 'error') - default: 'cpu'
+        WHISPER_IMPORT_TIMEOUT: Timeout for module import in seconds - default: 30.0
+        WHISPER_LOAD_TIMEOUT: Timeout for model loading in seconds - default: 120.0
+        WHISPER_RETRY_ATTEMPTS: Number of retry attempts - default: 3
+        WHISPER_RETRY_BASE_DELAY: Base delay between retries - default: 1.0
+        WHISPER_RETRY_MAX_DELAY: Maximum delay between retries - default: 30.0
+        WHISPER_CIRCUIT_FAILURE_THRESHOLD: Failures before circuit opens - default: 3
+        WHISPER_CIRCUIT_RECOVERY_TIMEOUT: Timeout before circuit half-opens - default: 60.0
+        WHISPER_HEALTH_CHECK_INTERVAL: Health check interval - default: 30.0
+        WHISPER_PREWARM_ON_INIT: Prewarm model on init - default: true
+        WHISPER_PREWARM_ASYNC: Use async prewarming - default: true
     """
 
     def __init__(self):
@@ -52,6 +69,10 @@ class WhisperConfig:
             'model_size': os.getenv('WHISPER_MODEL_SIZE', 'base'),
             'model_device': os.getenv('WHISPER_DEVICE', 'auto'),  # auto, cpu, cuda, mps
             'fp16': os.getenv('WHISPER_FP16', 'false').lower() == 'true',
+
+            # MPS (Apple Silicon) configuration
+            'force_mps': os.getenv('WHISPER_FORCE_MPS', 'false').lower() == 'true',
+            'mps_sparse_fallback': os.getenv('WHISPER_MPS_SPARSE_FALLBACK', 'cpu').lower(),
 
             # Import configuration
             'import_timeout': float(os.getenv('WHISPER_IMPORT_TIMEOUT', '30.0')),
@@ -818,7 +839,16 @@ class WhisperAudioHandler:
 
     def _get_optimal_device(self) -> str:
         """
-        Dynamically determine the optimal device for Whisper based on config and hardware.
+        Dynamically determine the optimal device for Whisper based on config, hardware,
+        and actual PyTorch backend capability probing.
+
+        Whisper uses sparse tensors internally which require SparseMPS backend support.
+        This method probes for actual sparse tensor support rather than assuming MPS works.
+
+        Environment variables:
+            WHISPER_DEVICE: Force specific device ('cpu', 'cuda', 'mps', or 'auto')
+            WHISPER_FORCE_MPS: Set to 'true' to force MPS even if probe fails (risky)
+            WHISPER_MPS_SPARSE_FALLBACK: Set to 'cpu' or 'error' for sparse failures
 
         Returns:
             Device string: 'cuda', 'mps', or 'cpu'
@@ -826,23 +856,95 @@ class WhisperAudioHandler:
         config = get_whisper_config()
         configured_device = config.model_device
 
+        # Explicit device override
         if configured_device != 'auto':
+            logger.info(f"🔧 Using explicitly configured device: {configured_device}")
             return configured_device
 
-        # Auto-detect best device
+        # Auto-detect best device with capability probing
         try:
             import torch
+
+            # Check CUDA first (most reliable for ML workloads)
             if torch.cuda.is_available():
                 logger.info("🎮 CUDA GPU detected - using cuda")
                 return 'cuda'
-            elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-                logger.info("🍎 Apple Silicon detected - using mps")
-                return 'mps'
-        except ImportError:
-            pass
 
-        logger.info("💻 Using CPU for Whisper")
+            # Check MPS (Apple Silicon) with sparse tensor compatibility probe
+            if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                # Check if user wants to force MPS despite potential issues
+                force_mps = os.getenv('WHISPER_FORCE_MPS', 'false').lower() == 'true'
+                if force_mps:
+                    logger.warning("🍎 Apple Silicon MPS forced via WHISPER_FORCE_MPS=true (may fail on sparse ops)")
+                    return 'mps'
+
+                # Probe for sparse tensor support (Whisper requires this)
+                mps_sparse_supported = self._probe_mps_sparse_support(torch)
+
+                if mps_sparse_supported:
+                    logger.info("🍎 Apple Silicon MPS with sparse tensor support - using mps")
+                    return 'mps'
+                else:
+                    # MPS available but sparse tensors not supported
+                    fallback = os.getenv('WHISPER_MPS_SPARSE_FALLBACK', 'cpu').lower()
+                    if fallback == 'error':
+                        raise RuntimeError(
+                            "MPS available but SparseMPS backend doesn't support required operations. "
+                            "Set WHISPER_MPS_SPARSE_FALLBACK=cpu to use CPU fallback, or "
+                            "WHISPER_FORCE_MPS=true to attempt MPS anyway (may fail)."
+                        )
+                    logger.warning(
+                        "🍎 Apple Silicon detected but MPS SparseMPS backend lacks required ops "
+                        "(aten::_sparse_coo_tensor_with_dims_and_tensors). Falling back to CPU. "
+                        "Set WHISPER_FORCE_MPS=true to override (may fail)."
+                    )
+                    # Fall through to CPU
+
+        except ImportError:
+            logger.debug("PyTorch not available for device detection")
+
+        logger.info("💻 Using CPU for Whisper (most compatible)")
         return 'cpu'
+
+    def _probe_mps_sparse_support(self, torch) -> bool:
+        """
+        Probe whether MPS backend actually supports sparse tensor operations
+        required by Whisper (specifically _sparse_coo_tensor_with_dims_and_tensors).
+
+        This is a dynamic runtime check rather than version-based hardcoding,
+        ensuring compatibility as PyTorch evolves.
+
+        Args:
+            torch: The torch module (passed to avoid re-import)
+
+        Returns:
+            True if MPS sparse tensors work, False otherwise
+        """
+        try:
+            # Create a small test sparse tensor on MPS
+            # This probes the actual SparseMPS backend capability
+            indices = torch.tensor([[0, 1], [0, 1]], device='mps')
+            values = torch.tensor([1.0, 2.0], device='mps')
+            size = (2, 2)
+
+            # Attempt to create sparse COO tensor - this is what Whisper uses
+            sparse_tensor = torch.sparse_coo_tensor(indices, values, size, device='mps')
+
+            # If we get here, sparse tensors work on MPS
+            logger.debug("✅ MPS sparse tensor probe successful")
+            return True
+
+        except RuntimeError as e:
+            error_msg = str(e).lower()
+            if 'sparse' in error_msg or 'sparsemps' in error_msg or 'aten::' in error_msg:
+                logger.debug(f"❌ MPS sparse tensor probe failed (expected): {e}")
+                return False
+            # Re-raise unexpected errors
+            raise
+        except Exception as e:
+            # Any other error means MPS sparse is not reliable
+            logger.debug(f"❌ MPS sparse tensor probe failed: {type(e).__name__}: {e}")
+            return False
 
     def load_model(self):
         """
