@@ -5907,6 +5907,37 @@ async def process_voice_unlock_robust(
             # ✅ Unlock SUCCESS
             await progress("unlock_execute", 95, f"Screen unlocked for {verified_speaker}", success=True)
 
+            # Calculate total duration for notification
+            total_duration_ms = (time.time() - start) * 1000
+
+            # =========================================================================
+            # 📚 CONTINUOUS LEARNING - Save successful audio for profile improvement
+            # =========================================================================
+            # Run in background (fire-and-forget) to not delay the user experience
+            # The audio sample will be saved to SQLite for future voice profile updates
+            # =========================================================================
+            asyncio.create_task(
+                save_for_continuous_learning(
+                    speaker_name=verified_speaker,
+                    confidence=conf,
+                    audio_bytes=audio_bytes if isinstance(audio_bytes, bytes) else b'',
+                    embedding=test_emb.tolist() if hasattr(test_emb, 'tolist') else list(test_emb) if test_emb is not None else None
+                )
+            )
+
+            # =========================================================================
+            # 🔔 NOTIFICATION - Send macOS notification with confidence score
+            # =========================================================================
+            # Run in background to not delay voice feedback
+            # =========================================================================
+            asyncio.create_task(
+                send_unlock_notification(
+                    speaker_name=verified_speaker,
+                    confidence=conf,
+                    duration_ms=total_duration_ms
+                )
+            )
+
             # 🎙️ STAGE: Complete
             # ============================================================
             # SYNCHRONIZED voice: Speak completion message AFTER unlock
@@ -5925,6 +5956,9 @@ async def process_voice_unlock_robust(
 
             # ✅ Complete SUCCESS
             await progress("complete", 100, f"Welcome back, {verified_speaker}!", success=True, confidence=conf)
+
+            # Log successful VBI unlock with all details
+            logger.info(f"🔓 [VBI-SUCCESS] Unlocked for {verified_speaker} | Confidence: {conf:.1%} | Duration: {total_duration_ms:.0f}ms")
 
             return result(True, completion_msg, speaker=verified_speaker, conf=conf)
 

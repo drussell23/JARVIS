@@ -985,6 +985,28 @@ class UnifiedCommandProcessor:
         """Process any command through unified pipeline with FULL context awareness including voice authentication"""
         logger.info(f"[UNIFIED] Processing with context awareness: '{command_text}'")
 
+        # =========================================================================
+        # 🔇 SELF-VOICE SUPPRESSION - Prevent JARVIS echo/hallucinations
+        # =========================================================================
+        # If JARVIS is currently speaking, this command is likely JARVIS's own
+        # voice being picked up by the microphone. Silently reject it to prevent
+        # feedback loops where JARVIS processes its own speech as commands.
+        # =========================================================================
+        try:
+            from agi_os.realtime_voice_communicator import get_voice_communicator
+            voice_comm = await asyncio.wait_for(get_voice_communicator(), timeout=0.5)
+            if voice_comm and voice_comm.is_speaking:
+                logger.warning(f"🔇 [SELF-VOICE-SUPPRESSION] Rejecting command while JARVIS is speaking: '{command_text[:50]}...'")
+                return {
+                    "success": False,
+                    "response": None,  # Silent - don't speak or it creates more echo
+                    "type": "self_voice_suppressed",
+                    "message": "Command rejected - JARVIS is currently speaking",
+                    "original_command": command_text
+                }
+        except Exception as e:
+            logger.debug(f"[UNIFIED] Self-voice check skipped: {e}")
+
         # Store audio data and speaker for voice authentication (used by context-aware handlers)
         self.current_audio_data = audio_data
         self.current_speaker_name = speaker_name
