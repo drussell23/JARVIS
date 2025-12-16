@@ -5070,48 +5070,66 @@ async def _execute_unlock_robust(
                 logger.debug(f"Progress callback error: {e}")
 
     # =========================================================================
-    # 🖥️ DISPLAY KEEPER: Background task to keep screen ON throughout unlock
+    # 🖥️ DISPLAY KEEPER: Aggressive background task to keep screen ON
     # =========================================================================
     display_keeper_running = True
     display_keeper_task = None
+    _caffeinate_master_proc = None  # Long-running caffeinate process
 
     async def _keep_display_on():
-        """Background task that continuously keeps the display awake."""
-        nonlocal display_keeper_running
-        logger.info("[DISPLAY-KEEPER] 🖥️ Started - keeping screen ON")
+        """
+        Aggressive background task that GUARANTEES the display stays awake.
 
-        while display_keeper_running:
-            try:
-                # Method 1: caffeinate user activity assertion (most reliable)
-                proc = await asyncio.create_subprocess_exec(
-                    "caffeinate", "-u", "-t", "2",
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL
-                )
-                # Don't wait - fire and forget
-                asyncio.create_task(_wait_and_ignore(proc))
+        Uses a long-running caffeinate process with -dims flags to prevent
+        ANY display sleep or dimming during the unlock process.
+        """
+        nonlocal display_keeper_running, _caffeinate_master_proc
+        logger.info("[DISPLAY-KEEPER] 🖥️ Started - GUARANTEEING screen stays ON")
 
-                # Method 2: Prevent display sleep via IOKit (if available)
-                # This is handled by caffeinate above
-
-                # Sleep before next keep-alive signal
-                await asyncio.sleep(1.5)  # Send keep-alive every 1.5 seconds
-
-            except asyncio.CancelledError:
-                logger.info("[DISPLAY-KEEPER] 🖥️ Cancelled")
-                break
-            except Exception as e:
-                logger.debug(f"[DISPLAY-KEEPER] Warning: {e}")
-                await asyncio.sleep(1.0)
-
-        logger.info("[DISPLAY-KEEPER] 🖥️ Stopped")
-
-    async def _wait_and_ignore(proc):
-        """Wait for process without blocking."""
         try:
-            await asyncio.wait_for(proc.wait(), timeout=3)
-        except:
-            pass
+            # Start a SINGLE long-running caffeinate that prevents ALL display sleep
+            # -d = prevent display sleep
+            # -i = prevent idle sleep
+            # -m = prevent disk sleep
+            # -s = prevent system sleep
+            # -u = simulate user activity (wakes display if asleep)
+            _caffeinate_master_proc = await asyncio.create_subprocess_exec(
+                "caffeinate", "-d", "-i", "-u", "-s",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL
+            )
+            logger.info("[DISPLAY-KEEPER] 🖥️ Master caffeinate process started (PID: %s)",
+                       _caffeinate_master_proc.pid if _caffeinate_master_proc else "?")
+
+            # Keep running until cancelled - the caffeinate process does the work
+            while display_keeper_running:
+                await asyncio.sleep(0.5)
+
+                # Check if caffeinate is still running
+                if _caffeinate_master_proc and _caffeinate_master_proc.returncode is not None:
+                    # Restart if it died
+                    logger.warning("[DISPLAY-KEEPER] ⚠️ Caffeinate died, restarting...")
+                    _caffeinate_master_proc = await asyncio.create_subprocess_exec(
+                        "caffeinate", "-d", "-i", "-u", "-s",
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.DEVNULL
+                    )
+
+        except asyncio.CancelledError:
+            logger.info("[DISPLAY-KEEPER] 🖥️ Cancelled")
+        except Exception as e:
+            logger.warning(f"[DISPLAY-KEEPER] Error: {e}")
+        finally:
+            # Kill the master caffeinate process
+            if _caffeinate_master_proc:
+                try:
+                    _caffeinate_master_proc.terminate()
+                    await asyncio.sleep(0.1)
+                    if _caffeinate_master_proc.returncode is None:
+                        _caffeinate_master_proc.kill()
+                except:
+                    pass
+            logger.info("[DISPLAY-KEEPER] 🖥️ Stopped")
 
     try:
         logger.info(f"[ROBUST-UNLOCK] Starting unlock sequence for {speaker_name} (conf={confidence:.1%})")
@@ -5157,181 +5175,97 @@ async def _execute_unlock_robust(
             return False
 
         # =====================================================================
-        # Step 2: WAKE DISPLAY AND VERIFY IT'S ON
+        # Step 2: WAKE DISPLAY (single clean wake - no flickering)
         # =====================================================================
         await _progress("wake", 92, "Waking display...")
 
-        async def _force_wake_display():
-            """Aggressively wake the display using multiple methods."""
-            # Method 1: caffeinate with display flag
-            proc1 = await asyncio.create_subprocess_exec(
-                "caffeinate", "-u", "-d", "-t", "5",
+        # The display keeper's caffeinate -u already woke the display
+        # Just wait a moment for the lock screen to fully render
+        logger.info("[ROBUST-UNLOCK] 🖥️ Display keeper active, waiting for lock screen...")
+        await asyncio.sleep(0.8)
+
+        # Send ONE gentle wake signal (Escape key) to ensure lock screen is visible
+        try:
+            wake_proc = await asyncio.create_subprocess_exec(
+                "osascript", "-e", 'tell application "System Events" to key code 53',
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL
             )
+            await asyncio.wait_for(wake_proc.wait(), timeout=2)
+        except:
+            pass
 
-            # Method 2: Press Escape key (wakes display reliably on lock screen)
-            wake_script = '''
+        # Wait for lock screen UI to be ready
+        await asyncio.sleep(0.5)
+        await _progress("wake", 93, "Display ready")
+        logger.info("[ROBUST-UNLOCK] ✅ Display ready for password entry")
+
+        # =====================================================================
+        # Step 3: SINGLE CLEAN PASSWORD ENTRY (no retries, no fallbacks mid-way)
+        # =====================================================================
+        await _progress("typing", 93, f"Authenticating {speaker_name}...")
+
+        # Use AppleScript for password entry - most reliable on lock screen
+        # This is a SINGLE, CLEAN attempt with proper timing
+        logger.info("[ROBUST-UNLOCK] 🔐 Entering password (single clean attempt)...")
+
+        try:
+            import os
+
+            # Secure password entry script:
+            # 1. Clear any existing input (Cmd+A, Delete)
+            # 2. Type password from environment variable (secure)
+            # 3. Press Enter to submit
+            password_script = '''
             tell application "System Events"
-                key code 53
+                -- Clear any existing input
+                keystroke "a" using command down
+                delay 0.05
+                key code 51
                 delay 0.1
-                key code 53
+
+                -- Type password (from secure environment variable)
+                keystroke (system attribute "JARVIS_PWD")
+                delay 0.15
+
+                -- Press Enter to submit
+                key code 36
             end tell
             '''
-            proc2 = await asyncio.create_subprocess_exec(
-                "osascript", "-e", wake_script,
+
+            # Set password in environment (doesn't appear in process list)
+            env = os.environ.copy()
+            env["JARVIS_PWD"] = password
+
+            password_proc = await asyncio.create_subprocess_exec(
+                "osascript", "-e", password_script,
                 stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL
+                stderr=asyncio.subprocess.PIPE,
+                env=env
             )
 
-            # Wait for both
-            await asyncio.gather(
-                asyncio.wait_for(proc1.wait(), timeout=3),
-                asyncio.wait_for(proc2.wait(), timeout=3),
-                return_exceptions=True
-            )
+            _, stderr = await asyncio.wait_for(password_proc.communicate(), timeout=10.0)
 
-        async def _is_display_on():
-            """Check if display is currently on."""
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    "ioreg", "-r", "-c", "IODisplayWrangler", "-d", "1",
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.DEVNULL
-                )
-                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=2)
-                output = stdout.decode().lower()
-                # Power state 4 = fully on, 3 = dim, 0-2 = off/sleep
-                is_on = '"devicepowerstate" = 4' in output or '"currentpowerstate" = 4' in output
-                return is_on
-            except:
+            # Clear password from environment
+            del env["JARVIS_PWD"]
+
+            if password_proc.returncode == 0:
+                logger.info("[ROBUST-UNLOCK] ✅ Password entered successfully")
+                await _progress("typing", 96, "Password submitted")
+            else:
+                error_msg = stderr.decode().strip() if stderr else "Unknown error"
+                logger.error(f"[ROBUST-UNLOCK] ❌ Password entry failed: {error_msg}")
+                await _progress("typing", 94, "Password entry failed")
                 return False
-
-        # Force wake the display
-        logger.info("[ROBUST-UNLOCK] 🖥️ Forcing display wake...")
-        await _force_wake_display()
-        await asyncio.sleep(0.5)
-
-        # Verify display is on (try up to 3 times)
-        display_on = False
-        for attempt in range(3):
-            if await _is_display_on():
-                display_on = True
-                logger.info(f"[ROBUST-UNLOCK] ✅ Display confirmed ON (attempt {attempt + 1})")
-                break
-            else:
-                logger.info(f"[ROBUST-UNLOCK] Display not on yet, retrying... ({attempt + 1}/3)")
-                await _force_wake_display()
-                await asyncio.sleep(0.3)
-
-        if display_on:
-            await _progress("wake", 93, "Display ON")
-        else:
-            logger.warning("[ROBUST-UNLOCK] ⚠️ Could not confirm display is ON, proceeding anyway")
-            await _progress("wake", 93, "Proceeding...")
-
-        # Small pause for lock screen UI to render
-        await asyncio.sleep(0.2)
-
-        # Step 3: Focus password field BEFORE typing (fast)
-        await _progress("typing", 93, "Preparing...")
-
-        try:
-            # Quick focus: space + backspace (clears any stray input)
-            focus_script = 'tell application "System Events" to keystroke " " & key code 51'
-            focus_proc = await asyncio.create_subprocess_exec(
-                "osascript", "-e", focus_script,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL
-            )
-            await asyncio.wait_for(focus_proc.wait(), timeout=2)
-            logger.info("[ROBUST-UNLOCK] Password field ready")
-        except Exception as e:
-            logger.debug(f"[ROBUST-UNLOCK] Focus warning: {e}")
-
-        # Step 4: Type password - Use SecurePasswordTyper (Core Graphics) as PRIMARY
-        # This is the user's preferred method - direct keyboard events
-        await _progress("typing", 94, f"Authenticating {speaker_name}...")
-
-        typing_success = False
-        try:
-            from voice_unlock.secure_password_typer import get_secure_typer, TypingConfig
-
-            typer = get_secure_typer()
-
-            if typer.available:
-                logger.info("[ROBUST-UNLOCK] Using SecurePasswordTyper (Core Graphics) - PRIMARY method")
-
-                # Configure for lock screen - fast but reliable
-                lock_screen_config = TypingConfig(
-                    base_keystroke_delay=0.06,  # 60ms between keys (fast)
-                    min_keystroke_delay=0.04,
-                    max_keystroke_delay=0.10,
-                    key_press_duration_min=0.03,  # 30ms key hold
-                    key_press_duration_max=0.05,
-                    shift_register_delay=0.04,  # 40ms for shift
-                    shift_release_delay=0.02,
-                    wake_screen=False,  # Already woke display
-                    wake_delay=0.0,
-                    submit_after_typing=True,
-                    submit_delay=0.1,  # 100ms before Enter
-                    randomize_timing=False,  # No randomization for speed
-                    adaptive_timing=False,  # Disabled for consistency
-                    max_retries=1,  # Single retry
-                    enable_applescript_fallback=False,
-                )
-
-                typing_result = await asyncio.wait_for(
-                    typer.type_password_secure(
-                        password=password,
-                        submit=True,
-                        config_override=lock_screen_config
-                    ),
-                    timeout=15.0
-                )
-
-                if isinstance(typing_result, tuple):
-                    typing_success, metrics = typing_result
-                else:
-                    typing_success = bool(typing_result)
-                    metrics = None
-
-                if typing_success:
-                    logger.info("[ROBUST-UNLOCK] ✅ SecurePasswordTyper succeeded")
-                    await _progress("typing", 96, "Password accepted")
-                else:
-                    logger.warning("[ROBUST-UNLOCK] SecurePasswordTyper reported failure, will verify...")
-            else:
-                logger.warning("[ROBUST-UNLOCK] Core Graphics not available, will use AppleScript fallback")
 
         except asyncio.TimeoutError:
-            logger.warning("[ROBUST-UNLOCK] SecurePasswordTyper timed out")
-        except ImportError as e:
-            logger.warning(f"[ROBUST-UNLOCK] SecurePasswordTyper import error: {e}")
+            logger.error("[ROBUST-UNLOCK] ❌ Password entry timed out")
+            await _progress("typing", 94, "Timeout")
+            return False
         except Exception as e:
-            logger.warning(f"[ROBUST-UNLOCK] SecurePasswordTyper error: {e}")
-
-        # If SecurePasswordTyper failed or unavailable, try AppleScript FALLBACK
-        if not typing_success:
-            await _progress("typing", 94, "Using backup method...")
-            logger.info("[ROBUST-UNLOCK] Trying AppleScript fallback...")
-
-            try:
-                applescript_success = await _execute_unlock_applescript_fallback(password, _progress)
-
-                if applescript_success:
-                    logger.info("[ROBUST-UNLOCK] AppleScript fallback succeeded")
-                    typing_success = True
-                    await _progress("typing", 96, "Password entered")
-                else:
-                    logger.error("[ROBUST-UNLOCK] AppleScript fallback also failed")
-                    await _progress("typing", 94, "All typing methods failed")
-                    return False
-
-            except Exception as e:
-                logger.error(f"[ROBUST-UNLOCK] AppleScript fallback error: {e}")
-                await _progress("typing", 94, f"Fallback error: {e}")
-                return False
+            logger.error(f"[ROBUST-UNLOCK] ❌ Password entry error: {e}")
+            await _progress("typing", 94, f"Error: {e}")
+            return False
 
         # Step 5: Verify unlock success (optimized for speed)
         await _progress("verify", 97, "Verifying...")
