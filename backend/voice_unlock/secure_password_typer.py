@@ -580,19 +580,28 @@ class SecurePasswordTyper:
                             logger.info("🔐 [SECURE-TYPE] Return key pressed")
 
                             # ✅ CRITICAL: Verify screen actually unlocked
-                            await asyncio.sleep(1.5)  # Give macOS time to process password
+                            # Give macOS ample time to process password - lock screen auth can be slow
+                            await asyncio.sleep(2.0)
 
                             try:
                                 from voice_unlock.objc.server.screen_lock_detector import is_screen_locked
 
                                 still_locked = is_screen_locked()
+                                logger.info(f"🔐 [SECURE-TYPE] First verification: still_locked={still_locked}")
+
+                                if still_locked:
+                                    # Give it one more chance - macOS sometimes needs more time
+                                    logger.info("🔐 [SECURE-TYPE] Waiting additional time for macOS auth...")
+                                    await asyncio.sleep(1.0)
+                                    still_locked = is_screen_locked()
+                                    logger.info(f"🔐 [SECURE-TYPE] Second verification: still_locked={still_locked}")
 
                                 if still_locked:
                                     # Password was WRONG - screen still locked
                                     metrics.success = False
                                     metrics.error_message = "Password incorrect - screen still locked"
                                     self.failed_operations += 1
-                                    logger.error("❌ [SECURE-TYPE] Password INCORRECT - screen still locked after typing")
+                                    logger.error("❌ [SECURE-TYPE] Screen still locked after password + verification delay")
                                 else:
                                     # Password was CORRECT - screen unlocked
                                     metrics.success = True
