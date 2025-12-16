@@ -5026,30 +5026,29 @@ async def _execute_unlock_robust(
     confidence: float = 0.0
 ) -> bool:
     """
-    Execute screen unlock using SecurePasswordTyper and macOS keychain.
+    Execute screen unlock with CLEAN, LINEAR flow.
 
-    This uses the robust unlock mechanism with:
-    - Password retrieval from macOS keychain (com.jarvis.voiceunlock)
-    - Core Graphics keyboard events for secure password entry
-    - Caffeinate to prevent display sleep during unlock
-    - Screen lock detector for verification
-    - Transparent progress updates via WebSocket
-    - Continuous learning via DB recording
+    DESIGN PRINCIPLES:
+    - ONE caffeinate process (prevents display sleep)
+    - ONE wake signal (no competing wake methods)
+    - ONE password entry attempt (no retries that cause double-typing)
+    - SIMPLE verification
 
     Args:
-        speaker_name: The verified speaker's name (for logging)
+        speaker_name: The verified speaker's name
         progress_callback: Optional callback for progress updates
         confidence: Voice verification confidence score
 
     Returns:
         bool: True if unlock succeeded, False otherwise
     """
-    caffeinate_process = None
+    import os
+    caffeinate_proc = None
     unlock_start_time = time.time()
-    attempt_id = int(unlock_start_time * 1000)  # Unique ID for this attempt
+    attempt_id = int(unlock_start_time * 1000)
 
     async def _progress(substage: str, pct: int, msg: str):
-        """Send transparent progress update."""
+        """Send progress update."""
         if progress_callback:
             try:
                 data = {
@@ -5066,275 +5065,139 @@ async def _execute_unlock_robust(
                     await progress_callback(data)
                 else:
                     progress_callback(data)
-            except Exception as e:
-                logger.debug(f"Progress callback error: {e}")
-
-    # =========================================================================
-    # 🖥️ DISPLAY KEEPER: Aggressive background task to keep screen ON
-    # =========================================================================
-    display_keeper_running = True
-    display_keeper_task = None
-    _caffeinate_master_proc = None  # Long-running caffeinate process
-
-    async def _keep_display_on():
-        """
-        Aggressive background task that GUARANTEES the display stays awake.
-
-        Uses a long-running caffeinate process with -dims flags to prevent
-        ANY display sleep or dimming during the unlock process.
-        """
-        nonlocal display_keeper_running, _caffeinate_master_proc
-        logger.info("[DISPLAY-KEEPER] 🖥️ Started - GUARANTEEING screen stays ON")
-
-        try:
-            # Start a SINGLE long-running caffeinate that prevents ALL display sleep
-            # -d = prevent display sleep
-            # -i = prevent idle sleep
-            # -m = prevent disk sleep
-            # -s = prevent system sleep
-            # -u = simulate user activity (wakes display if asleep)
-            _caffeinate_master_proc = await asyncio.create_subprocess_exec(
-                "caffeinate", "-d", "-i", "-u", "-s",
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL
-            )
-            logger.info("[DISPLAY-KEEPER] 🖥️ Master caffeinate process started (PID: %s)",
-                       _caffeinate_master_proc.pid if _caffeinate_master_proc else "?")
-
-            # Keep running until cancelled - the caffeinate process does the work
-            while display_keeper_running:
-                await asyncio.sleep(0.5)
-
-                # Check if caffeinate is still running
-                if _caffeinate_master_proc and _caffeinate_master_proc.returncode is not None:
-                    # Restart if it died
-                    logger.warning("[DISPLAY-KEEPER] ⚠️ Caffeinate died, restarting...")
-                    _caffeinate_master_proc = await asyncio.create_subprocess_exec(
-                        "caffeinate", "-d", "-i", "-u", "-s",
-                        stdout=asyncio.subprocess.DEVNULL,
-                        stderr=asyncio.subprocess.DEVNULL
-                    )
-
-        except asyncio.CancelledError:
-            logger.info("[DISPLAY-KEEPER] 🖥️ Cancelled")
-        except Exception as e:
-            logger.warning(f"[DISPLAY-KEEPER] Error: {e}")
-        finally:
-            # Kill the master caffeinate process
-            if _caffeinate_master_proc:
-                try:
-                    _caffeinate_master_proc.terminate()
-                    await asyncio.sleep(0.1)
-                    if _caffeinate_master_proc.returncode is None:
-                        _caffeinate_master_proc.kill()
-                except:
-                    pass
-            logger.info("[DISPLAY-KEEPER] 🖥️ Stopped")
+            except:
+                pass
 
     try:
-        logger.info(f"[ROBUST-UNLOCK] Starting unlock sequence for {speaker_name} (conf={confidence:.1%})")
+        logger.info(f"[UNLOCK] Starting for {speaker_name} (conf={confidence:.1%})")
 
         # =====================================================================
-        # Step 0: START DISPLAY KEEPER (runs in background throughout unlock)
+        # STEP 1: START CAFFEINATE (prevents display sleep - NO -u flag to avoid flicker)
         # =====================================================================
-        display_keeper_task = asyncio.create_task(_keep_display_on())
-        logger.info("[ROBUST-UNLOCK] 🖥️ Display keeper started")
+        caffeinate_proc = await asyncio.create_subprocess_exec(
+            "caffeinate", "-d", "-t", "30",  # -d = prevent display sleep, -t 30 = 30 second timeout
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL
+        )
+        logger.info(f"[UNLOCK] Caffeinate started (PID: {caffeinate_proc.pid})")
 
-        # Step 1: Retrieve password from keychain
-        await _progress("keychain", 91, f"Retrieving credentials for {speaker_name}...")
-        try:
-            process = await asyncio.wait_for(
-                asyncio.create_subprocess_exec(
-                    "security", "find-generic-password",
-                    "-s", "com.jarvis.voiceunlock",
-                    "-a", "unlock_token",
-                    "-w",
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
-                ),
-                timeout=3.0
-            )
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=2.0)
+        # =====================================================================
+        # STEP 2: GET PASSWORD FROM KEYCHAIN
+        # =====================================================================
+        await _progress("keychain", 91, "Getting credentials...")
 
-            if process.returncode != 0 or not stdout:
-                logger.error("[ROBUST-UNLOCK] Password not found in keychain")
-                await _progress("keychain", 91, "Keychain password not configured")
-                return False
+        keychain_proc = await asyncio.create_subprocess_exec(
+            "security", "find-generic-password",
+            "-s", "com.jarvis.voiceunlock",
+            "-a", "unlock_token",
+            "-w",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, _ = await asyncio.wait_for(keychain_proc.communicate(), timeout=5.0)
 
-            password = stdout.decode().strip()
-            logger.info(f"[ROBUST-UNLOCK] Password retrieved ({len(password)} chars)")
-            await _progress("keychain", 92, "Credentials secured")
-
-        except asyncio.TimeoutError:
-            logger.error("[ROBUST-UNLOCK] Keychain access timed out")
-            await _progress("keychain", 91, "Keychain timeout")
-            return False
-        except Exception as e:
-            logger.error(f"[ROBUST-UNLOCK] Keychain error: {e}")
-            await _progress("keychain", 91, f"Keychain error: {e}")
+        if keychain_proc.returncode != 0 or not stdout:
+            logger.error("[UNLOCK] Password not found in keychain")
+            await _progress("keychain", 91, "Password not configured")
             return False
 
-        # =====================================================================
-        # Step 2: WAKE DISPLAY (single clean wake - no flickering)
-        # =====================================================================
-        await _progress("wake", 92, "Waking display...")
-
-        # The display keeper's caffeinate -u already woke the display
-        # Just wait a moment for the lock screen to fully render
-        logger.info("[ROBUST-UNLOCK] 🖥️ Display keeper active, waiting for lock screen...")
-        await asyncio.sleep(0.8)
-
-        # Send ONE gentle wake signal (Escape key) to ensure lock screen is visible
-        try:
-            wake_proc = await asyncio.create_subprocess_exec(
-                "osascript", "-e", 'tell application "System Events" to key code 53',
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL
-            )
-            await asyncio.wait_for(wake_proc.wait(), timeout=2)
-        except:
-            pass
-
-        # Wait for lock screen UI to be ready
-        await asyncio.sleep(0.5)
-        await _progress("wake", 93, "Display ready")
-        logger.info("[ROBUST-UNLOCK] ✅ Display ready for password entry")
+        password = stdout.decode().strip()
+        logger.info(f"[UNLOCK] Password retrieved ({len(password)} chars)")
+        await _progress("keychain", 92, "Credentials ready")
 
         # =====================================================================
-        # Step 3: SINGLE CLEAN PASSWORD ENTRY (no retries, no fallbacks mid-way)
+        # STEP 3: WAKE DISPLAY ONCE (single clean wake)
         # =====================================================================
-        await _progress("typing", 93, f"Authenticating {speaker_name}...")
+        await _progress("wake", 93, "Waking display...")
 
-        # Use AppleScript for password entry - most reliable on lock screen
-        # This is a SINGLE, CLEAN attempt with proper timing
-        logger.info("[ROBUST-UNLOCK] 🔐 Entering password (single clean attempt)...")
+        # Use caffeinate -u for ONE instant wake, then let it exit
+        wake_proc = await asyncio.create_subprocess_exec(
+            "caffeinate", "-u", "-t", "1",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL
+        )
+        await asyncio.wait_for(wake_proc.wait(), timeout=3)
 
-        try:
-            import os
+        # Wait for lock screen to fully render
+        await asyncio.sleep(1.0)
+        logger.info("[UNLOCK] Display awake")
+        await _progress("wake", 94, "Display ready")
 
-            # Secure password entry script:
-            # 1. Clear any existing input (Cmd+A, Delete)
-            # 2. Type password from environment variable (secure)
-            # 3. Press Enter to submit
-            password_script = '''
-            tell application "System Events"
-                -- Clear any existing input
-                keystroke "a" using command down
-                delay 0.05
-                key code 51
-                delay 0.1
+        # =====================================================================
+        # STEP 4: TYPE PASSWORD (single attempt, no retries)
+        # =====================================================================
+        await _progress("typing", 95, f"Authenticating {speaker_name}...")
+        logger.info("[UNLOCK] Entering password...")
 
-                -- Type password (from secure environment variable)
-                keystroke (system attribute "JARVIS_PWD")
-                delay 0.15
+        # Simple, clean AppleScript - just type and submit
+        password_script = '''
+        tell application "System Events"
+            keystroke (system attribute "JARVIS_UNLOCK_PWD")
+            delay 0.1
+            key code 36
+        end tell
+        '''
 
-                -- Press Enter to submit
-                key code 36
-            end tell
-            '''
+        env = os.environ.copy()
+        env["JARVIS_UNLOCK_PWD"] = password
 
-            # Set password in environment (doesn't appear in process list)
-            env = os.environ.copy()
-            env["JARVIS_PWD"] = password
+        type_proc = await asyncio.create_subprocess_exec(
+            "osascript", "-e", password_script,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+            env=env
+        )
+        await asyncio.wait_for(type_proc.wait(), timeout=10.0)
 
-            password_proc = await asyncio.create_subprocess_exec(
-                "osascript", "-e", password_script,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.PIPE,
-                env=env
-            )
+        # Don't keep password in memory
+        del env["JARVIS_UNLOCK_PWD"]
+        password = None
 
-            _, stderr = await asyncio.wait_for(password_proc.communicate(), timeout=10.0)
+        logger.info("[UNLOCK] Password submitted")
+        await _progress("typing", 97, "Password submitted")
 
-            # Clear password from environment
-            del env["JARVIS_PWD"]
+        # =====================================================================
+        # STEP 5: VERIFY UNLOCK
+        # =====================================================================
+        await _progress("verify", 98, "Verifying...")
 
-            if password_proc.returncode == 0:
-                logger.info("[ROBUST-UNLOCK] ✅ Password entered successfully")
-                await _progress("typing", 96, "Password submitted")
-            else:
-                error_msg = stderr.decode().strip() if stderr else "Unknown error"
-                logger.error(f"[ROBUST-UNLOCK] ❌ Password entry failed: {error_msg}")
-                await _progress("typing", 94, "Password entry failed")
-                return False
+        # Wait for macOS to process the password
+        await asyncio.sleep(1.5)
 
-        except asyncio.TimeoutError:
-            logger.error("[ROBUST-UNLOCK] ❌ Password entry timed out")
-            await _progress("typing", 94, "Timeout")
-            return False
-        except Exception as e:
-            logger.error(f"[ROBUST-UNLOCK] ❌ Password entry error: {e}")
-            await _progress("typing", 94, f"Error: {e}")
-            return False
-
-        # Step 5: Verify unlock success (optimized for speed)
-        await _progress("verify", 97, "Verifying...")
-
-        # Quick async verification loop - check frequently instead of long waits
-        unlock_success = False
         try:
             from voice_unlock.objc.server.screen_lock_detector import is_screen_locked
+            is_locked = is_screen_locked()
 
-            # Fast polling: check every 200ms for up to 2 seconds
-            for check_num in range(10):
-                await asyncio.sleep(0.2)
-                is_locked = is_screen_locked()
-
-                if not is_locked:
-                    unlock_success = True
-                    await _progress("complete", 100, f"Welcome back, {speaker_name}!")
-                    logger.info(f"[ROBUST-UNLOCK] ✅ Screen unlocked (check {check_num + 1})")
-                    break
-
-            if not unlock_success:
-                logger.warning("[ROBUST-UNLOCK] Screen still locked after verification")
-                await _progress("verify", 97, "Unlock may have failed")
+            if not is_locked:
+                logger.info(f"[UNLOCK] ✅ Success for {speaker_name}")
+                await _progress("complete", 100, f"Welcome back, {speaker_name}!")
+                return True
+            else:
+                logger.warning("[UNLOCK] Screen still locked")
+                await _progress("verify", 98, "Verification failed")
+                return False
 
         except Exception as e:
-            # If we can't verify, assume success since password typing worked
-            unlock_success = True
+            # Can't verify - assume success
+            logger.info(f"[UNLOCK] ✅ Completed (verify unavailable: {e})")
             await _progress("complete", 100, f"Welcome back, {speaker_name}!")
-            logger.info(f"[ROBUST-UNLOCK] ✅ Unlock completed (verification unavailable: {e})")
+            return True
 
-        # Step 5: Record unlock attempt for continuous learning (fire-and-forget)
-        asyncio.create_task(_record_unlock_attempt(
-            attempt_id=attempt_id,
-            speaker_name=speaker_name,
-            confidence=confidence,
-            success=unlock_success,
-            duration_ms=(time.time() - unlock_start_time) * 1000
-        ))
-
-        return unlock_success
-
+    except asyncio.TimeoutError:
+        logger.error("[UNLOCK] Timeout")
+        await _progress("error", 90, "Timeout")
+        return False
     except Exception as e:
-        logger.error(f"[ROBUST-UNLOCK] Unlock failed: {e}", exc_info=True)
-        await _progress("error", 90, f"Unlock error: {e}")
+        logger.error(f"[UNLOCK] Error: {e}")
+        await _progress("error", 90, f"Error: {e}")
         return False
 
     finally:
-        # Stop the display keeper background task
-        display_keeper_running = False
-        if display_keeper_task:
+        # Cleanup caffeinate
+        if caffeinate_proc and caffeinate_proc.returncode is None:
             try:
-                display_keeper_task.cancel()
-                try:
-                    await asyncio.wait_for(display_keeper_task, timeout=1.0)
-                except (asyncio.CancelledError, asyncio.TimeoutError):
-                    pass
-                logger.info("[ROBUST-UNLOCK] 🖥️ Display keeper stopped")
-            except Exception:
-                pass
-
-        # Cleanup caffeinate process (legacy, kept for safety)
-        if caffeinate_process:
-            try:
-                caffeinate_process.terminate()
-                await asyncio.sleep(0.1)
-                if caffeinate_process.returncode is None:
-                    caffeinate_process.kill()
-                logger.debug("[ROBUST-UNLOCK] Caffeinate terminated")
-            except Exception:
+                caffeinate_proc.terminate()
+            except:
                 pass
 
 
