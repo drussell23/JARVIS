@@ -3865,26 +3865,36 @@ async def _load_primary_speaker_profile() -> Optional[Dict[str, Any]]:
 
             for table, emb_col, name_col in queries:
                 try:
-                    # If we have owner name, search for it; otherwise get primary or first user
+                    row = None
+
+                    # Strategy 1: Match by owner name if available
                     if owner_name:
                         cursor.execute(f"""
                             SELECT {emb_col}, {name_col}, total_samples FROM {table}
                             WHERE {name_col} LIKE ? OR {name_col} LIKE ? LIMIT 1
                         """, (f"%{owner_name}%", f"%{owner_name.lower()}%"))
-                    else:
-                        # Get primary user or first available
-                        cursor.execute(f"""
-                            SELECT {emb_col}, {name_col}, total_samples FROM {table}
-                            WHERE is_primary_user = 1 OR is_primary = 1 LIMIT 1
-                        """)
                         row = cursor.fetchone()
-                        if not row:
+
+                    # Strategy 2: Get primary user
+                    if not row:
+                        try:
                             cursor.execute(f"""
                                 SELECT {emb_col}, {name_col}, total_samples FROM {table}
-                                ORDER BY total_samples DESC LIMIT 1
+                                WHERE is_primary_user = 1 LIMIT 1
                             """)
+                            row = cursor.fetchone()
+                        except sqlite3.Error:
+                            pass  # Column might not exist
 
-                    row = cursor.fetchone()
+                    # Strategy 3: Get user with most samples (fallback)
+                    if not row:
+                        cursor.execute(f"""
+                            SELECT {emb_col}, {name_col}, total_samples FROM {table}
+                            ORDER BY total_samples DESC LIMIT 1
+                        """)
+                        row = cursor.fetchone()
+
+                    # Process the row if found
                     if row and row[0]:
                         raw = row[0]
                         profile_name = row[1] if len(row) > 1 else owner_name or "User"
@@ -3893,14 +3903,20 @@ async def _load_primary_speaker_profile() -> Optional[Dict[str, Any]]:
                         if isinstance(raw, bytes):
                             embedding = np.frombuffer(raw, dtype=np.float32).tolist()
                             if len(embedding) == 192:
-                                logger.info(f"[ROBUST-PROFILE] Loaded: {profile_name} ({total_samples} samples)")
+                                logger.info(f"[ROBUST-PROFILE] ✅ Loaded: {profile_name} ({total_samples} samples)")
                                 conn.close()
                                 return {
                                     "name": profile_name,
                                     "embedding": embedding,
                                     "total_samples": total_samples
                                 }
-                except sqlite3.Error:
+                            else:
+                                logger.warning(f"[ROBUST-PROFILE] Wrong embedding size: {len(embedding)} (expected 192)")
+                        else:
+                            logger.warning(f"[ROBUST-PROFILE] Embedding is not bytes: {type(raw)}")
+
+                except sqlite3.Error as e:
+                    logger.debug(f"[ROBUST-PROFILE] Query failed for {table}.{emb_col}: {e}")
                     continue
 
             conn.close()
@@ -4003,11 +4019,35 @@ async def _load_speaker_embedding_direct(speaker_name: Optional[str] = None) -> 
 
             for table, emb_col, name_col in queries:
                 try:
-                    cursor.execute(f"""
-                        SELECT {emb_col}, {name_col}, total_samples FROM {table}
-                        WHERE {name_col} LIKE ? OR {name_col} LIKE ? LIMIT 1
-                    """, (f"%{speaker_name}%", f"%{speaker_name.lower()}%"))
-                    row = cursor.fetchone()
+                    row = None
+
+                    # Strategy 1: Match by speaker name
+                    if speaker_name:
+                        cursor.execute(f"""
+                            SELECT {emb_col}, {name_col}, total_samples FROM {table}
+                            WHERE {name_col} LIKE ? OR {name_col} LIKE ? LIMIT 1
+                        """, (f"%{speaker_name}%", f"%{speaker_name.lower()}%"))
+                        row = cursor.fetchone()
+
+                    # Strategy 2: Get primary user
+                    if not row:
+                        try:
+                            cursor.execute(f"""
+                                SELECT {emb_col}, {name_col}, total_samples FROM {table}
+                                WHERE is_primary_user = 1 LIMIT 1
+                            """)
+                            row = cursor.fetchone()
+                        except sqlite3.Error:
+                            pass
+
+                    # Strategy 3: Get user with most samples
+                    if not row:
+                        cursor.execute(f"""
+                            SELECT {emb_col}, {name_col}, total_samples FROM {table}
+                            ORDER BY total_samples DESC LIMIT 1
+                        """)
+                        row = cursor.fetchone()
+
                     if row and row[0]:
                         raw = row[0]
                         profile_name = row[1] if len(row) > 1 else "unknown"
