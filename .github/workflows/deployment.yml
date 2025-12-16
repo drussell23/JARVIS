@@ -52,7 +52,7 @@ jobs:
 
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -124,7 +124,7 @@ jobs:
 
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -167,7 +167,7 @@ jobs:
 
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -190,7 +190,7 @@ jobs:
           tar -czf backend-${{ needs.pre-deployment-checks.outputs.version }}.tar.gz .
 
       - name: Upload Backend Artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: backend-${{ needs.pre-deployment-checks.outputs.version }}
           path: deploy/backend-${{ needs.pre-deployment-checks.outputs.version }}.tar.gz
@@ -211,7 +211,7 @@ jobs:
 
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
       - name: Set up Node.js
         uses: actions/setup-node@v6
@@ -231,7 +231,7 @@ jobs:
           npm run build || echo "Build command not found"
 
       - name: Upload Frontend Artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: frontend-${{ needs.pre-deployment-checks.outputs.version }}
           path: frontend/dist/
@@ -255,11 +255,11 @@ jobs:
 
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
       - name: Download Backend Artifact
         if: needs.build-backend.result == 'success'
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@v7
         with:
           name: backend-${{ needs.pre-deployment-checks.outputs.version }}
           path: ./artifacts/
@@ -320,11 +320,11 @@ jobs:
 
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
       - name: Download Backend Artifact
         if: needs.build-backend.result == 'success'
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@v7
         with:
           name: backend-${{ needs.pre-deployment-checks.outputs.version }}
           path: ./artifacts/
@@ -404,7 +404,7 @@ jobs:
 
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
