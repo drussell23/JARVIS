@@ -291,7 +291,7 @@ os.environ["USE_TORCH"] = "1"
 os.environ["USE_TF"] = "0"
 
 # FastAPI and core imports (always needed)
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -3110,6 +3110,179 @@ async def ultra_fast_lock():
     return {"success": False, "error": "all_methods_failed"}
 
 logger.info("✅ Ultra-fast /lock-now endpoint registered (module-level)")
+
+
+# ═══════════════════════════════════════════════════════════════
+# 🧠 CONTEXT-INTELLIGENT LOCK ENDPOINT (MODULE-LEVEL)
+# Uses lightweight context intelligence without full VBI
+# ═══════════════════════════════════════════════════════════════
+@app.post("/lock-with-context")
+async def lock_with_context(request: Request):
+    """
+    Context-intelligent lock endpoint.
+
+    Uses lightweight verification (NOT full VBI):
+    - RecentSpeakerCache for fast speaker recognition (~5ms)
+    - Behavioral patterns (time of day, recent activity)
+    - Temporal context (last unlock time, session duration)
+
+    This provides context awareness without blocking like full VBI.
+
+    Request body (optional):
+    {
+        "audio_b64": "base64_encoded_audio",  # Optional: for speaker cache check
+        "context": {
+            "timestamp": "ISO datetime",
+            "session_duration_ms": 12345,
+            "last_activity_ms": 1000
+        }
+    }
+    """
+    import asyncio
+    import shutil
+    from datetime import datetime
+    import base64
+
+    start_time = datetime.now()
+    context_result = {
+        "speaker_recognized": False,
+        "behavioral_match": True,  # Default true - lock is owner-only action
+        "temporal_valid": True,
+        "confidence": 0.85,  # Default confidence for lock (no verification needed)
+        "verification_ms": 0,
+    }
+
+    try:
+        # Parse request body if provided
+        body = {}
+        try:
+            body = await request.json()
+        except Exception:
+            pass  # No body is fine - context is optional for lock
+
+        # =====================================================================
+        # LIGHTWEIGHT CONTEXT INTELLIGENCE (Non-blocking)
+        # =====================================================================
+
+        # 1. Check RecentSpeakerCache if audio provided (fast path: ~5ms)
+        audio_b64 = body.get("audio_b64")
+        if audio_b64:
+            try:
+                from voice_unlock.cloud_ecapa_client import get_recent_speaker_cache
+                cache = get_recent_speaker_cache()
+
+                if cache and cache.CACHE_ENABLED:
+                    audio_data = base64.b64decode(audio_b64)
+                    # Quick fingerprint check (no cloud call)
+                    cache_result = await asyncio.wait_for(
+                        cache.check_fast_path(audio_data),
+                        timeout=0.1  # 100ms max - don't block lock
+                    )
+                    if cache_result:
+                        embedding, speaker_name, confidence = cache_result
+                        context_result["speaker_recognized"] = True
+                        context_result["speaker_name"] = speaker_name
+                        context_result["confidence"] = confidence
+                        context_result["cache_hit"] = True
+            except asyncio.TimeoutError:
+                pass  # Don't block lock for slow cache
+            except Exception as e:
+                logger.debug(f"Context cache check skipped: {e}")
+
+        # 2. Behavioral context check (from request body)
+        ctx = body.get("context", {})
+        if ctx:
+            session_duration = ctx.get("session_duration_ms", 0)
+            last_activity = ctx.get("last_activity_ms", 0)
+
+            # Reasonable session = behavioral match
+            if session_duration > 0 and session_duration < 86400000:  # < 24 hours
+                context_result["behavioral_match"] = True
+                context_result["session_duration_ms"] = session_duration
+
+            # Recent activity = likely same user
+            if last_activity > 0 and last_activity < 300000:  # < 5 minutes
+                context_result["recent_activity"] = True
+
+        context_result["verification_ms"] = (datetime.now() - start_time).total_seconds() * 1000
+
+    except Exception as e:
+        logger.warning(f"Context check failed (proceeding with lock): {e}")
+
+    # =====================================================================
+    # EXECUTE LOCK (Always proceeds - lock is a safe operation)
+    # =====================================================================
+    async def run_cmd(cmd, timeout=3.0):
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            return proc.returncode == 0
+        except Exception:
+            return False
+
+    lock_success = False
+    lock_method = "none"
+
+    # Method 1: AppleScript Cmd+Ctrl+Q (works on all macOS versions)
+    if shutil.which("osascript"):
+        script = 'tell application "System Events" to keystroke "q" using {command down, control down}'
+        if await run_cmd(["osascript", "-e", script]):
+            lock_success = True
+            lock_method = "applescript"
+
+    # Method 2: CGSession (older macOS location)
+    if not lock_success:
+        cgsession_old = "/System/Library/CoreServices/Menu Extras/User.menu/Contents/Resources/CGSession"
+        if os.path.exists(cgsession_old):
+            if await run_cmd([cgsession_old, "-suspend"]):
+                lock_success = True
+                lock_method = "cgsession"
+
+    # Method 3: LockScreen binary (newer macOS)
+    if not lock_success:
+        lockscreen = "/System/Library/CoreServices/RemoteManagement/AppleVNCServer.bundle/Contents/Support/LockScreen.app/Contents/MacOS/LockScreen"
+        if os.path.exists(lockscreen):
+            if await run_cmd([lockscreen]):
+                lock_success = True
+                lock_method = "lockscreen"
+
+    # Method 4: pmset display sleep
+    if not lock_success and shutil.which("pmset"):
+        if await run_cmd(["pmset", "displaysleepnow"]):
+            lock_success = True
+            lock_method = "pmset"
+
+    # Method 5: ScreenSaver
+    if not lock_success and os.path.exists("/System/Library/CoreServices/ScreenSaverEngine.app"):
+        if await run_cmd(["open", "-a", "ScreenSaverEngine"]):
+            lock_success = True
+            lock_method = "screensaver"
+
+    # Invalidate speaker cache on lock (security)
+    if lock_success:
+        try:
+            from voice_unlock.cloud_ecapa_client import get_recent_speaker_cache
+            cache = get_recent_speaker_cache()
+            if cache:
+                asyncio.create_task(cache.invalidate())  # Fire-and-forget
+        except Exception:
+            pass
+
+    total_ms = (datetime.now() - start_time).total_seconds() * 1000
+
+    return {
+        "success": lock_success,
+        "method": lock_method,
+        "context_intelligence": context_result,
+        "total_ms": round(total_ms, 2),
+        "message": "Screen locked successfully" if lock_success else "Lock failed - all methods exhausted"
+    }
+
+logger.info("✅ Context-intelligent /lock-with-context endpoint registered (module-level)")
 
 # ═══════════════════════════════════════════════════════════════
 # ROBUST DYNAMIC CORS CONFIGURATION

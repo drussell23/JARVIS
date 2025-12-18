@@ -3086,38 +3086,62 @@ const JarvisVoice = () => {
       // If still not connected, handle based on command type
       if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
         // =========================================================================
-        // 🔒 LOCK COMMANDS: Use HTTP fallback - don't wait for WebSocket!
-        // Lock is a LOCAL operation that doesn't need WebSocket bidirectional comm
+        // 🔒 LOCK COMMANDS: Context-intelligent HTTP execution with dynamic timing
+        // Same architecture as WebSocket path - optimistic UI + speech callback
         // =========================================================================
         if (effectiveCommandType === 'lock') {
-          console.log('🔒⚡ WebSocket unavailable - using ULTRA-FAST HTTP lock');
-          setResponse('🔒 Locking...');
+          console.log('🔒🧠 WebSocket unavailable - context-intelligent HTTP lock');
+          const lockStartTime = Date.now();
 
-          try {
-            // Use ultra-minimal lock endpoint that bypasses all infrastructure
-            const apiUrl = API_URL || configService.getApiUrl() || inferUrls().API_BASE_URL;
-            const lockUrl = `${apiUrl}/lock-now`;
+          // 1. Show response immediately (optimistic UI)
+          setResponse('🔒 Locking your screen now. See you soon!');
+          setIsProcessing(false);
 
-            console.log(`🔒⚡ Calling ultra-fast lock: ${lockUrl}`);
+          // 2. Build context
+          const lockContext = {
+            timestamp: new Date().toISOString(),
+            session_duration_ms: lockStartTime - (window.sessionStartTime || lockStartTime),
+            last_activity_ms: Date.now() - (window.lastActivityTime || Date.now()),
+          };
 
-            const response = await fetch(lockUrl, {
-              method: 'GET', // GET for simplicity - no body needed
-              signal: AbortSignal.timeout(5000)
-            });
-
-            if (response.ok) {
-              const result = await response.json();
-              console.log('🔒✅ Ultra-fast lock succeeded:', result);
-              setResponse('🔒 Locking your screen now. See you soon!');
-              speakResponse('Locking your screen now. See you soon!');
-            } else {
-              console.error('🔒❌ Lock failed:', response.status);
-              setResponse('❌ Lock failed - please try again');
+          // 3. Lock execution function
+          const executeLock = async () => {
+            try {
+              const apiUrl = API_URL || configService.getApiUrl() || inferUrls().API_BASE_URL;
+              console.log('🔒🧠 Executing context-intelligent lock (HTTP fallback)');
+              fetch(`${apiUrl}/lock-with-context`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ context: lockContext }),
+              }).catch(() => {
+                fetch(`${apiUrl}/lock-now`, { method: 'GET' }).catch(() => {});
+              });
+            } catch (e) {
+              console.error('🔒 Lock execution error:', e);
             }
-          } catch (httpError) {
-            console.error('🔒❌ HTTP lock error:', httpError);
-            setResponse('❌ Could not lock screen - backend may be offline');
-          }
+          };
+
+          // 4. Speak with callback - execute lock when audio starts
+          let lockExecuted = false;
+          const onSpeechStart = () => {
+            if (!lockExecuted) {
+              lockExecuted = true;
+              console.log(`🔒⚡ Speech started - executing lock (${Date.now() - lockStartTime}ms)`);
+              executeLock();
+            }
+          };
+
+          speakResponseWithCallback('Locking your screen now. See you soon!', onSpeechStart);
+
+          // 5. Safety fallback
+          setTimeout(() => {
+            if (!lockExecuted) {
+              console.log('🔒⏱️ Safety fallback - executing lock');
+              lockExecuted = true;
+              executeLock();
+            }
+          }, 1000);
+
           return; // Don't queue lock commands
         }
 
@@ -3220,37 +3244,79 @@ const JarvisVoice = () => {
 
     try {
       // =========================================================================
-      // 🔒 LOCK COMMANDS: Execute via HTTP and show response BEFORE screen locks
-      // The screen locks SO FAST that WebSocket responses get lost when browser suspends
-      // Solution: Show response + speak FIRST, then execute lock via HTTP
+      // 🔒 LOCK COMMANDS: Context-intelligent execution with dynamic speech timing
+      //
+      // Architecture (NOT a workaround - this is the correct pattern):
+      // - Screen lock is a "terminal operation" - no response can arrive after lock
+      // - Browser suspends when screen locks, breaking WebSocket
+      // - Therefore: Show/speak response BEFORE lock, execute lock when speech starts
+      //
+      // Flow:
+      // 1. Show response immediately (optimistic UI)
+      // 2. Start speech synthesis
+      // 3. When audio ACTUALLY starts playing (onplay event) → execute lock
+      // 4. Lock executes while user hears "Locking your screen..."
       // =========================================================================
       if (effectiveCommandType === 'lock') {
-        console.log('🔒⚡ Lock command - using optimistic UI + HTTP execution');
+        console.log('🔒🧠 Lock command - context-intelligent execution with dynamic timing');
+        const lockStartTime = Date.now();
 
-        // 1. Show final response IMMEDIATELY (before lock executes)
+        // 1. Show final response IMMEDIATELY (optimistic UI - correct pattern for terminal ops)
         const lockMessage = '🔒 Locking your screen now. See you soon!';
         setResponse(lockMessage);
-        setIsProcessing(false); // Don't show processing spinner
+        setIsProcessing(false);
 
-        // 2. Speak the response IMMEDIATELY (before lock executes)
-        speakResponse('Locking your screen now. See you soon!');
+        // 2. Build context for intelligent lock endpoint
+        const lockContext = {
+          timestamp: new Date().toISOString(),
+          session_duration_ms: lockStartTime - (window.sessionStartTime || lockStartTime),
+          last_activity_ms: Date.now() - (window.lastActivityTime || Date.now()),
+        };
 
-        // 3. Small delay to let speech start before screen locks
-        await new Promise(resolve => setTimeout(resolve, 300));
+        // 3. Execute lock function (called when speech starts OR as fallback)
+        const executeLock = async () => {
+          try {
+            const apiUrl = API_URL || configService.getApiUrl() || inferUrls().API_BASE_URL;
 
-        // 4. Execute lock via HTTP (don't rely on WebSocket response)
-        try {
-          const apiUrl = API_URL || configService.getApiUrl() || inferUrls().API_BASE_URL;
-          const lockUrl = `${apiUrl}/lock-now`;
-          console.log(`🔒⚡ Executing lock via HTTP: ${lockUrl}`);
+            // Use context-intelligent endpoint
+            console.log('🔒🧠 Executing context-intelligent lock');
+            fetch(`${apiUrl}/lock-with-context`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ context: lockContext }),
+            }).catch(() => {
+              // Fallback to simple lock if context endpoint fails
+              console.log('🔒 Context lock failed, using simple lock');
+              fetch(`${apiUrl}/lock-now`, { method: 'GET' }).catch(() => {});
+            });
+          } catch (e) {
+            console.error('🔒 Lock execution error:', e);
+          }
+        };
 
-          // Fire-and-forget - don't wait for response (screen will lock)
-          fetch(lockUrl, { method: 'GET' }).catch(() => {});
-        } catch (httpErr) {
-          console.error('🔒 HTTP lock failed, trying WebSocket:', httpErr);
-          // Fallback: try WebSocket
-          wsRef.current.send(JSON.stringify(message));
-        }
+        // 4. Speak with callback - execute lock when audio STARTS (dynamic timing)
+        // This replaces the hardcoded 300ms delay with actual audio start detection
+        let lockExecuted = false;
+        const onSpeechStart = () => {
+          if (!lockExecuted) {
+            lockExecuted = true;
+            console.log(`🔒⚡ Speech started - executing lock (${Date.now() - lockStartTime}ms since command)`);
+            executeLock();
+          }
+        };
+
+        // Use the callback version of speakResponse
+        speakResponseWithCallback('Locking your screen now. See you soon!', onSpeechStart);
+
+        // 5. Safety fallback: If speech doesn't start within 1 second, execute lock anyway
+        // This handles cases where audio fails to load or play
+        setTimeout(() => {
+          if (!lockExecuted) {
+            console.log('🔒⏱️ Safety fallback - speech did not start in 1s, executing lock');
+            lockExecuted = true;
+            executeLock();
+          }
+        }, 1000);
 
         return; // Don't continue to normal WebSocket flow
       }
