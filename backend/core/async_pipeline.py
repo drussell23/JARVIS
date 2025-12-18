@@ -1263,6 +1263,26 @@ class AdvancedAsyncPipeline:
         ):
             return await self._fast_voice_security_test(text, user_name, metadata)
 
+        # =====================================================================
+        # PROACTIVE CONTEXT AWARENESS INTELLIGENCE (CAI) - LOCKED SCREEN DETECTION
+        # =====================================================================
+        # Transparently detect if screen is locked and handle unlock + continuation
+        # This enables autonomous workflows like:
+        #   "Hey JARVIS, search for dogs" → detect lock → verify voice → unlock → search
+        # =====================================================================
+        if not (metadata or {}).get("screen_just_unlocked", False):
+            # Skip if we just completed an unlock to prevent infinite loops
+            proactive_unlock_result = await self._handle_proactive_unlock_if_needed(
+                text=text,
+                user_name=user_name,
+                metadata=metadata,
+                audio_data=audio_data,
+                speaker_name=speaker_name,
+                priority=priority,
+            )
+            if proactive_unlock_result is not None:
+                return proactive_unlock_result
+
         # Create pipeline context
         command_id = f"cmd_{int(time.time() * 1000)}"
         context = PipelineContext(
@@ -1408,6 +1428,383 @@ class AdvancedAsyncPipeline:
             "response": "Command processed successfully",
             "metadata": context.metadata
         })
+
+    # =========================================================================
+    # PROACTIVE UNLOCK + POST-UNLOCK RE-ENTRY (CAI Integration)
+    # =========================================================================
+    # This enables autonomous workflows like:
+    #   User: "Hey JARVIS, search for dogs"
+    #   JARVIS: [detects locked screen] → [verifies voice] → [unlocks]
+    #           → [continues executing "search for dogs"]
+    # =========================================================================
+
+    async def _handle_proactive_unlock_if_needed(
+        self,
+        text: str,
+        user_name: str,
+        metadata: Optional[Dict] = None,
+        audio_data: Optional[bytes] = None,
+        speaker_name: Optional[str] = None,
+        priority: int = 0,
+    ) -> Optional[Dict]:
+        """
+        Proactively detect locked screen and handle transparent unlock with continuation.
+
+        This method implements the autonomous unlock workflow:
+        1. Uses CAI ScreenLockContextDetector to check screen state
+        2. Uses IntentAnalyzer to determine if command requires screen access
+        3. If locked and needs screen, performs VBI verification + unlock
+        4. Provides verbal acknowledgment through the entire flow
+        5. Re-injects original command with screen_just_unlocked flag
+
+        Args:
+            text: Original command text
+            user_name: User name
+            metadata: Optional metadata dict
+            audio_data: Optional voice audio data for VBI authentication
+            speaker_name: Optional identified speaker name
+            priority: Command priority
+
+        Returns:
+            None if no proactive action needed (let normal pipeline continue)
+            Dict with result if proactive unlock was performed and command executed
+        """
+        start_time = time.time()
+
+        try:
+            # ─────────────────────────────────────────────────────────────────
+            # Step 1: Import CAI Components (lazy import for performance)
+            # ─────────────────────────────────────────────────────────────────
+            from context_intelligence.detectors.screen_lock_detector import (
+                get_screen_lock_detector,
+            )
+            from context_intelligence.analyzers.intent_analyzer import (
+                get_intent_analyzer,
+                IntentType,
+            )
+
+            screen_detector = get_screen_lock_detector()
+            intent_analyzer = get_intent_analyzer()
+
+            # ─────────────────────────────────────────────────────────────────
+            # Step 2: Check if screen is locked
+            # ─────────────────────────────────────────────────────────────────
+            is_locked = await screen_detector.is_screen_locked()
+
+            if not is_locked:
+                # Screen is not locked - no proactive action needed
+                return None
+
+            logger.info(
+                f"🔒 [PROACTIVE-CAI] Screen is LOCKED - analyzing command: '{text[:50]}...'"
+            )
+
+            # ─────────────────────────────────────────────────────────────────
+            # Step 3: Analyze intent to determine if command requires screen
+            # ─────────────────────────────────────────────────────────────────
+            intent = await intent_analyzer.analyze(text)
+
+            # Commands that don't require screen access can proceed without unlock
+            if not intent.requires_screen:
+                logger.info(
+                    f"🔓 [PROACTIVE-CAI] Command doesn't require screen (intent={intent.type.value}) - "
+                    f"skipping proactive unlock"
+                )
+                return None
+
+            logger.info(
+                f"📺 [PROACTIVE-CAI] Command requires screen access: "
+                f"intent={intent.type.value}, confidence={intent.confidence:.1%}"
+            )
+
+            # ─────────────────────────────────────────────────────────────────
+            # Step 4: Check screen context with CAI for detailed analysis
+            # ─────────────────────────────────────────────────────────────────
+            screen_context = await screen_detector.check_screen_context(
+                text, speaker_name=speaker_name
+            )
+
+            if not screen_context.get("requires_unlock", False):
+                # CAI determined unlock not required (command exempt)
+                return None
+
+            # ─────────────────────────────────────────────────────────────────
+            # Step 5: Extract semantic continuation intent
+            # ─────────────────────────────────────────────────────────────────
+            continuation_action = self._extract_continuation_intent(text, intent)
+
+            logger.info(
+                f"🎯 [PROACTIVE-CAI] Semantic continuation: '{continuation_action}'"
+            )
+
+            # ─────────────────────────────────────────────────────────────────
+            # Step 6: Verbal acknowledgment - tell user we're unlocking
+            # ─────────────────────────────────────────────────────────────────
+            acknowledgment = self._generate_proactive_acknowledgment(
+                speaker_name=speaker_name or user_name,
+                continuation_action=continuation_action,
+            )
+
+            logger.info(f"🎤 [PROACTIVE-CAI] Acknowledgment: '{acknowledgment}'")
+
+            # Speak the acknowledgment asynchronously
+            await self._speak_acknowledgment(acknowledgment)
+
+            # ─────────────────────────────────────────────────────────────────
+            # Step 7: Perform VBI verification and unlock
+            # ─────────────────────────────────────────────────────────────────
+            logger.info(f"🔐 [PROACTIVE-CAI] Performing VBI verification and unlock...")
+
+            unlock_result = await self._fast_lock_unlock(
+                text="unlock my screen",  # Internal unlock command
+                user_name=user_name,
+                metadata={
+                    **(metadata or {}),
+                    "proactive_unlock": True,
+                    "original_command": text,
+                    "continuation_intent": continuation_action,
+                },
+                audio_data=audio_data,
+                speaker_name=speaker_name,
+            )
+
+            if not unlock_result.get("success", False):
+                # Unlock failed - return the failure result
+                logger.warning(
+                    f"❌ [PROACTIVE-CAI] Unlock failed: {unlock_result.get('response', 'Unknown error')}"
+                )
+                return unlock_result
+
+            logger.info(f"✅ [PROACTIVE-CAI] Screen unlocked successfully!")
+
+            # ─────────────────────────────────────────────────────────────────
+            # Step 8: POST-UNLOCK RE-ENTRY - Continue with original command
+            # ─────────────────────────────────────────────────────────────────
+            # Brief pause to ensure screen is fully unlocked
+            await asyncio.sleep(0.5)
+
+            logger.info(
+                f"🔄 [PROACTIVE-CAI] RE-ENTRY: Executing original command: '{text[:50]}...'"
+            )
+
+            # Re-inject the original command with screen_just_unlocked flag
+            continuation_result = await self.process_async(
+                text=text,
+                user_name=user_name,
+                priority=priority,
+                metadata={
+                    **(metadata or {}),
+                    "screen_just_unlocked": True,
+                    "proactive_unlock_performed": True,
+                    "unlock_latency_ms": (time.time() - start_time) * 1000,
+                },
+                audio_data=audio_data,
+                speaker_name=speaker_name,
+            )
+
+            # Merge the unlock info into the continuation result
+            total_latency = (time.time() - start_time) * 1000
+            continuation_result["proactive_unlock"] = {
+                "performed": True,
+                "unlock_latency_ms": unlock_result.get("latency_ms", 0),
+                "total_latency_ms": total_latency,
+                "continuation_intent": continuation_action,
+            }
+
+            logger.info(
+                f"✅ [PROACTIVE-CAI] Complete workflow finished in {total_latency:.0f}ms"
+            )
+
+            # ─────────────────────────────────────────────────────────────────
+            # Step 9: Success acknowledgment (if continuation succeeded)
+            # ─────────────────────────────────────────────────────────────────
+            if continuation_result.get("success", False):
+                # Generate success message based on what we did
+                success_message = self._generate_completion_acknowledgment(
+                    speaker_name=speaker_name or user_name,
+                    continuation_action=continuation_action,
+                    continuation_result=continuation_result,
+                )
+                # Speak success asynchronously (fire and forget)
+                asyncio.create_task(self._speak_acknowledgment(success_message))
+
+            return continuation_result
+
+        except ImportError as e:
+            # CAI components not available - fall back to normal pipeline
+            logger.debug(f"[PROACTIVE-CAI] CAI components not available: {e}")
+            return None
+        except Exception as e:
+            logger.warning(f"[PROACTIVE-CAI] Error during proactive handling: {e}")
+            # Don't block normal pipeline on errors
+            return None
+
+    def _extract_continuation_intent(self, text: str, intent: Any) -> str:
+        """
+        Extract the semantic continuation intent from the command.
+
+        This determines what the user actually wants to do AFTER the screen is unlocked.
+
+        Args:
+            text: Original command text
+            intent: Analyzed intent from IntentAnalyzer
+
+        Returns:
+            Human-readable description of what to do after unlock
+        """
+        text_lower = text.lower()
+
+        # Common patterns and their semantic meanings
+        patterns = [
+            # Search patterns
+            (r"search\s+(?:for\s+)?(.+)", lambda m: f"search for {m.group(1)}"),
+            (r"google\s+(.+)", lambda m: f"search for {m.group(1)}"),
+            (r"look\s+up\s+(.+)", lambda m: f"look up {m.group(1)}"),
+            # App launch patterns
+            (r"open\s+(.+)", lambda m: f"open {m.group(1)}"),
+            (r"launch\s+(.+)", lambda m: f"launch {m.group(1)}"),
+            (r"start\s+(.+)", lambda m: f"start {m.group(1)}"),
+            # Navigation patterns
+            (r"go\s+to\s+(.+)", lambda m: f"navigate to {m.group(1)}"),
+            (r"navigate\s+to\s+(.+)", lambda m: f"navigate to {m.group(1)}"),
+            # File operations
+            (r"(?:create|write)\s+(?:an?\s+)?(.+)", lambda m: f"create {m.group(1)}"),
+            (r"edit\s+(.+)", lambda m: f"edit {m.group(1)}"),
+        ]
+
+        for pattern, extractor in patterns:
+            match = re.search(pattern, text_lower, re.IGNORECASE)
+            if match:
+                return extractor(match)
+
+        # Fallback: use intent type for description
+        intent_descriptions = {
+            "app_launch": "open the application",
+            "web_browse": "browse the web",
+            "file_operation": "perform file operation",
+            "document_creation": "create document",
+            "system_query": "check system status",
+        }
+
+        return intent_descriptions.get(
+            intent.type.value if hasattr(intent.type, "value") else str(intent.type),
+            "complete your request"
+        )
+
+    def _generate_proactive_acknowledgment(
+        self,
+        speaker_name: str,
+        continuation_action: str,
+    ) -> str:
+        """
+        Generate contextual verbal acknowledgment for proactive unlock.
+
+        Creates a natural, personalized message that tells the user:
+        1. We detected the screen is locked
+        2. We're verifying their voice
+        3. We'll continue with their original request after unlock
+
+        Args:
+            speaker_name: Identified speaker name for personalization
+            continuation_action: What we'll do after unlock
+
+        Returns:
+            Natural acknowledgment message to speak
+        """
+        # Dynamic templates for variety
+        templates = [
+            f"I notice your screen is locked, {speaker_name}. Let me verify your voice and unlock it so I can {continuation_action}.",
+            f"Your screen is locked. Verifying your voice now, {speaker_name}, then I'll {continuation_action}.",
+            f"Screen's locked. One moment while I verify it's you, {speaker_name}. I'll {continuation_action} right after.",
+            f"Let me unlock your screen first, {speaker_name}. Then I'll {continuation_action} for you.",
+        ]
+
+        # Use consistent selection based on command hash for predictability
+        import hashlib
+        hash_val = int(hashlib.md5(continuation_action.encode()).hexdigest()[:8], 16)
+        return templates[hash_val % len(templates)]
+
+    def _generate_completion_acknowledgment(
+        self,
+        speaker_name: str,
+        continuation_action: str,
+        continuation_result: Dict,
+    ) -> str:
+        """
+        Generate contextual verbal acknowledgment after successful continuation.
+
+        Creates a natural, personalized message that confirms the original
+        task has been completed after the proactive unlock.
+
+        Args:
+            speaker_name: Identified speaker name for personalization
+            continuation_action: What we completed
+            continuation_result: Result from the continuation execution
+
+        Returns:
+            Natural completion message to speak
+        """
+        # Check if the response includes a message we can use
+        response_msg = continuation_result.get("response", "")
+        if response_msg and len(response_msg) < 100:
+            # Use the actual response if it's short and meaningful
+            return response_msg
+
+        # Dynamic templates for variety
+        templates = [
+            f"Done, {speaker_name}. I've completed that for you.",
+            f"All set, {speaker_name}.",
+            f"There you go, {speaker_name}. Task complete.",
+            f"Finished, {speaker_name}.",
+        ]
+
+        # Use consistent selection based on action hash
+        import hashlib
+        hash_val = int(hashlib.md5(continuation_action.encode()).hexdigest()[:8], 16)
+        return templates[hash_val % len(templates)]
+
+    async def _speak_acknowledgment(self, message: str) -> None:
+        """
+        Speak the acknowledgment message using available TTS.
+
+        Tries multiple TTS backends in order of preference:
+        1. AGI OS voice communicator (if available)
+        2. JARVIS voice API (if available)
+        3. Direct macOS `say` command (fallback)
+
+        Args:
+            message: The message to speak
+        """
+        try:
+            # Try AGI OS voice communicator first
+            if hasattr(self, "_agi_voice_communicator") and self._agi_voice_communicator:
+                await self._agi_voice_communicator.speak(message, priority="high")
+                return
+
+            # Try JARVIS voice API
+            try:
+                import aiohttp
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        "http://localhost:8010/audio/speak",
+                        json={"text": message, "voice": "Daniel"},
+                        timeout=aiohttp.ClientTimeout(total=5.0),
+                    ) as resp:
+                        if resp.status == 200:
+                            return
+            except Exception:
+                pass
+
+            # Fallback to macOS say command
+            process = await asyncio.create_subprocess_exec(
+                "say", "-v", "Daniel", message,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(process.wait(), timeout=10.0)
+
+        except Exception as e:
+            logger.debug(f"[PROACTIVE-CAI] Could not speak acknowledgment: {e}")
 
     async def _fast_lock_unlock(
         self,
