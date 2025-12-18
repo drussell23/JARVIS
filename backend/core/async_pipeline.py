@@ -1451,7 +1451,7 @@ class AdvancedAsyncPipeline:
         Proactively detect locked screen and handle transparent unlock with continuation.
 
         This method implements the autonomous unlock workflow:
-        1. Uses CAI ScreenLockContextDetector to check screen state
+        1. Uses fast screen lock detection (non-blocking with timeout)
         2. Uses IntentAnalyzer to determine if command requires screen access
         3. If locked and needs screen, performs VBI verification + unlock
         4. Provides verbal acknowledgment through the entire flow
@@ -1471,25 +1471,46 @@ class AdvancedAsyncPipeline:
         """
         start_time = time.time()
 
+        # Wrap entire operation in timeout to prevent hangs
+        try:
+            return await asyncio.wait_for(
+                self._proactive_unlock_impl(
+                    text=text,
+                    user_name=user_name,
+                    metadata=metadata,
+                    audio_data=audio_data,
+                    speaker_name=speaker_name,
+                    priority=priority,
+                    start_time=start_time,
+                ),
+                timeout=30.0  # Max 30 seconds for entire proactive flow
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f"⏱️ [PROACTIVE-CAI] Timeout after 30s - falling back to normal pipeline")
+            return None
+        except Exception as e:
+            logger.warning(f"[PROACTIVE-CAI] Error: {e} - falling back to normal pipeline")
+            return None
+
+    async def _proactive_unlock_impl(
+        self,
+        text: str,
+        user_name: str,
+        metadata: Optional[Dict],
+        audio_data: Optional[bytes],
+        speaker_name: Optional[str],
+        priority: int,
+        start_time: float,
+    ) -> Optional[Dict]:
+        """
+        Internal implementation of proactive unlock with full CAI integration.
+        Separated to allow timeout wrapper in parent method.
+        """
         try:
             # ─────────────────────────────────────────────────────────────────
-            # Step 1: Import CAI Components (lazy import for performance)
+            # Step 1: FAST Screen Lock Check (direct, non-blocking)
             # ─────────────────────────────────────────────────────────────────
-            from context_intelligence.detectors.screen_lock_detector import (
-                get_screen_lock_detector,
-            )
-            from context_intelligence.analyzers.intent_analyzer import (
-                get_intent_analyzer,
-                IntentType,
-            )
-
-            screen_detector = get_screen_lock_detector()
-            intent_analyzer = get_intent_analyzer()
-
-            # ─────────────────────────────────────────────────────────────────
-            # Step 2: Check if screen is locked
-            # ─────────────────────────────────────────────────────────────────
-            is_locked = await screen_detector.is_screen_locked()
+            is_locked = await self._fast_check_screen_locked()
 
             if not is_locked:
                 # Screen is not locked - no proactive action needed
@@ -1500,32 +1521,28 @@ class AdvancedAsyncPipeline:
             )
 
             # ─────────────────────────────────────────────────────────────────
-            # Step 3: Analyze intent to determine if command requires screen
+            # Step 2: Analyze intent to determine if command requires screen
             # ─────────────────────────────────────────────────────────────────
-            intent = await intent_analyzer.analyze(text)
+            intent = await self._analyze_intent_for_screen_requirement(text)
 
             # Commands that don't require screen access can proceed without unlock
-            if not intent.requires_screen:
+            if not intent.get("requires_screen", True):
                 logger.info(
-                    f"🔓 [PROACTIVE-CAI] Command doesn't require screen (intent={intent.type.value}) - "
+                    f"🔓 [PROACTIVE-CAI] Command doesn't require screen (intent={intent.get('type', 'unknown')}) - "
                     f"skipping proactive unlock"
                 )
                 return None
 
             logger.info(
                 f"📺 [PROACTIVE-CAI] Command requires screen access: "
-                f"intent={intent.type.value}, confidence={intent.confidence:.1%}"
+                f"intent={intent.get('type', 'unknown')}, confidence={intent.get('confidence', 0):.1%}"
             )
 
             # ─────────────────────────────────────────────────────────────────
-            # Step 4: Check screen context with CAI for detailed analysis
+            # Step 3: Check if command is exempt from unlock requirement
             # ─────────────────────────────────────────────────────────────────
-            screen_context = await screen_detector.check_screen_context(
-                text, speaker_name=speaker_name
-            )
-
-            if not screen_context.get("requires_unlock", False):
-                # CAI determined unlock not required (command exempt)
+            if self._is_command_screen_exempt(text):
+                logger.info(f"🔓 [PROACTIVE-CAI] Command is screen-exempt - skipping proactive unlock")
                 return None
 
             # ─────────────────────────────────────────────────────────────────
@@ -1639,6 +1656,178 @@ class AdvancedAsyncPipeline:
             # Don't block normal pipeline on errors
             return None
 
+    async def _fast_check_screen_locked(self) -> bool:
+        """
+        Fast, non-blocking screen lock detection with multiple fallback strategies.
+
+        Uses direct low-level detection to avoid slow module imports.
+        Returns within 2 seconds max.
+        """
+        try:
+            # Strategy 1: Direct Quartz session check (fastest, most reliable)
+            try:
+                from Quartz import CGSessionCopyCurrentDictionary
+                session_dict = CGSessionCopyCurrentDictionary()
+                if session_dict:
+                    is_locked = session_dict.get("CGSSessionScreenIsLocked", False)
+                    screen_saver = session_dict.get("CGSSessionScreenSaverIsRunning", False)
+                    if is_locked or screen_saver:
+                        logger.debug(f"[FAST-LOCK-CHECK] Quartz: locked={is_locked}, screensaver={screen_saver}")
+                        return True
+                    return False
+            except ImportError:
+                pass
+
+            # Strategy 2: Try the voice_unlock screen detector directly
+            try:
+                from voice_unlock.objc.server.screen_lock_detector import is_screen_locked
+                result = await asyncio.wait_for(
+                    asyncio.get_event_loop().run_in_executor(None, is_screen_locked),
+                    timeout=1.5
+                )
+                return bool(result)
+            except (ImportError, asyncio.TimeoutError):
+                pass
+
+            # Strategy 3: Check for loginwindow process (indicates lock screen)
+            try:
+                process = await asyncio.create_subprocess_exec(
+                    "pgrep", "-x", "loginwindow",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                stdout, _ = await asyncio.wait_for(process.communicate(), timeout=1.0)
+                # loginwindow always runs, but if CGSSession is locked, screen is locked
+                # This is a fallback that assumes unlocked if we can't determine
+                return False
+            except (asyncio.TimeoutError, Exception):
+                pass
+
+            # Default: assume unlocked to avoid blocking user commands
+            logger.debug("[FAST-LOCK-CHECK] Could not determine lock state - assuming unlocked")
+            return False
+
+        except Exception as e:
+            logger.debug(f"[FAST-LOCK-CHECK] Error: {e} - assuming unlocked")
+            return False
+
+    async def _analyze_intent_for_screen_requirement(self, text: str) -> Dict[str, Any]:
+        """
+        Analyze command intent to determine if it requires screen access.
+
+        Uses lightweight pattern matching for speed, with optional CAI integration.
+        Returns dict with: type, requires_screen, confidence
+        """
+        text_lower = text.lower()
+
+        # Fast pattern-based intent detection (no heavy imports)
+        intent_patterns = {
+            # Screen-required intents
+            "app_launch": {
+                "patterns": [r"\b(open|launch|start|run)\s+\w+", r"\bswitch\s+to\s+\w+"],
+                "requires_screen": True,
+            },
+            "web_browse": {
+                "patterns": [r"\b(search|google|look up|browse)\b", r"\bgo\s+to\s+.*\.(com|org|net)"],
+                "requires_screen": True,
+            },
+            "file_operation": {
+                "patterns": [r"\b(create|edit|save|open)\s+(file|document|folder)"],
+                "requires_screen": True,
+            },
+            "ui_interaction": {
+                "patterns": [r"\b(click|scroll|type|select|minimize|maximize)\b"],
+                "requires_screen": True,
+            },
+            # Screen-NOT-required intents
+            "time_weather": {
+                "patterns": [r"\b(what|tell).*(time|weather|temperature)", r"\bhow's\s+the\s+weather"],
+                "requires_screen": False,
+            },
+            "voice_only": {
+                "patterns": [r"\b(play|pause|stop)\s+(music|audio)", r"\bset\s+(timer|alarm|reminder)"],
+                "requires_screen": False,
+            },
+            "screen_control": {
+                "patterns": [r"\b(lock|unlock)\s+(my\s+)?(screen|computer|mac)"],
+                "requires_screen": False,  # Screen control handles itself
+            },
+        }
+
+        for intent_type, config in intent_patterns.items():
+            for pattern in config["patterns"]:
+                if re.search(pattern, text_lower, re.IGNORECASE):
+                    return {
+                        "type": intent_type,
+                        "requires_screen": config["requires_screen"],
+                        "confidence": 0.85,
+                        "pattern_matched": pattern,
+                    }
+
+        # Try CAI IntentAnalyzer if available (with timeout)
+        try:
+            # Direct import to avoid module chain issues
+            import importlib.util
+            spec = importlib.util.spec_from_file_location(
+                "intent_analyzer",
+                str(Path(__file__).parent.parent / "context_intelligence" / "analyzers" / "intent_analyzer.py")
+            )
+            if spec and spec.loader:
+                intent_mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(intent_mod)
+                analyzer = intent_mod.get_intent_analyzer()
+
+                intent = await asyncio.wait_for(
+                    analyzer.analyze(text),
+                    timeout=2.0
+                )
+                return {
+                    "type": intent.type.value if hasattr(intent.type, "value") else str(intent.type),
+                    "requires_screen": intent.requires_screen,
+                    "confidence": intent.confidence,
+                    "source": "cai_analyzer",
+                }
+        except (ImportError, asyncio.TimeoutError, Exception) as e:
+            logger.debug(f"[INTENT-ANALYSIS] CAI analyzer unavailable: {e}")
+
+        # Default: assume screen required for safety
+        return {
+            "type": "unknown",
+            "requires_screen": True,
+            "confidence": 0.5,
+        }
+
+    def _is_command_screen_exempt(self, text: str) -> bool:
+        """
+        Check if command is exempt from screen unlock requirement.
+
+        Some commands can run regardless of screen state.
+        """
+        text_lower = text.lower()
+
+        exempt_patterns = [
+            # Screen control (handled separately)
+            r"\b(lock|unlock)\s+(my\s+)?(screen|computer|mac)\b",
+            # Voice-only commands
+            r"\bwhat\s+(time|is the time)\b",
+            r"\b(what's|how's)\s+the\s+weather\b",
+            r"\bset\s+(a\s+)?(timer|alarm|reminder)\b",
+            r"\b(play|pause|stop|skip)\s+(music|song|audio)\b",
+            # System info
+            r"\b(tell me|what is)\s+(the\s+)?(battery|volume)\b",
+            # Conversational
+            r"\bhey\s+jarvis\b",
+            r"\bthank\s+you\b",
+            r"\bgoodbye\b",
+            r"\bhow\s+are\s+you\b",
+        ]
+
+        for pattern in exempt_patterns:
+            if re.search(pattern, text_lower, re.IGNORECASE):
+                return True
+
+        return False
+
     def _extract_continuation_intent(self, text: str, intent: Any) -> str:
         """
         Extract the semantic continuation intent from the command.
@@ -1686,10 +1875,15 @@ class AdvancedAsyncPipeline:
             "system_query": "check system status",
         }
 
-        return intent_descriptions.get(
-            intent.type.value if hasattr(intent.type, "value") else str(intent.type),
-            "complete your request"
-        )
+        # Handle both dict-based intent (our format) and object-based intent (CAI format)
+        if isinstance(intent, dict):
+            intent_type = intent.get("type", "unknown")
+        elif hasattr(intent, "type"):
+            intent_type = intent.type.value if hasattr(intent.type, "value") else str(intent.type)
+        else:
+            intent_type = "unknown"
+
+        return intent_descriptions.get(intent_type, "complete your request")
 
     def _generate_proactive_acknowledgment(
         self,
