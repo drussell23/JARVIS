@@ -2,100 +2,58 @@
 
 ## Executive Summary
 
-- **Workflow**: Code Quality Checks
-- **Run Number**: #971
-- **Branch**: `main`
-- **Commit**: `1672bc2c1f58f1742c94fa619720004d6fa97941`
+- **Workflow**: PR Automation & Validation
+- **Run Number**: #1000
+- **Branch**: `fix/ci/code-quality-checks-run971-20251218-105316`
+- **Commit**: `f3c09689e8c667ed7f5e8548e5ac92e39beb096e`
 - **Status**: ❌ FAILED
-- **Timestamp**: 2025-12-18T10:39:49Z
-- **Triggered By**: @drussell23
-- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/20334188449)
+- **Timestamp**: 2025-12-18T10:53:43Z
+- **Triggered By**: @cubic-dev-ai[bot]
+- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/20334548357)
 
 ## Failure Overview
 
-Total Failed Jobs: **2**
+Total Failed Jobs: **1**
 
 | # | Job Name | Category | Severity | Duration |
 |---|----------|----------|----------|----------|
-| 1 | Quality Checks (bandit, Security, 🔒) | permission_error | high | 448s |
-| 2 | Generate Summary | permission_error | high | 4s |
+| 1 | Validate PR Title | timeout | high | 5s |
 
 ## Detailed Analysis
 
-### 1. Quality Checks (bandit, Security, 🔒)
+### 1. Validate PR Title
 
 **Status**: ❌ failure
-**Category**: Permission Error
+**Category**: Timeout
 **Severity**: HIGH
-**Started**: 2025-12-18T10:40:05Z
-**Completed**: 2025-12-18T10:47:33Z
-**Duration**: 448 seconds
-**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/20334188449/job/58416552518)
+**Started**: 2025-12-18T10:53:47Z
+**Completed**: 2025-12-18T10:53:52Z
+**Duration**: 5 seconds
+**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/20334548357/job/58417747409)
 
 #### Failed Steps
 
-- **Step 2**: Checkout Code
+- **Step 2**: Validate Conventional Commits
 
 #### Error Analysis
 
 **Detected Error Patterns:**
 
 - Pattern: `ERROR|Error|error`
-  - Occurrences: 4
+  - Occurrences: 2
   - Sample matches:
-    - Line 37: `2025-12-18T10:42:22.8589746Z ##[error]fatal: unable to access 'https://github.com/drussell23/JARVIS/`
-    - Line 41: `2025-12-18T10:44:58.5046286Z ##[error]fatal: unable to access 'https://github.com/drussell23/JARVIS/`
-    - Line 45: `2025-12-18T10:47:30.0567511Z ##[error]fatal: unable to access 'https://github.com/drussell23/JARVIS/`
+    - Line 27: `2025-12-18T10:53:49.7713562Z   subjectPatternError: The PR title must start with a capital letter.`
+    - Line 39: `2025-12-18T10:53:50.3386154Z ##[error]No release type found in pull request title "🚨 Fix CI/CD: Code`
 
-- Pattern: `FAIL|Failed|failed`
-  - Occurrences: 6
-  - Sample matches:
-    - Line 37: `2025-12-18T10:42:22.8589746Z ##[error]fatal: unable to access 'https://github.com/drussell23/JARVIS/`
-    - Line 38: `2025-12-18T10:42:22.8597682Z The process '/usr/bin/git' failed with exit code 128`
-    - Line 41: `2025-12-18T10:44:58.5046286Z ##[error]fatal: unable to access 'https://github.com/drussell23/JARVIS/`
-
-- Pattern: `WARN|Warning|warning`
+- Pattern: `timeout|timed out`
   - Occurrences: 1
   - Sample matches:
-    - Line 9: `2025-12-18T10:40:07.0578863Z hint: to use in all of your new repositories, which will suppress this `
+    - Line 31: `- fix: Resolve database connection timeout`
 
 #### Suggested Fixes
 
-1. Review the logs above for specific error messages
-
----
-
-### 2. Generate Summary
-
-**Status**: ❌ failure
-**Category**: Permission Error
-**Severity**: HIGH
-**Started**: 2025-12-18T10:47:35Z
-**Completed**: 2025-12-18T10:47:39Z
-**Duration**: 4 seconds
-**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/20334188449/job/58417211187)
-
-#### Failed Steps
-
-- **Step 3**: Generate Comprehensive Summary
-
-#### Error Analysis
-
-**Detected Error Patterns:**
-
-- Pattern: `ERROR|Error|error`
-  - Occurrences: 1
-  - Sample matches:
-    - Line 83: `2025-12-18T10:47:37.9651956Z ##[error]Process completed with exit code 1.`
-
-- Pattern: `FAIL|Failed|failed`
-  - Occurrences: 1
-  - Sample matches:
-    - Line 55: `2025-12-18T10:47:37.9500166Z [36;1mQUALITY_RESULT="failure"[0m`
-
-#### Suggested Fixes
-
-1. Review the logs above for specific error messages
+1. Consider increasing timeout values or optimizing slow operations
+2. Check service availability and network connectivity
 
 ---
 
@@ -115,5 +73,5 @@ Total Failed Jobs: **2**
 
 ---
 
-📊 *Report generated on 2025-12-18T10:53:16.202518*
+📊 *Report generated on 2025-12-18T10:54:39.664970*
 🤖 *JARVIS CI/CD Auto-PR Manager*
