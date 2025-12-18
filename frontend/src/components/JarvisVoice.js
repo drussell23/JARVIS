@@ -3083,8 +3083,45 @@ const JarvisVoice = () => {
         }
       }
       
-      // If still not connected, queue the command for when connection is restored
+      // If still not connected, handle based on command type
       if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+        // =========================================================================
+        // 🔒 LOCK COMMANDS: Use HTTP fallback - don't wait for WebSocket!
+        // Lock is a LOCAL operation that doesn't need WebSocket bidirectional comm
+        // =========================================================================
+        if (effectiveCommandType === 'lock') {
+          console.log('🔒⚡ WebSocket unavailable - using ULTRA-FAST HTTP lock');
+          setResponse('🔒 Locking...');
+
+          try {
+            // Use ultra-minimal lock endpoint that bypasses all infrastructure
+            const apiUrl = API_URL || configService.getApiUrl() || inferUrls().API_BASE_URL;
+            const lockUrl = `${apiUrl}/lock-now`;
+
+            console.log(`🔒⚡ Calling ultra-fast lock: ${lockUrl}`);
+
+            const response = await fetch(lockUrl, {
+              method: 'GET', // GET for simplicity - no body needed
+              signal: AbortSignal.timeout(5000)
+            });
+
+            if (response.ok) {
+              const result = await response.json();
+              console.log('🔒✅ Ultra-fast lock succeeded:', result);
+              setResponse('🔒 Locking your screen now. See you soon!');
+              speakResponse('Locking your screen now. See you soon!');
+            } else {
+              console.error('🔒❌ Lock failed:', response.status);
+              setResponse('❌ Lock failed - please try again');
+            }
+          } catch (httpError) {
+            console.error('🔒❌ HTTP lock error:', httpError);
+            setResponse('❌ Could not lock screen - backend may be offline');
+          }
+          return; // Don't queue lock commands
+        }
+
+        // For non-lock commands, queue for later delivery
         console.warn('❌ Quick reconnect failed - queuing command for later delivery');
 
         // Get audio while we can for later use

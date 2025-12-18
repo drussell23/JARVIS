@@ -2243,6 +2243,84 @@ class JARVISVoiceAPI:
                         }
                     )
 
+                    # =========================================================================
+                    # ULTRA FAST PATH v3.0: Lock detection FIRST - bypasses ALL other processing
+                    # This MUST be the very first check to prevent any blocking operations
+                    # =========================================================================
+                    import re as _re_fast
+
+                    _cmd_lower = command_text.lower().strip()
+                    # Quick wake phrase strip (inline, no function call overhead)
+                    for _wp in ['hey jarvis', 'hey jarvus', 'jarvis', 'jarvus', 'okay jarvis']:
+                        if _wp in _cmd_lower:
+                            _cmd_lower = _cmd_lower.replace(_wp, '', 1).strip()
+                            break
+
+                    # Fast lock detection (regex-free for speed)
+                    _is_lock = 'lock' in _cmd_lower and 'unlock' not in _cmd_lower
+                    _has_target = any(t in _cmd_lower for t in ['screen', 'mac', 'computer', 'it', 'this'])
+                    _is_lock_command_fast = _is_lock and (_has_target or len(_cmd_lower.split()) <= 3)
+
+                    if _is_lock_command_fast:
+                        logger.info(f"[JARVIS WS] 🔒⚡ ULTRA-FAST LOCK - direct CGSession execution")
+                        try:
+                            import shutil
+
+                            async def _run_lock_cmd(cmd, timeout=3.0):
+                                try:
+                                    proc = await asyncio.create_subprocess_exec(
+                                        *cmd,
+                                        stdout=asyncio.subprocess.PIPE,
+                                        stderr=asyncio.subprocess.PIPE
+                                    )
+                                    await asyncio.wait_for(proc.communicate(), timeout=timeout)
+                                    return proc.returncode == 0
+                                except:
+                                    return False
+
+                            lock_success = False
+                            lock_method = "none"
+
+                            # Try CGSession first (most reliable, no UI needed)
+                            cgsession = "/System/Library/CoreServices/Menu Extras/User.menu/Contents/Resources/CGSession"
+                            if os.path.exists(cgsession):
+                                if await _run_lock_cmd([cgsession, "-suspend"]):
+                                    lock_success = True
+                                    lock_method = "cgsession"
+
+                            # Try AppleScript if CGSession failed
+                            if not lock_success and shutil.which("osascript"):
+                                script = 'tell application "System Events" to keystroke "q" using {command down, control down}'
+                                if await _run_lock_cmd(["osascript", "-e", script]):
+                                    lock_success = True
+                                    lock_method = "applescript"
+
+                            # Try pmset as last resort
+                            if not lock_success and shutil.which("pmset"):
+                                if await _run_lock_cmd(["pmset", "displaysleepnow"]):
+                                    lock_success = True
+                                    lock_method = "pmset"
+
+                            # Send response immediately
+                            await websocket.send_json({
+                                "type": "response",
+                                "text": "🔒 Locking your screen now. See you soon!" if lock_success else "❌ Lock failed",
+                                "command_type": "screen_lock",
+                                "success": lock_success,
+                                "fast_path": True,
+                                "ultra_fast": True,
+                                "method": lock_method,
+                                "timestamp": datetime.now().isoformat(),
+                                "speak": True,
+                            })
+                            logger.info(f"[JARVIS WS] {'✅' if lock_success else '❌'} Ultra-fast lock via {lock_method}")
+                            continue  # Skip ALL other processing
+
+                        except Exception as e:
+                            logger.error(f"[JARVIS WS] ❌ Ultra-fast lock failed: {e}")
+                            # Fall through to normal processing as backup
+                            pass
+
                     # Check if context awareness is enabled
                     # Import the setting from main.py
                     try:
