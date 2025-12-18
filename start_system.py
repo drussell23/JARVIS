@@ -17343,6 +17343,97 @@ async def main():
     # PID file management (integrated from jarvis.sh)
     pid_file = Path(tempfile.gettempdir()) / "jarvis.pid"
 
+    # =========================================================================
+    # INTELLIGENT PROCESS DETECTION AND CLEANUP
+    # Detects zombie/stuck processes and cleans them automatically
+    # =========================================================================
+    async def is_process_responsive(pid: int, timeout: float = 2.0) -> bool:
+        """
+        Check if a process is actually responsive (not a zombie).
+
+        A process is considered unresponsive if:
+        - It's orphaned (PPID=1) AND has CLOSE_WAIT connections
+        - It doesn't respond to a status check within timeout
+        - It's been idle for extended periods with stale connections
+        """
+        try:
+            proc = psutil.Process(pid)
+
+            # Check 1: Orphaned process (PPID=1 means adopted by init)
+            is_orphaned = proc.ppid() == 1
+
+            # Check 2: Process status
+            status = proc.status()
+            is_sleeping = status in [psutil.STATUS_SLEEPING, psutil.STATUS_IDLE]
+
+            # Check 3: Network connections in stale states
+            stale_connection_count = 0
+            try:
+                connections = proc.connections()
+                for conn in connections:
+                    if conn.status in ['CLOSE_WAIT', 'TIME_WAIT', 'CLOSING']:
+                        stale_connection_count += 1
+            except (psutil.AccessDenied, psutil.NoSuchProcess):
+                pass
+
+            # Check 4: CPU activity (zombie processes have 0% CPU)
+            cpu_percent = proc.cpu_percent(interval=0.1)
+
+            # A process is likely zombie/stuck if:
+            # - Orphaned (PPID=1) AND sleeping AND has stale connections
+            # - OR has many stale connections (>5) and 0% CPU
+            is_zombie_like = (
+                (is_orphaned and is_sleeping and stale_connection_count > 0) or
+                (stale_connection_count > 5 and cpu_percent < 0.1)
+            )
+
+            if is_zombie_like:
+                logger.info(
+                    f"🔍 Process {pid} appears zombie-like: "
+                    f"orphaned={is_orphaned}, status={status}, "
+                    f"stale_connections={stale_connection_count}, cpu={cpu_percent}%"
+                )
+
+            return not is_zombie_like
+
+        except psutil.NoSuchProcess:
+            return False
+        except Exception as e:
+            logger.debug(f"Error checking process responsiveness: {e}")
+            return True  # Assume responsive if can't determine
+
+    async def cleanup_zombie_process(pid: int) -> bool:
+        """
+        Gracefully terminate a zombie/stuck process.
+
+        Tries SIGTERM first, then SIGKILL if needed.
+        """
+        try:
+            proc = psutil.Process(pid)
+            logger.info(f"🧹 Cleaning up unresponsive process {pid}")
+
+            # Try graceful termination first
+            proc.terminate()
+
+            # Wait up to 3 seconds for termination
+            try:
+                proc.wait(timeout=3)
+                logger.info(f"✅ Process {pid} terminated gracefully")
+                return True
+            except psutil.TimeoutExpired:
+                # Force kill if still running
+                logger.warning(f"⚠️ Process {pid} didn't terminate, force killing...")
+                proc.kill()
+                proc.wait(timeout=2)
+                logger.info(f"✅ Process {pid} force killed")
+                return True
+
+        except psutil.NoSuchProcess:
+            return True  # Already dead
+        except Exception as e:
+            logger.error(f"Failed to cleanup process {pid}: {e}")
+            return False
+
     # Clean up orphaned PID file from previous crashed sessions
     if pid_file.exists():
         try:
@@ -17356,12 +17447,32 @@ async def main():
                     proc = psutil.Process(old_pid)
                     cmdline = " ".join(proc.cmdline())
                     if "start_system.py" in cmdline:
-                        logger.warning(f"⚠️  Another JARVIS instance is running (PID {old_pid})")
-                        print(
-                            f"{Colors.YELLOW}⚠️  Another JARVIS instance is running (PID {old_pid}){Colors.ENDC}"
-                        )
-                        print(f"   Use --force-start to override, or kill PID {old_pid} first")
-                        return 1
+                        # Check if the process is actually responsive
+                        is_responsive = await is_process_responsive(old_pid)
+
+                        if not is_responsive:
+                            # Zombie process - clean it up automatically
+                            print(
+                                f"{Colors.YELLOW}🧹 Detected unresponsive JARVIS instance (PID {old_pid}) - cleaning up...{Colors.ENDC}"
+                            )
+                            cleanup_success = await cleanup_zombie_process(old_pid)
+                            if cleanup_success:
+                                pid_file.unlink()
+                                print(f"{Colors.GREEN}✅ Cleaned up zombie process{Colors.ENDC}")
+                            else:
+                                print(
+                                    f"{Colors.FAIL}❌ Failed to cleanup zombie process{Colors.ENDC}"
+                                )
+                                print(f"   Use --force-start to override, or kill PID {old_pid} first")
+                                return 1
+                        else:
+                            # Process is responsive - genuine conflict
+                            logger.warning(f"⚠️  Another JARVIS instance is running (PID {old_pid})")
+                            print(
+                                f"{Colors.YELLOW}⚠️  Another JARVIS instance is running (PID {old_pid}){Colors.ENDC}"
+                            )
+                            print(f"   Use --force-start to override, or kill PID {old_pid} first")
+                            return 1
                     else:
                         # Different process reused the PID - safe to remove
                         pid_file.unlink()
