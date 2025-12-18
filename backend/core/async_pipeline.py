@@ -2060,6 +2060,296 @@ class AdvancedAsyncPipeline:
         except Exception as e:
             logger.debug(f"[PROACTIVE-CAI] Could not speak acknowledgment: {e}")
 
+    # =========================================================================
+    # 🔄 POST-UNLOCK COMMAND CONTINUATION (Deterministic, No LLM Required)
+    # =========================================================================
+
+    async def _handle_post_unlock_continuation(
+        self,
+        original_text: str,
+        user_name: str,
+        metadata: Optional[Dict] = None,
+        audio_data: Optional[bytes] = None,
+        speaker_name: Optional[str] = None,
+        unlock_latency_ms: float = 0,
+    ) -> Optional[Dict]:
+        """
+        Handle post-unlock command continuation - PURELY DETERMINISTIC.
+
+        After a successful unlock, extract any additional intent from the original
+        command and execute it. This enables autonomous workflows like:
+
+            "search for dogs" (while locked) → unlock → search for dogs
+            "unlock and open Safari" → unlock → open Safari
+            "unlock my screen" → just unlock (no continuation)
+
+        This method is FAST and LOCAL:
+        - Uses regex pattern matching (no LLM)
+        - Routes to UnifiedCommandProcessor for execution (no API calls for search/open)
+        - Only triggers LLM if the specific command requires it (e.g., "summarize")
+
+        Args:
+            original_text: The original command text
+            user_name: User name
+            metadata: Optional metadata
+            audio_data: Optional audio data
+            speaker_name: Optional speaker name
+            unlock_latency_ms: How long the unlock took
+
+        Returns:
+            None if no continuation needed
+            Dict with continuation result if command was executed
+        """
+        start_time = time.time()
+
+        try:
+            # ─────────────────────────────────────────────────────────────────
+            # Step 1: Extract continuation intent (DETERMINISTIC - no LLM)
+            # ─────────────────────────────────────────────────────────────────
+            continuation_command = self._extract_continuation_command(original_text)
+
+            if not continuation_command:
+                logger.debug(f"[POST-UNLOCK] No continuation intent found in: '{original_text}'")
+                return None
+
+            logger.info(f"🔄 [POST-UNLOCK] Extracted continuation: '{continuation_command}'")
+
+            # ─────────────────────────────────────────────────────────────────
+            # Step 2: Speak brief acknowledgment (non-blocking)
+            # ─────────────────────────────────────────────────────────────────
+            continuation_action = self._describe_continuation_action(continuation_command)
+            asyncio.create_task(self._speak_brief_continuation(continuation_action))
+
+            # ─────────────────────────────────────────────────────────────────
+            # Step 3: Check if command needs LLM or can be handled locally
+            # ─────────────────────────────────────────────────────────────────
+            needs_llm = self._command_requires_llm(continuation_command)
+
+            if needs_llm:
+                logger.info(f"🧠 [POST-UNLOCK] Command requires LLM: '{continuation_command}'")
+            else:
+                logger.info(f"⚡ [POST-UNLOCK] Command is LOCAL (fast path): '{continuation_command}'")
+
+            # ─────────────────────────────────────────────────────────────────
+            # Step 4: Execute continuation via process_async with flag
+            # ─────────────────────────────────────────────────────────────────
+            logger.info(f"🚀 [POST-UNLOCK] Executing continuation command...")
+
+            continuation_result = await self.process_async(
+                text=continuation_command,
+                user_name=user_name,
+                priority=1,  # High priority for continuation
+                metadata={
+                    **(metadata or {}),
+                    "screen_just_unlocked": True,
+                    "continuation_from_unlock": True,
+                    "original_command": original_text,
+                    "unlock_latency_ms": unlock_latency_ms,
+                    "skip_llm": not needs_llm,  # Hint to skip LLM for simple commands
+                },
+                audio_data=audio_data,
+                speaker_name=speaker_name,
+            )
+
+            total_latency = (time.time() - start_time) * 1000
+            logger.info(
+                f"✅ [POST-UNLOCK] Continuation completed in {total_latency:.0f}ms "
+                f"(unlock={unlock_latency_ms:.0f}ms, continuation={total_latency - unlock_latency_ms:.0f}ms)"
+            )
+
+            # Add continuation metadata
+            continuation_result["post_unlock_continuation"] = {
+                "original_command": original_text,
+                "continuation_command": continuation_command,
+                "continuation_latency_ms": total_latency,
+                "used_llm": needs_llm,
+            }
+
+            return continuation_result
+
+        except Exception as e:
+            logger.warning(f"[POST-UNLOCK] Continuation failed: {e}")
+            # Don't fail the unlock just because continuation failed
+            return None
+
+    def _extract_continuation_command(self, text: str) -> Optional[str]:
+        """
+        Extract continuation command from unlock text - DETERMINISTIC.
+
+        Uses pure regex pattern matching - NO LLM calls.
+
+        Args:
+            text: Original command text
+
+        Returns:
+            Continuation command string, or None if just unlock
+        """
+        text_lower = text.lower().strip()
+
+        # Pattern 1: "unlock and <action>" or "unlock then <action>"
+        and_patterns = [
+            r"unlock\s+(?:my\s+)?(?:screen|computer|mac)?\s*(?:and|then|,)\s+(.+)",
+            r"(?:and|then)\s+(.+)$",
+        ]
+
+        for pattern in and_patterns:
+            match = re.search(pattern, text_lower, re.IGNORECASE)
+            if match:
+                continuation = match.group(1).strip()
+                if continuation and len(continuation) > 2:
+                    return continuation
+
+        # Pattern 2: Command that isn't primarily about unlock
+        # Check if "unlock" is NOT the main action
+        unlock_only_patterns = [
+            r"^unlock\s*(my\s*)?(screen|computer|mac|it)?\.?$",
+            r"^(please\s+)?unlock\s*(my\s*)?(screen|computer|mac|it)?\.?$",
+            r"^can\s+you\s+unlock\s*(my\s*)?(screen|computer|mac)?\.?$",
+            r"^hey\s+jarvis\s*,?\s*unlock\s*(my\s*)?(screen|computer|mac)?\.?$",
+        ]
+
+        is_unlock_only = any(
+            re.match(pattern, text_lower.strip()) for pattern in unlock_only_patterns
+        )
+
+        if is_unlock_only:
+            return None
+
+        # Pattern 3: Extract action from non-unlock-primary commands
+        # e.g., "search for dogs" when said while screen is locked
+        action_patterns = [
+            # Search patterns
+            (r"(search\s+(?:for\s+)?.+)", 1),
+            (r"(google\s+.+)", 1),
+            (r"(look\s+up\s+.+)", 1),
+            # App launch patterns
+            (r"(open\s+\w+(?:\s+\w+)?)", 1),
+            (r"(launch\s+\w+(?:\s+\w+)?)", 1),
+            (r"(start\s+\w+(?:\s+\w+)?)", 1),
+            # Navigation patterns
+            (r"(go\s+to\s+.+)", 1),
+            (r"(navigate\s+to\s+.+)", 1),
+            # File operations
+            (r"(create\s+(?:a\s+)?.+)", 1),
+            (r"(edit\s+.+)", 1),
+            (r"(close\s+\w+)", 1),
+        ]
+
+        for pattern, group in action_patterns:
+            match = re.search(pattern, text_lower, re.IGNORECASE)
+            if match:
+                action = match.group(group).strip()
+                # Make sure it's not just "unlock" related
+                if "unlock" not in action.lower():
+                    return action
+
+        return None
+
+    def _describe_continuation_action(self, command: str) -> str:
+        """
+        Generate brief human-readable description of continuation action.
+
+        DETERMINISTIC - pure pattern matching.
+        """
+        command_lower = command.lower()
+
+        patterns = [
+            (r"search\s+(?:for\s+)?(.+)", lambda m: f"searching for {m.group(1)}"),
+            (r"google\s+(.+)", lambda m: f"searching for {m.group(1)}"),
+            (r"open\s+(.+)", lambda m: f"opening {m.group(1)}"),
+            (r"launch\s+(.+)", lambda m: f"launching {m.group(1)}"),
+            (r"go\s+to\s+(.+)", lambda m: f"navigating to {m.group(1)}"),
+            (r"create\s+(.+)", lambda m: f"creating {m.group(1)}"),
+        ]
+
+        for pattern, formatter in patterns:
+            match = re.search(pattern, command_lower, re.IGNORECASE)
+            if match:
+                return formatter(match)
+
+        return f"completing your request"
+
+    def _command_requires_llm(self, command: str) -> bool:
+        """
+        Determine if a command requires LLM processing or can be handled locally.
+
+        FAST commands (no LLM needed):
+        - search for X → web_search (local AppleScript)
+        - open X → open_app (local AppleScript)
+        - close X → close_app (local AppleScript)
+        - lock/unlock → system control (local)
+
+        SLOW commands (LLM required):
+        - summarize X → needs AI reasoning
+        - explain X → needs AI reasoning
+        - write X → needs AI generation
+        - complex questions → needs AI
+
+        Returns:
+            True if LLM is required, False if can be handled locally
+        """
+        command_lower = command.lower()
+
+        # Commands that DON'T need LLM (fast, local)
+        local_patterns = [
+            r"\b(search|google|look\s+up|browse)\b",
+            r"\b(open|launch|start|run|close|quit|exit)\s+\w+",
+            r"\bgo\s+to\s+",
+            r"\b(lock|unlock)\s+(my\s+)?(screen|computer|mac)",
+            r"\b(volume|brightness)\s+(up|down|\d+)",
+            r"\b(play|pause|stop|skip)\s+(music|song|audio)",
+            r"\bset\s+(timer|alarm|reminder)",
+            r"\bwhat\s+(time|is the time)",
+            r"\b(screenshot|screen\s*shot)",
+            r"\b(minimize|maximize|full\s*screen)",
+            r"\bnew\s+tab",
+            r"\bswitch\s+to\s+",
+        ]
+
+        for pattern in local_patterns:
+            if re.search(pattern, command_lower, re.IGNORECASE):
+                return False
+
+        # Commands that DO need LLM
+        llm_patterns = [
+            r"\b(summarize|summarise|summary)\b",
+            r"\b(explain|describe|tell\s+me\s+about)\b",
+            r"\b(write|compose|draft|create)\s+(an?\s+)?(essay|article|email|letter|story)",
+            r"\b(analyze|analyse|analysis)\b",
+            r"\b(translate|translation)\b",
+            r"\bwhat\s+is\s+(?!the\s+time)",  # "what is X" except "what is the time"
+            r"\bhow\s+(do|does|can|should)\b",
+            r"\bwhy\s+(is|are|do|does)\b",
+            r"\b(help\s+me|assist|advice)\b",
+        ]
+
+        for pattern in llm_patterns:
+            if re.search(pattern, command_lower, re.IGNORECASE):
+                return True
+
+        # Default: assume local if short and action-oriented
+        words = command_lower.split()
+        if len(words) <= 5 and words[0] in {"search", "open", "close", "go", "play", "set"}:
+            return False
+
+        # Default: assume might need LLM for unknown commands
+        return True
+
+    async def _speak_brief_continuation(self, action_description: str) -> None:
+        """Speak brief continuation acknowledgment (fire and forget)."""
+        try:
+            # Very brief acknowledgment
+            message = f"Now {action_description}."
+
+            process = await asyncio.create_subprocess_exec(
+                "say", "-v", "Daniel", "-r", "180", message,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(process.wait(), timeout=5.0)
+        except Exception:
+            pass  # Fire and forget
+
     async def _fast_lock_unlock(
         self,
         text: str,
@@ -2555,6 +2845,38 @@ class AdvancedAsyncPipeline:
                 })
             else:
                 await self._fail_tracked_operation(tracked_operation, message or "Operation failed")
+
+            # =================================================================
+            # 🔄 POST-UNLOCK COMMAND CONTINUATION (Autonomous Workflow)
+            # =================================================================
+            # After successful unlock, check if the original command had
+            # additional intent beyond just "unlock". If so, execute it.
+            #
+            # Examples:
+            #   "unlock and search for dogs" → unlock, then search for dogs
+            #   "search for dogs" (when locked) → unlock, then search
+            #   "unlock my screen" → just unlock (no continuation)
+            #
+            # This is PURELY DETERMINISTIC - no LLM calls for simple commands
+            # =================================================================
+            if success and not is_lock and not (metadata or {}).get("screen_just_unlocked"):
+                continuation_result = await self._handle_post_unlock_continuation(
+                    original_text=text,
+                    user_name=user_name,
+                    metadata=metadata,
+                    audio_data=audio_data,
+                    speaker_name=speaker_name,
+                    unlock_latency_ms=latency_ms,
+                )
+
+                if continuation_result is not None:
+                    # Merge unlock info into continuation result
+                    continuation_result["unlock_performed"] = {
+                        "success": True,
+                        "latency_ms": latency_ms,
+                        "response": message,
+                    }
+                    return continuation_result
 
             return {
                 "success": success,
