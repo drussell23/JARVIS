@@ -794,10 +794,70 @@ class AdvancedAsyncPipeline:
         return context
 
     async def _process_command(self, context: PipelineContext) -> PipelineContext:
-        """Main command processing logic."""
-        # This would contain the actual command processing
-        context.data["processed"] = True
-        context.data["result"] = {"status": "success", "message": "Command processed"}
+        """
+        Main command processing logic - routes to UnifiedCommandProcessor.
+
+        This is the core execution stage that actually processes commands like:
+        - "search for dogs" → opens browser and searches
+        - "open Safari" → launches Safari
+        - System commands, browser automation, etc.
+        """
+        command_text = context.text
+        audio_data = context.audio_data if hasattr(context, 'audio_data') else None
+        speaker_name = context.speaker_name if hasattr(context, 'speaker_name') else None
+
+        try:
+            # Route to UnifiedCommandProcessor for intelligent command execution
+            from api.unified_command_processor import get_unified_processor
+
+            # Get API key from environment or metadata
+            api_key = os.environ.get("ANTHROPIC_API_KEY") or context.metadata.get("api_key")
+            processor = get_unified_processor(api_key)
+
+            logger.info(f"[PIPELINE] Routing to UnifiedCommandProcessor: '{command_text[:50]}...'")
+
+            # Process the command with full context
+            result = await asyncio.wait_for(
+                processor.process_command(
+                    command_text,
+                    websocket=context.metadata.get("websocket"),
+                    audio_data=audio_data,
+                    speaker_name=speaker_name,
+                ),
+                timeout=30.0
+            )
+
+            logger.info(f"[PIPELINE] UnifiedCommandProcessor result: success={result.get('success', False)}")
+
+            context.data["processed"] = True
+            context.data["result"] = result
+            context.data["response"] = result
+
+        except ImportError as e:
+            logger.warning(f"[PIPELINE] UnifiedCommandProcessor not available: {e}")
+            # Fallback to basic response
+            context.data["processed"] = True
+            context.data["result"] = {
+                "success": False,
+                "response": f"Command processor not available. Command was: {command_text}",
+            }
+
+        except asyncio.TimeoutError:
+            logger.error(f"[PIPELINE] Command processing timed out: '{command_text}'")
+            context.data["processed"] = True
+            context.data["result"] = {
+                "success": False,
+                "response": "Command processing timed out. Please try again.",
+            }
+
+        except Exception as e:
+            logger.error(f"[PIPELINE] Error processing command: {e}", exc_info=True)
+            context.data["processed"] = True
+            context.data["result"] = {
+                "success": False,
+                "response": f"Error processing command: {str(e)}",
+            }
+
         return context
 
     async def _postprocess_response(self, context: PipelineContext) -> PipelineContext:
