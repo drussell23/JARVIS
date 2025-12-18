@@ -2441,6 +2441,16 @@ const JarvisVoice = () => {
         // IMMEDIATE DEBUG LOG - to see if we're even getting input
         console.log('🎤 RAW SPEECH:', transcript, `(final: ${isFinal}, conf: ${confidence})`);
 
+        // ============================================================
+        // 🔇 SELF-VOICE SUPPRESSION - First line of defense
+        // ============================================================
+        // Check if this is JARVIS hearing its own voice
+        const echoCheck = isSelfVoiceEcho(transcript);
+        if (echoCheck.isEcho) {
+          console.log(`🔇 [Self-Voice] BLOCKED: "${transcript.substring(0, 50)}..." - Reason: ${echoCheck.reason}`);
+          return; // Completely ignore this speech input
+        }
+
         // 🆕 ULTRA-FAST-PATH: Check for critical unlock/lock commands immediately
         // These commands get special priority with LOWER confidence threshold
         // Also use fuzzy matching for better detection
@@ -4235,6 +4245,9 @@ const JarvisVoice = () => {
         audio2.volume = 1.0;
 
         setIsJarvisSpeaking(true);
+        isSpeakingRef.current = true;
+        // 🔇 SELF-VOICE SUPPRESSION: Record what we're speaking (POST method)
+        recordSpokenText(text);
 
         audio2.onplay = () => {
           console.log('[JARVIS Audio] POST: Playback started');
@@ -4249,6 +4262,8 @@ const JarvisVoice = () => {
           console.log('[JARVIS Audio] POST: Playback completed');
           setIsJarvisSpeaking(false);
           isSpeakingRef.current = false;
+          // 🔇 SELF-VOICE SUPPRESSION: Record when speaking ended
+          recordSpeakingEnded();
           URL.revokeObjectURL(audioUrl); // Clean up
           // Process next in queue after a small delay
           setTimeout(() => processNextInSpeechQueue(), 200);
@@ -4264,6 +4279,8 @@ const JarvisVoice = () => {
           }
           setIsJarvisSpeaking(false);
           isSpeakingRef.current = false;
+          // 🔇 SELF-VOICE SUPPRESSION: Record when speaking ended (even on error)
+          recordSpeakingEnded();
           URL.revokeObjectURL(audioUrl); // Clean up
           // Process next in queue even after error
           setTimeout(() => processNextInSpeechQueue(), 200);
@@ -4278,6 +4295,8 @@ const JarvisVoice = () => {
       console.error('[JARVIS Audio] POST: Failed:', postError);
       setIsJarvisSpeaking(false);
       isSpeakingRef.current = false;
+      // 🔇 SELF-VOICE SUPPRESSION: Record when speaking ended (even on error)
+      recordSpeakingEnded();
       // Process next in queue even after error
       setTimeout(() => processNextInSpeechQueue(), 200);
     }
@@ -4288,6 +4307,124 @@ const JarvisVoice = () => {
   // Speech queue to prevent overlapping
   const speechQueueRef = useRef([]);
   const isSpeakingRef = useRef(false);
+
+  // ============================================================
+  // 🔇 SELF-VOICE SUPPRESSION SYSTEM
+  // ============================================================
+  // Prevents JARVIS from hearing and responding to its own voice
+  // Uses multiple strategies for robust echo cancellation:
+  // 1. Speaking state check - ignore all input while speaking
+  // 2. Cooldown period - ignore input for 500ms after speech ends
+  // 3. Text similarity - detect and filter echoes of what JARVIS just said
+  // 4. Audio fingerprinting - match acoustic patterns (future)
+  const lastSpokenTextRef = useRef('');           // What JARVIS just said
+  const lastSpokenTimeRef = useRef(0);            // When speaking started
+  const speakingEndTimeRef = useRef(0);           // When speaking ended
+  const selfVoiceCooldownMs = 800;                // Cooldown after speech ends (ms)
+  const recentSpokenTextsRef = useRef([]);        // History of recent spoken texts
+  const maxRecentSpokenTexts = 5;                 // Keep last 5 spoken texts for matching
+
+  /**
+   * Calculate text similarity using Levenshtein distance ratio
+   * Returns a value between 0 (completely different) and 1 (identical)
+   */
+  const calculateTextSimilarity = (text1, text2) => {
+    if (!text1 || !text2) return 0;
+
+    const s1 = text1.toLowerCase().trim();
+    const s2 = text2.toLowerCase().trim();
+
+    if (s1 === s2) return 1.0;
+    if (s1.length === 0 || s2.length === 0) return 0;
+
+    // Check if one text is contained in the other (partial match)
+    if (s1.includes(s2) || s2.includes(s1)) {
+      return 0.85; // High similarity for substring matches
+    }
+
+    // Quick word-based similarity check
+    const words1 = s1.split(/\s+/).filter(w => w.length > 2);
+    const words2 = s2.split(/\s+/).filter(w => w.length > 2);
+
+    if (words1.length === 0 || words2.length === 0) return 0;
+
+    const commonWords = words1.filter(w => words2.includes(w));
+    const wordSimilarity = (2 * commonWords.length) / (words1.length + words2.length);
+
+    return wordSimilarity;
+  };
+
+  /**
+   * Check if the recognized text is an echo of JARVIS's speech
+   * Uses multiple strategies for robust detection
+   */
+  const isSelfVoiceEcho = (recognizedText) => {
+    const now = Date.now();
+    const text = recognizedText.toLowerCase().trim();
+
+    // Strategy 1: Currently speaking - definitely our voice
+    if (isSpeakingRef.current) {
+      console.log('🔇 [Self-Voice] Suppressed: JARVIS is currently speaking');
+      return { isEcho: true, reason: 'currently_speaking', confidence: 1.0 };
+    }
+
+    // Strategy 2: Within cooldown period after speech ended
+    const timeSinceSpeechEnd = now - speakingEndTimeRef.current;
+    if (timeSinceSpeechEnd < selfVoiceCooldownMs && speakingEndTimeRef.current > 0) {
+      console.log(`🔇 [Self-Voice] Suppressed: Within cooldown (${timeSinceSpeechEnd}ms since speech ended)`);
+      return { isEcho: true, reason: 'cooldown_period', confidence: 0.9, timeSinceSpeechEnd };
+    }
+
+    // Strategy 3: Text similarity with last spoken text
+    if (lastSpokenTextRef.current) {
+      const similarity = calculateTextSimilarity(text, lastSpokenTextRef.current);
+      if (similarity > 0.6) {
+        console.log(`🔇 [Self-Voice] Suppressed: Text similarity ${(similarity * 100).toFixed(1)}% with last spoken`);
+        return { isEcho: true, reason: 'text_similarity', confidence: similarity, matchedText: lastSpokenTextRef.current };
+      }
+    }
+
+    // Strategy 4: Check against recent spoken texts history
+    for (const recentText of recentSpokenTextsRef.current) {
+      const similarity = calculateTextSimilarity(text, recentText.text);
+      const age = now - recentText.timestamp;
+
+      // More lenient threshold for recent texts (within 10 seconds)
+      if (similarity > 0.5 && age < 10000) {
+        console.log(`🔇 [Self-Voice] Suppressed: Matches recent spoken text (${(similarity * 100).toFixed(1)}% similar, ${age}ms ago)`);
+        return { isEcho: true, reason: 'recent_text_match', confidence: similarity, matchedText: recentText.text, age };
+      }
+    }
+
+    return { isEcho: false, reason: 'passed_all_checks' };
+  };
+
+  /**
+   * Record that JARVIS just spoke something (for echo detection)
+   */
+  const recordSpokenText = (text) => {
+    const now = Date.now();
+    lastSpokenTextRef.current = text;
+    lastSpokenTimeRef.current = now;
+
+    // Add to recent spoken texts history
+    recentSpokenTextsRef.current.unshift({ text: text.toLowerCase().trim(), timestamp: now });
+
+    // Keep only the most recent texts
+    if (recentSpokenTextsRef.current.length > maxRecentSpokenTexts) {
+      recentSpokenTextsRef.current = recentSpokenTextsRef.current.slice(0, maxRecentSpokenTexts);
+    }
+
+    console.log(`🔇 [Self-Voice] Recorded spoken text: "${text.substring(0, 50)}..." (${recentSpokenTextsRef.current.length} in history)`);
+  };
+
+  /**
+   * Record that JARVIS finished speaking (for cooldown)
+   */
+  const recordSpeakingEnded = () => {
+    speakingEndTimeRef.current = Date.now();
+    console.log('🔇 [Self-Voice] Speaking ended, cooldown started');
+  };
 
   const processNextInSpeechQueue = async () => {
     if (speechQueueRef.current.length === 0 || isSpeakingRef.current) {
@@ -4358,6 +4495,9 @@ const JarvisVoice = () => {
       setIsJarvisSpeaking(true);
       isSpeakingRef.current = true;
 
+      // 🔇 SELF-VOICE SUPPRESSION: Record what we're about to say
+      recordSpokenText(text);
+
       // Use backend TTS endpoint for consistent voice quality
       // Use POST for any text with special characters or newlines to avoid URL encoding issues
       const hasSpecialChars = /[^\w\s.,!?-]/.test(text);
@@ -4395,6 +4535,8 @@ const JarvisVoice = () => {
           console.log('[JARVIS Audio] GET method playback completed');
           setIsJarvisSpeaking(false);
           isSpeakingRef.current = false;
+          // 🔇 SELF-VOICE SUPPRESSION: Record when speaking ended
+          recordSpeakingEnded();
           // Process next in queue after a small delay
           setTimeout(() => processNextInSpeechQueue(), 200);
         };
@@ -4435,6 +4577,8 @@ const JarvisVoice = () => {
       });
       setIsJarvisSpeaking(false);
       isSpeakingRef.current = false;
+      // 🔇 SELF-VOICE SUPPRESSION: Record when speaking ended (even on error)
+      recordSpeakingEnded();
       // Process next in queue even after error
       setTimeout(() => processNextInSpeechQueue(), 200);
 
@@ -4482,6 +4626,9 @@ const JarvisVoice = () => {
         utterance.onstart = () => {
           console.log('[JARVIS Audio] Browser speech synthesis started');
           setIsJarvisSpeaking(true);
+          isSpeakingRef.current = true;
+          // 🔇 SELF-VOICE SUPPRESSION: Record what we're speaking
+          recordSpokenText(text);
           // Call the callback when browser speech ACTUALLY starts playing (perfect sync!)
           if (onStartCallback && typeof onStartCallback === 'function') {
             console.log('[JARVIS Audio] Calling start callback - text will appear NOW');
@@ -4492,6 +4639,8 @@ const JarvisVoice = () => {
           console.log('[JARVIS Audio] Browser speech completed');
           setIsJarvisSpeaking(false);
           isSpeakingRef.current = false;
+          // 🔇 SELF-VOICE SUPPRESSION: Record when speaking ended
+          recordSpeakingEnded();
           // Process next in queue after a small delay
           setTimeout(() => processNextInSpeechQueue(), 200);
         };
@@ -4499,6 +4648,8 @@ const JarvisVoice = () => {
           console.error('[JARVIS Audio] Browser speech error:', e);
           setIsJarvisSpeaking(false);
           isSpeakingRef.current = false;
+          // 🔇 SELF-VOICE SUPPRESSION: Record when speaking ended (even on error)
+          recordSpeakingEnded();
           // Process next in queue even after error
           setTimeout(() => processNextInSpeechQueue(), 200);
         };
