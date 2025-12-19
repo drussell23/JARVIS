@@ -4383,6 +4383,18 @@ async def _extract_ecapa_robust(audio_bytes: bytes) -> Optional[List[float]]:
             logger.info(f"[EDGE-ECAPA]   min={emb.min():.4f}, max={emb.max():.4f}")
             logger.info(f"[EDGE-ECAPA]   mean={emb.mean():.4f}, std={emb.std():.4f}")
             logger.info(f"[EDGE-ECAPA]   first_5={emb[:5].tolist()}")
+
+            # ═══════════════════════════════════════════════════════════════════
+            # 🔍 NaN/Inf VALIDATION - Critical for catching corrupted embeddings
+            # ═══════════════════════════════════════════════════════════════════
+            nan_count = int(np.sum(np.isnan(emb)))
+            inf_count = int(np.sum(np.isinf(emb)))
+            if nan_count > 0 or inf_count > 0:
+                logger.error(f"[EDGE-ECAPA] ❌ EMBEDDING CORRUPTED! NaN={nan_count}, Inf={inf_count}")
+                logger.error(f"[EDGE-ECAPA]   Cause: ECAPA model produced invalid values")
+                logger.error(f"[EDGE-ECAPA]   Falling through to try next strategy...")
+                raise ValueError(f"Embedding contains NaN ({nan_count}) or Inf ({inf_count})")
+
             logger.info(f"[EDGE-ECAPA] ═══════════════════════════════════════════════════")
 
             return emb.tolist()
@@ -5062,6 +5074,33 @@ def _verify_speaker_robust(test_emb: List[float], ref_emb: List[float]) -> Tuple
 
     test = np.array(test_emb, dtype=np.float32)
     ref = np.array(ref_emb, dtype=np.float32)
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # 🔍 NaN/Inf VALIDATION - Critical for catching corrupted embeddings
+    # ═══════════════════════════════════════════════════════════════════════
+    # NaN embeddings cause silent failures (NaN comparisons return False)
+    # This makes debugging extremely difficult without explicit checks
+    # ═══════════════════════════════════════════════════════════════════════
+    test_nan_count = int(np.sum(np.isnan(test)))
+    test_inf_count = int(np.sum(np.isinf(test)))
+    ref_nan_count = int(np.sum(np.isnan(ref)))
+    ref_inf_count = int(np.sum(np.isinf(ref)))
+
+    if test_nan_count > 0 or test_inf_count > 0:
+        logger.error(f"[ROBUST-VERIFY] ❌ TEST EMBEDDING CORRUPTED!")
+        logger.error(f"[ROBUST-VERIFY]   NaN values: {test_nan_count}/{len(test)}")
+        logger.error(f"[ROBUST-VERIFY]   Inf values: {test_inf_count}/{len(test)}")
+        logger.error(f"[ROBUST-VERIFY]   Cause: Audio extraction produced invalid values")
+        logger.error(f"[ROBUST-VERIFY]   Fix: Check audio format, sample rate, or ECAPA model")
+        return False, 0.0
+
+    if ref_nan_count > 0 or ref_inf_count > 0:
+        logger.error(f"[ROBUST-VERIFY] ❌ REFERENCE EMBEDDING CORRUPTED!")
+        logger.error(f"[ROBUST-VERIFY]   NaN values: {ref_nan_count}/{len(ref)}")
+        logger.error(f"[ROBUST-VERIFY]   Inf values: {ref_inf_count}/{len(ref)}")
+        logger.error(f"[ROBUST-VERIFY]   Cause: Stored voice profile contains invalid values")
+        logger.error(f"[ROBUST-VERIFY]   Fix: Re-enroll voice profile with fresh audio samples")
+        return False, 0.0
 
     # 🔍 DIAGNOSTIC LOGGING - Critical for debugging low similarity scores
     logger.info(f"[ROBUST-VERIFY] ═══════════════════════════════════════════════════")

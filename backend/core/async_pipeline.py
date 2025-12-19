@@ -44,7 +44,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Set
 
 # Ensure project root is in path for 'from backend.X' imports
 _project_root = Path(__file__).parent.parent.parent
@@ -666,6 +666,17 @@ class AdvancedAsyncPipeline:
 
         if self._health_monitor_enabled:
             asyncio.create_task(self._init_vbi_health_monitor())
+
+        # ═══════════════════════════════════════════════════════════════════
+        # BACKGROUND TASKS REGISTRY - Prevents Garbage Collection
+        # ═══════════════════════════════════════════════════════════════════
+        # Critical for Event-Driven Continuation Pattern:
+        # When we schedule continuation tasks with asyncio.create_task(),
+        # we MUST hold a strong reference to prevent the GC from destroying
+        # the task before it completes. This set holds all background tasks
+        # and uses done callbacks to auto-cleanup finished tasks.
+        # ═══════════════════════════════════════════════════════════════════
+        self._background_tasks: Set[asyncio.Task] = set()
 
         if self._follow_up_enabled:
             try:
@@ -1656,57 +1667,139 @@ class AdvancedAsyncPipeline:
             logger.info(f"✅ [PROACTIVE-CAI] Screen unlocked successfully!")
 
             # ─────────────────────────────────────────────────────────────────
-            # Step 8: POST-UNLOCK RE-ENTRY - Continue with original command
+            # Step 8: EVENT-DRIVEN CONTINUATION PATTERN
             # ─────────────────────────────────────────────────────────────────
-            # Brief pause to ensure screen is fully unlocked
-            await asyncio.sleep(0.5)
+            # CRITICAL FIX: Do NOT recursively await self.process_async() here!
+            # The recursive await blocks the unlock response from returning,
+            # keeping the frontend stuck at "Processing..." until the
+            # continuation completes.
+            #
+            # Instead, we use the Event-Driven Continuation Pattern:
+            # 1. Return the unlock success IMMEDIATELY (clears frontend state)
+            # 2. Schedule the continuation as an INDEPENDENT background task
+            # 3. The continuation runs AFTER this function returns
+            #
+            # This ensures:
+            # - Frontend gets "unlocked" response instantly
+            # - User sees unlock success, not eternal "Processing..."
+            # - Continuation executes independently without blocking
+            # ─────────────────────────────────────────────────────────────────
 
+            unlock_latency = (time.time() - start_time) * 1000
             logger.info(
-                f"🔄 [PROACTIVE-CAI] RE-ENTRY: Executing original command: '{text[:50]}...'"
+                f"🔓 [PROACTIVE-CAI] Unlock completed in {unlock_latency:.0f}ms - "
+                f"scheduling continuation as background task"
             )
 
-            # Re-inject the original command with screen_just_unlocked flag
-            continuation_result = await self.process_async(
-                text=text,
-                user_name=user_name,
-                priority=priority,
-                metadata={
-                    **(metadata or {}),
-                    "screen_just_unlocked": True,
-                    "proactive_unlock_performed": True,
-                    "unlock_latency_ms": (time.time() - start_time) * 1000,
+            # Capture variables for the closure
+            _text = text
+            _user_name = user_name
+            _priority = priority
+            _metadata = metadata
+            _audio_data = audio_data
+            _speaker_name = speaker_name
+            _continuation_action = continuation_action
+            _unlock_latency = unlock_latency
+
+            # Create an independent continuation task
+            async def _execute_continuation():
+                """
+                Execute the original command as a completely separate transaction.
+                This runs AFTER the unlock result has been returned to the frontend.
+                """
+                try:
+                    # Brief pause to ensure frontend has processed unlock response
+                    await asyncio.sleep(0.5)
+
+                    logger.info(
+                        f"🔄 [PROACTIVE-CAI] CONTINUATION: Now executing '{_text[:50]}...'"
+                    )
+
+                    # Process as a NEW independent command with screen_just_unlocked flag
+                    continuation_result = await self.process_async(
+                        text=_text,
+                        user_name=_user_name,
+                        priority=_priority,
+                        metadata={
+                            **(_metadata or {}),
+                            "screen_just_unlocked": True,
+                            "proactive_unlock_performed": True,
+                            "unlock_latency_ms": _unlock_latency,
+                        },
+                        audio_data=_audio_data,
+                        speaker_name=_speaker_name,
+                    )
+
+                    # Log result
+                    if continuation_result.get("success", False):
+                        logger.info(
+                            f"✅ [PROACTIVE-CAI] Continuation completed successfully"
+                        )
+                        # Generate and speak success acknowledgment
+                        success_message = self._generate_completion_acknowledgment(
+                            speaker_name=_speaker_name or _user_name,
+                            continuation_action=_continuation_action,
+                            continuation_result=continuation_result,
+                        )
+                        # Fire and forget - don't block on speech
+                        asyncio.create_task(self._speak_acknowledgment(success_message))
+                    else:
+                        logger.warning(
+                            f"⚠️ [PROACTIVE-CAI] Continuation failed: "
+                            f"{continuation_result.get('response', 'Unknown')}"
+                        )
+
+                except asyncio.TimeoutError:
+                    logger.error(
+                        f"⏱️ [PROACTIVE-CAI] Continuation timed out for: '{_text}'"
+                    )
+                except Exception as e:
+                    logger.error(f"❌ [PROACTIVE-CAI] Continuation error: {e}")
+
+            # ─────────────────────────────────────────────────────────────────
+            # BULLETPROOF TASK SCHEDULING - Prevents Garbage Collection
+            # ─────────────────────────────────────────────────────────────────
+            # CRITICAL: We MUST store a strong reference to the task!
+            # Without this, Python's garbage collector could destroy the task
+            # before it completes, causing the continuation to silently fail.
+            #
+            # The done_callback automatically removes the task from the set
+            # once it completes (success or failure), preventing memory leaks.
+            # ─────────────────────────────────────────────────────────────────
+            continuation_task = asyncio.create_task(
+                _execute_continuation(),
+                name=f"proactive_continuation_{text[:30]}_{time.time()}"
+            )
+
+            # Store strong reference to prevent GC from destroying the task
+            self._background_tasks.add(continuation_task)
+
+            # Auto-cleanup when task completes (prevents memory leaks)
+            continuation_task.add_done_callback(self._background_tasks.discard)
+
+            logger.info(
+                f"📋 [PROACTIVE-CAI] Continuation task scheduled "
+                f"(id={id(continuation_task)}, active_tasks={len(self._background_tasks)}) - "
+                f"returning unlock success NOW"
+            )
+
+            # ─────────────────────────────────────────────────────────────────
+            # Return IMMEDIATELY with unlock success
+            # ─────────────────────────────────────────────────────────────────
+            # This allows the frontend to clear "Processing..." state
+            # The continuation task will start a NEW processing cycle
+            return {
+                "success": True,
+                "response": f"Screen unlocked. Now {continuation_action}...",
+                "command_type": "proactive_unlock_success",
+                "status": "unlocked",
+                "proactive_unlock": {
+                    "performed": True,
+                    "unlock_latency_ms": unlock_latency,
+                    "continuation_scheduled": True,
+                    "continuation_intent": continuation_action,
                 },
-                audio_data=audio_data,
-                speaker_name=speaker_name,
-            )
-
-            # Merge the unlock info into the continuation result
-            total_latency = (time.time() - start_time) * 1000
-            continuation_result["proactive_unlock"] = {
-                "performed": True,
-                "unlock_latency_ms": unlock_result.get("latency_ms", 0),
-                "total_latency_ms": total_latency,
-                "continuation_intent": continuation_action,
             }
-
-            logger.info(
-                f"✅ [PROACTIVE-CAI] Complete workflow finished in {total_latency:.0f}ms"
-            )
-
-            # ─────────────────────────────────────────────────────────────────
-            # Step 9: Success acknowledgment (if continuation succeeded)
-            # ─────────────────────────────────────────────────────────────────
-            if continuation_result.get("success", False):
-                # Generate success message based on what we did
-                success_message = self._generate_completion_acknowledgment(
-                    speaker_name=speaker_name or user_name,
-                    continuation_action=continuation_action,
-                    continuation_result=continuation_result,
-                )
-                # Speak success asynchronously (fire and forget)
-                asyncio.create_task(self._speak_acknowledgment(success_message))
-
-            return continuation_result
 
         except ImportError as e:
             # CAI components not available - fall back to normal pipeline
@@ -2848,7 +2941,7 @@ class AdvancedAsyncPipeline:
                 await self._fail_tracked_operation(tracked_operation, message or "Operation failed")
 
             # =================================================================
-            # 🔄 POST-UNLOCK COMMAND CONTINUATION (Autonomous Workflow)
+            # 🔄 POST-UNLOCK CONTINUATION - EVENT-DRIVEN PATTERN
             # =================================================================
             # After successful unlock, check if the original command had
             # additional intent beyond just "unlock". If so, execute it.
@@ -2858,26 +2951,72 @@ class AdvancedAsyncPipeline:
             #   "search for dogs" (when locked) → unlock, then search
             #   "unlock my screen" → just unlock (no continuation)
             #
-            # This is PURELY DETERMINISTIC - no LLM calls for simple commands
+            # CRITICAL FIX: Use asyncio.create_task() instead of await!
+            # The old code blocked return until continuation completed,
+            # causing "Processing..." to hang on the frontend.
             # =================================================================
             if success and not is_lock and not (metadata or {}).get("screen_just_unlocked"):
-                continuation_result = await self._handle_post_unlock_continuation(
-                    original_text=text,
-                    user_name=user_name,
-                    metadata=metadata,
-                    audio_data=audio_data,
-                    speaker_name=speaker_name,
-                    unlock_latency_ms=latency_ms,
-                )
+                # Check if there's a continuation intent
+                continuation_command = self._extract_continuation_command(text)
 
-                if continuation_result is not None:
-                    # Merge unlock info into continuation result
-                    continuation_result["unlock_performed"] = {
-                        "success": True,
+                if continuation_command:
+                    logger.info(
+                        f"🔄 [FAST-LOCK-UNLOCK] Continuation detected: '{continuation_command}' - "
+                        f"scheduling as background task"
+                    )
+
+                    # Capture variables for closure
+                    _text = text
+                    _user_name = user_name
+                    _metadata = metadata
+                    _audio_data = audio_data
+                    _speaker_name = speaker_name
+                    _latency_ms = latency_ms
+
+                    async def _execute_post_unlock_continuation():
+                        """Execute post-unlock continuation as independent task."""
+                        try:
+                            await asyncio.sleep(0.3)  # Brief pause
+                            result = await self._handle_post_unlock_continuation(
+                                original_text=_text,
+                                user_name=_user_name,
+                                metadata=_metadata,
+                                audio_data=_audio_data,
+                                speaker_name=_speaker_name,
+                                unlock_latency_ms=_latency_ms,
+                            )
+                            if result and result.get("success"):
+                                logger.info(f"✅ [FAST-LOCK-UNLOCK] Post-unlock continuation completed")
+                            else:
+                                logger.warning(f"⚠️ [FAST-LOCK-UNLOCK] Post-unlock continuation failed")
+                        except Exception as e:
+                            logger.error(f"❌ [FAST-LOCK-UNLOCK] Continuation error: {e}")
+
+                    # Schedule as background task with GC protection
+                    continuation_task = asyncio.create_task(
+                        _execute_post_unlock_continuation(),
+                        name=f"post_unlock_continuation_{time.time()}"
+                    )
+                    self._background_tasks.add(continuation_task)
+                    continuation_task.add_done_callback(self._background_tasks.discard)
+
+                    # Return unlock success IMMEDIATELY
+                    return {
+                        "success": success,
+                        "response": f"Screen unlocked. Now {self._describe_continuation_action(continuation_command)}...",
+                        "fast_path": True,
+                        "action": action,
                         "latency_ms": latency_ms,
-                        "response": message,
+                        "step_times_ms": step_times,
+                        "continuation_scheduled": True,
+                        "metadata": {
+                            "method": "fast_lock_unlock",
+                            "command": text,
+                            "user": user_name,
+                            "action_type": action_type,
+                            "continuation_intent": continuation_command,
+                        },
                     }
-                    return continuation_result
 
             return {
                 "success": success,
