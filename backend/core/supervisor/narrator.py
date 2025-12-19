@@ -38,7 +38,13 @@ class NarratorVoice(str, Enum):
 
 class NarratorEvent(str, Enum):
     """Supervisor events that trigger narration."""
+    # Lifecycle events
     SUPERVISOR_START = "supervisor_start"
+    JARVIS_ONLINE = "jarvis_online"
+    RESTART_STARTING = "restart_starting"
+    CRASH_DETECTED = "crash_detected"
+    
+    # Update events
     UPDATE_AVAILABLE = "update_available"
     UPDATE_STARTING = "update_starting"
     DOWNLOADING = "downloading"
@@ -47,20 +53,56 @@ class NarratorEvent(str, Enum):
     VERIFYING = "verifying"
     UPDATE_COMPLETE = "update_complete"
     UPDATE_FAILED = "update_failed"
+    IDLE_UPDATE = "idle_update"
+    
+    # Rollback events
     ROLLBACK_STARTING = "rollback_starting"
     ROLLBACK_COMPLETE = "rollback_complete"
-    RESTART_STARTING = "restart_starting"
-    JARVIS_ONLINE = "jarvis_online"
-    CRASH_DETECTED = "crash_detected"
-    IDLE_UPDATE = "idle_update"
+    
+    # Startup phase events (v19.6.0)
+    STARTUP_CLEANUP = "startup_cleanup"
+    STARTUP_SPAWNING = "startup_spawning"
+    STARTUP_BACKEND = "startup_backend"
+    STARTUP_DATABASE = "startup_database"
+    STARTUP_DOCKER = "startup_docker"
+    STARTUP_DOCKER_SLOW = "startup_docker_slow"
+    STARTUP_MODELS = "startup_models"
+    STARTUP_MODELS_SLOW = "startup_models_slow"
+    STARTUP_VOICE = "startup_voice"
+    STARTUP_VISION = "startup_vision"
+    STARTUP_FRONTEND = "startup_frontend"
+    STARTUP_PROGRESS_25 = "startup_progress_25"
+    STARTUP_PROGRESS_50 = "startup_progress_50"
+    STARTUP_PROGRESS_75 = "startup_progress_75"
+    STARTUP_SLOW = "startup_slow"
+    STARTUP_ERROR = "startup_error"
+    STARTUP_RECOVERY = "startup_recovery"
 
 
 # Narration templates with variations for natural feel
 NARRATION_TEMPLATES: dict[NarratorEvent, list[str]] = {
+    # Lifecycle events
     NarratorEvent.SUPERVISOR_START: [
         "Lifecycle supervisor online. Initializing JARVIS core systems.",
         "Supervisor active. Bringing JARVIS systems online.",
     ],
+    NarratorEvent.JARVIS_ONLINE: [
+        "JARVIS online. All systems operational.",
+        "Good to be back, Sir. How may I assist you?",
+        "Systems restored. Ready when you are.",
+    ],
+    NarratorEvent.RESTART_STARTING: [
+        "Restarting core systems. Back in a moment.",
+        "System restart initiated. Please stand by.",
+        "Restarting now. I'll be right back.",
+    ],
+    NarratorEvent.CRASH_DETECTED: [
+        "I detected a system fault. Attempting recovery.",
+        "An unexpected error occurred. Restarting now.",
+        "Crash detected. Initiating recovery protocol.",
+    ],
+    
+    # Update events
     NarratorEvent.UPDATE_AVAILABLE: [
         "Sir, a system update is available. {summary}",
         "I've detected a new update. {summary}",
@@ -101,6 +143,13 @@ NARRATION_TEMPLATES: dict[NarratorEvent, list[str]] = {
         "The update failed. Reverting to stable version.",
         "I'm sorry, the update didn't complete. Rolling back now.",
     ],
+    NarratorEvent.IDLE_UPDATE: [
+        "You've been away. I've updated myself while you were gone.",
+        "I applied a system update during idle time. {summary}",
+        "While you were away, I installed some improvements.",
+    ],
+    
+    # Rollback events
     NarratorEvent.ROLLBACK_STARTING: [
         "Initiating rollback to previous stable version.",
         "Reverting to the last known good configuration.",
@@ -111,25 +160,75 @@ NARRATION_TEMPLATES: dict[NarratorEvent, list[str]] = {
         "Successfully reverted. Systems stable.",
         "Rollback finished. We're back to the stable version.",
     ],
-    NarratorEvent.RESTART_STARTING: [
-        "Restarting core systems. Back in a moment.",
-        "System restart initiated. Please stand by.",
-        "Restarting now. I'll be right back.",
+    
+    # Startup phase events (v19.6.0)
+    NarratorEvent.STARTUP_CLEANUP: [
+        "Cleaning up previous sessions.",
+        "Preparing a fresh workspace.",
     ],
-    NarratorEvent.JARVIS_ONLINE: [
-        "JARVIS online. All systems operational.",
-        "Good to be back, Sir. How may I assist you?",
-        "Systems restored. Ready when you are.",
+    NarratorEvent.STARTUP_SPAWNING: [
+        "Spawning JARVIS core process.",
+        "Launching main system.",
     ],
-    NarratorEvent.CRASH_DETECTED: [
-        "I detected a system fault. Attempting recovery.",
-        "An unexpected error occurred. Restarting now.",
-        "Crash detected. Initiating recovery protocol.",
+    NarratorEvent.STARTUP_BACKEND: [
+        "Initializing backend services.",
+        "Backend is coming online.",
     ],
-    NarratorEvent.IDLE_UPDATE: [
-        "You've been away. I've updated myself while you were gone.",
-        "I applied a system update during idle time. {summary}",
-        "While you were away, I installed some improvements.",
+    NarratorEvent.STARTUP_DATABASE: [
+        "Connecting to databases.",
+        "Establishing data connections.",
+    ],
+    NarratorEvent.STARTUP_DOCKER: [
+        "Initializing Docker environment.",
+        "Starting container services.",
+    ],
+    NarratorEvent.STARTUP_DOCKER_SLOW: [
+        "Docker is taking a moment. Please stand by.",
+        "Waiting for Docker daemon. This may take a minute.",
+    ],
+    NarratorEvent.STARTUP_MODELS: [
+        "Loading machine learning models.",
+        "Initializing neural networks.",
+    ],
+    NarratorEvent.STARTUP_MODELS_SLOW: [
+        "Loading models. This is the heavy lifting.",
+        "Neural networks are warming up.",
+    ],
+    NarratorEvent.STARTUP_VOICE: [
+        "Initializing voice systems.",
+        "Calibrating speech recognition.",
+    ],
+    NarratorEvent.STARTUP_VISION: [
+        "Calibrating vision systems.",
+        "Initializing visual processing.",
+    ],
+    NarratorEvent.STARTUP_FRONTEND: [
+        "Connecting to user interface.",
+        "Frontend is coming online.",
+    ],
+    NarratorEvent.STARTUP_PROGRESS_25: [
+        "About a quarter of the way through.",
+        "25 percent loaded.",
+    ],
+    NarratorEvent.STARTUP_PROGRESS_50: [
+        "Halfway there.",
+        "50 percent complete.",
+    ],
+    NarratorEvent.STARTUP_PROGRESS_75: [
+        "Almost ready. Just a few more moments.",
+        "75 percent. Nearly done.",
+    ],
+    NarratorEvent.STARTUP_SLOW: [
+        "Taking a bit longer than usual. Everything is fine.",
+        "Still working on it. Thank you for your patience.",
+    ],
+    NarratorEvent.STARTUP_ERROR: [
+        "I've encountered a problem during startup.",
+        "Something went wrong. Attempting recovery.",
+    ],
+    NarratorEvent.STARTUP_RECOVERY: [
+        "Initiating recovery sequence.",
+        "Attempting to recover from failure.",
     ],
 }
 

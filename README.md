@@ -283,6 +283,124 @@ python3 start_system.py --restart
 | **"Check for updates"** | Forces immediate update check (bypasses 5-min interval) |
 | **"Rollback"** | Reverts to previous stable version |
 
+### Intelligent Startup Narration (v19.6.0)
+
+JARVIS now provides **intelligent, phase-aware voice narration** during the startup process. Instead of just saying "Supervisor online" and "JARVIS ready," the system narrates each major phase with contextual, dynamic messages.
+
+#### Architecture
+
+```
+┌────────────────────────────────────────────────────────────────────────────┐
+│                      IntelligentStartupNarrator                            │
+│                                                                            │
+│  ┌────────────────────────────────────────────────────────────────────┐   │
+│  │  StartupPhase State Machine                                        │   │
+│  │                                                                     │   │
+│  │  SUPERVISOR_INIT → CLEANUP → SPAWNING → BACKEND_INIT → ...        │   │
+│  │                         ↓                                          │   │
+│  │  DATABASE → DOCKER → MODELS → VOICE → VISION → FRONTEND           │   │
+│  │                         ↓                                          │   │
+│  │  WEBSOCKET → COMPLETE (or FAILED → RECOVERY)                      │   │
+│  └────────────────────────────────────────────────────────────────────┘   │
+│                                                                            │
+│  Features:                                                                 │
+│  ├── Smart batching (min 3s between narrations)                          │
+│  ├── Phase deduplication (each phase narrated once)                      │
+│  ├── Progress milestones (25%, 50%, 75%)                                 │
+│  ├── Slow startup detection (>45s triggers encouragement)                │
+│  ├── Parallel execution with loading page                                │
+│  └── Adaptive timing based on phase duration                             │
+│                                                                            │
+│  Output Channels:                                                          │
+│  ├── Voice (TTS): macOS "say" command with Daniel voice                  │
+│  └── Console: Logged with 🔊 prefix for visibility                       │
+└────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Startup Phases
+
+| Phase | When | Example Narration |
+|-------|------|-------------------|
+| `SUPERVISOR_INIT` | Supervisor starting | "Lifecycle supervisor online. Initializing JARVIS core systems." |
+| `CLEANUP` | Killing old instances | "Cleaning up previous sessions." |
+| `SPAWNING` | Launching JARVIS | "Spawning JARVIS core process." |
+| `BACKEND_INIT` | Backend starting | "Backend is coming online." |
+| `DATABASE` | DB connections | "Connecting to databases." |
+| `DOCKER` | Container services | "Initializing Docker environment." |
+| `MODELS` | ML model loading | "Loading machine learning models." |
+| `VOICE` | Voice systems | "Initializing voice systems." |
+| `VISION` | Vision systems | "Calibrating vision systems." |
+| `FRONTEND` | UI ready | "Connecting to user interface." |
+| `COMPLETE` | All ready | "JARVIS online. All systems operational." |
+
+#### Slow Startup Handling
+
+If startup takes longer than expected, JARVIS provides encouraging feedback:
+
+- **>45 seconds**: "Taking a bit longer than usual. Everything is fine."
+- **Docker slow**: "Docker is taking a moment. Please stand by."
+- **Models slow**: "Loading models. This is the heavy lifting."
+
+#### Progress Milestones
+
+At major progress points, JARVIS announces progress:
+
+- **25%**: "About a quarter of the way through."
+- **50%**: "Halfway there."
+- **75%**: "Almost ready. Just a few more moments."
+- **100%**: "JARVIS online. All systems operational."
+
+#### Configuration
+
+Control narration via environment variables:
+
+```bash
+# Enable/disable voice narration
+STARTUP_NARRATOR_VOICE=true          # Default: true
+
+# Enable/disable console logging
+STARTUP_NARRATOR_CONSOLE=true        # Default: true
+
+# Voice settings (macOS)
+STARTUP_NARRATOR_VOICE_NAME=Daniel   # Default: Daniel
+STARTUP_NARRATOR_RATE=190            # Words per minute (default: 190)
+
+# Timing
+STARTUP_NARRATOR_MIN_INTERVAL=3.0    # Min seconds between narrations
+STARTUP_SLOW_PHASE_THRESHOLD=15.0    # Announce if phase takes >15s
+STARTUP_FAST_PHASE_THRESHOLD=1.0     # Skip narration if phase <1s
+```
+
+#### Example Output
+
+```
+$ python3 run_supervisor.py
+
+=================================================================
+               ⚡ JARVIS LIFECYCLE SUPERVISOR ⚡
+=================================================================
+
+  🤖 Self-Updating • Self-Healing • Autonomous
+
+  [1/3] Checking for existing instances...
+  ● No existing JARVIS instances found
+
+  [2/3] Initializing supervisor...
+  ● Mode:          AUTO
+  ● Voice Narration: Enabled
+
+  [3/3] Starting JARVIS with loading page...
+  🔊 Voice narration enabled - JARVIS will speak during startup
+
+🔊 Narrating: Lifecycle supervisor online. Initializing JARVIS core systems.
+🔊 Narrating: Spawning JARVIS core process.
+🔊 Narrating: Backend is coming online.
+🔊 Narrating: Halfway there.
+🔊 Narrating: Calibrating vision systems.
+🔊 Narrating: Almost ready. Just a few more moments.
+🔊 Narrating: JARVIS online. All systems operational.
+```
+
 ### Configuration
 
 The Supervisor can be configured via `backend/config/supervisor_config.yaml`:

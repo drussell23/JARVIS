@@ -12,6 +12,7 @@ Components:
 - `ChangelogAnalyzer` - AI-powered commit summarization
 - `IdleDetector` - System activity monitoring
 - `SupervisorNarrator` - TTS voice feedback (Daniel voice)
+- `IntelligentStartupNarrator` - Phase-aware startup narration (v19.6.0)
 - `UpdateNotificationOrchestrator` - Multi-modal notification system (TTS + WebSocket)
 - `UpdateIntentHandler` - Voice command integration
 - `supervisor_integration` - start_system.py bridge
@@ -29,6 +30,18 @@ from .update_detector import UpdateDetector, UpdateInfo
 from .changelog_analyzer import ChangelogAnalyzer, ChangelogSummary, CommitSummary
 from .idle_detector import IdleDetector, ActivityLevel
 from .narrator import SupervisorNarrator, NarratorEvent, get_narrator
+from .startup_narrator import (
+    IntelligentStartupNarrator,
+    StartupPhase,
+    NarrationPriority,
+    NarrationConfig,
+    get_startup_narrator,
+    get_phase_from_stage,
+    narrate_phase,
+    narrate_progress,
+    narrate_complete,
+    narrate_error,
+)
 from .update_notification import (
     UpdateNotificationOrchestrator,
     NotificationChannel,
@@ -92,6 +105,17 @@ __all__ = [
     "SupervisorNarrator",
     "NarratorEvent",
     "get_narrator",
+    # Startup Narrator (v19.6.0)
+    "IntelligentStartupNarrator",
+    "StartupPhase",
+    "NarrationPriority",
+    "NarrationConfig",
+    "get_startup_narrator",
+    "get_phase_from_stage",
+    "narrate_phase",
+    "narrate_progress",
+    "narrate_complete",
+    "narrate_error",
     # Notifications
     "UpdateNotificationOrchestrator",
     "NotificationChannel",

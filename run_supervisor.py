@@ -11,6 +11,8 @@ Features:
 - Automatic cleanup of existing JARVIS instances
 - Graceful termination with TTS announcements
 - Self-updating with voice feedback
+- Intelligent startup narration (v19.6.0)
+- Phase-aware voice feedback during loading
 
 Usage:
     # Run supervisor (recommended way to start JARVIS)
@@ -19,13 +21,17 @@ Usage:
     # With custom config
     JARVIS_SUPERVISOR_CONFIG=/path/to/config.yaml python run_supervisor.py
 
+    # Disable voice narration
+    STARTUP_NARRATOR_VOICE=false python run_supervisor.py
+
 Author: JARVIS System
-Version: 1.1.0
+Version: 1.2.0
 """
 
 import asyncio
 import logging
 import os
+import platform
 import sys
 import time
 from pathlib import Path
@@ -68,12 +74,43 @@ def print_banner() -> None:
     print()
 
 
+async def speak_async(text: str, wait: bool = True) -> None:
+    """
+    Speak text asynchronously using macOS say command.
+    
+    Args:
+        text: Text to speak
+        wait: Whether to wait for speech to complete
+    """
+    if platform.system() != "Darwin":
+        return
+    
+    voice = os.getenv("STARTUP_NARRATOR_VOICE_NAME", "Daniel")
+    rate = os.getenv("STARTUP_NARRATOR_RATE", "190")
+    
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "say", "-v", voice, "-r", rate, text,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        if wait:
+            await process.wait()
+        else:
+            # Fire and forget
+            asyncio.create_task(process.wait())
+    except Exception:
+        pass
+
+
 async def cleanup_existing_instances() -> bool:
     """
     Automatically discover and cleanup existing JARVIS instances.
     
     Uses psutil for process discovery and graceful termination
     with SIGINT → SIGTERM → SIGKILL cascade.
+    
+    Includes intelligent voice narration during the cleanup process.
     
     Returns:
         True if any instances were terminated
@@ -134,17 +171,11 @@ async def cleanup_existing_instances() -> bool:
         print(f"    └─ PID {pid} (running {age_min:.1f} min)")
     print()
     
-    # TTS announcement
-    try:
-        process = await asyncio.create_subprocess_exec(
-            "say", "-v", "Daniel",
-            f"Detected {len(discovered)} existing instance. Shutting down gracefully.",
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        await process.wait()
-    except Exception:
-        pass
+    # TTS announcement - intelligent message based on instance count
+    instance_word = "instance" if len(discovered) == 1 else "instances"
+    await speak_async(
+        f"Detected {len(discovered)} existing {instance_word}. Shutting down gracefully."
+    )
     
     # Terminate with cascade: SIGINT → SIGTERM → SIGKILL
     terminated = 0
@@ -190,24 +221,24 @@ async def cleanup_existing_instances() -> bool:
     if terminated > 0:
         print(f"  \033[32m✓\033[0m Terminated {terminated} instance(s)")
         # Announce completion
-        try:
-            process = await asyncio.create_subprocess_exec(
-                "say", "-v", "Daniel", "Previous instance terminated. Starting fresh.",
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            await process.wait()
-        except Exception:
-            pass
+        await speak_async("Previous instance terminated. Starting fresh.")
     
     return terminated > 0
 
 
 async def main() -> None:
-    """Main entry point for the supervisor."""
+    """
+    Main entry point for the supervisor.
+    
+    Orchestrates the startup process with intelligent voice narration
+    and visual loading feedback.
+    """
     from core.supervisor import JARVISSupervisor
     
     print_banner()
+    
+    # Check if voice is enabled
+    voice_enabled = os.getenv("STARTUP_NARRATOR_VOICE", "true").lower() == "true"
     
     # Step 1: Automatic cleanup of existing instances
     print("  \033[90m[1/3] Checking for existing instances...\033[0m")
@@ -232,6 +263,7 @@ async def main() -> None:
     print(f"  \033[32m●\033[0m Auto-Rollback: {'Enabled' if config.rollback.auto_on_boot_failure else 'Disabled'}")
     print(f"  \033[32m●\033[0m Max Retries:   {config.health.max_crash_retries}")
     print(f"  \033[32m●\033[0m Loading Page:  \033[1mEnabled\033[0m (port 3001)")
+    print(f"  \033[32m●\033[0m Voice Narration: \033[1m{'Enabled' if voice_enabled else 'Disabled'}\033[0m")
     print()
     print("\033[36m" + "-" * 65 + "\033[0m")
     print()
@@ -239,14 +271,21 @@ async def main() -> None:
     print()
     print("  \033[33m📡 Loading page will open in Chrome Incognito\033[0m")
     print("  \033[33m   Watch real-time progress as JARVIS initializes!\033[0m")
+    if voice_enabled:
+        print("  \033[33m🔊 Voice narration enabled - JARVIS will speak during startup\033[0m")
     print()
     
     try:
         await supervisor.run()
     except KeyboardInterrupt:
         print("\n\033[33m👋 Supervisor interrupted by user\033[0m")
+        # Announce shutdown if voice is enabled
+        if voice_enabled:
+            await speak_async("Supervisor shutting down. Goodbye.", wait=True)
     except Exception as e:
         logging.error(f"Supervisor error: {e}")
+        if voice_enabled:
+            await speak_async("An error occurred. Please check the logs.", wait=True)
         raise
 
 

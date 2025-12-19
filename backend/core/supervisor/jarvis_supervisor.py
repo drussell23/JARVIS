@@ -40,6 +40,13 @@ from .narrator import (
     NarratorEvent,
     get_narrator,
 )
+from .startup_narrator import (
+    IntelligentStartupNarrator,
+    StartupPhase,
+    NarrationPriority as StartupNarrationPriority,
+    get_startup_narrator,
+    get_phase_from_stage,
+)
 from .update_notification import (
     UpdateNotificationOrchestrator,
     NotificationChannel,
@@ -176,6 +183,9 @@ class JARVISSupervisor:
         # TTS Narrator for engaging feedback
         self._narrator: SupervisorNarrator = get_narrator()
         
+        # Intelligent startup narrator for phase-aware narration
+        self._startup_narrator: IntelligentStartupNarrator = get_startup_narrator()
+        
         # Loading page support (uses loading_server.py directly)
         self._progress_reporter: Optional[Any] = None
         self._show_loading_page: bool = True  # Can be disabled via env
@@ -275,12 +285,16 @@ class JARVISSupervisor:
         """
         Spawn the JARVIS process and wait for exit.
         
-        Includes loading page orchestration for visual feedback during startup.
+        Includes loading page orchestration for visual feedback during startup
+        AND intelligent voice narration for audio feedback.
         
         Returns:
             Exit code from the JARVIS process
         """
         self._set_state(SupervisorState.STARTING)
+        
+        # Start the startup narrator
+        await self._startup_narrator.start()
         
         # Start loading page if enabled (first start or after crash)
         show_loading = self._show_loading_page and os.environ.get("JARVIS_NO_LOADING") != "1"
@@ -295,10 +309,17 @@ class JARVISSupervisor:
                 # Get progress reporter
                 self._progress_reporter = loading_server.get_progress_reporter()
                 
+                # Report and narrate supervisor init
                 await self._progress_reporter.report(
                     "supervisor_init",
                     "Supervisor initializing...",
                     5,
+                )
+                await self._startup_narrator.announce_phase(
+                    StartupPhase.SUPERVISOR_INIT,
+                    "Supervisor initializing...",
+                    5,
+                    context="start",
                 )
                 
                 # Open browser to loading page (only on first start)
@@ -390,7 +411,14 @@ class JARVISSupervisor:
         Monitor JARVIS startup and update loading page progress.
         
         Polls backend health endpoint and broadcasts stages until ready.
-        Uses loading_server.py for all progress updates.
+        Uses loading_server.py for visual progress and IntelligentStartupNarrator
+        for voice narration.
+        
+        Features:
+        - Parallel visual + voice feedback
+        - Smart phase detection and narration
+        - Slow startup detection with encouraging messages
+        - Milestone progress announcements
         """
         if not self._progress_reporter:
             return
@@ -405,8 +433,11 @@ class JARVISSupervisor:
         frontend_url = f"http://localhost:{frontend_port}"
         
         stages_completed = set()
+        stages_narrated = set()
         max_wait_seconds = 120  # 2 minute timeout
         start_time = time.time()
+        slow_startup_announced = False
+        slow_startup_threshold = 45.0  # Announce if startup takes > 45s
         
         async def check_endpoint(url: str, timeout: float = 2.0) -> bool:
             """Check if an endpoint is responding."""
@@ -419,6 +450,7 @@ class JARVISSupervisor:
         
         # Progress percentages for each stage
         progress_map = {
+            "spawning": 15,
             "backend": 40,
             "database": 55,
             "voice": 70,
@@ -426,8 +458,21 @@ class JARVISSupervisor:
             "frontend": 90,
         }
         
+        # Narrate spawning phase
+        await self._startup_narrator.announce_phase(
+            StartupPhase.SPAWNING,
+            "Starting JARVIS Core...",
+            progress_map["spawning"],
+            context="start",
+        )
+        
         while self.state == SupervisorState.RUNNING and self._progress_reporter:
             elapsed = time.time() - start_time
+            
+            # Check for slow startup
+            if not slow_startup_announced and elapsed > slow_startup_threshold:
+                slow_startup_announced = True
+                await self._startup_narrator.announce_slow_startup()
             
             if elapsed > max_wait_seconds:
                 logger.warning("⚠️ Startup monitoring timeout")
@@ -435,6 +480,7 @@ class JARVISSupervisor:
                     "Startup timeout - please check logs",
                     error="Timeout after 2 minutes"
                 )
+                await self._startup_narrator.announce_error("Startup timeout")
                 break
             
             try:
@@ -448,6 +494,18 @@ class JARVISSupervisor:
                         "Backend API online!",
                         progress_map["backend"],
                     )
+                    
+                    # Narrate backend ready (only once)
+                    if "backend" not in stages_narrated:
+                        stages_narrated.add("backend")
+                        await self._startup_narrator.announce_phase(
+                            StartupPhase.BACKEND_INIT,
+                            "Backend API online!",
+                            progress_map["backend"],
+                            context="complete",
+                        )
+                        # Also announce progress milestone
+                        await self._startup_narrator.announce_progress(progress_map["backend"])
                 
                 # Once backend is ready, check for full system status
                 if backend_ready:
@@ -468,6 +526,16 @@ class JARVISSupervisor:
                                             "Database connected",
                                             progress_map["database"],
                                         )
+                                        
+                                        if "database" not in stages_narrated:
+                                            stages_narrated.add("database")
+                                            await self._startup_narrator.announce_phase(
+                                                StartupPhase.DATABASE,
+                                                "Database connected",
+                                                progress_map["database"],
+                                                context="complete",
+                                            )
+                                            await self._startup_narrator.announce_progress(progress_map["database"])
                                     
                                     if status.get("voice_ready") and "voice" not in stages_completed:
                                         stages_completed.add("voice")
@@ -476,6 +544,16 @@ class JARVISSupervisor:
                                             "Voice system ready",
                                             progress_map["voice"],
                                         )
+                                        
+                                        if "voice" not in stages_narrated:
+                                            stages_narrated.add("voice")
+                                            await self._startup_narrator.announce_phase(
+                                                StartupPhase.VOICE,
+                                                "Voice system ready",
+                                                progress_map["voice"],
+                                                context="complete",
+                                            )
+                                            await self._startup_narrator.announce_progress(progress_map["voice"])
                                     
                                     if status.get("vision_ready") and "vision" not in stages_completed:
                                         stages_completed.add("vision")
@@ -484,6 +562,15 @@ class JARVISSupervisor:
                                             "Vision system ready",
                                             progress_map["vision"],
                                         )
+                                        
+                                        if "vision" not in stages_narrated:
+                                            stages_narrated.add("vision")
+                                            await self._startup_narrator.announce_phase(
+                                                StartupPhase.VISION,
+                                                "Vision system ready",
+                                                progress_map["vision"],
+                                                context="complete",
+                                            )
                     except Exception:
                         pass
                 
@@ -497,6 +584,16 @@ class JARVISSupervisor:
                         "Frontend ready!",
                         progress_map["frontend"],
                     )
+                    
+                    if "frontend" not in stages_narrated:
+                        stages_narrated.add("frontend")
+                        await self._startup_narrator.announce_phase(
+                            StartupPhase.FRONTEND,
+                            "Frontend ready!",
+                            progress_map["frontend"],
+                            context="complete",
+                        )
+                        await self._startup_narrator.announce_progress(progress_map["frontend"])
                 
                 # If both backend and frontend are ready, complete!
                 if backend_ready and frontend_ready:
@@ -505,6 +602,13 @@ class JARVISSupervisor:
                         "JARVIS is online!",
                         redirect_url=frontend_url,
                     )
+                    
+                    # Narrate completion with duration info
+                    duration = time.time() - start_time
+                    await self._startup_narrator.announce_complete(
+                        duration_seconds=duration,
+                    )
+                    
                     logger.info("✅ Startup complete, loading page redirecting to main app")
                     break
                 
@@ -512,6 +616,9 @@ class JARVISSupervisor:
                 logger.debug(f"Startup progress check error: {e}")
             
             await asyncio.sleep(1.0)  # Check every second
+        
+        # Stop the startup narrator
+        await self._startup_narrator.stop()
     
     async def _monitor_health(self) -> None:
         """Monitor JARVIS health while running."""
@@ -817,6 +924,12 @@ class JARVISSupervisor:
         
         Runs until shutdown is requested. Handles all exit codes
         and coordinates updates/rollbacks.
+        
+        Features:
+        - Intelligent voice narration during startup
+        - Visual loading page with progress
+        - Update detection and notification
+        - Automatic recovery from crashes
         """
         if not self.config.enabled:
             logger.warning("⚠️ Supervisor is disabled in config")
@@ -828,7 +941,7 @@ class JARVISSupervisor:
         # Start narrator
         await self._narrator.start()
         
-        # Announce supervisor online
+        # Announce supervisor online (uses main narrator)
         await self._narrator.narrate(NarratorEvent.SUPERVISOR_START, wait=True)
         
         # Initialize components
