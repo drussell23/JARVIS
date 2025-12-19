@@ -1084,24 +1084,123 @@ class UnifiedCommandProcessor:
                 }
 
         # =========================================================================
-        # FAST PATH v4.0: SYSTEM commands bypass heavy processing
+        # FAST PATH v5.0: SYSTEM commands with PROACTIVE UNLOCK support
         # =========================================================================
-        # System commands (search, open, navigate) don't need:
-        # - VBI/ECAPA verification (no security implications)
-        # - Context-aware handlers (direct execution)
-        # - Query complexity analysis (simple commands)
-        # - Goal inference (no autonomous decisions needed)
-        # Route directly to _execute_system_command for instant response.
+        # System commands (search, open, navigate) use fast path BUT:
+        # - First check if screen is locked (fast Quartz check)
+        # - If locked → trigger proactive unlock with voice verification
+        # - After unlock → continue with the command
+        # This maintains the autonomous workflow while being fast when unlocked.
         # =========================================================================
         if command_type == CommandType.SYSTEM:
-            logger.info("[UNIFIED] 🚀 SYSTEM command detected - FAST PATH v4.0")
-            logger.info("[UNIFIED]    ⚡ Bypassing VBI/ECAPA/Context handlers")
+            logger.info("[UNIFIED] 🚀 SYSTEM command detected - FAST PATH v5.0")
             logger.info(f"[UNIFIED]    📝 Command: '{command_text}'")
 
             try:
+                # ─────────────────────────────────────────────────────────────
+                # Step 1: FAST Screen Lock Check (Quartz-based, <10ms)
+                # ─────────────────────────────────────────────────────────────
+                is_locked = False
+                try:
+                    from Quartz import CGSessionCopyCurrentDictionary
+                    session_dict = CGSessionCopyCurrentDictionary()
+                    if session_dict:
+                        is_locked = session_dict.get("CGSSessionScreenIsLocked", False)
+                        if not is_locked:
+                            # Also check screensaver
+                            is_locked = session_dict.get("CGSSessionScreenSaverIsRunning", False)
+                    logger.info(f"[UNIFIED]    🔒 Screen locked: {is_locked}")
+                except ImportError:
+                    logger.debug("[UNIFIED] Quartz not available for lock check")
+                except Exception as e:
+                    logger.debug(f"[UNIFIED] Lock check error: {e}")
+
+                # ─────────────────────────────────────────────────────────────
+                # Step 2: If LOCKED → Proactive Unlock Flow
+                # ─────────────────────────────────────────────────────────────
+                if is_locked:
+                    logger.info("[UNIFIED] 🔐 Screen is LOCKED - triggering proactive unlock")
+                    
+                    # Determine what action we'll do after unlock (for acknowledgment)
+                    continuation_action = "searching" if "search" in command_text.lower() else "executing your command"
+                    
+                    # Speak acknowledgment (non-blocking)
+                    try:
+                        ack_message = f"Screen is locked. Verifying your voice, then {continuation_action}."
+                        logger.info(f"[UNIFIED] 🎤 Acknowledgment: '{ack_message}'")
+                        ack_process = await asyncio.create_subprocess_exec(
+                            "say", "-v", "Daniel", "-r", "180", ack_message,
+                            stdout=asyncio.subprocess.DEVNULL,
+                            stderr=asyncio.subprocess.DEVNULL,
+                        )
+                        # Don't wait - let it speak in background
+                        asyncio.create_task(ack_process.wait())
+                    except Exception:
+                        pass
+                    
+                    # Trigger unlock via simple_unlock_handler (has VBI integration)
+                    try:
+                        from api.simple_unlock_handler import handle_unlock_command
+                        
+                        # Create audio container for voice verification
+                        class AudioContainer:
+                            def __init__(self, audio_data, speaker_name):
+                                self.last_audio_data = audio_data
+                                self.last_speaker_name = speaker_name
+                        
+                        jarvis_instance = AudioContainer(
+                            audio_data=audio_data,
+                            speaker_name=speaker_name
+                        ) if audio_data else None
+                        
+                        if jarvis_instance and audio_data:
+                            logger.info(f"[UNIFIED] 🎤 Passing {len(audio_data)} bytes for voice verification")
+                        
+                        unlock_result = await asyncio.wait_for(
+                            handle_unlock_command("unlock my screen", jarvis_instance=jarvis_instance),
+                            timeout=20.0
+                        )
+                        
+                        if not unlock_result.get("success", False):
+                            logger.warning(f"[UNIFIED] ❌ Unlock failed: {unlock_result.get('response')}")
+                            return {
+                                "success": False,
+                                "response": unlock_result.get("response", "Could not unlock screen. Please try again."),
+                                "command_type": "system",
+                                "unlock_failed": True,
+                            }
+                        
+                        logger.info("[UNIFIED] ✅ Screen unlocked successfully!")
+                        
+                        # Brief pause for screen to fully unlock
+                        await asyncio.sleep(0.3)
+                        
+                    except asyncio.TimeoutError:
+                        logger.error("[UNIFIED] ❌ Unlock timed out")
+                        return {
+                            "success": False,
+                            "response": "Screen unlock timed out. Please try again.",
+                            "command_type": "system",
+                            "error": "unlock_timeout"
+                        }
+                    except ImportError:
+                        logger.warning("[UNIFIED] simple_unlock_handler not available")
+                    except Exception as e:
+                        logger.error(f"[UNIFIED] ❌ Unlock error: {e}")
+                        return {
+                            "success": False,
+                            "response": f"Could not unlock screen: {str(e)}",
+                            "command_type": "system",
+                            "error": str(e)
+                        }
+
+                # ─────────────────────────────────────────────────────────────
+                # Step 3: Execute the System Command (screen is now unlocked)
+                # ─────────────────────────────────────────────────────────────
+                logger.info("[UNIFIED]    ⚡ Executing system command...")
                 result = await asyncio.wait_for(
                     self._execute_system_command(command_text),
-                    timeout=20.0  # 20 second timeout for system commands
+                    timeout=20.0
                 )
 
                 logger.info(f"[UNIFIED] ✅ System command executed: success={result.get('success')}")
@@ -1111,6 +1210,7 @@ class UnifiedCommandProcessor:
                     "response": result.get("response", ""),
                     "command_type": "system",
                     "fast_path": True,
+                    "proactive_unlock": is_locked,  # Track if we unlocked
                     **result
                 }
             except asyncio.TimeoutError:

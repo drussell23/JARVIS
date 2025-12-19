@@ -474,6 +474,81 @@ class MacOSController:
             logger.error(f"Async AppleScript execution error: {e}")
             return False, str(e)
 
+    async def execute_shell_async(
+        self, command: str, timeout: float = 30.0, safe_mode: bool = True
+    ) -> Tuple[bool, str]:
+        """Execute shell command asynchronously without blocking the event loop.
+
+        This is the PROPER async method for shell execution that should be used
+        in all async contexts. Uses asyncio.create_subprocess_shell to avoid blocking.
+
+        Unlike execute_shell_pipeline, this does NOT go through the full pipeline,
+        making it ideal for simple system commands like 'open URL'.
+
+        Args:
+            command: The shell command to execute
+            timeout: Maximum execution time in seconds (default: 30.0)
+            safe_mode: If True, validates command against blocked patterns
+
+        Returns:
+            Tuple of (success: bool, output: str)
+        """
+        import asyncio
+        import shlex
+
+        # Safety check for dangerous commands
+        if safe_mode:
+            dangerous_patterns = [
+                "rm -rf /", "mkfs", "dd if=", "> /dev/sd",
+                "chmod -R 777 /", ":(){ :|:& };:", "fork bomb",
+                "sudo rm", "sudo mkfs", "sudo dd"
+            ]
+            cmd_lower = command.lower()
+            for pattern in dangerous_patterns:
+                if pattern in cmd_lower:
+                    logger.warning(f"Blocked dangerous command: {command[:50]}...")
+                    return False, f"Command blocked for safety: contains '{pattern}'"
+
+        try:
+            logger.debug(f"[SHELL_ASYNC] Executing: {command[:100]}...")
+
+            # Create subprocess asynchronously using shell
+            process = await asyncio.create_subprocess_shell(
+                command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+
+            # Wait for completion with timeout
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(),
+                    timeout=timeout
+                )
+            except asyncio.TimeoutError:
+                # Kill the process if it times out
+                try:
+                    process.kill()
+                    await process.wait()
+                except Exception:
+                    pass
+                logger.warning(f"[SHELL_ASYNC] Command timed out: {command[:50]}...")
+                return False, "Shell command execution timed out"
+
+            stdout_str = stdout.decode().strip() if stdout else ""
+            stderr_str = stderr.decode().strip() if stderr else ""
+
+            if process.returncode == 0:
+                logger.debug(f"[SHELL_ASYNC] Success: {stdout_str[:100] if stdout_str else '(no output)'}")
+                return True, stdout_str
+            else:
+                logger.warning(f"[SHELL_ASYNC] Failed (code {process.returncode}): {stderr_str[:100]}")
+                return False, stderr_str or f"Command failed with exit code {process.returncode}"
+
+        except Exception as e:
+            logger.error(f"[SHELL_ASYNC] Execution error: {e}")
+            return False, str(e)
+
     async def execute_shell_pipeline(
         self, command: str, safe_mode: bool = True, timeout: float = 30.0
     ) -> Tuple[bool, str]:
@@ -505,10 +580,25 @@ class MacOSController:
             logger.error(f"Pipeline shell execution failed: {e}")
             return False, str(e)
 
-    async def execute_shell(self, command: str, safe_mode: bool = True) -> Tuple[bool, str]:
-        """Execute shell command (async)"""
-        # Directly call async pipeline - no need for run_until_complete
-        return await self.execute_shell_pipeline(command, safe_mode)
+    async def execute_shell(
+        self, command: str, safe_mode: bool = True, use_pipeline: bool = False
+    ) -> Tuple[bool, str]:
+        """Execute shell command (async).
+
+        By default, uses the lightweight execute_shell_async for non-blocking execution.
+        Set use_pipeline=True for complex commands that need full pipeline processing.
+
+        Args:
+            command: The shell command to execute
+            safe_mode: If True, validates command against blocked patterns
+            use_pipeline: If True, routes through full async pipeline (heavier)
+        """
+        if use_pipeline:
+            # Use full pipeline for complex commands that need stage processing
+            return await self.execute_shell_pipeline(command, safe_mode)
+        else:
+            # Use lightweight async execution (non-blocking, no pipeline overhead)
+            return await self.execute_shell_async(command, safe_mode=safe_mode)
 
     # Application Control Methods
 
@@ -1153,9 +1243,9 @@ class MacOSController:
                     domain = urlparse(url).netloc.replace("www.", "")
                     return True, f"Opening {domain} for you"
             else:
-                # Fallback to shell command
+                # Fallback to shell command (ASYNC - non-blocking)
                 cmd = f"open -a '{browser}' '{url}'"
-                success, message = await self.execute_shell(cmd)
+                success, message = await self.execute_shell_async(cmd)
                 if success:
                     # Consistent conversational format
                     if "google.com/search?q=" in url.lower():
@@ -1178,8 +1268,9 @@ class MacOSController:
                         return True, f"opening {domain} in {browser}"
                 return False, f"I couldn't open that URL"
         else:
+            # Use truly async shell execution (NON-BLOCKING - doesn't go through pipeline)
             cmd = f"open '{url}'"
-            success, message = await self.execute_shell(cmd)
+            success, message = await self.execute_shell_async(cmd)
             if success:
                 # More conversational response for default browser
                 if "google.com/search?q=" in url.lower():
