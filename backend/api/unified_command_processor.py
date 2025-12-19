@@ -1222,9 +1222,16 @@ class UnifiedCommandProcessor:
                     "error": "timeout"
                 }
             except Exception as e:
-                logger.error(f"[UNIFIED] ❌ System command failed: {e}")
-                # Fall through to normal processing if fast path fails
-                logger.info("[UNIFIED] Falling back to normal processing...")
+                logger.error(f"[UNIFIED] ❌ System command failed: {e}", exc_info=True)
+                # CRITICAL FIX: Return error instead of falling through to heavy normal processing
+                # Falling through caused "Processing..." hang because normal path is very heavyweight
+                return {
+                    "success": False,
+                    "response": f"Sorry, I had trouble executing that command. Error: {str(e)}",
+                    "command_type": "system",
+                    "error": str(e),
+                    "fast_path_failed": True,
+                }
 
         # NORMAL PATH: For all non-SCREEN_LOCK and non-SYSTEM commands
         else:

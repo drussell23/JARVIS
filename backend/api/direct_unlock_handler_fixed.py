@@ -211,7 +211,7 @@ async def check_screen_locked_direct() -> bool:
 
     except asyncio.TimeoutError:
         logger.warning("[DIRECT UNLOCK] Daemon connection timed out, checking via system")
-        return check_screen_locked_system()
+        return await check_screen_locked_system()
     except (ConnectionRefusedError, OSError) as e:
         if "Connect call failed" in str(e) or "connection refused" in str(e).lower():
             logger.warning(
@@ -219,55 +219,78 @@ async def check_screen_locked_direct() -> bool:
             )
         else:
             logger.warning(f"[DIRECT UNLOCK] Connection error: {e}")
-        return check_screen_locked_system()
+        return await check_screen_locked_system()
     except Exception as e:
         logger.error(f"[DIRECT UNLOCK] Error checking screen lock: {e}")
         # Fallback to system check
-        return check_screen_locked_system()
+        return await check_screen_locked_system()
 
 
-def check_screen_locked_system() -> bool:
-    """Check screen lock state using system API"""
+async def check_screen_locked_system() -> bool:
+    """Check screen lock state using system API - ASYNC VERSION.
+
+    CRITICAL: This function MUST be async to avoid blocking the event loop.
+    Using asyncio.create_subprocess_exec() instead of subprocess.run().
+    """
     try:
         logger.info("[DIRECT UNLOCK] Checking screen lock via system API")
-        import subprocess
 
-        # Use a more reliable method to check screen lock
+        # FAST PATH: Try direct Quartz check first (no subprocess needed)
+        try:
+            from Quartz import CGSessionCopyCurrentDictionary
+            session_dict = CGSessionCopyCurrentDictionary()
+            if session_dict:
+                screen_locked = session_dict.get("CGSSessionScreenIsLocked", False)
+                screen_saver = session_dict.get("CGSSessionScreenSaverIsActive", False)
+                is_locked = bool(screen_locked or screen_saver)
+                logger.info(f"[DIRECT UNLOCK] Screen locked (Quartz direct): {is_locked}")
+                return is_locked
+        except ImportError:
+            logger.debug("[DIRECT UNLOCK] Quartz not available, using subprocess fallback")
+        except Exception as e:
+            logger.debug(f"[DIRECT UNLOCK] Quartz check failed: {e}, using subprocess fallback")
+
+        # FALLBACK: Use async subprocess if Quartz direct check failed
         check_script = """
-import Quartz
 import sys
-
 try:
-    # Get the current session dictionary
+    import Quartz
     session_dict = Quartz.CGSessionCopyCurrentDictionary()
     if session_dict:
-        # Check multiple indicators
         screen_locked = session_dict.get("CGSSessionScreenIsLocked", False)
         screen_saver = session_dict.get("CGSSessionScreenSaverIsActive", False)
-        on_console = session_dict.get("kCGSSessionOnConsoleKey", True)
-        
-        # Screen is considered locked if locked flag is True or screensaver is active
         is_locked = bool(screen_locked or screen_saver)
         print("true" if is_locked else "false")
     else:
-        # If we can't get session dict, assume unlocked
         print("false")
-except Exception as e:
+except Exception:
     print("false")
-    sys.exit(1)
 """
 
-        result = subprocess.run(
-            ["python3", "-c", check_script], capture_output=True, text=True, timeout=5
+        # CRITICAL: Use async subprocess to avoid blocking the event loop
+        process = await asyncio.create_subprocess_exec(
+            "python3", "-c", check_script,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
 
-        is_locked = result.stdout.strip().lower() == "true"
-        logger.info(f"[DIRECT UNLOCK] Screen locked from system: {is_locked}")
-        return is_locked
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(),
+                timeout=5.0
+            )
+            is_locked = stdout.decode().strip().lower() == "true"
+            logger.info(f"[DIRECT UNLOCK] Screen locked from system: {is_locked}")
+            return is_locked
+        except asyncio.TimeoutError:
+            logger.error("[DIRECT UNLOCK] Timeout checking screen lock state")
+            try:
+                process.kill()
+                await process.wait()
+            except Exception:
+                pass
+            return False
 
-    except subprocess.TimeoutExpired:
-        logger.error("[DIRECT UNLOCK] Timeout checking screen lock state")
-        return False
     except Exception as e:
         logger.error(f"[DIRECT UNLOCK] Error in system screen check: {e}")
         return False

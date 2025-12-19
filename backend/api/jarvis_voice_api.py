@@ -2845,10 +2845,23 @@ class JARVISVoiceAPI:
                                     f"[JARVIS WS] Processing with SIMPLE context awareness: '{command_text}'"
                                 )
 
-                            # Process with context awareness
-                            result = await context_handler.process_with_context(
-                                command_text, websocket
-                            )
+                            # Process with context awareness - WITH TIMEOUT PROTECTION
+                            # CRITICAL: Without timeout, blocking operations could hang forever
+                            try:
+                                result = await asyncio.wait_for(
+                                    context_handler.process_with_context(
+                                        command_text, websocket
+                                    ),
+                                    timeout=30.0  # 30 second max for context processing
+                                )
+                            except asyncio.TimeoutError:
+                                logger.error(f"[JARVIS WS] ❌ Context processing timed out for: '{command_text}'")
+                                result = {
+                                    "success": False,
+                                    "response": "I apologize, but that command is taking too long. Please try again.",
+                                    "command_type": "timeout",
+                                    "error": "context_processing_timeout"
+                                }
 
                             # Send the response with enhanced context info
                             response_text = result.get("response", "I processed your command.")
