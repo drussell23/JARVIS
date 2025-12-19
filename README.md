@@ -371,6 +371,36 @@ STARTUP_SLOW_PHASE_THRESHOLD=15.0    # Announce if phase takes >15s
 STARTUP_FAST_PHASE_THRESHOLD=1.0     # Skip narration if phase <1s
 ```
 
+#### Narration Flow (Precisely Aligned with Visual)
+
+Voice narration is **synchronized with the loading page** - they happen at the exact same moment:
+
+```
+Time     Visual (Loading Page)              Voice (TTS)
+──────   ─────────────────────────────────  ──────────────────────────────────────
+T+0.0    Loading page opens                 -
+T+0.1    -                                  "Cleaning up previous session." (if needed)
+T+1.0    -                                  "Lifecycle supervisor online..."
+T+2.0    5% - Supervisor initializing...    -
+T+2.5    10% - Starting JARVIS Core...      "Spawning JARVIS core process." ← ALIGNED
+T+2.6    (process created)                  -
+T+...    40% - Backend API online!          "Backend is coming online." ← ALIGNED
+T+...    55% - Database connected           - (visual only)
+T+...    70% - Voice system ready           - (visual only)
+T+...    80% - Vision system ready          - (visual only)
+T+...    90% - Frontend ready!              - (visual only)
+T+END    100% - Complete! (redirects)       "JARVIS online." ← ALIGNED
+```
+
+**Key Alignments:**
+1. **Spawning**: Visual + Voice happen BEFORE process creation (accurate timing)
+2. **Backend**: Visual + Voice announce together when health check passes
+3. **Complete**: Visual redirect + Voice "JARVIS online" happen simultaneously
+
+**What's NOT narrated** (visual-only details):
+- Database connection, Voice system, Vision system, Frontend ready
+- These are shown on the loading page but not spoken to avoid over-talking
+
 #### Example Output
 
 ```
@@ -383,7 +413,9 @@ $ python3 run_supervisor.py
   🤖 Self-Updating • Self-Healing • Autonomous
 
   [1/3] Checking for existing instances...
-  ● No existing JARVIS instances found
+  ● Found 1 existing instance(s):
+    └─ PID 12345 (running 5.2 min)
+  ✓ Terminated 1 instance(s)
 
   [2/3] Initializing supervisor...
   ● Mode:          AUTO
@@ -392,12 +424,11 @@ $ python3 run_supervisor.py
   [3/3] Starting JARVIS with loading page...
   🔊 Voice narration enabled - JARVIS will speak during startup
 
+🔊 Narrating: Cleaning up previous session.
 🔊 Narrating: Lifecycle supervisor online. Initializing JARVIS core systems.
 🔊 Narrating: Spawning JARVIS core process.
 🔊 Narrating: Backend is coming online.
-🔊 Narrating: Halfway there.
-🔊 Narrating: Calibrating vision systems.
-🔊 Narrating: Almost ready. Just a few more moments.
+✅ Startup complete in 23.4s, redirecting to main app
 🔊 Narrating: JARVIS online. All systems operational.
 ```
 

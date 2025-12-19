@@ -171,11 +171,11 @@ async def cleanup_existing_instances() -> bool:
         print(f"    └─ PID {pid} (running {age_min:.1f} min)")
     print()
     
-    # TTS announcement - intelligent message based on instance count
-    instance_word = "instance" if len(discovered) == 1 else "instances"
-    await speak_async(
-        f"Detected {len(discovered)} existing {instance_word}. Shutting down gracefully."
-    )
+    # TTS announcement - concise, don't over-explain
+    # Only speak if voice is enabled (check env)
+    voice_enabled = os.getenv("STARTUP_NARRATOR_VOICE", "true").lower() == "true"
+    if voice_enabled:
+        await speak_async("Cleaning up previous session.", wait=False)
     
     # Terminate with cascade: SIGINT → SIGTERM → SIGKILL
     terminated = 0
@@ -220,8 +220,8 @@ async def cleanup_existing_instances() -> bool:
     
     if terminated > 0:
         print(f"  \033[32m✓\033[0m Terminated {terminated} instance(s)")
-        # Announce completion
-        await speak_async("Previous instance terminated. Starting fresh.")
+        # NOTE: Don't narrate again here - the supervisor will announce "Supervisor online" next
+        # Having too many announcements is confusing
     
     return terminated > 0
 
