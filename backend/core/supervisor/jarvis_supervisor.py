@@ -242,6 +242,10 @@ class JARVISSupervisor:
         if self._update_detector is None and self.config.update.check.enabled:
             from .update_detector import UpdateDetector
             self._update_detector = UpdateDetector(self.config)
+            # v2.0: Initialize baseline for local change awareness
+            await self._update_detector.initialize_baseline()
+            # Register callback for local change notifications
+            self._update_detector.on_local_change(self._on_local_change_detected)
         
         if self._idle_detector is None and self.config.idle.enabled:
             from .idle_detector import IdleDetector
@@ -1050,21 +1054,70 @@ class JARVISSupervisor:
             logger.error(f"❌ Rollback error: {e}")
             return False
     
+    async def _on_local_change_detected(self, info: "LocalChangeInfo") -> None:
+        """
+        Callback for local change awareness (v2.0).
+
+        Triggered when local repository changes are detected:
+        - New commits made
+        - Code pushed to remote
+        - Uncommitted changes
+        - Branch switches
+
+        Communicates with user via voice and logs.
+        """
+        from .update_detector import ChangeType
+        from .narrator import NarratorEvent
+
+        if not info.has_changes:
+            return
+
+        logger.info(f"📝 Local change detected: {info.summary}")
+
+        # Determine which event to announce
+        event: Optional[NarratorEvent] = None
+        context: dict = {}
+
+        if info.change_type == ChangeType.LOCAL_PUSH:
+            event = NarratorEvent.LOCAL_PUSH_DETECTED
+            context["summary"] = info.summary
+        elif info.change_type == ChangeType.LOCAL_COMMIT:
+            event = NarratorEvent.LOCAL_COMMIT_DETECTED
+            context["summary"] = info.summary
+        elif info.change_type == ChangeType.UNCOMMITTED:
+            event = NarratorEvent.CODE_CHANGES_DETECTED
+            context["summary"] = f"{info.uncommitted_files} uncommitted files"
+
+        # Announce via narrator
+        if event and self._narrator:
+            await self._narrator.narrate_event(event, **context)
+
+        # If restart is recommended, announce that too
+        if info.restart_recommended and info.restart_reason:
+            logger.info(f"🔄 Restart recommended: {info.restart_reason}")
+            if self._narrator:
+                await asyncio.sleep(2)  # Brief pause for clarity
+                await self._narrator.narrate_event(
+                    NarratorEvent.RESTART_RECOMMENDED,
+                    reason=info.restart_reason,
+                )
+
     async def _run_update_detector(self) -> None:
         """
         Background task: Intelligent update detection and multi-modal notification.
-        
+
         This method runs continuously in the background, checking for updates
         and delivering notifications through multiple channels:
         - Voice (TTS) announcements for immediate awareness
         - WebSocket broadcasts for frontend badge/modal display
         - Console logging for developer visibility
-        
+
         Features:
         - Intelligent deduplication (same update = one notification)
         - Priority-based delivery (security updates are urgent)
         - User activity awareness (configurable interrupt behavior)
         - Rich changelog summaries for meaningful notifications
+        - LOCAL CHANGE AWARENESS (v2.0): Detects your commits and pushes
         """
         if not self._update_detector:
             logger.info("📭 Update detector not enabled")

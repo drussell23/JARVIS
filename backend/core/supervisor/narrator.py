@@ -78,6 +78,12 @@ class NarratorEvent(str, Enum):
     STARTUP_ERROR = "startup_error"
     STARTUP_RECOVERY = "startup_recovery"
 
+    # Local change awareness events (v2.0)
+    LOCAL_COMMIT_DETECTED = "local_commit_detected"
+    LOCAL_PUSH_DETECTED = "local_push_detected"
+    RESTART_RECOMMENDED = "restart_recommended"
+    CODE_CHANGES_DETECTED = "code_changes_detected"
+
 
 # Narration templates with variations for natural feel
 NARRATION_TEMPLATES: dict[NarratorEvent, list[str]] = {
@@ -229,6 +235,28 @@ NARRATION_TEMPLATES: dict[NarratorEvent, list[str]] = {
     NarratorEvent.STARTUP_RECOVERY: [
         "Initiating recovery sequence.",
         "Attempting to recover from failure.",
+    ],
+
+    # Local change awareness events (v2.0)
+    NarratorEvent.LOCAL_COMMIT_DETECTED: [
+        "I notice you've made a new commit. {summary}",
+        "A new commit has been detected. {summary}",
+        "You've been busy! I see {summary}.",
+    ],
+    NarratorEvent.LOCAL_PUSH_DETECTED: [
+        "I see you've pushed code to the repository. {summary}",
+        "Nice! Your changes have been pushed. {summary}",
+        "Your code is now on the remote. {summary}",
+    ],
+    NarratorEvent.RESTART_RECOMMENDED: [
+        "Sir, I recommend a restart to apply your changes. {reason}",
+        "A restart would pick up your recent modifications. {reason}",
+        "Would you like me to restart? {reason}",
+    ],
+    NarratorEvent.CODE_CHANGES_DETECTED: [
+        "I've detected code changes since I started. {summary}",
+        "Some files have been modified. {summary}",
+        "There are uncommitted changes in the repository. {summary}",
     ],
 }
 
