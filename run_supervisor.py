@@ -1149,9 +1149,10 @@ class SupervisorBootstrapper:
             # CRITICAL: Optimize Frontend Memory & Timeout based on resources
             # Reduce Node memory to 2GB (from default 4GB) to prevent relief pressure
             os.environ["JARVIS_FRONTEND_MEMORY_MB"] = "2048"
-            # Increase timeout to 120s to prevent early shutdown
-            os.environ["JARVIS_FRONTEND_TIMEOUT"] = "120"
-            self.logger.info("🔄 Configured Frontend: 2GB RAM limit, 120s timeout")
+            # Increase timeout to 600s to prevent early shutdown on slow systems
+            # (Observed startup time takes up to 4 minutes)
+            os.environ["JARVIS_FRONTEND_TIMEOUT"] = "600"
+            self.logger.info("🔄 Configured Frontend: 2GB RAM limit, 600s timeout")
 
             # Propagate warnings for downstream handling
             if resources.warnings:

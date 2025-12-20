@@ -8988,6 +8988,7 @@ class AsyncSystemManager:
             self.backend_dir / "logs" / f"frontend_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
         )
         log_file.parent.mkdir(exist_ok=True)
+        self.frontend_log_path = log_file  # Store for monitoring
 
         # Open log file without 'with' statement to keep it open for subprocess
         log = open(log_file, "w")
@@ -9089,7 +9090,7 @@ class AsyncSystemManager:
         This is the ROOT FIX for the loading page completing too early.
         """
         frontend_port = self.ports.get('frontend', 3000)
-        url = f"http://localhost:{frontend_port}"
+        url = f"http://127.0.0.1:{frontend_port}"
         
         try:
             async with aiohttp.ClientSession() as session:
@@ -9110,7 +9111,7 @@ class AsyncSystemManager:
         Broadcasts progress updates to loading page during wait.
         """
         frontend_port = self.ports.get('frontend', 3000)
-        url = f"http://localhost:{frontend_port}"
+        url = f"http://127.0.0.1:{frontend_port}"
         start_time = time.time()
         check_interval = 1.0  # Check every second
         last_progress_broadcast = 0  # Track last broadcast time
@@ -9119,6 +9120,9 @@ class AsyncSystemManager:
         print(f"{Colors.CYAN}Waiting for frontend (port {frontend_port}) to be ready...{Colors.ENDC}")
 
         check_count = 0
+        last_log_size = 0
+        last_activity_time = time.time()
+        
         while (time.time() - start_time) < max_wait:
             check_count += 1
             try:
@@ -9142,8 +9146,32 @@ class AsyncSystemManager:
             except Exception:
                 pass
 
-            remaining = max_wait - (time.time() - start_time)
-            elapsed = time.time() - start_time
+            # Check log activity to extend timeout dynamically
+            current_time = time.time()
+            if hasattr(self, 'frontend_log_path') and self.frontend_log_path and self.frontend_log_path.exists():
+                try:
+                    current_size = self.frontend_log_path.stat().st_size
+                    if current_size > last_log_size:
+                        last_log_size = current_size
+                        last_activity_time = current_time  # Reset activity timer
+                        
+                        # Peek at last line to show progress
+                        with open(self.frontend_log_path, 'r') as f:
+                            lines = f.readlines()
+                            if lines:
+                                last_line = lines[-1].strip()[:50]
+                                if "Compiling" in last_line or "webpack" in last_line:
+                                    print(f"{Colors.CYAN}   Running: {last_line}...{Colors.ENDC}", end="\r")
+                except:
+                    pass
+
+            # Fail if no activity for 60 seconds (stuck)
+            if current_time - last_activity_time > 60:
+                print(f"\n{Colors.WARNING}⚠️  Frontend process stuck (no log output for 60s){Colors.ENDC}")
+                return False
+
+            remaining = max_wait - (current_time - start_time)
+            elapsed = current_time - start_time
 
             # Broadcast progress updates to loading page every few seconds
             if elapsed - last_progress_broadcast >= progress_broadcast_interval:
