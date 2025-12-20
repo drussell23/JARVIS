@@ -14252,28 +14252,34 @@ except Exception as e:
             frontend_ready = await self._wait_for_frontend_ready(max_wait=30)
         
         # NOW broadcast 100% completion - only after frontend is verified
-        try:
-            import aiohttp
-            url = "http://localhost:3001/api/update-progress"
-            data = {
-                "stage": "complete",
-                "message": "JARVIS is ready!" if frontend_ready else "JARVIS ready (frontend may still be loading)",
-                "progress": 100,
-                "timestamp": datetime.now().isoformat(),
-                "metadata": {
-                    "icon": "✅",
-                    "label": "Complete",
-                    "sublabel": "System ready!" if frontend_ready else "Frontend initializing...",
-                    "success": True,
-                    "frontend_verified": frontend_ready,
-                    "redirect_url": f"http://localhost:{self.ports['frontend']}"
+        # CRITICAL: Skip if supervisor is handling loading page (avoid duplicate completion signals)
+        supervisor_handling_loading = os.environ.get("JARVIS_SUPERVISOR_LOADING") == "1"
+
+        if supervisor_handling_loading:
+            print(f"{Colors.CYAN}📡 Supervisor controls completion - skipping broadcast{Colors.ENDC}")
+        else:
+            try:
+                import aiohttp
+                url = "http://localhost:3001/api/update-progress"
+                data = {
+                    "stage": "complete",
+                    "message": "JARVIS is ready!" if frontend_ready else "JARVIS ready (frontend may still be loading)",
+                    "progress": 100,
+                    "timestamp": datetime.now().isoformat(),
+                    "metadata": {
+                        "icon": "✅",
+                        "label": "Complete",
+                        "sublabel": "System ready!" if frontend_ready else "Frontend initializing...",
+                        "success": True,
+                        "frontend_verified": frontend_ready,
+                        "redirect_url": f"http://localhost:{self.ports['frontend']}"
+                    }
                 }
-            }
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=data, timeout=aiohttp.ClientTimeout(total=1)) as resp:
-                    print(f"{Colors.GREEN}✓ Loading page notified of completion (frontend verified: {frontend_ready}){Colors.ENDC}")
-        except:
-            pass  # Loading server might have already shut down
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(url, json=data, timeout=aiohttp.ClientTimeout(total=1)) as resp:
+                        print(f"{Colors.GREEN}✓ Loading page notified of completion (frontend verified: {frontend_ready}){Colors.ENDC}")
+            except:
+                pass  # Loading server might have already shut down
 
         # Configure frontend for autonomous mode
         if self.autonomous_mode and AUTONOMOUS_AVAILABLE:
@@ -14370,7 +14376,12 @@ except Exception as e:
                 )
 
             # Handle browser opening based on restart status
-            if self.is_restart:
+            # CRITICAL: Skip browser operations if supervisor is handling loading page
+            supervisor_handling_loading = os.environ.get("JARVIS_SUPERVISOR_LOADING") == "1"
+
+            if supervisor_handling_loading:
+                print(f"{Colors.CYAN}📡 Supervisor controls browser/loading - skipping browser operations{Colors.ENDC}")
+            elif self.is_restart:
                 # During restart: Clean up duplicate tabs and show loading page
                 await self.open_browser_smart()  # Will redirect to localhost:3001 (loading page)
                 print(f"{Colors.GREEN}✓ Redirected existing tabs to loading page{Colors.ENDC}")
@@ -15922,7 +15933,19 @@ async def main():
 
     # Helper function to broadcast progress to loading server
     async def broadcast_to_loading_server(stage, message, progress, metadata=None):
-        """Send progress update to loading server via HTTP"""
+        """
+        Send progress update to loading server via HTTP.
+
+        CRITICAL: When JARVIS_SUPERVISOR_LOADING=1, the supervisor is the authority
+        for progress updates. start_system.py should NOT broadcast progress in this mode
+        to avoid conflicting signals that cause premature completion.
+        """
+        # Skip if supervisor is handling loading page
+        if os.environ.get("JARVIS_SUPERVISOR_LOADING") == "1":
+            # Only print to console for visibility, don't broadcast
+            print(f"  {Colors.CYAN}📊 [Supervisor Mode] {progress}% - {message}{Colors.ENDC}")
+            return
+
         try:
             import aiohttp
             url = "http://localhost:3001/api/update-progress"
@@ -16840,7 +16863,20 @@ async def main():
         # Step 0: Start standalone loading server BEFORE killing processes
         loading_server_url = "http://localhost:3001"
 
-        if not args.no_browser:
+        # CRITICAL: Check if supervisor is handling the loading page
+        # When JARVIS_SUPERVISOR_LOADING=1, the supervisor already:
+        # 1. Started the loading server
+        # 2. Opened the Chrome window
+        # 3. Is broadcasting progress updates
+        # We must NOT duplicate these operations!
+        supervisor_handling_loading = os.environ.get("JARVIS_SUPERVISOR_LOADING") == "1"
+
+        if supervisor_handling_loading:
+            print(f"{Colors.CYAN}📡 Supervisor is handling loading page - skipping browser/loading server{Colors.ENDC}")
+            # Set the flag to prevent any browser operations in this session
+            globals()['_browser_opened_this_startup'] = True
+
+        if not args.no_browser and not supervisor_handling_loading:
             print(f"{Colors.CYAN}📡 Starting loading page server...{Colors.ENDC}")
             try:
                 loading_server_script = Path(__file__).parent / "loading_server.py"
