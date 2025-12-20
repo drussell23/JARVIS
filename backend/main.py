@@ -3663,68 +3663,162 @@ async def health_ping():
 @app.get("/health/ready")
 async def health_ready():
     """
-    Quick readiness probe - confirms key services are initialized.
+    Quick readiness probe - confirms key services are OPERATIONALLY READY.
 
-    Faster than full /health endpoint, checks only critical systems.
-    Use this for Kubernetes readiness probes.
+    ═══════════════════════════════════════════════════════════════════════════
+    CRITICAL: This endpoint determines when JARVIS is ready for USER INTERACTION
+    ═══════════════════════════════════════════════════════════════════════════
 
-    During ML warmup, returns "warming_up" status with progress info.
-    This allows the frontend to show appropriate loading state.
+    Returns ready=True ONLY when:
+    1. ML models are loaded and ready (not warming up)
+    2. Voice system is initialized
+    3. Core APIs are functional
+
+    This prevents false positives where the loading page redirects before
+    JARVIS can actually respond to user commands.
     """
-    ready = True
     details = {}
+    critical_services_ready = []
+    critical_services_failed = []
 
-    # Check ML Engine Registry warmup status (most important for voice unlock)
+    # ═══════════════════════════════════════════════════════════════════════════
+    # CHECK 1: ML Engine Registry (CRITICAL for voice unlock)
+    # ═══════════════════════════════════════════════════════════════════════════
     ml_warmup_info = {}
+    ml_ready = False
     try:
         from voice_unlock.ml_engine_registry import get_ml_warmup_status, is_voice_unlock_ready
         ml_warmup_info = get_ml_warmup_status()
         details["ml_warmup"] = ml_warmup_info
 
-        # If ML is warming up, report that status
         if ml_warmup_info.get("is_warming_up"):
-            details["ml_models"] = "warming_up"
+            details["ml_models_ready"] = False
+            details["ml_models_status"] = "warming_up"
             details["ml_progress"] = ml_warmup_info.get("progress", 0.0)
             details["ml_current_engine"] = ml_warmup_info.get("current_engine")
+            critical_services_failed.append("ml_models")
         elif ml_warmup_info.get("is_ready"):
-            details["ml_models"] = "ready"
+            details["ml_models_ready"] = True
+            details["ml_models_status"] = "ready"
+            ml_ready = True
+            critical_services_ready.append("ml_models")
         else:
-            details["ml_models"] = "not_started"
+            details["ml_models_ready"] = False
+            details["ml_models_status"] = "not_started"
+            critical_services_failed.append("ml_models")
     except ImportError:
-        details["ml_warmup"] = {"status": "not_available"}
-        details["ml_models"] = "not_available"
+        details["ml_models_ready"] = False
+        details["ml_models_status"] = "not_available"
+        # ML not available is degraded but not a blocker
     except Exception as e:
-        details["ml_warmup"] = {"error": str(e)}
-        details["ml_models"] = "error"
+        details["ml_models_ready"] = False
+        details["ml_models_status"] = f"error: {str(e)[:50]}"
+        critical_services_failed.append("ml_models")
 
-    # Check if voice unlock is initialized (fast check - no async calls)
+    # ═══════════════════════════════════════════════════════════════════════════
+    # CHECK 2: Voice System (CRITICAL for user interaction)
+    # ═══════════════════════════════════════════════════════════════════════════
+    voice_ready = False
     if hasattr(app.state, "voice_unlock"):
-        details["voice_unlock"] = app.state.voice_unlock.get("initialized", False)
+        voice_initialized = app.state.voice_unlock.get("initialized", False)
+        details["voice_unlock_ready"] = voice_initialized
+        if voice_initialized:
+            voice_ready = True
+            critical_services_ready.append("voice_unlock")
+        else:
+            critical_services_failed.append("voice_unlock")
     else:
-        details["voice_unlock"] = False
+        details["voice_unlock_ready"] = False
+        # Voice unlock not available is acceptable (degraded mode)
 
-    # Check if ML audio is available (fast check)
-    if hasattr(app.state, "ml_audio_state"):
-        details["ml_audio"] = True
+    # ═══════════════════════════════════════════════════════════════════════════
+    # CHECK 3: Speaker Verification Service (IMPORTANT for voice biometrics)
+    # ═══════════════════════════════════════════════════════════════════════════
+    speaker_service_ready = False
+    try:
+        from voice.speaker_verification_service import get_speaker_service
+        speaker_svc = get_speaker_service()
+        if speaker_svc and speaker_svc._initialized:
+            details["speaker_service_ready"] = True
+            speaker_service_ready = True
+            critical_services_ready.append("speaker_service")
+        else:
+            details["speaker_service_ready"] = False
+            critical_services_failed.append("speaker_service")
+    except ImportError:
+        details["speaker_service_ready"] = False
+    except Exception:
+        details["speaker_service_ready"] = False
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # CHECK 4: WebSocket System (CRITICAL for frontend communication)
+    # ═══════════════════════════════════════════════════════════════════════════
+    websocket_ready = False
+    if hasattr(app.state, "unified_websocket_manager"):
+        details["websocket_ready"] = True
+        websocket_ready = True
+        critical_services_ready.append("websocket")
     else:
-        details["ml_audio"] = False
+        details["websocket_ready"] = False
+        # WebSocket not ready means frontend can't communicate properly
+        critical_services_failed.append("websocket")
 
-    # Check if event loop is responsive (always true if we got here)
-    details["event_loop"] = True
+    # ═══════════════════════════════════════════════════════════════════════════
+    # CHECK 5: Database Connection (IMPORTANT for persistence)
+    # ═══════════════════════════════════════════════════════════════════════════
+    database_ready = False
+    try:
+        from intelligence.learning_database import get_learning_db
+        db = get_learning_db()
+        if db and db._initialized:
+            details["database_connected"] = True
+            database_ready = True
+            critical_services_ready.append("database")
+        else:
+            details["database_connected"] = False
+    except ImportError:
+        details["database_connected"] = False
+    except Exception:
+        details["database_connected"] = False
 
-    # Determine overall status
-    if ml_warmup_info.get("is_warming_up"):
-        status = "warming_up"
-        ready = True  # Backend is ready, just warming models
-    elif all(v for k, v in details.items() if k not in ["ml_warmup", "ml_models", "ml_progress", "ml_current_engine"]):
+    # ═══════════════════════════════════════════════════════════════════════════
+    # DETERMINE OVERALL READINESS
+    # ═══════════════════════════════════════════════════════════════════════════
+    # ready=True ONLY when critical services are operational
+    # This prevents false positives that mislead users
+
+    # Minimum requirements for "ready":
+    # 1. WebSocket must be ready (frontend communication)
+    # 2. At least one voice service must be ready (ML or speaker service)
+    voice_operational = ml_ready or speaker_service_ready or voice_ready
+    core_ready = websocket_ready and voice_operational
+
+    # Determine status
+    if core_ready and len(critical_services_failed) == 0:
         status = "ready"
+        ready = True
+    elif core_ready:
+        status = "degraded"  # Some services failed but core is operational
+        ready = True
+    elif ml_warmup_info.get("is_warming_up"):
+        status = "warming_up"
+        ready = False  # NOT ready during warmup - this was the bug!
     else:
-        status = "degraded"
+        status = "initializing"
+        ready = False
+
+    # Event loop is always responsive if we got here
+    details["event_loop"] = True
 
     return {
         "status": status,
         "ready": ready,
-        "details": details
+        "operational": core_ready,
+        "details": details,
+        "services": {
+            "ready": critical_services_ready,
+            "failed": critical_services_failed,
+        }
     }
 
 
