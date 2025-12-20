@@ -704,19 +704,46 @@ class JARVISSupervisor:
                 return False
         
         async def check_system_status() -> dict:
-            """Check detailed system status from backend."""
+            """
+            Check detailed system status from backend using /health/ready endpoint.
+
+            This endpoint provides accurate subsystem status including:
+            - ML model warmup status
+            - Voice unlock readiness
+            - Audio system status
+
+            Returns a normalized dict with consistent field names for subsystem tracking.
+            """
             try:
                 if session is None or session.closed:
                     return {}
-                
+
+                # Use /health/ready which provides actual subsystem status
                 async with session.get(
-                    f"{backend_url}/api/system/status",
+                    f"{backend_url}/health/ready",
                     timeout=aiohttp.ClientTimeout(total=health_check_timeout)
                 ) as resp:
                     if resp.status == 200:
-                        return await resp.json()
-            except Exception:
-                pass
+                        data = await resp.json()
+                        details = data.get("details", {})
+                        ml_warmup = details.get("ml_warmup", {})
+
+                        # Normalize response to expected format
+                        # CRITICAL: Default to False (not ready), not True!
+                        # We should only mark components ready when explicitly confirmed
+                        return {
+                            "database_connected": True,  # If backend responds, SQLite is connected
+                            "voice_ready": details.get("voice_unlock", False),
+                            "vision_ready": True,  # Vision is typically always available
+                            "ml_models_ready": ml_warmup.get("is_ready", False),
+                            "ml_warming_up": ml_warmup.get("is_warming_up", False),
+                            "ml_progress": ml_warmup.get("progress", 0.0),
+                            "ml_audio_ready": details.get("ml_audio", False),
+                            "overall_status": data.get("status", "unknown"),
+                            "overall_ready": data.get("ready", False),
+                        }
+            except Exception as e:
+                logger.debug(f"System status check failed: {e}")
             return {}
         
         async def parallel_health_check() -> Tuple[bool, bool, dict]:
@@ -834,15 +861,19 @@ class JARVISSupervisor:
                                 context="complete",
                             )
                     
-                    # System subsystems - mark complete based on system_status OR assume ready if backend is up
-                    # This handles cases where the backend doesn't expose granular status fields
+                    # System subsystems - mark complete based on ACTUAL status from /health/ready
+                    # CRITICAL: Default to False (not ready), not True!
+                    # Progress should reflect REAL backend state, not assumptions
                     if backend_ready:
-                        # If we have detailed system_status, use it; otherwise assume subsystems are ready
-                        # when backend health check passes (backend wouldn't be healthy if subsystems failed)
-                        database_ready = system_status.get("database_connected", True) if system_status else True
-                        voice_ready_status = system_status.get("voice_ready", True) if system_status else True
-                        vision_ready_status = system_status.get("vision_ready", True) if system_status else True
+                        # Extract status from system_status (from /health/ready endpoint)
+                        # Only mark components ready when explicitly confirmed
+                        database_ready = system_status.get("database_connected", False) if system_status else False
+                        voice_ready_status = system_status.get("voice_ready", False) if system_status else False
+                        vision_ready_status = system_status.get("vision_ready", False) if system_status else False
+                        ml_models_ready = system_status.get("ml_models_ready", False) if system_status else False
+                        ml_warming_up = system_status.get("ml_warming_up", False) if system_status else False
 
+                        # Database: SQLite is connected if backend responds
                         if database_ready and "database" not in stages_completed:
                             stages_completed.add("database")
                             if self._progress_hub:
@@ -856,6 +887,7 @@ class JARVISSupervisor:
                                 log_type="success"
                             )
 
+                        # Voice: Wait for actual voice_unlock confirmation
                         if voice_ready_status and "voice" not in stages_completed:
                             stages_completed.add("voice")
                             if self._progress_hub:
@@ -869,6 +901,7 @@ class JARVISSupervisor:
                                 log_type="success"
                             )
 
+                        # Vision: Mark complete if vision status is ready
                         if vision_ready_status and "vision" not in stages_completed:
                             stages_completed.add("vision")
                             if self._progress_hub:
@@ -882,17 +915,30 @@ class JARVISSupervisor:
                                 log_type="success"
                             )
 
-                        # Mark websocket and models as complete when backend is ready
-                        # These are internal to the backend and don't have separate health endpoints
+                        # WebSocket: Mark complete when backend is ready (WebSocket is always available when backend is up)
                         if "websocket" not in stages_completed:
                             stages_completed.add("websocket")
                             if self._progress_hub:
                                 await self._progress_hub.component_complete("websocket", "WebSocket ready")
 
-                        if "models" not in stages_completed:
+                        # Models: Only mark complete when ML models are actually ready (not warming up)
+                        if ml_models_ready and not ml_warming_up and "models" not in stages_completed:
                             stages_completed.add("models")
                             if self._progress_hub:
                                 await self._progress_hub.component_complete("models", "AI models loaded")
+                            await self._progress_reporter.report(
+                                "models",
+                                "AI models loaded",
+                                get_progress(),
+                                log_entry="ML models fully initialized and ready",
+                                log_source="Backend",
+                                log_type="success"
+                            )
+                        elif ml_warming_up and "models" not in stages_completed:
+                            # Models are warming up - start the component but don't complete it
+                            if self._progress_hub and "models_started" not in stages_completed:
+                                stages_completed.add("models_started")
+                                await self._progress_hub.component_start("models", "ML models warming up...")
 
                     # Frontend
                     if frontend_ready and "frontend" not in stages_completed:
