@@ -2482,7 +2482,7 @@ class ProcessCleanupManager:
     def _schedule_memory_relief(self, memory_percent: float) -> None:
         """
         Schedule async memory relief safely, handling both sync and async contexts.
-        
+
         NOTE: This method recalculates relief level. For event-driven cleanup,
         use _schedule_memory_relief_with_level() to use the level from the event.
         """
@@ -2496,7 +2496,7 @@ class ProcessCleanupManager:
             level = "MODERATE"
         else:
             return  # No relief needed
-        
+
         self._schedule_memory_relief_with_level(memory_percent, level, [])
     
     def _schedule_memory_relief_with_level(
@@ -2808,7 +2808,7 @@ class ProcessCleanupManager:
             if decision == VMDecision.CREATE:
                 # Approved - create the VM
                 logger.info(f"🚀 Creating GCP Spot VM (approved): {reason}")
-                
+
                 # Create the request object for the controller
                 from core.supervisor_gcp_controller import VMCreationRequest
                 from datetime import datetime
@@ -3065,7 +3065,7 @@ class ProcessCleanupManager:
             return {
                 "status": "error",
                 "message": f"Failed to reset memory controller: {e}"
-            }
+        }
 
     def robust_force_restart_cleanup(self, skip_code_check: bool = True) -> List[Dict]:
         """

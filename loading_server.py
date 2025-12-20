@@ -1243,7 +1243,7 @@ class StartupProgressReporter:
         
         asyncio.create_task(self._send_with_retry(payload))
         return True
-
+    
     async def close(self):
         if self._session and not self._session.closed:
             await self._session.close()
