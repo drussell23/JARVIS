@@ -1022,25 +1022,101 @@ class ParallelInitializer:
     # =========================================================================
 
     def get_status(self) -> Dict[str, Any]:
-        """Get current initialization status"""
+        """
+        Get current initialization status.
+
+        Returns format compatible with supervisor's check_system_status():
+        - components.ready: LIST of component names (not counts!)
+        - components.failed: LIST of failed component names
+        - is_complete: Whether startup is fully complete
+        - message: Current status message
+
+        Also includes detailed component info for debugging.
+        """
         elapsed = time.time() - self.started_at if self.started_at else 0
 
-        ready_count = sum(1 for c in self.components.values() if c.phase == InitPhase.COMPLETE)
-        failed_count = sum(1 for c in self.components.values() if c.phase == InitPhase.FAILED)
-        pending_count = sum(1 for c in self.components.values() if c.phase in (InitPhase.PENDING, InitPhase.RUNNING))
+        # Get component name LISTS (not counts!) - this is what supervisor expects
+        ready_components = [
+            name for name, c in self.components.items()
+            if c.phase == InitPhase.COMPLETE
+        ]
+        failed_components = [
+            name for name, c in self.components.items()
+            if c.phase == InitPhase.FAILED
+        ]
+        pending_components = [
+            name for name, c in self.components.items()
+            if c.phase in (InitPhase.PENDING, InitPhase.RUNNING)
+        ]
+
+        # Map internal component names to supervisor-expected names
+        # Supervisor expects: database, voice, vision, models, websocket, backend
+        component_mapping = {
+            # Database components
+            "cloud_sql_proxy": "database",
+            "learning_database": "database",
+            # Voice components
+            "speaker_verification": "voice",
+            "voice_unlock_api": "voice",
+            "jarvis_voice_api": "voice",
+            # Vision components
+            "vision_analyzer": "vision",
+            "display_monitor": "vision",
+            # ML/Models components
+            "ml_engine_registry": "models",
+            "cloud_ml_router": "models",
+            "cloud_ecapa_client": "models",
+            "vbi_prewarm": "models",
+            "neural_mesh": "models",
+            # WebSocket
+            "unified_websocket": "websocket",
+        }
+
+        # Build simplified component lists for supervisor
+        simplified_ready = set()
+        for comp_name in ready_components:
+            mapped = component_mapping.get(comp_name)
+            if mapped:
+                simplified_ready.add(mapped)
+
+        simplified_failed = set()
+        for comp_name in failed_components:
+            mapped = component_mapping.get(comp_name)
+            if mapped:
+                simplified_failed.add(mapped)
+
+        # Determine if startup is complete
+        is_complete = self._full_mode_event.is_set()
+
+        # Generate status message
+        if is_complete:
+            message = "JARVIS startup complete!"
+        elif failed_components:
+            message = f"Startup in progress ({len(failed_components)} failures)"
+        elif pending_components:
+            message = f"Initializing {len(pending_components)} components..."
+        else:
+            message = "Starting up..."
 
         return {
             "phase": self.app.state.startup_phase,
             "progress": self.app.state.startup_progress,
+            "message": message,
             "elapsed_seconds": elapsed,
+            # Supervisor-compatible component format (LISTS of names!)
             "components": {
-                "ready": ready_count,
-                "failed": failed_count,
-                "pending": pending_count,
+                "ready": list(simplified_ready),
+                "failed": list(simplified_failed),
+                # Also include counts for backwards compatibility
+                "ready_count": len(ready_components),
+                "failed_count": len(failed_components),
+                "pending_count": len(pending_components),
                 "total": len(self.components),
             },
             "ready_for_requests": self._ready_event.is_set(),
-            "full_mode": self._full_mode_event.is_set(),
+            "full_mode": is_complete,
+            "is_complete": is_complete,
+            # Detailed component info for debugging
             "components_detail": {
                 name: {
                     "status": comp.phase.value,
@@ -1048,6 +1124,12 @@ class ParallelInitializer:
                     "error": comp.error,
                 }
                 for name, comp in self.components.items()
+            },
+            # Raw component lists for advanced debugging
+            "internal_components": {
+                "ready": ready_components,
+                "failed": failed_components,
+                "pending": pending_components,
             }
         }
 

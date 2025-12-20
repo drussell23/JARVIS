@@ -79,8 +79,15 @@ wikipedia-api==0.6.0
 python-dotenv==1.0.0
 
 # Cloud AI APIs
-anthropic==0.72.0
-huggingface-hub==0.19.4  # For Claude API integration
+anthropic>=0.72.0
+huggingface-hub>=0.19.4  # For Claude API integration
+
+# Voice Activity & Wake Word Detection
+webrtcvad>=2.0.10  # Voice activity detection
+pvporcupine>=3.0.0  # Wake word detection (requires PICOVOICE_ACCESS_KEY)
+
+# Schema Validation
+jsonschema>=4.20.0  # JSON schema validation for config and API
 
 # Weather and location services
 geocoder>=1.38.0  # For IP-based location detection

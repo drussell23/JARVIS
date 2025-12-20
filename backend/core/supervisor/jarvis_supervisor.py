@@ -991,13 +991,31 @@ class JARVISSupervisor:
                         )
                     
                     # === COMPLETION CHECK ===
-                    # Complete when: backend ready AND (frontend ready OR frontend is optional)
-                    # If frontend is optional, we complete as soon as backend is ready
-                    # (no need to wait for frontend to be in stages_completed)
+                    # Complete when ALL conditions are met:
+                    # 1. Backend is ready (responding to /health)
+                    # 2. Backend reports is_complete=True (all components initialized)
+                    # 3. Frontend is ready OR frontend is optional
+                    #
+                    # The is_complete check ensures we don't complete prematurely
+                    # while components are still initializing in parallel_initializer
+                    backend_fully_complete = system_status.get("is_complete", False) if system_status else False
+
                     ready_for_completion = (
                         backend_ready and
+                        backend_fully_complete and
                         (frontend_ready or frontend_optional)
                     )
+
+                    # Fallback: If backend has been ready for 30+ seconds but is_complete
+                    # is still false, check if we have most components ready
+                    if (not ready_for_completion and
+                        backend_ready and
+                        (frontend_ready or frontend_optional) and
+                        len(stages_completed) >= 5):
+                        # Check if we've been waiting too long with backend ready
+                        if elapsed > 60:
+                            logger.warning("⚠️ Backend ready but is_complete=False for 60s+, completing anyway")
+                            ready_for_completion = True
 
                     # If completing without frontend, mark it as skipped
                     if ready_for_completion and not frontend_ready and frontend_optional:
