@@ -142,6 +142,99 @@
 }
 
 /* ═══════════════════════════════════════════════════════════════════
+   LOCAL CHANGE VARIANTS (v2.0)
+   ═══════════════════════════════════════════════════════════════════ */
+
+/* Local changes - Cyan accent */
+.badge-local {
+    border-color: #00d4ff;
+    color: #00d4ff;
+    box-shadow:
+        0 0 20px rgba(0, 212, 255, 0.3),
+        0 4px 20px rgba(0, 0, 0, 0.5),
+        inset 0 0 20px rgba(0, 212, 255, 0.1);
+}
+
+.badge-local .badge-count {
+    background: #00d4ff;
+}
+
+.badge-local .badge-pulse {
+    border-color: #00d4ff;
+}
+
+/* Code pushed - Purple accent */
+.badge-push {
+    border-color: #a855f7;
+    color: #a855f7;
+    box-shadow:
+        0 0 20px rgba(168, 85, 247, 0.3),
+        0 4px 20px rgba(0, 0, 0, 0.5),
+        inset 0 0 20px rgba(168, 85, 247, 0.1);
+}
+
+.badge-push .badge-count {
+    background: #a855f7;
+}
+
+.badge-push .badge-pulse {
+    border-color: #a855f7;
+}
+
+/* Restart recommended - Amber/Orange accent */
+.badge-restart {
+    border-color: #f59e0b;
+    color: #f59e0b;
+    box-shadow:
+        0 0 20px rgba(245, 158, 11, 0.3),
+        0 4px 20px rgba(0, 0, 0, 0.5),
+        inset 0 0 20px rgba(245, 158, 11, 0.1);
+    animation: restartPulse 1.5s ease-in-out infinite;
+}
+
+.badge-restart .badge-count {
+    background: #f59e0b;
+}
+
+.badge-restart .badge-pulse {
+    border-color: #f59e0b;
+    animation: pulse-ring 1s ease-out infinite;
+}
+
+@keyframes restartPulse {
+    0%, 100% {
+        box-shadow:
+            0 0 20px rgba(245, 158, 11, 0.3),
+            0 4px 20px rgba(0, 0, 0, 0.5),
+            inset 0 0 20px rgba(245, 158, 11, 0.1);
+    }
+    50% {
+        box-shadow:
+            0 0 30px rgba(245, 158, 11, 0.5),
+            0 4px 20px rgba(0, 0, 0, 0.5),
+            inset 0 0 30px rgba(245, 158, 11, 0.2);
+    }
+}
+
+/* Countdown badge */
+.badge-countdown {
+    background: #f59e0b;
+    color: #000;
+    padding: 2px 8px;
+    border-radius: 12px;
+    font-size: 12px;
+    font-weight: 700;
+    min-width: 30px;
+    text-align: center;
+    animation: countdownBlink 1s ease-in-out infinite;
+}
+
+@keyframes countdownBlink {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.7; }
+}
+
+/* ═══════════════════════════════════════════════════════════════════
    MODAL OVERLAY
    ═══════════════════════════════════════════════════════════════════ */
 
@@ -319,6 +412,36 @@
     color: #ffbb44;
 }
 
+/* Restart recommended alert (v2.0) */
+.restart-alert {
+    background: rgba(245, 158, 11, 0.15);
+    border: 1px solid rgba(245, 158, 11, 0.3);
+    color: #fbbf24;
+}
+
+/* Countdown alert (v2.0) */
+.countdown-alert {
+    background: rgba(239, 68, 68, 0.15);
+    border: 1px solid rgba(239, 68, 68, 0.3);
+    color: #f87171;
+    animation: countdownPulse 1s ease-in-out infinite;
+}
+
+@keyframes countdownPulse {
+    0%, 100% {
+        background: rgba(239, 68, 68, 0.15);
+    }
+    50% {
+        background: rgba(239, 68, 68, 0.25);
+    }
+}
+
+/* More files indicator */
+.more-files {
+    color: #666;
+    font-style: italic;
+}
+
 /* Highlights list */
 .update-highlights {
     margin-bottom: 16px;
@@ -369,7 +492,8 @@
 }
 
 .btn-later,
-.btn-update {
+.btn-update,
+.btn-restart {
     flex: 1;
     padding: 14px 24px;
     border-radius: 8px;
@@ -421,6 +545,77 @@
 .update-modal.badge-security .btn-update:hover:not(:disabled) {
     background: #ff6666;
     box-shadow: 0 4px 20px rgba(255, 68, 68, 0.4);
+}
+
+/* Restart button (v2.0) */
+.btn-restart {
+    background: #f59e0b;
+    border: none;
+    color: #000;
+}
+
+.btn-restart:hover:not(:disabled) {
+    background: #fbbf24;
+    transform: translateY(-1px);
+    box-shadow: 0 4px 20px rgba(245, 158, 11, 0.4);
+}
+
+.btn-restart:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+/* Local change modal variants (v2.0) */
+.update-modal.badge-local {
+    border-color: #00d4ff;
+    box-shadow:
+        0 0 40px rgba(0, 212, 255, 0.3),
+        0 20px 60px rgba(0, 0, 0, 0.8);
+}
+
+.update-modal.badge-local .update-modal-header {
+    border-bottom-color: rgba(0, 212, 255, 0.2);
+    background: rgba(0, 212, 255, 0.05);
+}
+
+.update-modal.badge-local .update-modal-header h2 {
+    color: #00d4ff;
+}
+
+.update-modal.badge-push {
+    border-color: #a855f7;
+    box-shadow:
+        0 0 40px rgba(168, 85, 247, 0.3),
+        0 20px 60px rgba(0, 0, 0, 0.8);
+}
+
+.update-modal.badge-push .update-modal-header {
+    border-bottom-color: rgba(168, 85, 247, 0.2);
+    background: rgba(168, 85, 247, 0.05);
+}
+
+.update-modal.badge-push .update-modal-header h2 {
+    color: #a855f7;
+}
+
+.update-modal.badge-restart {
+    border-color: #f59e0b;
+    box-shadow:
+        0 0 40px rgba(245, 158, 11, 0.3),
+        0 20px 60px rgba(0, 0, 0, 0.8);
+}
+
+.update-modal.badge-restart .update-modal-header {
+    border-bottom-color: rgba(245, 158, 11, 0.2);
+    background: rgba(245, 158, 11, 0.05);
+}
+
+.update-modal.badge-restart .update-modal-header h2 {
+    color: #f59e0b;
+}
+
+.update-modal.badge-restart .update-modal-actions {
+    border-top-color: rgba(245, 158, 11, 0.2);
 }
 
 /* ═══════════════════════════════════════════════════════════════════

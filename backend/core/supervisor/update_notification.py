@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-JARVIS Update Notification Orchestrator
-=========================================
+JARVIS Update Notification Orchestrator v2.0
+==============================================
 
 Intelligent, multi-modal update notification system that provides:
 - Voice (TTS) announcements via the narrator
@@ -10,12 +10,17 @@ Intelligent, multi-modal update notification system that provides:
 - User activity awareness (don't interrupt active use)
 - Changelog-aware summaries for meaningful notifications
 - Configurable notification preferences
+- LOCAL CHANGE AWARENESS (v2.0):
+  - Detects local commits and pushes
+  - Intelligent restart recommendations
+  - Auto-restart option with user transparency
+  - MaintenanceOverlay integration
 
 This orchestrator ensures users receive timely, non-intrusive notifications
 through multiple channels while maintaining a cohesive experience.
 
 Author: JARVIS System
-Version: 1.0.0
+Version: 2.0.0
 """
 
 from __future__ import annotations
@@ -31,7 +36,7 @@ from typing import Any, Callable, Optional, TYPE_CHECKING
 import aiohttp
 
 from .supervisor_config import SupervisorConfig, get_supervisor_config
-from .update_detector import UpdateDetector, UpdateInfo
+from .update_detector import UpdateDetector, UpdateInfo, LocalChangeInfo, ChangeType
 
 if TYPE_CHECKING:
     from .changelog_analyzer import ChangelogAnalyzer, ChangelogSummary
@@ -68,7 +73,7 @@ class UserActivityState(str, Enum):
 class NotificationState:
     """
     Tracks notification state to prevent spam and enable smart delivery.
-    
+
     Attributes:
         last_notified_hash: Hash of the last update we notified about
         last_notified_at: When we last sent a notification
@@ -86,38 +91,51 @@ class NotificationState:
     last_update_info: Optional[UpdateInfo] = None
     last_changelog: Optional[Any] = None  # ChangelogSummary
 
+    # v2.0: Local change awareness state
+    last_local_change_hash: Optional[str] = None
+    last_local_notified_at: Optional[datetime] = None
+    pending_restart: bool = False
+    auto_restart_scheduled: bool = False
+    last_local_changes: Optional[LocalChangeInfo] = None
 
-@dataclass  
+
+@dataclass
 class NotificationConfig:
     """
     Configuration for update notifications.
-    
+
     Loaded from supervisor config with sensible defaults.
     """
     # Channel settings
     voice_enabled: bool = True
     websocket_enabled: bool = True
     console_enabled: bool = True
-    
+
     # Timing
     min_interval_seconds: int = 300       # Minimum time between notifications
     reminder_interval_seconds: int = 3600  # Re-notify after this long
     max_reminders: int = 3                 # Max reminder notifications
-    
+
     # Priority thresholds
     security_immediate: bool = True        # Always notify immediately for security
-    
+
     # User activity awareness
     interrupt_active_user: bool = False    # Don't interrupt active use
     active_timeout_seconds: int = 120      # Consider user "active" if recent activity
-    
+
     # Content
     announce_changes: bool = True          # Use changelog analyzer
     max_summary_words: int = 50            # TTS summary word limit
-    
+
     # Frontend integration
     backend_url: str = "http://localhost:8010"
     websocket_timeout: float = 3.0
+
+    # v2.0: Local change awareness settings
+    local_change_enabled: bool = True      # Enable local change detection
+    auto_restart_enabled: bool = True      # Auto-restart when recommended
+    auto_restart_delay_seconds: int = 5    # Delay before auto-restart for user awareness
+    local_change_debounce_seconds: int = 30  # Debounce multiple rapid changes
 
 
 @dataclass
@@ -640,8 +658,268 @@ class UpdateNotificationOrchestrator:
             "user_dismissed": self._state.user_dismissed,
             "user_acknowledged": self._state.user_acknowledged,
             "user_activity": self._get_user_activity_state().value,
+            # v2.0: Local change state
+            "has_local_changes": self._state.last_local_changes is not None and self._state.last_local_changes.has_changes,
+            "pending_restart": self._state.pending_restart,
+            "auto_restart_scheduled": self._state.auto_restart_scheduled,
         }
-    
+
+    # =========================================================================
+    # v2.0: LOCAL CHANGE AWARENESS METHODS
+    # =========================================================================
+
+    def _compute_local_change_hash(self, info: LocalChangeInfo) -> str:
+        """Compute hash for local change to detect duplicates."""
+        content = f"{info.started_on_commit}:{info.commits_since_start}:{info.uncommitted_files}"
+        return hashlib.sha256(content.encode()).hexdigest()[:16]
+
+    async def notify_local_changes(
+        self,
+        info: LocalChangeInfo,
+        force: bool = False,
+    ) -> NotificationResult:
+        """
+        Notify about local repository changes.
+
+        This handles:
+        - Local commits detected
+        - Code pushed to remote
+        - Uncommitted changes
+        - Restart recommendations
+
+        Args:
+            info: LocalChangeInfo from the update detector
+            force: Force notification even if recently notified
+
+        Returns:
+            NotificationResult with delivery status
+        """
+        if not self._notification_config.local_change_enabled:
+            return NotificationResult(success=False, error_message="Local change notifications disabled")
+
+        if not info.has_changes:
+            return NotificationResult(success=False, error_message="No changes to notify")
+
+        async with self._lock:
+            # Check debounce
+            change_hash = self._compute_local_change_hash(info)
+            if not force and self._state.last_local_change_hash == change_hash:
+                if self._state.last_local_notified_at:
+                    elapsed = (datetime.now() - self._state.last_local_notified_at).total_seconds()
+                    if elapsed < self._notification_config.local_change_debounce_seconds:
+                        return NotificationResult(
+                            success=False,
+                            error_message=f"Debounced (notified {elapsed:.0f}s ago)"
+                        )
+
+            # Update state
+            self._state.last_local_change_hash = change_hash
+            self._state.last_local_notified_at = datetime.now()
+            self._state.last_local_changes = info
+            self._state.pending_restart = info.restart_recommended
+
+            # Prepare parallel notifications
+            channels_delivered: list[NotificationChannel] = []
+            tasks = []
+
+            # Build notification message
+            if info.change_type == ChangeType.LOCAL_PUSH:
+                event_type = "local_push_detected"
+                message = f"Code pushed to remote: {info.summary}"
+            elif info.change_type == ChangeType.LOCAL_COMMIT:
+                event_type = "local_commit_detected"
+                message = f"New commit detected: {info.summary}"
+            elif info.change_type == ChangeType.UNCOMMITTED:
+                event_type = "code_changes_detected"
+                message = f"Uncommitted changes: {info.summary}"
+            else:
+                event_type = "local_changes_detected"
+                message = info.summary
+
+            # WebSocket broadcast to frontend
+            if self._notification_config.websocket_enabled:
+                tasks.append(("websocket", self._broadcast_local_changes_to_frontend(info, event_type)))
+
+            # Console logging
+            if self._notification_config.console_enabled:
+                log_emoji = "📤" if info.change_type == ChangeType.LOCAL_PUSH else "📝"
+                logger.info(f"{log_emoji} Local changes: {message}")
+                if info.restart_recommended:
+                    logger.info(f"🔄 Restart recommended: {info.restart_reason}")
+                channels_delivered.append(NotificationChannel.CONSOLE)
+
+            # Execute parallel notifications
+            if tasks:
+                results = await asyncio.gather(
+                    *[task for _, task in tasks],
+                    return_exceptions=True
+                )
+
+                for (channel_name, _), result in zip(tasks, results):
+                    if isinstance(result, Exception):
+                        logger.warning(f"{channel_name} notification failed: {result}")
+                    elif result:
+                        if channel_name == "websocket":
+                            channels_delivered.append(NotificationChannel.WEBSOCKET)
+
+            # Handle auto-restart if recommended
+            if info.restart_recommended and self._notification_config.auto_restart_enabled:
+                if not self._state.auto_restart_scheduled:
+                    self._state.auto_restart_scheduled = True
+                    # Schedule auto-restart with delay for user awareness
+                    asyncio.create_task(self._schedule_auto_restart(info))
+
+            return NotificationResult(
+                success=len(channels_delivered) > 0,
+                channels_delivered=channels_delivered,
+            )
+
+    async def _broadcast_local_changes_to_frontend(
+        self,
+        info: LocalChangeInfo,
+        event_type: str,
+    ) -> bool:
+        """Broadcast local changes to frontend via WebSocket."""
+        payload = {
+            "type": event_type,
+            "data": {
+                "has_changes": info.has_changes,
+                "change_type": info.change_type.value if info.change_type else None,
+                "summary": info.summary,
+                "commits_since_start": info.commits_since_start,
+                "uncommitted_files": info.uncommitted_files,
+                "modified_files": info.modified_files[:10],  # Limit for payload size
+                "current_branch": info.current_branch,
+                "started_on_commit": info.started_on_commit,
+                "restart_recommended": info.restart_recommended,
+                "restart_reason": info.restart_reason,
+                "detected_at": info.detected_at.isoformat(),
+            }
+        }
+
+        # Try broadcast endpoints
+        endpoints = [
+            f"{self._notification_config.backend_url}/api/broadcast",
+            f"{self._notification_config.backend_url}/api/system/broadcast",
+        ]
+
+        session = await self._get_session()
+
+        for endpoint in endpoints:
+            try:
+                async with session.post(
+                    endpoint,
+                    json={"event": event_type, "data": payload["data"]},
+                ) as response:
+                    if response.status in (200, 201, 202, 204):
+                        logger.info(f"📡 Broadcast {event_type} to frontend")
+                        return True
+            except Exception as e:
+                logger.debug(f"Broadcast to {endpoint} failed: {e}")
+                continue
+
+        return False
+
+    async def _schedule_auto_restart(self, info: LocalChangeInfo) -> None:
+        """
+        Schedule an automatic restart with user-transparent countdown.
+
+        Shows MaintenanceOverlay on frontend before restarting.
+        """
+        delay = self._notification_config.auto_restart_delay_seconds
+
+        # Broadcast restart notification to frontend
+        await self._broadcast_restart_notification(
+            message=f"Restarting in {delay} seconds to apply code changes",
+            reason=info.restart_reason or "Code changes detected",
+            estimated_time=delay,
+        )
+
+        # Voice announcement
+        if self._notification_config.voice_enabled:
+            try:
+                await self.narrator.speak(
+                    f"Sir, I'm applying your code changes. Restarting in {delay} seconds.",
+                    wait=False
+                )
+            except Exception as e:
+                logger.debug(f"TTS failed: {e}")
+
+        # Wait before restart
+        logger.info(f"⏱️ Auto-restart scheduled in {delay} seconds")
+        await asyncio.sleep(delay)
+
+        # Final broadcast before restart
+        await self._broadcast_restart_notification(
+            message="Restarting now...",
+            reason="Applying code changes",
+            estimated_time=15,
+        )
+
+        # Trigger restart via supervisor exit code
+        logger.info("🔄 Triggering restart to apply code changes")
+        self._state.auto_restart_scheduled = False
+        self._state.pending_restart = False
+
+        # Signal restart (exit code 102 = restart request)
+        # This will be caught by the supervisor which handles the actual restart
+        import sys
+        sys.exit(102)
+
+    async def _broadcast_restart_notification(
+        self,
+        message: str,
+        reason: str,
+        estimated_time: int,
+    ) -> bool:
+        """Broadcast restart notification to trigger MaintenanceOverlay."""
+        payload = {
+            "message": message,
+            "reason": reason,
+            "estimated_time": estimated_time,
+        }
+
+        endpoints = [
+            f"{self._notification_config.backend_url}/api/broadcast",
+            f"{self._notification_config.backend_url}/api/system/broadcast",
+        ]
+
+        session = await self._get_session()
+
+        for endpoint in endpoints:
+            try:
+                async with session.post(
+                    endpoint,
+                    json={"event": "system_restarting", "data": payload},
+                ) as response:
+                    if response.status in (200, 201, 202, 204):
+                        logger.info("📡 Broadcast system_restarting to frontend")
+                        return True
+            except Exception as e:
+                logger.debug(f"Broadcast to {endpoint} failed: {e}")
+                continue
+
+        return False
+
+    def cancel_auto_restart(self) -> None:
+        """Cancel a scheduled auto-restart."""
+        if self._state.auto_restart_scheduled:
+            self._state.auto_restart_scheduled = False
+            logger.info("🚫 Auto-restart cancelled by user")
+
+    def get_local_change_state(self) -> dict[str, Any]:
+        """Get current local change state for debugging/UI."""
+        info = self._state.last_local_changes
+        return {
+            "has_local_changes": info is not None and info.has_changes if info else False,
+            "change_type": info.change_type.value if info and info.change_type else None,
+            "summary": info.summary if info else None,
+            "restart_recommended": info.restart_recommended if info else False,
+            "restart_reason": info.restart_reason if info else None,
+            "pending_restart": self._state.pending_restart,
+            "auto_restart_scheduled": self._state.auto_restart_scheduled,
+        }
+
     async def close(self) -> None:
         """Clean up resources."""
         if self._session and not self._session.closed:

@@ -1064,7 +1064,11 @@ class JARVISSupervisor:
         - Uncommitted changes
         - Branch switches
 
-        Communicates with user via voice and logs.
+        Communicates with user via:
+        - Voice (TTS) announcements
+        - WebSocket broadcasts for frontend UI (UpdateNotificationBadge)
+        - Console logging
+        - Auto-restart when recommended
         """
         from .update_detector import ChangeType
         from .narrator import NarratorEvent
@@ -1074,33 +1078,37 @@ class JARVISSupervisor:
 
         logger.info(f"📝 Local change detected: {info.summary}")
 
-        # Determine which event to announce
-        event: Optional[NarratorEvent] = None
-        context: dict = {}
+        # Use the notification orchestrator for multi-channel delivery
+        if self._notification_orchestrator:
+            await self._notification_orchestrator.notify_local_changes(info)
+        else:
+            # Fallback: Direct voice announcement if orchestrator not available
+            event: Optional[NarratorEvent] = None
+            context: dict = {}
 
-        if info.change_type == ChangeType.LOCAL_PUSH:
-            event = NarratorEvent.LOCAL_PUSH_DETECTED
-            context["summary"] = info.summary
-        elif info.change_type == ChangeType.LOCAL_COMMIT:
-            event = NarratorEvent.LOCAL_COMMIT_DETECTED
-            context["summary"] = info.summary
-        elif info.change_type == ChangeType.UNCOMMITTED:
-            event = NarratorEvent.CODE_CHANGES_DETECTED
-            context["summary"] = f"{info.uncommitted_files} uncommitted files"
+            if info.change_type == ChangeType.LOCAL_PUSH:
+                event = NarratorEvent.LOCAL_PUSH_DETECTED
+                context["summary"] = info.summary
+            elif info.change_type == ChangeType.LOCAL_COMMIT:
+                event = NarratorEvent.LOCAL_COMMIT_DETECTED
+                context["summary"] = info.summary
+            elif info.change_type == ChangeType.UNCOMMITTED:
+                event = NarratorEvent.CODE_CHANGES_DETECTED
+                context["summary"] = f"{info.uncommitted_files} uncommitted files"
 
-        # Announce via narrator
-        if event and self._narrator:
-            await self._narrator.narrate_event(event, **context)
+            # Announce via narrator
+            if event and self._narrator:
+                await self._narrator.narrate_event(event, **context)
 
-        # If restart is recommended, announce that too
-        if info.restart_recommended and info.restart_reason:
-            logger.info(f"🔄 Restart recommended: {info.restart_reason}")
-            if self._narrator:
-                await asyncio.sleep(2)  # Brief pause for clarity
-                await self._narrator.narrate_event(
-                    NarratorEvent.RESTART_RECOMMENDED,
-                    reason=info.restart_reason,
-                )
+            # If restart is recommended, announce that too
+            if info.restart_recommended and info.restart_reason:
+                logger.info(f"🔄 Restart recommended: {info.restart_reason}")
+                if self._narrator:
+                    await asyncio.sleep(2)  # Brief pause for clarity
+                    await self._narrator.narrate_event(
+                        NarratorEvent.RESTART_RECOMMENDED,
+                        reason=info.restart_reason,
+                    )
 
     async def _run_update_detector(self) -> None:
         """

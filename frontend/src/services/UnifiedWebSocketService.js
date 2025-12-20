@@ -31,6 +31,10 @@ class UnifiedWebSocketService {
     this.updateAvailable = false;
     this.updateInfo = null; // { commits_behind, summary, priority, highlights, security_update, breaking_changes }
 
+    // Local change awareness state (v2.0)
+    this.localChangesDetected = false;
+    this.localChangeInfo = null; // { changeType, summary, commits_since_start, restart_recommended, restart_reason }
+
     // Wait for config and then connect
     this._initializeWhenReady();
   }
@@ -202,6 +206,57 @@ class UnifiedWebSocketService {
       // Clear the badge - user is acting on the update
       this.updateAvailable = false;
       this.updateInfo = null;
+    });
+
+    // ═══════════════════════════════════════════════════════════════════
+    // LOCAL CHANGE AWARENESS - Code Changes/Push/Commit Events (v2.0)
+    // ═══════════════════════════════════════════════════════════════════
+
+    // Handle local commit detected
+    this.client.on('local_commit_detected', (data) => {
+      console.log('📝 Local commit detected:', data);
+      this._handleLocalChange(data, 'commit');
+    });
+
+    // Handle local push detected
+    this.client.on('local_push_detected', (data) => {
+      console.log('📤 Local push detected:', data);
+      this._handleLocalChange(data, 'push');
+    });
+
+    // Handle code changes detected (uncommitted)
+    this.client.on('code_changes_detected', (data) => {
+      console.log('📁 Code changes detected:', data);
+      this._handleLocalChange(data, 'uncommitted');
+    });
+
+    // Handle generic local changes
+    this.client.on('local_changes_detected', (data) => {
+      console.log('🔄 Local changes detected:', data);
+      this._handleLocalChange(data, 'changes');
+    });
+  }
+
+  /**
+   * Handle local change events (v2.0)
+   */
+  _handleLocalChange(data, changeType) {
+    this.localChangesDetected = true;
+    this.localChangeInfo = {
+      changeType: changeType,
+      summary: data?.summary || 'Code changes detected',
+      commits_since_start: data?.commits_since_start || 0,
+      uncommitted_files: data?.uncommitted_files || 0,
+      modified_files: data?.modified_files || [],
+      current_branch: data?.current_branch || null,
+      restart_recommended: data?.restart_recommended || false,
+      restart_reason: data?.restart_reason || null,
+      detected_at: data?.detected_at || new Date().toISOString(),
+    };
+
+    this._notifySubscribers('local_changes', {
+      detected: true,
+      ...this.localChangeInfo,
     });
   }
 
@@ -390,6 +445,31 @@ class UnifiedWebSocketService {
   }
 
   /**
+   * Check if local changes have been detected (v2.0)
+   */
+  hasLocalChanges() {
+    return this.localChangesDetected;
+  }
+
+  /**
+   * Get local change information (v2.0)
+   */
+  getLocalChangeInfo() {
+    return this.localChangeInfo;
+  }
+
+  /**
+   * Dismiss local changes notification (v2.0)
+   */
+  dismissLocalChanges() {
+    this.localChangesDetected = false;
+    this.localChangeInfo = null;
+    this._notifySubscribers('local_changes', {
+      detected: false,
+    });
+  }
+
+  /**
    * Notify all subscribers of an event
    */
   _notifySubscribers(eventType, data) {
@@ -426,6 +506,9 @@ export function useUnifiedWebSocket() {
   // Update available state
   const [updateAvailable, setUpdateAvailable] = React.useState(false);
   const [updateInfo, setUpdateInfo] = React.useState(null);
+  // Local change awareness state (v2.0)
+  const [localChangesDetected, setLocalChangesDetected] = React.useState(false);
+  const [localChangeInfo, setLocalChangeInfo] = React.useState(null);
   const service = React.useMemo(() => getUnifiedWebSocketService(), []);
 
   React.useEffect(() => {
@@ -459,11 +542,32 @@ export function useUnifiedWebSocket() {
       }
     });
 
+    // Subscribe to local change notifications (v2.0)
+    const unsubscribeLocalChanges = service.subscribe('local_changes', (data) => {
+      setLocalChangesDetected(data.detected);
+      if (data.detected) {
+        setLocalChangeInfo({
+          changeType: data.changeType,
+          summary: data.summary,
+          commits_since_start: data.commits_since_start,
+          uncommitted_files: data.uncommitted_files,
+          modified_files: data.modified_files,
+          restart_recommended: data.restart_recommended,
+          restart_reason: data.restart_reason,
+          detected_at: data.detected_at,
+        });
+      } else {
+        setLocalChangeInfo(null);
+      }
+    });
+
     // Initial connection state
     setConnected(service.isConnected());
     setMaintenanceMode(service.isInMaintenanceMode());
     setUpdateAvailable(service.isUpdateAvailable());
     setUpdateInfo(service.getUpdateInfo());
+    setLocalChangesDetected(service.hasLocalChanges?.() || false);
+    setLocalChangeInfo(service.getLocalChangeInfo?.() || null);
 
     // Update stats periodically
     const interval = setInterval(() => {
@@ -474,6 +578,7 @@ export function useUnifiedWebSocket() {
       unsubscribeConnection();
       unsubscribeMaintenance();
       unsubscribeUpdate();
+      unsubscribeLocalChanges();
       clearInterval(interval);
     };
   }, [service]);
@@ -489,6 +594,10 @@ export function useUnifiedWebSocket() {
     updateAvailable,
     updateInfo,
     dismissUpdate: () => service.dismissUpdate(),
+    // Local change awareness (v2.0)
+    localChangesDetected,
+    localChangeInfo,
+    dismissLocalChanges: () => service.dismissLocalChanges?.(),
     // Actions
     connect: (capability) => service.connect(capability),
     disconnect: () => service.disconnect(),
