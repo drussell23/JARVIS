@@ -1,22 +1,26 @@
 """
-Self-Updating Lifecycle Manager - Supervisor Module
+Self-Updating Lifecycle Manager - Supervisor Module v2.0
 
 Exposes core supervisor components for JARVIS self-management.
 
 Components:
 - `JARVISSupervisor` - Main lifecycle watchdog
-- `UpdateEngine` - Async parallel update orchestration  
+- `UpdateEngine` - Async parallel update orchestration
 - `RollbackManager` - Version history and rollback logic
 - `HealthMonitor` - Boot health & stability checks
 - `UpdateDetector` - GitHub polling and change detection
 - `ChangelogAnalyzer` - AI-powered commit summarization
 - `IdleDetector` - System activity monitoring
-- `SupervisorNarrator` - TTS voice feedback (Daniel voice)
-- `IntelligentStartupNarrator` - Phase-aware startup narration (v19.6.0)
+- `UnifiedVoiceOrchestrator` - SINGLE SOURCE OF TRUTH for all voice output (v2.0)
+- `SupervisorNarrator` - TTS voice feedback (now delegates to orchestrator)
+- `IntelligentStartupNarrator` - Phase-aware startup narration (now delegates to orchestrator)
 - `UpdateNotificationOrchestrator` - Multi-modal notification system (TTS + WebSocket)
 - `UpdateIntentHandler` - Voice command integration
 - `supervisor_integration` - start_system.py bridge
 - `maintenance_broadcaster` - WebSocket broadcast utilities for frontend
+
+v2.0: All voice output now goes through UnifiedVoiceOrchestrator to prevent
+concurrent `say` processes ("multiple voices" issue).
 
 Note: Loading page is managed via loading_server.py at project root
 """
@@ -81,6 +85,17 @@ from .supervisor_integration import (
     trigger_restart,
     check_for_updates,
     speak_tts,
+)
+from .unified_voice_orchestrator import (
+    UnifiedVoiceOrchestrator,
+    VoicePriority,
+    VoiceSource,
+    VoiceConfig,
+    VoiceMessage,
+    get_voice_orchestrator,
+    speak,
+    speak_and_wait,
+    speak_critical,
 )
 
 __all__ = [
@@ -160,6 +175,16 @@ __all__ = [
     "trigger_restart",
     "check_for_updates",
     "speak_tts",
+    # Unified Voice Orchestrator (v2.0 - single source of truth)
+    "UnifiedVoiceOrchestrator",
+    "VoicePriority",
+    "VoiceSource",
+    "VoiceConfig",
+    "VoiceMessage",
+    "get_voice_orchestrator",
+    "speak",
+    "speak_and_wait",
+    "speak_critical",
 ]
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"

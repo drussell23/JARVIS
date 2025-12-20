@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """
-JARVIS Supervisor Voice Narrator
-=================================
+JARVIS Supervisor Voice Narrator v2.0
+======================================
 
 Lightweight TTS narrator for the supervisor to provide engaging voice
 feedback during updates, restarts, and system events.
 
-Uses macOS native 'say' command with Daniel (British) voice for immediate
-playback without loading heavy TTS models.
+v2.0 CHANGE: Now delegates to UnifiedVoiceOrchestrator instead of spawning
+its own `say` processes. This prevents the "multiple voices" issue where
+concurrent narrator systems would speak simultaneously.
 
 Author: JARVIS System
-Version: 1.0.0
+Version: 2.0.0
 """
 
 from __future__ import annotations
@@ -23,6 +24,13 @@ import random
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
+
+# Import unified voice orchestrator (single source of truth for all voice)
+from .unified_voice_orchestrator import (
+    get_voice_orchestrator,
+    VoicePriority,
+    VoiceSource,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -274,105 +282,65 @@ class NarratorConfig:
 class SupervisorNarrator:
     """
     Voice narrator for supervisor events.
-    
-    Uses lightweight macOS 'say' command for immediate voice feedback
-    without loading heavy TTS models. Falls back to silent logging
-    on non-macOS systems.
-    
+
+    v2.0: Now delegates ALL voice output to UnifiedVoiceOrchestrator,
+    ensuring only one voice speaks at a time across the entire system.
+
     Example:
         >>> narrator = SupervisorNarrator()
         >>> await narrator.narrate(NarratorEvent.UPDATE_STARTING)
         >>> await narrator.narrate(NarratorEvent.UPDATE_COMPLETE, version="v1.2.3")
     """
-    
+
     def __init__(self, config: Optional[NarratorConfig] = None):
         """
         Initialize the narrator.
-        
+
         Args:
             config: Narrator configuration
         """
         self.config = config or NarratorConfig()
         self._is_macos = platform.system() == "Darwin"
-        self._current_process: Optional[asyncio.subprocess.Process] = None
-        self._speech_queue: asyncio.Queue = asyncio.Queue()
-        self._processor_task: Optional[asyncio.Task] = None
-        
+
+        # v2.0: Get unified voice orchestrator (single source of truth)
+        self._orchestrator = get_voice_orchestrator()
+
         if self._is_macos:
-            logger.info(f"🔊 Narrator initialized (voice: {self.config.voice.value})")
+            logger.info(f"🔊 Narrator initialized (delegating to UnifiedVoiceOrchestrator)")
         else:
             logger.info("🔇 Narrator initialized (silent mode - non-macOS)")
-    
+
     async def start(self) -> None:
-        """Start the speech queue processor."""
-        if self.config.async_playback and self._processor_task is None:
-            self._processor_task = asyncio.create_task(self._process_queue())
-    
+        """Start the narrator (starts unified orchestrator if needed)."""
+        # v2.0: Delegate to unified orchestrator
+        if not self._orchestrator._running:
+            await self._orchestrator.start()
+
     async def stop(self) -> None:
-        """Stop the narrator and cancel pending speech."""
-        if self._current_process:
-            self._current_process.terminate()
-            await self._current_process.wait()
-        
-        if self._processor_task:
-            self._processor_task.cancel()
-            try:
-                await self._processor_task
-            except asyncio.CancelledError:
-                pass
-    
-    async def _process_queue(self) -> None:
-        """Process queued speech in order."""
-        while True:
-            try:
-                text = await self._speech_queue.get()
-                await self._speak_sync(text)
-                self._speech_queue.task_done()
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.warning(f"Speech queue error: {e}")
-    
-    async def _speak_sync(self, text: str) -> None:
-        """Speak text synchronously using macOS say command."""
-        if not self._is_macos or not self.config.enabled:
-            logger.info(f"🔊 [WOULD SAY]: {text}")
-            return
-        
-        try:
-            # Build say command with voice and rate
-            cmd = [
-                "say",
-                "-v", self.config.voice.value,
-                "-r", str(self.config.rate),
-                text,
-            ]
-            
-            self._current_process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            
-            await self._current_process.wait()
-            
-        except Exception as e:
-            logger.warning(f"TTS error: {e}")
-        finally:
-            self._current_process = None
-    
+        """Stop the narrator."""
+        # v2.0: Don't stop orchestrator here - it's shared across components
+        # The orchestrator will be stopped by the supervisor at shutdown
+        pass
+
     async def speak(self, text: str, wait: bool = False) -> None:
         """
-        Speak arbitrary text.
-        
+        Speak arbitrary text through unified orchestrator.
+
         Args:
             text: Text to speak
             wait: If True, wait for speech to complete
         """
-        if wait or not self.config.async_playback:
-            await self._speak_sync(text)
-        else:
-            await self._speech_queue.put(text)
+        if not self.config.enabled:
+            logger.debug(f"🔇 Narrator disabled, skipping: {text[:50]}...")
+            return
+
+        # v2.0: Delegate to unified orchestrator
+        await self._orchestrator.speak(
+            text=text,
+            priority=VoicePriority.MEDIUM,
+            source=VoiceSource.SUPERVISOR,
+            wait=wait,
+        )
     
     async def narrate(
         self,

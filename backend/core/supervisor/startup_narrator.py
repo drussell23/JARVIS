@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """
-JARVIS Intelligent Startup Narrator v1.0
+JARVIS Intelligent Startup Narrator v2.0
 =========================================
 
 Provides intelligent, phase-aware voice narration during JARVIS startup.
 Coordinates with the visual loading page to provide complementary
 (not redundant) audio feedback.
+
+v2.0 CHANGE: Now delegates to UnifiedVoiceOrchestrator instead of spawning
+its own `say` processes. This prevents the "multiple voices" issue where
+concurrent narrator systems would speak simultaneously.
 
 Features:
 - Phase-aware narration with smart batching
@@ -16,9 +20,10 @@ Features:
 - Console and voice output coordination
 - User activity awareness
 - Parallel execution support
+- UNIFIED VOICE COORDINATION (v2.0)
 
 Author: JARVIS System
-Version: 1.0.0
+Version: 2.0.0
 """
 
 from __future__ import annotations
@@ -34,6 +39,14 @@ from datetime import datetime, timedelta
 from enum import Enum, auto
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 from collections import deque
+
+# Import unified voice orchestrator (single source of truth for all voice)
+from .unified_voice_orchestrator import (
+    get_voice_orchestrator,
+    VoicePriority,
+    VoiceSource,
+    UnifiedVoiceOrchestrator,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -289,14 +302,18 @@ SLOW_STARTUP_MESSAGES: List[str] = [
 class IntelligentStartupNarrator:
     """
     Intelligent narrator that provides phase-aware voice feedback during startup.
-    
+
+    v2.0: Now delegates ALL voice output to UnifiedVoiceOrchestrator,
+    ensuring only one voice speaks at a time across the entire system.
+
     Features:
     - Smart batching to avoid over-narration
     - Adaptive timing based on phase duration
     - Milestone announcements
     - Error and recovery handling
     - Parallel execution support
-    
+    - UNIFIED VOICE COORDINATION (v2.0)
+
     Example:
         >>> narrator = IntelligentStartupNarrator()
         >>> await narrator.start()
@@ -304,11 +321,14 @@ class IntelligentStartupNarrator:
         >>> await narrator.announce_progress(50, "Loading models")
         >>> await narrator.announce_complete()
     """
-    
+
     def __init__(self, config: Optional[NarrationConfig] = None):
         self.config = config or NarrationConfig()
         self._is_macos = platform.system() == "Darwin"
-        
+
+        # v2.0: Get unified voice orchestrator (single source of truth)
+        self._orchestrator: UnifiedVoiceOrchestrator = get_voice_orchestrator()
+
         # State tracking
         self._phases: Dict[StartupPhase, PhaseInfo] = {}
         self._current_phase: Optional[StartupPhase] = None
@@ -316,121 +336,92 @@ class IntelligentStartupNarrator:
         self._last_progress_narrated: int = 0
         self._startup_start_time: Optional[datetime] = None
         self._narration_history: deque = deque(maxlen=50)
-        
-        # Async management
-        self._narration_queue: asyncio.Queue = asyncio.Queue()
-        self._processor_task: Optional[asyncio.Task] = None
-        self._current_speech_process: Optional[asyncio.subprocess.Process] = None
+
+        # v2.0: Removed self-managed queue and speech process
+        # All voice now goes through unified orchestrator
         self._lock = asyncio.Lock()
-        
+
         # Tracking for intelligent decisions
         self._phases_narrated: Set[StartupPhase] = set()
         self._milestones_announced: Set[int] = set()
         self._slow_phase_announced: bool = False
-        
-        logger.info(f"🎙️ Startup narrator initialized (voice: {self.config.voice}, enabled: {self.config.voice_enabled})")
+
+        logger.info(f"🎙️ Startup narrator initialized (delegating to UnifiedVoiceOrchestrator)")
     
     async def start(self) -> None:
         """Start the narration processor."""
         self._startup_start_time = datetime.now()
-        if self._processor_task is None or self._processor_task.done():
-            self._processor_task = asyncio.create_task(self._process_narration_queue())
-        logger.debug("🎙️ Startup narrator started")
-    
+        # v2.0: Start unified orchestrator if not already running
+        if not self._orchestrator._running:
+            await self._orchestrator.start()
+        logger.debug("🎙️ Startup narrator started (using unified orchestrator)")
+
     async def stop(self) -> None:
         """Stop the narrator and cleanup."""
-        if self._current_speech_process:
-            try:
-                self._current_speech_process.terminate()
-                await self._current_speech_process.wait()
-            except Exception:
-                pass
-        
-        if self._processor_task:
-            self._processor_task.cancel()
-            try:
-                await self._processor_task
-            except asyncio.CancelledError:
-                pass
-        
+        # v2.0: Don't stop orchestrator here - it's shared across components
+        # The orchestrator will be stopped by the supervisor at shutdown
         logger.debug("🎙️ Startup narrator stopped")
-    
-    async def _process_narration_queue(self) -> None:
-        """Process queued narrations in order."""
-        while True:
-            try:
-                text, priority = await self._narration_queue.get()
-                await self._speak(text, priority)
-                self._narration_queue.task_done()
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.warning(f"Narration queue error: {e}")
-    
+
+    def _map_priority(self, priority: NarrationPriority) -> VoicePriority:
+        """Map NarrationPriority to VoicePriority."""
+        mapping = {
+            NarrationPriority.LOW: VoicePriority.LOW,
+            NarrationPriority.MEDIUM: VoicePriority.MEDIUM,
+            NarrationPriority.HIGH: VoicePriority.HIGH,
+            NarrationPriority.CRITICAL: VoicePriority.CRITICAL,
+        }
+        return mapping.get(priority, VoicePriority.MEDIUM)
+
     async def _speak(self, text: str, priority: NarrationPriority = NarrationPriority.MEDIUM) -> None:
         """
-        Speak text using macOS say command or log on other platforms.
-        
+        Speak text through unified voice orchestrator.
+
         Args:
             text: Text to speak
             priority: Priority level (affects whether we wait or skip)
         """
-        async with self._lock:
-            # Check minimum interval (unless critical)
-            if priority != NarrationPriority.CRITICAL and self._last_narration_time:
-                elapsed = (datetime.now() - self._last_narration_time).total_seconds()
-                if elapsed < self.config.min_narration_interval:
-                    logger.debug(f"🎙️ Skipping narration (too soon): {text[:50]}...")
-                    return
-            
-            # Console output
-            if self.config.console_enabled:
-                logger.info(f"🔊 Narrating: {text}")
-            
-            # Track history
-            self._narration_history.append({
-                "text": text,
-                "priority": priority.name,
-                "timestamp": datetime.now().isoformat(),
-            })
-            
-            # Voice output
-            if self.config.voice_enabled and self._is_macos:
-                try:
-                    cmd = [
-                        "say",
-                        "-v", self.config.voice,
-                        "-r", str(self.config.rate),
-                        text,
-                    ]
-                    
-                    self._current_speech_process = await asyncio.create_subprocess_exec(
-                        *cmd,
-                        stdout=asyncio.subprocess.DEVNULL,
-                        stderr=asyncio.subprocess.DEVNULL,
-                    )
-                    
-                    # Wait for critical messages, fire-and-forget for others
-                    if priority == NarrationPriority.CRITICAL:
-                        await self._current_speech_process.wait()
-                    else:
-                        # Fire and forget, but track the process
-                        asyncio.create_task(self._current_speech_process.wait())
-                    
-                except Exception as e:
-                    logger.warning(f"TTS error: {e}")
-                finally:
-                    self._last_narration_time = datetime.now()
-            else:
-                self._last_narration_time = datetime.now()
-    
+        # Check minimum interval (unless critical) - orchestrator also has rate limiting
+        # but we do a local check to avoid queuing too many messages
+        if priority != NarrationPriority.CRITICAL and self._last_narration_time:
+            elapsed = (datetime.now() - self._last_narration_time).total_seconds()
+            if elapsed < self.config.min_narration_interval:
+                logger.debug(f"🎙️ Skipping narration (too soon): {text[:50]}...")
+                return
+
+        # Console output
+        if self.config.console_enabled:
+            logger.info(f"🔊 Narrating: {text}")
+
+        # Track history
+        self._narration_history.append({
+            "text": text,
+            "priority": priority.name,
+            "timestamp": datetime.now().isoformat(),
+        })
+
+        # Update last narration time
+        self._last_narration_time = datetime.now()
+
+        # v2.0: Delegate to unified voice orchestrator
+        if self.config.voice_enabled:
+            voice_priority = self._map_priority(priority)
+            wait = (priority == NarrationPriority.CRITICAL)
+
+            await self._orchestrator.speak(
+                text=text,
+                priority=voice_priority,
+                source=VoiceSource.STARTUP,
+                wait=wait,
+            )
+
     async def _queue_narration(
         self,
         text: str,
         priority: NarrationPriority = NarrationPriority.MEDIUM,
     ) -> None:
-        """Queue a narration for processing."""
-        await self._narration_queue.put((text, priority))
+        """Queue a narration for processing through unified orchestrator."""
+        # v2.0: Directly speak through orchestrator (it handles queuing)
+        await self._speak(text, priority)
     
     def _get_phase_message(
         self,

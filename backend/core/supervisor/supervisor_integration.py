@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """
-JARVIS Supervisor Integration
-==============================
+JARVIS Supervisor Integration v2.0
+===================================
 
 Integration module for connecting the Self-Updating Lifecycle Manager
 with the main JARVIS system (start_system.py).
+
+v2.0 CHANGE: Now uses UnifiedVoiceOrchestrator for all TTS output instead
+of spawning direct `say` processes. This prevents "multiple voices" issue.
 
 This module provides:
 1. Environment detection for supervised vs standalone mode
 2. Update intent registration with the event system
 3. Exit code helpers for triggering supervisor actions
-4. TTS announcements integration
+4. TTS announcements integration (via unified orchestrator)
 
 Usage in start_system.py:
     from backend.core.supervisor.supervisor_integration import (
@@ -18,15 +21,15 @@ Usage in start_system.py:
         is_supervised,
         trigger_update,
     )
-    
+
     # During startup
     await setup_supervisor_integration(event_coordinator)
-    
+
     # When user says "update yourself"
     await trigger_update()
 
-Author: JARVIS System  
-Version: 1.0.0
+Author: JARVIS System
+Version: 2.0.0
 """
 
 from __future__ import annotations
@@ -37,6 +40,13 @@ import os
 import sys
 from pathlib import Path
 from typing import Any, Callable, Optional
+
+# v2.0: Import unified voice orchestrator
+from .unified_voice_orchestrator import (
+    get_voice_orchestrator,
+    VoicePriority,
+    VoiceSource,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -64,20 +74,29 @@ def get_supervisor_pid() -> Optional[int]:
     return None
 
 
-async def speak_tts(text: str, voice: str = "Daniel") -> None:
+async def speak_tts(text: str, voice: str = "Daniel", wait: bool = True) -> None:
     """
-    Speak text using lightweight macOS TTS.
-    
-    Uses the native 'say' command for immediate feedback
-    without loading heavy TTS models.
+    Speak text through unified voice orchestrator.
+
+    v2.0: Now delegates to UnifiedVoiceOrchestrator instead of spawning
+    direct `say` processes. This ensures only one voice speaks at a time.
+
+    Args:
+        text: Text to speak
+        voice: Voice name (ignored - orchestrator uses configured voice)
+        wait: Whether to wait for speech to complete
     """
     try:
-        process = await asyncio.create_subprocess_exec(
-            "say", "-v", voice, text,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
+        orchestrator = get_voice_orchestrator()
+        if not orchestrator._running:
+            await orchestrator.start()
+
+        await orchestrator.speak(
+            text=text,
+            priority=VoicePriority.MEDIUM,
+            source=VoiceSource.SYSTEM,
+            wait=wait,
         )
-        await process.wait()
     except Exception as e:
         logger.debug(f"TTS failed: {e}")
 

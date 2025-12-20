@@ -47,6 +47,10 @@ from .startup_narrator import (
     get_startup_narrator,
     get_phase_from_stage,
 )
+from .unified_voice_orchestrator import (
+    get_voice_orchestrator,
+    UnifiedVoiceOrchestrator,
+)
 from .update_notification import (
     UpdateNotificationOrchestrator,
     NotificationChannel,
@@ -200,10 +204,14 @@ class JARVISSupervisor:
         self._on_crash: list[Callable[[int], None]] = []
         self._on_update_available: list[Callable[[], None]] = []
         
-        # TTS Narrator for engaging feedback
+        # v2.0: Unified voice orchestrator (single source of truth for ALL voice)
+        # This prevents "multiple voices" by ensuring only one `say` process at a time
+        self._voice_orchestrator: UnifiedVoiceOrchestrator = get_voice_orchestrator()
+
+        # TTS Narrator for engaging feedback (now delegates to orchestrator)
         self._narrator: SupervisorNarrator = get_narrator()
 
-        # Intelligent startup narrator for phase-aware narration
+        # Intelligent startup narrator for phase-aware narration (now delegates to orchestrator)
         self._startup_narrator: IntelligentStartupNarrator = get_startup_narrator()
 
         # Loading page support (uses loading_server.py directly)
@@ -1404,11 +1412,16 @@ class JARVISSupervisor:
         
         logger.info("🚀 Starting JARVIS Supervisor")
         self.stats.supervisor_start_time = datetime.now()
-        
-        # Start narrator
+
+        # v2.0: Start unified voice orchestrator FIRST (single source of truth)
+        # This ensures all voice output is coordinated through one system
+        await self._voice_orchestrator.start()
+        logger.info("🔊 Unified voice orchestrator started")
+
+        # Start narrator (now delegates to orchestrator)
         await self._narrator.start()
-        
-        # Announce supervisor online (uses main narrator)
+
+        # Announce supervisor online (uses main narrator -> orchestrator)
         await self._narrator.narrate(NarratorEvent.SUPERVISOR_START, wait=True)
         
         # Initialize components
@@ -1501,6 +1514,14 @@ class JARVISSupervisor:
                     await task
                 except asyncio.CancelledError:
                     pass
+
+            # v2.0: Stop unified voice orchestrator LAST (after all other cleanup)
+            # This ensures any final messages can still be spoken
+            try:
+                await self._voice_orchestrator.stop()
+                logger.info("🔊 Unified voice orchestrator stopped")
+            except Exception as e:
+                logger.debug(f"Voice orchestrator cleanup error: {e}")
 
             self._set_state(SupervisorState.STOPPED)
             logger.info("👋 Supervisor stopped")
