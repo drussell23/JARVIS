@@ -1694,30 +1694,39 @@ class JARVISLoadingManager {
     }
 
     async handleCompletion(success, redirectUrl, message) {
-        // Intelligent completion handling - don't fail if backend is actually ready
-        if (!success) {
-            // Check if we can still redirect (backend might be up)
-            const backendOk = await this.quickBackendCheck();
-            const frontendOk = await this.checkFrontendReady();
-            
-            if (backendOk && frontendOk) {
-                console.warn('[Complete] Marked as failed but services are ready - proceeding anyway');
-                success = true; // Override - services are actually working
-            } else if (backendOk) {
-                console.warn('[Complete] Backend ready but frontend check failed - trying redirect anyway');
-                success = true; // Try anyway
-                redirectUrl = redirectUrl || `${this.config.httpProtocol}//${this.config.hostname}:${this.config.mainAppPort}`;
-            } else {
-                this.showError(message || 'Startup completed with errors');
-                this.updateStatusText('Startup failed', 'error');
-                return;
-            }
+        // Intelligent completion handling with robust frontend waiting
+        const backendOk = await this.quickBackendCheck();
+
+        if (!success && !backendOk) {
+            this.showError(message || 'Startup completed with errors');
+            this.updateStatusText('Startup failed', 'error');
+            return;
         }
 
-        // Stop all polling immediately
+        // Stop regular polling - we're in completion mode now
         this.state.redirecting = true;
-        console.log('[Complete] ✓ Received completion from authority (start_system.py)');
-        
+        console.log('[Complete] ✓ Backend ready, waiting for frontend...');
+
+        // Update UI to show we're waiting for frontend
+        this.elements.subtitle.textContent = 'FINALIZING';
+        this.state.progress = 95;
+        this.state.targetProgress = 95;
+        this.updateProgressBar();
+
+        // CRITICAL: Wait for frontend with intelligent retries
+        // Never redirect until frontend is actually responding
+        const frontendReady = await this.waitForFrontendWithRetries();
+
+        if (!frontendReady) {
+            // After all retries, show error but allow manual retry
+            this.showError('Frontend failed to start. Please check the console.');
+            this.updateStatusText('Frontend unavailable', 'error');
+            return;
+        }
+
+        // Frontend is confirmed ready - now we can redirect!
+        console.log('[Complete] ✓ Frontend verified ready, proceeding with redirect...');
+
         // Update UI to show completion
         this.elements.subtitle.textContent = 'SYSTEM READY';
         this.elements.statusMessage.textContent = message || 'JARVIS is online!';
@@ -1726,23 +1735,10 @@ class JARVISLoadingManager {
         this.state.targetProgress = 100;
         this.updateProgressBar();
 
-        // Quick sanity check - just verify frontend is reachable before redirect
-        // We trust start_system.py already verified this, this is just a safety net
-            const frontendOk = await this.checkFrontendReady();
-            if (!frontendOk) {
-            console.warn('[Complete] Frontend sanity check failed, brief wait...');
-            this.elements.statusMessage.textContent = 'Finalizing...';
-            await this.sleep(2000);
-        }
-
-        console.log('[Complete] Proceeding with redirect...');
-        
         // CRITICAL: Pass backend readiness state to main app via URL parameters
         // localStorage doesn't work cross-origin (port 3001 -> port 3000 are different origins)
         // So we encode the state in the redirect URL instead
         const backendPort = this.config.backendPort || 8010;
-        const backendUrl = `${this.config.httpProtocol}//${this.config.hostname}:${backendPort}`;
-        const wsUrl = `ws://${this.config.hostname}:${backendPort}`;
         const timestamp = Date.now().toString();
 
         // Build redirect URL with backend readiness parameters
@@ -1753,21 +1749,88 @@ class JARVISLoadingManager {
             ts: timestamp
         });
 
+        // Ensure we have a valid redirect URL
+        const baseRedirectUrl = redirectUrl || `${this.config.httpProtocol}//${this.config.hostname}:${this.config.mainAppPort}`;
+
         // Append params to redirect URL
-        const finalRedirectUrl = redirectUrl.includes('?')
-            ? `${redirectUrl}&${params.toString()}`
-            : `${redirectUrl}?${params.toString()}`;
+        const finalRedirectUrl = baseRedirectUrl.includes('?')
+            ? `${baseRedirectUrl}&${params.toString()}`
+            : `${baseRedirectUrl}?${params.toString()}`;
 
         console.log('[Complete] ✓ Backend readiness encoded in redirect URL');
         console.log(`[Complete] Redirect URL: ${finalRedirectUrl}`);
 
         this.cleanup();
-
-        this.elements.subtitle.textContent = 'SYSTEM READY';
-        this.elements.statusMessage.textContent = message || 'JARVIS is online!';
-        this.updateStatusText('System ready', 'ready');
-
         this.playEpicCompletionAnimation(finalRedirectUrl);
+    }
+
+    async waitForFrontendWithRetries() {
+        /**
+         * Intelligent frontend waiting with exponential backoff.
+         * This is the CRITICAL gate that prevents redirecting to an unavailable frontend.
+         *
+         * Strategy:
+         * - Quick initial checks (frontend might already be up)
+         * - Exponential backoff to avoid hammering
+         * - Maximum wait time before giving up
+         * - Clear status updates to the user
+         */
+        const config = {
+            maxWaitTime: 60000,        // Maximum 60 seconds total wait
+            initialDelay: 500,          // Start with 500ms between checks
+            maxDelay: 3000,             // Cap delay at 3 seconds
+            backoffMultiplier: 1.5,     // Increase delay by 50% each attempt
+        };
+
+        const startTime = Date.now();
+        let attempt = 0;
+        let delay = config.initialDelay;
+
+        console.log('[Frontend Wait] Starting intelligent wait for frontend...');
+        this.updateStatusText('Waiting for frontend...', 'loading');
+        this.elements.statusMessage.textContent = 'Starting user interface...';
+
+        while (Date.now() - startTime < config.maxWaitTime) {
+            attempt++;
+            const elapsed = Math.round((Date.now() - startTime) / 1000);
+
+            console.log(`[Frontend Wait] Attempt ${attempt} (${elapsed}s elapsed)...`);
+
+            try {
+                const isReady = await this.checkFrontendReady();
+
+                if (isReady) {
+                    console.log(`[Frontend Wait] ✓ Frontend ready after ${attempt} attempts (${elapsed}s)`);
+                    return true;
+                }
+            } catch (error) {
+                console.debug(`[Frontend Wait] Check failed: ${error.message}`);
+            }
+
+            // Update user-facing status
+            if (elapsed < 10) {
+                this.elements.statusMessage.textContent = 'Starting user interface...';
+            } else if (elapsed < 30) {
+                this.elements.statusMessage.textContent = 'Frontend is initializing...';
+                this.updateStatusText('Starting frontend...', 'loading');
+            } else {
+                this.elements.statusMessage.textContent = `Still waiting for frontend (${elapsed}s)...`;
+                this.updateStatusText('Frontend slow to start...', 'warning');
+            }
+
+            // Update progress to show we're making progress in waiting
+            const waitProgress = 95 + Math.min(4, (elapsed / 60) * 4); // 95% -> 99% over 60s
+            this.state.progress = waitProgress;
+            this.state.targetProgress = waitProgress;
+            this.updateProgressBar();
+
+            // Wait with exponential backoff
+            await this.sleep(delay);
+            delay = Math.min(delay * config.backoffMultiplier, config.maxDelay);
+        }
+
+        console.error(`[Frontend Wait] ✗ Frontend failed to become ready after ${config.maxWaitTime / 1000}s`);
+        return false;
     }
 
     async verifyBackendReady(redirectUrl) {

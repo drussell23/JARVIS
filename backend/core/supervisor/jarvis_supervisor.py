@@ -610,7 +610,9 @@ class JARVISSupervisor:
         health_check_timeout = float(os.environ.get("HEALTH_CHECK_TIMEOUT", "3.0"))
         slow_threshold = float(os.environ.get("STARTUP_SLOW_THRESHOLD", "45.0"))
         poll_interval = float(os.environ.get("STARTUP_POLL_INTERVAL", "0.5"))
-        frontend_optional = os.environ.get("FRONTEND_OPTIONAL", "true").lower() == "true"
+        # CRITICAL: Default to waiting for frontend since loading page expects to redirect to it
+        # Only set FRONTEND_OPTIONAL=true for headless/no-browser mode
+        frontend_optional = os.environ.get("FRONTEND_OPTIONAL", "false").lower() == "true"
         
         backend_url = f"http://localhost:{backend_port}"
         frontend_url = f"http://localhost:{frontend_port}"
