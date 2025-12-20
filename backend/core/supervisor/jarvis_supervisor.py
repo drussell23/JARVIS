@@ -309,11 +309,14 @@ class JARVISSupervisor:
                 # Get progress reporter
                 self._progress_reporter = loading_server.get_progress_reporter()
                 
-                # Report progress (visual only - supervisor start was already narrated in run())
+                # Report progress with detailed log entry
                 await self._progress_reporter.report(
                     "supervisor_init",
                     "Supervisor initializing...",
                     5,
+                    log_entry="Supervisor process started and initializing components",
+                    log_source="Supervisor",
+                    log_type="info"
                 )
                 # NOTE: Don't announce SUPERVISOR_INIT here - run() already did it via _narrator
                 
@@ -347,6 +350,9 @@ class JARVISSupervisor:
                 "spawning",
                 "Starting JARVIS Core...",
                 10,
+                log_entry=f"Spawning JARVIS process: {' '.join(cmd[:2])}...",
+                log_source="Supervisor",
+                log_type="info"
             )
         
         # Voice: Announce spawning NOW (aligned with visual)
@@ -642,11 +648,14 @@ class JARVISSupervisor:
                         stages_completed.add("backend")
                         progress = calculate_progress()
                         
-                        # Visual + Voice aligned
+                        # Visual + Voice aligned with detailed log
                         await self._progress_reporter.report(
                             "api",
                             "Backend API online!",
                             progress,
+                            log_entry=f"Backend API responding on port {backend_port}",
+                            log_source="Backend",
+                            log_type="success"
                         )
                         
                         if "backend" not in key_milestones_narrated:
@@ -666,6 +675,9 @@ class JARVISSupervisor:
                                 "database",
                                 "Database connected",
                                 calculate_progress(),
+                                log_entry="SQLite database connection established",
+                                log_source="Backend",
+                                log_type="success"
                             )
                         
                         if system_status.get("voice_ready") and "voice" not in stages_completed:
@@ -674,6 +686,9 @@ class JARVISSupervisor:
                                 "voice",
                                 "Voice system ready",
                                 calculate_progress(),
+                                log_entry="Voice recognition and TTS engines initialized",
+                                log_source="Backend",
+                                log_type="success"
                             )
                         
                         if system_status.get("vision_ready") and "vision" not in stages_completed:
@@ -682,6 +697,9 @@ class JARVISSupervisor:
                                 "vision",
                                 "Vision system ready",
                                 calculate_progress(),
+                                log_entry="Vision pipeline and Claude integration active",
+                                log_source="Backend",
+                                log_type="success"
                             )
                     
                     # Frontend
@@ -691,6 +709,9 @@ class JARVISSupervisor:
                             "frontend",
                             "Frontend ready!",
                             calculate_progress(),
+                            log_entry=f"React frontend serving on port {frontend_port}",
+                            log_source="Frontend",
+                            log_type="success"
                         )
                     
                     # === COMPLETION CHECK ===

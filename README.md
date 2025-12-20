@@ -1,6 +1,6 @@
 # JARVIS AI Assistant v19.6.0 - Intelligent Lifecycle & Cost Management
 
-An intelligent voice-activated AI assistant with **Production-Grade Supervisor Bootstrap v2.0** (Parallel Process Discovery + Resource Validation + Dynamic Configuration + Performance Tracking), **Robust Startup Monitoring System v19.6.0** (Parallel Health Checks + Circuit Breaker + Adaptive Timeout + Smart Error Recovery), **Self-Updating Lifecycle Manager v19.6.0** (Intelligent Update Notifications + Multi-Modal Communication + Changelog Analysis), **Intelligent Memory Pressure Controller v1.0** (Adaptive Thresholds + Effectiveness Tracking + Cooldown System), **Supervisor-Aware GCP Controller v1.0** (Budget Management + Idle Shutdown + Cost-Aware Routing), **Intelligent ECAPA Backend Orchestrator v19.0.0** (Zero-Configuration Backend Selection + Concurrent Probing + Auto-Start Docker + Intelligent Fallback), **Async-Safe Statistics Tracking v1.0** (Self-Healing Consistency Validation + Atomic Counter Operations + Mathematical Invariant Enforcement), **Global Session Manager v1.0** (Thread-Safe Singleton + Multi-Terminal Conflict Prevention + Cleanup Reliability), **Cost Optimization Framework v3.0** (Scale-to-Zero VMs + Semantic Voice Caching + Spot Instance Resilience + Tiered Storage + Intelligent Cache Management), **Cloud ECAPA Client v19.2.0** (Intelligent Hybrid Cloud Voice Processing + Spot VM Auto-Creation + Cost-Aware Routing + 60% Cache Savings + RecentSpeakerCache Fast-Path Optimization with 98% Latency Reduction), **Physics-Aware Voice Authentication v2.5** (Vocal Tract Length Verification + Reverberation Analysis + Doppler Effect Detection + Bayesian Confidence Fusion + 7-Layer Anti-Spoofing), **Bayesian Confidence Fusion** (Multi-factor probability fusion with adaptive priors), **Voice Authentication Enhancement v2.1** (ChromaDB Semantic Caching + Scale-to-Zero + Langfuse Audit Trail + Behavioral Pattern Recognition), **Dynamic Restart with UE State Detection** (detects stuck macOS processes in Uninterruptible Sleep state), **Self-Healing Port Fallback System** (automatically finds healthy ports when blocked), **Dynamic Port Configuration** (loads ports from config instead of hardcoding), **Memory-Aware Startup System** (auto-detects RAM and activates GCP cloud ML when constrained), **Process-Isolated ML Loading** (prevents event loop blocking with true async wrapping), **Database Connection Leak Prevention** (proper try/finally resource cleanup), **Parallel Model Loading** (4-worker ThreadPool for 3-4x faster startup), **Comprehensive Timeout Protection** (25s unlock, 10s transcription, 8s speaker ID), **Voice Profile Database Consolidation** (unified `jarvis_learning.db` with owner migration), **Unified Voice Cache Manager** (~1ms Instant Recognition vs 200-500ms), **4-Layer Cache Architecture** (L1 Session + L2 Preloaded Profiles + L3 Database + L4 Continuous Learning), **Voice Biometric Semantic Cache with Continuous Learning** (L1-L3 Cache Layers + SQLite Database Recording), **PRD v2.0 Voice Biometric Intelligence** (AAM-Softmax + Center Loss + Triplet Loss Fine-Tuning, Platt/Isotonic Score Calibration, Comprehensive Anti-Spoofing), **AGI OS** (Autonomous General Intelligence Operating System), **Phase 2 Hybrid Database Sync** (Redis + Prometheus + ML Prefetching), **Advanced Process Detection System**, **Production-Grade Voice System**, **Cloud SQL Voice Biometric Storage**, **Real ECAPA-TDNN Speaker Embeddings**, **Advanced Voice Enrollment**, **Unified TTS Engine**, **Wake Word Detection**, **SpeechBrain STT Engine**, **CAI/SAI Locked Screen Auto-Unlock**, **Contextual Awareness Intelligence**, **Situational Awareness Intelligence**, **Backend Self-Awareness**, **Progressive Startup UX**, **GCP Spot VM Auto-Creation** (>85% memory → 32GB cloud offloading), **Advanced GCP Cost Optimization**, **Intelligent Voice-Authenticated Screen Unlock**, **Platform-Aware Memory Monitoring**, **Dynamic Speaker Recognition**, **Hybrid Cloud Auto-Scaling**, **Phase 4 Proactive Communication**, advanced multi-space desktop awareness, Claude Vision integration, and **continuous learning from every interaction**.
+An intelligent voice-activated AI assistant with **Live Operations Transparency v1.0** (Real-Time Operations Log + Supervisor-Backend Communication + Enhanced Progress Reporter), **Production-Grade Supervisor Bootstrap v2.0** (Parallel Process Discovery + Resource Validation + Dynamic Configuration + Performance Tracking), **Robust Startup Monitoring System v19.6.0** (Parallel Health Checks + Circuit Breaker + Adaptive Timeout + Smart Error Recovery), **Self-Updating Lifecycle Manager v19.6.0** (Intelligent Update Notifications + Multi-Modal Communication + Changelog Analysis), **Intelligent Memory Pressure Controller v1.0** (Adaptive Thresholds + Effectiveness Tracking + Cooldown System), **Supervisor-Aware GCP Controller v1.0** (Budget Management + Idle Shutdown + Cost-Aware Routing), **Intelligent ECAPA Backend Orchestrator v19.0.0** (Zero-Configuration Backend Selection + Concurrent Probing + Auto-Start Docker + Intelligent Fallback), **Async-Safe Statistics Tracking v1.0** (Self-Healing Consistency Validation + Atomic Counter Operations + Mathematical Invariant Enforcement), **Global Session Manager v1.0** (Thread-Safe Singleton + Multi-Terminal Conflict Prevention + Cleanup Reliability), **Cost Optimization Framework v3.0** (Scale-to-Zero VMs + Semantic Voice Caching + Spot Instance Resilience + Tiered Storage + Intelligent Cache Management), **Cloud ECAPA Client v19.2.0** (Intelligent Hybrid Cloud Voice Processing + Spot VM Auto-Creation + Cost-Aware Routing + 60% Cache Savings + RecentSpeakerCache Fast-Path Optimization with 98% Latency Reduction), **Physics-Aware Voice Authentication v2.5** (Vocal Tract Length Verification + Reverberation Analysis + Doppler Effect Detection + Bayesian Confidence Fusion + 7-Layer Anti-Spoofing), **Bayesian Confidence Fusion** (Multi-factor probability fusion with adaptive priors), **Voice Authentication Enhancement v2.1** (ChromaDB Semantic Caching + Scale-to-Zero + Langfuse Audit Trail + Behavioral Pattern Recognition), **Dynamic Restart with UE State Detection** (detects stuck macOS processes in Uninterruptible Sleep state), **Self-Healing Port Fallback System** (automatically finds healthy ports when blocked), **Dynamic Port Configuration** (loads ports from config instead of hardcoding), **Memory-Aware Startup System** (auto-detects RAM and activates GCP cloud ML when constrained), **Process-Isolated ML Loading** (prevents event loop blocking with true async wrapping), **Database Connection Leak Prevention** (proper try/finally resource cleanup), **Parallel Model Loading** (4-worker ThreadPool for 3-4x faster startup), **Comprehensive Timeout Protection** (25s unlock, 10s transcription, 8s speaker ID), **Voice Profile Database Consolidation** (unified `jarvis_learning.db` with owner migration), **Unified Voice Cache Manager** (~1ms Instant Recognition vs 200-500ms), **4-Layer Cache Architecture** (L1 Session + L2 Preloaded Profiles + L3 Database + L4 Continuous Learning), **Voice Biometric Semantic Cache with Continuous Learning** (L1-L3 Cache Layers + SQLite Database Recording), **PRD v2.0 Voice Biometric Intelligence** (AAM-Softmax + Center Loss + Triplet Loss Fine-Tuning, Platt/Isotonic Score Calibration, Comprehensive Anti-Spoofing), **AGI OS** (Autonomous General Intelligence Operating System), **Phase 2 Hybrid Database Sync** (Redis + Prometheus + ML Prefetching), **Advanced Process Detection System**, **Production-Grade Voice System**, **Cloud SQL Voice Biometric Storage**, **Real ECAPA-TDNN Speaker Embeddings**, **Advanced Voice Enrollment**, **Unified TTS Engine**, **Wake Word Detection**, **SpeechBrain STT Engine**, **CAI/SAI Locked Screen Auto-Unlock**, **Contextual Awareness Intelligence**, **Situational Awareness Intelligence**, **Backend Self-Awareness**, **Progressive Startup UX**, **GCP Spot VM Auto-Creation** (>85% memory → 32GB cloud offloading), **Advanced GCP Cost Optimization**, **Intelligent Voice-Authenticated Screen Unlock**, **Platform-Aware Memory Monitoring**, **Dynamic Speaker Recognition**, **Hybrid Cloud Auto-Scaling**, **Phase 4 Proactive Communication**, advanced multi-space desktop awareness, Claude Vision integration, and **continuous learning from every interaction**.
 
 ---
 
@@ -9,6 +9,9 @@ An intelligent voice-activated AI assistant with **Production-Grade Supervisor B
 JARVIS v19.5.0+ introduces the **Self-Updating Lifecycle Manager** (The Supervisor) — a robust, external process supervisor that manages JARVIS as a child process. This architecture enables autonomous updates, automatic rollbacks on crash, idle-time maintenance, and an engaging "Maintenance Mode" UI.
 
 **v19.6.0 Enhancements:**
+- ✅ **Live Operations Transparency** - Real-time operations log showing Supervisor/Backend activity
+- ✅ **Enhanced Progress Reporter** - Rich logging API with batch operations and color-coded sources
+- ✅ **Intelligent Thread Cleanup** - Aggressive cleanup of third-party library threads (PyTorch, aiohttp)
 - ✅ **Intelligent Update Notifications** - Multi-modal notifications with smart deduplication
 - ✅ **Changelog Analysis** - Rich summaries of what's changing
 - ✅ **Priority-Based Delivery** - Security updates bypass delays
@@ -471,6 +474,356 @@ Bootstrap performance: {
 ```
 
 This information is logged at INFO level for debugging and optimization.
+
+### Live Operations Transparency (v1.0)
+
+JARVIS now provides **complete transparency** into what's happening behind the scenes during startup. The loading page displays a real-time operations log that shows exactly what the Supervisor and Backend are doing, with timestamped entries and color-coded sources.
+
+#### Architecture
+
+```
+┌────────────────────────────────────────────────────────────────────────────┐
+│                    Live Operations Log System                              │
+│                                                                            │
+│  ┌────────────────────────────────────────────────────────────────────┐   │
+│  │  Supervisor (run_supervisor.py)                                   │   │
+│  │  ├── Process cleanup operations                                    │   │
+│  │  ├── Resource validation                                           │   │
+│  │  └── JARVIS spawning                                               │   │
+│  │      └──→ LoadingServer.log() → WebSocket → Frontend              │   │
+│  └────────────────────────────────────────────────────────────────────┘   │
+│                                                                            │
+│  ┌────────────────────────────────────────────────────────────────────┐   │
+│  │  Backend (start_system.py)                                         │   │
+│  │  ├── FastAPI startup                                               │   │
+│  │  ├── Database connection                                           │   │
+│  │  ├── Voice system initialization                                   │   │
+│  │  ├── Vision pipeline startup                                       │   │
+│  │  └── Frontend serving                                              │   │
+│  │      └──→ ProgressReporter.report(log_entry=...) → Frontend       │   │
+│  └────────────────────────────────────────────────────────────────────┘   │
+│                                                                            │
+│  ┌────────────────────────────────────────────────────────────────────┐   │
+│  │  Frontend (loading-manager.js)                                     │   │
+│  │  ├── Live operations log panel                                    │   │
+│  │  ├── Phase indicator (STARTING, INITIALIZATION, READY)            │   │
+│  │  ├── Stage header with icon and name                              │   │
+│  │  └── Substep list showing current operations                      │   │
+│  └────────────────────────────────────────────────────────────────────┘   │
+└────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Features
+
+| Feature | Description | Benefit |
+|---------|-------------|---------|
+| **Real-Time Logging** | Timestamped entries appear as operations occur | Complete transparency |
+| **Color-Coded Sources** | Blue (Supervisor), Green (Backend/Frontend), Orange (System) | Easy source identification |
+| **Auto-Scrolling** | Log automatically scrolls to latest entries | Always see current activity |
+| **Entry Limit** | Maximum 50 entries (oldest removed automatically) | Prevents memory bloat |
+| **Phase Indicator** | Shows current startup phase (STARTING, INITIALIZATION, etc.) | Context awareness |
+| **Stage Details** | Icon, name, and substeps for each stage | Detailed progress tracking |
+| **System Status** | Memory usage and mode indicators | Resource awareness |
+
+#### Loading Page UI Components
+
+The loading page now includes a comprehensive details panel:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ PHASE: INITIALIZATION                                        │
+├─────────────────────────────────────────────────────────────┤
+│ 🔄 Backend                                                    │
+│   • Initializing FastAPI application...                      │
+│   • Loading ML models...                                      │
+│   ✓ Database connection established                          │
+├─────────────────────────────────────────────────────────────┤
+│ ⚡ Live Operations                                    [12]   │
+│ ─────────────────────────────────────────────────────────── │
+│ 16:23:45  SUPERVISOR  Spawning JARVIS process: python3...    │
+│ 16:23:48  BACKEND     FastAPI application started            │
+│ 16:23:50  BACKEND     Backend API responding on port 8010    │
+│ 16:23:52  BACKEND     SQLite database connection established  │
+│ 16:23:55  BACKEND     Voice recognition engines initialized  │
+│ 16:23:58  BACKEND     Vision pipeline and Claude integration │
+│ 16:24:01  FRONTEND    React frontend serving on port 3000    │
+│ 16:24:03  SYSTEM      All systems operational                │
+├─────────────────────────────────────────────────────────────┤
+│ Memory: 8.5GB (45% used)  │  Mode: STANDARD                  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### Progress Reporter API
+
+The `StartupProgressReporter` class now supports rich logging:
+
+```python
+from loading_server import get_progress_reporter
+
+reporter = get_progress_reporter()
+
+# Method 1: Log with progress update
+await reporter.report(
+    stage="api",
+    message="Backend API online!",
+    progress=50.0,
+    log_entry="Backend API responding on port 8010",
+    log_source="Backend",
+    log_type="success"
+)
+
+# Method 2: Log-only (no progress change)
+await reporter.log(
+    source="Supervisor",
+    message="Checking for existing instances...",
+    log_type="info"
+)
+
+# Method 3: Batch logging
+await reporter.log_batch([
+    {"source": "Supervisor", "message": "Killed 2 processes", "type": "success"},
+    {"source": "System", "message": "Ports released", "type": "info"},
+    {"source": "Backend", "message": "FastAPI starting", "type": "info"}
+])
+```
+
+#### Log Entry Types
+
+| Type | Color | Usage |
+|------|-------|-------|
+| `info` | Default (green) | General informational messages |
+| `success` | Green (highlighted) | Successful operations (API ready, DB connected) |
+| `error` | Red | Errors and failures |
+| `warning` | Orange | Warnings and cautions |
+
+#### Supervisor Integration
+
+The Supervisor automatically logs key operations:
+
+```python
+# Process cleanup
+await reporter.log("Supervisor", f"Cleaned up {terminated} existing instance(s)", "success")
+
+# Resource validation
+await reporter.log("Supervisor", "System resources validated", "success")
+
+# JARVIS spawning
+await reporter.report(
+    "spawning",
+    "Starting JARVIS Core...",
+    10,
+    log_entry=f"Spawning JARVIS process: {' '.join(cmd[:2])}...",
+    log_source="Supervisor",
+    log_type="info"
+)
+```
+
+#### Backend Integration
+
+The Backend logs system initialization:
+
+```python
+# Backend API ready
+await reporter.report(
+    "api",
+    "Backend API online!",
+    progress,
+    log_entry=f"Backend API responding on port {backend_port}",
+    log_source="Backend",
+    log_type="success"
+)
+
+# Database connected
+await reporter.report(
+    "database",
+    "Database connected",
+    calculate_progress(),
+    log_entry="SQLite database connection established",
+    log_source="Backend",
+    log_type="success"
+)
+
+# Voice system ready
+await reporter.report(
+    "voice",
+    "Voice system ready",
+    calculate_progress(),
+    log_entry="Voice recognition and TTS engines initialized",
+    log_source="Backend",
+    log_type="success"
+)
+```
+
+### Enhanced Thread Cleanup (v1.0)
+
+JARVIS now includes **aggressive, intelligent thread cleanup** to prevent orphaned threads from third-party libraries (PyTorch, aiohttp, etc.) that can cause shutdown delays.
+
+#### Problem Statement
+
+Third-party libraries often create non-daemon threads that don't terminate gracefully:
+- **PyTorch**: Worker threads (`pytorch_worker_0`) for data loading
+- **aiohttp**: Connection worker threads (`_connection_worker_thread`)
+- **Other libraries**: Background threads that persist after shutdown
+
+These threads cause:
+- Shutdown delays (5+ seconds waiting)
+- Warning messages about non-daemon threads
+- Potential resource leaks
+
+#### Solution Architecture
+
+```
+┌────────────────────────────────────────────────────────────────────────────┐
+│                    Intelligent Thread Cleanup System                      │
+│                                                                            │
+│  Phase 1: Managed Executor Shutdown                                       │
+│  ├── ExecutorRegistry.shutdown_all()                                      │
+│  ├── ManagedThreadPoolExecutor cleanup                                    │
+│  └── Wait up to 3 seconds for graceful shutdown                          │
+│                                                                            │
+│  Phase 2: Library-Specific Cleanup                                        │
+│  ├── PyTorch: JIT registry clear + CUDA cache                            │
+│  ├── aiohttp: Connector close                                            │
+│  └── Garbage collection                                                   │
+│                                                                            │
+│  Phase 3: Pattern-Based Thread Identification                             │
+│  ├── Identify stubborn threads (worker, pool, connection, pytorch)      │
+│  ├── Attempt daemon conversion (if not started)                          │
+│  └── Wait 2 seconds for natural termination                              │
+│                                                                            │
+│  Phase 4: Force Termination (Last Resort)                                │
+│  ├── ctypes.PyThreadState_SetAsyncExc()                                  │
+│  ├── Raise SystemExit in thread                                          │
+│  └── Log termination results                                             │
+│                                                                            │
+└────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Implementation
+
+```python
+# 1. PyTorch Cleanup
+try:
+    import torch
+    if hasattr(torch, '_C'):
+        # Clear JIT registry
+        if hasattr(torch._C, '_jit_clear_class_registry'):
+            torch._C._jit_clear_class_registry()
+        # Synchronize CUDA operations
+        if hasattr(torch, 'cuda') and torch.cuda.is_available():
+            torch.cuda.synchronize()
+    # Force garbage collection
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+except ImportError:
+    pass
+
+# 2. aiohttp Connector Cleanup
+try:
+    import aiohttp
+    connector = getattr(aiohttp, '_default_connector', None)
+    if connector:
+        if asyncio.iscoroutinefunction(connector.close):
+            await connector.close()
+        else:
+            connector.close()
+except ImportError:
+    pass
+
+# 3. Force-Terminate Stubborn Threads
+import ctypes
+
+def force_terminate_thread(thread):
+    """Force terminate using ctypes (last resort)."""
+    tid = thread.ident
+    if tid is None:
+        return False
+    # Raise SystemExit in the thread
+    res = ctypes.pythonapi.PyThreadState_SetAsyncExc(
+        ctypes.c_ulong(tid), 
+        ctypes.py_object(SystemExit)
+    )
+    return res == 1
+
+# Identify stubborn threads
+stubborn_threads = [
+    t for t in threading.enumerate()
+    if t != threading.main_thread() 
+    and not t.daemon 
+    and t.is_alive()
+    and any(pattern in t.name.lower() for pattern in [
+        'worker', 'pool', 'connection', 'pytorch', 'thread-'
+    ])
+]
+
+# Wait briefly, then force terminate
+for thread in stubborn_threads:
+    if thread.is_alive():
+        force_terminate_thread(thread)
+```
+
+#### Thread Patterns Targeted
+
+The cleanup system identifies and handles threads matching these patterns:
+
+| Pattern | Examples | Source |
+|---------|----------|--------|
+| `worker` | `pytorch_worker_0`, `ThreadPool-worker-1` | PyTorch, ThreadPoolExecutor |
+| `pool` | `pool-1-thread-1` | Java-style thread pools |
+| `connection` | `_connection_worker_thread` | aiohttp, httpx |
+| `pytorch` | `pytorch_worker_0` | PyTorch DataLoader |
+| `thread-` | `Thread-5`, `Thread-10` | Generic worker threads |
+
+#### Cleanup Phases
+
+1. **Graceful Shutdown** (3 seconds)
+   - ExecutorRegistry shutdown
+   - ManagedThreadPoolExecutor cleanup
+   - Wait for natural termination
+
+2. **Library Cleanup** (immediate)
+   - PyTorch JIT registry clear
+   - CUDA cache clearing
+   - aiohttp connector close
+   - Garbage collection
+
+3. **Pattern-Based Wait** (2 seconds)
+   - Identify stubborn threads
+   - Attempt daemon conversion
+   - Wait for natural termination
+
+4. **Force Termination** (last resort)
+   - Use ctypes to raise SystemExit
+   - Log termination results
+   - Continue shutdown
+
+#### Expected Output
+
+```
+🧹 Shutting down thread pool executors...
+   ├─ Shut down 3 managed executors
+
+🧹 Cleaning up library threads...
+   ├─ ✓ PyTorch cleanup complete
+   ├─ ✓ aiohttp cleanup complete
+   ├─ Found 4 stubborn threads
+   ├─ Force terminated 4 threads
+   └─ ✓ Library thread cleanup complete
+```
+
+#### Configuration
+
+Thread cleanup is automatic and requires no configuration. However, you can adjust executor shutdown timeout:
+
+```bash
+# Executor shutdown timeout (default: 3.0 seconds)
+EXECUTOR_SHUTDOWN_TIMEOUT=3.0
+
+# Thread manager graceful timeout (default: 5.0 seconds)
+THREAD_GRACEFUL_TIMEOUT=5.0
+```
 
 ### Voice Commands
 

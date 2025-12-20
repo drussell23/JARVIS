@@ -18647,6 +18647,124 @@ if __name__ == "__main__":
             print(f"   ├─ Thread manager not available")
         except Exception as e:
             print(f"   ├─ {Colors.YELLOW}⚠ Executor shutdown error: {e}{Colors.ENDC}")
+        
+        # Aggressive cleanup of third-party library threads
+        print(f"\n{Colors.CYAN}🧹 Cleaning up library threads...{Colors.ENDC}")
+        
+        # 1. PyTorch cleanup
+        try:
+            import torch
+            if hasattr(torch, '_C'):
+                # Clear JIT registry
+                if hasattr(torch._C, '_jit_clear_class_registry'):
+                    torch._C._jit_clear_class_registry()
+                # Stop any background threads PyTorch may have started
+                if hasattr(torch, 'cuda') and torch.cuda.is_available():
+                    torch.cuda.synchronize()
+            # Force garbage collection of PyTorch tensors
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            print(f"   ├─ {Colors.GREEN}✓ PyTorch cleanup complete{Colors.ENDC}")
+        except ImportError:
+            pass
+        except Exception as e:
+            logger.debug(f"PyTorch cleanup: {e}")
+        
+        # 2. aiohttp connection cleanup
+        try:
+            import aiohttp
+            # Close any default connectors
+            if hasattr(aiohttp, 'TCPConnector'):
+                connector = getattr(aiohttp, '_default_connector', None)
+                if connector:
+                    try:
+                        if asyncio.iscoroutinefunction(connector.close):
+                            loop = asyncio.get_event_loop()
+                            if not loop.is_closed():
+                                loop.run_until_complete(connector.close())
+                        else:
+                            connector.close()
+                    except:
+                        pass
+            print(f"   ├─ {Colors.GREEN}✓ aiohttp cleanup complete{Colors.ENDC}")
+        except ImportError:
+            pass
+        except Exception as e:
+            logger.debug(f"aiohttp cleanup: {e}")
+        
+        # 3. Force-terminate stubborn non-daemon threads
+        import threading
+        import ctypes
+        
+        def force_terminate_thread(thread):
+            """Force terminate a thread using ctypes (last resort)."""
+            if not thread.is_alive():
+                return True
+            try:
+                tid = thread.ident
+                if tid is None:
+                    return False
+                # Raise SystemExit in the thread
+                res = ctypes.pythonapi.PyThreadState_SetAsyncExc(
+                    ctypes.c_ulong(tid), 
+                    ctypes.py_object(SystemExit)
+                )
+                if res == 0:
+                    return False
+                elif res > 1:
+                    # Reset if we hit multiple threads
+                    ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_ulong(tid), None)
+                    return False
+                return True
+            except Exception:
+                return False
+        
+        # Identify and handle stubborn threads
+        stubborn_threads = [
+            t for t in threading.enumerate()
+            if t != threading.main_thread() 
+            and not t.daemon 
+            and t.is_alive()
+            and any(pattern in t.name.lower() for pattern in [
+                'worker', 'pool', 'connection', 'pytorch', 'thread-'
+            ])
+        ]
+        
+        if stubborn_threads:
+            print(f"   ├─ Found {len(stubborn_threads)} stubborn threads")
+            
+            # First, try to make them daemon (if not started)
+            for thread in stubborn_threads:
+                try:
+                    if hasattr(thread, '_started') and not thread._started.is_set():
+                        thread.daemon = True
+                except:
+                    pass
+            
+            # Wait briefly for them to finish naturally
+            import time as time_mod
+            deadline = time_mod.time() + 2.0
+            while time_mod.time() < deadline:
+                alive = [t for t in stubborn_threads if t.is_alive()]
+                if not alive:
+                    break
+                time_mod.sleep(0.1)
+            
+            # Force terminate any remaining
+            still_alive = [t for t in stubborn_threads if t.is_alive()]
+            if still_alive:
+                terminated = 0
+                for thread in still_alive:
+                    if force_terminate_thread(thread):
+                        terminated += 1
+                if terminated > 0:
+                    print(f"   ├─ Force terminated {terminated} threads")
+            
+            print(f"   └─ {Colors.GREEN}✓ Library thread cleanup complete{Colors.ENDC}")
+        else:
+            print(f"   └─ {Colors.GREEN}✓ No stubborn threads found{Colors.ENDC}")
 
         # Aggressively clean up async tasks and event loop
         print(f"\n{Colors.CYAN}🧹 Performing final async cleanup...{Colors.ENDC}")

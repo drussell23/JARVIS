@@ -1085,10 +1085,13 @@ class StartupProgressReporter:
         message: str,
         progress: float,
         metadata: Optional[Dict[str, Any]] = None,
-        fire_and_forget: bool = True
+        fire_and_forget: bool = True,
+        log_entry: Optional[str] = None,
+        log_source: Optional[str] = None,
+        log_type: str = "info"
     ) -> bool:
         """
-        Report progress to loading server
+        Report progress to loading server with optional operation log.
         
         Args:
             stage: Current stage name (e.g., "init", "backend", "models")
@@ -1096,6 +1099,9 @@ class StartupProgressReporter:
             progress: Percentage complete (0-100)
             metadata: Optional additional data
             fire_and_forget: If True, don't wait for response
+            log_entry: Optional single log entry to add to operations log
+            log_source: Source of the log entry (supervisor, backend, system)
+            log_type: Type of log (info, success, error, warning)
         """
         if not self._enabled:
             return False
@@ -1106,11 +1112,18 @@ class StartupProgressReporter:
         else:
             progress = self._last_progress
         
+        # Build metadata with log entry if provided
+        meta = metadata.copy() if metadata else {}
+        if log_entry:
+            meta["log_entry"] = log_entry
+            meta["log_source"] = log_source or "system"
+            meta["log_type"] = log_type
+        
         payload = {
             "stage": stage,
             "message": message,
             "progress": progress,
-            "metadata": metadata or {}
+            "metadata": meta
         }
         
         if fire_and_forget:
@@ -1161,6 +1174,76 @@ class StartupProgressReporter:
             fire_and_forget=False
         )
     
+    async def log(
+        self,
+        source: str,
+        message: str,
+        log_type: str = "info"
+    ) -> bool:
+        """
+        Add an entry to the live operations log without changing progress.
+        
+        Args:
+            source: Source of the operation (supervisor, backend, system, etc.)
+            message: Log message to display
+            log_type: Type of log (info, success, error, warning)
+            
+        Example:
+            await reporter.log("supervisor", "Checking for existing instances...", "info")
+            await reporter.log("backend", "FastAPI application started", "success")
+        """
+        if not self._enabled:
+            return False
+        
+        # Send a progress update at current level with just the log entry
+        payload = {
+            "stage": "_log",  # Special stage that doesn't change visual progress
+            "message": "",
+            "progress": self._last_progress,
+            "metadata": {
+                "log_entry": message,
+                "log_source": source,
+                "log_type": log_type,
+                "is_log_only": True
+            }
+        }
+        
+        # Fire and forget for logs
+        asyncio.create_task(self._send_with_retry(payload))
+        return True
+    
+    async def log_batch(
+        self,
+        operations: list
+    ) -> bool:
+        """
+        Add multiple entries to the operations log at once.
+        
+        Args:
+            operations: List of dicts with {source, message, type}
+            
+        Example:
+            await reporter.log_batch([
+                {"source": "supervisor", "message": "Started cleanup", "type": "info"},
+                {"source": "supervisor", "message": "Killed 2 processes", "type": "success"}
+            ])
+        """
+        if not self._enabled or not operations:
+            return False
+        
+        payload = {
+            "stage": "_log_batch",
+            "message": "",
+            "progress": self._last_progress,
+            "metadata": {
+                "operations": operations,
+                "is_log_only": True
+            }
+        }
+        
+        asyncio.create_task(self._send_with_retry(payload))
+        return True
+
     async def close(self):
         if self._session and not self._session.closed:
             await self._session.close()

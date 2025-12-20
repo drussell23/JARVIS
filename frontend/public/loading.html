@@ -598,6 +598,228 @@
             font-weight: 700;
         }
 
+        /* Phase and Stage headers */
+        .phase-header {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 12px;
+            padding-bottom: 10px;
+            border-bottom: 1px solid rgba(0, 255, 65, 0.2);
+        }
+
+        .phase-label {
+            font-size: 0.75rem;
+            color: rgba(0, 255, 65, 0.6);
+            text-transform: uppercase;
+            letter-spacing: 0.1em;
+        }
+
+        .phase-value {
+            font-size: 0.85rem;
+            font-weight: 700;
+            padding: 4px 10px;
+            border-radius: 4px;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+
+        .phase-value.starting { background: rgba(255, 170, 0, 0.2); color: #ffaa00; }
+        .phase-value.cleanup { background: rgba(0, 168, 255, 0.2); color: #00a8ff; }
+        .phase-value.initialization { background: rgba(0, 255, 65, 0.2); color: var(--jarvis-green); }
+        .phase-value.ready { background: rgba(0, 255, 65, 0.3); color: var(--jarvis-green); }
+        .phase-value.complete { background: rgba(0, 255, 65, 0.4); color: var(--jarvis-green); }
+        .phase-value.error { background: rgba(255, 68, 68, 0.2); color: var(--jarvis-red); }
+
+        .stage-header {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 15px;
+        }
+
+        .stage-icon-large {
+            font-size: 1.5rem;
+            filter: drop-shadow(0 0 8px var(--jarvis-green-glow));
+        }
+
+        .stage-name-large {
+            font-size: 1.1rem;
+            font-weight: 600;
+            color: var(--jarvis-green);
+        }
+
+        /* Substep list */
+        .substep-list {
+            margin-bottom: 15px;
+        }
+
+        .substep {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 6px 10px;
+            margin: 4px 0;
+            font-size: 0.85rem;
+            color: rgba(0, 255, 65, 0.6);
+            transition: all 0.3s ease;
+        }
+
+        .substep.active {
+            color: var(--jarvis-green);
+            background: rgba(0, 255, 65, 0.1);
+            border-radius: 4px;
+        }
+
+        .substep.completed {
+            color: rgba(0, 255, 65, 0.8);
+        }
+
+        .substep-indicator {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: rgba(0, 255, 65, 0.3);
+            flex-shrink: 0;
+        }
+
+        .substep.active .substep-indicator {
+            background: var(--jarvis-green);
+            box-shadow: 0 0 8px var(--jarvis-green-glow);
+            animation: pulse 1s infinite;
+        }
+
+        .substep.completed .substep-indicator {
+            background: var(--jarvis-green);
+        }
+
+        /* Live operations log */
+        .operations-log {
+            background: rgba(0, 0, 0, 0.3);
+            border: 1px solid rgba(0, 255, 65, 0.2);
+            border-radius: 8px;
+            padding: 12px;
+            margin-bottom: 15px;
+        }
+
+        .log-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+            padding-bottom: 8px;
+            border-bottom: 1px solid rgba(0, 255, 65, 0.15);
+        }
+
+        .log-title {
+            font-size: 0.8rem;
+            color: var(--jarvis-green);
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+
+        .log-count {
+            font-size: 0.7rem;
+            background: rgba(0, 255, 65, 0.2);
+            color: var(--jarvis-green);
+            padding: 2px 8px;
+            border-radius: 10px;
+        }
+
+        .log-entries {
+            max-height: 120px;
+            overflow-y: auto;
+            font-family: 'Courier New', monospace;
+            font-size: 0.75rem;
+        }
+
+        .log-entries::-webkit-scrollbar {
+            width: 4px;
+        }
+
+        .log-entries::-webkit-scrollbar-thumb {
+            background: rgba(0, 255, 65, 0.3);
+            border-radius: 2px;
+        }
+
+        .log-entry {
+            padding: 4px 8px;
+            margin: 2px 0;
+            border-radius: 3px;
+            display: flex;
+            align-items: flex-start;
+            gap: 8px;
+            animation: fadeIn 0.3s ease;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateX(-10px); }
+            to { opacity: 1; transform: translateX(0); }
+        }
+
+        .log-entry.supervisor { background: rgba(0, 168, 255, 0.1); border-left: 2px solid #00a8ff; }
+        .log-entry.backend { background: rgba(0, 255, 65, 0.1); border-left: 2px solid var(--jarvis-green); }
+        .log-entry.system { background: rgba(255, 170, 0, 0.1); border-left: 2px solid #ffaa00; }
+        .log-entry.error { background: rgba(255, 68, 68, 0.1); border-left: 2px solid var(--jarvis-red); }
+        .log-entry.success { background: rgba(0, 255, 65, 0.15); border-left: 2px solid var(--jarvis-green); }
+
+        .log-time {
+            color: rgba(0, 255, 65, 0.5);
+            flex-shrink: 0;
+            width: 55px;
+        }
+
+        .log-source {
+            color: var(--jarvis-green-dark);
+            flex-shrink: 0;
+            width: 80px;
+            text-transform: uppercase;
+            font-weight: 600;
+            font-size: 0.65rem;
+        }
+
+        .log-message {
+            color: rgba(0, 255, 65, 0.9);
+            flex-grow: 1;
+            word-break: break-word;
+        }
+
+        /* System info */
+        .system-info {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 10px;
+        }
+
+        .info-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 8px 12px;
+            background: rgba(0, 255, 65, 0.05);
+            border-radius: 4px;
+        }
+
+        .info-label {
+            font-size: 0.75rem;
+            color: rgba(0, 255, 65, 0.6);
+            text-transform: uppercase;
+        }
+
+        .info-value {
+            font-size: 0.8rem;
+            font-weight: 600;
+            color: var(--jarvis-green);
+        }
+
+        .info-value.good { color: var(--jarvis-green); }
+        .info-value.medium { color: #ffaa00; }
+        .info-value.low { color: var(--jarvis-red); }
+        .info-value.minimal { color: #ffaa00; }
+        .info-value.full { color: var(--jarvis-green); }
+        .info-value.standard { color: var(--jarvis-green); }
+
         /* Error state */
         .error-container {
             display: none;
@@ -719,7 +941,43 @@
         <div class="stages-container" id="stages-container" style="order: 8;"></div>
 
         <!-- Details panel -->
-        <div class="details-panel" id="details-panel" style="order: 9;"></div>
+        <div class="details-panel" id="details-panel" style="order: 9;">
+            <!-- Phase indicator -->
+            <div class="phase-header">
+                <span class="phase-label">PHASE:</span>
+                <span id="phase-indicator" class="phase-value starting">STARTING</span>
+            </div>
+            
+            <!-- Current stage -->
+            <div class="stage-header">
+                <span id="stage-icon" class="stage-icon-large">🔄</span>
+                <span id="stage-name" class="stage-name-large">Initializing</span>
+            </div>
+            
+            <!-- Substeps -->
+            <div id="substep-list" class="substep-list"></div>
+            
+            <!-- Live operations log -->
+            <div class="operations-log" id="operations-log">
+                <div class="log-header">
+                    <span class="log-title">⚡ Live Operations</span>
+                    <span class="log-count" id="log-count">0</span>
+                </div>
+                <div class="log-entries" id="log-entries"></div>
+            </div>
+            
+            <!-- System info -->
+            <div class="system-info">
+                <div class="info-row" id="memory-status">
+                    <span class="info-label">Memory:</span>
+                    <span class="info-value">Analyzing...</span>
+                </div>
+                <div class="info-row" id="mode-indicator">
+                    <span class="info-label">Mode:</span>
+                    <span class="info-value">Detecting...</span>
+                </div>
+            </div>
+        </div>
 
         <!-- Error container -->
         <div class="error-container" id="error-container" style="order: 10;">

@@ -430,7 +430,10 @@ class JARVISLoadingManager {
             memoryInfo: null,
             voiceBiometricsReady: false,
             speakerCacheReady: false,
-            phase: 'cleanup'
+            phase: 'cleanup',
+            // Live operations log
+            operationsLog: [],
+            maxLogEntries: 50
         };
 
         this.elements = this.cacheElements();
@@ -454,8 +457,89 @@ class JARVISLoadingManager {
             substepList: document.getElementById('substep-list'),
             memoryStatus: document.getElementById('memory-status'),
             modeIndicator: document.getElementById('mode-indicator'),
-            phaseIndicator: document.getElementById('phase-indicator')
+            phaseIndicator: document.getElementById('phase-indicator'),
+            // Live operations log elements
+            operationsLog: document.getElementById('operations-log'),
+            logEntries: document.getElementById('log-entries'),
+            logCount: document.getElementById('log-count'),
+            detailsPanel: document.getElementById('details-panel')
         };
+    }
+
+    /**
+     * Add an entry to the live operations log.
+     * 
+     * @param {string} source - Source of the operation (supervisor, backend, system)
+     * @param {string} message - Log message
+     * @param {string} type - Type of log (info, success, error, warning)
+     */
+    addLogEntry(source, message, type = 'info') {
+        if (!this.elements.logEntries) return;
+        
+        const now = new Date();
+        const timeStr = now.toLocaleTimeString('en-US', { 
+            hour12: false, 
+            hour: '2-digit', 
+            minute: '2-digit',
+            second: '2-digit'
+        });
+        
+        // Map source to CSS class
+        const sourceClass = {
+            'supervisor': 'supervisor',
+            'backend': 'backend',
+            'system': 'system',
+            'start_system': 'backend',
+            'jarvis': 'backend',
+            'error': 'error',
+            'success': 'success'
+        }[source.toLowerCase()] || 'system';
+        
+        // Create log entry
+        const entry = document.createElement('div');
+        entry.className = `log-entry ${sourceClass}`;
+        entry.innerHTML = `
+            <span class="log-time">${timeStr}</span>
+            <span class="log-source">${source.substring(0, 12)}</span>
+            <span class="log-message">${this._escapeHtml(message)}</span>
+        `;
+        
+        // Add to DOM
+        this.elements.logEntries.appendChild(entry);
+        
+        // Keep only last N entries
+        while (this.elements.logEntries.children.length > this.state.maxLogEntries) {
+            this.elements.logEntries.removeChild(this.elements.logEntries.firstChild);
+        }
+        
+        // Auto-scroll to bottom
+        this.elements.logEntries.scrollTop = this.elements.logEntries.scrollHeight;
+        
+        // Update count
+        if (this.elements.logCount) {
+            const count = this.elements.logEntries.children.length;
+            this.elements.logCount.textContent = count;
+        }
+        
+        // Store in state
+        this.state.operationsLog.push({
+            time: timeStr,
+            source,
+            message,
+            type
+        });
+        
+        // Trim state array too
+        if (this.state.operationsLog.length > this.state.maxLogEntries) {
+            this.state.operationsLog.shift();
+        }
+        
+    }
+
+    _escapeHtml(text) {
+        const div = document.createElement('div');
+        div.textContent = text;
+        return div.innerHTML;
     }
 
     /**
@@ -735,6 +819,13 @@ class JARVISLoadingManager {
         this.createParticles();
         this.createDetailedStatusPanel();
         this.startSmoothProgress();
+        
+        // Make details panel visible immediately and add initial log
+        if (this.elements.detailsPanel) {
+            this.elements.detailsPanel.classList.add('visible');
+        }
+        this.addLogEntry('System', 'Loading manager initialized', 'info');
+        this.addLogEntry('System', 'Connecting to supervisor...', 'info');
 
         // Connect to loading server (port 3001) - this is our PRIMARY source
         // start_system.py → loading_server.py → here
@@ -1369,6 +1460,45 @@ class JARVISLoadingManager {
             if (metadata.sublabel) {
                 this.state.displaySublabel = metadata.sublabel;
             }
+            
+            // Process operations log from metadata
+            if (metadata.operations && Array.isArray(metadata.operations)) {
+                for (const op of metadata.operations) {
+                    this.addLogEntry(
+                        op.source || 'system',
+                        op.message || op.text || '',
+                        op.type || 'info'
+                    );
+                }
+            }
+            
+            // Single operation log entry
+            if (metadata.log_entry) {
+                this.addLogEntry(
+                    metadata.log_source || 'system',
+                    metadata.log_entry,
+                    metadata.log_type || 'info'
+                );
+            }
+            
+            // Auto-log stage changes with source info
+            if (metadata.source && message) {
+                this.addLogEntry(metadata.source, message, 'info');
+            }
+        }
+
+        // Handle special log-only stages
+        if (stage === '_log' || stage === '_log_batch') {
+            // Don't update visual progress for log-only updates
+            return;
+        }
+
+        // Log stage transitions automatically
+        if (stage && stage !== this.state.stage && message) {
+            const source = stage.includes('supervisor') ? 'Supervisor' : 
+                          stage.includes('backend') || stage === 'api' ? 'Backend' : 
+                          'System';
+            this.addLogEntry(source, message, stage === 'failed' ? 'error' : 'info');
         }
 
         // Update UI

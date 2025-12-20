@@ -316,6 +316,19 @@ class ParallelProcessCleaner:
         
         self.logger.debug(f"Cleanup performance: {perf.get_summary()}")
         
+        # Send log to loading page if available
+        try:
+            from loading_server import get_progress_reporter
+            reporter = get_progress_reporter()
+            if terminated > 0:
+                await reporter.log(
+                    "Supervisor",
+                    f"Cleaned up {terminated} existing instance(s)",
+                    "success"
+                )
+        except Exception:
+            pass
+        
         return terminated, list(discovered.values())
     
     async def _parallel_discover(self) -> Dict[int, ProcessInfo]:
@@ -651,20 +664,20 @@ class TerminalUI:
     
     @classmethod
     def print_banner(cls) -> None:
-        """Print an engaging startup banner."""
-        print()
+    """Print an engaging startup banner."""
+    print()
         print(f"{cls.CYAN}{'=' * 65}{cls.RESET}")
         print(f"{cls.CYAN}{' ' * 15}⚡ JARVIS LIFECYCLE SUPERVISOR ⚡{' ' * 15}{cls.RESET}")
         print(f"{cls.CYAN}{'=' * 65}{cls.RESET}")
-        print()
+    print()
         print(f"  {cls.YELLOW}🤖 Self-Updating • Self-Healing • Autonomous{cls.RESET}")
-        print()
+    print()
         print(f"  {cls.GRAY}The Living OS - Manages updates, restarts, and rollbacks")
         print(f"  while keeping JARVIS online and responsive.{cls.RESET}")
-        print()
+    print()
         print(f"{cls.CYAN}{'-' * 65}{cls.RESET}")
-        print()
-    
+    print()
+
     @classmethod
     def print_phase(cls, number: int, total: int, message: str) -> None:
         """Print a phase indicator."""
@@ -694,9 +707,9 @@ class TerminalUI:
     @classmethod
     def print_divider(cls) -> None:
         """Print a divider line."""
-        print()
+    print()
         print(f"{cls.CYAN}{'-' * 65}{cls.RESET}")
-        print()
+    print()
     
     @classmethod
     def print_process_list(cls, processes: List[ProcessInfo]) -> None:
@@ -808,17 +821,17 @@ class SupervisorBootstrapper:
             
             # Run supervisor
             self.perf.start("jarvis")
-            await supervisor.run()
+        await supervisor.run()
             self.perf.end("jarvis")
             
             return 0
             
-        except KeyboardInterrupt:
+    except KeyboardInterrupt:
             print(f"\n{TerminalUI.YELLOW}👋 Supervisor interrupted by user{TerminalUI.RESET}")
             await self.narrator.speak("Supervisor shutting down. Goodbye.", wait=True)
             return 130
             
-        except Exception as e:
+    except Exception as e:
             self.logger.exception(f"Bootstrap failed: {e}")
             TerminalUI.print_error(f"Bootstrap failed: {e}")
             await self.narrator.speak("An error occurred. Please check the logs.", wait=True)
