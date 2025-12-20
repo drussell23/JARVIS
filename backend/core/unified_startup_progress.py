@@ -152,6 +152,27 @@ class UnifiedStartupProgressHub:
         self._memory_info: Optional[Dict[str, Any]] = None
         self._startup_mode: Optional[str] = None
 
+        # Milestone tracking for narrator integration
+        # Milestones are announced ONCE when progress crosses the threshold
+        self._announced_milestones: Set[int] = set()
+        self._milestone_thresholds = [25, 50, 75, 100]  # Percentage thresholds
+        self._narrator_callback: Optional[Callable] = None
+
+        # Stage-to-message mapping for narrator (dynamic, based on current component)
+        self._stage_messages: Dict[str, str] = {
+            "supervisor": "Initializing supervisor systems",
+            "cleanup": "Cleaning up previous sessions",
+            "spawning": "Spawning core processes",
+            "backend": "Starting backend services",
+            "database": "Connecting to database",
+            "voice": "Initializing voice systems",
+            "vision": "Calibrating vision systems",
+            "models": "Loading machine learning models",
+            "frontend": "Connecting user interface",
+            "websocket": "Establishing WebSocket connections",
+            "config": "Loading configuration",
+        }
+
     @classmethod
     async def get_instance(cls) -> "UnifiedStartupProgressHub":
         """Get or create the singleton instance"""
@@ -373,6 +394,9 @@ class UnifiedStartupProgressHub:
         )
         await self._sync_all()
 
+        # Announce stage start to narrator (if callback registered)
+        await self._announce_stage(component, "stage_start")
+
     async def component_progress(
         self,
         component: str,
@@ -430,6 +454,9 @@ class UnifiedStartupProgressHub:
             metadata={"duration_ms": comp.duration_ms}
         )
         await self._sync_all()
+
+        # Check and announce milestones (25%, 50%, 75%, 100%)
+        await self._check_and_announce_milestones()
 
     async def component_failed(
         self,
@@ -595,6 +622,99 @@ class UnifiedStartupProgressHub:
     def on_ready(self, callback: Callable):
         """Register a callback to be called when system is ready"""
         self._ready_callbacks.append(callback)
+
+    # =========================================================================
+    # Narrator Integration (v19.7.0)
+    # =========================================================================
+    # Provides automatic milestone announcements and stage narration.
+    # The narrator callback is invoked when progress crosses milestone thresholds.
+
+    def set_narrator_callback(self, callback: Callable):
+        """
+        Set the narrator callback for automatic progress announcements.
+
+        The callback will be invoked with:
+            callback(event_type: str, progress: float, message: str)
+
+        Where event_type is one of:
+            - "milestone_25", "milestone_50", "milestone_75", "milestone_100"
+            - "stage_start" (when a new component starts)
+            - "stage_complete" (when a component finishes)
+            - "slow_warning" (when startup is taking longer than expected)
+
+        Example:
+            async def narrate(event: str, progress: float, message: str):
+                if event == "milestone_50":
+                    await narrator.speak("Halfway there!")
+
+            hub.set_narrator_callback(narrate)
+        """
+        self._narrator_callback = callback
+        logger.info("[UnifiedProgress] Narrator callback registered for auto-announcements")
+
+    async def _check_and_announce_milestones(self):
+        """
+        Check if progress has crossed any milestone thresholds and announce them.
+        Milestones are announced exactly ONCE per threshold.
+        """
+        if not self._narrator_callback:
+            return
+
+        for threshold in self._milestone_thresholds:
+            if self._progress >= threshold and threshold not in self._announced_milestones:
+                self._announced_milestones.add(threshold)
+                event_type = f"milestone_{threshold}"
+
+                # Craft a human-friendly message
+                if threshold == 25:
+                    message = "About a quarter of the way through."
+                elif threshold == 50:
+                    message = "Halfway there."
+                elif threshold == 75:
+                    message = "Almost ready. Just a few more moments."
+                elif threshold == 100:
+                    message = "Startup complete."
+                else:
+                    message = f"{threshold} percent loaded."
+
+                logger.info(f"[UnifiedProgress] 📢 Announcing milestone: {threshold}%")
+
+                try:
+                    if asyncio.iscoroutinefunction(self._narrator_callback):
+                        await self._narrator_callback(event_type, self._progress, message)
+                    else:
+                        self._narrator_callback(event_type, self._progress, message)
+                except Exception as e:
+                    logger.error(f"Narrator callback error at {threshold}%: {e}")
+
+    async def _announce_stage(self, stage: str, event_type: str = "stage_start"):
+        """Announce a stage change via narrator callback."""
+        if not self._narrator_callback:
+            return
+
+        message = self._stage_messages.get(stage, f"Initializing {stage}")
+        logger.debug(f"[UnifiedProgress] 📢 Stage announcement: {stage} - {message}")
+
+        try:
+            if asyncio.iscoroutinefunction(self._narrator_callback):
+                await self._narrator_callback(event_type, self._progress, message)
+            else:
+                self._narrator_callback(event_type, self._progress, message)
+        except Exception as e:
+            logger.error(f"Narrator stage callback error: {e}")
+
+    def get_current_stage_message(self) -> str:
+        """Get the current stage message for display/narration."""
+        # Find the currently running component
+        for name, comp in self._components.items():
+            if comp.status == ComponentStatus.RUNNING:
+                return self._stage_messages.get(name, comp.message)
+        return self._message
+
+    def reset_milestones(self):
+        """Reset announced milestones (useful for restart scenarios)."""
+        self._announced_milestones.clear()
+        logger.debug("[UnifiedProgress] Milestones reset for new startup")
 
     # =========================================================================
     # State Getters

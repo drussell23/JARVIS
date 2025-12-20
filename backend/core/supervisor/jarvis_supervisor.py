@@ -450,6 +450,13 @@ class JARVISSupervisor:
                         loading_server_url="http://localhost:3001",
                         required_components=["backend", "frontend", "voice", "vision"]
                     )
+
+                    # v19.7.0: Register narrator callback for automatic milestone announcements
+                    # This connects the progress hub to the startup narrator so that
+                    # progress milestones (25%, 50%, 75%, 100%) are announced automatically.
+                    self._progress_hub.set_narrator_callback(self._startup_narrator.hub_callback)
+                    logger.info("📢 Narrator connected to progress hub for auto-announcements")
+
                     # Mark supervisor as starting (already pre-registered in hub.initialize)
                     await self._progress_hub.component_start("supervisor", "Supervisor initializing...")
 

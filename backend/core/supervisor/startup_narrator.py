@@ -362,6 +362,47 @@ class IntelligentStartupNarrator:
         # The orchestrator will be stopped by the supervisor at shutdown
         logger.debug("🎙️ Startup narrator stopped")
 
+    async def hub_callback(self, event_type: str, progress: float, message: str) -> None:
+        """
+        Callback handler for the unified progress hub (v19.7.0).
+
+        This is called automatically by the hub when:
+        - Progress crosses milestone thresholds (25%, 50%, 75%, 100%)
+        - Stages start or complete
+        - Warnings occur (slow startup, etc.)
+
+        Args:
+            event_type: Type of event (milestone_25, stage_start, etc.)
+            progress: Current progress percentage
+            message: Human-friendly message for the event
+        """
+        # Don't double-announce milestones we've already handled
+        if event_type.startswith("milestone_"):
+            try:
+                milestone = int(event_type.split("_")[1])
+                if milestone in self._milestones_announced:
+                    logger.debug(f"🎙️ Skipping already announced milestone: {milestone}%")
+                    return
+                self._milestones_announced.add(milestone)
+            except (ValueError, IndexError):
+                pass
+
+        # Determine priority based on event type
+        if event_type == "milestone_100" or event_type == "stage_complete":
+            priority = NarrationPriority.HIGH
+        elif event_type.startswith("milestone_"):
+            priority = NarrationPriority.MEDIUM
+        elif event_type == "slow_warning":
+            priority = NarrationPriority.LOW
+        elif event_type == "stage_start":
+            priority = NarrationPriority.LOW  # Don't over-narrate stage starts
+        else:
+            priority = NarrationPriority.MEDIUM
+
+        # Speak the message
+        logger.debug(f"🎙️ Hub callback: {event_type} ({progress:.0f}%) - {message}")
+        await self._speak(message, priority)
+
     def _map_priority(self, priority: NarrationPriority) -> VoicePriority:
         """Map NarrationPriority to VoicePriority."""
         mapping = {
