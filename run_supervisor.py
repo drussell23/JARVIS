@@ -364,14 +364,20 @@ class ParallelProcessCleaner:
             process_scan_task = loop.run_in_executor(
                 executor, self._discover_from_process_list
             )
+
+            # Task 3: Scan ports (new)
+            port_scan_task = loop.run_in_executor(
+                executor, self._discover_from_ports
+            )
             
-            # Wait for both
-            pid_file_procs, scanned_procs = await asyncio.gather(
-                pid_file_task, process_scan_task
+            # Wait for all
+            pid_file_procs, scanned_procs, port_procs = await asyncio.gather(
+                pid_file_task, process_scan_task, port_scan_task
             )
         
-        # Merge results (PID files take precedence)
+        # Merge results (PID files take precedence, then ports, then scan)
         discovered.update(scanned_procs)
+        discovered.update(port_procs)
         discovered.update(pid_file_procs)
         
         return discovered
@@ -406,7 +412,7 @@ class ParallelProcessCleaner:
                         memory_mb=proc.memory_info().rss / (1024 * 1024),
                         source="pid_file"
                     )
-            except (ValueError, psutil.NoSuchProcess, psutil.AccessDenied):
+            except (ValueError, psutil.NoSuchProcess, psutil.AccessDenied, ProcessLookupError):
                 try:
                     pid_file.unlink(missing_ok=True)
                 except Exception:
@@ -442,6 +448,47 @@ class ParallelProcessCleaner:
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 pass
         
+        return discovered
+
+    def _discover_from_ports(self) -> Dict[int, ProcessInfo]:
+        """Discover processes holding critical ports."""
+        try:
+            import psutil
+        except ImportError:
+            return {}
+
+        discovered = {}
+        critical_ports = self.config.required_ports
+
+        try:
+            for conn in psutil.net_connections(kind='inet'):
+                if conn.laddr.port in critical_ports:
+                    try:
+                        pid = conn.pid
+                        if not pid or pid in (self._my_pid, self._my_parent):
+                            continue
+                            
+                        # Don't rediscover if we already found it, but verify it exists
+                        if pid in discovered:
+                            continue
+
+                        proc = psutil.Process(pid)
+                        cmdline = " ".join(proc.cmdline()).lower()
+                        mem_info = proc.memory_info()
+                        
+                        discovered[pid] = ProcessInfo(
+                            pid=pid,
+                            cmdline=cmdline[:100],
+                            age_seconds=time.time() - proc.create_time(),
+                            memory_mb=mem_info.rss / (1024 * 1024),
+                            source=f"port_{conn.laddr.port}"
+                        )
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        pass
+        except (psutil.AccessDenied, PermissionError):
+            # macOS might require root for net_connections on other users' procs
+            pass
+            
         return discovered
     
     async def _parallel_terminate(self, processes: Dict[int, ProcessInfo]) -> int:
@@ -986,6 +1033,12 @@ class SupervisorBootstrapper:
         self.phase = StartupPhase.INIT
         self._shutdown_event = asyncio.Event()
         self._loading_server_process: Optional[asyncio.subprocess.Process] = None  # Track for cleanup
+        
+        # CRITICAL: Set CI=true to prevent npm start from hanging interactively
+        # if port 3000 is taken. This ensures we fail fast or handle it automatically.
+        os.environ["CI"] = "true"
+        
+        self._setup_signal_handlers()
     
     async def run(self) -> int:
         """
@@ -1092,6 +1145,13 @@ class SupervisorBootstrapper:
             # Propagate memory constraints for adaptive loading
             os.environ["JARVIS_AVAILABLE_RAM_GB"] = str(round(resources.memory_available_gb, 1))
             os.environ["JARVIS_TOTAL_RAM_GB"] = str(round(resources.memory_total_gb, 1))
+
+            # CRITICAL: Optimize Frontend Memory & Timeout based on resources
+            # Reduce Node memory to 2GB (from default 4GB) to prevent relief pressure
+            os.environ["JARVIS_FRONTEND_MEMORY_MB"] = "2048"
+            # Increase timeout to 120s to prevent early shutdown
+            os.environ["JARVIS_FRONTEND_TIMEOUT"] = "120"
+            self.logger.info("🔄 Configured Frontend: 2GB RAM limit, 120s timeout")
 
             # Propagate warnings for downstream handling
             if resources.warnings:

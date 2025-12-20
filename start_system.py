@@ -8976,7 +8976,11 @@ class AsyncSystemManager:
         env["PORT"] = str(self.ports["frontend"])
         env["BROWSER"] = "none"  # Disable React's auto-opening of browser
         env["SKIP_PREFLIGHT_CHECK"] = "true"  # Skip CRA preflight checks
-        env["NODE_OPTIONS"] = "--max-old-space-size=4096"  # Increase Node memory
+        
+        # Configure Node memory dynamically (default 4GB, configurable via env)
+        frontend_memory = os.getenv("JARVIS_FRONTEND_MEMORY_MB", "4096")
+        env["NODE_OPTIONS"] = f"--max-old-space-size={frontend_memory}"
+        
         env["GENERATE_SOURCEMAP"] = "false"  # Disable source maps to reduce memory
 
         # Create a log file for frontend to help debug issues
@@ -14308,7 +14312,9 @@ except Exception as e:
                 pass
             
             # Wait for frontend with retries
-            frontend_ready = await self._wait_for_frontend_ready(max_wait=30)
+            # Wait for frontend with configurable timeout
+            frontend_timeout = int(os.getenv("JARVIS_FRONTEND_TIMEOUT", "60"))
+            frontend_ready = await self._wait_for_frontend_ready(max_wait=frontend_timeout)
         
         # NOW broadcast 100% completion - only after frontend is verified
         # CRITICAL: Skip if supervisor is handling loading page (avoid duplicate completion signals)
