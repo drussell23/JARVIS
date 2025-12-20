@@ -13279,14 +13279,61 @@ except Exception as e:
         """Main run method with self-healing"""
         self.print_header()
 
-        # Helper to broadcast progress if available (during --restart)
-        async def broadcast_progress(stage, message, progress, metadata=None):
-            """Broadcast progress to loading server if available"""
+        # =================================================================
+        # SUPERVISOR COORDINATION: Use progress bridge when supervised
+        # =================================================================
+        # When running under supervisor (python3 run_supervisor.py):
+        # - Use SupervisorProgressBridge to update backend's app.state
+        # - Supervisor polls /health/startup and broadcasts to loading page
+        # - This ensures single source of truth and accurate progress
+        # =================================================================
+        progress_bridge = None
+        supervisor_mode = os.environ.get("JARVIS_SUPERVISED") == "1"
+
+        if supervisor_mode:
             try:
-                if '_broadcast_to_loading_server' in globals():
-                    await _broadcast_to_loading_server(stage, message, progress, metadata)
-            except Exception:
-                pass  # Silently fail if loading server not available
+                from core.supervisor.supervisor_integration import get_progress_bridge
+                progress_bridge = get_progress_bridge()
+                logger.info("📊 Running supervised - using progress bridge for coordination")
+            except ImportError:
+                logger.warning("Progress bridge not available - falling back to direct broadcast")
+
+        # Helper to broadcast progress (uses bridge when supervised)
+        async def broadcast_progress(stage, message, progress, metadata=None):
+            """
+            Broadcast progress - routes to appropriate destination.
+
+            When supervised: Updates backend's app.state via progress bridge
+            When standalone: Broadcasts directly to loading server
+            """
+            # Map stage to component name for bridge
+            stage_to_component = {
+                "backend_spawned": "backend",
+                "database": "database",
+                "voice": "voice",
+                "vision": "vision",
+                "models": "models",
+                "websocket": "websocket",
+                "config": "config",
+                "cleanup": "cleanup",
+                "frontend": "frontend",
+            }
+
+            if progress_bridge and supervisor_mode:
+                # Supervised mode: Update progress bridge
+                await progress_bridge.report_progress(stage, message, progress)
+
+                # If this is a component completion, mark it ready
+                component = stage_to_component.get(stage)
+                if component and progress >= 100:
+                    await progress_bridge.report_component_ready(component, message)
+            else:
+                # Standalone mode: Direct broadcast to loading server
+                try:
+                    if '_broadcast_to_loading_server' in globals():
+                        await _broadcast_to_loading_server(stage, message, progress, metadata)
+                except Exception:
+                    pass  # Silently fail if loading server not available
 
         await broadcast_progress(
             "backend_spawned",

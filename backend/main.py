@@ -1129,6 +1129,22 @@ async def parallel_lifespan(app: FastAPI):
     """
     from core.parallel_initializer import ParallelInitializer
 
+    # =================================================================
+    # SUPERVISOR COORDINATION: Attach progress bridge for /health/startup
+    # =================================================================
+    # When running under supervisor, the progress bridge is the single
+    # source of truth. Attach it to app so /health/startup can use it.
+    # =================================================================
+    try:
+        from core.supervisor.supervisor_integration import get_progress_bridge
+        bridge = get_progress_bridge()
+        bridge.attach_app(app)
+        logger.info("📊 Progress bridge attached for supervisor coordination")
+    except ImportError:
+        logger.debug("Supervisor integration not available")
+    except Exception as e:
+        logger.debug(f"Could not attach progress bridge: {e}")
+
     logger.info("=" * 60)
     logger.info("PARALLEL STARTUP MODE v1.0.0")
     logger.info("=" * 60)
@@ -1170,6 +1186,19 @@ async def lifespan(app: FastAPI):  # type: ignore[misc]
     """Optimized lifespan handler with parallel initialization"""
     logger.info("🚀 Starting optimized JARVIS backend...")
     start_time = time.time()
+
+    # =================================================================
+    # SUPERVISOR COORDINATION: Attach progress bridge for /health/startup
+    # =================================================================
+    try:
+        from core.supervisor.supervisor_integration import get_progress_bridge
+        bridge = get_progress_bridge()
+        bridge.attach_app(app)
+        logger.info("📊 Progress bridge attached for supervisor coordination")
+    except ImportError:
+        logger.debug("Supervisor integration not available")
+    except Exception as e:
+        logger.debug(f"Could not attach progress bridge: {e}")
 
     # ═══════════════════════════════════════════════════════════════════════════
     # CRITICAL: Pre-startup cleanup of stuck ML processes
@@ -3579,28 +3608,44 @@ async def health_startup():
     """
     Startup progress endpoint - shows detailed initialization status.
 
-    Use this to monitor parallel initialization progress.
+    This is the SINGLE SOURCE OF TRUTH for startup progress when running
+    under the supervisor. The supervisor polls this endpoint and broadcasts
+    to the loading page.
+
     Returns immediately even during initialization.
     """
-    # Check for parallel initializer
+    # Priority 1: Check for supervisor progress bridge (unified coordination)
+    try:
+        from core.supervisor.supervisor_integration import get_progress_bridge
+        bridge = get_progress_bridge()
+        if bridge._initialized:
+            return bridge.get_status()
+    except ImportError:
+        pass
+
+    # Priority 2: Check for parallel initializer
     if hasattr(app.state, "parallel_initializer"):
         return app.state.parallel_initializer.get_status()
 
-    # Fallback to basic status
+    # Priority 3: Fallback to app.state (may be set by progress bridge)
     phase = getattr(app.state, "startup_phase", "UNKNOWN")
     progress = getattr(app.state, "startup_progress", 0.0)
+    message = getattr(app.state, "startup_message", "Initializing...")
     ready = getattr(app.state, "components_ready", set())
     failed = getattr(app.state, "components_failed", set())
+    is_complete = getattr(app.state, "startup_complete", False)
 
     return {
         "phase": phase,
         "progress": progress,
+        "message": message,
         "components": {
-            "ready": list(ready),
-            "failed": list(failed),
+            "ready": list(ready) if isinstance(ready, set) else ready,
+            "failed": list(failed) if isinstance(failed, set) else failed,
         },
         "ready_for_requests": True,
-        "full_mode": phase == "FULL_MODE",
+        "full_mode": phase == "FULL_MODE" or is_complete,
+        "is_complete": is_complete,
     }
 
 

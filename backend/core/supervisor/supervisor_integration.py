@@ -361,12 +361,223 @@ async def setup_supervisor_integration(
     return supervised
 
 
+# =============================================================================
+# SUPERVISOR PROGRESS BRIDGE
+# =============================================================================
+# This is the coordination layer between start_system.py and the supervisor.
+# When running supervised, progress updates go through this bridge which:
+# 1. Updates the backend's app.state (exposed via /health/startup)
+# 2. The supervisor polls /health/startup and broadcasts to loading page
+# This ensures a single source of truth and accurate progress tracking.
+# =============================================================================
+
+
+class SupervisorProgressBridge:
+    """
+    Coordination bridge for progress reporting when running under supervisor.
+
+    When JARVIS runs under the supervisor (python3 run_supervisor.py):
+    - start_system.py uses this bridge to report progress
+    - The bridge updates FastAPI's app.state
+    - The supervisor polls /health/startup endpoint
+    - The supervisor broadcasts to the loading page
+
+    This ensures:
+    - Single source of truth (backend's actual state)
+    - No duplicate broadcasts
+    - Accurate progress tracking
+    - Proper coordination between supervisor and start_system.py
+
+    Usage:
+        bridge = get_progress_bridge()
+        await bridge.report_progress("backend_init", "Starting backend...", 45)
+        await bridge.report_component_ready("voice")
+        await bridge.mark_complete()
+    """
+
+    def __init__(self):
+        self._app = None
+        self._components_ready: set = set()
+        self._components_failed: set = set()
+        self._current_phase: str = "INITIALIZING"
+        self._current_progress: float = 0.0
+        self._current_message: str = "Starting JARVIS..."
+        self._is_complete: bool = False
+        self._initialized: bool = False
+
+        # Component weights for progress calculation
+        self._component_weights = {
+            "database": 8,
+            "voice": 15,
+            "vision": 12,
+            "websocket": 5,
+            "models": 20,
+            "frontend": 15,
+            "backend": 20,
+            "config": 3,
+            "cleanup": 2,
+        }
+        self._total_weight = sum(self._component_weights.values())
+
+        logger.info("🔧 Supervisor progress bridge initialized")
+
+    def attach_app(self, app) -> None:
+        """
+        Attach FastAPI app to update its state directly.
+
+        Call this during FastAPI lifespan startup:
+            from core.supervisor.supervisor_integration import get_progress_bridge
+            bridge = get_progress_bridge()
+            bridge.attach_app(app)
+        """
+        self._app = app
+        self._initialized = True
+        self._sync_to_app()
+        logger.info("📊 Progress bridge attached to FastAPI app")
+
+    def _sync_to_app(self) -> None:
+        """Sync current state to FastAPI app.state for /health/startup endpoint."""
+        if not self._app:
+            return
+
+        self._app.state.startup_phase = self._current_phase
+        self._app.state.startup_progress = self._current_progress
+        self._app.state.startup_message = self._current_message
+        self._app.state.components_ready = self._components_ready.copy()
+        self._app.state.components_failed = self._components_failed.copy()
+        self._app.state.startup_complete = self._is_complete
+
+    def _calculate_progress(self) -> float:
+        """Calculate progress based on ready components."""
+        ready_weight = sum(
+            self._component_weights.get(c, 0)
+            for c in self._components_ready
+        )
+        return min(100.0, (ready_weight / self._total_weight) * 100.0)
+
+    async def report_progress(
+        self,
+        phase: str,
+        message: str,
+        progress: Optional[float] = None,
+    ) -> None:
+        """
+        Report progress update.
+
+        Args:
+            phase: Current phase name (e.g., "backend_init", "voice_loading")
+            message: Human-readable status message
+            progress: Optional explicit progress (0-100). If None, calculated from components.
+        """
+        self._current_phase = phase
+        self._current_message = message
+
+        if progress is not None:
+            self._current_progress = min(100.0, max(0.0, progress))
+        else:
+            self._current_progress = self._calculate_progress()
+
+        self._sync_to_app()
+
+        # Log for visibility (supervisor can see this in stdout)
+        logger.debug(f"📊 Progress: {self._current_progress:.0f}% - {phase}: {message}")
+
+    async def report_component_ready(self, component: str, message: Optional[str] = None) -> None:
+        """
+        Mark a component as ready.
+
+        Args:
+            component: Component name (database, voice, vision, etc.)
+            message: Optional status message
+        """
+        if component not in self._components_ready:
+            self._components_ready.add(component)
+            self._components_failed.discard(component)
+            self._current_progress = self._calculate_progress()
+            self._current_message = message or f"{component.title()} ready"
+            self._sync_to_app()
+            logger.info(f"✅ Component ready: {component} ({self._current_progress:.0f}%)")
+
+    async def report_component_failed(self, component: str, error: Optional[str] = None) -> None:
+        """Mark a component as failed."""
+        if component not in self._components_failed:
+            self._components_failed.add(component)
+            self._current_message = error or f"{component.title()} failed"
+            self._sync_to_app()
+            logger.warning(f"❌ Component failed: {component}")
+
+    async def mark_complete(self, success: bool = True, message: Optional[str] = None) -> None:
+        """Mark startup as complete."""
+        self._is_complete = True
+        self._current_phase = "COMPLETE" if success else "FAILED"
+        self._current_progress = 100.0 if success else self._current_progress
+        self._current_message = message or ("JARVIS is online!" if success else "Startup failed")
+        self._sync_to_app()
+        logger.info(f"🎉 Startup complete: {self._current_message}")
+
+    def get_status(self) -> dict:
+        """Get current status (matches /health/startup format)."""
+        return {
+            "phase": self._current_phase,
+            "progress": self._current_progress,
+            "message": self._current_message,
+            "components": {
+                "ready": list(self._components_ready),
+                "failed": list(self._components_failed),
+            },
+            "ready_for_requests": len(self._components_ready) > 0,
+            "full_mode": self._is_complete,
+            "is_complete": self._is_complete,
+        }
+
+    def is_supervised(self) -> bool:
+        """Check if running under supervisor."""
+        return os.environ.get("JARVIS_SUPERVISED") == "1"
+
+    def supervisor_controls_loading(self) -> bool:
+        """Check if supervisor is handling the loading page."""
+        return os.environ.get("JARVIS_SUPERVISOR_LOADING") == "1"
+
+
+# Singleton bridge
+_progress_bridge: Optional[SupervisorProgressBridge] = None
+
+
+def get_progress_bridge() -> SupervisorProgressBridge:
+    """Get singleton progress bridge."""
+    global _progress_bridge
+    if _progress_bridge is None:
+        _progress_bridge = SupervisorProgressBridge()
+    return _progress_bridge
+
+
+async def report_supervised_progress(
+    phase: str,
+    message: str,
+    progress: Optional[float] = None,
+) -> None:
+    """
+    Convenience function to report progress when supervised.
+
+    If not supervised, this is a no-op (caller should use direct broadcast).
+    """
+    bridge = get_progress_bridge()
+    if bridge.is_supervised():
+        await bridge.report_progress(phase, message, progress)
+
+
+async def report_component_ready(component: str, message: Optional[str] = None) -> None:
+    """Convenience function to report component ready."""
+    bridge = get_progress_bridge()
+    await bridge.report_component_ready(component, message)
+
+
 # Convenience exports
 __all__ = [
     "is_supervised",
     "get_supervisor_pid",
     "trigger_update",
-    "trigger_rollback", 
+    "trigger_rollback",
     "trigger_restart",
     "check_for_updates",
     "announce_update_status",
@@ -376,4 +587,9 @@ __all__ = [
     "EXIT_CODE_UPDATE",
     "EXIT_CODE_ROLLBACK",
     "EXIT_CODE_RESTART",
+    # New coordination exports
+    "SupervisorProgressBridge",
+    "get_progress_bridge",
+    "report_supervised_progress",
+    "report_component_ready",
 ]

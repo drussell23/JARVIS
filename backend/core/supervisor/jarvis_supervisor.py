@@ -705,12 +705,11 @@ class JARVISSupervisor:
         
         async def check_system_status() -> dict:
             """
-            Check detailed system status from backend using /health/ready endpoint.
+            Check detailed system status from backend using /health/startup endpoint.
 
-            This endpoint provides accurate subsystem status including:
-            - ML model warmup status
-            - Voice unlock readiness
-            - Audio system status
+            This is the SINGLE SOURCE OF TRUTH for backend startup progress.
+            The backend's SupervisorProgressBridge updates this endpoint with
+            real progress data, and we map it to our progress hub.
 
             Returns a normalized dict with consistent field names for subsystem tracking.
             """
@@ -718,7 +717,48 @@ class JARVISSupervisor:
                 if session is None or session.closed:
                     return {}
 
-                # Use /health/ready which provides actual subsystem status
+                # Primary: Poll /health/startup for detailed progress from progress bridge
+                async with session.get(
+                    f"{backend_url}/health/startup",
+                    timeout=aiohttp.ClientTimeout(total=health_check_timeout)
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        components = data.get("components", {})
+                        ready_components = set(components.get("ready", []))
+
+                        # Map backend progress to supervisor's expected format
+                        return {
+                            # Phase and progress from backend
+                            "phase": data.get("phase", "UNKNOWN"),
+                            "progress": data.get("progress", 0.0),
+                            "message": data.get("message", ""),
+                            "is_complete": data.get("is_complete", False),
+
+                            # Component status from backend's ready list
+                            "database_connected": "database" in ready_components,
+                            "voice_ready": "voice" in ready_components,
+                            "vision_ready": "vision" in ready_components,
+                            "models_ready": "models" in ready_components,
+                            "websocket_ready": "websocket" in ready_components,
+                            "config_ready": "config" in ready_components,
+                            "cleanup_ready": "cleanup" in ready_components,
+                            "backend_ready": "backend" in ready_components,
+
+                            # Legacy fields for compatibility
+                            "ml_models_ready": "models" in ready_components,
+                            "ml_warming_up": data.get("phase") == "MODELS_LOADING",
+                            "overall_ready": data.get("full_mode", False),
+                        }
+
+            except Exception as e:
+                logger.debug(f"System status check failed: {e}")
+
+            # Fallback: Try /health/ready for basic status
+            try:
+                if session is None or session.closed:
+                    return {}
+
                 async with session.get(
                     f"{backend_url}/health/ready",
                     timeout=aiohttp.ClientTimeout(total=health_check_timeout)
@@ -728,22 +768,17 @@ class JARVISSupervisor:
                         details = data.get("details", {})
                         ml_warmup = details.get("ml_warmup", {})
 
-                        # Normalize response to expected format
-                        # CRITICAL: Default to False (not ready), not True!
-                        # We should only mark components ready when explicitly confirmed
                         return {
-                            "database_connected": True,  # If backend responds, SQLite is connected
+                            "database_connected": True,
                             "voice_ready": details.get("voice_unlock", False),
-                            "vision_ready": True,  # Vision is typically always available
+                            "vision_ready": True,
                             "ml_models_ready": ml_warmup.get("is_ready", False),
                             "ml_warming_up": ml_warmup.get("is_warming_up", False),
-                            "ml_progress": ml_warmup.get("progress", 0.0),
-                            "ml_audio_ready": details.get("ml_audio", False),
-                            "overall_status": data.get("status", "unknown"),
                             "overall_ready": data.get("ready", False),
                         }
-            except Exception as e:
-                logger.debug(f"System status check failed: {e}")
+            except Exception:
+                pass
+
             return {}
         
         async def parallel_health_check() -> Tuple[bool, bool, dict]:
