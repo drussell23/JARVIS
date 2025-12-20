@@ -8,7 +8,7 @@ import sys
 os.environ['SKIP_RUST_BUILD'] = 'true'
 os.environ['SKIP_VISION_INTELLIGENCE'] = 'true'
 os.environ['OPTIMIZE_STARTUP'] = 'true'
-os.environ['BACKEND_PORT'] = '8000'
+os.environ['BACKEND_PORT'] = '8010'
 
 # Import and run main
 sys.path.insert(0, os.path.dirname(__file__))

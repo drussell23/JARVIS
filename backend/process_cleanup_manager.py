@@ -4087,7 +4087,7 @@ class ProcessCleanupManager:
         Returns True if this is the only instance, False otherwise.
         """
         current_pid = os.getpid()
-        target_port = int(os.getenv("BACKEND_PORT", "8000"))
+        target_port = int(os.getenv("BACKEND_PORT", "8010"))
 
         # First, check for any JARVIS processes regardless of port
         jarvis_processes = self._find_jarvis_processes()
@@ -5605,7 +5605,7 @@ def prevent_multiple_jarvis_instances():
 
         if other_processes:
             # Check if any are using the target port
-            target_port = int(os.getenv("BACKEND_PORT", "8000"))
+            target_port = int(os.getenv("BACKEND_PORT", "8010"))
             port_conflict = False
 
             for proc_info in other_processes:

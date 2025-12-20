@@ -2636,7 +2636,7 @@ async def lifespan(app: FastAPI):  # type: ignore[misc]
         await mesh.start()
 
         # Register backend service
-        backend_port = int(os.getenv("BACKEND_PORT", "8000"))
+        backend_port = int(os.getenv("BACKEND_PORT", "8010"))
         await orchestrator.register_service("jarvis_backend", backend_port, "http")
         await mesh.join(
             {

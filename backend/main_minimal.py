@@ -94,6 +94,30 @@ async def root():
     return {"status": "JARVIS Minimal Backend Running"}
 
 
+@app.get("/health/ping")
+async def health_ping():
+    """Ultra-fast liveness probe - responds immediately."""
+    return {"status": "ok", "message": "pong"}
+
+
+@app.get("/health/startup")
+async def health_startup():
+    """Startup status for minimal backend."""
+    return {
+        "phase": "MINIMAL_MODE",
+        "progress": 1.0,
+        "ready_for_requests": True,
+        "full_mode": False,
+        "is_complete": False,
+        "components": {
+            "ready": ["config", "minimal_api"],
+            "pending": ["full_backend"],
+            "total": 3
+        },
+        "message": "Running in minimal mode - full features loading in background"
+    }
+
+
 @app.get("/health")
 async def health():
     global _upgrader
