@@ -7612,6 +7612,27 @@ class AsyncSystemManager:
 
     async def cleanup_stuck_processes(self):
         """Clean up stuck processes before starting with enhanced recovery"""
+        # ═══════════════════════════════════════════════════════════════════
+        # CRITICAL: Check if supervisor already cleaned up
+        # When run_supervisor.py starts JARVIS, it performs its own comprehensive
+        # parallel cleanup and sets JARVIS_CLEANUP_DONE=1 to signal completion.
+        # Skipping redundant cleanup prevents:
+        # 1. The "already running on port 8010" warning
+        # 2. Race conditions where ports aren't fully released yet
+        # 3. Unnecessary process scanning and termination attempts
+        # ═══════════════════════════════════════════════════════════════════
+        if os.environ.get("JARVIS_CLEANUP_DONE") == "1":
+            cleanup_timestamp = float(os.environ.get("JARVIS_CLEANUP_TIMESTAMP", "0"))
+            age_seconds = time.time() - cleanup_timestamp if cleanup_timestamp else 0
+
+            # Only trust the cleanup flag if it was set recently (within 60 seconds)
+            if age_seconds < 60:
+                print(f"\n{Colors.GREEN}✓ Supervisor cleanup already completed ({age_seconds:.1f}s ago){Colors.ENDC}")
+                print(f"{Colors.CYAN}   Skipping redundant process cleanup...{Colors.ENDC}")
+                return True
+            else:
+                print(f"{Colors.YELLOW}   Supervisor cleanup flag is stale ({age_seconds:.1f}s old), re-checking...{Colors.ENDC}")
+
         try:
             # Add backend to path if needed
             backend_dir = Path(__file__).parent / "backend"
@@ -7733,6 +7754,13 @@ class AsyncSystemManager:
                 print(f"{Colors.GREEN}✓ No stuck processes found{Colors.ENDC}")
 
             # Step 3: Final check - ensure we can start fresh
+            # Skip if supervisor already verified (JARVIS_CLEANUP_DONE is set)
+            if os.environ.get("JARVIS_CLEANUP_DONE") == "1":
+                cleanup_ts = float(os.environ.get("JARVIS_CLEANUP_TIMESTAMP", "0"))
+                if cleanup_ts and (time.time() - cleanup_ts) < 60:
+                    print(f"{Colors.GREEN}✓ Supervisor verified ports are clear{Colors.ENDC}")
+                    return True  # Trust supervisor's verification
+
             can_start, message = prevent_multiple_jarvis_instances()
             if can_start:
                 print(f"{Colors.GREEN}✓ {message}{Colors.ENDC}")
@@ -15072,12 +15100,25 @@ class DockerDaemonManager:
     - Configurable timeouts and retry logic
     - Detailed status reporting
     - Dynamic detection without hardcoding
+    - Intelligent skip when Cloud Run is available (non-blocking startup)
+
+    v19.8.0: Dramatically reduced timeouts for faster startup
+    - Old: 120s timeout × 3 retries = 370s potential blocking
+    - New: 15s timeout × 1 retry = 15s max blocking (with Cloud Run fallback)
     """
 
-    # Default configuration (no hardcoding - all configurable via env vars)
-    DEFAULT_STARTUP_TIMEOUT = int(os.environ.get("DOCKER_STARTUP_TIMEOUT", "120"))  # 2 minutes
-    DEFAULT_POLL_INTERVAL = float(os.environ.get("DOCKER_POLL_INTERVAL", "2.0"))  # 2 seconds
-    DEFAULT_MAX_RETRIES = int(os.environ.get("DOCKER_MAX_RETRIES", "3"))
+    # ═══════════════════════════════════════════════════════════════════════════
+    # INTELLIGENT TIMEOUT CONFIGURATION
+    # ═══════════════════════════════════════════════════════════════════════════
+    # v19.8.0: Reduced timeouts dramatically. Docker startup should be FAST.
+    # If Docker isn't ready in 15 seconds, Cloud Run is available as fallback.
+    # The old 120s × 3 = 370s timeout was unacceptable for user experience.
+    #
+    # These are defaults - still configurable via environment variables.
+    # ═══════════════════════════════════════════════════════════════════════════
+    DEFAULT_STARTUP_TIMEOUT = int(os.environ.get("DOCKER_STARTUP_TIMEOUT", "15"))  # 15 seconds (was 120)
+    DEFAULT_POLL_INTERVAL = float(os.environ.get("DOCKER_POLL_INTERVAL", "1.0"))  # 1 second (was 2)
+    DEFAULT_MAX_RETRIES = int(os.environ.get("DOCKER_MAX_RETRIES", "1"))  # 1 retry (was 3)
 
     def __init__(self):
         self._platform = platform.system().lower()
@@ -16297,14 +16338,23 @@ async def main():
     print(f"{Colors.CYAN}   Phase 1: Probing available backends...{Colors.ENDC}")
 
     async def probe_docker_backend() -> dict:
-        """Probe Docker ECAPA backend availability and health with auto-start."""
+        """
+        Probe Docker ECAPA backend availability WITHOUT blocking on auto-start.
+
+        v19.8.0: This function NO LONGER auto-starts Docker daemon.
+        Auto-start only happens in Phase 2 if Cloud Run is unavailable.
+        This prevents the 120+ second blocking that was degrading startup UX.
+
+        Returns:
+            dict with keys: available, healthy, endpoint, latency_ms, error, daemon_running
+        """
         result = {
             "available": False,
             "healthy": False,
             "endpoint": None,
             "latency_ms": None,
             "error": None,
-            "daemon_status": None,
+            "daemon_running": False,
             "auto_started": False
         }
 
@@ -16316,45 +16366,52 @@ async def main():
             import subprocess
             import time
 
-            # Use the robust Docker daemon manager with auto-start
+            # ═══════════════════════════════════════════════════════════════════
+            # v19.8.0: FAST DOCKER CHECK - NO AUTO-START DURING PROBING
+            # ═══════════════════════════════════════════════════════════════════
+            # Check if Docker is installed and if daemon is ALREADY running.
+            # Do NOT wait for Docker daemon to start - that blocks startup.
+            # Auto-start only happens in Phase 2 if Cloud Run is unavailable.
+            # ═══════════════════════════════════════════════════════════════════
             docker_manager = get_docker_daemon_manager()
-            daemon_status = await docker_manager.ensure_daemon_running(auto_start=True)
-            result["daemon_status"] = daemon_status
 
-            if not daemon_status.get("installed", False):
+            # Quick check: Is Docker installed?
+            if not await docker_manager.check_docker_installed():
                 result["error"] = "Docker not installed"
                 return result
 
-            if not daemon_status.get("daemon_running", False):
-                result["error"] = daemon_status.get("error", "Docker daemon not running")
-                return result
+            # Quick check: Is daemon already running? (no wait, no auto-start)
+            if await docker_manager.check_daemon_running():
+                result["daemon_running"] = True
+                result["available"] = True
 
-            # Track if Docker was auto-started
-            result["auto_started"] = daemon_status.get("started_automatically", False)
-            result["available"] = True
-
-            # Check if container is already running
-            container_check = subprocess.run(
-                ["docker", "ps", "--filter", "name=jarvis-ecapa-cloud", "--format", "{{.Status}}"],
-                capture_output=True, text=True, timeout=5
-            )
-
-            if container_check.stdout.strip() and "Up" in container_check.stdout:
-                # Container running - check health
-                start_time = time.time()
-                health_check = subprocess.run(
-                    ["curl", "-sf", "http://localhost:8010/health"],
-                    capture_output=True, timeout=5
+                # Check if container is already running
+                container_check = subprocess.run(
+                    ["docker", "ps", "--filter", "name=jarvis-ecapa-cloud", "--format", "{{.Status}}"],
+                    capture_output=True, text=True, timeout=5
                 )
-                latency = (time.time() - start_time) * 1000
 
-                if health_check.returncode == 0:
-                    result["healthy"] = True
-                    result["endpoint"] = "http://localhost:8010/api/ml"
-                    result["latency_ms"] = latency
+                if container_check.stdout.strip() and "Up" in container_check.stdout:
+                    # Container running - check health
+                    start_time = time.time()
+                    health_check = subprocess.run(
+                        ["curl", "-sf", "http://localhost:8010/health"],
+                        capture_output=True, timeout=5
+                    )
+                    latency = (time.time() - start_time) * 1000
+
+                    if health_check.returncode == 0:
+                        result["healthy"] = True
+                        result["endpoint"] = "http://localhost:8010/api/ml"
+                        result["latency_ms"] = latency
+                else:
+                    result["error"] = "Container not running (can start if needed)"
             else:
-                # Container not running - we can start it
-                result["error"] = "Container not running (will auto-start)"
+                # Daemon not running - mark as available but needs start
+                # This allows Phase 2 to decide whether to start Docker
+                result["available"] = True  # Can be started if needed
+                result["daemon_running"] = False
+                result["error"] = "Docker daemon not running (can start if needed)"
 
         except FileNotFoundError:
             result["error"] = "Docker not in PATH"
@@ -16536,8 +16593,18 @@ async def main():
         else:
             decision_reason = f"Docker requested but unavailable: {docker_probe.get('error')}"
     else:
-        # Automatic selection based on availability and performance
-        # Priority: Docker (if healthy) > Cloud Run (if healthy) > Docker (start) > Local
+        # ═══════════════════════════════════════════════════════════════════════
+        # v19.8.0: INTELLIGENT BACKEND SELECTION - CLOUD FIRST, NO BLOCKING
+        # ═══════════════════════════════════════════════════════════════════════
+        # Priority (optimized for fast startup):
+        # 1. Docker (if already running and healthy) - lowest latency
+        # 2. Cloud Run (if healthy) - no startup cost, always available
+        # 3. Docker (start only if Cloud Run is UNAVAILABLE) - last resort
+        # 4. Local - emergency fallback
+        #
+        # KEY CHANGE: Don't auto-start Docker if Cloud Run is healthy!
+        # This prevents 15-120 second blocking for Docker startup.
+        # ═══════════════════════════════════════════════════════════════════════
 
         if docker_probe.get("healthy"):
             # Docker is running and healthy - use it (lowest latency)
@@ -16545,35 +16612,30 @@ async def main():
             selected_endpoint = docker_probe.get("endpoint")
             decision_reason = f"Docker healthy with {docker_probe.get('latency_ms', 0):.0f}ms latency (best performance)"
 
-        elif cloud_probe.get("healthy") and prefer_cloud:
-            # Cloud Run is healthy - use it
+        elif cloud_probe.get("healthy"):
+            # ═══════════════════════════════════════════════════════════════════
+            # v19.8.0: Cloud Run healthy - USE IT! Don't start Docker.
+            # This is the key optimization: Cloud Run is always-on, no startup cost.
+            # ═══════════════════════════════════════════════════════════════════
             selected_backend = "cloud_run"
             selected_endpoint = cloud_probe.get("endpoint")
-            decision_reason = f"Cloud Run healthy with {cloud_probe.get('latency_ms', 0):.0f}ms latency"
+            decision_reason = f"Cloud Run healthy with {cloud_probe.get('latency_ms', 0):.0f}ms latency (instant, no Docker wait)"
 
         elif docker_probe.get("available") and not skip_docker:
-            # Docker is available but not running - try to start it
-            print(f"   {Colors.CYAN}→ Auto-starting Docker container...{Colors.ENDC}")
+            # ═══════════════════════════════════════════════════════════════════
+            # v19.8.0: Only start Docker if Cloud Run is UNAVAILABLE
+            # This is the fallback path - Cloud Run failed, try Docker
+            # ═══════════════════════════════════════════════════════════════════
+            print(f"   {Colors.YELLOW}⚠️  Cloud Run unavailable, attempting Docker fallback...{Colors.ENDC}")
             docker_result = await ensure_docker_ecapa_service(force_rebuild=docker_rebuild)
             if docker_result.get("success"):
                 selected_backend = "docker"
                 selected_endpoint = docker_result.get("endpoint")
-                decision_reason = "Docker auto-started successfully (best local performance)"
+                decision_reason = "Cloud Run unavailable, Docker started as fallback"
                 ecapa_backend_status["docker"]["healthy"] = True
                 ecapa_backend_status["docker"]["endpoint"] = selected_endpoint
-            elif cloud_probe.get("healthy"):
-                # Docker failed to start, fallback to Cloud Run
-                selected_backend = "cloud_run"
-                selected_endpoint = cloud_probe.get("endpoint")
-                decision_reason = f"Docker start failed, using Cloud Run fallback"
             else:
-                decision_reason = f"Docker start failed: {docker_result.get('error')}"
-
-        elif cloud_probe.get("healthy"):
-            # Only Cloud Run available
-            selected_backend = "cloud_run"
-            selected_endpoint = cloud_probe.get("endpoint")
-            decision_reason = "Cloud Run is the only healthy backend"
+                decision_reason = f"Cloud Run unavailable, Docker failed: {docker_result.get('error')}"
 
         # Final fallback to local if nothing else works
         if not selected_backend and local_probe.get("available") and local_probe.get("memory_ok"):

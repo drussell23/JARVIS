@@ -1064,10 +1064,20 @@ class SupervisorBootstrapper:
             if discovered:
                 TerminalUI.print_process_list(discovered)
                 TerminalUI.print_success(f"Terminated {terminated} instance(s)")
-                await asyncio.sleep(1.0)  # Let ports release
+
+                # Wait for ports to be fully released with verification
+                await self._wait_for_ports_release()
             else:
                 TerminalUI.print_success("No existing instances found")
-            
+
+            # ═══════════════════════════════════════════════════════════════════
+            # CRITICAL: Signal to start_system.py that cleanup was already done
+            # This prevents the duplicate "already running on port 8010" warning
+            # ═══════════════════════════════════════════════════════════════════
+            os.environ["JARVIS_CLEANUP_DONE"] = "1"
+            os.environ["JARVIS_CLEANUP_TIMESTAMP"] = str(time.time())
+            self.logger.info("Set JARVIS_CLEANUP_DONE=1 - start_system.py will skip redundant cleanup")
+
             self.perf.end("cleanup")
             
             # Phase 2: Intelligent Resource Validation & Optimization
@@ -1208,15 +1218,46 @@ class SupervisorBootstrapper:
             return 1
         
         finally:
-            # Cleanup loading server if it was started
+            # ═══════════════════════════════════════════════════════════════════
+            # GRACEFUL SHUTDOWN: Give Chrome time to redirect before killing server
+            # ═══════════════════════════════════════════════════════════════════
+            # When JARVIS starts successfully, the loading page automatically
+            # redirects Chrome to the main app (localhost:3000). If we terminate
+            # the loading server too quickly, Chrome may show:
+            # "window terminated unexpectedly (reason: 'killed', code: '15')"
+            #
+            # Solution: Wait for Chrome to complete its redirect before shutting down.
+            # ═══════════════════════════════════════════════════════════════════
             if self._loading_server_process:
                 try:
-                    self._loading_server_process.terminate()
-                    await asyncio.wait_for(self._loading_server_process.wait(), timeout=5.0)
-                    self.logger.info("Loading server terminated")
-                except asyncio.TimeoutError:
-                    self._loading_server_process.kill()
-                    self.logger.warning("Loading server killed (timeout)")
+                    # Check if JARVIS startup was successful (env var set by supervisor)
+                    startup_complete = os.environ.get("JARVIS_STARTUP_COMPLETE") == "true"
+
+                    if startup_complete:
+                        # Give Chrome 2 seconds to redirect to main app
+                        # The loading-manager.js has a 1s fade-out animation before redirect
+                        self.logger.debug("Waiting for Chrome to complete redirect...")
+                        await asyncio.sleep(2.0)
+
+                    # Send SIGINT first for graceful shutdown (allows cleanup handlers to run)
+                    self._loading_server_process.send_signal(signal.SIGINT)
+                    try:
+                        await asyncio.wait_for(self._loading_server_process.wait(), timeout=3.0)
+                        self.logger.info("Loading server gracefully terminated")
+                    except asyncio.TimeoutError:
+                        # SIGINT didn't work, try SIGTERM
+                        self._loading_server_process.terminate()
+                        try:
+                            await asyncio.wait_for(self._loading_server_process.wait(), timeout=2.0)
+                            self.logger.info("Loading server terminated")
+                        except asyncio.TimeoutError:
+                            # Still not dead, force kill
+                            self._loading_server_process.kill()
+                            self.logger.warning("Loading server force killed (timeout)")
+
+                except ProcessLookupError:
+                    # Process already exited
+                    self.logger.debug("Loading server already exited")
                 except Exception as e:
                     self.logger.debug(f"Loading server cleanup error: {e}")
             
@@ -1328,11 +1369,54 @@ class SupervisorBootstrapper:
             print(f"  {TerminalUI.YELLOW}⚠️  Loading page failed: {e}{TerminalUI.RESET}")
             print(f"  {TerminalUI.CYAN}💡 JARVIS will start without loading page{TerminalUI.RESET}")
     
+    async def _wait_for_ports_release(self, max_wait: float = 5.0) -> bool:
+        """
+        Wait for all critical ports to be fully released after cleanup.
+
+        This prevents race conditions where start_system.py checks ports
+        before they're fully released by the OS.
+
+        Args:
+            max_wait: Maximum time to wait in seconds
+
+        Returns:
+            True if all ports are free, False if timeout
+        """
+        import socket
+
+        start_time = time.time()
+        check_interval = 0.2
+
+        while time.time() - start_time < max_wait:
+            all_free = True
+
+            for port in self.config.required_ports:
+                try:
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.settimeout(0.1)
+                    result = sock.connect_ex(('localhost', port))
+                    sock.close()
+
+                    if result == 0:  # Port is still in use
+                        all_free = False
+                        break
+                except Exception:
+                    pass  # Error connecting = port is free
+
+            if all_free:
+                self.logger.debug(f"All ports released after {time.time() - start_time:.1f}s")
+                return True
+
+            await asyncio.sleep(check_interval)
+
+        self.logger.warning(f"Timeout waiting for ports to release after {max_wait}s")
+        return False
+
     def _setup_signal_handlers(self) -> None:
         """Setup signal handlers for graceful shutdown."""
         def handle_signal(signum, frame):
             self._shutdown_event.set()
-        
+
         signal.signal(signal.SIGTERM, handle_signal)
         # SIGINT is handled by KeyboardInterrupt
     
