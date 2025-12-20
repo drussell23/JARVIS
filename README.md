@@ -1,6 +1,6 @@
 # JARVIS AI Assistant v19.6.0 - Intelligent Lifecycle & Cost Management
 
-An intelligent voice-activated AI assistant with **Robust Startup Monitoring System v19.6.0** (Parallel Health Checks + Circuit Breaker + Adaptive Timeout + Smart Error Recovery), **Self-Updating Lifecycle Manager v19.6.0** (Intelligent Update Notifications + Multi-Modal Communication + Changelog Analysis), **Intelligent Memory Pressure Controller v1.0** (Adaptive Thresholds + Effectiveness Tracking + Cooldown System), **Supervisor-Aware GCP Controller v1.0** (Budget Management + Idle Shutdown + Cost-Aware Routing), **Intelligent ECAPA Backend Orchestrator v19.0.0** (Zero-Configuration Backend Selection + Concurrent Probing + Auto-Start Docker + Intelligent Fallback), **Async-Safe Statistics Tracking v1.0** (Self-Healing Consistency Validation + Atomic Counter Operations + Mathematical Invariant Enforcement), **Global Session Manager v1.0** (Thread-Safe Singleton + Multi-Terminal Conflict Prevention + Cleanup Reliability), **Cost Optimization Framework v3.0** (Scale-to-Zero VMs + Semantic Voice Caching + Spot Instance Resilience + Tiered Storage + Intelligent Cache Management), **Cloud ECAPA Client v19.2.0** (Intelligent Hybrid Cloud Voice Processing + Spot VM Auto-Creation + Cost-Aware Routing + 60% Cache Savings + RecentSpeakerCache Fast-Path Optimization with 98% Latency Reduction), **Physics-Aware Voice Authentication v2.5** (Vocal Tract Length Verification + Reverberation Analysis + Doppler Effect Detection + Bayesian Confidence Fusion + 7-Layer Anti-Spoofing), **Bayesian Confidence Fusion** (Multi-factor probability fusion with adaptive priors), **Voice Authentication Enhancement v2.1** (ChromaDB Semantic Caching + Scale-to-Zero + Langfuse Audit Trail + Behavioral Pattern Recognition), **Dynamic Restart with UE State Detection** (detects stuck macOS processes in Uninterruptible Sleep state), **Self-Healing Port Fallback System** (automatically finds healthy ports when blocked), **Dynamic Port Configuration** (loads ports from config instead of hardcoding), **Memory-Aware Startup System** (auto-detects RAM and activates GCP cloud ML when constrained), **Process-Isolated ML Loading** (prevents event loop blocking with true async wrapping), **Database Connection Leak Prevention** (proper try/finally resource cleanup), **Parallel Model Loading** (4-worker ThreadPool for 3-4x faster startup), **Comprehensive Timeout Protection** (25s unlock, 10s transcription, 8s speaker ID), **Voice Profile Database Consolidation** (unified `jarvis_learning.db` with owner migration), **Unified Voice Cache Manager** (~1ms Instant Recognition vs 200-500ms), **4-Layer Cache Architecture** (L1 Session + L2 Preloaded Profiles + L3 Database + L4 Continuous Learning), **Voice Biometric Semantic Cache with Continuous Learning** (L1-L3 Cache Layers + SQLite Database Recording), **PRD v2.0 Voice Biometric Intelligence** (AAM-Softmax + Center Loss + Triplet Loss Fine-Tuning, Platt/Isotonic Score Calibration, Comprehensive Anti-Spoofing), **AGI OS** (Autonomous General Intelligence Operating System), **Phase 2 Hybrid Database Sync** (Redis + Prometheus + ML Prefetching), **Advanced Process Detection System**, **Production-Grade Voice System**, **Cloud SQL Voice Biometric Storage**, **Real ECAPA-TDNN Speaker Embeddings**, **Advanced Voice Enrollment**, **Unified TTS Engine**, **Wake Word Detection**, **SpeechBrain STT Engine**, **CAI/SAI Locked Screen Auto-Unlock**, **Contextual Awareness Intelligence**, **Situational Awareness Intelligence**, **Backend Self-Awareness**, **Progressive Startup UX**, **GCP Spot VM Auto-Creation** (>85% memory → 32GB cloud offloading), **Advanced GCP Cost Optimization**, **Intelligent Voice-Authenticated Screen Unlock**, **Platform-Aware Memory Monitoring**, **Dynamic Speaker Recognition**, **Hybrid Cloud Auto-Scaling**, **Phase 4 Proactive Communication**, advanced multi-space desktop awareness, Claude Vision integration, and **continuous learning from every interaction**.
+An intelligent voice-activated AI assistant with **Production-Grade Supervisor Bootstrap v2.0** (Parallel Process Discovery + Resource Validation + Dynamic Configuration + Performance Tracking), **Robust Startup Monitoring System v19.6.0** (Parallel Health Checks + Circuit Breaker + Adaptive Timeout + Smart Error Recovery), **Self-Updating Lifecycle Manager v19.6.0** (Intelligent Update Notifications + Multi-Modal Communication + Changelog Analysis), **Intelligent Memory Pressure Controller v1.0** (Adaptive Thresholds + Effectiveness Tracking + Cooldown System), **Supervisor-Aware GCP Controller v1.0** (Budget Management + Idle Shutdown + Cost-Aware Routing), **Intelligent ECAPA Backend Orchestrator v19.0.0** (Zero-Configuration Backend Selection + Concurrent Probing + Auto-Start Docker + Intelligent Fallback), **Async-Safe Statistics Tracking v1.0** (Self-Healing Consistency Validation + Atomic Counter Operations + Mathematical Invariant Enforcement), **Global Session Manager v1.0** (Thread-Safe Singleton + Multi-Terminal Conflict Prevention + Cleanup Reliability), **Cost Optimization Framework v3.0** (Scale-to-Zero VMs + Semantic Voice Caching + Spot Instance Resilience + Tiered Storage + Intelligent Cache Management), **Cloud ECAPA Client v19.2.0** (Intelligent Hybrid Cloud Voice Processing + Spot VM Auto-Creation + Cost-Aware Routing + 60% Cache Savings + RecentSpeakerCache Fast-Path Optimization with 98% Latency Reduction), **Physics-Aware Voice Authentication v2.5** (Vocal Tract Length Verification + Reverberation Analysis + Doppler Effect Detection + Bayesian Confidence Fusion + 7-Layer Anti-Spoofing), **Bayesian Confidence Fusion** (Multi-factor probability fusion with adaptive priors), **Voice Authentication Enhancement v2.1** (ChromaDB Semantic Caching + Scale-to-Zero + Langfuse Audit Trail + Behavioral Pattern Recognition), **Dynamic Restart with UE State Detection** (detects stuck macOS processes in Uninterruptible Sleep state), **Self-Healing Port Fallback System** (automatically finds healthy ports when blocked), **Dynamic Port Configuration** (loads ports from config instead of hardcoding), **Memory-Aware Startup System** (auto-detects RAM and activates GCP cloud ML when constrained), **Process-Isolated ML Loading** (prevents event loop blocking with true async wrapping), **Database Connection Leak Prevention** (proper try/finally resource cleanup), **Parallel Model Loading** (4-worker ThreadPool for 3-4x faster startup), **Comprehensive Timeout Protection** (25s unlock, 10s transcription, 8s speaker ID), **Voice Profile Database Consolidation** (unified `jarvis_learning.db` with owner migration), **Unified Voice Cache Manager** (~1ms Instant Recognition vs 200-500ms), **4-Layer Cache Architecture** (L1 Session + L2 Preloaded Profiles + L3 Database + L4 Continuous Learning), **Voice Biometric Semantic Cache with Continuous Learning** (L1-L3 Cache Layers + SQLite Database Recording), **PRD v2.0 Voice Biometric Intelligence** (AAM-Softmax + Center Loss + Triplet Loss Fine-Tuning, Platt/Isotonic Score Calibration, Comprehensive Anti-Spoofing), **AGI OS** (Autonomous General Intelligence Operating System), **Phase 2 Hybrid Database Sync** (Redis + Prometheus + ML Prefetching), **Advanced Process Detection System**, **Production-Grade Voice System**, **Cloud SQL Voice Biometric Storage**, **Real ECAPA-TDNN Speaker Embeddings**, **Advanced Voice Enrollment**, **Unified TTS Engine**, **Wake Word Detection**, **SpeechBrain STT Engine**, **CAI/SAI Locked Screen Auto-Unlock**, **Contextual Awareness Intelligence**, **Situational Awareness Intelligence**, **Backend Self-Awareness**, **Progressive Startup UX**, **GCP Spot VM Auto-Creation** (>85% memory → 32GB cloud offloading), **Advanced GCP Cost Optimization**, **Intelligent Voice-Authenticated Screen Unlock**, **Platform-Aware Memory Monitoring**, **Dynamic Speaker Recognition**, **Hybrid Cloud Auto-Scaling**, **Phase 4 Proactive Communication**, advanced multi-space desktop awareness, Claude Vision integration, and **continuous learning from every interaction**.
 
 ---
 
@@ -274,6 +274,203 @@ python3 start_system.py --restart
 **Key Difference:**
 - `run_supervisor.py`: Runs JARVIS as a child process, manages lifecycle, handles updates/rollbacks
 - `start_system.py`: Direct execution, no supervisor features
+
+### Production-Grade Supervisor Bootstrap (v2.0)
+
+The `run_supervisor.py` entry point has been enhanced to production-grade quality with parallel operations, intelligent resource management, and dynamic configuration.
+
+#### Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  SupervisorBootstrapper (run_supervisor.py)                 │
+│                                                             │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │  Phase 1: ParallelProcessCleaner                    │   │
+│  │  ├── ThreadPoolExecutor (4 workers)                 │   │
+│  │  ├── PID file discovery (async)                     │   │
+│  │  ├── Process list scanning (async)                  │   │
+│  │  └── Semaphore-controlled termination (max 5)       │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                                                             │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │  Phase 2: SystemResourceValidator                   │   │
+│  │  ├── Memory check (psutil)                         │   │
+│  │  ├── Disk check (shutil)                           │   │
+│  │  ├── Port check (socket)                           │   │
+│  │  └── CPU/Load check (os.getloadavg)               │   │
+│  │  All checks run in parallel via asyncio.gather()   │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                                                             │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │  Phase 3: Supervisor Initialization                 │   │
+│  │  └── JARVISSupervisor instantiation                │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                                                             │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │  Phase 4: JARVIS Start                              │   │
+│  │  └── supervisor.run() with loading page             │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                                                             │
+│  Cross-Cutting:                                             │
+│  ├── PerformanceLogger (timing analysis)                   │
+│  ├── AsyncVoiceNarrator (non-blocking TTS)                │
+│  ├── TerminalUI (color-coded output)                       │
+│  └── Signal handlers (graceful shutdown)                   │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### Key Features
+
+| Feature | Description | Benefit |
+|---------|-------------|---------|
+| **Parallel Process Discovery** | ThreadPoolExecutor + asyncio for concurrent PID/process scanning | 2x faster cleanup |
+| **Parallel Termination** | Semaphore-controlled with SIGINT→SIGTERM→SIGKILL cascade | Safe, efficient cleanup |
+| **Resource Validation** | Async memory, disk, port, CPU checks in parallel | Pre-flight safety |
+| **Dynamic Configuration** | ALL settings configurable via environment variables | Zero hardcoding |
+| **Async Voice Narration** | Non-blocking TTS with priority queue | No startup delays |
+| **Performance Tracking** | PerformanceLogger with per-phase timing | Debugging & optimization |
+| **Enhanced Terminal UI** | Color-coded, structured output | Clear visual feedback |
+| **Graceful Shutdown** | Signal handlers + cleanup orchestration | Clean exit |
+
+#### Process Cleanup Strategy
+
+The supervisor uses a sophisticated cascade termination strategy:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Cascade Termination (per process, parallel across all)     │
+│                                                             │
+│  1. SIGINT (graceful)                                       │
+│     └── Wait up to 10 seconds for clean shutdown           │
+│                                                             │
+│  2. SIGTERM (forceful)                                      │
+│     └── Wait up to 5 seconds                                │
+│                                                             │
+│  3. SIGKILL (forced)                                        │
+│     └── Wait up to 2 seconds for kernel cleanup            │
+│                                                             │
+│  Parallelism: Up to 5 processes terminated simultaneously  │
+│  (semaphore-controlled to prevent resource exhaustion)     │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### Resource Validation
+
+Pre-flight checks ensure the system has sufficient resources:
+
+```python
+# All checks run in parallel via asyncio.gather()
+memory_task = asyncio.create_task(self._check_memory())
+disk_task = asyncio.create_task(self._check_disk())
+ports_task = asyncio.create_task(self._check_ports())
+cpu_task = asyncio.create_task(self._check_cpu())
+
+results = await asyncio.gather(memory_task, disk_task, ports_task, cpu_task)
+```
+
+**Checks performed:**
+- **Memory**: Minimum 2GB available (configurable)
+- **Disk**: Minimum 1GB free (configurable)
+- **Ports**: 8010 (backend), 3000 (frontend), 3001 (loading server)
+- **CPU**: Core count and load average
+
+**Error vs Warning:**
+- **Error**: Insufficient resources → Startup blocked
+- **Warning**: Low resources → Startup continues with warning
+
+#### Environment Variables
+
+All settings are configurable via environment variables (no hardcoding):
+
+```bash
+# Logging
+JARVIS_SUPERVISOR_LOG_LEVEL=INFO        # DEBUG, INFO, WARNING, ERROR
+
+# Voice Narration
+STARTUP_NARRATOR_VOICE=true             # Enable/disable TTS
+STARTUP_NARRATOR_VOICE_NAME=Daniel      # macOS voice name
+STARTUP_NARRATOR_RATE=190               # Words per minute
+
+# Resource Validation
+SKIP_RESOURCE_CHECK=false               # Skip pre-flight checks (faster startup)
+MIN_MEMORY_GB=2.0                       # Minimum required memory
+MIN_DISK_GB=1.0                         # Minimum required disk space
+
+# Process Cleanup
+CLEANUP_TIMEOUT_SIGINT=10.0             # Seconds to wait for SIGINT
+CLEANUP_TIMEOUT_SIGTERM=5.0             # Seconds to wait for SIGTERM
+CLEANUP_TIMEOUT_SIGKILL=2.0             # Seconds to wait for SIGKILL
+MAX_PARALLEL_CLEANUPS=5                 # Max concurrent terminations
+
+# Ports (used for validation)
+BACKEND_PORT=8010                       # Backend API port
+FRONTEND_PORT=3000                      # Frontend port
+LOADING_SERVER_PORT=3001                # Loading page port
+```
+
+#### Example Output
+
+```
+=================================================================
+               ⚡ JARVIS LIFECYCLE SUPERVISOR ⚡               
+=================================================================
+
+  🤖 Self-Updating • Self-Healing • Autonomous
+
+  The Living OS - Manages updates, restarts, and rollbacks
+  while keeping JARVIS online and responsive.
+
+-----------------------------------------------------------------
+
+  [1/4] Checking for existing instances...
+  ● Found 2 existing instance(s):
+    └─ PID 12345 (5.2 min, 512MB)
+    └─ PID 12346 (3.1 min, 256MB)
+  
+  ✓ Terminated 2 instance(s)
+  
+  [2/4] Validating system resources...
+  ✓ Resources OK (8.5GB RAM, 45.2GB disk)
+  
+  [3/4] Initializing supervisor...
+  
+  ● Mode:          AUTO
+  ● Update Check:  Enabled (300s)
+  ● Idle Updates:  Enabled (2h threshold)
+  ● Auto-Rollback: Enabled
+  ● Max Retries:   3
+  ● Loading Page:  Enabled (port 3001)
+  ● Voice Narration: Enabled
+
+-----------------------------------------------------------------
+
+  [4/4] Starting JARVIS with loading page...
+
+  📡 Loading page will open in Chrome Incognito
+     Watch real-time progress as JARVIS initializes!
+  🔊 Voice narration enabled - JARVIS will speak during startup
+
+🔊 Narrating: Supervisor active. Bringing JARVIS systems online.
+🔊 Narrating: Spawning JARVIS core process.
+...
+```
+
+#### Performance Metrics
+
+The bootstrapper tracks timing for each phase:
+
+```
+Bootstrap performance: {
+  'cleanup': 1.23,
+  'validation': 0.45,
+  'supervisor_init': 0.12,
+  'jarvis': 28.67,
+  'total': 30.47
+}
+```
+
+This information is logged at INFO level for debugging and optimization.
 
 ### Voice Commands
 
