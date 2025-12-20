@@ -659,7 +659,6 @@ WantedBy=default.target
         Returns:
             Dict with health status, timeout forecasting, rate limit usage, and recommendations
         """
-        import psycopg2
         from datetime import datetime, timedelta
 
         health_data = {
@@ -675,6 +674,20 @@ WantedBy=default.target
             'needs_reconnect': False,
             'auto_heal_triggered': False
         }
+
+        # Check for psycopg2 dependency (PostgreSQL driver)
+        try:
+            import psycopg2
+        except ImportError:
+            logger.warning("[CLOUDSQL] ❌ psycopg2 not installed - database connection checks disabled")
+            health_data['connection_active'] = False
+            health_data['error'] = 'psycopg2 not installed'
+            health_data['recommendations'].append(
+                'Install PostgreSQL driver: pip install psycopg2-binary'
+            )
+            # Proxy can still be running even without psycopg2
+            health_data['proxy_running'] = self.is_running()
+            return health_data
 
         # Check if proxy process is running
         health_data['proxy_running'] = self.is_running()
@@ -1124,8 +1137,6 @@ WantedBy=default.target
         Returns:
             Dict with voice profile status, sample counts, and readiness
         """
-        import psycopg2
-
         profile_data = {
             'status': 'unknown',
             'profiles_found': 0,
@@ -1134,6 +1145,16 @@ WantedBy=default.target
             'ready_for_unlock': False,
             'issues': []
         }
+
+        # Check for psycopg2 dependency
+        try:
+            import psycopg2
+        except ImportError:
+            logger.warning("[CLOUDSQL] ❌ psycopg2 not installed - voice profile checks disabled")
+            profile_data['status'] = 'psycopg2_missing'
+            profile_data['error'] = 'psycopg2 not installed'
+            profile_data['issues'].append('Install PostgreSQL driver: pip install psycopg2-binary')
+            return profile_data
 
         conn = None
         cursor = None

@@ -1,8 +1,9 @@
 # GCP Centralized Database Support
 # Install with: pip install -r requirements-gcp-databases.txt
 
-# PostgreSQL async driver
-asyncpg>=0.29.0
+# PostgreSQL drivers
+asyncpg>=0.29.0  # Async driver for production
+psycopg2-binary>=2.9.0  # Sync driver for health checks and admin tasks
 
 # Cloud SQL Python Connector (recommended for secure connections)
 cloud-sql-python-connector[asyncpg]>=1.7.0

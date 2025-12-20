@@ -13364,46 +13364,50 @@ except Exception as e:
         print(f"   └─ PYTHONPATH entries: {len(sys.path)}")
 
         # Start Cloud SQL proxy FIRST (before any database connections)
+        # Uses singleton pattern to avoid duplicate starts
         if self.cloud_sql_proxy_enabled:
             await broadcast_progress(
                 "cloud_sql_proxy",
-                "Starting Cloud SQL Proxy for database connections",
+                "Initializing Cloud SQL Proxy for database connections",
                 50,
-                {"icon": "🔐", "label": "Cloud SQL Proxy", "sublabel": "Starting proxy"}
+                {"icon": "🔐", "label": "Cloud SQL Proxy", "sublabel": "Checking status"}
             )
-            print(f"\n{Colors.CYAN}🔐 Starting Cloud SQL Proxy...{Colors.ENDC}")
+            print(f"\n{Colors.CYAN}🔐 Cloud SQL Proxy Initialization...{Colors.ENDC}")
             try:
-                # Import from backend/intelligence
+                # Import from backend/intelligence using singleton
                 backend_dir = Path(__file__).parent / "backend"
                 if str(backend_dir) not in sys.path:
                     sys.path.insert(0, str(backend_dir))
-                    print(f"{Colors.CYAN}   → Added backend to sys.path{Colors.ENDC}")
 
-                print(f"{Colors.CYAN}   → Importing CloudSQLProxyManager...{Colors.ENDC}")
-                from intelligence.cloud_sql_proxy_manager import CloudSQLProxyManager
+                from intelligence.cloud_sql_proxy_manager import get_proxy_manager
 
-                print(f"{Colors.CYAN}   → Initializing proxy manager...{Colors.ENDC}")
-                self.cloud_sql_proxy_manager = CloudSQLProxyManager()
+                # Use singleton to share state across the application
+                self.cloud_sql_proxy_manager = get_proxy_manager()
 
-                # Display proxy configuration before starting
-                print(f"{Colors.CYAN}   → Proxy configuration loaded:{Colors.ENDC}")
-                print(f"      ├─ Connection: {self.cloud_sql_proxy_manager.config['cloud_sql']['connection_name']}")
-                print(f"      ├─ Database: {self.cloud_sql_proxy_manager.config['cloud_sql']['database']}")
-                print(f"      └─ Port: {self.cloud_sql_proxy_manager.config['cloud_sql']['port']}")
+                # Display proxy configuration
+                print(f"{Colors.CYAN}   → Config: {self.cloud_sql_proxy_manager.config['cloud_sql']['connection_name']}{Colors.ENDC}")
+                print(f"{Colors.CYAN}   → Port: {self.cloud_sql_proxy_manager.config['cloud_sql']['port']}{Colors.ENDC}")
 
-                # Start proxy asynchronously (non-blocking)
-                print(f"{Colors.CYAN}   → Starting proxy process (force_restart=True)...{Colors.ENDC}")
-                proxy_started = await self.cloud_sql_proxy_manager.start(force_restart=True)
-
-                if proxy_started:
-                    print(f"   • {Colors.GREEN}✓{Colors.ENDC} Proxy started on port {self.cloud_sql_proxy_manager.config['cloud_sql']['port']}")
-                    print(f"   • {Colors.GREEN}✓{Colors.ENDC} Connection: {self.cloud_sql_proxy_manager.config['cloud_sql']['connection_name']}")
-                    print(f"   • {Colors.GREEN}✓{Colors.ENDC} Log: {self.cloud_sql_proxy_manager.log_path}")
-                    print(f"   • {Colors.GREEN}✓{Colors.ENDC} Ready to accept database connections")
+                # Check if proxy is already running (from earlier startup stage)
+                if self.cloud_sql_proxy_manager.is_running():
+                    print(f"   • {Colors.GREEN}✓{Colors.ENDC} Proxy already running")
+                    print(f"   • {Colors.GREEN}✓{Colors.ENDC} Reusing existing connection")
                 else:
-                    logger.warning("⚠️  Cloud SQL proxy failed to start - falling back to SQLite")
-                    print(f"{Colors.YELLOW}   ⚠️  Will use local SQLite database instead{Colors.ENDC}")
-                    self.cloud_sql_proxy_enabled = False
+                    # Start proxy (force_restart=False to avoid killing existing proxy)
+                    print(f"{Colors.CYAN}   → Starting proxy process...{Colors.ENDC}")
+                    proxy_started = await self.cloud_sql_proxy_manager.start(force_restart=False)
+
+                    if proxy_started:
+                        print(f"   • {Colors.GREEN}✓{Colors.ENDC} Proxy started on port {self.cloud_sql_proxy_manager.config['cloud_sql']['port']}")
+                        print(f"   • {Colors.GREEN}✓{Colors.ENDC} Ready for database connections")
+                    else:
+                        logger.warning("⚠️  Cloud SQL proxy failed to start - falling back to SQLite")
+                        print(f"{Colors.YELLOW}   ⚠️  Will use local SQLite database instead{Colors.ENDC}")
+                        self.cloud_sql_proxy_enabled = False
+            except FileNotFoundError as e:
+                logger.warning(f"Cloud SQL proxy config not found: {e}")
+                print(f"{Colors.YELLOW}   ⚠️  Config not found - using SQLite{Colors.ENDC}")
+                self.cloud_sql_proxy_enabled = False
             except Exception as e:
                 logger.warning(f"Cloud SQL proxy initialization failed: {e}")
                 print(f"{Colors.YELLOW}   ⚠️  Error: {e}{Colors.ENDC}")
@@ -14745,123 +14749,267 @@ def ensure_ecapa_cache():
         return False
 
 
-async def ensure_cloud_sql_proxy():
+async def ensure_cloud_sql_proxy() -> bool:
     """
     Ensure CloudSQL proxy is running for voice biometric data access.
-    Auto-starts the proxy if not running.
+
+    Uses the robust CloudSQLProxyManager for:
+    - Async startup with proper retries
+    - Intelligent health verification
+    - Dynamic port detection from config
+    - Auto-recovery on failure
+    - Proper process lifecycle management
+
+    Returns:
+        True if proxy is running and healthy, False otherwise
+    """
+    print(f"\n{Colors.CYAN}🔗 CloudSQL Proxy Initialization{Colors.ENDC}")
+    print(f"{Colors.CYAN}   Using robust CloudSQLProxyManager...{Colors.ENDC}")
+
+    try:
+        # Import the robust proxy manager
+        from backend.intelligence.cloud_sql_proxy_manager import (
+            CloudSQLProxyManager,
+            get_proxy_manager,
+        )
+    except ImportError:
+        # Fallback import path when running from project root
+        try:
+            from intelligence.cloud_sql_proxy_manager import (
+                CloudSQLProxyManager,
+                get_proxy_manager,
+            )
+        except ImportError as e:
+            print(f"  {Colors.FAIL}✗ CloudSQLProxyManager not available: {e}{Colors.ENDC}")
+            return await _ensure_cloud_sql_proxy_fallback()
+
+    try:
+        # Get singleton manager instance
+        manager = get_proxy_manager()
+
+        # Get port from config for logging
+        port = manager.config.get("cloud_sql", {}).get("port", 5432)
+        connection_name = manager.config.get("cloud_sql", {}).get("connection_name", "unknown")
+
+        print(f"  {Colors.CYAN}📂 Config: {manager.config_path}{Colors.ENDC}")
+        print(f"  {Colors.CYAN}🔌 Connection: {connection_name}{Colors.ENDC}")
+        print(f"  {Colors.CYAN}🔗 Port: {port}{Colors.ENDC}")
+
+        # Check if already running
+        if manager.is_running():
+            print(f"  {Colors.GREEN}✓ CloudSQL Proxy already running{Colors.ENDC}")
+
+            # Verify health with actual connection test
+            health = await manager.check_connection_health()
+
+            if health.get("error") == "psycopg2 not installed":
+                print(f"  {Colors.YELLOW}⚠️  PostgreSQL driver not installed{Colors.ENDC}")
+                print(f"  {Colors.CYAN}💡 Database connection checks disabled{Colors.ENDC}")
+                print(f"  {Colors.CYAN}   To enable: pip install psycopg2-binary{Colors.ENDC}")
+                # Proxy is running, just can't verify connection
+                return True
+
+            if health.get("connection_active"):
+                print(f"  {Colors.GREEN}✓ Database connection verified{Colors.ENDC}")
+
+                # Show voice profile status if available
+                voice_profiles = health.get("voice_profiles", {})
+                if voice_profiles.get("ready_for_unlock"):
+                    profiles_found = voice_profiles.get("profiles_found", 0)
+                    total_samples = voice_profiles.get("total_samples", 0)
+                    print(f"  {Colors.GREEN}✓ Voice profiles ready ({profiles_found} profiles, {total_samples} samples){Colors.ENDC}")
+                elif voice_profiles.get("status") == "no_profiles":
+                    print(f"  {Colors.YELLOW}⚠️  No voice profiles found - enrollment needed{Colors.ENDC}")
+                elif voice_profiles.get("status") == "psycopg2_missing":
+                    print(f"  {Colors.YELLOW}⚠️  Voice profile check skipped (psycopg2 not installed){Colors.ENDC}")
+
+                return True
+            else:
+                error = health.get("error", "Unknown error")
+                if "psycopg2" in error:
+                    # Just a dependency issue, proxy is fine
+                    print(f"  {Colors.YELLOW}⚠️  Database driver missing: {error}{Colors.ENDC}")
+                    return True
+
+                print(f"  {Colors.YELLOW}⚠️  Proxy running but connection unhealthy, restarting...{Colors.ENDC}")
+                # Let the manager handle restart with its retry logic
+                success = await manager.restart()
+                if success:
+                    print(f"  {Colors.GREEN}✓ Proxy restarted successfully{Colors.ENDC}")
+                    return True
+                else:
+                    print(f"  {Colors.FAIL}✗ Proxy restart failed{Colors.ENDC}")
+                    return False
+
+        # Proxy not running - start it
+        print(f"  {Colors.CYAN}🚀 Starting CloudSQL Proxy...{Colors.ENDC}")
+
+        # Use manager's robust start with retries
+        success = await manager.start(force_restart=False, max_retries=3)
+
+        if success:
+            print(f"  {Colors.GREEN}✓ CloudSQL Proxy started successfully{Colors.ENDC}")
+            print(f"  {Colors.GREEN}✓ Listening on 127.0.0.1:{port}{Colors.ENDC}")
+
+            # Verify connection is actually working
+            print(f"  {Colors.CYAN}🔍 Verifying database connection...{Colors.ENDC}")
+
+            # Give a moment for the proxy to fully initialize
+            await asyncio.sleep(1)
+
+            health = await manager.check_connection_health()
+
+            if health.get("error") == "psycopg2 not installed":
+                print(f"  {Colors.YELLOW}⚠️  PostgreSQL driver not installed{Colors.ENDC}")
+                print(f"  {Colors.CYAN}💡 To enable connection verification: pip install psycopg2-binary{Colors.ENDC}")
+                # Proxy is running, just can't verify connection
+                return True
+
+            if health.get("connection_active"):
+                print(f"  {Colors.GREEN}✓ Database connection verified{Colors.ENDC}")
+
+                # Show voice profile status
+                voice_profiles = health.get("voice_profiles", {})
+                if voice_profiles.get("ready_for_unlock"):
+                    profiles_found = voice_profiles.get("profiles_found", 0)
+                    total_samples = voice_profiles.get("total_samples", 0)
+                    print(f"  {Colors.GREEN}✓ Voice profiles ready ({profiles_found} profiles, {total_samples} samples){Colors.ENDC}")
+                elif voice_profiles.get("status") == "psycopg2_missing":
+                    print(f"  {Colors.CYAN}💡 Voice profile check skipped (install psycopg2-binary){Colors.ENDC}")
+
+                return True
+            else:
+                error = health.get("error", "Unknown error")
+                if "psycopg2" in error:
+                    # Just a dependency issue, proxy is fine
+                    print(f"  {Colors.YELLOW}⚠️  Database driver missing, connection checks disabled{Colors.ENDC}")
+                    return True
+
+                print(f"  {Colors.YELLOW}⚠️  Proxy started but connection not yet active: {error}{Colors.ENDC}")
+                print(f"  {Colors.YELLOW}   (Connection may succeed on first voice unlock attempt){Colors.ENDC}")
+                return True  # Proxy is running, connection will be retried later
+        else:
+            print(f"  {Colors.FAIL}✗ CloudSQL Proxy failed to start{Colors.ENDC}")
+            print(f"  {Colors.FAIL}   Check log: {manager.log_path}{Colors.ENDC}")
+
+            # Show last few lines of log for debugging
+            try:
+                if manager.log_path.exists():
+                    log_content = manager.log_path.read_text()
+                    last_lines = log_content.strip().split('\n')[-5:]
+                    if last_lines:
+                        print(f"  {Colors.YELLOW}📋 Recent log:{Colors.ENDC}")
+                        for line in last_lines:
+                            print(f"     {line}")
+            except Exception:
+                pass
+
+            return False
+
+    except FileNotFoundError as e:
+        print(f"  {Colors.FAIL}✗ Configuration error: {e}{Colors.ENDC}")
+        return False
+    except Exception as e:
+        print(f"  {Colors.FAIL}✗ Unexpected error: {e}{Colors.ENDC}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+async def _ensure_cloud_sql_proxy_fallback() -> bool:
+    """
+    Fallback proxy startup when CloudSQLProxyManager is not available.
+    Uses basic subprocess approach with improved verification.
     """
     import subprocess
     import json
     from pathlib import Path
+    import socket
 
-    print(f"\n{Colors.CYAN}🔗 Checking CloudSQL Proxy...{Colors.ENDC}")
-
-    # Check if proxy is already running
-    try:
-        result = subprocess.run(
-            ["pgrep", "-f", "cloud-sql-proxy"],
-            capture_output=True,
-            text=True,
-            timeout=5
-        )
-
-        if result.returncode == 0 and result.stdout.strip():
-            print(f"  {Colors.GREEN}✓ CloudSQL Proxy already running (PID: {result.stdout.strip()}){Colors.ENDC}")
-
-            # Verify it's listening on correct port
-            port_check = subprocess.run(
-                ["lsof", "-i", ":5432"],
-                capture_output=True,
-                text=True,
-                timeout=5
-            )
-
-            if port_check.returncode == 0 and "cloud-sql" in port_check.stdout:
-                print(f"  {Colors.GREEN}✓ Listening on port 5432{Colors.ENDC}")
-                return True
-            else:
-                print(f"  {Colors.YELLOW}⚠️  Proxy running but not on port 5432, restarting...{Colors.ENDC}")
-                subprocess.run(["pkill", "-f", "cloud-sql-proxy"], timeout=5)
-                await asyncio.sleep(1)
-    except Exception as e:
-        print(f"  {Colors.YELLOW}⚠️  Error checking proxy status: {e}{Colors.ENDC}")
-
-    # Start the proxy
-    print(f"  {Colors.CYAN}Starting CloudSQL Proxy...{Colors.ENDC}")
+    print(f"  {Colors.YELLOW}Using fallback proxy startup...{Colors.ENDC}")
 
     # Load database config
-    config_path = Path.home() / ".jarvis" / "gcp" / "database_config.json"
-    if not config_path.exists():
-        print(f"  {Colors.FAIL}✗ Database config not found at {config_path}{Colors.ENDC}")
+    config_paths = [
+        Path.home() / ".jarvis" / "gcp" / "database_config.json",
+        Path("database_config.json"),
+    ]
+
+    config = None
+    config_path = None
+    for path in config_paths:
+        if path.exists():
+            config_path = path
+            with open(path, 'r') as f:
+                config = json.load(f)
+            break
+
+    if not config:
+        print(f"  {Colors.FAIL}✗ Database config not found{Colors.ENDC}")
         return False
 
-    with open(config_path, 'r') as f:
-        config = json.load(f)
+    cloud_sql = config.get("cloud_sql", {})
+    connection_name = cloud_sql.get("connection_name")
+    port = cloud_sql.get("port", 5432)
 
-    connection_name = config.get("cloud_sql", {}).get("connection_name")
     if not connection_name:
         print(f"  {Colors.FAIL}✗ No connection_name in config{Colors.ENDC}")
         return False
 
-    # Find cloud-sql-proxy binary
-    proxy_paths = [
-        Path.home() / ".local" / "bin" / "cloud-sql-proxy",
-        "/usr/local/bin/cloud-sql-proxy",
-        "cloud-sql-proxy"  # In PATH
-    ]
+    # Check if port is already in use (proxy might be running)
+    def is_port_in_use(p: int) -> bool:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            return s.connect_ex(("127.0.0.1", p)) == 0
 
-    proxy_binary = None
-    for path in proxy_paths:
-        if isinstance(path, Path) and path.exists():
-            proxy_binary = str(path)
-            break
-        elif isinstance(path, str):
-            # Check if it's in PATH
-            which_result = subprocess.run(
-                ["which", path],
-                capture_output=True,
-                text=True,
-                timeout=5
+    if is_port_in_use(port):
+        # Verify it's the cloud-sql-proxy
+        try:
+            result = subprocess.run(
+                ["pgrep", "-f", "cloud-sql-proxy"],
+                capture_output=True, text=True, timeout=5
             )
-            if which_result.returncode == 0:
-                proxy_binary = path
+            if result.returncode == 0 and result.stdout.strip():
+                print(f"  {Colors.GREEN}✓ CloudSQL Proxy already running on port {port}{Colors.ENDC}")
+                return True
+        except Exception:
+            pass
+
+    # Find proxy binary
+    import shutil
+    proxy_binary = shutil.which("cloud-sql-proxy")
+
+    if not proxy_binary:
+        search_paths = [
+            Path.home() / ".local" / "bin" / "cloud-sql-proxy",
+            Path("/usr/local/bin/cloud-sql-proxy"),
+            Path("/opt/homebrew/bin/cloud-sql-proxy"),
+        ]
+        for path in search_paths:
+            if path.exists() and os.access(path, os.X_OK):
+                proxy_binary = str(path)
                 break
 
     if not proxy_binary:
-        print(f"  {Colors.FAIL}✗ cloud-sql-proxy not found{Colors.ENDC}")
-        print(f"    Install: brew install cloud-sql-proxy")
+        print(f"  {Colors.FAIL}✗ cloud-sql-proxy binary not found{Colors.ENDC}")
         return False
 
-    # Start proxy in background
+    # Start proxy
     try:
         log_file = Path("/tmp/cloud-sql-proxy.log")
         with open(log_file, 'w') as f:
             subprocess.Popen(
-                [proxy_binary, "--port=5432", connection_name],
-                stdout=f,
-                stderr=f,
-                start_new_session=True
+                [proxy_binary, connection_name, f"--port={port}"],
+                stdout=f, stderr=f, start_new_session=True
             )
 
-        # Wait for proxy to start
-        await asyncio.sleep(3)
+        # Wait with progressive checking (up to 10 seconds)
+        for i in range(20):
+            await asyncio.sleep(0.5)
+            if is_port_in_use(port):
+                print(f"  {Colors.GREEN}✓ CloudSQL Proxy started on port {port} ({(i+1)*0.5:.1f}s){Colors.ENDC}")
+                return True
 
-        # Verify it started
-        port_check = subprocess.run(
-            ["lsof", "-i", ":5432"],
-            capture_output=True,
-            text=True,
-            timeout=5
-        )
-
-        if port_check.returncode == 0 and "cloud-sql" in port_check.stdout:
-            print(f"  {Colors.GREEN}✓ CloudSQL Proxy started successfully{Colors.ENDC}")
-            print(f"  {Colors.GREEN}✓ Listening on 127.0.0.1:5432{Colors.ENDC}")
-            print(f"  {Colors.CYAN}  Connection: {connection_name}{Colors.ENDC}")
-            return True
-        else:
-            print(f"  {Colors.FAIL}✗ Proxy failed to start (check {log_file}){Colors.ENDC}")
-            return False
+        print(f"  {Colors.FAIL}✗ Proxy failed to start within 10 seconds{Colors.ENDC}")
+        return False
 
     except Exception as e:
         print(f"  {Colors.FAIL}✗ Error starting proxy: {e}{Colors.ENDC}")
