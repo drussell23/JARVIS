@@ -174,14 +174,20 @@ class UnifiedStartupProgressHub:
     async def initialize(
         self,
         loading_server_url: str = "http://localhost:3001",
-        required_components: Optional[List[str]] = None
+        required_components: Optional[List[str]] = None,
+        component_weights: Optional[Dict[str, float]] = None
     ):
         """
-        Initialize the progress hub.
+        Initialize the progress hub with ALL components registered UPFRONT.
+
+        This is CRITICAL for accurate progress calculation. By registering all
+        components before any complete, the denominator (total weight) is fixed
+        and progress increases smoothly.
 
         Args:
             loading_server_url: URL for the standalone loading server
             required_components: Components that must complete for system to be "ready"
+            component_weights: Dict mapping component name to weight (optional)
         """
         self._loading_server_url = loading_server_url
         self._started_at = time.time()
@@ -196,9 +202,42 @@ class UnifiedStartupProgressHub:
                 timeout=aiohttp.ClientTimeout(total=2.0)
             )
 
+        # CRITICAL: Register ALL components UPFRONT with default weights
+        # This ensures the denominator (total_weight) is fixed from the start
+        # and progress increases smoothly as components complete.
+        #
+        # Default weights are calibrated based on typical startup times:
+        default_weights = {
+            "supervisor": 5.0,      # Quick - just coordination
+            "spawning": 5.0,        # Process creation
+            "backend": 20.0,        # API server startup
+            "database": 8.0,        # Database connections
+            "voice": 15.0,          # Voice engine initialization
+            "vision": 12.0,         # Vision/camera initialization
+            "frontend": 15.0,       # React app startup
+            "websocket": 5.0,       # WebSocket connections
+            "models": 10.0,         # AI models loading
+            "config": 3.0,          # Configuration loading
+            "cleanup": 2.0,         # Process cleanup
+        }
+
+        # Override with provided weights
+        if component_weights:
+            default_weights.update(component_weights)
+
+        # Register all known components upfront
+        for name, weight in default_weights.items():
+            is_required = name in self._required_components if self._required_components else True
+            await self.register_component(
+                name=name,
+                weight=weight,
+                is_critical=(name in ("backend", "supervisor")),
+                is_required_for_ready=is_required
+            )
+
         # Record initialization event
-        await self._record_event("initialize", "Startup hub initialized")
-        logger.info("[UnifiedProgress] Hub initialized")
+        await self._record_event("initialize", "Startup hub initialized with all components")
+        logger.info(f"[UnifiedProgress] Hub initialized with {len(self._components)} components pre-registered")
 
     async def shutdown(self):
         """Clean up resources"""

@@ -337,14 +337,15 @@ class JARVISSupervisor:
                 self._progress_reporter = loading_server.get_progress_reporter()
 
                 # Initialize unified progress hub (single source of truth)
+                # The hub pre-registers ALL components with their weights upfront
+                # to ensure the denominator is fixed and progress increases smoothly.
                 self._progress_hub = _get_progress_hub()
                 if self._progress_hub:
                     await self._progress_hub.initialize(
                         loading_server_url="http://localhost:3001",
                         required_components=["backend", "frontend", "voice", "vision"]
                     )
-                    # Register supervisor component
-                    await self._progress_hub.register_component("supervisor", weight=5.0)
+                    # Mark supervisor as starting (already pre-registered in hub.initialize)
                     await self._progress_hub.component_start("supervisor", "Supervisor initializing...")
 
                 # Report progress with detailed log entry
@@ -381,27 +382,34 @@ class JARVISSupervisor:
             env["JARVIS_SUPERVISOR_LOADING"] = "1"
         
         logger.info(f"🚀 Spawning JARVIS: {' '.join(cmd)}")
-        
+
         # === SPAWNING PHASE ===
+        # Mark spawning as started in the hub (single source of truth)
+        if self._progress_hub:
+            await self._progress_hub.component_start("spawning", "Starting JARVIS Core...")
+
+        # Get progress from hub for reporter
+        spawn_progress = self._progress_hub.get_progress() if self._progress_hub else 10
+
         # Visual + Voice happen at the SAME moment, BEFORE process creation
         if self._progress_reporter:
             await self._progress_reporter.report(
                 "spawning",
                 "Starting JARVIS Core...",
-                10,
+                spawn_progress,
                 log_entry=f"Spawning JARVIS process: {' '.join(cmd[:2])}...",
                 log_source="Supervisor",
                 log_type="info"
             )
-        
+
         # Voice: Announce spawning NOW (aligned with visual)
         await self._startup_narrator.announce_phase(
             StartupPhase.SPAWNING,
             "Starting JARVIS Core...",
-            10,
+            spawn_progress,
             context="start",
         )
-        
+
         try:
             # Actually create the process (voice + visual already announced)
             self._process = await asyncio.create_subprocess_exec(
@@ -411,13 +419,17 @@ class JARVISSupervisor:
                 stdout=None,  # Inherit stdout
                 stderr=None,  # Inherit stderr
             )
-            
+
             self.process_info.pid = self._process.pid
             self.process_info.start_time = datetime.now()
             self.stats.total_starts += 1
-            
+
             self._set_state(SupervisorState.RUNNING)
             logger.info(f"✅ JARVIS spawned (PID: {self._process.pid})")
+
+            # Mark spawning as complete in the hub
+            if self._progress_hub:
+                await self._progress_hub.component_complete("spawning", "JARVIS Core started")
             
             # NOTE: Do NOT announce "JARVIS online" here - that's premature!
             # The startup narrator will announce completion when ALL systems are ready
@@ -622,23 +634,18 @@ class JARVISSupervisor:
             
             return backend_ready, frontend_ready, system_status
         
-        # === PROGRESS CALCULATION ===
-        def calculate_progress() -> int:
-            """Calculate progress based on completed stages."""
-            progress_weights = {
-                "spawning": 15,
-                "backend": 25,
-                "database": 10,
-                "voice": 15,
-                "vision": 10,
-                "frontend": 15,
-                "complete": 10,
-            }
-            total = sum(
-                progress_weights.get(stage, 0)
-                for stage in stages_completed
-            )
-            return min(total, 100)
+        # === PROGRESS CALCULATION (uses hub as single source of truth) ===
+        def get_progress() -> int:
+            """
+            Get progress from the unified hub (single source of truth).
+
+            The hub pre-registers all components with their weights upfront,
+            so the denominator is fixed and progress increases smoothly.
+            """
+            if self._progress_hub:
+                return int(self._progress_hub.get_progress())
+            # Fallback if hub not available
+            return min(len(stages_completed) * 15, 100)
         
         def get_adaptive_timeout() -> float:
             """Adjust timeout based on what's already loaded."""
@@ -685,12 +692,13 @@ class JARVISSupervisor:
                     # Backend
                     if backend_ready and "backend" not in stages_completed:
                         stages_completed.add("backend")
-                        progress = calculate_progress()
 
                         # Update unified hub (single source of truth)
+                        # NOTE: Component is pre-registered, just mark as complete
                         if self._progress_hub:
-                            await self._progress_hub.register_component("backend", weight=15.0)
                             await self._progress_hub.component_complete("backend", "Backend API online!")
+
+                        progress = get_progress()  # Get from hub after update
 
                         # Visual + Voice aligned with detailed log
                         await self._progress_reporter.report(
@@ -715,14 +723,13 @@ class JARVISSupervisor:
                     if backend_ready and system_status:
                         if system_status.get("database_connected") and "database" not in stages_completed:
                             stages_completed.add("database")
-                            # Update unified hub
+                            # Update unified hub (pre-registered, just mark complete)
                             if self._progress_hub:
-                                await self._progress_hub.register_component("database", weight=5.0)
                                 await self._progress_hub.component_complete("database", "Database connected")
                             await self._progress_reporter.report(
                                 "database",
                                 "Database connected",
-                                calculate_progress(),
+                                get_progress(),
                                 log_entry="SQLite database connection established",
                                 log_source="Backend",
                                 log_type="success"
@@ -730,14 +737,13 @@ class JARVISSupervisor:
 
                         if system_status.get("voice_ready") and "voice" not in stages_completed:
                             stages_completed.add("voice")
-                            # Update unified hub
+                            # Update unified hub (pre-registered, just mark complete)
                             if self._progress_hub:
-                                await self._progress_hub.register_component("voice", weight=10.0)
                                 await self._progress_hub.component_complete("voice", "Voice system ready")
                             await self._progress_reporter.report(
                                 "voice",
                                 "Voice system ready",
-                                calculate_progress(),
+                                get_progress(),
                                 log_entry="Voice recognition and TTS engines initialized",
                                 log_source="Backend",
                                 log_type="success"
@@ -745,14 +751,13 @@ class JARVISSupervisor:
 
                         if system_status.get("vision_ready") and "vision" not in stages_completed:
                             stages_completed.add("vision")
-                            # Update unified hub
+                            # Update unified hub (pre-registered, just mark complete)
                             if self._progress_hub:
-                                await self._progress_hub.register_component("vision", weight=10.0)
                                 await self._progress_hub.component_complete("vision", "Vision system ready")
                             await self._progress_reporter.report(
                                 "vision",
                                 "Vision system ready",
-                                calculate_progress(),
+                                get_progress(),
                                 log_entry="Vision pipeline and Claude integration active",
                                 log_source="Backend",
                                 log_type="success"
@@ -761,14 +766,13 @@ class JARVISSupervisor:
                     # Frontend
                     if frontend_ready and "frontend" not in stages_completed:
                         stages_completed.add("frontend")
-                        # Update unified hub
+                        # Update unified hub (pre-registered, just mark complete)
                         if self._progress_hub:
-                            await self._progress_hub.register_component("frontend", weight=10.0)
                             await self._progress_hub.component_complete("frontend", "Frontend ready!")
                         await self._progress_reporter.report(
                             "frontend",
                             "Frontend ready!",
-                            calculate_progress(),
+                            get_progress(),
                             log_entry=f"React frontend serving on port {frontend_port}",
                             log_source="Frontend",
                             log_type="success"
