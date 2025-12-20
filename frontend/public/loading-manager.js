@@ -813,6 +813,29 @@ class JARVISLoadingManager {
         return backendReady && frontendReady;
     }
 
+    async quickBackendCheck() {
+        /**
+         * Quick backend health check for recovery scenarios.
+         * Returns true if backend is responsive.
+         * Uses a short timeout to avoid blocking.
+         */
+        const backendPort = this.config.backendPort || 8010;
+        const backendUrl = `${this.config.httpProtocol}//${this.config.hostname}:${backendPort}`;
+        try {
+            const response = await fetch(`${backendUrl}/health`, {
+                method: 'GET',
+                cache: 'no-cache',
+                signal: AbortSignal.timeout(2000)
+            });
+            const isReady = response.ok;
+            console.log(`[Recovery] Quick backend check: ${isReady ? 'UP' : 'DOWN'}`);
+            return isReady;
+        } catch (e) {
+            console.debug('[Recovery] Quick backend check failed:', e.message);
+            return false;
+        }
+    }
+
     quickRedirectToApp() {
         /**
          * Quick redirect to main app when backend is already ready.
@@ -1359,9 +1382,25 @@ class JARVISLoadingManager {
             this.handleCompletion(success, redirectUrl, message);
         }
 
-        // Handle failure
+        // Handle failure - but be smart about it
         if (stage === 'failed' || metadata.success === false) {
-            this.showError(message || 'Startup failed');
+            // Don't show error if we've made significant progress - backend might be up
+            const hasProgress = this.state.progress > 30 || effectiveProgress > 30;
+            const backendReady = metadata.backend_ready === true || this.state.backendReady;
+            
+            if (hasProgress && backendReady) {
+                // Backend is up - this might be a frontend-only issue
+                console.warn('[Progress] Backend ready but startup marked failed - attempting graceful recovery');
+                this.updateStatusText('Finishing up...', 'warning');
+                // Give it more time before showing error
+                setTimeout(() => {
+                    if (this.state.progress < 100 && !this.state.redirecting) {
+                        this.showError(message || 'Frontend startup incomplete');
+                    }
+                }, 10000); // 10 second grace period
+            } else {
+                this.showError(message || 'Startup failed');
+            }
         }
     }
 
@@ -1525,10 +1564,24 @@ class JARVISLoadingManager {
     }
 
     async handleCompletion(success, redirectUrl, message) {
+        // Intelligent completion handling - don't fail if backend is actually ready
         if (!success) {
-            this.showError(message || 'Startup completed with errors');
-            this.updateStatusText('Startup failed', 'error');
-            return;
+            // Check if we can still redirect (backend might be up)
+            const backendOk = await this.quickBackendCheck();
+            const frontendOk = await this.checkFrontendReady();
+            
+            if (backendOk && frontendOk) {
+                console.warn('[Complete] Marked as failed but services are ready - proceeding anyway');
+                success = true; // Override - services are actually working
+            } else if (backendOk) {
+                console.warn('[Complete] Backend ready but frontend check failed - trying redirect anyway');
+                success = true; // Try anyway
+                redirectUrl = redirectUrl || `${this.config.httpProtocol}//${this.config.hostname}:${this.config.mainAppPort}`;
+            } else {
+                this.showError(message || 'Startup completed with errors');
+                this.updateStatusText('Startup failed', 'error');
+                return;
+            }
         }
 
         // Stop all polling immediately
@@ -1756,21 +1809,50 @@ class JARVISLoadingManager {
         return new Promise(resolve => setTimeout(resolve, ms));
     }
 
-    showError(message) {
+    async showError(message) {
         console.error('[Error]', message);
+        
+        // Before showing error, do a quick sanity check
+        // Maybe backend is actually fine and we can recover
+        const backendUp = await this.quickBackendCheck();
+        
+        if (backendUp && this.state.progress >= 30) {
+            // Backend is up! Try recovery instead of showing error
+            console.warn('[Error] Backend is UP despite error - attempting recovery redirect');
+            this.updateStatusText('Recovering...', 'warning');
+            
+            // Give frontend a moment to stabilize, then try redirect
+            await this.sleep(3000);
+            
+            const frontendUp = await this.checkFrontendReady();
+            if (frontendUp) {
+                console.log('[Error] Recovery successful - redirecting');
+                const redirectUrl = `${this.config.httpProtocol}//${this.config.hostname}:${this.config.mainAppPort}`;
+                this.playEpicCompletionAnimation(redirectUrl);
+                return;
+            }
+        }
+        
+        // Actually show the error
         this.cleanup();
 
         if (this.elements.errorContainer) {
             this.elements.errorContainer.classList.add('visible');
         }
         if (this.elements.errorMessage) {
-            this.elements.errorMessage.textContent = message;
+            // Make error message more helpful
+            const helpfulMessage = backendUp 
+                ? `${message}\n\nNote: Backend is running. Try refreshing or accessing http://localhost:3000 directly.`
+                : message;
+            this.elements.errorMessage.textContent = helpfulMessage;
         }
         if (this.elements.subtitle) {
-            this.elements.subtitle.textContent = 'INITIALIZATION FAILED';
+            // Use more accurate subtitle based on what's actually happening
+            const subtitle = backendUp ? 'PARTIAL INITIALIZATION' : 'INITIALIZATION FAILED';
+            this.elements.subtitle.textContent = subtitle;
         }
         if (this.elements.reactor) {
-            this.elements.reactor.style.opacity = '0.3';
+            this.elements.reactor.style.opacity = backendUp ? '0.6' : '0.3';
         }
     }
 

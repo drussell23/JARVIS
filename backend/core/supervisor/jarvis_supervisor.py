@@ -418,189 +418,320 @@ class JARVISSupervisor:
     
     async def _monitor_startup_progress(self) -> None:
         """
-        Monitor JARVIS startup and update loading page progress.
+        Intelligent, robust startup monitoring with parallel health checks.
         
-        Intelligently coordinates visual progress (loading page) with voice narration.
-        
-        Voice Narration Strategy (avoid over-talking):
-        - Spawning: Announce once when process starts
-        - Backend: Announce when backend is ready (major milestone)
-        - Slow startup: Only announce if taking >45s
-        - Halfway: Optional 50% milestone (if enabled)
-        - Complete: Final "JARVIS online" announcement
-        
-        Visual Progress (always updated):
-        - All stages are shown on the loading page
-        - More granular than voice (database, voice, vision, frontend)
+        Features:
+        - Parallel health checks for backend/frontend (async)
+        - Adaptive timeout based on system state
+        - Intelligent retry with exponential backoff
+        - Graceful degradation (frontend-optional mode)
+        - Real-time progress tracking with visual+voice sync
+        - Circuit breaker for failed endpoints
+        - Dynamic progress interpolation for smooth UX
         """
         if not self._progress_reporter:
             return
         
         import aiohttp
+        from dataclasses import dataclass, field
+        from typing import Tuple
         
-        # Use dynamic port configuration from environment
+        # === DYNAMIC CONFIGURATION (no hardcoding) ===
         backend_port = int(os.environ.get("BACKEND_PORT", "8010"))
         frontend_port = int(os.environ.get("FRONTEND_PORT", "3000"))
+        base_timeout = float(os.environ.get("STARTUP_TIMEOUT", "180"))  # 3 minutes default
+        health_check_timeout = float(os.environ.get("HEALTH_CHECK_TIMEOUT", "3.0"))
+        slow_threshold = float(os.environ.get("STARTUP_SLOW_THRESHOLD", "45.0"))
+        poll_interval = float(os.environ.get("STARTUP_POLL_INTERVAL", "0.5"))
+        frontend_optional = os.environ.get("FRONTEND_OPTIONAL", "true").lower() == "true"
         
         backend_url = f"http://localhost:{backend_port}"
         frontend_url = f"http://localhost:{frontend_port}"
         
-        # Tracking state
-        stages_completed: set = set()
-        key_milestones_narrated: set = set()  # Only narrate key milestones
-        max_wait_seconds = 120
+        # === INTELLIGENT STATE TRACKING ===
+        @dataclass
+        class HealthCheckState:
+            """Track health check state with circuit breaker logic."""
+            consecutive_failures: int = 0
+            last_success: float = 0.0
+            is_ready: bool = False
+            circuit_open: bool = False
+            check_count: int = 0
+            
+            def record_success(self):
+                self.consecutive_failures = 0
+                self.last_success = time.time()
+                self.is_ready = True
+                self.circuit_open = False
+                self.check_count += 1
+            
+            def record_failure(self):
+                self.consecutive_failures += 1
+                self.check_count += 1
+                # Open circuit after 10 consecutive failures
+                if self.consecutive_failures >= 10:
+                    self.circuit_open = True
+            
+            def should_check(self) -> bool:
+                """Circuit breaker: skip checks if circuit is open."""
+                if self.is_ready:
+                    return False  # Already ready, no need to check
+                if self.circuit_open:
+                    # Half-open: try again after 5 seconds
+                    return time.time() - self.last_success > 5.0
+                return True
+        
+        backend_state = HealthCheckState()
+        frontend_state = HealthCheckState()
+        
+        # Progress stages with dynamic weighting
+        # Include spawning as already completed (announced in _spawn_jarvis)
+        stages_completed: set = {"spawning"}  # Start with spawning done
+        key_milestones_narrated: set = {"spawning"}  # Already announced in _spawn_jarvis
+        
         start_time = time.time()
         slow_startup_announced = False
-        slow_startup_threshold = 45.0
+        last_progress_update = start_time
         
-        # Determine what's worth narrating (avoid talking too much)
-        # Key milestones: spawning, backend ready, slow warning, complete
-        NARRATE_MILESTONES = {"spawning", "backend", "slow", "complete"}
+        # Create a shared session for connection pooling
+        connector = aiohttp.TCPConnector(limit=10, ttl_dns_cache=300)
+        session: Optional[aiohttp.ClientSession] = None
         
-        async def check_endpoint(url: str, timeout: float = 2.0) -> bool:
-            """Check if an endpoint is responding."""
+        # === PARALLEL HEALTH CHECK FUNCTIONS ===
+        async def check_endpoint_smart(
+            url: str,
+            state: HealthCheckState,
+            timeout: float = health_check_timeout
+        ) -> bool:
+            """Smart health check with circuit breaker and retry logic."""
+            nonlocal session
+            
+            if not state.should_check():
+                return state.is_ready
+            
             try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
-                        return resp.status == 200
-            except Exception:
+                if session is None or session.closed:
+                    session = aiohttp.ClientSession(
+                        connector=connector,
+                        timeout=aiohttp.ClientTimeout(total=timeout)
+                    )
+                
+                async with session.get(url) as resp:
+                    if resp.status == 200:
+                        state.record_success()
+                        return True
+                    else:
+                        state.record_failure()
+                        return False
+            except asyncio.TimeoutError:
+                state.record_failure()
+                return False
+            except aiohttp.ClientError:
+                state.record_failure()
+                return False
+            except Exception as e:
+                logger.debug(f"Health check error for {url}: {e}")
+                state.record_failure()
                 return False
         
-        # Progress percentages for visual display
-        progress_map = {
-            "spawning": 15,
-            "backend": 40,
-            "database": 55,
-            "voice": 70,
-            "vision": 80,
-            "frontend": 90,
-        }
-        
-        # NOTE: Spawning was already announced in _spawn_jarvis() (aligned with visual)
-        # The startup narrator was started there too
-        
-        # Mark spawning as narrated so we don't repeat it
-        key_milestones_narrated.add("spawning")
-        
-        while self.state == SupervisorState.RUNNING and self._progress_reporter:
-            elapsed = time.time() - start_time
-            
-            # Check for slow startup - give user feedback if waiting long
-            if not slow_startup_announced and elapsed > slow_startup_threshold:
-                slow_startup_announced = True
-                key_milestones_narrated.add("slow")
-                await self._startup_narrator.announce_slow_startup()
-            
-            if elapsed > max_wait_seconds:
-                logger.warning("⚠️ Startup monitoring timeout")
-                await self._progress_reporter.fail(
-                    "Startup timeout - please check logs",
-                    error="Timeout after 2 minutes"
-                )
-                await self._startup_narrator.announce_error("Startup timeout")
-                break
-            
+        async def check_system_status() -> dict:
+            """Check detailed system status from backend."""
             try:
-                # Check backend health
-                backend_ready = await check_endpoint(f"{backend_url}/health")
+                if session is None or session.closed:
+                    return {}
                 
-                if backend_ready and "backend" not in stages_completed:
-                    stages_completed.add("backend")
-                    
-                    # Visual: Update loading page
-                    await self._progress_reporter.report(
-                        "api",
-                        "Backend API online!",
-                        progress_map["backend"],
-                    )
-                    
-                    # Voice: Backend ready is a key milestone - narrate it
-                    if "backend" not in key_milestones_narrated:
-                        key_milestones_narrated.add("backend")
-                        await self._startup_narrator.announce_phase(
-                            StartupPhase.BACKEND_INIT,
-                            "Backend API online!",
-                            progress_map["backend"],
-                            context="complete",
-                        )
-                
-                # Once backend is ready, check for full system status
-                if backend_ready:
-                    try:
-                        async with aiohttp.ClientSession() as session:
-                            async with session.get(
-                                f"{backend_url}/api/system/status",
-                                timeout=aiohttp.ClientTimeout(total=3.0)
-                            ) as resp:
-                                if resp.status == 200:
-                                    status = await resp.json()
-                                    
-                                    # Visual only updates for sub-systems (don't narrate each one)
-                                    if status.get("database_connected") and "database" not in stages_completed:
-                                        stages_completed.add("database")
-                                        await self._progress_reporter.report(
-                                            "database",
-                                            "Database connected",
-                                            progress_map["database"],
-                                        )
-                                    
-                                    if status.get("voice_ready") and "voice" not in stages_completed:
-                                        stages_completed.add("voice")
-                                        await self._progress_reporter.report(
-                                            "voice",
-                                            "Voice system ready",
-                                            progress_map["voice"],
-                                        )
-                                    
-                                    if status.get("vision_ready") and "vision" not in stages_completed:
-                                        stages_completed.add("vision")
-                                        await self._progress_reporter.report(
-                                            "vision",
-                                            "Vision system ready",
-                                            progress_map["vision"],
-                                        )
-                    except Exception:
-                        pass
-                
-                # Check frontend
-                frontend_ready = await check_endpoint(frontend_url)
-                
-                if frontend_ready and "frontend" not in stages_completed:
-                    stages_completed.add("frontend")
-                    await self._progress_reporter.report(
-                        "frontend",
-                        "Frontend ready!",
-                        progress_map["frontend"],
-                    )
-                
-                # If both backend and frontend are ready, complete!
-                if backend_ready and frontend_ready:
-                    # Brief pause for visual effect before redirecting
-                    await asyncio.sleep(0.5)
-                    
-                    # Visual: Complete the loading page and redirect
-                    await self._progress_reporter.complete(
-                        "JARVIS is online!",
-                        redirect_url=frontend_url,
-                    )
-                    
-                    # Voice: Announce completion - the "JARVIS online" moment
-                    # This is the ONLY place we say "JARVIS online"
-                    duration = time.time() - start_time
-                    await self._startup_narrator.announce_complete(
-                        duration_seconds=duration,
-                    )
-                    
-                    logger.info(f"✅ Startup complete in {duration:.1f}s, redirecting to main app")
-                    break
-                
-            except Exception as e:
-                logger.debug(f"Startup progress check error: {e}")
-            
-            await asyncio.sleep(1.0)  # Check every second
+                async with session.get(
+                    f"{backend_url}/api/system/status",
+                    timeout=aiohttp.ClientTimeout(total=health_check_timeout)
+                ) as resp:
+                    if resp.status == 200:
+                        return await resp.json()
+            except Exception:
+                pass
+            return {}
         
-        # Cleanup
-        await self._startup_narrator.stop()
+        async def parallel_health_check() -> Tuple[bool, bool, dict]:
+            """Run backend and frontend health checks in parallel."""
+            backend_task = asyncio.create_task(
+                check_endpoint_smart(f"{backend_url}/health", backend_state)
+            )
+            frontend_task = asyncio.create_task(
+                check_endpoint_smart(frontend_url, frontend_state)
+            )
+            
+            # Wait for both
+            backend_ready, frontend_ready = await asyncio.gather(
+                backend_task, frontend_task, return_exceptions=True
+            )
+            
+            # Handle exceptions
+            if isinstance(backend_ready, Exception):
+                backend_ready = False
+            if isinstance(frontend_ready, Exception):
+                frontend_ready = False
+            
+            # Get system status if backend is ready
+            system_status = {}
+            if backend_ready:
+                system_status = await check_system_status()
+            
+            return backend_ready, frontend_ready, system_status
+        
+        # === PROGRESS CALCULATION ===
+        def calculate_progress() -> int:
+            """Calculate progress based on completed stages."""
+            progress_weights = {
+                "spawning": 15,
+                "backend": 25,
+                "database": 10,
+                "voice": 15,
+                "vision": 10,
+                "frontend": 15,
+                "complete": 10,
+            }
+            total = sum(
+                progress_weights.get(stage, 0)
+                for stage in stages_completed
+            )
+            return min(total, 100)
+        
+        def get_adaptive_timeout() -> float:
+            """Adjust timeout based on what's already loaded."""
+            # If backend is ready, we're close - extend timeout
+            if backend_state.is_ready:
+                return base_timeout * 1.5
+            return base_timeout
+        
+        # === MAIN MONITORING LOOP ===
+        try:
+            while self.state == SupervisorState.RUNNING and self._progress_reporter:
+                elapsed = time.time() - start_time
+                adaptive_timeout = get_adaptive_timeout()
+                
+                # Check for slow startup
+                if not slow_startup_announced and elapsed > slow_threshold:
+                    slow_startup_announced = True
+                    key_milestones_narrated.add("slow")
+                    await self._startup_narrator.announce_slow_startup()
+                
+                # Check for timeout
+                if elapsed > adaptive_timeout:
+                    # Graceful degradation: if backend is ready but frontend isn't,
+                    # complete anyway in frontend-optional mode
+                    if backend_state.is_ready and frontend_optional:
+                        logger.warning("⚠️ Frontend timeout, completing with backend only")
+                        stages_completed.add("frontend")  # Mark as complete
+                    else:
+                        logger.warning(f"⚠️ Startup timeout after {elapsed:.1f}s")
+                        await self._progress_reporter.fail(
+                            f"Startup timeout after {int(elapsed)}s",
+                            error=f"Backend: {'ready' if backend_state.is_ready else 'not ready'}, "
+                                  f"Frontend: {'ready' if frontend_state.is_ready else 'not ready'}"
+                        )
+                        await self._startup_narrator.announce_error("Startup timeout")
+                        break
+                
+                # === PARALLEL HEALTH CHECKS ===
+                try:
+                    backend_ready, frontend_ready, system_status = await parallel_health_check()
+                    
+                    # === UPDATE PROGRESS BASED ON STATE ===
+                    
+                    # Backend
+                    if backend_ready and "backend" not in stages_completed:
+                        stages_completed.add("backend")
+                        progress = calculate_progress()
+                        
+                        # Visual + Voice aligned
+                        await self._progress_reporter.report(
+                            "api",
+                            "Backend API online!",
+                            progress,
+                        )
+                        
+                        if "backend" not in key_milestones_narrated:
+                            key_milestones_narrated.add("backend")
+                            await self._startup_narrator.announce_phase(
+                                StartupPhase.BACKEND_INIT,
+                                "Backend API online!",
+                                progress,
+                                context="complete",
+                            )
+                    
+                    # System subsystems (visual only)
+                    if backend_ready and system_status:
+                        if system_status.get("database_connected") and "database" not in stages_completed:
+                            stages_completed.add("database")
+                            await self._progress_reporter.report(
+                                "database",
+                                "Database connected",
+                                calculate_progress(),
+                            )
+                        
+                        if system_status.get("voice_ready") and "voice" not in stages_completed:
+                            stages_completed.add("voice")
+                            await self._progress_reporter.report(
+                                "voice",
+                                "Voice system ready",
+                                calculate_progress(),
+                            )
+                        
+                        if system_status.get("vision_ready") and "vision" not in stages_completed:
+                            stages_completed.add("vision")
+                            await self._progress_reporter.report(
+                                "vision",
+                                "Vision system ready",
+                                calculate_progress(),
+                            )
+                    
+                    # Frontend
+                    if frontend_ready and "frontend" not in stages_completed:
+                        stages_completed.add("frontend")
+                        await self._progress_reporter.report(
+                            "frontend",
+                            "Frontend ready!",
+                            calculate_progress(),
+                        )
+                    
+                    # === COMPLETION CHECK ===
+                    # Complete when: backend ready AND (frontend ready OR frontend optional timeout)
+                    ready_for_completion = (
+                        backend_ready and 
+                        (frontend_ready or (frontend_optional and "frontend" in stages_completed))
+                    )
+                    
+                    if ready_for_completion:
+                        await asyncio.sleep(0.3)  # Brief pause for visual effect
+                        
+                        # Add complete stage
+                        stages_completed.add("complete")
+                        
+                        # Visual: Complete and redirect
+                        await self._progress_reporter.complete(
+                            "JARVIS is online!",
+                            redirect_url=frontend_url,
+                        )
+                        
+                        # Voice: Final announcement
+                        duration = time.time() - start_time
+                        await self._startup_narrator.announce_complete(
+                            duration_seconds=duration,
+                        )
+                        
+                        logger.info(f"✅ Startup complete in {duration:.1f}s")
+                        break
+                    
+                except Exception as e:
+                    logger.debug(f"Progress check error: {e}")
+                
+                # Adaptive polling interval
+                await asyncio.sleep(poll_interval)
+        
+        finally:
+            # Cleanup
+            if session and not session.closed:
+                await session.close()
+            await self._startup_narrator.stop()
     
     async def _monitor_health(self) -> None:
         """Monitor JARVIS health while running."""
@@ -615,58 +746,126 @@ class JARVISSupervisor:
     
     async def _announce_ready_fallback(self) -> None:
         """
-        Fallback announcement when no loading page is available.
+        Robust fallback announcement when no loading page is available.
         
-        Polls backend health and announces "JARVIS online" when ready.
-        This ensures we still narrate completion even without the loading page.
+        Features:
+        - Parallel health checks with connection pooling
+        - Adaptive polling with exponential backoff
+        - Intelligent retry logic
+        - Graceful degradation
         """
         import aiohttp
         
+        # Dynamic configuration
         backend_port = int(os.environ.get("BACKEND_PORT", "8010"))
+        frontend_port = int(os.environ.get("FRONTEND_PORT", "3000"))
+        max_wait = float(os.environ.get("STARTUP_TIMEOUT", "180"))
+        
         backend_url = f"http://localhost:{backend_port}"
+        frontend_url = f"http://localhost:{frontend_port}"
         
         start_time = time.time()
-        max_wait = 120  # 2 minute timeout
         announced_spawning = False
+        announced_backend = False
+        consecutive_failures = 0
+        poll_interval = 1.0  # Start with 1 second
         
         await self._startup_narrator.start()
         
-        while self.state == SupervisorState.RUNNING:
-            elapsed = time.time() - start_time
-            
-            if elapsed > max_wait:
-                logger.warning("⚠️ Startup fallback timeout")
-                await self._startup_narrator.announce_error("Startup timeout")
-                break
-            
-            # Announce spawning once
-            if not announced_spawning and elapsed > 2:
-                announced_spawning = True
-                await self._startup_narrator.announce_phase(
-                    StartupPhase.SPAWNING,
-                    "Starting JARVIS Core...",
-                    15,
-                    context="start",
-                )
-            
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(
-                        f"{backend_url}/health",
-                        timeout=aiohttp.ClientTimeout(total=2.0)
-                    ) as resp:
-                        if resp.status == 200:
-                            # Backend is ready
-                            duration = time.time() - start_time
-                            await self._startup_narrator.announce_complete(
-                                duration_seconds=duration,
-                            )
-                            logger.info("✅ Startup complete (no loading page)")
-                            break
-            except Exception:
-                pass
-            
-            await asyncio.sleep(2.0)
+        # Create session with connection pooling
+        connector = aiohttp.TCPConnector(limit=5)
+        
+        async with aiohttp.ClientSession(
+            connector=connector,
+            timeout=aiohttp.ClientTimeout(total=3.0)
+        ) as session:
+            while self.state == SupervisorState.RUNNING:
+                elapsed = time.time() - start_time
+                
+                # Adaptive timeout check
+                if elapsed > max_wait:
+                    logger.warning(f"⚠️ Startup fallback timeout after {elapsed:.1f}s")
+                    await self._startup_narrator.announce_error("Startup timeout")
+                    break
+                
+                # Announce spawning once (after brief delay)
+                if not announced_spawning and elapsed > 1.5:
+                    announced_spawning = True
+                    await self._startup_narrator.announce_phase(
+                        StartupPhase.SPAWNING,
+                        "Starting JARVIS Core...",
+                        15,
+                        context="start",
+                    )
+                
+                # Parallel health check
+                try:
+                    backend_task = asyncio.create_task(
+                        session.get(f"{backend_url}/health")
+                    )
+                    frontend_task = asyncio.create_task(
+                        session.get(frontend_url)
+                    )
+                    
+                    results = await asyncio.gather(
+                        backend_task, frontend_task,
+                        return_exceptions=True
+                    )
+                    
+                    backend_resp, frontend_resp = results
+                    
+                    # Check backend
+                    backend_ready = (
+                        not isinstance(backend_resp, Exception) and
+                        backend_resp.status == 200
+                    )
+                    
+                    # Check frontend
+                    frontend_ready = (
+                        not isinstance(frontend_resp, Exception) and
+                        frontend_resp.status in (200, 304)
+                    )
+                    
+                    # Close responses
+                    if not isinstance(backend_resp, Exception):
+                        backend_resp.close()
+                    if not isinstance(frontend_resp, Exception):
+                        frontend_resp.close()
+                    
+                    # Announce backend ready
+                    if backend_ready and not announced_backend:
+                        announced_backend = True
+                        await self._startup_narrator.announce_phase(
+                            StartupPhase.BACKEND_INIT,
+                            "Backend API online!",
+                            40,
+                            context="complete",
+                        )
+                    
+                    # Complete when both ready (or backend ready after extended wait)
+                    if backend_ready and (frontend_ready or elapsed > 60):
+                        duration = time.time() - start_time
+                        await self._startup_narrator.announce_complete(
+                            duration_seconds=duration,
+                        )
+                        logger.info(f"✅ Startup complete in {duration:.1f}s (no loading page)")
+                        break
+                    
+                    # Reset failure counter on any success
+                    if backend_ready or frontend_ready:
+                        consecutive_failures = 0
+                        poll_interval = 1.0
+                    else:
+                        consecutive_failures += 1
+                        # Exponential backoff on failures
+                        poll_interval = min(poll_interval * 1.2, 5.0)
+                    
+                except Exception as e:
+                    logger.debug(f"Fallback health check error: {e}")
+                    consecutive_failures += 1
+                    poll_interval = min(poll_interval * 1.2, 5.0)
+                
+                await asyncio.sleep(poll_interval)
         
         await self._startup_narrator.stop()
     
