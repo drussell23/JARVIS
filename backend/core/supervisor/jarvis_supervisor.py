@@ -229,6 +229,13 @@ class JARVISSupervisor:
         self._idle_detector: Optional[Any] = None
         self._notification_orchestrator: Optional[UpdateNotificationOrchestrator] = None
         
+        # Dead Man's Switch - Post-update stability verification
+        self._dead_man_switch: Optional[DeadManSwitch] = None
+        self._is_post_update: bool = False  # Track if this is a post-update boot
+        self._pending_update_commit: Optional[str] = None  # Commit we just updated to
+        self._previous_commit: Optional[str] = None  # Commit we're replacing
+        self._dms_rollback_decision: Optional[RollbackDecision] = None  # Pending rollback from DMS
+        
         logger.info(f"🔧 Supervisor initialized (mode: {self.config.mode.value})")
     
     def _find_entry_point(self) -> str:
@@ -262,7 +269,12 @@ class JARVISSupervisor:
             self._update_engine = UpdateEngine(self.config)
         
         if self._rollback_manager is None:
-            from .rollback_manager import RollbackManager
+            from .rollback_manager import (
+            RollbackManager,
+            DeadManSwitch,
+            ProbationState,
+            RollbackDecision,
+        )
             self._rollback_manager = RollbackManager(self.config)
             await self._rollback_manager.initialize()
         
@@ -289,6 +301,20 @@ class JARVISSupervisor:
                 narrator=self._narrator,
                 update_detector=self._update_detector,
             )
+        
+        # Initialize Dead Man's Switch for post-update stability verification
+        if self._dead_man_switch is None and self.config.dead_man_switch.enabled:
+            self._dead_man_switch = DeadManSwitch(
+                config=self.config,
+                rollback_manager=self._rollback_manager,
+                narrator=self._narrator,
+            )
+            
+            # Register callbacks
+            self._dead_man_switch.on_rollback(self._on_dms_rollback)
+            self._dead_man_switch.on_stable(self._on_dms_stable)
+            
+            logger.info("🎯 Dead Man's Switch initialized")
     
     async def _find_existing_jarvis_window(self) -> bool:
         """
@@ -538,6 +564,14 @@ class JARVISSupervisor:
 
             self._set_state(SupervisorState.RUNNING)
             logger.info(f"✅ JARVIS spawned (PID: {self._process.pid})")
+            
+            # ═══════════════════════════════════════════════════════════════════
+            # DEAD MAN'S SWITCH: Start probation monitoring for post-update boots
+            # ═══════════════════════════════════════════════════════════════════
+            dms_task = None
+            if self._is_post_update and self._dead_man_switch and self.config.dead_man_switch.enabled:
+                logger.info("🎯 Starting Dead Man's Switch probation (post-update boot)")
+                dms_task = asyncio.create_task(self._run_dead_man_switch())
 
             # Mark spawning AND supervisor as complete in the hub
             # Supervisor's job is done once the process is spawned
@@ -574,6 +608,27 @@ class JARVISSupervisor:
             ).total_seconds()
             
             logger.info(f"📋 JARVIS exited with code {exit_code} (uptime: {self.process_info.uptime_seconds:.1f}s)")
+            
+            # ═══════════════════════════════════════════════════════════════════
+            # DEAD MAN'S SWITCH: Handle exit during probation
+            # ═══════════════════════════════════════════════════════════════════
+            if dms_task and not dms_task.done():
+                # Cancel the probation loop since JARVIS exited
+                dms_task.cancel()
+                try:
+                    await dms_task
+                except asyncio.CancelledError:
+                    pass
+                
+                # If this was a crash during probation, handle it specially
+                if self._dead_man_switch and self._dead_man_switch.is_probation_active():
+                    if exit_code != 0:  # Crash or error
+                        logger.warning(f"💥 JARVIS crashed during Dead Man's Switch probation!")
+                        decision = await self._dead_man_switch.handle_crash(exit_code)
+                        if decision.should_rollback:
+                            logger.info(f"🔄 Dead Man's Switch recommends rollback: {decision.reason}")
+                            # Store the decision for the main loop to handle
+                            self._dms_rollback_decision = decision
             
             return exit_code
             
@@ -1285,6 +1340,8 @@ class JARVISSupervisor:
         """
         Handle a crash (exit code != 0, 100, 101, 102).
         
+        Integrates with Dead Man's Switch for post-update crash handling.
+        
         Returns:
             True if should retry, False if should stop
         """
@@ -1303,6 +1360,49 @@ class JARVISSupervisor:
                 callback(exit_code)
             except Exception as e:
                 logger.error(f"Crash callback error: {e}")
+        
+        # ═══════════════════════════════════════════════════════════════════
+        # DEAD MAN'S SWITCH: Priority handling for post-update crashes
+        # If DMS flagged this crash for rollback, execute it immediately
+        # ═══════════════════════════════════════════════════════════════════
+        if self._dms_rollback_decision and self._dms_rollback_decision.should_rollback:
+            decision = self._dms_rollback_decision
+            self._dms_rollback_decision = None  # Clear the decision
+            
+            logger.warning(f"🎯 Dead Man's Switch executing rollback: {decision.reason}")
+            
+            self._set_state(SupervisorState.ROLLING_BACK)
+            
+            # Voice announcement
+            if self._narrator:
+                await self._narrator.narrate(NarratorEvent.ROLLBACK_STARTING)
+            
+            if self._rollback_manager:
+                # Try reflog first (more reliable for recent changes)
+                success = await self._rollback_manager.rollback_using_reflog(steps=1)
+                
+                if not success:
+                    # Fallback to snapshot-based rollback
+                    success = await self._rollback_manager.rollback()
+                
+                if success:
+                    self.stats.total_rollbacks += 1
+                    logger.info("✅ Dead Man's Switch rollback complete")
+                    
+                    # Clear post-update state
+                    self._is_post_update = False
+                    self._pending_update_commit = None
+                    
+                    # Reset crash count for the reverted version
+                    self.process_info.crash_count = 0
+                    
+                    if self._narrator:
+                        await self._narrator.narrate(NarratorEvent.ROLLBACK_COMPLETE)
+                    
+                    return True
+                else:
+                    logger.error("❌ Dead Man's Switch rollback FAILED")
+                    # Continue with normal crash handling
         
         # Check if boot was unstable (crash within stability window)
         if not self.process_info.is_stable(self.config.health.boot_stability_window):
@@ -1339,6 +1439,12 @@ class JARVISSupervisor:
         """
         Handle an update request (exit code 100).
         
+        This method now integrates with the Dead Man's Switch:
+        1. Captures current commit BEFORE update
+        2. Applies update
+        3. Sets flags for post-update probation
+        4. On next boot, Dead Man's Switch monitors stability
+        
         Returns:
             True if update successful, False if failed
         """
@@ -1365,6 +1471,13 @@ class JARVISSupervisor:
             return False
         
         try:
+            # ═══════════════════════════════════════════════════════════════════
+            # DEAD MAN'S SWITCH INTEGRATION: Capture current commit BEFORE update
+            # ═══════════════════════════════════════════════════════════════════
+            if self._dead_man_switch and self.config.dead_man_switch.enabled:
+                self._previous_commit = await self._update_engine.get_current_version()
+                logger.info(f"📸 Captured previous commit: {self._previous_commit[:12] if self._previous_commit else 'unknown'}")
+            
             # Take version snapshot before update
             if self._rollback_manager:
                 await self._rollback_manager.create_snapshot()
@@ -1382,11 +1495,23 @@ class JARVISSupervisor:
                     await self._narrator.narrate(NarratorEvent.VERIFYING)
             
             # Perform update
-            success = await self._update_engine.apply_update()
+            result = await self._update_engine.apply_update()
+            
+            # Check if result is a boolean or UpdateResult object
+            success = result.success if hasattr(result, 'success') else result
             
             if success:
                 self.stats.total_updates += 1
                 logger.info("✅ Update applied successfully")
+                
+                # ═══════════════════════════════════════════════════════════════════
+                # DEAD MAN'S SWITCH: Set up post-update probation
+                # ═══════════════════════════════════════════════════════════════════
+                if self._dead_man_switch and self.config.dead_man_switch.enabled:
+                    self._is_post_update = True
+                    self._pending_update_commit = await self._update_engine.get_current_version()
+                    logger.info(f"🎯 Dead Man's Switch armed for {self._pending_update_commit[:12] if self._pending_update_commit else 'unknown'}")
+                    logger.info(f"   Probation period: {self.config.dead_man_switch.probation_seconds}s")
                 
                 # Announce success
                 version = self._update_engine.get_progress().message or ""
@@ -1396,16 +1521,18 @@ class JARVISSupervisor:
                     wait=True,
                 )
                 
-                # Reset crash count on successful update
-                self.process_info.crash_count = 0
+                # Note: crash count reset moved to _on_dms_stable callback
+                # We only reset after probation passes
                 return True
             else:
                 logger.error("❌ Update failed")
                 await self._narrator.narrate(NarratorEvent.UPDATE_FAILED)
+                self._is_post_update = False
                 return False
                 
         except Exception as e:
             logger.error(f"❌ Update error: {e}")
+            self._is_post_update = False
             return False
     
     async def _handle_rollback_request(self) -> bool:
@@ -1440,6 +1567,80 @@ class JARVISSupervisor:
         except Exception as e:
             logger.error(f"❌ Rollback error: {e}")
             return False
+    
+    def _on_dms_rollback(self, decision: RollbackDecision) -> None:
+        """
+        Callback when Dead Man's Switch triggers a rollback.
+        
+        This is called BEFORE the rollback is executed, allowing us
+        to log and take any necessary actions.
+        """
+        logger.warning(f"🔄 Dead Man's Switch triggered rollback!")
+        logger.info(f"   Reason: {decision.reason}")
+        logger.info(f"   Confidence: {decision.confidence:.1%}")
+        logger.info(f"   Target: {decision.target_commit[:12] if decision.target_commit else 'unknown'}")
+        
+        # Reset post-update state
+        self._is_post_update = False
+        self._pending_update_commit = None
+        
+        # The rollback itself is handled by DeadManSwitch._execute_rollback
+    
+    def _on_dms_stable(self, commit: str) -> None:
+        """
+        Callback when Dead Man's Switch confirms version as stable.
+        
+        This is called AFTER the probation period completes successfully.
+        """
+        logger.info(f"✅ Dead Man's Switch: Version {commit[:12]} confirmed stable!")
+        
+        # Clear post-update state
+        self._is_post_update = False
+        self._pending_update_commit = None
+        self._previous_commit = None
+        
+        # Reset crash count since this version is now proven stable
+        self.process_info.crash_count = 0
+    
+    async def _run_dead_man_switch(self) -> None:
+        """
+        Background task: Run Dead Man's Switch probation monitoring.
+        
+        This runs concurrently with JARVIS and monitors its health
+        during the post-update probation period.
+        """
+        if not self._dead_man_switch or not self._is_post_update:
+            return
+        
+        logger.info("🎯 Starting Dead Man's Switch probation monitor...")
+        
+        try:
+            # Start probation
+            await self._dead_man_switch.start_probation(
+                update_commit=self._pending_update_commit or "unknown",
+                previous_commit=self._previous_commit or "unknown",
+            )
+            
+            # Run probation loop
+            status = await self._dead_man_switch.run_probation_loop()
+            
+            # Handle result
+            if status.state == ProbationState.ROLLING_BACK:
+                # Rollback was triggered - need to restart
+                logger.warning("🔄 Dead Man's Switch triggered rollback - restarting...")
+                self._restart_requested.set()
+                
+                # Terminate current process
+                if self._process and self._process.returncode is None:
+                    self._process.send_signal(signal.SIGTERM)
+                    
+            elif status.state == ProbationState.COMMITTED:
+                logger.info("✅ Dead Man's Switch: Probation passed!")
+                
+        except asyncio.CancelledError:
+            logger.info("🛑 Dead Man's Switch probation cancelled")
+        except Exception as e:
+            logger.error(f"❌ Dead Man's Switch error: {e}")
     
     async def _on_local_change_detected(self, info: "LocalChangeInfo") -> None:
         """
@@ -1749,6 +1950,9 @@ class JARVISSupervisor:
         # Start restart monitor (always enabled - handles async restart signals)
         restart_monitor_task = asyncio.create_task(self._run_restart_monitor())
         tasks.append(restart_monitor_task)
+        
+        # Dead Man's Switch task (created dynamically after updates)
+        dms_task: Optional[asyncio.Task] = None
 
         # Get exit codes from config
         exit_codes = ExitCode.from_config(self.config)
@@ -1762,6 +1966,17 @@ class JARVISSupervisor:
                 
                 # Spawn JARVIS and wait for exit
                 exit_code = await self._spawn_jarvis()
+                
+                # ═══════════════════════════════════════════════════════════════════
+                # DEAD MAN'S SWITCH: Start probation monitoring after post-update boot
+                # ═══════════════════════════════════════════════════════════════════
+                # Note: The DMS task runs DURING JARVIS execution, not after.
+                # We start it here but it monitors concurrently with JARVIS.
+                # The exit_code check below happens AFTER JARVIS exits.
+                # 
+                # For proper integration, we need to start DMS monitoring in
+                # _spawn_jarvis or right after the process is created.
+                # ═══════════════════════════════════════════════════════════════════
 
                 # Check if restart was triggered by restart coordinator
                 # (this takes precedence over exit code handling)
@@ -1813,6 +2028,14 @@ class JARVISSupervisor:
 
             # Cleanup restart coordinator
             await self._restart_coordinator.cleanup()
+            
+            # Cleanup Dead Man's Switch
+            if self._dead_man_switch:
+                try:
+                    await self._dead_man_switch.close()
+                    logger.debug("🎯 Dead Man's Switch closed")
+                except Exception as e:
+                    logger.debug(f"Dead Man's Switch cleanup error: {e}")
 
             for task in tasks:
                 task.cancel()

@@ -1,24 +1,33 @@
 #!/usr/bin/env python3
 """
-JARVIS Health Monitor
-======================
+JARVIS Health Monitor with Parallel Probing
+=============================================
 
 Boot health and stability monitoring for the Self-Updating Lifecycle Manager.
 Tracks component initialization, memory baselines, and detects crashes.
 
+Features:
+- Parallel async health probes with connection pooling
+- Dynamic endpoint discovery (no hardcoding)
+- Boot stability tracking with configurable window
+- Health score aggregation from multiple signals
+- Circuit breaker for flaky endpoints
+- Integration with Dead Man's Switch
+
 Author: JARVIS System
-Version: 1.0.0
+Version: 2.0.0 - Parallel Probing Edition
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import aiohttp
 
@@ -344,3 +353,187 @@ class HealthMonitor:
         """Close resources."""
         if self._session and not self._session.closed:
             await self._session.close()
+    
+    # =========================================================================
+    # Parallel Probing System (v2.0)
+    # =========================================================================
+    
+    async def parallel_health_check(
+        self,
+        endpoints: Optional[Dict[str, str]] = None,
+        timeout: Optional[float] = None,
+    ) -> Tuple[bool, Dict[str, ComponentHealth]]:
+        """
+        Perform parallel health checks across multiple endpoints.
+        
+        This is more efficient than sequential checks and provides
+        better latency for multi-component health assessment.
+        
+        Args:
+            endpoints: Dict of {name: url} to check (auto-detect if None)
+            timeout: Override timeout for this check
+            
+        Returns:
+            Tuple of (all_healthy, component_results)
+        """
+        if endpoints is None:
+            endpoints = self._discover_endpoints()
+        
+        if not endpoints:
+            logger.warning("No endpoints to check")
+            return False, {}
+        
+        # Create parallel tasks
+        tasks = []
+        names = []
+        
+        for name, url in endpoints.items():
+            tasks.append(asyncio.create_task(
+                self._probe_with_circuit_breaker(name, url, timeout)
+            ))
+            names.append(name)
+        
+        # Execute in parallel
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Process results
+        component_results: Dict[str, ComponentHealth] = {}
+        all_healthy = True
+        
+        for i, result in enumerate(results):
+            name = names[i]
+            
+            if isinstance(result, Exception):
+                component_results[name] = ComponentHealth(
+                    name=name,
+                    status=HealthStatus.UNHEALTHY,
+                    error=str(result),
+                )
+                all_healthy = False
+            elif isinstance(result, ComponentHealth):
+                component_results[name] = result
+                if result.status != HealthStatus.HEALTHY:
+                    all_healthy = False
+            else:
+                component_results[name] = ComponentHealth(
+                    name=name,
+                    status=HealthStatus.UNKNOWN,
+                    error="Unexpected result type",
+                )
+                all_healthy = False
+        
+        # Update system health
+        self.system_health.components.update(component_results)
+        
+        return all_healthy, component_results
+    
+    def _discover_endpoints(self) -> Dict[str, str]:
+        """
+        Dynamically discover health check endpoints.
+        
+        Uses environment variables to avoid hardcoding ports.
+        """
+        backend_port = int(os.environ.get("BACKEND_PORT", "8010"))
+        frontend_port = int(os.environ.get("FRONTEND_PORT", "3000"))
+        
+        endpoints = {
+            "backend": f"http://localhost:{backend_port}/health",
+            "backend_ready": f"http://localhost:{backend_port}/health/ready",
+        }
+        
+        # Only add frontend if not in headless mode
+        if os.environ.get("JARVIS_HEADLESS", "false").lower() != "true":
+            endpoints["frontend"] = f"http://localhost:{frontend_port}"
+        
+        return endpoints
+    
+    async def _probe_with_circuit_breaker(
+        self,
+        name: str,
+        url: str,
+        timeout: Optional[float] = None,
+    ) -> ComponentHealth:
+        """
+        Probe an endpoint with circuit breaker logic.
+        
+        Tracks consecutive failures and "opens" the circuit after
+        too many failures to avoid wasting resources.
+        
+        Args:
+            name: Endpoint name
+            url: URL to probe
+            timeout: Override timeout
+            
+        Returns:
+            ComponentHealth result
+        """
+        # Check circuit breaker state (simple implementation)
+        circuit_key = f"_circuit_{name}"
+        failures = getattr(self, circuit_key, 0)
+        
+        if failures >= 5:
+            # Circuit open - return cached failure without probing
+            last_check = getattr(self, f"_last_check_{name}", None)
+            if last_check and (datetime.now() - last_check).total_seconds() < 10:
+                return ComponentHealth(
+                    name=name,
+                    status=HealthStatus.UNHEALTHY,
+                    error="Circuit breaker open",
+                )
+            # Half-open: try again after 10 seconds
+        
+        result = await self.check_http_endpoint(name, url)
+        
+        # Update circuit breaker
+        if result.status == HealthStatus.HEALTHY:
+            setattr(self, circuit_key, 0)
+        else:
+            setattr(self, circuit_key, failures + 1)
+        
+        setattr(self, f"_last_check_{name}", datetime.now())
+        
+        return result
+    
+    async def wait_for_backend(
+        self,
+        timeout: float = 60.0,
+        poll_interval: float = 1.0,
+    ) -> bool:
+        """
+        Wait for the backend to become healthy.
+        
+        This is a convenience method for startup sequences.
+        
+        Args:
+            timeout: Maximum time to wait
+            poll_interval: Time between checks
+            
+        Returns:
+            True if backend became healthy, False if timeout
+        """
+        backend_port = int(os.environ.get("BACKEND_PORT", "8010"))
+        url = f"http://localhost:{backend_port}/health"
+        
+        start = time.time()
+        
+        while time.time() - start < timeout:
+            try:
+                result = await self.check_http_endpoint("backend", url)
+                if result.status == HealthStatus.HEALTHY:
+                    logger.info("✅ Backend is healthy")
+                    return True
+            except Exception as e:
+                logger.debug(f"Backend probe failed: {e}")
+            
+            await asyncio.sleep(poll_interval)
+        
+        logger.warning(f"⚠️ Backend did not become healthy within {timeout}s")
+        return False
+    
+    def get_quick_health_score(self) -> float:
+        """
+        Get a quick health score without performing new checks.
+        
+        Uses cached component states for fast assessment.
+        """
+        return self._calculate_health_score()

@@ -108,6 +108,57 @@ class RollbackConfig:
 
 
 @dataclass
+class DeadManSwitchConfig:
+    """
+    Dead Man's Switch Configuration - Post-Update Stability Verification.
+    
+    The "Dead Man's Switch" is a critical safety mechanism that:
+    1. Monitors JARVIS health after updates for a probation period
+    2. Automatically rolls back if health checks fail
+    3. Commits the update as "stable" once probation passes
+    4. Uses parallel health probing for fast detection
+    5. Provides intelligent, multi-signal health assessment
+    
+    This transforms JARVIS from a "tool" to an "organism" that can
+    safely self-update without creating "Zombie JARVIS" loops.
+    """
+    # Core settings
+    enabled: bool = True
+    
+    # Probation period - how long to monitor after update
+    probation_seconds: int = 45  # 45 seconds of stability required
+    
+    # Heartbeat detection
+    heartbeat_interval_seconds: float = 2.0  # Check every 2 seconds
+    heartbeat_timeout_seconds: float = 5.0   # Consider dead if no response in 5s
+    max_consecutive_failures: int = 3        # 3 strikes = rollback
+    
+    # Health thresholds
+    min_health_score: float = 0.6            # Minimum 60% components healthy
+    require_backend_healthy: bool = True     # Backend MUST be healthy
+    require_api_responding: bool = True      # /health endpoint MUST respond
+    
+    # Rollback behavior
+    auto_rollback_enabled: bool = True       # Automatically rollback on failure
+    announce_rollback: bool = True           # Voice announcement of rollback
+    max_rollback_attempts: int = 2           # Max cascading rollback attempts
+    
+    # Parallel probing endpoints (dynamic, no hardcoding)
+    probe_backend: bool = True
+    probe_frontend: bool = True
+    probe_voice: bool = False                # Voice service optional
+    probe_vision: bool = False               # Vision service optional
+    
+    # Stability commitment
+    auto_commit_stable: bool = True          # Auto-mark as stable after probation
+    notify_on_commit: bool = True            # Voice announcement when stable
+    
+    # Advanced: Intelligent analysis
+    analyze_crash_patterns: bool = True      # Learn from crash patterns
+    track_boot_metrics: bool = True          # Track boot time trends
+
+
+@dataclass
 class ChangelogConfig:
     """Changelog analysis configuration."""
     enabled: bool = True
@@ -176,6 +227,7 @@ class SupervisorConfig:
     changelog: ChangelogConfig = field(default_factory=ChangelogConfig)
     notification: NotificationConfig = field(default_factory=NotificationConfig)
     exit_codes: ExitCodes = field(default_factory=ExitCodes)
+    dead_man_switch: DeadManSwitchConfig = field(default_factory=DeadManSwitchConfig)
     
     # Runtime state
     config_path: Optional[Path] = None
@@ -343,6 +395,32 @@ def load_config(config_path: Optional[Path] = None) -> SupervisorConfig:
         restart_request=exit_codes_data.get("restart_request", 102),
     )
     
+    # Build Dead Man's Switch config
+    dms_data = raw_config.get("dead_man_switch", {})
+    dms_probes = dms_data.get("probes", {})
+    dms_rollback = dms_data.get("rollback", {})
+    dms_config = DeadManSwitchConfig(
+        enabled=_env_override("dms_enabled", dms_data.get("enabled", True), bool),
+        probation_seconds=_env_override("dms_probation", dms_data.get("probation_seconds", 45), int),
+        heartbeat_interval_seconds=dms_data.get("heartbeat_interval_seconds", 2.0),
+        heartbeat_timeout_seconds=dms_data.get("heartbeat_timeout_seconds", 5.0),
+        max_consecutive_failures=dms_data.get("max_consecutive_failures", 3),
+        min_health_score=dms_data.get("min_health_score", 0.6),
+        require_backend_healthy=dms_data.get("require_backend_healthy", True),
+        require_api_responding=dms_data.get("require_api_responding", True),
+        auto_rollback_enabled=dms_rollback.get("auto_enabled", True),
+        announce_rollback=dms_rollback.get("announce", True),
+        max_rollback_attempts=dms_rollback.get("max_attempts", 2),
+        probe_backend=dms_probes.get("backend", True),
+        probe_frontend=dms_probes.get("frontend", True),
+        probe_voice=dms_probes.get("voice", False),
+        probe_vision=dms_probes.get("vision", False),
+        auto_commit_stable=dms_data.get("auto_commit_stable", True),
+        notify_on_commit=dms_data.get("notify_on_commit", True),
+        analyze_crash_patterns=dms_data.get("analyze_crash_patterns", True),
+        track_boot_metrics=dms_data.get("track_boot_metrics", True),
+    )
+    
     # Build main config
     logging_data = supervisor_data.get("logging", {})
     config = SupervisorConfig(
@@ -356,6 +434,7 @@ def load_config(config_path: Optional[Path] = None) -> SupervisorConfig:
         rollback=rollback_config,
         changelog=changelog_config,
         exit_codes=exit_codes,
+        dead_man_switch=dms_config,
         config_path=Path(config_path) if config_path else None,
     )
     
