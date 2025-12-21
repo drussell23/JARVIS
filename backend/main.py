@@ -202,37 +202,43 @@ print(f"[STARTUP-DEBUG] Running from: {os.path.abspath(__file__)}")
 print(f"[STARTUP-DEBUG] Working directory: {os.getcwd()}")
 print(f"[STARTUP-DEBUG] Python path: {sys.path[:3]}")  # First 3 entries
 
-# DEBUG: Run coordinate diagnostic (dynamic path detection - no hardcoding!)
-try:
-    from pathlib import Path as _DebugPath
-    _project_root = _DebugPath(__file__).resolve().parent.parent  # backend -> project root
-    _diag_script = _project_root / "diagnose_coordinate_doubling.py"
+# DEBUG: Coordinate diagnostic and PyAutoGUI intercept are now DEFERRED to lifespan
+# v4.0: These were blocking module load and preventing fast startup
+# They will be run in background after server is serving
+_DEFERRED_DEBUG_TASKS = []
 
-    if _diag_script.exists():
-        print("[STARTUP-DEBUG] Running coordinate diagnostic...")
-        exec(_diag_script.read_text())
-    else:
-        print(f"[STARTUP-DEBUG] Coordinate diagnostic script not found at {_diag_script}")
-except Exception as e:
-    print(f"[STARTUP-DEBUG] Coordinate diagnostic failed: {e}")
+def _run_deferred_coordinate_diagnostic():
+    """Run coordinate diagnostic in background - deferred from module load"""
+    try:
+        from pathlib import Path as _DebugPath
+        _project_root = _DebugPath(__file__).resolve().parent.parent
+        _diag_script = _project_root / "diagnose_coordinate_doubling.py"
 
-# DEBUG: Install PyAutoGUI intercept to track coordinate doubling (dynamic path!)
-try:
-    from pathlib import Path as _IntPath
-    _project_root = _IntPath(__file__).resolve().parent.parent
+        if _diag_script.exists():
+            print("[STARTUP-DEBUG] Running coordinate diagnostic (deferred)...")
+            exec(_diag_script.read_text())
+    except Exception as e:
+        print(f"[STARTUP-DEBUG] Coordinate diagnostic failed: {e}")
 
-    if str(_project_root) not in sys.path:
-        sys.path.insert(0, str(_project_root))
+def _run_deferred_pyautogui_intercept():
+    """Install PyAutoGUI intercept in background - deferred from module load"""
+    try:
+        from pathlib import Path as _IntPath
+        _project_root = _IntPath(__file__).resolve().parent.parent
 
-    print("[STARTUP-DEBUG] Installing PyAutoGUI intercept...")
-    import pyautogui_intercept
+        if str(_project_root) not in sys.path:
+            sys.path.insert(0, str(_project_root))
 
-    pyautogui_intercept.install_intercept()
-    print(
-        "[STARTUP-DEBUG] ✅ PyAutoGUI intercept installed - logging to /tmp/pyautogui_intercept.log"
-    )
-except Exception as e:
-    print(f"[STARTUP-DEBUG] PyAutoGUI intercept failed: {e}")
+        import pyautogui_intercept
+        pyautogui_intercept.install_intercept()
+        print("[STARTUP-DEBUG] ✅ PyAutoGUI intercept installed (deferred)")
+    except Exception as e:
+        print(f"[STARTUP-DEBUG] PyAutoGUI intercept failed: {e}")
+
+# Queue for background execution
+_DEFERRED_DEBUG_TASKS.append(_run_deferred_coordinate_diagnostic)
+_DEFERRED_DEBUG_TASKS.append(_run_deferred_pyautogui_intercept)
+print("[STARTUP] Debug tasks deferred to background for fast startup")
 
 # Enable enhanced ML model logging
 try:
@@ -358,56 +364,60 @@ except ImportError:
     logger.warning("⚠️ Dynamic Component Manager not available - using legacy loading")
     DYNAMIC_LOADING_ENABLED = False
 
-# Initialize Advanced Thread Manager with custom policy
+# v4.0: Thread Manager initialization is now DEFERRED to lifespan
+# This was blocking module load and preventing fast startup
 thread_manager = None
-if THREAD_MANAGER_AVAILABLE:
+_thread_manager_initialized = False
+
+def _init_thread_manager_lazy():
+    """Initialize thread manager lazily - called from lifespan or on first use"""
+    global thread_manager, _thread_manager_initialized, THREAD_MANAGER_AVAILABLE
+    
+    if _thread_manager_initialized:
+        return thread_manager
+    
+    _thread_manager_initialized = True
+    
+    if not THREAD_MANAGER_AVAILABLE:
+        return None
+    
     try:
         # Create custom policy optimized for JARVIS
         thread_policy = ThreadPolicy(
-            # Shutdown timeouts (total: 20s)
-            graceful_shutdown_timeout=8.0,      # Give threads time to clean up
-            forceful_shutdown_timeout=5.0,      # Force daemon conversion
-            terminate_shutdown_timeout=4.0,     # Try force termination
-            emergency_shutdown_timeout=3.0,     # Final cleanup
-
-            # Thread limits
-            max_threads=500,                    # Reasonable limit for JARVIS
-            max_thread_lifetime=7200.0,         # 2 hours max per thread
-            warn_thread_age=1800.0,             # Warn if thread runs > 30min
-
-            # Monitoring
+            graceful_shutdown_timeout=8.0,
+            forceful_shutdown_timeout=5.0,
+            terminate_shutdown_timeout=4.0,
+            emergency_shutdown_timeout=3.0,
+            max_threads=500,
+            max_thread_lifetime=7200.0,
+            warn_thread_age=1800.0,
             enable_health_check=True,
-            health_check_interval=60.0,         # Check every minute
+            health_check_interval=60.0,
             enable_deadlock_detection=True,
-            deadlock_check_interval=120.0,      # Check every 2 minutes
-
-            # Cleanup
+            deadlock_check_interval=120.0,
             auto_cleanup_orphans=True,
-            orphan_check_interval=90.0,         # Check every 90s
-            force_daemon_on_shutdown=True,      # Convert to daemon during shutdown
-
-            # Logging
-            log_thread_creation=False,          # Reduce noise
-            log_thread_completion=False,        # Reduce noise
-            log_stack_traces=True,              # Keep for debugging
-            capture_full_stack=False,           # Only last 5 frames
-
-            # Performance
+            orphan_check_interval=90.0,
+            force_daemon_on_shutdown=True,
+            log_thread_creation=False,
+            log_thread_completion=False,
+            log_stack_traces=True,
+            capture_full_stack=False,
             use_thread_pool=True,
-            thread_pool_size=None,              # Auto-detect (CPU cores × 2)
-            recycle_threads=True                # Use weak references
+            thread_pool_size=None,
+            recycle_threads=True
         )
 
         thread_manager = get_thread_manager(policy=thread_policy)
-        logger.info("🧵 Advanced Thread Manager initialized with custom JARVIS policy")
-        logger.info(f"   Max threads: {thread_policy.max_threads}")
-        logger.info(f"   Shutdown timeout: {thread_policy.graceful_shutdown_timeout + thread_policy.forceful_shutdown_timeout + thread_policy.terminate_shutdown_timeout + thread_policy.emergency_shutdown_timeout}s")
-        logger.info(f"   Health monitoring: {thread_policy.enable_health_check}")
-        logger.info(f"   Deadlock detection: {thread_policy.enable_deadlock_detection}")
+        logger.info("🧵 Advanced Thread Manager initialized (lazy)")
+        return thread_manager
     except Exception as e:
         logger.error(f"❌ Failed to initialize Thread Manager: {e}")
-        thread_manager = None
         THREAD_MANAGER_AVAILABLE = False
+        return None
+
+# Queue for background init
+_DEFERRED_DEBUG_TASKS.append(_init_thread_manager_lazy)
+print("[STARTUP] Thread manager deferred to background for fast startup")
 
 
 async def parallel_import_components():
@@ -1121,35 +1131,21 @@ async def parallel_lifespan(app: FastAPI):
     """
     Parallel lifespan handler - server starts IMMEDIATELY.
 
-    All heavy initialization runs in background tasks after the server
-    starts serving requests. This enables:
-    - Health endpoint available within 1-2 seconds
-    - Progressive loading of ML models
-    - Graceful degradation if components fail
+    v4.0: Ultra-fast startup - all heavy initialization runs in background.
+    Server should respond to /health/ping within 1-2 seconds.
+    
+    Key optimizations:
+    - Module-level debug tasks deferred to background
+    - Thread manager initialized lazily
+    - All ML models loaded in background
     """
     from core.parallel_initializer import ParallelInitializer
 
-    # =================================================================
-    # SUPERVISOR COORDINATION: Attach progress bridge for /health/startup
-    # =================================================================
-    # When running under supervisor, the progress bridge is the single
-    # source of truth. Attach it to app so /health/startup can use it.
-    # =================================================================
-    try:
-        from core.supervisor.supervisor_integration import get_progress_bridge
-        bridge = get_progress_bridge()
-        bridge.attach_app(app)
-        logger.info("📊 Progress bridge attached for supervisor coordination")
-    except ImportError:
-        logger.debug("Supervisor integration not available")
-    except Exception as e:
-        logger.debug(f"Could not attach progress bridge: {e}")
-
+    # v4.0: Ultra-minimal pre-yield setup
     logger.info("=" * 60)
-    logger.info("PARALLEL STARTUP MODE v1.0.0")
+    logger.info("PARALLEL STARTUP MODE v4.0.0 (Ultra-Fast)")
     logger.info("=" * 60)
-    logger.info("Server will be ready immediately for health checks.")
-    logger.info("Heavy initialization runs in background.")
+    logger.info("Server accepting requests in <2s, heavy init in background")
     logger.info("=" * 60)
 
     # Create parallel initializer
@@ -1164,7 +1160,7 @@ async def parallel_lifespan(app: FastAPI):
     logger.info("")
     logger.info("=" * 60)
     logger.info("SERVER IS NOW ACCEPTING REQUESTS")
-    logger.info("  - /health/ping   -> Liveness probe")
+    logger.info("  - /health/ping   -> Liveness probe (instant)")
     logger.info("  - /health/startup -> Initialization progress")
     logger.info("  - /health        -> Full status (after init)")
     logger.info("=" * 60)
@@ -1172,6 +1168,36 @@ async def parallel_lifespan(app: FastAPI):
 
     try:
         yield
+        
+        # =====================================================================
+        # v4.0: Run deferred debug tasks in background AFTER server is serving
+        # =====================================================================
+        async def run_deferred_tasks():
+            """Run deferred tasks in background thread"""
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix='deferred') as executor:
+                for task in _DEFERRED_DEBUG_TASKS:
+                    try:
+                        executor.submit(task)
+                    except Exception as e:
+                        logger.debug(f"Deferred task failed: {e}")
+        
+        # Start deferred tasks without awaiting
+        asyncio.create_task(run_deferred_tasks())
+        
+        # =================================================================
+        # SUPERVISOR COORDINATION: Attach progress bridge for /health/startup
+        # =================================================================
+        try:
+            from core.supervisor.supervisor_integration import get_progress_bridge
+            bridge = get_progress_bridge()
+            bridge.attach_app(app)
+            logger.info("📊 Progress bridge attached for supervisor coordination")
+        except ImportError:
+            logger.debug("Supervisor integration not available")
+        except Exception as e:
+            logger.debug(f"Could not attach progress bridge: {e}")
+        
     finally:
         # Shutdown
         logger.info("Shutting down parallel startup...")

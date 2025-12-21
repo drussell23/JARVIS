@@ -8710,8 +8710,10 @@ class AsyncSystemManager:
         ping_url = f"http://localhost:{self.ports['main_api']}/health/ping"
         print(f"{Colors.CYAN}Checking server at {ping_url}...{Colors.ENDC}")
 
-        # Fast timeout - parallel startup should respond within 10 seconds
-        backend_ready = await self.wait_for_service(ping_url, timeout=30)
+        # v4.0: More generous timeout - module loading can take time on first run
+        # The /health/ping endpoint should respond within 5-10 seconds normally,
+        # but give 60 seconds for cold starts with uncached imports
+        backend_ready = await self.wait_for_service(ping_url, timeout=60)
 
         if backend_ready:
             print(f"{Colors.GREEN}Server is responding to requests{Colors.ENDC}")
