@@ -542,6 +542,28 @@
             animation: none;
         }
 
+        /* Connection status toggle hint */
+        .connection-status {
+            cursor: pointer;
+            user-select: none;
+        }
+
+        .connection-status:hover {
+            border-color: var(--jarvis-green);
+            background: rgba(0, 255, 65, 0.05);
+        }
+
+        .toggle-hint {
+            font-size: 0.7rem;
+            color: rgba(0, 255, 65, 0.5);
+            margin-left: 6px;
+            transition: transform 0.3s ease;
+        }
+
+        .connection-status.panel-hidden .toggle-hint {
+            transform: rotate(180deg);
+        }
+
         @keyframes blink {
             0%, 100% { opacity: 1; }
             50% { opacity: 0.3; }
@@ -566,6 +588,78 @@
         .details-panel.visible {
             opacity: 1;
             transform: translateY(0);
+        }
+
+        /* Minimized state */
+        .details-panel.minimized {
+            max-height: 45px;
+            overflow: hidden;
+        }
+
+        .details-panel.minimized .panel-content {
+            display: none;
+        }
+
+        .details-panel.minimized .minimize-icon {
+            transform: rotate(180deg);
+        }
+
+        /* Hidden state - completely hide the panel */
+        .details-panel.hidden {
+            display: none !important;
+        }
+
+        /* Panel control header */
+        .panel-control-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 12px;
+            padding-bottom: 10px;
+            border-bottom: 1px solid rgba(0, 255, 65, 0.2);
+        }
+
+        .details-panel.minimized .panel-control-header {
+            margin-bottom: 0;
+            padding-bottom: 0;
+            border-bottom: none;
+        }
+
+        .panel-title {
+            font-size: 0.85rem;
+            font-weight: 600;
+            color: var(--jarvis-green);
+            text-transform: uppercase;
+            letter-spacing: 0.1em;
+        }
+
+        .panel-minimize-btn {
+            background: rgba(0, 255, 65, 0.1);
+            border: 1px solid rgba(0, 255, 65, 0.3);
+            border-radius: 4px;
+            color: var(--jarvis-green);
+            width: 28px;
+            height: 28px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.3s ease;
+        }
+
+        .panel-minimize-btn:hover {
+            background: rgba(0, 255, 65, 0.2);
+            border-color: var(--jarvis-green);
+            transform: scale(1.1);
+        }
+
+        .minimize-icon {
+            font-size: 0.7rem;
+            transition: transform 0.3s ease;
+        }
+
+        .panel-content {
+            transition: all 0.3s ease;
         }
 
         .details-panel::-webkit-scrollbar {
@@ -903,16 +997,17 @@
     <!-- Particle background - floating particles above matrix -->
     <div class="particles-bg" id="particles"></div>
 
-    <!-- Connection status -->
-    <div class="connection-status">
+    <!-- Connection status - clickable to toggle details panel -->
+    <div class="connection-status" id="connection-status" title="Click to toggle details panel">
         <div class="status-indicator connecting" id="status-indicator"></div>
         <span id="status-text">Connecting to backend...</span>
+        <span class="toggle-hint" id="toggle-hint">▼</span>
     </div>
 
     <!-- Main loading container - uses flexbox for responsive layout -->
     <div class="loading-container">
         <div class="jarvis-logo" style="order: 1;">J.A.R.V.I.S.</div>
-        <div class="subtitle" id="subtitle" style="order: 2;">System Initialization</div>
+        <div class="subtitle" id="subtitle" style="order: 2;">STARTING</div>
 
         <!-- Arc Reactor -->
         <div class="arc-reactor-wrapper" style="order: 3;">
@@ -940,41 +1035,52 @@
         <!-- Stage indicators (dynamically populated) -->
         <div class="stages-container" id="stages-container" style="order: 8;"></div>
 
-        <!-- Details panel -->
+        <!-- Details panel - with minimize/hide capability -->
         <div class="details-panel" id="details-panel" style="order: 9;">
-            <!-- Phase indicator -->
-            <div class="phase-header">
-                <span class="phase-label">PHASE:</span>
-                <span id="phase-indicator" class="phase-value starting">STARTING</span>
+            <!-- Panel header with minimize button -->
+            <div class="panel-control-header">
+                <span class="panel-title">System Status</span>
+                <button class="panel-minimize-btn" id="panel-minimize-btn" title="Minimize panel" aria-label="Minimize panel">
+                    <span class="minimize-icon">▼</span>
+                </button>
             </div>
             
-            <!-- Current stage -->
-            <div class="stage-header">
-                <span id="stage-icon" class="stage-icon-large">🔄</span>
-                <span id="stage-name" class="stage-name-large">Initializing</span>
-            </div>
-            
-            <!-- Substeps -->
-            <div id="substep-list" class="substep-list"></div>
-            
-            <!-- Live operations log -->
-            <div class="operations-log" id="operations-log">
-                <div class="log-header">
-                    <span class="log-title">⚡ Live Operations</span>
-                    <span class="log-count" id="log-count">0</span>
+            <!-- Collapsible content -->
+            <div class="panel-content" id="panel-content">
+                <!-- Phase indicator -->
+                <div class="phase-header">
+                    <span class="phase-label">PHASE:</span>
+                    <span id="phase-indicator" class="phase-value starting">STARTING</span>
                 </div>
-                <div class="log-entries" id="log-entries"></div>
-            </div>
-            
-            <!-- System info -->
-            <div class="system-info">
-                <div class="info-row" id="memory-status">
-                    <span class="info-label">Memory:</span>
-                    <span class="info-value">Analyzing...</span>
+                
+                <!-- Current stage -->
+                <div class="stage-header">
+                    <span id="stage-icon" class="stage-icon-large">🔄</span>
+                    <span id="stage-name" class="stage-name-large">Initializing</span>
                 </div>
-                <div class="info-row" id="mode-indicator">
-                    <span class="info-label">Mode:</span>
-                    <span class="info-value">Detecting...</span>
+                
+                <!-- Substeps -->
+                <div id="substep-list" class="substep-list"></div>
+                
+                <!-- Live operations log -->
+                <div class="operations-log" id="operations-log">
+                    <div class="log-header">
+                        <span class="log-title">⚡ Live Operations</span>
+                        <span class="log-count" id="log-count">0</span>
+                    </div>
+                    <div class="log-entries" id="log-entries"></div>
+                </div>
+                
+                <!-- System info -->
+                <div class="system-info">
+                    <div class="info-row" id="memory-status">
+                        <span class="info-label">Memory:</span>
+                        <span class="info-value">Analyzing...</span>
+                    </div>
+                    <div class="info-row" id="mode-indicator">
+                        <span class="info-label">Mode:</span>
+                        <span class="info-value">Detecting...</span>
+                    </div>
                 </div>
             </div>
         </div>
@@ -1263,6 +1369,266 @@
                 window.matrixRain.destroy();
             }
         });
+    })();
+    </script>
+
+    <!-- Panel Minimize/Hide Functionality -->
+    <script>
+    (function() {
+        'use strict';
+
+        /**
+         * Panel Control - Minimize/Hide functionality for details panel
+         * v4.0: User can minimize or completely hide the status panel
+         */
+        class PanelController {
+            constructor() {
+                this.panel = document.getElementById('details-panel');
+                this.minimizeBtn = document.getElementById('panel-minimize-btn');
+                this.panelContent = document.getElementById('panel-content');
+                
+                if (!this.panel || !this.minimizeBtn) {
+                    console.warn('[PanelController] Required elements not found');
+                    return;
+                }
+
+                this.isMinimized = false;
+                this.isHidden = false;
+                this.clickCount = 0;
+                this.lastClickTime = 0;
+
+                // Load saved state from localStorage
+                this.loadState();
+
+                // Bind events
+                this.minimizeBtn.addEventListener('click', (e) => this.handleClick(e));
+                
+                // Keyboard shortcuts
+                document.addEventListener('keydown', (e) => this.handleKeydown(e));
+
+                // Connection status click to toggle panel
+                const connStatus = document.getElementById('connection-status');
+                if (connStatus) {
+                    connStatus.addEventListener('click', (e) => {
+                        // Don't trigger if clicking directly on minimize button
+                        if (e.target.closest('.panel-minimize-btn')) return;
+                        this.togglePanel();
+                    });
+                }
+
+                console.log('[PanelController] Initialized');
+            }
+
+            togglePanel() {
+                if (this.isHidden) {
+                    this.show();
+                } else {
+                    this.toggleMinimize();
+                }
+            }
+
+            loadState() {
+                try {
+                    const savedState = localStorage.getItem('jarvis_panel_state');
+                    if (savedState) {
+                        const state = JSON.parse(savedState);
+                        if (state.minimized) {
+                            this.minimize();
+                        } else if (state.hidden) {
+                            this.hide();
+                        }
+                    }
+                } catch (e) {
+                    console.debug('[PanelController] No saved state');
+                }
+            }
+
+            saveState() {
+                try {
+                    localStorage.setItem('jarvis_panel_state', JSON.stringify({
+                        minimized: this.isMinimized,
+                        hidden: this.isHidden
+                    }));
+                } catch (e) {
+                    console.debug('[PanelController] Could not save state');
+                }
+            }
+
+            handleClick(e) {
+                e.preventDefault();
+                const now = Date.now();
+                
+                // Double-click detection (within 300ms)
+                if (now - this.lastClickTime < 300) {
+                    this.clickCount++;
+                } else {
+                    this.clickCount = 1;
+                }
+                this.lastClickTime = now;
+
+                // Double-click = toggle hide completely
+                if (this.clickCount >= 2) {
+                    this.clickCount = 0;
+                    if (this.isHidden) {
+                        this.show();
+                    } else {
+                        this.hide();
+                    }
+                } else {
+                    // Single click = toggle minimize
+                    setTimeout(() => {
+                        if (this.clickCount === 1) {
+                            this.toggleMinimize();
+                        }
+                    }, 300);
+                }
+            }
+
+            handleKeydown(e) {
+                // 'M' key = toggle minimize
+                // 'H' key = toggle hide
+                // Escape = show panel if hidden
+                if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+
+                switch(e.key.toLowerCase()) {
+                    case 'm':
+                        if (!e.ctrlKey && !e.metaKey) {
+                            this.toggleMinimize();
+                        }
+                        break;
+                    case 'h':
+                        if (!e.ctrlKey && !e.metaKey) {
+                            if (this.isHidden) {
+                                this.show();
+                            } else {
+                                this.hide();
+                            }
+                        }
+                        break;
+                    case 'escape':
+                        if (this.isHidden) {
+                            this.show();
+                        }
+                        break;
+                }
+            }
+
+            toggleMinimize() {
+                if (this.isMinimized) {
+                    this.expand();
+                } else {
+                    this.minimize();
+                }
+            }
+
+            minimize() {
+                this.panel.classList.add('minimized');
+                this.minimizeBtn.title = 'Expand panel';
+                this.minimizeBtn.setAttribute('aria-label', 'Expand panel');
+                this.isMinimized = true;
+                this.isHidden = false;
+                this.saveState();
+            }
+
+            expand() {
+                this.panel.classList.remove('minimized');
+                this.minimizeBtn.title = 'Minimize panel (double-click to hide)';
+                this.minimizeBtn.setAttribute('aria-label', 'Minimize panel');
+                this.isMinimized = false;
+                this.saveState();
+            }
+
+            hide() {
+                this.panel.classList.add('hidden');
+                this.isHidden = true;
+                this.isMinimized = false;
+                this.saveState();
+                this.updateConnectionStatusIcon();
+                
+                // Show toast notification with restore hint
+                this.showRestoreHint();
+            }
+
+            show() {
+                this.panel.classList.remove('hidden', 'minimized');
+                this.minimizeBtn.title = 'Minimize panel (double-click to hide)';
+                this.isHidden = false;
+                this.isMinimized = false;
+                this.saveState();
+                this.updateConnectionStatusIcon();
+            }
+
+            updateConnectionStatusIcon() {
+                const connStatus = document.getElementById('connection-status');
+                if (connStatus) {
+                    if (this.isHidden) {
+                        connStatus.classList.add('panel-hidden');
+                    } else {
+                        connStatus.classList.remove('panel-hidden');
+                    }
+                }
+            }
+
+            showRestoreHint() {
+                // Create a temporary toast notification
+                const toast = document.createElement('div');
+                toast.className = 'panel-restore-hint';
+                toast.innerHTML = `
+                    <span>Panel hidden. Click status badge, press <kbd>H</kbd> or <kbd>Esc</kbd> to restore</span>
+                `;
+                toast.style.cssText = `
+                    position: fixed;
+                    bottom: 20px;
+                    right: 20px;
+                    background: rgba(0, 255, 65, 0.1);
+                    border: 1px solid rgba(0, 255, 65, 0.3);
+                    border-radius: 8px;
+                    padding: 12px 20px;
+                    color: var(--jarvis-green, #00ff41);
+                    font-size: 0.85rem;
+                    z-index: 1000;
+                    animation: fadeInUp 0.3s ease;
+                `;
+                
+                // Add fadeInUp animation if not exists
+                if (!document.getElementById('panel-hint-styles')) {
+                    const style = document.createElement('style');
+                    style.id = 'panel-hint-styles';
+                    style.textContent = `
+                        @keyframes fadeInUp {
+                            from { opacity: 0; transform: translateY(10px); }
+                            to { opacity: 1; transform: translateY(0); }
+                        }
+                        .panel-restore-hint kbd {
+                            background: rgba(0, 255, 65, 0.2);
+                            border: 1px solid rgba(0, 255, 65, 0.4);
+                            border-radius: 3px;
+                            padding: 2px 6px;
+                            font-family: monospace;
+                        }
+                    `;
+                    document.head.appendChild(style);
+                }
+                
+                document.body.appendChild(toast);
+                
+                // Remove after 3 seconds
+                setTimeout(() => {
+                    toast.style.opacity = '0';
+                    toast.style.transition = 'opacity 0.3s';
+                    setTimeout(() => toast.remove(), 300);
+                }, 3000);
+            }
+        }
+
+        // Initialize when DOM is ready
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', () => {
+                window.panelController = new PanelController();
+            });
+        } else {
+            window.panelController = new PanelController();
+        }
     })();
     </script>
 </body>

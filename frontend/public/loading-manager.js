@@ -615,9 +615,18 @@ class JARVISLoadingManager {
 
     /**
      * Create the detailed status panel dynamically
-     * Uses flexbox-friendly positioning that adapts to viewport/zoom changes
+     * v4.0: DISABLED - Using HTML-defined details-panel instead
+     * The HTML version has minimize/hide functionality built-in
      */
     createDetailedStatusPanel() {
+        // v4.0: Use existing HTML panel instead of creating a duplicate
+        // The HTML details-panel has minimize/hide functionality
+        if (document.getElementById('details-panel')) {
+            console.log('[LoadingManager] Using existing details-panel from HTML');
+            return;
+        }
+        
+        // Fallback: Only create if HTML panel doesn't exist (shouldn't happen)
         if (document.getElementById('detailed-status')) return;
 
         const panel = document.createElement('div');
@@ -1036,24 +1045,70 @@ class JARVISLoadingManager {
 
     startBackendHealthPolling() {
         /**
-         * Poll backend health directly as fallback when loading server isn't available.
-         * This ensures we can still detect when backend is ready.
+         * v4.0: Intelligent backend health polling with stuck detection
          * 
-         * IMPORTANT: This is a FALLBACK mechanism, not the primary completion trigger.
-         * - Requires multiple consecutive healthy checks before triggering
-         * - Also verifies frontend is ready before completing
-         * - Only triggers if we haven't received proper loading server updates
+         * Poll backend health directly as fallback when loading server isn't available.
+         * Also detects when we're STUCK at 95%+ and forces completion.
+         * 
+         * Features:
+         * - Multiple consecutive healthy checks before triggering
+         * - Frontend verification before completing
+         * - STUCK DETECTION: If at 95%+ for > 30s, force complete
          */
         let consecutiveHealthyChecks = 0;
-        const requiredConsecutiveChecks = 3; // Require 3 consecutive healthy checks
-        let lastLoadingServerUpdate = Date.now();
+        const requiredConsecutiveChecks = 3;
+        let stuckAt95Timer = null;
+        const STUCK_TIMEOUT_MS = 30000; // 30 seconds stuck = force complete
         
         const pollInterval = setInterval(async () => {
             try {
-                // Don't trigger completion if we're receiving loading server updates
+                // ═══════════════════════════════════════════════════════════════════════════
+                // v4.0 STUCK DETECTION: If at 95%+ for too long, force completion
+                // ═══════════════════════════════════════════════════════════════════════════
+                if (this.state.progress >= 95 && this.state.progress < 100 && !this.state.redirecting) {
+                    if (!stuckAt95Timer) {
+                        stuckAt95Timer = Date.now();
+                        console.log('[Stuck Detection] Progress at 95%+, starting timer...');
+                    } else {
+                        const stuckDuration = Date.now() - stuckAt95Timer;
+                        console.log(`[Stuck Detection] At ${Math.round(this.state.progress)}% for ${Math.round(stuckDuration/1000)}s`);
+                        
+                        if (stuckDuration >= STUCK_TIMEOUT_MS) {
+                            // We're stuck - check if services are actually ready
+                            const backendHealthy = await this.checkBackendHealth();
+                            const frontendReady = await this.checkFrontendReady();
+                            
+                            if (backendHealthy && frontendReady) {
+                                console.log('[JARVIS] ✅ Stuck detection: Services ready, forcing completion');
+                                clearInterval(pollInterval);
+                                
+                                this.handleProgressUpdate({
+                                    stage: 'complete',
+                                    message: 'JARVIS is online!',
+                                    progress: 100,
+                                    metadata: {
+                                        success: true,
+                                        forced_completion: true,
+                                        redirect_url: `${this.config.httpProtocol}//${this.config.hostname}:${this.config.mainAppPort}`
+                                    }
+                                });
+                                return;
+                            } else if (backendHealthy) {
+                                console.log('[Stuck Detection] Backend ready, waiting for frontend...');
+                            }
+                        }
+                    }
+                } else {
+                    // Reset timer if progress changes
+                    stuckAt95Timer = null;
+                }
+
+                // ═══════════════════════════════════════════════════════════════════════════
+                // FALLBACK: Standard health polling
+                // ═══════════════════════════════════════════════════════════════════════════
                 const timeSinceLoadingUpdate = Date.now() - this.state.lastUpdate;
                 if (timeSinceLoadingUpdate < 10000 && this.state.progress < 95) {
-                    // Loading server is active, let it handle completion
+                    // Loading server is active and we're not stuck, let it handle completion
                     consecutiveHealthyChecks = 0;
                     return;
                 }
@@ -1064,21 +1119,17 @@ class JARVISLoadingManager {
                     consecutiveHealthyChecks++;
                     console.log(`[Health Polling] Backend healthy (${consecutiveHealthyChecks}/${requiredConsecutiveChecks})`);
                     
-                    // Require multiple consecutive healthy checks
                     if (consecutiveHealthyChecks >= requiredConsecutiveChecks) {
-                        // Also verify frontend is ready before completing
                         const frontendReady = await this.checkFrontendReady();
                         
                         if (!frontendReady) {
                             console.log('[Health Polling] Backend ready but frontend not yet available, waiting...');
-                            // Don't reset counter, just wait for frontend
                             return;
                         }
                         
                         console.log('[JARVIS] ✅ Full system ready via fallback polling');
                         clearInterval(pollInterval);
                         
-                        // Trigger completion
                         this.handleProgressUpdate({
                             stage: 'complete',
                             message: 'JARVIS is online - All systems operational',
@@ -1090,16 +1141,13 @@ class JARVISLoadingManager {
                         });
                     }
                 } else {
-                    // Reset counter if backend becomes unhealthy
                     consecutiveHealthyChecks = 0;
                 }
             } catch (error) {
-                // Silent fail - loading server polling is primary
                 consecutiveHealthyChecks = 0;
             }
-        }, 3000); // Check every 3 seconds (slower to let loading server handle it)
+        }, 3000);
 
-        // Store interval for cleanup
         this.backendHealthInterval = pollInterval;
     }
 
@@ -1766,6 +1814,26 @@ class JARVISLoadingManager {
         const statusIndicator = document.getElementById('status-indicator');
         if (statusIndicator) {
             statusIndicator.className = `status-indicator ${status}`;
+        }
+        
+        // v4.0: Keep subtitle in sync with phase for consistency
+        // The subtitle below JARVIS logo should match the connection status
+        if (this.elements.subtitle) {
+            const phaseMap = {
+                'connected': 'CONNECTED',
+                'starting': 'STARTING',
+                'loading': 'LOADING',
+                'initializing': 'INITIALIZING',
+                'verifying': 'VERIFYING',
+                'finalizing': 'FINALIZING',
+                'ready': 'SYSTEM READY',
+                'error': 'ERROR',
+                'warning': 'WARNING'
+            };
+            const newSubtitle = phaseMap[status] || 'INITIALIZING';
+            if (this.elements.subtitle.textContent !== newSubtitle) {
+                this.elements.subtitle.textContent = newSubtitle;
+            }
         }
         
         console.log(`[Status] ${text} (${status})`);

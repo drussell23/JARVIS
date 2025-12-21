@@ -1629,13 +1629,25 @@ class SupervisorBootstrapper:
                                 is_ready = (
                                     data.get("ready") == True or
                                     data.get("operational") == True or
-                                    status in ["ready", "operational"]
+                                    status in ["ready", "operational", "degraded"]
                                 )
                                 
                                 # Also accept if WebSocket is ready (core functionality)
-                                websocket_ready = data.get("details", {}).get("websocket_ready", False)
+                                details = data.get("details", {})
+                                websocket_ready = details.get("websocket_ready", False)
                                 
-                                if is_ready or (websocket_ready and elapsed > 45):
+                                # v4.2: Accept "warming_up" status after 30s if WebSocket is ready
+                                # ML models can continue warming in background - user can interact
+                                if status == "warming_up" and elapsed > 30 and websocket_ready:
+                                    self.logger.info(f"✅ Backend warming up but functional after {elapsed:.0f}s")
+                                    is_ready = True
+                                
+                                # v4.2: Accept any responding status after 45s with WebSocket
+                                if websocket_ready and elapsed > 45:
+                                    self.logger.info(f"✅ Backend WebSocket ready after {elapsed:.0f}s")
+                                    is_ready = True
+                                
+                                if is_ready:
                                     backend_operational = True
                                     self.logger.info("✅ Backend operationally ready")
                                     await self._broadcast_to_loading_page(
@@ -1645,8 +1657,8 @@ class SupervisorBootstrapper:
                                         {"icon": "✅", "label": "Backend Ready", "backend_ready": True}
                                     )
                 except Exception as e:
-                    # /health/ready might not exist - fallback after 60s
-                    if backend_http_ready and elapsed > 60:
+                    # /health/ready might not exist - fallback after 45s if /health works
+                    if backend_http_ready and elapsed > 45:
                         backend_operational = True
                         self.logger.warning(f"⚠️ /health/ready unavailable, accepting after {elapsed:.0f}s")
                         await self._broadcast_to_loading_page(
