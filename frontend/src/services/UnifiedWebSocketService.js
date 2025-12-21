@@ -51,6 +51,11 @@ class UnifiedWebSocketService {
     
     // v3.0: Prime Directives State
     this.primeDirectiveViolation = null; // { type, action, file, limit, timestamp }
+    
+    // v5.0: Hot Reload (Dev Mode) State
+    this.hotReloadActive = false;
+    this.hotReloadStatus = null; // { state, fileCount, fileTypes, target, message, progress }
+    this.devModeEnabled = false;
 
     // Wait for config and then connect
     this._initializeWhenReady();
@@ -459,6 +464,116 @@ class UnifiedWebSocketService {
       console.log('🔄 Local changes detected:', data);
       this._handleLocalChange(data, 'changes');
     });
+
+    // ═══════════════════════════════════════════════════════════════════
+    // v5.0: HOT RELOAD (DEV MODE) EVENTS
+    // ═══════════════════════════════════════════════════════════════════
+
+    // Dev mode status
+    this.client.on('dev_mode_status', (data) => {
+      console.log('🔥 Dev mode status:', data);
+      this.devModeEnabled = data?.enabled || false;
+      this._notifySubscribers('dev_mode', { enabled: this.devModeEnabled });
+    });
+
+    // Hot reload - file changes detected
+    this.client.on('hot_reload_detected', (data) => {
+      console.log('🔥 Hot reload: changes detected:', data);
+      this.hotReloadActive = true;
+      this.hotReloadStatus = {
+        state: 'detected',
+        fileCount: data?.file_count || 0,
+        fileTypes: data?.file_types || [],
+        target: data?.target || 'backend',
+        message: data?.message || 'Code changes detected',
+        changedFiles: data?.changed_files || [],
+        timestamp: new Date().toISOString(),
+      };
+      this._notifySubscribers('hot_reload', { active: true, ...this.hotReloadStatus });
+    });
+
+    // Hot reload - restarting
+    this.client.on('hot_reload_restarting', (data) => {
+      console.log('🔥 Hot reload: restarting:', data);
+      this.hotReloadActive = true;
+      this.maintenanceMode = true;
+      this.maintenanceReason = 'hot_reload';
+      this.hotReloadStatus = {
+        ...this.hotReloadStatus,
+        state: 'restarting',
+        message: data?.message || 'Applying your changes...',
+        target: data?.target || 'backend',
+      };
+      this._notifySubscribers('hot_reload', { active: true, ...this.hotReloadStatus });
+      this._notifySubscribers('maintenance_mode', {
+        active: true,
+        reason: 'hot_reload',
+        message: this.hotReloadStatus.message,
+        estimatedTime: 10,
+      });
+    });
+
+    // Hot reload - rebuilding (frontend)
+    this.client.on('hot_reload_rebuilding', (data) => {
+      console.log('🔥 Hot reload: rebuilding frontend:', data);
+      this.hotReloadStatus = {
+        ...this.hotReloadStatus,
+        state: 'rebuilding',
+        message: data?.message || 'Rebuilding frontend...',
+        target: 'frontend',
+        progress: 0,
+      };
+      this._notifySubscribers('hot_reload', { active: true, ...this.hotReloadStatus });
+    });
+
+    // Hot reload - progress update
+    this.client.on('hot_reload_progress', (data) => {
+      this.hotReloadStatus = {
+        ...this.hotReloadStatus,
+        progress: data?.progress || 0,
+        message: data?.message || this.hotReloadStatus?.message,
+      };
+      this._notifySubscribers('hot_reload', { active: true, ...this.hotReloadStatus });
+    });
+
+    // Hot reload - complete
+    this.client.on('hot_reload_complete', (data) => {
+      console.log('✅ Hot reload complete:', data);
+      this.hotReloadActive = false;
+      this.maintenanceMode = false;
+      this.maintenanceReason = null;
+      this.hotReloadStatus = {
+        ...this.hotReloadStatus,
+        state: 'complete',
+        message: data?.message || 'Changes applied successfully',
+        duration: data?.duration || null,
+      };
+      this._notifySubscribers('hot_reload', { active: false, ...this.hotReloadStatus });
+      this._notifySubscribers('maintenance_mode', {
+        active: false,
+        reason: null,
+        message: 'Hot reload complete - JARVIS is back online',
+      });
+      
+      // Clear status after a brief delay
+      setTimeout(() => {
+        this.hotReloadStatus = null;
+        this._notifySubscribers('hot_reload', { active: false, status: null });
+      }, 5000);
+    });
+
+    // Hot reload - failed
+    this.client.on('hot_reload_failed', (data) => {
+      console.log('❌ Hot reload failed:', data);
+      this.hotReloadActive = false;
+      this.hotReloadStatus = {
+        ...this.hotReloadStatus,
+        state: 'failed',
+        message: data?.message || 'Hot reload failed',
+        error: data?.error || null,
+      };
+      this._notifySubscribers('hot_reload', { active: false, ...this.hotReloadStatus });
+    });
   }
 
   /**
@@ -741,6 +856,10 @@ export function useUnifiedWebSocket() {
   const [dmsStatus, setDmsStatus] = React.useState(null);
   // v3.0: Prime Directives state
   const [primeDirectiveViolation, setPrimeDirectiveViolation] = React.useState(null);
+  // v5.0: Hot Reload (Dev Mode) state
+  const [hotReloadActive, setHotReloadActive] = React.useState(false);
+  const [hotReloadStatus, setHotReloadStatus] = React.useState(null);
+  const [devModeEnabled, setDevModeEnabled] = React.useState(false);
   
   const service = React.useMemo(() => getUnifiedWebSocketService(), []);
 
@@ -839,6 +958,31 @@ export function useUnifiedWebSocket() {
       // Auto-clear after 10 seconds
       setTimeout(() => setPrimeDirectiveViolation(null), 10000);
     });
+    
+    // v5.0: Subscribe to Hot Reload events
+    const unsubscribeHotReload = service.subscribe('hot_reload', (data) => {
+      setHotReloadActive(data.active);
+      if (data.active || data.status) {
+        setHotReloadStatus({
+          state: data.state,
+          fileCount: data.fileCount,
+          fileTypes: data.fileTypes,
+          target: data.target,
+          message: data.message,
+          progress: data.progress,
+          changedFiles: data.changedFiles,
+          duration: data.duration,
+          error: data.error,
+        });
+      } else if (!data.active && !data.status) {
+        setHotReloadStatus(null);
+      }
+    });
+    
+    // v5.0: Subscribe to Dev Mode status
+    const unsubscribeDevMode = service.subscribe('dev_mode', (data) => {
+      setDevModeEnabled(data.enabled);
+    });
 
     // Initial connection state
     setConnected(service.isConnected());
@@ -850,6 +994,9 @@ export function useUnifiedWebSocket() {
     setZeroTouchActive(service.zeroTouchActive || false);
     setZeroTouchStatus(service.zeroTouchStatus || null);
     setDmsActive(service.dmsActive || false);
+    setHotReloadActive(service.hotReloadActive || false);
+    setHotReloadStatus(service.hotReloadStatus || null);
+    setDevModeEnabled(service.devModeEnabled || false);
     setDmsStatus(service.dmsStatus || null);
 
     // Update stats periodically
@@ -865,6 +1012,8 @@ export function useUnifiedWebSocket() {
       unsubscribeZeroTouch();
       unsubscribeDms();
       unsubscribePrimeDirective();
+      unsubscribeHotReload();
+      unsubscribeDevMode();
       clearInterval(interval);
     };
   }, [service]);
@@ -892,6 +1041,10 @@ export function useUnifiedWebSocket() {
     dmsStatus,
     // v3.0: Prime Directives
     primeDirectiveViolation,
+    // v5.0: Hot Reload (Dev Mode)
+    hotReloadActive,
+    hotReloadStatus,
+    devModeEnabled,
     // Actions
     connect: (capability) => service.connect(capability),
     disconnect: () => service.disconnect(),

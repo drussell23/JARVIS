@@ -505,6 +505,35 @@ class JARVISLoadingManager {
                 phase: 'zero_touch',
                 expectedProgress: [85, 90],
                 substeps: ['Stability check failed', 'Reverting to previous version']
+            },
+            // v5.0: Hot Reload (Dev Mode) stages
+            'hot_reload_detected': {
+                name: 'Changes Detected',
+                icon: '👀',
+                phase: 'hot_reload',
+                expectedProgress: [0, 20],
+                substeps: ['Scanning changes', 'Identifying file types']
+            },
+            'hot_reload_restarting': {
+                name: 'Hot Reloading',
+                icon: '🔥',
+                phase: 'hot_reload',
+                expectedProgress: [20, 80],
+                substeps: ['Clearing cache', 'Restarting backend']
+            },
+            'hot_reload_rebuilding': {
+                name: 'Rebuilding Frontend',
+                icon: '🔨',
+                phase: 'hot_reload',
+                expectedProgress: [30, 70],
+                substeps: ['Compiling assets', 'Building bundle']
+            },
+            'hot_reload_complete': {
+                name: 'Reload Complete',
+                icon: '✅',
+                phase: 'hot_reload',
+                expectedProgress: [100, 100],
+                substeps: ['Changes applied', 'Ready']
             }
         };
 
@@ -1750,7 +1779,8 @@ class JARVISLoadingManager {
                     'warning': 'Warning',
                     'slow': 'Slow Startup',
                     'error': 'Error',
-                    'zero_touch': 'Zero-Touch Update'
+                    'zero_touch': 'Zero-Touch Update',
+                    'hot_reload': 'Hot Reload'
                 };
                 phaseValue.textContent = phaseNames[phase] || phase;
                 phaseValue.className = `phase-value ${phase}`;

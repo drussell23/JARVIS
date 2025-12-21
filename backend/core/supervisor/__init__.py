@@ -138,6 +138,17 @@ from .unified_voice_orchestrator import (
     speak_and_wait,
     speak_critical,
 )
+from .unified_startup_voice_coordinator import (
+    UnifiedStartupVoiceCoordinator,
+    SharedStartupContext,
+    AnnouncementType,
+    CoordinatorState,
+    get_startup_voice_coordinator,
+    start_coordinated_startup,
+    announce_coordinated_greeting,
+    announce_coordinated_phase,
+    announce_coordinated_complete,
+)
 
 __all__ = [
     # Config
@@ -243,6 +254,16 @@ __all__ = [
     "speak",
     "speak_and_wait",
     "speak_critical",
+    # Unified Startup Voice Coordinator (v5.0 - coordinates narrator + announcer)
+    "UnifiedStartupVoiceCoordinator",
+    "SharedStartupContext",
+    "AnnouncementType",
+    "CoordinatorState",
+    "get_startup_voice_coordinator",
+    "start_coordinated_startup",
+    "announce_coordinated_greeting",
+    "announce_coordinated_phase",
+    "announce_coordinated_complete",
 ]
 
-__version__ = "3.0.0"  # Zero-Touch Edition
+__version__ = "5.0.0"  # Unified Startup Voice Coordination Edition

@@ -46,6 +46,10 @@ const UpdateNotificationBadge = () => {
         zeroTouchStatus,
         dmsActive,
         dmsStatus,
+        // v5.0: Hot Reload states
+        hotReloadActive,
+        hotReloadStatus,
+        devModeEnabled,
     } = useUnifiedWebSocket();
 
     const [showModal, setShowModal] = useState(false);
@@ -59,7 +63,11 @@ const UpdateNotificationBadge = () => {
     const isLocalChange = localChangesDetected && localChangeInfo;
     const isRemoteUpdate = updateAvailable && updateInfo;
     const isZeroTouchUpdate = zeroTouchActive && zeroTouchStatus;
+    const isHotReload = hotReloadActive && hotReloadStatus;
     const hasNotification = isLocalChange || isRemoteUpdate || isZeroTouchUpdate;
+    
+    // v5.0: Show dev mode indicator (separate from notifications)
+    const showDevModeIndicator = devModeEnabled && !isHotReload;
     
     // v3.0: Memoized update classification
     const updateClassification = useMemo(() => {
@@ -142,13 +150,15 @@ const UpdateNotificationBadge = () => {
         }
     }, [restartCountdown]);
 
-    // Don't render if no notification
-    if (!hasNotification) {
+    // Don't render if no notification AND no dev mode indicator
+    if (!hasNotification && !showDevModeIndicator) {
         return null;
     }
 
     // Determine badge style based on type and priority
     const getBadgeClass = () => {
+        // v5.0: Dev Mode indicator
+        if (showDevModeIndicator) return 'badge-dev-mode';
         // v3.0: Zero-Touch autonomous update
         if (isZeroTouchUpdate) {
             if (zeroTouchStatus?.state === 'applying') return 'badge-zero-touch-active';
@@ -173,6 +183,8 @@ const UpdateNotificationBadge = () => {
 
     // Get badge icon
     const getBadgeIcon = () => {
+        // v5.0: Dev Mode indicator
+        if (showDevModeIndicator) return '🔥';
         // v3.0: Zero-Touch icons
         if (isZeroTouchUpdate) {
             if (zeroTouchStatus?.state === 'applying') return '⚡';
@@ -195,6 +207,8 @@ const UpdateNotificationBadge = () => {
 
     // Get badge text
     const getBadgeText = () => {
+        // v5.0: Dev Mode indicator
+        if (showDevModeIndicator) return 'Dev Mode';
         // v3.0: Zero-Touch status text
         if (isZeroTouchUpdate) {
             if (zeroTouchStatus?.state === 'applying') return 'Auto-Updating';

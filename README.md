@@ -1,6 +1,6 @@
-# JARVIS AI Assistant v3.0.0 - Zero-Touch Edition (Living OS)
+# JARVIS AI Assistant v5.0.0 - Zero-Touch Edition (Living OS)
 
-An intelligent voice-activated AI assistant with **Zero-Touch Autonomous Update System v3.0** (Self-Updating + Dead Man's Switch + Staging Validation + Update Classification), **AGI OS Integration v3.0** (Autonomous Decision-Making + Goal Inference + User Approval Workflow), **Unified Voice Orchestrator v3.0** (Semantic Deduplication + Topic Cooldowns + Natural Pacing + Priority Queue), **Enhanced Loading Experience v3.0** (Minimizable Panels + Stuck Detection + Accurate Progress + Synchronized UI), **Intelligent Resource Orchestrator v1.0** (Active Memory Optimization + Dynamic Startup Modes + Cloud Offloading Decisions + ARM64 SIMD Detection + Parallel Resource Checks + Cost-Aware Recommendations), **Unified Startup Progress System v2.0** (Single Source of Truth + Dynamic Component Registration + Accurate Ready Detection + Multi-Channel Synchronization), **Live Operations Transparency v1.0** (Real-Time Operations Log + Supervisor-Backend Communication + Enhanced Progress Reporter), **Production-Grade Supervisor Bootstrap v2.0** (Parallel Process Discovery + Resource Validation + Dynamic Configuration + Performance Tracking), **Robust Startup Monitoring System v19.6.0** (Parallel Health Checks + Circuit Breaker + Adaptive Timeout + Smart Error Recovery), **Self-Updating Lifecycle Manager v19.6.0** (Intelligent Update Notifications + Multi-Modal Communication + Changelog Analysis), **Intelligent Memory Pressure Controller v1.0** (Adaptive Thresholds + Effectiveness Tracking + Cooldown System), **Supervisor-Aware GCP Controller v1.0** (Budget Management + Idle Shutdown + Cost-Aware Routing), **Intelligent ECAPA Backend Orchestrator v19.0.0** (Zero-Configuration Backend Selection + Concurrent Probing + Auto-Start Docker + Intelligent Fallback), **Async-Safe Statistics Tracking v1.0** (Self-Healing Consistency Validation + Atomic Counter Operations + Mathematical Invariant Enforcement), **Global Session Manager v1.0** (Thread-Safe Singleton + Multi-Terminal Conflict Prevention + Cleanup Reliability), **Cost Optimization Framework v3.0** (Scale-to-Zero VMs + Semantic Voice Caching + Spot Instance Resilience + Tiered Storage + Intelligent Cache Management), **Cloud ECAPA Client v19.2.0** (Intelligent Hybrid Cloud Voice Processing + Spot VM Auto-Creation + Cost-Aware Routing + 60% Cache Savings + RecentSpeakerCache Fast-Path Optimization with 98% Latency Reduction), **Physics-Aware Voice Authentication v2.5** (Vocal Tract Length Verification + Reverberation Analysis + Doppler Effect Detection + Bayesian Confidence Fusion + 7-Layer Anti-Spoofing), **Bayesian Confidence Fusion** (Multi-factor probability fusion with adaptive priors), **Voice Authentication Enhancement v2.1** (ChromaDB Semantic Caching + Scale-to-Zero + Langfuse Audit Trail + Behavioral Pattern Recognition), **Dynamic Restart with UE State Detection** (detects stuck macOS processes in Uninterruptible Sleep state), **Self-Healing Port Fallback System** (automatically finds healthy ports when blocked), **Dynamic Port Configuration** (loads ports from config instead of hardcoding), **Memory-Aware Startup System** (auto-detects RAM and activates GCP cloud ML when constrained), **Process-Isolated ML Loading** (prevents event loop blocking with true async wrapping), **Database Connection Leak Prevention** (proper try/finally resource cleanup), **Parallel Model Loading** (4-worker ThreadPool for 3-4x faster startup), **Comprehensive Timeout Protection** (25s unlock, 10s transcription, 8s speaker ID), **Voice Profile Database Consolidation** (unified `jarvis_learning.db` with owner migration), **Unified Voice Cache Manager** (~1ms Instant Recognition vs 200-500ms), **4-Layer Cache Architecture** (L1 Session + L2 Preloaded Profiles + L3 Database + L4 Continuous Learning), **Voice Biometric Semantic Cache with Continuous Learning** (L1-L3 Cache Layers + SQLite Database Recording), **PRD v2.0 Voice Biometric Intelligence** (AAM-Softmax + Center Loss + Triplet Loss Fine-Tuning, Platt/Isotonic Score Calibration, Comprehensive Anti-Spoofing), **Phase 2 Hybrid Database Sync** (Redis + Prometheus + ML Prefetching), **Advanced Process Detection System**, **Production-Grade Voice System**, **Cloud SQL Voice Biometric Storage**, **Real ECAPA-TDNN Speaker Embeddings**, **Advanced Voice Enrollment**, **Unified TTS Engine**, **Wake Word Detection**, **SpeechBrain STT Engine**, **CAI/SAI Locked Screen Auto-Unlock**, **Contextual Awareness Intelligence**, **Situational Awareness Intelligence**, **Backend Self-Awareness**, **Progressive Startup UX**, **GCP Spot VM Auto-Creation** (>85% memory → 32GB cloud offloading), **Advanced GCP Cost Optimization**, **Intelligent Voice-Authenticated Screen Unlock**, **Platform-Aware Memory Monitoring**, **Dynamic Speaker Recognition**, **Hybrid Cloud Auto-Scaling**, **Phase 4 Proactive Communication**, advanced multi-space desktop awareness, Claude Vision integration, and **continuous learning from every interaction**.
+An intelligent voice-activated AI assistant with **Intelligent Polyglot Hot Reload System v5.0** (Real-Time Code Changes + Multi-Language Support + Voice Feedback + Frontend Integration), **Zero-Touch Autonomous Update System v3.0** (Self-Updating + Dead Man's Switch + Staging Validation + Update Classification), **AGI OS Integration v3.0** (Autonomous Decision-Making + Goal Inference + User Approval Workflow), **Unified Voice Orchestrator v3.0** (Semantic Deduplication + Topic Cooldowns + Natural Pacing + Priority Queue), **Enhanced Loading Experience v3.0** (Minimizable Panels + Stuck Detection + Accurate Progress + Synchronized UI), **Intelligent Resource Orchestrator v1.0** (Active Memory Optimization + Dynamic Startup Modes + Cloud Offloading Decisions + ARM64 SIMD Detection + Parallel Resource Checks + Cost-Aware Recommendations), **Unified Startup Progress System v2.0** (Single Source of Truth + Dynamic Component Registration + Accurate Ready Detection + Multi-Channel Synchronization), **Live Operations Transparency v1.0** (Real-Time Operations Log + Supervisor-Backend Communication + Enhanced Progress Reporter), **Production-Grade Supervisor Bootstrap v2.0** (Parallel Process Discovery + Resource Validation + Dynamic Configuration + Performance Tracking), **Robust Startup Monitoring System v19.6.0** (Parallel Health Checks + Circuit Breaker + Adaptive Timeout + Smart Error Recovery), **Self-Updating Lifecycle Manager v19.6.0** (Intelligent Update Notifications + Multi-Modal Communication + Changelog Analysis), **Intelligent Memory Pressure Controller v1.0** (Adaptive Thresholds + Effectiveness Tracking + Cooldown System), **Supervisor-Aware GCP Controller v1.0** (Budget Management + Idle Shutdown + Cost-Aware Routing), **Intelligent ECAPA Backend Orchestrator v19.0.0** (Zero-Configuration Backend Selection + Concurrent Probing + Auto-Start Docker + Intelligent Fallback), **Async-Safe Statistics Tracking v1.0** (Self-Healing Consistency Validation + Atomic Counter Operations + Mathematical Invariant Enforcement), **Global Session Manager v1.0** (Thread-Safe Singleton + Multi-Terminal Conflict Prevention + Cleanup Reliability), **Cost Optimization Framework v3.0** (Scale-to-Zero VMs + Semantic Voice Caching + Spot Instance Resilience + Tiered Storage + Intelligent Cache Management), **Cloud ECAPA Client v19.2.0** (Intelligent Hybrid Cloud Voice Processing + Spot VM Auto-Creation + Cost-Aware Routing + 60% Cache Savings + RecentSpeakerCache Fast-Path Optimization with 98% Latency Reduction), **Physics-Aware Voice Authentication v2.5** (Vocal Tract Length Verification + Reverberation Analysis + Doppler Effect Detection + Bayesian Confidence Fusion + 7-Layer Anti-Spoofing), **Bayesian Confidence Fusion** (Multi-factor probability fusion with adaptive priors), **Voice Authentication Enhancement v2.1** (ChromaDB Semantic Caching + Scale-to-Zero + Langfuse Audit Trail + Behavioral Pattern Recognition), **Dynamic Restart with UE State Detection** (detects stuck macOS processes in Uninterruptible Sleep state), **Self-Healing Port Fallback System** (automatically finds healthy ports when blocked), **Dynamic Port Configuration** (loads ports from config instead of hardcoding), **Memory-Aware Startup System** (auto-detects RAM and activates GCP cloud ML when constrained), **Process-Isolated ML Loading** (prevents event loop blocking with true async wrapping), **Database Connection Leak Prevention** (proper try/finally resource cleanup), **Parallel Model Loading** (4-worker ThreadPool for 3-4x faster startup), **Comprehensive Timeout Protection** (25s unlock, 10s transcription, 8s speaker ID), **Voice Profile Database Consolidation** (unified `jarvis_learning.db` with owner migration), **Unified Voice Cache Manager** (~1ms Instant Recognition vs 200-500ms), **4-Layer Cache Architecture** (L1 Session + L2 Preloaded Profiles + L3 Database + L4 Continuous Learning), **Voice Biometric Semantic Cache with Continuous Learning** (L1-L3 Cache Layers + SQLite Database Recording), **PRD v2.0 Voice Biometric Intelligence** (AAM-Softmax + Center Loss + Triplet Loss Fine-Tuning, Platt/Isotonic Score Calibration, Comprehensive Anti-Spoofing), **Phase 2 Hybrid Database Sync** (Redis + Prometheus + ML Prefetching), **Advanced Process Detection System**, **Production-Grade Voice System**, **Cloud SQL Voice Biometric Storage**, **Real ECAPA-TDNN Speaker Embeddings**, **Advanced Voice Enrollment**, **Unified TTS Engine**, **Wake Word Detection**, **SpeechBrain STT Engine**, **CAI/SAI Locked Screen Auto-Unlock**, **Contextual Awareness Intelligence**, **Situational Awareness Intelligence**, **Backend Self-Awareness**, **Progressive Startup UX**, **GCP Spot VM Auto-Creation** (>85% memory → 32GB cloud offloading), **Advanced GCP Cost Optimization**, **Intelligent Voice-Authenticated Screen Unlock**, **Platform-Aware Memory Monitoring**, **Dynamic Speaker Recognition**, **Hybrid Cloud Auto-Scaling**, **Phase 4 Proactive Communication**, advanced multi-space desktop awareness, Claude Vision integration, and **continuous learning from every interaction**.
 
 ---
 
@@ -284,10 +284,13 @@ python3 start_system.py --restart
 
 JARVIS v3.0+ introduces the **Zero-Touch Autonomous Update System** — a revolutionary capability that transforms JARVIS from a static tool into a **"living OS"** that can self-update, self-heal, and evolve autonomously. Combined with **AGI OS** (Autonomous General Intelligence Operating System) integration, this creates a truly autonomous synthetic organism.
 
+**v5.0 Enhancement:** The **Intelligent Polyglot Hot Reload System** adds real-time development capabilities, enabling JARVIS to watch your entire codebase and automatically restart/rebuild when you save changes, supporting all programming languages in your polyglot stack.
+
 ### 🎯 The Vision: JARVIS as a Living OS
 
 JARVIS v3.0+ is no longer just an AI assistant — it's a **synthetic organism** with:
 
+- **🔥 Real-Time Development**: Hot reload watches your codebase and auto-restarts on save (v5.0)
 - **🔄 Self-Update Capability**: Detects, validates, and applies updates without human intervention
 - **🛡️ Dead Man's Switch**: Automatic rollback if updates cause instability
 - **🧠 AGI OS Integration**: Autonomous decision-making with user approval
@@ -866,6 +869,504 @@ python3 run_supervisor.py
 - **Rollback Analytics**: Learn from rollback patterns
 - **Update Scheduling**: Intelligent scheduling based on usage patterns
 - **Multi-Environment Support**: Staging/production update workflows
+
+---
+
+## 🔥 NEW in v5.0+: Intelligent Polyglot Hot Reload System (Dev Mode)
+
+JARVIS v5.0+ introduces the **Intelligent Polyglot Hot Reload System** — the "Holy Grail" of developer experience. This revolutionary feature enables JARVIS to **watch your entire codebase in real-time** and automatically restart or rebuild when you save changes, supporting **all programming languages** in your polyglot stack.
+
+### 🎯 The Vision: Real-Time Development
+
+**Before v5.0:**
+- Developer saves a Python file → Manually presses `CTRL+C` → Runs `python3 run_supervisor.py` again
+- Developer saves a JavaScript file → Manually rebuilds frontend → Refreshes browser
+- **Wasted seconds every minute** → Breaks "Flow State"
+
+**After v5.0:**
+- Developer saves **any file** → JARVIS **automatically detects** → **Restarts/Rebuilds** → **Ready in seconds**
+- **Zero manual intervention** → **Stay in Flow State** → **Maximum productivity**
+
+### 🚀 Key Features
+
+| Feature | Description | Benefit |
+|---------|-------------|---------|
+| **Polyglot Support** | Watches Python, Rust, Swift, JavaScript, TypeScript, CSS, HTML, YAML, TOML | Works with your entire stack |
+| **Intelligent Detection** | Dynamic file type discovery (no hardcoding!) | Automatically adapts to your codebase |
+| **Smart Restart Logic** | Backend vs Frontend vs Native rebuild decisions | Right action for right change |
+| **React HMR Integration** | Detects React Dev Server and lets HMR handle it | No redundant rebuilds |
+| **Voice Feedback** | JARVIS speaks when changes are detected | Context-aware announcements |
+| **Visual Overlay** | Orange "Hot Reload" maintenance overlay | Clear visual feedback |
+| **Dev Mode Badge** | "🔥 Dev Mode" indicator in UI | Always know when watching |
+| **Debouncing & Cooldown** | Prevents rapid-fire restarts | Stable, predictable behavior |
+| **Grace Period** | 120s startup grace period | No false positives during boot |
+
+### Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│              Intelligent Polyglot Hot Reload System v5.0                     │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  HotReloadWatcher (run_supervisor.py)                               │   │
+│  │       │                                                              │   │
+│  │       ├── IntelligentFileTypeRegistry                                │   │
+│  │       │   └── Dynamic file type discovery (no hardcoding!)          │   │
+│  │       │                                                              │   │
+│  │       ├── Parallel File Hash Calculation                            │   │
+│  │       │   └── ThreadPoolExecutor (4 workers)                        │   │
+│  │       │                                                              │   │
+│  │       ├── Change Detection Loop (every 10s)                          │   │
+│  │       │   ├── Calculate file hashes                                  │   │
+│  │       │   ├── Compare with previous hashes                          │   │
+│  │       │   └── Categorize changes (backend/frontend/native/all)      │   │
+│  │       │                                                              │   │
+│  │       └── Smart Restart Decision                                     │   │
+│  │           ├── Backend changes → Restart backend                     │   │
+│  │           ├── Frontend changes → Rebuild frontend (or HMR)         │   │
+│  │           ├── Native changes → Trigger rebuild                      │   │
+│  │           └── Config changes → Reload config                        │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                           │                                                  │
+│                           ▼                                                  │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Voice Feedback System                                              │   │
+│  │       │                                                              │   │
+│  │       ├── UnifiedStartupVoiceCoordinator                            │   │
+│  │       │   └── Routes to IntelligentStartupAnnouncer                 │   │
+│  │       │                                                              │   │
+│  │       └── Personality-Driven Messages                               │   │
+│  │           "I see you've made some updates. Restarting now."         │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                           │                                                  │
+│                           ▼                                                  │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Frontend Visual Feedback                                           │   │
+│  │       │                                                              │   │
+│  │       ├── MaintenanceOverlay (Orange Flame Theme)                   │   │
+│  │       │   ├── File type badges (🐍 Python, 🦀 Rust, etc.)          │   │
+│  │       │   ├── Change statistics                                     │   │
+│  │       │   └── Progress steps (Detect → Reload → Ready)             │   │
+│  │       │                                                              │   │
+│  │       ├── UpdateNotificationBadge ("🔥 Dev Mode")                    │   │
+│  │       │                                                              │   │
+│  │       └── Loading Manager (new stages)                               │   │
+│  │           └── hot_reload_detected, hot_reload_restarting, etc.     │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Supported File Types
+
+The Hot Reload system **dynamically discovers** all file types in your codebase. Here's what it supports:
+
+| Category | File Types | Action |
+|----------|------------|--------|
+| **Backend** | `.py`, `.pyx` | Restart backend |
+| **Native** | `.rs` (Rust), `.swift` (Swift) | Restart backend (may require rebuild) |
+| **Frontend** | `.js`, `.jsx`, `.ts`, `.tsx`, `.css`, `.html` | Rebuild frontend (or React HMR) |
+| **Config** | `.yaml`, `.yml`, `.toml`, `.json` | Restart backend (config reload) |
+| **Build** | `Cargo.toml`, `package.json`, `requirements.txt` | Full rebuild |
+| **Docs** | `.md`, `.txt`, `.rst` | No action (logging only) |
+| **Scripts** | `.sh`, `.bash` | No action (utility files) |
+
+**Example:** Your codebase has:
+- **72 Rust files** → All watched, triggers backend restart
+- **71 Swift files** → All watched, triggers backend restart
+- **63 JavaScript files** → All watched, triggers frontend rebuild
+- **21 CSS files** → All watched, triggers frontend rebuild
+- **109 Shell scripts** → All watched, but no restart (utility)
+
+### How It Works
+
+#### 1. **File Watching**
+
+The `HotReloadWatcher` runs in a background task, checking for changes every 10 seconds:
+
+```python
+# Simplified flow
+async def _monitor_loop():
+    while True:
+        await asyncio.sleep(10)  # Check interval
+        
+        # Calculate hashes for all watched files
+        current_hashes = await _calculate_file_hashes_parallel()
+        
+        # Compare with previous hashes
+        changed_files = detect_changes(current_hashes, previous_hashes)
+        
+        if changed_files:
+            # Categorize changes
+            categorized = categorize_changes(changed_files)
+            
+            # Trigger appropriate action
+            if categorized['backend']:
+                await restart_backend()
+            if categorized['frontend']:
+                await rebuild_frontend()
+```
+
+#### 2. **Intelligent File Type Registry**
+
+The system uses `IntelligentFileTypeRegistry` to **dynamically discover** file types:
+
+```python
+# No hardcoding! Discovers file types automatically
+registry = IntelligentFileTypeRegistry(repo_root)
+registry.discover_file_types()  # Scans entire codebase
+
+# Returns:
+# {
+#   'backend': ['.py', '.pyx'],
+#   'native': ['.rs', '.swift'],
+#   'frontend': ['.js', '.jsx', '.ts', '.tsx', '.css', '.html'],
+#   'config': ['.yaml', '.toml', '.json'],
+#   ...
+# }
+```
+
+#### 3. **React HMR Detection**
+
+If React Dev Server is running on port 3000, the system **skips frontend rebuilds** and lets React HMR handle it:
+
+```python
+async def _is_react_dev_server_running() -> bool:
+    """Check if React dev server is running."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    result = sock.connect_ex(('localhost', 3000))
+    return result == 0
+
+# If HMR is active, skip rebuild
+if await _is_react_dev_server_running():
+    logger.info("🌐 React HMR will handle these changes automatically")
+    return  # No rebuild needed
+```
+
+#### 4. **Voice Feedback Integration**
+
+When changes are detected, JARVIS speaks to you:
+
+```python
+# Via UnifiedStartupVoiceCoordinator
+await voice_coordinator.announce_hot_reload_detected(
+    file_count=3,
+    file_types=['Python', 'Rust'],
+    target='backend',
+)
+
+# JARVIS says: "I see you've made some updates. Restarting to incorporate changes."
+```
+
+The voice system uses **personality-driven messages** based on tone (friendly, witty, efficient, formal):
+
+- **Friendly**: "Noticed you changed some Python files!"
+- **Witty**: "Someone's been busy. 3 files modified."
+- **Efficient**: "Code changes detected. Restarting now."
+
+#### 5. **Frontend Visual Feedback**
+
+**Maintenance Overlay (Orange Flame Theme):**
+- Shows when hot reload is active
+- Displays file type badges (🐍 Python, 🦀 Rust, 📜 JavaScript)
+- Shows change statistics (file count, target)
+- Progress steps: Detect → Reload → Ready
+
+**Dev Mode Badge:**
+- "🔥 Dev Mode" indicator appears when monitoring is active
+- Click to see details
+
+**Loading Manager:**
+- New stages: `hot_reload_detected`, `hot_reload_restarting`, `hot_reload_complete`
+- Accurate progress during dev cycle restarts
+
+### Configuration
+
+#### Environment Variables
+
+```bash
+# Enable/disable dev mode (default: enabled)
+JARVIS_DEV_MODE=true
+
+# Grace period before hot reload activates (default: 120s)
+JARVIS_RELOAD_GRACE_PERIOD=120
+
+# Check interval for file changes (default: 10s)
+JARVIS_RELOAD_CHECK_INTERVAL=10
+
+# Cooldown between restarts (default: 10s)
+JARVIS_RELOAD_COOLDOWN=10
+
+# Frontend auto-rebuild when not using dev server (default: true)
+JARVIS_FRONTEND_AUTO_REBUILD=true
+
+# React dev server port to check (default: 3000)
+JARVIS_FRONTEND_DEV_PORT=3000
+
+# Verbose logging (default: false)
+JARVIS_RELOAD_VERBOSE=true
+```
+
+#### Supervisor Config (`supervisor_config.yaml`)
+
+```yaml
+dev_mode:
+  enabled: true                    # Enable hot reload
+  grace_period_seconds: 120        # Grace period after startup
+  check_interval_seconds: 10        # File check interval
+  restart_cooldown_seconds: 10     # Cooldown between restarts
+  debounce_delay_seconds: 0.5       # Debounce rapid changes
+  verbose_logging: false            # Verbose logs
+```
+
+### Usage
+
+#### Basic Usage
+
+```bash
+# Just run once - watches ALL file types automatically!
+python3 run_supervisor.py
+
+# Now edit any file:
+# - Save a Python file → Backend restarts automatically
+# - Save a JavaScript file → Frontend rebuilds (or React HMR handles it)
+# - Save a Rust file → Backend restarts (may require cargo build)
+# - Save a YAML config → Backend restarts with new config
+```
+
+#### Example Workflow
+
+```
+1. Developer runs: python3 run_supervisor.py
+   → JARVIS starts, Hot Reload watcher initializes
+   → "🔥 Hot reload watching 1,247 files"
+   → "🐍 Backend/Native: 834 files"
+   → "⚛️  Frontend: 413 files"
+
+2. Developer edits: backend/voice/speaker_verification_service.py
+   → Saves file (CTRL+S)
+
+3. Hot Reload detects change:
+   → "🔥 Detected 1 file change(s):"
+   → "   🐍 BACKEND: 1 file(s)"
+   → "     └─ backend/voice/speaker_verification_service.py"
+
+4. Voice announcement:
+   → JARVIS: "I see you've made some updates. Restarting to incorporate changes."
+
+5. Maintenance overlay appears:
+   → Orange flame theme
+   → Shows "🔥 Dev Mode Hot Reload"
+   → File type badges: 🐍 Python
+   → Progress: 👀 Detect → 🔥 Reload → ✅ Ready
+
+6. Backend restarts:
+   → Supervisor gracefully stops JARVIS
+   → Clears Python cache
+   → Restarts with new code
+
+7. Completion:
+   → JARVIS: "Changes applied successfully. Ready."
+   → Overlay fades
+   → Normal JARVIS UI returns
+```
+
+#### React Dev Server Integration
+
+If you're running React Dev Server (`npm start`), the system **automatically detects it** and lets HMR handle frontend changes:
+
+```bash
+# Terminal 1: JARVIS with hot reload
+python3 run_supervisor.py
+
+# Terminal 2: React Dev Server (optional)
+cd frontend && npm start
+
+# Now:
+# - Backend changes → JARVIS restarts backend
+# - Frontend changes → React HMR handles it (no rebuild needed)
+```
+
+### Voice Feedback System
+
+The Hot Reload system integrates with JARVIS's intelligent voice system:
+
+#### Components
+
+1. **IntelligentStartupAnnouncer** (`backend/agi_os/intelligent_startup_announcer.py`)
+   - Generates personality-driven messages
+   - Context-aware (knows what file types changed)
+   - Tone adaptation (friendly, witty, efficient, formal)
+
+2. **UnifiedStartupVoiceCoordinator** (`backend/core/supervisor/unified_startup_voice_coordinator.py`)
+   - Routes hot reload announcements to the announcer
+   - Manages shared context
+   - Prevents duplicate announcements
+
+3. **IntelligentStartupNarrator** (`backend/core/supervisor/startup_narrator.py`)
+   - Provides phase-aware narration
+   - Brief status updates during hot reload
+
+#### Example Voice Messages
+
+**Detection:**
+- "Code changes detected."
+- "I see you've been coding. 3 files changed."
+- "New code detected. Time for a quick refresh."
+
+**Restarting:**
+- "Applying your changes. Restarting now."
+- "Hot reloading with your updates."
+- "Out with the old, in with the new."
+
+**Complete:**
+- "Changes applied successfully. Ready."
+- "Hot reload complete. Back online."
+- "Fresh code, fresh start. Ready to roll."
+
+### Frontend Integration
+
+#### WebSocket Events
+
+The frontend receives real-time hot reload events via WebSocket:
+
+```javascript
+// Events from backend
+'dev_mode_status'          // Dev mode enabled/disabled
+'hot_reload_detected'      // Code changes detected
+'hot_reload_restarting'    // Backend restarting
+'hot_reload_rebuilding'    // Frontend rebuilding
+'hot_reload_progress'      // Progress updates
+'hot_reload_complete'      // Reload finished
+'hot_reload_failed'        // Reload failed
+```
+
+#### React Hook
+
+```javascript
+import { useUnifiedWebSocket } from './services/UnifiedWebSocketService';
+
+function MyComponent() {
+  const {
+    hotReloadActive,
+    hotReloadStatus,
+    devModeEnabled,
+  } = useUnifiedWebSocket();
+  
+  // hotReloadStatus contains:
+  // {
+  //   state: 'detected' | 'restarting' | 'rebuilding' | 'complete' | 'failed',
+  //   fileCount: 3,
+  //   fileTypes: ['Python', 'Rust'],
+  //   target: 'backend',
+  //   message: 'Code changes detected',
+  //   progress: 50,
+  //   changedFiles: [...],
+  //   duration: 5.2,
+  // }
+}
+```
+
+#### Maintenance Overlay
+
+The `MaintenanceOverlay` component automatically shows the hot reload overlay:
+
+```jsx
+// Automatically appears when hotReloadActive is true
+<MaintenanceOverlay />
+
+// Shows:
+// - Orange flame theme (different from Zero-Touch blue)
+// - File type badges
+// - Change statistics
+// - Progress steps
+```
+
+### Performance
+
+**Hot Reload Performance:**
+- File hash calculation: < 1 second (parallel, 4 workers)
+- Change detection: < 0.1 second (hash comparison)
+- Backend restart: 10-30 seconds (graceful shutdown + startup)
+- Frontend rebuild: 30-60 seconds (npm run build)
+- React HMR: < 1 second (instant, no rebuild)
+
+**Total Time:**
+- Backend change: ~15-30 seconds (detection → restart → ready)
+- Frontend change (with HMR): < 1 second (instant)
+- Frontend change (no HMR): ~30-60 seconds (rebuild)
+
+### Troubleshooting
+
+#### Hot Reload Not Working
+
+**Check:**
+1. Is dev mode enabled? (`JARVIS_DEV_MODE=true`)
+2. Are you running `run_supervisor.py`? (Not `start_system.py`)
+3. Is grace period over? (Wait 120 seconds after startup)
+4. Check supervisor logs for hot reload messages
+
+#### Too Many Restarts
+
+**Symptoms:**
+- JARVIS keeps restarting rapidly
+- "In cooldown" messages
+
+**Solutions:**
+1. Increase `JARVIS_RELOAD_COOLDOWN` (default: 10s)
+2. Increase `JARVIS_RELOAD_CHECK_INTERVAL` (default: 10s)
+3. Check for file watchers triggering multiple times
+
+#### Frontend Not Rebuilding
+
+**Check:**
+1. Is React Dev Server running? (Port 3000)
+2. Is `JARVIS_FRONTEND_AUTO_REBUILD=true`?
+3. Check if HMR is handling it (check browser console)
+
+#### Voice Not Announcing
+
+**Check:**
+1. Is voice enabled? (`STARTUP_NARRATOR_VOICE=true`)
+2. Check `UnifiedVoiceOrchestrator` logs
+3. Verify `UnifiedStartupVoiceCoordinator` is initialized
+
+### Best Practices
+
+1. **Use React Dev Server for Frontend:**
+   ```bash
+   # Terminal 1
+   python3 run_supervisor.py
+   
+   # Terminal 2
+   cd frontend && npm start
+   ```
+   This gives you instant HMR for frontend changes.
+
+2. **Monitor Logs:**
+   ```bash
+   # Enable verbose logging
+   export JARVIS_RELOAD_VERBOSE=true
+   python3 run_supervisor.py
+   ```
+
+3. **Respect Cooldowns:**
+   - Don't save files rapidly (wait 10s between saves)
+   - Or increase `JARVIS_RELOAD_COOLDOWN` if needed
+
+4. **Grace Period:**
+   - Wait 120 seconds after startup before expecting hot reload
+   - This prevents false positives during initial boot
+
+### Future Enhancements
+
+**Planned for v5.1+:**
+- **Incremental Rebuilds**: Only rebuild changed components
+- **Parallel Restarts**: Restart backend + rebuild frontend simultaneously
+- **Change Preview**: Show diff before restarting
+- **Rollback on Error**: Auto-rollback if restart fails
+- **Multi-Project Support**: Watch multiple codebases
+- **IDE Integration**: VS Code/Cursor extension for hot reload status
 
 ---
 

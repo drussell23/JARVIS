@@ -75,6 +75,11 @@ class StartupPhase(str, Enum):
     WARNING = "warning"  # v5.0: Warning state (startup taking too long)
     FAILED = "failed"
     RECOVERY = "recovery"
+    # v5.0: Hot Reload (Dev Mode) phases
+    HOT_RELOAD_DETECTED = "hot_reload_detected"
+    HOT_RELOAD_RESTARTING = "hot_reload_restarting"
+    HOT_RELOAD_REBUILDING = "hot_reload_rebuilding"
+    HOT_RELOAD_COMPLETE = "hot_reload_complete"
 
 
 class NarrationPriority(Enum):
@@ -305,6 +310,48 @@ PHASE_NARRATION_TEMPLATES: Dict[StartupPhase, Dict[str, List[str]]] = {
         ],
         "complete": [
             "Recovery successful.",
+        ],
+    },
+    # v5.0: Hot Reload (Dev Mode) phases
+    StartupPhase.HOT_RELOAD_DETECTED: {
+        "start": [
+            "Code changes detected.",
+            "I see you've made some updates.",
+            "New code detected.",
+        ],
+        "backend": [
+            "Backend code changed.",
+            "Python code modified.",
+        ],
+        "frontend": [
+            "Frontend code changed.",
+            "UI updates detected.",
+        ],
+        "native": [
+            "Native code changed. Rebuild may be required.",
+        ],
+    },
+    StartupPhase.HOT_RELOAD_RESTARTING: {
+        "start": [
+            "Applying your changes. Restarting now.",
+            "Hot reloading with your updates.",
+            "Restarting to incorporate changes.",
+        ],
+    },
+    StartupPhase.HOT_RELOAD_REBUILDING: {
+        "start": [
+            "Rebuilding frontend.",
+            "Compiling UI changes.",
+        ],
+        "complete": [
+            "Frontend rebuild complete.",
+        ],
+    },
+    StartupPhase.HOT_RELOAD_COMPLETE: {
+        "start": [
+            "Changes applied successfully. Ready.",
+            "Hot reload complete. Back online.",
+            "Update applied. All systems operational.",
         ],
     },
 }
@@ -818,6 +865,79 @@ class IntelligentStartupNarrator:
             ),
             "history": list(self._narration_history)[-10:],  # Last 10 entries
         }
+    
+    # =========================================================================
+    # v5.0: Hot Reload Announcements (Dev Mode)
+    # =========================================================================
+    
+    async def announce_hot_reload_detected(
+        self,
+        file_count: int,
+        file_types: List[str],
+        target: str = "backend",
+    ) -> None:
+        """
+        v5.0: Announce that code changes were detected.
+        
+        Args:
+            file_count: Number of files changed
+            file_types: Types of files (e.g., ["Python", "Rust"])
+            target: What's being affected ("backend", "frontend", "native", "all")
+        """
+        phase = StartupPhase.HOT_RELOAD_DETECTED
+        
+        # Get context-specific message
+        context = target if target in ("backend", "frontend", "native") else "start"
+        text = self._get_phase_message(phase, context)
+        
+        if not text:
+            text = f"Code changes detected. {file_count} {', '.join(file_types)} files modified."
+        
+        await self._speak(text, NarrationPriority.MEDIUM)
+    
+    async def announce_hot_reload_restarting(self, target: str = "backend") -> None:
+        """
+        v5.0: Announce that JARVIS is restarting due to code changes.
+        
+        Args:
+            target: What's being restarted
+        """
+        phase = StartupPhase.HOT_RELOAD_RESTARTING
+        text = self._get_phase_message(phase, "start") or f"Restarting {target} with your changes."
+        
+        await self._speak(text, NarrationPriority.HIGH)
+    
+    async def announce_hot_reload_rebuilding(self, target: str = "frontend") -> None:
+        """
+        v5.0: Announce that frontend is being rebuilt.
+        
+        Args:
+            target: What's being rebuilt (usually "frontend")
+        """
+        phase = StartupPhase.HOT_RELOAD_REBUILDING
+        text = self._get_phase_message(phase, "start") or f"Rebuilding {target}."
+        
+        await self._speak(text, NarrationPriority.MEDIUM)
+    
+    async def announce_hot_reload_complete(
+        self,
+        target: str = "backend",
+        duration_seconds: Optional[float] = None,
+    ) -> None:
+        """
+        v5.0: Announce that hot reload is complete.
+        
+        Args:
+            target: What was reloaded
+            duration_seconds: How long the restart took
+        """
+        phase = StartupPhase.HOT_RELOAD_COMPLETE
+        text = self._get_phase_message(phase, "start") or "Changes applied. Ready."
+        
+        if duration_seconds and duration_seconds > 3:
+            text += f" Took {duration_seconds:.1f} seconds."
+        
+        await self._speak(text, NarrationPriority.HIGH)
 
 
 # Phase mapping from progress reporter stages to StartupPhase
@@ -838,6 +958,11 @@ STAGE_TO_PHASE: Dict[str, StartupPhase] = {
     "complete": StartupPhase.COMPLETE,
     "failed": StartupPhase.FAILED,
     "error": StartupPhase.FAILED,
+    # v5.0: Hot Reload phases
+    "hot_reload_detected": StartupPhase.HOT_RELOAD_DETECTED,
+    "hot_reload_restarting": StartupPhase.HOT_RELOAD_RESTARTING,
+    "hot_reload_rebuilding": StartupPhase.HOT_RELOAD_REBUILDING,
+    "hot_reload_complete": StartupPhase.HOT_RELOAD_COMPLETE,
 }
 
 

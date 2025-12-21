@@ -16,8 +16,90 @@ ADVANCED LAZY IMPORT SYSTEM:
 - Retry with exponential backoff
 - Parallel initialization capabilities
 - Metrics collection for performance tracking
+
+v7.0: CRITICAL NUMBA FIX
+- Module-level numba initialization BEFORE any imports
+- Uses centralized numba_preload for process-wide safety
+- Blocks until numba is fully initialized
 """
 
+# =============================================================================
+# CRITICAL: NUMBA PRE-INITIALIZATION - MUST BE FIRST
+# =============================================================================
+# This MUST happen before ANY other imports that might use numba
+# (numpy operations, whisper, librosa, scipy with JIT, etc.)
+#
+# The numba circular import error occurs when multiple threads try to import
+# numba.core.utils simultaneously. By ensuring numba is fully initialized
+# at module load time (before ThreadPoolExecutor creates workers), we prevent
+# this race condition entirely.
+# =============================================================================
+import os
+import sys
+import threading
+
+_numba_ready = False
+_numba_version = None
+
+try:
+    # Import the centralized numba preloader
+    from core.numba_preload import (
+        wait_for_numba,
+        is_numba_ready,
+        get_numba_status,
+        acquire_import_lock_and_wait,
+    )
+    
+    # BLOCKING WAIT - This ensures numba is fully initialized before we continue
+    # This is critical because the imports below (numpy, soundfile) may trigger
+    # numba indirectly, and any subsequent whisper import definitely will
+    _numba_ready = wait_for_numba(timeout=60.0)
+    
+    if _numba_ready:
+        status = get_numba_status()
+        _numba_version = status.get('version')
+        # Only log in main thread to avoid log spam
+        if threading.current_thread() is threading.main_thread():
+            print(f"[whisper_audio_fix] ✅ numba {_numba_version} ready")
+    else:
+        status = get_numba_status()
+        if status.get('status') == 'not_installed':
+            # numba not installed is fine - whisper will work without JIT optimization
+            if threading.current_thread() is threading.main_thread():
+                print("[whisper_audio_fix] numba not installed (optional)")
+        else:
+            if threading.current_thread() is threading.main_thread():
+                print(f"[whisper_audio_fix] ⚠️ numba init issue: {status.get('error', 'unknown')}")
+                
+except ImportError:
+    # numba_preload module doesn't exist - fall back to direct import
+    if threading.current_thread() is threading.main_thread():
+        print("[whisper_audio_fix] numba_preload not available, using fallback")
+    try:
+        os.environ['NUMBA_DISABLE_JIT'] = '1'
+        os.environ['NUMBA_NUM_THREADS'] = '1'
+        import numba
+        from numba.core import utils as _numba_utils
+        _ = getattr(_numba_utils, 'get_hashable_key', None)
+        _numba_ready = True
+        _numba_version = numba.__version__
+        os.environ.pop('NUMBA_DISABLE_JIT', None)
+        os.environ.pop('NUMBA_NUM_THREADS', None)
+        if threading.current_thread() is threading.main_thread():
+            print(f"[whisper_audio_fix] ✅ numba {_numba_version} ready (fallback)")
+    except ImportError:
+        if threading.current_thread() is threading.main_thread():
+            print("[whisper_audio_fix] numba not installed (optional)")
+    except Exception as e:
+        if threading.current_thread() is threading.main_thread():
+            print(f"[whisper_audio_fix] ⚠️ numba fallback error: {e}")
+except Exception as e:
+    if threading.current_thread() is threading.main_thread():
+        print(f"[whisper_audio_fix] ⚠️ numba pre-init error: {e}")
+
+# =============================================================================
+# NOW SAFE TO IMPORT OTHER MODULES
+# =============================================================================
 import base64
 import numpy as np
 import tempfile
@@ -25,8 +107,6 @@ import logging
 import asyncio
 import soundfile as sf
 import io
-import os
-import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -310,102 +390,56 @@ class WhisperImportManager:
         """
         Pre-import numba using centralized process-level loader.
         
-        v6.0: Uses core.numba_preload with BLOCKING wait for thread safety.
+        v7.0: Uses module-level initialization result for instant response.
         
-        This solves the circular import issue:
-        "cannot import name 'get_hashable_key' from partially initialized module"
+        The module-level code at the top of this file already called
+        wait_for_numba() before any imports happened. This method just
+        returns the cached result.
         
-        The centralized loader ensures numba is initialized exactly ONCE
-        in the main thread before any parallel imports can access it.
-        
-        CRITICAL: Uses wait_for_numba() which BLOCKS until the main thread's
-        initialization completes. This prevents race conditions where parallel
-        threads try to import numba simultaneously.
+        Why module-level is critical:
+        - The module-level wait happens BEFORE ThreadPoolExecutor workers spawn
+        - By the time any thread gets here, numba is already fully initialized
+        - This eliminates ALL race conditions
         
         Returns numba version if successful, None otherwise.
         """
-        # Check cache first
+        global _numba_ready, _numba_version
+        
+        # Check instance cache first
         if hasattr(self, '_numba_version_cache'):
             return self._numba_version_cache
         
+        # Use module-level result (already initialized at import time)
+        if _numba_ready and _numba_version:
+            self._numba_version_cache = _numba_version
+            logger.debug(f"numba {_numba_version} ready (module-level init)")
+            return _numba_version
+        
+        # Double-check with centralized loader if module-level failed
         try:
-            # v6.0: Use wait_for_numba which BLOCKS until main thread completes
-            from core.numba_preload import wait_for_numba, get_numba_status, is_numba_ready
+            from core.numba_preload import is_numba_ready as check_numba_ready, get_numba_status
             
-            # CRITICAL: This BLOCKS until the main thread's numba initialization completes
-            # This prevents the "circular import" race condition
-            logger.debug(f"[whisper] Waiting for numba initialization (thread: {threading.current_thread().name})...")
-            success = wait_for_numba(timeout=60.0)
-            status = get_numba_status()
-            
-            if success:
+            if check_numba_ready():
+                status = get_numba_status()
                 version = status.get('version')
                 self._numba_version_cache = version
-                logger.debug(f"numba {version} available via centralized loader")
+                logger.debug(f"numba {version} ready via centralized loader")
                 return version
-            elif status['status'] == 'not_installed':
-                logger.debug("numba not installed (optional dependency)")
-                self._numba_version_cache = None
-                return None
             else:
-                # Failed but non-fatal
-                logger.warning(
-                    f"numba initialization failed (non-fatal): {status.get('error', 'unknown')}. "
-                    f"Whisper will continue without numba optimization."
-                )
+                status = get_numba_status()
+                if status.get('status') == 'not_installed':
+                    logger.debug("numba not installed (optional dependency)")
+                else:
+                    logger.debug(f"numba status: {status.get('status')}")
                 self._numba_version_cache = None
                 return None
                 
         except ImportError:
-            # Fallback if numba_preload module doesn't exist
-            logger.debug("numba_preload not available, using direct import fallback")
-            return self._pre_import_numba_fallback()
-        except Exception as e:
-            logger.warning(f"numba pre-initialization issue via centralized loader: {e}")
-            # Try fallback
-            return self._pre_import_numba_fallback()
-    
-    def _pre_import_numba_fallback(self) -> Optional[str]:
-        """
-        Fallback numba import for when centralized loader is unavailable.
-        Uses local locking - less robust but works as a fallback.
-        """
-        try:
-            import os
-            
-            # Disable JIT during import
-            original_jit = os.environ.get('NUMBA_DISABLE_JIT')
-            original_threads = os.environ.get('NUMBA_NUM_THREADS')
-            os.environ['NUMBA_DISABLE_JIT'] = '1'
-            os.environ['NUMBA_NUM_THREADS'] = '1'
-            
-            try:
-                import numba
-                from numba.core import utils as numba_utils
-                if hasattr(numba_utils, 'get_hashable_key'):
-                    _ = numba_utils.get_hashable_key
-                
-                version = numba.__version__
-                self._numba_version_cache = version
-                logger.debug(f"numba {version} pre-initialized (fallback)")
-                return version
-            finally:
-                # Restore environment
-                if original_jit is None:
-                    os.environ.pop('NUMBA_DISABLE_JIT', None)
-                else:
-                    os.environ['NUMBA_DISABLE_JIT'] = original_jit
-                if original_threads is None:
-                    os.environ.pop('NUMBA_NUM_THREADS', None)
-                else:
-                    os.environ['NUMBA_NUM_THREADS'] = original_threads
-                    
-        except ImportError:
-            logger.debug("numba not installed (optional dependency)")
+            logger.debug("numba_preload not available")
             self._numba_version_cache = None
             return None
         except Exception as e:
-            logger.warning(f"numba fallback pre-import failed (non-fatal): {e}")
+            logger.debug(f"numba status check error: {e}")
             self._numba_version_cache = None
             return None
 

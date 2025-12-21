@@ -41,12 +41,19 @@ const MaintenanceOverlay = () => {
         zeroTouchStatus,
         dmsActive,
         dmsStatus,
+        // v5.0: Hot Reload states
+        hotReloadActive,
+        hotReloadStatus,
+        devModeEnabled,
     } = useUnifiedWebSocket();
     const canvasRef = useRef(null);
     const animationRef = useRef(null);
     
     // v3.0: Determine if this is a Zero-Touch update
     const isZeroTouchUpdate = maintenanceReason === 'zero_touch' || zeroTouchActive;
+    
+    // v5.0: Determine if this is a Hot Reload
+    const isHotReload = maintenanceReason === 'hot_reload' || hotReloadActive;
 
     // Matrix rain effect
     useEffect(() => {
@@ -113,6 +120,17 @@ const MaintenanceOverlay = () => {
 
     // Determine icon based on reason
     const getIcon = () => {
+        // v5.0: Hot Reload icons
+        if (isHotReload) {
+            switch (hotReloadStatus?.state) {
+                case 'detected': return '👀';
+                case 'restarting': return '🔥';
+                case 'rebuilding': return '🔨';
+                case 'complete': return '✅';
+                case 'failed': return '❌';
+                default: return '🔥';
+            }
+        }
         // v3.0: Zero-Touch phase icons
         if (isZeroTouchUpdate) {
             switch (zeroTouchStatus?.state) {
@@ -140,6 +158,17 @@ const MaintenanceOverlay = () => {
 
     // Determine title based on reason
     const getTitle = () => {
+        // v5.0: Hot Reload titles
+        if (isHotReload) {
+            switch (hotReloadStatus?.state) {
+                case 'detected': return 'Code Changes Detected';
+                case 'restarting': return 'Hot Reloading';
+                case 'rebuilding': return 'Rebuilding Frontend';
+                case 'complete': return 'Reload Complete';
+                case 'failed': return 'Reload Failed';
+                default: return 'Hot Reload';
+            }
+        }
         // v3.0: Zero-Touch phase titles
         if (isZeroTouchUpdate) {
             switch (zeroTouchStatus?.state) {
@@ -207,7 +236,7 @@ const MaintenanceOverlay = () => {
     };
 
     return (
-        <div className={`maintenance-overlay ${isZeroTouchUpdate ? 'zero-touch-mode' : ''}`}>
+        <div className={`maintenance-overlay ${isZeroTouchUpdate ? 'zero-touch-mode' : ''} ${isHotReload ? 'hot-reload-mode' : ''}`}>
             {/* Matrix rain canvas */}
             <canvas ref={canvasRef} className="matrix-rain-canvas" />
 
@@ -252,8 +281,67 @@ const MaintenanceOverlay = () => {
 
                 {/* Message */}
                 <p className="maintenance-message">
-                    {maintenanceMessage || (isZeroTouchUpdate ? 'Autonomous update in progress...' : 'Please wait...')}
+                    {maintenanceMessage || (
+                        isHotReload ? (hotReloadStatus?.message || 'Applying your changes...') :
+                        isZeroTouchUpdate ? 'Autonomous update in progress...' : 
+                        'Please wait...'
+                    )}
                 </p>
+                
+                {/* v5.0: Hot Reload Info Panel */}
+                {isHotReload && hotReloadStatus && (
+                    <div className="hot-reload-panel">
+                        <div className="hr-header">
+                            <span className="hr-icon">🔥</span>
+                            <span className="hr-title">Dev Mode Hot Reload</span>
+                        </div>
+                        
+                        {hotReloadStatus.fileTypes && hotReloadStatus.fileTypes.length > 0 && (
+                            <div className="hr-file-types">
+                                {hotReloadStatus.fileTypes.map((type, idx) => (
+                                    <span key={idx} className="file-type-badge">
+                                        {type === 'Python' && '🐍'}
+                                        {type === 'Rust' && '🦀'}
+                                        {type === 'Swift' && '🍎'}
+                                        {type === 'JavaScript' && '📜'}
+                                        {type === 'TypeScript' && '📘'}
+                                        {' '}{type}
+                                    </span>
+                                ))}
+                            </div>
+                        )}
+                        
+                        {hotReloadStatus.fileCount > 0 && (
+                            <div className="hr-stats">
+                                <span className="hr-stat">
+                                    {hotReloadStatus.fileCount} file{hotReloadStatus.fileCount > 1 ? 's' : ''} changed
+                                </span>
+                                {hotReloadStatus.target && (
+                                    <span className="hr-stat hr-target">
+                                        Target: {hotReloadStatus.target}
+                                    </span>
+                                )}
+                            </div>
+                        )}
+                        
+                        <div className="hr-progress-steps">
+                            <div className={`hr-step ${hotReloadStatus.state === 'detected' ? 'active' : ['restarting', 'rebuilding', 'complete'].includes(hotReloadStatus.state) ? 'complete' : ''}`}>
+                                <span className="step-icon">👀</span>
+                                <span className="step-label">Detect</span>
+                            </div>
+                            <div className="phase-connector" />
+                            <div className={`hr-step ${hotReloadStatus.state === 'restarting' || hotReloadStatus.state === 'rebuilding' ? 'active' : hotReloadStatus.state === 'complete' ? 'complete' : ''}`}>
+                                <span className="step-icon">🔥</span>
+                                <span className="step-label">Reload</span>
+                            </div>
+                            <div className="phase-connector" />
+                            <div className={`hr-step ${hotReloadStatus.state === 'complete' ? 'active complete' : ''}`}>
+                                <span className="step-icon">✅</span>
+                                <span className="step-label">Ready</span>
+                            </div>
+                        </div>
+                    </div>
+                )}
                 
                 {/* v3.0: Zero-Touch Phase Progress */}
                 {isZeroTouchUpdate && (

@@ -53,6 +53,12 @@ from .unified_voice_orchestrator import (
     SpeechTopic,
     VoicePriority,
 )
+# v5.0: Unified Startup Voice Coordinator (coordinates narrator + announcer)
+from .unified_startup_voice_coordinator import (
+    UnifiedStartupVoiceCoordinator,
+    get_startup_voice_coordinator,
+    CoordinatorState,
+)
 from .update_notification import (
     UpdateNotificationOrchestrator,
     NotificationChannel,
@@ -215,6 +221,10 @@ class JARVISSupervisor:
 
         # Intelligent startup narrator for phase-aware narration (now delegates to orchestrator)
         self._startup_narrator: IntelligentStartupNarrator = get_startup_narrator()
+        
+        # v5.0: Unified Startup Voice Coordinator (coordinates narrator + announcer)
+        # This ensures both systems work together, sharing context and preventing duplicates
+        self._voice_coordinator: Optional[UnifiedStartupVoiceCoordinator] = None
 
         # Loading page support (uses loading_server.py directly)
         self._progress_reporter: Optional[Any] = None
@@ -453,7 +463,17 @@ class JARVISSupervisor:
         """
         self._set_state(SupervisorState.STARTING)
         
-        # Start the startup narrator
+        # v5.0: Initialize and start the unified voice coordinator
+        # This coordinates both startup_narrator and intelligent_startup_announcer
+        try:
+            self._voice_coordinator = await get_startup_voice_coordinator()
+            await self._voice_coordinator.start_startup()
+            logger.info("✅ Unified startup voice coordinator active")
+        except Exception as e:
+            logger.warning(f"Voice coordinator unavailable, using narrator only: {e}")
+            self._voice_coordinator = None
+        
+        # Start the startup narrator (fallback if coordinator not available)
         await self._startup_narrator.start()
         
         # Start loading page if enabled (first start or after crash)
@@ -1205,13 +1225,22 @@ class JARVISSupervisor:
                             f"   Status: {backend_status}, Services: {services_ready}, Progress: {current_progress}%"
                         )
                         
-                        # v5.0: Use accurate partial completion announcement
-                        await self._startup_narrator.announce_partial_complete(
-                            services_ready=services_ready,
-                            services_failed=system_status.get('services_failed', []) if system_status else [],
-                            progress=current_progress,
-                            duration_seconds=elapsed,
-                        )
+                        # v5.0: Use coordinator for accurate partial completion announcement
+                        # Coordinator coordinates both narrator and intelligent announcer
+                        if self._voice_coordinator:
+                            await self._voice_coordinator.announce_complete(
+                                services_ready=services_ready,
+                                services_failed=system_status.get('services_failed', []) if system_status else [],
+                                duration_seconds=elapsed,
+                            )
+                        else:
+                            # Fallback to narrator only
+                            await self._startup_narrator.announce_partial_complete(
+                                services_ready=services_ready,
+                                services_failed=system_status.get('services_failed', []) if system_status else [],
+                                progress=current_progress,
+                                duration_seconds=elapsed,
+                            )
                         
                         # Mark as partial completion - allows user to interact with available features
                         ready_for_completion = True
@@ -1255,9 +1284,21 @@ class JARVISSupervisor:
                         # Voice: Final announcement (only AFTER hub is marked complete)
                         # This prevents premature "ready" announcements
                         duration = time.time() - start_time
-                        await self._startup_narrator.announce_complete(
-                            duration_seconds=duration,
-                        )
+                        
+                        # v5.0: Use coordinator for rich, personalized completion
+                        # Coordinator uses intelligent_announcer for context-aware messages
+                        if self._voice_coordinator:
+                            services_ready = system_status.get('services_ready', []) if system_status else []
+                            await self._voice_coordinator.announce_complete(
+                                services_ready=services_ready,
+                                services_failed=[],  # Full completion = no failures
+                                duration_seconds=duration,
+                            )
+                        else:
+                            # Fallback to narrator only
+                            await self._startup_narrator.announce_complete(
+                                duration_seconds=duration,
+                            )
 
                         # ═══════════════════════════════════════════════════════════════════
                         # CRITICAL: Signal to reload manager that startup is complete

@@ -1,17 +1,27 @@
 #!/usr/bin/env python3
 """
-JARVIS Supervisor Entry Point - Production Grade v3.0 (Zero-Touch Edition)
+JARVIS Supervisor Entry Point - Production Grade v5.0 (Living OS Edition)
 ===========================================================================
 
 Advanced, robust, async, parallel, intelligent, and dynamic supervisor entry point.
+This is the SINGLE COMMAND needed to run JARVIS - it handles everything.
 
-v3.0 Zero-Touch Features:
-- Autonomous self-updating without human intervention
-- Dead Man's Switch for post-update stability verification
-- Prime Directives (immutable safety constraints)
-- Update classification (security/critical/minor/major)
-- Staging area with dry-run validation
-- AGI OS integration for intelligent decision making
+v5.0 Living OS Features:
+- 🔥 DEV MODE: Hot reload / live reload - edit code and see changes instantly
+- 🔄 Zero-Touch autonomous self-updating without human intervention
+- 🛡️ Dead Man's Switch for post-update stability verification
+- 🎙️ Unified voice coordination (narrator + announcer working together)
+- 📋 Prime Directives (immutable safety constraints)
+- 🧠 AGI OS integration for intelligent decision making
+
+Dev Mode (Hot Reload):
+    When you run `python3 run_supervisor.py`, it:
+    1. Starts JARVIS normally
+    2. Watches your code for changes (.py, .yaml files)
+    3. Automatically restarts JARVIS when you save changes
+    4. You never have to manually restart while developing!
+    
+    This is like "nodemon" for Python - write code, save, see changes.
 
 Core Features:
 - Parallel process discovery and termination with cascade strategy
@@ -31,22 +41,28 @@ Architecture:
     │  ├── IntelligentResourceOrchestrator (pre-flight checks)    │
     │  ├── DynamicConfigLoader (env + yaml + defaults)            │
     │  ├── AGIOSBridge (intelligent decision propagation)         │
+    │  ├── HotReloadWatcher (file change detection) [DEV MODE]    │
     │  └── IntelligentStartupOrchestrator (phased initialization) │
     └─────────────────────────────────────────────────────────────┘
                               │
                               ▼
     ┌─────────────────────────────────────────────────────────────┐
-    │  JARVISSupervisor (core/supervisor/jarvis_supervisor.py)     │
+    │  JARVISSupervisor (core/supervisor/jarvis_supervisor.py)    │
     │  ├── ZeroTouchEngine (autonomous updates)                   │
     │  ├── DeadManSwitch (stability verification)                 │
     │  ├── UpdateEngine (staging, validation, classification)     │
     │  ├── RollbackManager (version history, snapshots)           │
-    │  └── SupervisorNarrator v3.0 (intelligent voice feedback)   │
+    │  ├── UnifiedStartupVoiceCoordinator (narrator + announcer)  │
+    │  └── SupervisorNarrator v5.0 (intelligent voice feedback)   │
     └─────────────────────────────────────────────────────────────┘
 
 Usage:
     # Run supervisor (recommended way to start JARVIS)
+    # This is ALL you need - it handles everything including hot reload!
     python run_supervisor.py
+
+    # Disable dev mode / hot reload (production)
+    JARVIS_DEV_MODE=false python run_supervisor.py
 
     # With debug logging
     JARVIS_SUPERVISOR_LOG_LEVEL=DEBUG python run_supervisor.py
@@ -63,11 +79,14 @@ Usage:
     # Configure Dead Man's Switch probation period
     JARVIS_DMS_PROBATION_SECONDS=60 python run_supervisor.py
 
-    # Require idle system before auto-updates
-    JARVIS_ZERO_TOUCH_REQUIRE_IDLE=true python run_supervisor.py
+    # Configure hot reload check interval (default: 10s)
+    JARVIS_RELOAD_CHECK_INTERVAL=5 python run_supervisor.py
+
+    # Configure startup grace period before hot reload activates (default: 120s)
+    JARVIS_RELOAD_GRACE_PERIOD=60 python run_supervisor.py
 
 Author: JARVIS System
-Version: 3.0.0
+Version: 5.0.0
 """
 
 from __future__ import annotations
@@ -1064,6 +1083,605 @@ class TerminalUI:
 
 
 # =============================================================================
+# Hot Reload Watcher - Intelligent Polyglot File Change Detection v5.0
+# =============================================================================
+
+class FileTypeCategory(Enum):
+    """Categories of file types for intelligent restart decisions."""
+    BACKEND_CODE = "backend_code"       # Python, Rust - requires backend restart
+    FRONTEND_CODE = "frontend_code"     # JS, JSX, TS, TSX, CSS, HTML - may need frontend rebuild
+    NATIVE_CODE = "native_code"         # Swift, Rust - may need recompilation
+    CONFIG = "config"                   # YAML, TOML, JSON - configuration changes
+    SCRIPT = "script"                   # Shell scripts - utility scripts
+    DOCS = "docs"                       # Markdown, text - documentation (usually no restart)
+    BUILD = "build"                     # Cargo.toml, package.json - build configs
+    UNKNOWN = "unknown"
+
+
+@dataclass
+class FileTypeInfo:
+    """Information about a file type."""
+    extension: str
+    category: FileTypeCategory
+    requires_restart: bool
+    restart_target: str  # "backend", "frontend", "native", "all", "none"
+    description: str
+
+
+class IntelligentFileTypeRegistry:
+    """
+    Dynamically discovers and categorizes file types in the codebase.
+    
+    Instead of hardcoding patterns, this registry:
+    1. Scans the codebase to discover all file types
+    2. Categorizes them intelligently
+    3. Determines restart requirements for each type
+    """
+    
+    # Known file type mappings (extensible, not exhaustive)
+    KNOWN_TYPES: Dict[str, FileTypeInfo] = {
+        # Backend code (requires backend restart)
+        ".py": FileTypeInfo(".py", FileTypeCategory.BACKEND_CODE, True, "backend", "Python"),
+        ".pyx": FileTypeInfo(".pyx", FileTypeCategory.BACKEND_CODE, True, "backend", "Cython"),
+        ".pyi": FileTypeInfo(".pyi", FileTypeCategory.BACKEND_CODE, False, "none", "Python type stubs"),
+        
+        # Rust (native extensions - may need rebuild)
+        ".rs": FileTypeInfo(".rs", FileTypeCategory.NATIVE_CODE, True, "backend", "Rust"),
+        
+        # Swift (native macOS code - may need rebuild)
+        ".swift": FileTypeInfo(".swift", FileTypeCategory.NATIVE_CODE, True, "backend", "Swift"),
+        
+        # Frontend code
+        ".js": FileTypeInfo(".js", FileTypeCategory.FRONTEND_CODE, True, "frontend", "JavaScript"),
+        ".jsx": FileTypeInfo(".jsx", FileTypeCategory.FRONTEND_CODE, True, "frontend", "React JSX"),
+        ".ts": FileTypeInfo(".ts", FileTypeCategory.FRONTEND_CODE, True, "frontend", "TypeScript"),
+        ".tsx": FileTypeInfo(".tsx", FileTypeCategory.FRONTEND_CODE, True, "frontend", "React TSX"),
+        ".css": FileTypeInfo(".css", FileTypeCategory.FRONTEND_CODE, True, "frontend", "CSS"),
+        ".scss": FileTypeInfo(".scss", FileTypeCategory.FRONTEND_CODE, True, "frontend", "SCSS"),
+        ".less": FileTypeInfo(".less", FileTypeCategory.FRONTEND_CODE, True, "frontend", "LESS"),
+        ".html": FileTypeInfo(".html", FileTypeCategory.FRONTEND_CODE, True, "frontend", "HTML"),
+        
+        # Configuration files
+        ".yaml": FileTypeInfo(".yaml", FileTypeCategory.CONFIG, True, "backend", "YAML config"),
+        ".yml": FileTypeInfo(".yml", FileTypeCategory.CONFIG, True, "backend", "YAML config"),
+        ".toml": FileTypeInfo(".toml", FileTypeCategory.BUILD, True, "backend", "TOML config"),
+        ".json": FileTypeInfo(".json", FileTypeCategory.CONFIG, False, "none", "JSON config"),  # Usually runtime
+        ".env": FileTypeInfo(".env", FileTypeCategory.CONFIG, True, "all", "Environment"),
+        ".ini": FileTypeInfo(".ini", FileTypeCategory.CONFIG, True, "backend", "INI config"),
+        
+        # Shell scripts
+        ".sh": FileTypeInfo(".sh", FileTypeCategory.SCRIPT, False, "none", "Shell script"),
+        ".bash": FileTypeInfo(".bash", FileTypeCategory.SCRIPT, False, "none", "Bash script"),
+        ".zsh": FileTypeInfo(".zsh", FileTypeCategory.SCRIPT, False, "none", "Zsh script"),
+        
+        # Build files (require full rebuild)
+        "Cargo.toml": FileTypeInfo("Cargo.toml", FileTypeCategory.BUILD, True, "all", "Rust build"),
+        "package.json": FileTypeInfo("package.json", FileTypeCategory.BUILD, True, "frontend", "NPM package"),
+        "requirements.txt": FileTypeInfo("requirements.txt", FileTypeCategory.BUILD, True, "all", "Python deps"),
+        "pyproject.toml": FileTypeInfo("pyproject.toml", FileTypeCategory.BUILD, True, "all", "Python project"),
+        
+        # Documentation (no restart needed)
+        ".md": FileTypeInfo(".md", FileTypeCategory.DOCS, False, "none", "Markdown"),
+        ".txt": FileTypeInfo(".txt", FileTypeCategory.DOCS, False, "none", "Text"),
+        ".rst": FileTypeInfo(".rst", FileTypeCategory.DOCS, False, "none", "RST docs"),
+        
+        # SQL (may need migration)
+        ".sql": FileTypeInfo(".sql", FileTypeCategory.CONFIG, False, "none", "SQL"),
+    }
+    
+    def __init__(self, repo_root: Path, logger: logging.Logger):
+        self.repo_root = repo_root
+        self.logger = logger
+        self._discovered_extensions: Set[str] = set()
+        self._file_counts: Dict[str, int] = {}
+    
+    def discover_file_types(self) -> Dict[str, int]:
+        """
+        Dynamically discover all file types in the codebase.
+        Returns a dict of extension -> count.
+        """
+        self._discovered_extensions.clear()
+        self._file_counts.clear()
+        
+        exclude_dirs = {
+            '.git', '__pycache__', 'node_modules', 'venv', 'env',
+            '.venv', 'build', 'dist', 'target', '.cursor', '.idea',
+            '.vscode', 'coverage', '.pytest_cache', '.mypy_cache',
+        }
+        
+        for root, dirs, files in os.walk(self.repo_root):
+            # Skip excluded directories
+            dirs[:] = [d for d in dirs if d not in exclude_dirs and not d.startswith('.')]
+            
+            for file in files:
+                if file.startswith('.'):
+                    continue
+                
+                # Get extension
+                if '.' in file:
+                    ext = '.' + file.rsplit('.', 1)[-1].lower()
+                else:
+                    ext = ''
+                
+                if ext:
+                    self._discovered_extensions.add(ext)
+                    self._file_counts[ext] = self._file_counts.get(ext, 0) + 1
+        
+        return self._file_counts
+    
+    def get_file_info(self, file_path: str) -> FileTypeInfo:
+        """Get info about a file type."""
+        path = Path(file_path)
+        filename = path.name
+        
+        # Check exact filename match first (e.g., "Cargo.toml")
+        if filename in self.KNOWN_TYPES:
+            return self.KNOWN_TYPES[filename]
+        
+        # Check extension
+        ext = path.suffix.lower()
+        if ext in self.KNOWN_TYPES:
+            return self.KNOWN_TYPES[ext]
+        
+        # Unknown type - return safe default
+        return FileTypeInfo(ext, FileTypeCategory.UNKNOWN, False, "none", f"Unknown ({ext})")
+    
+    def get_watch_patterns(self) -> List[str]:
+        """
+        Dynamically generate watch patterns based on discovered file types.
+        Only includes types that require restart.
+        """
+        patterns = []
+        
+        # Discover file types if not already done
+        if not self._discovered_extensions:
+            self.discover_file_types()
+        
+        # Add patterns for known restart-requiring types
+        for ext in self._discovered_extensions:
+            if ext in self.KNOWN_TYPES:
+                info = self.KNOWN_TYPES[ext]
+                if info.requires_restart:
+                    patterns.append(f"**/*{ext}")
+            else:
+                # For unknown types, be conservative - don't watch by default
+                pass
+        
+        # Always include important config files
+        patterns.extend([
+            "**/Cargo.toml",
+            "**/package.json",
+            "**/requirements.txt",
+            "**/pyproject.toml",
+        ])
+        
+        return list(set(patterns))  # Deduplicate
+    
+    def categorize_changes(self, changed_files: List[str]) -> Dict[str, List[str]]:
+        """
+        Categorize changed files by restart target.
+        Returns dict of target -> list of files.
+        """
+        categorized: Dict[str, List[str]] = {
+            "backend": [],
+            "frontend": [],
+            "native": [],
+            "all": [],
+            "none": [],
+        }
+        
+        for file_path in changed_files:
+            info = self.get_file_info(file_path)
+            categorized[info.restart_target].append(file_path)
+        
+        return categorized
+    
+    def get_summary(self) -> str:
+        """Get a summary of discovered file types."""
+        if not self._file_counts:
+            self.discover_file_types()
+        
+        # Sort by count
+        sorted_types = sorted(self._file_counts.items(), key=lambda x: -x[1])
+        
+        lines = ["File types in codebase:"]
+        for ext, count in sorted_types[:15]:  # Top 15
+            info = self.KNOWN_TYPES.get(ext, None)
+            if info:
+                restart = "🔄" if info.requires_restart else "📝"
+                lines.append(f"  {restart} {ext}: {count} files ({info.description})")
+            else:
+                lines.append(f"  ❓ {ext}: {count} files")
+        
+        if len(sorted_types) > 15:
+            lines.append(f"  ... and {len(sorted_types) - 15} more types")
+        
+        return "\n".join(lines)
+
+
+class HotReloadWatcher:
+    """
+    v5.0: Intelligent polyglot hot reload watcher.
+    
+    Features:
+    - Dynamic file type discovery (no hardcoding!)
+    - Category-based restart decisions (backend vs frontend)
+    - Parallel file hash calculation
+    - Smart debouncing and cooldown
+    - Frontend rebuild support (npm run build)
+    - React dev server detection (skip if HMR is active)
+    """
+    
+    def __init__(self, config: BootstrapConfig, logger: logging.Logger):
+        self.config = config
+        self.logger = logger
+        self.repo_root = Path(__file__).parent
+        self.frontend_dir = self.repo_root / "frontend"
+        self.backend_dir = self.repo_root / "backend"
+        
+        # Configuration from environment
+        self.enabled = os.getenv("JARVIS_DEV_MODE", "true").lower() == "true"
+        self.grace_period = int(os.getenv("JARVIS_RELOAD_GRACE_PERIOD", "120"))
+        self.check_interval = int(os.getenv("JARVIS_RELOAD_CHECK_INTERVAL", "10"))
+        self.cooldown_seconds = int(os.getenv("JARVIS_RELOAD_COOLDOWN", "10"))
+        self.verbose = os.getenv("JARVIS_RELOAD_VERBOSE", "false").lower() == "true"
+        
+        # Frontend-specific config
+        self.frontend_auto_rebuild = os.getenv("JARVIS_FRONTEND_AUTO_REBUILD", "true").lower() == "true"
+        self.frontend_dev_server_port = int(os.getenv("JARVIS_FRONTEND_DEV_PORT", "3000"))
+        
+        # Intelligent file type registry
+        self._type_registry = IntelligentFileTypeRegistry(self.repo_root, logger)
+        
+        # Exclude patterns (directories and file patterns to skip)
+        self.exclude_dirs = {
+            '.git', '__pycache__', 'node_modules', 'venv', 'env',
+            '.venv', 'build', 'dist', 'target', '.cursor', '.idea',
+            '.vscode', 'coverage', '.pytest_cache', '.mypy_cache',
+            'logs', 'cache', '.jarvis_cache', 'htmlcov',
+        }
+        self.exclude_patterns = [
+            "*.pyc", "*.pyo", "*.log", "*.tmp", "*.bak",
+            "*.swp", "*.swo", "*~", ".DS_Store",
+        ]
+        
+        # State
+        self._start_time = time.time()
+        self._file_hashes: Dict[str, str] = {}
+        self._last_restart_time = 0.0
+        self._last_frontend_rebuild_time = 0.0
+        self._grace_period_ended = False
+        self._monitor_task: Optional[asyncio.Task] = None
+        self._restart_callback: Optional[Callable] = None
+        self._frontend_callback: Optional[Callable] = None
+        self._pending_changes: List[str] = []
+        self._pending_frontend_changes: List[str] = []
+        self._debounce_task: Optional[asyncio.Task] = None
+        self._frontend_debounce_task: Optional[asyncio.Task] = None
+        self._react_dev_server_running: Optional[bool] = None
+    
+    def set_restart_callback(self, callback: Callable) -> None:
+        """Set the callback to invoke when a backend restart is needed."""
+        self._restart_callback = callback
+    
+    def set_frontend_callback(self, callback: Callable) -> None:
+        """Set the callback to invoke when a frontend rebuild is needed."""
+        self._frontend_callback = callback
+    
+    async def _is_react_dev_server_running(self) -> bool:
+        """
+        Check if React dev server is running.
+        If it is, we don't need to trigger rebuilds - React HMR handles it.
+        """
+        if self._react_dev_server_running is not None:
+            return self._react_dev_server_running
+        
+        import socket
+        
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(1)
+            result = sock.connect_ex(('localhost', self.frontend_dev_server_port))
+            sock.close()
+            
+            self._react_dev_server_running = (result == 0)
+            
+            if self._react_dev_server_running:
+                self.logger.info(f"🌐 React dev server detected on port {self.frontend_dev_server_port} - HMR active")
+            else:
+                self.logger.info("📦 React dev server not running - will trigger rebuilds on frontend changes")
+            
+            return self._react_dev_server_running
+        except Exception:
+            self._react_dev_server_running = False
+            return False
+    
+    async def _rebuild_frontend(self, changed_files: List[str]) -> bool:
+        """
+        Trigger frontend rebuild (npm run build).
+        Only runs if React dev server is NOT running.
+        """
+        if await self._is_react_dev_server_running():
+            self.logger.info("   🔄 React HMR will handle these changes automatically")
+            return True
+        
+        if not self.frontend_auto_rebuild:
+            self.logger.info("   ⚠️ Frontend auto-rebuild disabled (JARVIS_FRONTEND_AUTO_REBUILD=false)")
+            return False
+        
+        self.logger.info("   🔨 Triggering frontend rebuild...")
+        
+        try:
+            # Run npm run build in frontend directory
+            process = await asyncio.create_subprocess_exec(
+                "npm", "run", "build",
+                cwd=str(self.frontend_dir),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env={**os.environ, "CI": "true"}  # Prevent interactive prompts
+            )
+            
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=120)
+            
+            if process.returncode == 0:
+                self.logger.info("   ✅ Frontend rebuild completed successfully")
+                return True
+            else:
+                self.logger.error(f"   ❌ Frontend rebuild failed: {stderr.decode()[:200]}")
+                return False
+                
+        except asyncio.TimeoutError:
+            self.logger.error("   ❌ Frontend rebuild timed out (120s)")
+            return False
+        except Exception as e:
+            self.logger.error(f"   ❌ Frontend rebuild error: {e}")
+            return False
+    
+    def _should_watch_file(self, file_path: Path) -> bool:
+        """Determine if a file should be watched."""
+        # Check if in excluded directory
+        for part in file_path.parts:
+            if part in self.exclude_dirs or part.startswith('.'):
+                return False
+        
+        # Check exclude patterns
+        from fnmatch import fnmatch
+        for pattern in self.exclude_patterns:
+            if fnmatch(file_path.name, pattern):
+                return False
+        
+        # Check if file type requires restart
+        info = self._type_registry.get_file_info(str(file_path))
+        return info.requires_restart
+    
+    def _calculate_file_hashes_parallel(self) -> Dict[str, str]:
+        """Calculate file hashes in parallel for speed."""
+        import hashlib
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        
+        def hash_file(file_path: Path) -> Tuple[str, Optional[str]]:
+            try:
+                with open(file_path, 'rb') as f:
+                    return str(file_path.relative_to(self.repo_root)), hashlib.md5(f.read()).hexdigest()
+            except Exception:
+                return str(file_path), None
+        
+        files_to_hash = []
+        
+        # Walk directories and find watchable files
+        for root, dirs, files in os.walk(self.repo_root):
+            # Filter out excluded directories
+            dirs[:] = [d for d in dirs if d not in self.exclude_dirs and not d.startswith('.')]
+            
+            root_path = Path(root)
+            for file in files:
+                file_path = root_path / file
+                if self._should_watch_file(file_path):
+                    files_to_hash.append(file_path)
+        
+        # Calculate hashes in parallel
+        hashes = {}
+        with ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as executor:
+            futures = {executor.submit(hash_file, fp): fp for fp in files_to_hash}
+            for future in as_completed(futures):
+                rel_path, file_hash = future.result()
+                if file_hash:
+                    hashes[rel_path] = file_hash
+        
+        return hashes
+    
+    def _detect_changes(self) -> Tuple[bool, List[str], Dict[str, List[str]]]:
+        """
+        Detect which files have changed.
+        Returns: (has_changes, changed_files, categorized_changes)
+        """
+        current = self._calculate_file_hashes_parallel()
+        changed = []
+        
+        for path, hash_val in current.items():
+            if path not in self._file_hashes or self._file_hashes[path] != hash_val:
+                changed.append(path)
+        
+        # Check for deleted files
+        for path in self._file_hashes:
+            if path not in current:
+                changed.append(f"[DELETED] {path}")
+        
+        self._file_hashes = current
+        
+        # Categorize changes
+        categorized = self._type_registry.categorize_changes(changed)
+        
+        return len(changed) > 0, changed, categorized
+    
+    def _is_in_grace_period(self) -> bool:
+        """Check if we're still in the startup grace period."""
+        elapsed = time.time() - self._start_time
+        in_grace = elapsed < self.grace_period
+        
+        if not in_grace and not self._grace_period_ended:
+            self._grace_period_ended = True
+            self.logger.info(f"⏰ Hot reload grace period ended after {elapsed:.0f}s - now active")
+        
+        return in_grace
+    
+    def _is_in_cooldown(self) -> bool:
+        """Check if we're in cooldown from a recent restart."""
+        return (time.time() - self._last_restart_time) < self.cooldown_seconds
+    
+    async def start(self) -> None:
+        """Start the hot reload watcher."""
+        if not self.enabled:
+            self.logger.info("🔥 Hot reload disabled (JARVIS_DEV_MODE=false)")
+            return
+        
+        # Discover and log file types
+        self._type_registry.discover_file_types()
+        
+        if self.verbose:
+            self.logger.info(self._type_registry.get_summary())
+        
+        # Initialize file hashes
+        self._file_hashes = self._calculate_file_hashes_parallel()
+        
+        # Count files by category
+        backend_count = 0
+        frontend_count = 0
+        for file_path in self._file_hashes:
+            info = self._type_registry.get_file_info(file_path)
+            if info.restart_target == "backend" or info.restart_target == "native":
+                backend_count += 1
+            elif info.restart_target == "frontend":
+                frontend_count += 1
+        
+        # Log summary
+        watch_patterns = self._type_registry.get_watch_patterns()
+        file_types = sorted(set(p.split('*')[-1] for p in watch_patterns if '*' in p))
+        
+        self.logger.info(f"🔥 Hot reload watching {len(self._file_hashes)} files")
+        self.logger.info(f"   🐍 Backend/Native: {backend_count} files")
+        self.logger.info(f"   ⚛️  Frontend: {frontend_count} files")
+        self.logger.info(f"   File types: {', '.join(file_types)}")
+        self.logger.info(f"   Grace period: {self.grace_period}s, Check interval: {self.check_interval}s")
+        
+        # Start monitor task
+        self._monitor_task = asyncio.create_task(self._monitor_loop())
+    
+    async def stop(self) -> None:
+        """Stop the hot reload watcher."""
+        if self._monitor_task:
+            self._monitor_task.cancel()
+            try:
+                await self._monitor_task
+            except asyncio.CancelledError:
+                pass
+        
+        if self._debounce_task:
+            self._debounce_task.cancel()
+        
+        if self._frontend_debounce_task:
+            self._frontend_debounce_task.cancel()
+    
+    async def _debounced_restart(self, delay: float = 0.5) -> None:
+        """Debounce rapid backend file changes into a single restart."""
+        await asyncio.sleep(delay)
+        
+        if self._pending_changes and self._restart_callback:
+            changes = self._pending_changes.copy()
+            self._pending_changes.clear()
+            
+            self._last_restart_time = time.time()
+            await self._restart_callback(changes)
+    
+    async def _debounced_frontend_rebuild(self, delay: float = 1.0) -> None:
+        """Debounce rapid frontend file changes into a single rebuild."""
+        await asyncio.sleep(delay)
+        
+        if self._pending_frontend_changes:
+            changes = self._pending_frontend_changes.copy()
+            self._pending_frontend_changes.clear()
+            
+            self._last_frontend_rebuild_time = time.time()
+            await self._rebuild_frontend(changes)
+    
+    async def _monitor_loop(self) -> None:
+        """Main monitoring loop."""
+        # Check React dev server status on first run
+        await self._is_react_dev_server_running()
+        
+        while True:
+            try:
+                await asyncio.sleep(self.check_interval)
+                
+                # Skip during grace period
+                if self._is_in_grace_period():
+                    continue
+                
+                # Check for changes
+                has_changes, changed_files, categorized = self._detect_changes()
+                
+                if has_changes:
+                    # Log changes by category
+                    self.logger.info(f"🔥 Detected {len(changed_files)} file change(s):")
+                    
+                    for target, files in categorized.items():
+                        if files and target != "none":
+                            icon = {
+                                "backend": "🐍",
+                                "frontend": "⚛️",
+                                "native": "🦀",
+                                "all": "🌐",
+                            }.get(target, "📁")
+                            self.logger.info(f"   {icon} {target.upper()}: {len(files)} file(s)")
+                            if self.verbose:
+                                for f in files[:3]:
+                                    self.logger.info(f"     └─ {f}")
+                                if len(files) > 3:
+                                    self.logger.info(f"     └─ ... and {len(files) - 3} more")
+                    
+                    # Separate backend and frontend changes
+                    backend_changes = categorized.get("backend", []) + categorized.get("native", []) + categorized.get("all", [])
+                    frontend_changes = categorized.get("frontend", []) + categorized.get("all", [])
+                    
+                    # Handle backend changes
+                    if backend_changes:
+                        if self._is_in_cooldown():
+                            remaining = self.cooldown_seconds - (time.time() - self._last_restart_time)
+                            self.logger.info(f"   ⏳ Backend cooldown ({remaining:.0f}s remaining), deferring")
+                            self._pending_changes.extend(backend_changes)
+                        else:
+                            self._pending_changes.extend(backend_changes)
+                            if self._debounce_task:
+                                self._debounce_task.cancel()
+                            self._debounce_task = asyncio.create_task(self._debounced_restart())
+                    
+                    # Handle frontend changes
+                    if frontend_changes:
+                        # Check frontend cooldown
+                        frontend_cooldown = (time.time() - self._last_frontend_rebuild_time) < self.cooldown_seconds
+                        
+                        if frontend_cooldown:
+                            remaining = self.cooldown_seconds - (time.time() - self._last_frontend_rebuild_time)
+                            self.logger.info(f"   ⏳ Frontend cooldown ({remaining:.0f}s remaining), deferring")
+                            self._pending_frontend_changes.extend(frontend_changes)
+                        else:
+                            self._pending_frontend_changes.extend(frontend_changes)
+                            if self._frontend_debounce_task:
+                                self._frontend_debounce_task.cancel()
+                            self._frontend_debounce_task = asyncio.create_task(self._debounced_frontend_rebuild())
+                    
+                    # Log if only docs changed
+                    if not backend_changes and not frontend_changes:
+                        self.logger.info("   📝 Changes don't require restart (docs only)")
+                
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.logger.error(f"Hot reload monitor error: {e}")
+                await asyncio.sleep(self.check_interval)
+
+
+# =============================================================================
 # Main Orchestrator - Intelligent Startup Sequence
 # =============================================================================
 
@@ -1086,6 +1704,11 @@ class SupervisorBootstrapper:
         self.phase = StartupPhase.INIT
         self._shutdown_event = asyncio.Event()
         self._loading_server_process: Optional[asyncio.subprocess.Process] = None  # Track for cleanup
+        
+        # v5.0: Hot Reload Watcher for dev mode
+        self._hot_reload = HotReloadWatcher(self.config, self.logger)
+        self._hot_reload.set_restart_callback(self._on_hot_reload_triggered)
+        self._supervisor: Optional[Any] = None  # Reference to running supervisor for restart
         
         # CRITICAL: Set CI=true to prevent npm start from hanging interactively
         # if port 3000 is taken. This ensures we fail fast or handle it automatically.
@@ -1236,6 +1859,7 @@ class SupervisorBootstrapper:
             
             from core.supervisor import JARVISSupervisor
             supervisor = JARVISSupervisor()
+            self._supervisor = supervisor  # Store reference for hot reload
             
             self._print_config_summary(supervisor)
             self.perf.end("supervisor_init")
@@ -1273,9 +1897,15 @@ class SupervisorBootstrapper:
             else:
                 monitoring_task = None
             
+            # v5.0: Start hot reload watcher (dev mode)
+            await self._hot_reload.start()
+            
             try:
                 await supervisor.run()
             finally:
+                # Stop hot reload watcher
+                await self._hot_reload.stop()
+                
                 # Cancel monitoring if still running
                 if monitoring_task and not monitoring_task.done():
                     monitoring_task.cancel()
@@ -1878,6 +2508,108 @@ class SupervisorBootstrapper:
                 self.logger.info("🧠 AGI OS module available - will integrate with supervisor")
             except ImportError:
                 self.logger.debug("AGI OS module not available - supervisor will operate independently")
+    
+    async def _on_hot_reload_triggered(self, changed_files: List[str]) -> None:
+        """
+        v5.0: Handle hot reload trigger - restart JARVIS with new code.
+        
+        This is called by the HotReloadWatcher when file changes are detected.
+        """
+        self.logger.info(f"🔥 Hot reload triggered by {len(changed_files)} file change(s)")
+        restart_start_time = time.time()
+        
+        if not self._supervisor:
+            self.logger.warning("No supervisor reference - cannot hot reload")
+            return
+        
+        # Detect file types for announcement
+        file_types = []
+        for f in changed_files:
+            ext = Path(f).suffix.lower()
+            if ext in (".py", ".pyx"):
+                if "Python" not in file_types:
+                    file_types.append("Python")
+            elif ext in (".rs",):
+                if "Rust" not in file_types:
+                    file_types.append("Rust")
+            elif ext in (".swift",):
+                if "Swift" not in file_types:
+                    file_types.append("Swift")
+            elif ext in (".js", ".jsx"):
+                if "JavaScript" not in file_types:
+                    file_types.append("JavaScript")
+            elif ext in (".ts", ".tsx"):
+                if "TypeScript" not in file_types:
+                    file_types.append("TypeScript")
+        
+        # v5.0: Announce changes via voice coordinator
+        try:
+            from core.supervisor import get_startup_voice_coordinator
+            voice_coordinator = get_startup_voice_coordinator()
+            
+            # Announce detection
+            await voice_coordinator.announce_hot_reload_detected(
+                file_count=len(changed_files),
+                file_types=file_types,
+                target="backend",
+            )
+            
+            # Announce restart
+            await voice_coordinator.announce_hot_reload_restarting(target="backend")
+            
+        except Exception as e:
+            self.logger.debug(f"Voice announcement failed (non-fatal): {e}")
+        
+        try:
+            # Clear Python cache for changed modules
+            self._clear_python_cache(changed_files)
+            
+            # Request supervisor restart (this gracefully stops and restarts JARVIS)
+            # The supervisor has built-in restart capability
+            from core.supervisor import request_restart, RestartSource, RestartUrgency
+            
+            await request_restart(
+                source=RestartSource.DEV_MODE,
+                reason=f"Hot reload: {len(changed_files)} file(s) changed",
+                urgency=RestartUrgency.NORMAL,
+            )
+            
+            self.logger.info("✅ Restart requested via supervisor")
+            
+            # v5.0: Announce completion (after restart completes)
+            # Note: This runs before restart actually completes, but we still announce
+            # The actual restart will trigger a full startup sequence with its own announcements
+            
+        except Exception as e:
+            self.logger.error(f"Hot reload failed: {e}")
+            # Fallback: Try direct supervisor restart
+            try:
+                if hasattr(self._supervisor, '_handle_restart_request'):
+                    await self._supervisor._handle_restart_request()
+            except Exception as e2:
+                self.logger.error(f"Fallback restart also failed: {e2}")
+    
+    def _clear_python_cache(self, changed_files: List[str]) -> None:
+        """Clear Python import cache for changed modules."""
+        import shutil
+        
+        # Clear __pycache__ directories
+        for cache_dir in (Path(__file__).parent / "backend").glob("**/__pycache__"):
+            try:
+                shutil.rmtree(cache_dir)
+            except Exception:
+                pass
+        
+        # Clear sys.modules for JARVIS modules
+        modules_to_clear = []
+        for module_name in list(sys.modules.keys()):
+            if 'jarvis' in module_name.lower() or 'backend' in module_name.lower():
+                modules_to_clear.append(module_name)
+        
+        for module_name in modules_to_clear:
+            sys.modules.pop(module_name, None)
+        
+        self.logger.debug(f"Cleared {len(modules_to_clear)} cached modules")
     
     def _print_config_summary(self, supervisor) -> None:
         """Print supervisor configuration summary."""

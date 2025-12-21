@@ -108,6 +108,20 @@ class StartupType(Enum):
     SCREEN_UNLOCK = "unlock"            # Screen unlock
     PARTIAL_BOOT = "partial_boot"       # v5.0: Partial completion (some services failed)
     SLOW_BOOT = "slow_boot"             # v5.0: Extended startup time
+    # v5.0: Hot Reload (Dev Mode)
+    HOT_RELOAD = "hot_reload"           # Code change detected, restarting
+    HOT_RELOAD_BACKEND = "hot_reload_backend"    # Backend code changed
+    HOT_RELOAD_FRONTEND = "hot_reload_frontend"  # Frontend code changed
+    HOT_RELOAD_NATIVE = "hot_reload_native"      # Rust/Swift code changed
+
+
+class HotReloadContext(Enum):
+    """Context for hot reload announcements."""
+    DETECTED = "detected"               # Changes detected
+    RESTARTING = "restarting"           # About to restart
+    REBUILDING = "rebuilding"           # Rebuilding (frontend)
+    COMPLETE = "complete"               # Restart/rebuild complete
+    SKIPPED = "skipped"                 # Skipped (e.g., React HMR handling it)
 
 
 # =============================================================================
@@ -547,6 +561,107 @@ class ReadyPhrase(PhraseComponent):
             return ["Ready."]
 
 
+class HotReloadPhrase(PhraseComponent):
+    """
+    v5.0: Generates hot reload announcement phrases.
+    
+    Provides context-aware messages for code change detection and restart.
+    """
+    
+    def __init__(self, context: HotReloadContext = HotReloadContext.DETECTED):
+        self.context = context
+        self.changed_files: List[str] = []
+        self.file_types: List[str] = []
+    
+    def set_change_info(self, files: List[str], types: List[str]) -> None:
+        """Set information about what changed."""
+        self.changed_files = files
+        self.file_types = types
+    
+    def get_variations(self, ctx: FullContext, tone: AnnouncementTone) -> List[str]:
+        file_count = len(self.changed_files)
+        type_str = ", ".join(self.file_types[:3]) if self.file_types else "code"
+        
+        if self.context == HotReloadContext.DETECTED:
+            if tone == AnnouncementTone.FORMAL:
+                return [
+                    f"I've detected {file_count} file change{'s' if file_count > 1 else ''}.",
+                    f"Code changes detected. {file_count} file{'s' if file_count > 1 else ''} modified.",
+                ]
+            elif tone == AnnouncementTone.FRIENDLY:
+                return [
+                    f"Noticed you changed some {type_str} files!",
+                    f"I see you've been coding. {file_count} file{'s' if file_count > 1 else ''} changed.",
+                ]
+            elif tone == AnnouncementTone.WITTY:
+                return [
+                    f"Someone's been busy. {file_count} file{'s' if file_count > 1 else ''} modified.",
+                    f"New code detected. Time for a quick refresh.",
+                ]
+            else:
+                return [f"Code changes detected."]
+        
+        elif self.context == HotReloadContext.RESTARTING:
+            if tone == AnnouncementTone.FORMAL:
+                return [
+                    "Applying your changes now.",
+                    "Restarting to incorporate your updates.",
+                ]
+            elif tone == AnnouncementTone.FRIENDLY:
+                return [
+                    "Restarting with your new code!",
+                    "Quick restart to apply your changes.",
+                ]
+            elif tone == AnnouncementTone.WITTY:
+                return [
+                    "Out with the old, in with the new.",
+                    "Rebooting with fresh code. Be right back.",
+                ]
+            else:
+                return ["Restarting now."]
+        
+        elif self.context == HotReloadContext.REBUILDING:
+            if tone == AnnouncementTone.FORMAL:
+                return [
+                    "Rebuilding frontend components.",
+                    "Frontend rebuild in progress.",
+                ]
+            elif tone == AnnouncementTone.FRIENDLY:
+                return [
+                    "Building the new frontend!",
+                    "Compiling your UI changes.",
+                ]
+            else:
+                return ["Frontend rebuilding."]
+        
+        elif self.context == HotReloadContext.COMPLETE:
+            if tone == AnnouncementTone.FORMAL:
+                return [
+                    "Changes applied successfully.",
+                    "Update complete. All systems operational.",
+                ]
+            elif tone == AnnouncementTone.FRIENDLY:
+                return [
+                    "Done! Your changes are live.",
+                    "All set with the new code!",
+                ]
+            elif tone == AnnouncementTone.WITTY:
+                return [
+                    "Fresh code, fresh start. Ready to roll.",
+                    "Hot reload complete. Still hot.",
+                ]
+            else:
+                return ["Update complete."]
+        
+        elif self.context == HotReloadContext.SKIPPED:
+            return [
+                "React is handling those changes automatically.",
+                "Frontend dev server will pick that up.",
+            ]
+        
+        return []
+
+
 # =============================================================================
 # Context Gatherers
 # =============================================================================
@@ -775,6 +890,10 @@ class IntelligentStartupAnnouncer:
 
     Orchestrates context gathering, tone selection, and message synthesis
     to produce dynamic, context-aware startup messages.
+    
+    v5.0: Now integrates with UnifiedStartupVoiceCoordinator for coordinated
+    announcements. Shares context with startup_narrator to prevent duplicates
+    and ensure consistent user experience.
     """
 
     def __init__(self):
@@ -797,6 +916,9 @@ class IntelligentStartupAnnouncer:
         self._voice_priority = None
         self._speech_topic = None
         self._message_history: List[Tuple[datetime, str, AnnouncementTone]] = []
+        
+        # v5.0: Reference to shared coordinator context
+        self._coordinator_context = None
 
         # Configuration
         self._default_tone = AnnouncementTone.FORMAL
@@ -858,6 +980,9 @@ class IntelligentStartupAnnouncer:
             *[gatherer.gather(ctx) for gatherer in self._gatherers],
             return_exceptions=True
         )
+        
+        # v5.0: Update coordinator context with gathered info
+        self.update_coordinator_context(ctx)
 
         return ctx
 
@@ -1106,6 +1231,171 @@ class IntelligentStartupAnnouncer:
         
         return message, spoken
 
+    # =========================================================================
+    # v5.0: Hot Reload Announcements
+    # =========================================================================
+
+    async def generate_hot_reload_message(
+        self,
+        context: HotReloadContext,
+        changed_files: Optional[List[str]] = None,
+        file_types: Optional[List[str]] = None,
+        target: str = "backend",  # "backend", "frontend", "native", "all"
+        tone_override: Optional[AnnouncementTone] = None,
+    ) -> str:
+        """
+        v5.0: Generate a hot reload announcement message.
+        
+        Args:
+            context: The hot reload context (detected, restarting, complete, etc.)
+            changed_files: List of files that changed
+            file_types: Types of files (e.g., ["Python", "Rust"])
+            target: What's being reloaded
+            tone_override: Force a specific tone
+            
+        Returns:
+            Dynamically generated hot reload message
+        """
+        # Gather user context for personalization
+        ctx = await self.gather_full_context(StartupType.HOT_RELOAD)
+        
+        # Select tone - for hot reload, prefer efficient or friendly
+        if tone_override:
+            tone = tone_override
+        elif context == HotReloadContext.DETECTED:
+            # Detection messages can be friendly
+            tone = AnnouncementTone.FRIENDLY
+        elif context == HotReloadContext.COMPLETE:
+            # Completion can be witty
+            tone = random.choice([AnnouncementTone.FRIENDLY, AnnouncementTone.WITTY])
+        else:
+            # Restarting/rebuilding should be efficient
+            tone = AnnouncementTone.EFFICIENT
+        
+        # Create hot reload phrase generator
+        hot_reload_phrase = HotReloadPhrase(context)
+        hot_reload_phrase.set_change_info(
+            changed_files or [],
+            file_types or []
+        )
+        
+        # Get the phrase
+        message = hot_reload_phrase.select(ctx, tone)
+        
+        if not message:
+            # Fallback
+            message = f"Code changes detected. Restarting {target}."
+        
+        # Track history
+        self._message_history.append((datetime.now(), message, tone))
+        
+        logger.info(f"Generated hot reload message [{tone.value}]: \"{message}\"")
+        
+        return message
+
+    async def announce_hot_reload(
+        self,
+        context: HotReloadContext,
+        changed_files: Optional[List[str]] = None,
+        file_types: Optional[List[str]] = None,
+        target: str = "backend",
+    ) -> Tuple[str, bool]:
+        """
+        v5.0: Generate and speak a hot reload message.
+        
+        Args:
+            context: The hot reload context
+            changed_files: List of files that changed
+            file_types: Types of files
+            target: What's being reloaded
+            
+        Returns:
+            Tuple of (message, was_spoken)
+        """
+        if not self._initialized:
+            await self.initialize()
+        
+        message = await self.generate_hot_reload_message(
+            context=context,
+            changed_files=changed_files,
+            file_types=file_types,
+            target=target,
+        )
+        
+        spoken = False
+        if self._voice:
+            try:
+                if self._use_orchestrator:
+                    await self._voice.speak(
+                        message,
+                        priority=self._voice_priority,
+                        topic=self._speech_topic,
+                    )
+                else:
+                    await self._voice.speak(message, mode=self._VoiceMode.NORMAL)
+                spoken = True
+            except Exception as e:
+                logger.error(f"Failed to speak hot reload announcement: {e}")
+        
+        return message, spoken
+
+    async def announce_code_change_detected(
+        self,
+        file_count: int,
+        file_types: List[str],
+    ) -> Tuple[str, bool]:
+        """Convenience method for announcing detected changes."""
+        return await self.announce_hot_reload(
+            context=HotReloadContext.DETECTED,
+            changed_files=[""] * file_count,  # Just for count
+            file_types=file_types,
+        )
+
+    async def announce_hot_reload_complete(
+        self,
+        target: str = "backend",
+        duration_seconds: Optional[float] = None,
+    ) -> Tuple[str, bool]:
+        """Convenience method for announcing hot reload completion."""
+        return await self.announce_hot_reload(
+            context=HotReloadContext.COMPLETE,
+            target=target,
+        )
+
+    def set_coordinator_context(self, context: Any) -> None:
+        """
+        v5.0: Link to the coordinator's shared context.
+        
+        This allows the announcer to read from and update the shared state,
+        ensuring consistency with startup_narrator.
+        
+        Args:
+            context: SharedStartupContext from UnifiedStartupVoiceCoordinator
+        """
+        self._coordinator_context = context
+        logger.debug("IntelligentStartupAnnouncer linked to coordinator context")
+    
+    def update_coordinator_context(self, ctx: FullContext) -> None:
+        """
+        v5.0: Push gathered context back to coordinator for sharing.
+        
+        This allows startup_narrator to access user name, system status,
+        and other context gathered by the announcer.
+        """
+        if self._coordinator_context is not None:
+            try:
+                # Share user info
+                self._coordinator_context.user_name = ctx.user.name
+                self._coordinator_context.user_first_name = ctx.user.first_name
+                
+                # Share system info
+                self._coordinator_context.total_components = ctx.system.total_components
+                self._coordinator_context.active_components = ctx.system.active_components
+                
+                logger.debug(f"Updated coordinator context: user={ctx.user.first_name}")
+            except Exception as e:
+                logger.debug(f"Could not update coordinator context: {e}")
+
     def get_statistics(self) -> Dict[str, Any]:
         """Get announcer statistics."""
         if not self._message_history:
@@ -1126,6 +1416,7 @@ class IntelligentStartupAnnouncer:
             "by_tone": tone_counts,
             "average_word_count": round(avg_length, 1),
             "last_message": self._message_history[-1][1] if self._message_history else None,
+            "coordinator_linked": self._coordinator_context is not None,
         }
 
 

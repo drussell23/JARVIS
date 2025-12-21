@@ -736,6 +736,64 @@
     color: #ff8800;
 }
 
+/* ═══════════════════════════════════════════════════════════════════
+   v5.0: DEV MODE (HOT RELOAD) STYLES
+   ═══════════════════════════════════════════════════════════════════ */
+
+.badge-dev-mode {
+    border-color: #ff6600;
+    background: linear-gradient(135deg, rgba(20, 10, 0, 0.95) 0%, rgba(40, 20, 0, 0.95) 100%);
+    box-shadow:
+        0 0 20px rgba(255, 100, 0, 0.3),
+        0 4px 20px rgba(0, 0, 0, 0.5),
+        inset 0 0 20px rgba(255, 100, 0, 0.1);
+}
+
+.badge-dev-mode .badge-icon {
+    animation: dev-flame 0.5s ease-in-out infinite alternate;
+    color: #ff6600;
+}
+
+.badge-dev-mode .badge-text {
+    color: #ff8800;
+    text-transform: uppercase;
+    font-size: 12px;
+    letter-spacing: 1px;
+}
+
+.badge-dev-mode .badge-pulse {
+    border-color: #ff6600;
+}
+
+@keyframes dev-flame {
+    0% { transform: scale(1) translateY(0); opacity: 1; }
+    100% { transform: scale(1.1) translateY(-1px); opacity: 0.8; }
+}
+
+.badge-dev-mode:hover {
+    box-shadow:
+        0 0 30px rgba(255, 100, 0, 0.5),
+        0 8px 30px rgba(0, 0, 0, 0.6),
+        inset 0 0 30px rgba(255, 100, 0, 0.2);
+}
+
+/* Dev mode modal variant */
+.update-modal.badge-dev-mode {
+    border-color: #ff6600;
+    box-shadow: 
+        0 0 40px rgba(255, 100, 0, 0.3),
+        0 20px 60px rgba(0, 0, 0, 0.8);
+}
+
+.update-modal.badge-dev-mode .update-modal-header {
+    border-bottom-color: rgba(255, 100, 0, 0.2);
+    background: rgba(255, 100, 0, 0.05);
+}
+
+.update-modal.badge-dev-mode .update-modal-header h2 {
+    color: #ff6600;
+}
+
 /* Zero-Touch Status Panel */
 .zero-touch-status-panel {
     background: rgba(0, 170, 255, 0.08);

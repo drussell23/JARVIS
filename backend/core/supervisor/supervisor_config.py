@@ -17,7 +17,7 @@ import os
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 import yaml
 
@@ -331,6 +331,94 @@ class ExitCodes:
 
 
 @dataclass
+class DevModeConfig:
+    """
+    v5.0: Developer Mode Configuration - Intelligent Polyglot Hot Reload
+    
+    When enabled, the supervisor watches for code changes across ALL languages
+    in your codebase and automatically restarts JARVIS when files are modified.
+    
+    SUPPORTED LANGUAGES (auto-detected):
+    - Python (.py, .pyx)        → Backend restart
+    - Rust (.rs)                → Backend restart (native rebuild)
+    - Swift (.swift)            → Backend restart (native rebuild)
+    - JavaScript (.js)          → Frontend restart
+    - TypeScript (.ts, .tsx)    → Frontend restart
+    - React (.jsx)              → Frontend restart
+    - CSS/SCSS/LESS             → Frontend restart
+    - HTML                      → Frontend restart
+    - YAML/TOML                 → Config reload
+    
+    Think of this as JARVIS's own "nodemon" - you run `python3 run_supervisor.py`
+    once and it handles all restarts automatically as you develop.
+    """
+    enabled: bool = field(
+        default_factory=lambda: os.getenv("JARVIS_DEV_MODE", "true").lower() == "true"
+    )
+    
+    # Grace period before hot reload activates (allows initial startup)
+    startup_grace_period_seconds: int = field(
+        default_factory=lambda: int(os.getenv("JARVIS_RELOAD_GRACE_PERIOD", "120"))
+    )
+    
+    # How often to check for file changes
+    check_interval_seconds: int = field(
+        default_factory=lambda: int(os.getenv("JARVIS_RELOAD_CHECK_INTERVAL", "10"))
+    )
+    
+    # Cooldown between restarts (prevents rapid-fire restarts)
+    restart_cooldown_seconds: int = field(
+        default_factory=lambda: int(os.getenv("JARVIS_RELOAD_COOLDOWN", "10"))
+    )
+    
+    # Debounce delay for rapid file changes (seconds)
+    debounce_delay_seconds: float = field(
+        default_factory=lambda: float(os.getenv("JARVIS_RELOAD_DEBOUNCE", "0.5"))
+    )
+    
+    # Directories to exclude from watching
+    exclude_directories: List[str] = field(default_factory=lambda: [
+        ".git", "__pycache__", "node_modules", "venv", "env",
+        ".venv", "build", "dist", "target", ".cursor", ".idea",
+        ".vscode", "coverage", ".pytest_cache", ".mypy_cache",
+        "logs", "cache", ".jarvis_cache", "htmlcov",
+    ])
+    
+    # File patterns to ignore
+    exclude_patterns: List[str] = field(default_factory=lambda: [
+        "*.pyc", "*.pyo", "*.log", "*.tmp", "*.bak",
+        "*.swp", "*.swo", "*~", ".DS_Store",
+    ])
+    
+    # Files that require FULL restart (dependencies, not hot reload)
+    cold_restart_files: List[str] = field(default_factory=lambda: [
+        "requirements.txt",
+        "requirements-dev.txt",
+        "Cargo.toml",
+        "Cargo.lock",
+        "package.json",
+        "package-lock.json",
+        "pyproject.toml",
+        "setup.py",
+        ".env",
+    ])
+    
+    # Clear Python cache on restart
+    clear_cache_on_restart: bool = True
+    
+    # Enable parallel file hash calculation
+    parallel_hash_calculation: bool = True
+    
+    # Verbose logging of file changes
+    verbose_logging: bool = field(
+        default_factory=lambda: os.getenv("JARVIS_RELOAD_VERBOSE", "false").lower() == "true"
+    )
+    
+    # Auto-discover file types (vs using predefined list)
+    auto_discover_file_types: bool = True
+
+
+@dataclass
 class SupervisorConfig:
     """
     Complete supervisor configuration.
@@ -359,6 +447,9 @@ class SupervisorConfig:
     # v2.0: Zero-Touch Autonomous Updates
     zero_touch: ZeroTouchConfig = field(default_factory=ZeroTouchConfig)
     prime_directives: PrimeDirectivesConfig = field(default_factory=PrimeDirectivesConfig)
+    
+    # v5.0: Developer Mode - Hot Reload / Live Reload
+    dev_mode: DevModeConfig = field(default_factory=DevModeConfig)
     
     # Runtime state
     config_path: Optional[Path] = None
