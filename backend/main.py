@@ -162,6 +162,37 @@ os.environ["TRANSFORMERS_OFFLINE"] = "1"
 os.environ["HF_DATASETS_OFFLINE"] = "1"
 os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"  # Also disable telemetry
 
+# =============================================================================
+# v4.0 FIX: Pre-import numba in MAIN THREAD to prevent circular import errors
+# =============================================================================
+# numba has threading issues when imported from multiple threads simultaneously
+# causing: "cannot import name 'get_hashable_key' from partially initialized module"
+# The fix is to import numba FIRST in the main thread before any parallel imports
+# =============================================================================
+try:
+    # Disable JIT during initial import to avoid circular import issues
+    os.environ['NUMBA_DISABLE_JIT'] = '1'
+    os.environ['NUMBA_NUM_THREADS'] = '1'
+    
+    import numba
+    # Force initialization of the problematic module
+    try:
+        from numba.core import utils as _numba_utils
+        if hasattr(_numba_utils, 'get_hashable_key'):
+            _ = _numba_utils.get_hashable_key
+    except (ImportError, AttributeError):
+        pass
+    
+    print(f"[STARTUP] numba {numba.__version__} pre-initialized in main thread")
+    
+    # Re-enable JIT after import
+    os.environ.pop('NUMBA_DISABLE_JIT', None)
+    os.environ.pop('NUMBA_NUM_THREADS', None)
+except ImportError:
+    print("[STARTUP] numba not installed (optional)")
+except Exception as e:
+    print(f"[STARTUP] numba pre-import warning: {e}")
+
 # Clean up leaked semaphores from previous runs FIRST
 if sys.platform == "darwin":  # macOS specific
     try:

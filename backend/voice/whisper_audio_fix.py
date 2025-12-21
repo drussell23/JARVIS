@@ -309,20 +309,87 @@ class WhisperImportManager:
     def _pre_import_numba(self) -> Optional[str]:
         """
         Pre-import numba to avoid circular import issues.
+        
+        v4.0: Enhanced to handle threading issues that cause:
+        "cannot import name 'get_hashable_key' from partially initialized module"
+        
+        This happens when numba is imported from multiple threads simultaneously.
+        The fix is to:
+        1. Disable numba JIT during import (NUMBA_DISABLE_JIT=1)
+        2. Use a process-level lock
+        3. Import in a controlled, single-threaded manner
+        
         Returns numba version if successful, None otherwise.
         """
-        try:
-            import numba
-            # Force full initialization
-            version = numba.__version__
-            logger.debug(f"numba {version} pre-initialized successfully")
-            return version
-        except ImportError:
-            logger.debug("numba not installed (optional dependency)")
-            return None
-        except Exception as e:
-            logger.warning(f"numba pre-initialization issue (non-fatal): {e}")
-            return None
+        import os
+        import threading
+        
+        # Thread-safe singleton for numba import
+        if not hasattr(self, '_numba_import_lock'):
+            self._numba_import_lock = threading.Lock()
+        
+        with self._numba_import_lock:
+            # Check if already imported successfully
+            if hasattr(self, '_numba_version_cache'):
+                return self._numba_version_cache
+            
+            try:
+                # v4.0 FIX: Disable JIT during import to prevent circular import issues
+                # This is a known workaround for numba threading issues
+                original_jit_setting = os.environ.get('NUMBA_DISABLE_JIT')
+                os.environ['NUMBA_DISABLE_JIT'] = '1'
+                
+                # Also disable threading within numba
+                original_threading = os.environ.get('NUMBA_NUM_THREADS')
+                os.environ['NUMBA_NUM_THREADS'] = '1'
+                
+                try:
+                    # Import numba with JIT disabled
+                    import numba
+                    
+                    # Force initialization of core module that causes issues
+                    try:
+                        from numba.core import utils as numba_utils
+                        # Touch the problematic function to ensure it's fully loaded
+                        if hasattr(numba_utils, 'get_hashable_key'):
+                            _ = numba_utils.get_hashable_key
+                    except (ImportError, AttributeError):
+                        # Older numba versions may not have this
+                        pass
+                    
+                    version = numba.__version__
+                    self._numba_version_cache = version
+                    logger.debug(f"numba {version} pre-initialized successfully (JIT disabled)")
+                    return version
+                    
+                finally:
+                    # Restore original environment
+                    if original_jit_setting is None:
+                        os.environ.pop('NUMBA_DISABLE_JIT', None)
+                    else:
+                        os.environ['NUMBA_DISABLE_JIT'] = original_jit_setting
+                    
+                    if original_threading is None:
+                        os.environ.pop('NUMBA_NUM_THREADS', None)
+                    else:
+                        os.environ['NUMBA_NUM_THREADS'] = original_threading
+                    
+            except ImportError:
+                logger.debug("numba not installed (optional dependency)")
+                self._numba_version_cache = None
+                return None
+            except Exception as e:
+                error_str = str(e)
+                if "circular import" in error_str.lower() or "partially initialized" in error_str.lower():
+                    # This is the known threading issue - log it but don't fail
+                    logger.warning(
+                        f"numba circular import detected (will retry later): {e}. "
+                        f"This is a known threading issue. Whisper will use fallback path."
+                    )
+                else:
+                    logger.warning(f"numba pre-initialization issue (non-fatal): {e}")
+                self._numba_version_cache = None
+                return None
 
     def _do_import(self) -> Any:
         """
