@@ -690,6 +690,16 @@ const JarvisVoice = () => {
   const [vbiStages, setVbiStages] = useState([]); // History of completed stages for display
   const vbiProgressTimeoutRef = useRef(null); // Auto-hide VBI progress after completion
 
+  // ═══════════════════════════════════════════════════════════════════
+  // v8.0: PROACTIVE UNLOCK PROGRESS STATE
+  // ═══════════════════════════════════════════════════════════════════
+  // Shows visual progress when JARVIS proactively unlocks screen
+  // for a command like "search for dogs" while screen is locked
+  // ═══════════════════════════════════════════════════════════════════
+  const [proactiveUnlockProgress, setProactiveUnlockProgress] = useState(null);
+  // { stage, message, originalCommand, continuationIntent, progress, status }
+  const proactiveUnlockTimeoutRef = useRef(null);
+
   const typingTimeoutRef = useRef(null);
 
   const wsRef = useRef(null);
@@ -1914,6 +1924,117 @@ const JarvisVoice = () => {
           }
         }
         setIsProcessing(false);
+        break;
+      }
+      
+      case 'proactive_unlock_progress': {
+        // ═══════════════════════════════════════════════════════════════════
+        // v8.0: PROACTIVE UNLOCK PROGRESS - Real-time visual feedback
+        // ═══════════════════════════════════════════════════════════════════
+        // Shows a popup notification during the proactive unlock flow:
+        // 1. Screen locked detected → 2. Verifying voice → 3. Unlocking → 
+        // 4. Processing command → 5. Complete
+        // ═══════════════════════════════════════════════════════════════════
+        const stage = data.stage || 'initializing';
+        const message = data.message || '';
+        const progress = data.progress || 0;
+        const originalCommand = data.original_command || '';
+        const continuationIntent = data.continuation_intent || '';
+        const status = data.status || 'in_progress';
+        
+        console.log('%c[PROACTIVE-UNLOCK]', 'color: #00bfff; font-weight: bold',
+          `Stage: ${stage} (${progress}%) - ${message}`);
+        
+        // Stage icon mapping
+        const stageIcons = {
+          'screen_detected': '🔒',
+          'verifying_voice': '🎤',
+          'voice_verified': '✅',
+          'unlocking': '🔐',
+          'unlocked': '🔓',
+          'executing': '🚀',
+          'complete': '✨',
+          'error': '❌',
+        };
+        
+        // Update proactive unlock progress state
+        setProactiveUnlockProgress({
+          stage,
+          stageIcon: stageIcons[stage] || '⚙️',
+          message,
+          originalCommand,
+          continuationIntent,
+          progress,
+          status,
+          timestamp: Date.now(),
+        });
+        
+        // Auto-hide after completion
+        if (status === 'complete' || status === 'error') {
+          if (proactiveUnlockTimeoutRef.current) {
+            clearTimeout(proactiveUnlockTimeoutRef.current);
+          }
+          proactiveUnlockTimeoutRef.current = setTimeout(() => {
+            setProactiveUnlockProgress(null);
+          }, status === 'complete' ? 3000 : 5000);
+        }
+        break;
+      }
+      
+      case 'proactive_unlock_success': {
+        // ═══════════════════════════════════════════════════════════════════
+        // v8.0: PROACTIVE UNLOCK FLOW - Screen was locked, we unlocked it,
+        // and a continuation command is scheduled in the background.
+        // ═══════════════════════════════════════════════════════════════════
+        // Example: User said "search for dogs" → JARVIS unlocked screen → 
+        //          Now searching for dogs in background
+        // ═══════════════════════════════════════════════════════════════════
+        console.log('🔓 [PROACTIVE-UNLOCK] Screen unlocked, continuation scheduled:', data);
+        
+        const proactiveData = data.proactive_unlock || {};
+        const continuationIntent = proactiveData.continuation_intent || '';
+        const unlockLatency = proactiveData.unlock_latency_ms || 0;
+        
+        // Update the progress to show success
+        setProactiveUnlockProgress({
+          stage: 'unlocked',
+          stageIcon: '🔓',
+          message: `Screen unlocked. Now ${continuationIntent}...`,
+          originalCommand: proactiveData.original_command || '',
+          continuationIntent,
+          progress: 80,
+          status: 'success',
+          unlockLatency,
+          timestamp: Date.now(),
+        });
+        
+        // Show the unlock response but indicate continuation is coming
+        const msg = data.response || 'Screen unlocked, processing your request...';
+        setResponse(msg);
+        
+        // Don't speak the response - JARVIS already spoke the acknowledgment before unlock
+        // and will speak again after the continuation completes
+        
+        // Keep processing indicator on since continuation is coming
+        // We'll clear it when the continuation response arrives
+        // Actually, set to false now since the continuation will trigger new processing
+        setIsProcessing(false);
+        
+        // Log the proactive unlock metrics
+        if (unlockLatency > 0) {
+          console.log(`🔓 [PROACTIVE-UNLOCK] Unlock completed in ${unlockLatency.toFixed(0)}ms`);
+        }
+        if (continuationIntent) {
+          console.log(`🔄 [PROACTIVE-UNLOCK] Continuation scheduled: "${continuationIntent}"`);
+        }
+        
+        // Auto-hide progress after delay
+        if (proactiveUnlockTimeoutRef.current) {
+          clearTimeout(proactiveUnlockTimeoutRef.current);
+        }
+        proactiveUnlockTimeoutRef.current = setTimeout(() => {
+          setProactiveUnlockProgress(null);
+        }, 5000);
         break;
       }
 
@@ -3676,6 +3797,29 @@ const JarvisVoice = () => {
       return;
     }
 
+    // ═══════════════════════════════════════════════════════════════════
+    // v8.0: SELF-VOICE CHECK BEFORE SENDING COMMAND
+    // ═══════════════════════════════════════════════════════════════════
+    // Check if JARVIS is speaking or in cooldown before sending.
+    // This prevents sending commands that might include JARVIS's own voice.
+    // ═══════════════════════════════════════════════════════════════════
+    try {
+      const { getUnifiedWebSocketService } = require('../services/UnifiedWebSocketService');
+      const wsService = getUnifiedWebSocketService();
+      if (wsService && wsService.speechState) {
+        const { isSpeaking, inCooldown, cooldownRemainingMs } = wsService.speechState;
+        if (isSpeaking || inCooldown) {
+          console.log(`🔇 [Self-Voice v8] Command blocked - JARVIS is ${isSpeaking ? 'speaking' : `in cooldown (${cooldownRemainingMs}ms remaining)`}`);
+          console.log(`🔇 [Self-Voice v8] Blocked command: "${command.substring(0, 50)}..."`);
+          // Don't send the command - it's likely JARVIS's own voice
+          return;
+        }
+      }
+    } catch (e) {
+      // Service not available - continue with command
+      console.debug('[Self-Voice v8] Speech state check unavailable');
+    }
+    
     // Send via WebSocket with audio_data for voice biometrics
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       const message = {
@@ -4962,6 +5106,107 @@ const JarvisVoice = () => {
           onDismiss={() => setDetectedCommand(null)}
           autoDismiss={3000}
         />
+      )}
+
+      {/* ═══════════════════════════════════════════════════════════════════ */}
+      {/* PROACTIVE UNLOCK PROGRESS - Visual feedback for autonomous unlock flow */}
+      {/* Shows when JARVIS detects locked screen and unlocks for a command     */}
+      {/* ═══════════════════════════════════════════════════════════════════ */}
+      {proactiveUnlockProgress && (
+        <div className="proactive-unlock-container">
+          <div className="proactive-unlock-header">
+            <span className="proactive-unlock-icon">
+              {proactiveUnlockProgress.stageIcon || '🔐'}
+            </span>
+            <div className="proactive-unlock-title-section">
+              <span className="proactive-unlock-title">Autonomous Screen Unlock</span>
+              <span className="proactive-unlock-subtitle">
+                {proactiveUnlockProgress.originalCommand 
+                  ? `"${proactiveUnlockProgress.originalCommand}"` 
+                  : 'Processing your request...'}
+              </span>
+            </div>
+            <span className="proactive-unlock-percentage">{proactiveUnlockProgress.progress}%</span>
+          </div>
+
+          {/* Progress Bar */}
+          <div className="proactive-unlock-progress-bar-container">
+            <div
+              className={`proactive-unlock-progress-bar ${proactiveUnlockProgress.status}`}
+              style={{ width: `${proactiveUnlockProgress.progress}%` }}
+            >
+              <div className="proactive-unlock-progress-glow"></div>
+            </div>
+          </div>
+
+          {/* Current Stage Message */}
+          <div className={`proactive-unlock-message ${proactiveUnlockProgress.status}`}>
+            <span className="proactive-unlock-stage-icon">
+              {proactiveUnlockProgress.status === 'complete' ? '✅' 
+                : proactiveUnlockProgress.status === 'error' ? '❌' 
+                : '⏳'}
+            </span>
+            <span className="proactive-unlock-stage-text">
+              {proactiveUnlockProgress.message || 'Processing...'}
+            </span>
+          </div>
+
+          {/* Flow Steps Visualization */}
+          <div className="proactive-unlock-steps">
+            {[
+              { key: 'screen_detected', label: 'Screen Locked', icon: '🔒' },
+              { key: 'verifying_voice', label: 'Verify Voice', icon: '🎤' },
+              { key: 'unlocking', label: 'Unlocking', icon: '🔐' },
+              { key: 'executing', label: 'Execute', icon: '🚀' },
+              { key: 'complete', label: 'Complete', icon: '✨' },
+            ].map((step, idx) => {
+              const currentStageOrder = {
+                'screen_detected': 0,
+                'verifying_voice': 1,
+                'voice_verified': 2,
+                'unlocking': 2,
+                'unlocked': 3,
+                'executing': 3,
+                'complete': 4,
+                'error': -1,
+              };
+              const currentOrder = currentStageOrder[proactiveUnlockProgress.stage] || 0;
+              const stepOrder = idx;
+              const isActive = stepOrder === currentOrder;
+              const isComplete = stepOrder < currentOrder || proactiveUnlockProgress.stage === 'complete';
+              const isFuture = stepOrder > currentOrder;
+              
+              return (
+                <div 
+                  key={step.key} 
+                  className={`proactive-unlock-step ${isActive ? 'active' : ''} ${isComplete ? 'complete' : ''} ${isFuture ? 'future' : ''}`}
+                >
+                  <span className="step-icon">
+                    {isComplete && step.key !== 'complete' ? '✓' : step.icon}
+                  </span>
+                  <span className="step-label">{step.label}</span>
+                  {idx < 4 && <span className="step-connector"></span>}
+                </div>
+              );
+            })}
+          </div>
+
+          {/* Continuation Intent */}
+          {proactiveUnlockProgress.continuationIntent && proactiveUnlockProgress.status !== 'error' && (
+            <div className="proactive-unlock-continuation">
+              <span className="continuation-label">Next:</span>
+              <span className="continuation-action">{proactiveUnlockProgress.continuationIntent}</span>
+            </div>
+          )}
+
+          {/* Error State */}
+          {proactiveUnlockProgress.status === 'error' && (
+            <div className="proactive-unlock-error">
+              <span className="error-icon">⚠️</span>
+              <span className="error-text">{proactiveUnlockProgress.message || 'Unlock failed'}</span>
+            </div>
+          )}
+        </div>
       )}
 
       {/* VBI (Voice Biometric Intelligence) Progress Display - Real-time voice unlock visualization */}

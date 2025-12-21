@@ -1222,6 +1222,7 @@ class HybridSTTRouter:
         sample_rate: Optional[int] = None,
         mode: str = 'general',
         skip_speaker_id: bool = True,  # PERFORMANCE: Skip speaker ID by default (done separately)
+        bypass_self_voice_check: bool = False,  # v8.0: Allow bypassing for known-clean audio
     ) -> STTResult:
         """
         Main transcription entry point with VAD/windowing mode support.
@@ -1231,6 +1232,11 @@ class HybridSTTRouter:
         - Uses prewarmed Whisper model when available
         - Circuit breaker prevents repeated failures from blocking
         - Granular timeout protection at each stage
+
+        v8.0 SELF-VOICE SUPPRESSION:
+        - Checks UnifiedSpeechStateManager BEFORE transcription
+        - Rejects audio if JARVIS is speaking or in cooldown
+        - Prevents hallucinations from JARVIS hearing its own voice
 
         Args:
             audio_data: Raw audio bytes
@@ -1244,11 +1250,49 @@ class HybridSTTRouter:
                   - 'command': 3s window, optimized for commands
             skip_speaker_id: Skip speaker identification for faster transcription (default: True)
                              Speaker ID should be done in parallel, not serial.
+            bypass_self_voice_check: Skip self-voice check for pre-verified audio (default: False)
 
         Returns:
             STTResult with transcription text, confidence, and metadata
         """
         logger.info(f"🎤 Transcribe called: {len(audio_data)} bytes, mode={mode}")
+        
+        # ═══════════════════════════════════════════════════════════════════
+        # v8.0: SELF-VOICE SUPPRESSION - CRITICAL CHECK
+        # ═══════════════════════════════════════════════════════════════════
+        # If JARVIS is currently speaking or in post-speech cooldown,
+        # reject this audio to prevent transcribing JARVIS's own voice.
+        # This is the FIRST LINE OF DEFENSE against self-voice hallucinations.
+        # ═══════════════════════════════════════════════════════════════════
+        if not bypass_self_voice_check:
+            try:
+                from core.unified_speech_state import get_speech_state_manager_sync
+                speech_manager = get_speech_state_manager_sync()
+                rejection = speech_manager.should_reject_audio()
+                
+                if rejection.reject:
+                    logger.warning(
+                        f"🔇 [SELF-VOICE-STT] Rejecting transcription request - "
+                        f"reason: {rejection.reason}, details: {rejection.details}"
+                    )
+                    # Return empty result with low confidence
+                    return STTResult(
+                        text="",
+                        confidence=0.0,
+                        engine="self_voice_suppression",
+                        latency_ms=0,
+                        metadata={
+                            "rejected": True,
+                            "rejection_reason": rejection.reason,
+                            "rejection_details": rejection.details,
+                        }
+                    )
+            except ImportError:
+                # UnifiedSpeechStateManager not available - continue without check
+                logger.debug("[SELF-VOICE-STT] Speech state manager not available")
+            except Exception as e:
+                # Non-fatal error - continue with transcription
+                logger.debug(f"[SELF-VOICE-STT] Check error (non-fatal): {e}")
 
         self.total_requests += 1
         start_time = time.time()
@@ -1505,6 +1549,10 @@ class HybridSTTRouter:
         - Skips model selection (uses Whisper directly)
         - Uses unlock mode (2s window) by default
 
+        v8.0 SELF-VOICE SUPPRESSION:
+        - Checks UnifiedSpeechStateManager BEFORE transcription
+        - Rejects audio if JARVIS is speaking or in cooldown
+
         Args:
             audio_data: Raw audio bytes
             sample_rate: Optional sample rate from frontend
@@ -1515,6 +1563,32 @@ class HybridSTTRouter:
         """
         start_time = time.time()
         self.total_requests += 1
+        
+        # ═══════════════════════════════════════════════════════════════════
+        # v8.0: SELF-VOICE SUPPRESSION - FAST PATH CHECK
+        # ═══════════════════════════════════════════════════════════════════
+        try:
+            from core.unified_speech_state import get_speech_state_manager_sync
+            speech_manager = get_speech_state_manager_sync()
+            rejection = speech_manager.should_reject_audio()
+            
+            if rejection.reject:
+                logger.warning(
+                    f"🔇 [SELF-VOICE-STT-FAST] Rejecting fast transcription - "
+                    f"reason: {rejection.reason}"
+                )
+                return STTResult(
+                    text="",
+                    confidence=0.0,
+                    engine="self_voice_suppression",
+                    latency_ms=0,
+                    metadata={
+                        "rejected": True,
+                        "rejection_reason": rejection.reason,
+                    }
+                )
+        except Exception:
+            pass  # Non-fatal - continue with transcription
 
         try:
             # Use prewarmed handler if available

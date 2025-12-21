@@ -839,6 +839,319 @@ AudioQualityStatsDisplay {
   }
 }
 
+/* ==================== PROACTIVE UNLOCK PROGRESS ==================== */
+/* v8.0: Autonomous unlock visualization - shows when JARVIS unlocks screen for a command */
+
+.proactive-unlock-container {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 90%;
+  max-width: 540px;
+  background: linear-gradient(135deg, rgba(15, 10, 35, 0.98), rgba(30, 20, 60, 0.98));
+  border: 2px solid #9966ff;
+  border-radius: 20px;
+  padding: 28px;
+  box-shadow:
+    0 0 50px rgba(153, 102, 255, 0.4),
+    0 0 100px rgba(153, 102, 255, 0.2),
+    inset 0 0 60px rgba(153, 102, 255, 0.1);
+  z-index: 10000;
+  animation: proactive-unlock-fade-in 0.4s ease-out forwards;
+}
+
+@keyframes proactive-unlock-fade-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, -50%) scale(0.9);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, -50%) scale(1);
+  }
+}
+
+/* Header */
+.proactive-unlock-header {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-bottom: 24px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid rgba(153, 102, 255, 0.3);
+}
+
+.proactive-unlock-icon {
+  font-size: 32px;
+  animation: proactive-unlock-pulse 2s ease-in-out infinite;
+}
+
+@keyframes proactive-unlock-pulse {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.15); filter: brightness(1.2); }
+}
+
+.proactive-unlock-title-section {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.proactive-unlock-title {
+  font-size: 18px;
+  font-weight: 700;
+  color: #e0d0ff;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+}
+
+.proactive-unlock-subtitle {
+  font-size: 13px;
+  color: #a090c0;
+  font-style: italic;
+  max-width: 280px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.proactive-unlock-percentage {
+  font-size: 24px;
+  font-weight: 700;
+  color: #9966ff;
+  font-family: 'Courier New', monospace;
+  text-shadow: 0 0 12px rgba(153, 102, 255, 0.6);
+}
+
+/* Progress Bar */
+.proactive-unlock-progress-bar-container {
+  width: 100%;
+  height: 14px;
+  background: rgba(0, 0, 0, 0.5);
+  border-radius: 7px;
+  overflow: hidden;
+  margin-bottom: 20px;
+  border: 1px solid rgba(153, 102, 255, 0.3);
+}
+
+.proactive-unlock-progress-bar {
+  height: 100%;
+  background: linear-gradient(90deg, #9966ff, #cc88ff, #9966ff);
+  background-size: 200% 100%;
+  border-radius: 7px;
+  transition: width 0.4s ease-out;
+  animation: proactive-unlock-shimmer 2s linear infinite;
+  position: relative;
+}
+
+@keyframes proactive-unlock-shimmer {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
+.proactive-unlock-progress-bar.success {
+  background: linear-gradient(90deg, #00ff88, #88ffcc, #00ff88);
+}
+
+.proactive-unlock-progress-bar.error {
+  background: linear-gradient(90deg, #ff6b6b, #ff8888, #ff6b6b);
+}
+
+.proactive-unlock-progress-glow {
+  position: absolute;
+  right: 0;
+  top: 0;
+  width: 24px;
+  height: 100%;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.4));
+  animation: proactive-unlock-glow-move 1.5s ease-in-out infinite;
+}
+
+@keyframes proactive-unlock-glow-move {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
+/* Current Stage Message */
+.proactive-unlock-message {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 16px;
+  background: rgba(153, 102, 255, 0.1);
+  border-radius: 10px;
+  margin-bottom: 20px;
+  border: 1px solid rgba(153, 102, 255, 0.2);
+}
+
+.proactive-unlock-message.success {
+  background: rgba(0, 255, 136, 0.1);
+  border-color: rgba(0, 255, 136, 0.3);
+}
+
+.proactive-unlock-message.error {
+  background: rgba(255, 107, 107, 0.1);
+  border-color: rgba(255, 107, 107, 0.3);
+}
+
+.proactive-unlock-stage-icon {
+  font-size: 20px;
+}
+
+.proactive-unlock-stage-text {
+  font-size: 14px;
+  color: #d0c0e0;
+}
+
+/* Flow Steps */
+.proactive-unlock-steps {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 16px 0;
+  margin-bottom: 16px;
+}
+
+.proactive-unlock-step {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  position: relative;
+  flex: 1;
+}
+
+.proactive-unlock-step .step-icon {
+  width: 36px;
+  height: 36px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(50, 40, 70, 0.8);
+  border: 2px solid rgba(153, 102, 255, 0.3);
+  border-radius: 50%;
+  font-size: 16px;
+  transition: all 0.3s ease;
+}
+
+.proactive-unlock-step.active .step-icon {
+  background: rgba(153, 102, 255, 0.3);
+  border-color: #9966ff;
+  box-shadow: 0 0 15px rgba(153, 102, 255, 0.5);
+  animation: proactive-step-active-pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes proactive-step-active-pulse {
+  0%, 100% { box-shadow: 0 0 15px rgba(153, 102, 255, 0.5); }
+  50% { box-shadow: 0 0 25px rgba(153, 102, 255, 0.8); }
+}
+
+.proactive-unlock-step.complete .step-icon {
+  background: rgba(0, 255, 136, 0.2);
+  border-color: #00ff88;
+  color: #00ff88;
+}
+
+.proactive-unlock-step.future .step-icon {
+  opacity: 0.4;
+}
+
+.proactive-unlock-step .step-label {
+  font-size: 11px;
+  color: #a090c0;
+  text-align: center;
+  transition: color 0.3s ease;
+}
+
+.proactive-unlock-step.active .step-label {
+  color: #cc88ff;
+  font-weight: 600;
+}
+
+.proactive-unlock-step.complete .step-label {
+  color: #00ff88;
+}
+
+.proactive-unlock-step .step-connector {
+  position: absolute;
+  top: 18px;
+  left: calc(50% + 20px);
+  width: calc(100% - 40px);
+  height: 2px;
+  background: rgba(153, 102, 255, 0.2);
+}
+
+.proactive-unlock-step.complete .step-connector {
+  background: linear-gradient(90deg, #00ff88, rgba(153, 102, 255, 0.3));
+}
+
+/* Continuation Intent */
+.proactive-unlock-continuation {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 16px;
+  background: rgba(0, 255, 136, 0.08);
+  border: 1px solid rgba(0, 255, 136, 0.2);
+  border-radius: 10px;
+  margin-top: 12px;
+}
+
+.proactive-unlock-continuation .continuation-label {
+  font-size: 12px;
+  color: #00ff88;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+}
+
+.proactive-unlock-continuation .continuation-action {
+  font-size: 14px;
+  color: #88ffcc;
+  font-style: italic;
+}
+
+/* Error State */
+.proactive-unlock-error {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 18px;
+  background: rgba(255, 107, 107, 0.1);
+  border: 1px solid rgba(255, 107, 107, 0.3);
+  border-radius: 10px;
+  margin-top: 12px;
+}
+
+.proactive-unlock-error .error-icon {
+  font-size: 22px;
+}
+
+.proactive-unlock-error .error-text {
+  color: #ff8888;
+  font-size: 14px;
+}
+
+/* Responsive */
+@media (max-width: 600px) {
+  .proactive-unlock-container {
+    width: 95%;
+    padding: 20px;
+  }
+  
+  .proactive-unlock-step .step-label {
+    font-size: 9px;
+  }
+  
+  .proactive-unlock-step .step-icon {
+    width: 30px;
+    height: 30px;
+    font-size: 14px;
+  }
+}
+
 /* ==================== VBI PROGRESS DISPLAY ==================== */
 /* Voice Biometric Intelligence - Real-time verification progress */
 

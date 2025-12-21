@@ -1377,7 +1377,8 @@ class WhisperAudioHandler:
         self,
         audio_data,
         sample_rate: int = None,
-        mode: str = 'general'
+        mode: str = 'general',
+        bypass_self_voice_check: bool = False
     ):
         """
         Transcribe audio in any format with automatic normalization + VAD + windowing
@@ -1387,6 +1388,7 @@ class WhisperAudioHandler:
         - Windowing/truncation (5s global, 2s unlock, 3s command)
         - Mode-aware optimization for ultra-low latency
         - Non-blocking async model loading
+        - v8.0: Self-voice suppression to prevent JARVIS from hearing itself
 
         Args:
             audio_data: Audio bytes or base64 string
@@ -1396,7 +1398,31 @@ class WhisperAudioHandler:
                   - 'general': Standard transcription (5s window)
                   - 'unlock': Ultra-fast unlock flow (2s window)
                   - 'command': Command detection (3s window)
+            bypass_self_voice_check: Skip self-voice check for pre-verified audio
         """
+        
+        # ═══════════════════════════════════════════════════════════════════
+        # v8.0: SELF-VOICE SUPPRESSION - WHISPER LEVEL CHECK
+        # ═══════════════════════════════════════════════════════════════════
+        # This is the DEEPEST level of defense. Even if audio gets past the
+        # STT router, we check again here before Whisper processes it.
+        # ═══════════════════════════════════════════════════════════════════
+        if not bypass_self_voice_check:
+            try:
+                from core.unified_speech_state import get_speech_state_manager_sync
+                speech_manager = get_speech_state_manager_sync()
+                rejection = speech_manager.should_reject_audio()
+                
+                if rejection.reject:
+                    logger.warning(
+                        f"🔇 [WHISPER-SELF-VOICE] Rejecting audio - "
+                        f"reason: {rejection.reason}, details: {rejection.details}"
+                    )
+                    return None  # Return None to indicate no transcription
+            except ImportError:
+                pass  # UnifiedSpeechStateManager not available
+            except Exception as e:
+                logger.debug(f"[WHISPER-SELF-VOICE] Check error (non-fatal): {e}")
 
         # Load model asynchronously (non-blocking) if not already loaded
         if not self.is_model_loaded():

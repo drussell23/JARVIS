@@ -1579,6 +1579,23 @@ class AdvancedAsyncPipeline:
         Separated to allow timeout wrapper in parent method.
         """
         try:
+            # Helper to broadcast progress to frontend
+            async def broadcast_progress(stage: str, message: str, progress: int, status: str = "in_progress"):
+                """Broadcast proactive unlock progress to frontend via WebSocket."""
+                try:
+                    from api.broadcast_router import manager as broadcast_manager
+                    await broadcast_manager.broadcast({
+                        "type": "proactive_unlock_progress",
+                        "stage": stage,
+                        "message": message,
+                        "progress": progress,
+                        "status": status,
+                        "original_command": text,
+                        "continuation_intent": continuation_action if 'continuation_action' in dir() else "",
+                    })
+                except Exception as e:
+                    logger.debug(f"[PROACTIVE-CAI] Broadcast error (non-fatal): {e}")
+            
             # ─────────────────────────────────────────────────────────────────
             # Step 1: FAST Screen Lock Check (direct, non-blocking)
             # ─────────────────────────────────────────────────────────────────
@@ -1591,6 +1608,9 @@ class AdvancedAsyncPipeline:
             logger.info(
                 f"🔒 [PROACTIVE-CAI] Screen is LOCKED - analyzing command: '{text[:50]}...'"
             )
+            
+            # Broadcast: Screen locked detected
+            await broadcast_progress("screen_detected", "Screen is locked. Analyzing command...", 10)
 
             # ─────────────────────────────────────────────────────────────────
             # Step 2: Analyze intent to determine if command requires screen
@@ -1635,9 +1655,20 @@ class AdvancedAsyncPipeline:
             )
 
             logger.info(f"🎤 [PROACTIVE-CAI] Acknowledgment: '{acknowledgment}'")
+            
+            # Broadcast: Verifying voice
+            await broadcast_progress("verifying_voice", f"Verifying your voice, {speaker_name or user_name}...", 25)
 
-            # Speak the acknowledgment asynchronously
-            await self._speak_acknowledgment(acknowledgment)
+            # Speak the acknowledgment and WAIT for completion
+            # This ensures the microphone doesn't pick up JARVIS's voice during VBI
+            await self._speak_acknowledgment(acknowledgment, wait_for_completion=True)
+            
+            # v8.0: Brief pause after speech to let audio echo dissipate
+            # This prevents the VBI from processing any trailing audio of JARVIS's voice
+            await asyncio.sleep(0.5)
+            
+            # Broadcast: Voice verified, unlocking
+            await broadcast_progress("unlocking", "Voice verified. Unlocking screen...", 50)
 
             # ─────────────────────────────────────────────────────────────────
             # Step 7: Perform VBI verification and unlock
@@ -1662,9 +1693,19 @@ class AdvancedAsyncPipeline:
                 logger.warning(
                     f"❌ [PROACTIVE-CAI] Unlock failed: {unlock_result.get('response', 'Unknown error')}"
                 )
+                # Broadcast: Error
+                await broadcast_progress(
+                    "error", 
+                    unlock_result.get('response', 'Unlock failed'), 
+                    50, 
+                    status="error"
+                )
                 return unlock_result
 
             logger.info(f"✅ [PROACTIVE-CAI] Screen unlocked successfully!")
+            
+            # Broadcast: Unlocked successfully
+            await broadcast_progress("unlocked", "Screen unlocked! Executing command...", 70)
 
             # ─────────────────────────────────────────────────────────────────
             # Step 8: EVENT-DRIVEN CONTINUATION PATTERN
@@ -1706,14 +1747,51 @@ class AdvancedAsyncPipeline:
                 """
                 Execute the original command as a completely separate transaction.
                 This runs AFTER the unlock result has been returned to the frontend.
+                
+                v8.0: Waits for any JARVIS speech to complete before executing,
+                preventing self-voice interference with command processing.
                 """
                 try:
                     # Brief pause to ensure frontend has processed unlock response
                     await asyncio.sleep(0.5)
+                    
+                    # v8.0: Wait for any JARVIS speech to complete before continuing
+                    # This prevents the continuation from being affected by JARVIS's voice
+                    try:
+                        from core.unified_speech_state import get_speech_state_manager_sync
+                        speech_manager = get_speech_state_manager_sync()
+                        
+                        # Wait up to 10 seconds for speech to complete
+                        max_wait = 10.0
+                        waited = 0.0
+                        while speech_manager.is_busy and waited < max_wait:
+                            logger.debug(f"🔇 [PROACTIVE-CAI] Waiting for JARVIS speech to complete...")
+                            await asyncio.sleep(0.5)
+                            waited += 0.5
+                        
+                        if waited > 0:
+                            logger.info(f"🔇 [PROACTIVE-CAI] Speech complete after {waited:.1f}s - proceeding")
+                    except Exception:
+                        pass
 
                     logger.info(
                         f"🔄 [PROACTIVE-CAI] CONTINUATION: Now executing '{_text[:50]}...'"
                     )
+                    
+                    # Broadcast: Executing command
+                    try:
+                        from api.broadcast_router import manager as broadcast_manager
+                        await broadcast_manager.broadcast({
+                            "type": "proactive_unlock_progress",
+                            "stage": "executing",
+                            "message": f"Executing: {_continuation_action}...",
+                            "progress": 85,
+                            "status": "in_progress",
+                            "original_command": _text,
+                            "continuation_intent": _continuation_action,
+                        })
+                    except Exception:
+                        pass
 
                     # Process as a NEW independent command with screen_just_unlocked flag
                     continuation_result = await self.process_async(
@@ -1735,19 +1813,52 @@ class AdvancedAsyncPipeline:
                         logger.info(
                             f"✅ [PROACTIVE-CAI] Continuation completed successfully"
                         )
+                        
+                        # Broadcast: Complete
+                        try:
+                            from api.broadcast_router import manager as broadcast_manager
+                            await broadcast_manager.broadcast({
+                                "type": "proactive_unlock_progress",
+                                "stage": "complete",
+                                "message": f"Done! {_continuation_action}",
+                                "progress": 100,
+                                "status": "complete",
+                                "original_command": _text,
+                                "continuation_intent": _continuation_action,
+                            })
+                        except Exception:
+                            pass
+                        
                         # Generate and speak success acknowledgment
                         success_message = self._generate_completion_acknowledgment(
                             speaker_name=_speaker_name or _user_name,
                             continuation_action=_continuation_action,
                             continuation_result=continuation_result,
                         )
-                        # Fire and forget - don't block on speech
-                        asyncio.create_task(self._speak_acknowledgment(success_message))
+                        # Speak acknowledgment (don't wait since this is fire-and-forget)
+                        asyncio.create_task(
+                            self._speak_acknowledgment(success_message, wait_for_completion=False)
+                        )
                     else:
                         logger.warning(
                             f"⚠️ [PROACTIVE-CAI] Continuation failed: "
                             f"{continuation_result.get('response', 'Unknown')}"
                         )
+                        
+                        # Broadcast: Error
+                        try:
+                            from api.broadcast_router import manager as broadcast_manager
+                            await broadcast_manager.broadcast({
+                                "type": "proactive_unlock_progress",
+                                "stage": "error",
+                                "message": continuation_result.get('response', 'Command failed'),
+                                "progress": 85,
+                                "status": "error",
+                                "original_command": _text,
+                                "continuation_intent": _continuation_action,
+                            })
+                        except Exception:
+                            pass
 
                 except asyncio.TimeoutError:
                     logger.error(
@@ -2111,20 +2222,36 @@ class AdvancedAsyncPipeline:
         hash_val = int(hashlib.md5(continuation_action.encode()).hexdigest()[:8], 16)
         return templates[hash_val % len(templates)]
 
-    async def _speak_acknowledgment(self, message: str) -> None:
+    async def _speak_acknowledgment(self, message: str, wait_for_completion: bool = True) -> None:
         """
         Speak the acknowledgment message using available TTS.
+        
+        v8.0: Integrates with UnifiedSpeechStateManager for self-voice suppression.
+        This prevents the spoken acknowledgment from interfering with subsequent
+        voice processing (e.g., VBI verification or continuation commands).
 
         Tries multiple TTS backends in order of preference:
-        1. AGI OS voice communicator (if available)
+        1. AGI OS voice communicator (if available) - already integrates with speech state
         2. JARVIS voice API (if available)
         3. Direct macOS `say` command (fallback)
 
         Args:
             message: The message to speak
+            wait_for_completion: Whether to wait for speech to complete (default True)
         """
+        speech_start_time = time.time()
+        
+        # v8.0: Notify UnifiedSpeechStateManager BEFORE speech
+        speech_manager = None
         try:
-            # Try AGI OS voice communicator first
+            from core.unified_speech_state import get_speech_state_manager_sync, SpeechSource
+            speech_manager = get_speech_state_manager_sync()
+            await speech_manager.start_speaking(message, source=SpeechSource.CAI_FEEDBACK)
+        except Exception as e:
+            logger.debug(f"[PROACTIVE-CAI] Could not notify speech state: {e}")
+        
+        try:
+            # Try AGI OS voice communicator first (already handles speech state)
             if hasattr(self, "_agi_voice_communicator") and self._agi_voice_communicator:
                 await self._agi_voice_communicator.speak(message, priority="high")
                 return
@@ -2139,6 +2266,11 @@ class AdvancedAsyncPipeline:
                         timeout=aiohttp.ClientTimeout(total=5.0),
                     ) as resp:
                         if resp.status == 200:
+                            if wait_for_completion:
+                                # Estimate speech duration: ~150 words/min = 400ms/word
+                                word_count = len(message.split())
+                                estimated_duration = max(1.0, word_count * 0.4 + 0.5)
+                                await asyncio.sleep(estimated_duration)
                             return
             except Exception:
                 pass
@@ -2153,6 +2285,14 @@ class AdvancedAsyncPipeline:
 
         except Exception as e:
             logger.debug(f"[PROACTIVE-CAI] Could not speak acknowledgment: {e}")
+        finally:
+            # v8.0: Notify UnifiedSpeechStateManager AFTER speech completes
+            if speech_manager:
+                try:
+                    speech_duration_ms = (time.time() - speech_start_time) * 1000
+                    await speech_manager.stop_speaking(actual_duration_ms=speech_duration_ms)
+                except Exception:
+                    pass
 
     # =========================================================================
     # 🔄 POST-UNLOCK COMMAND CONTINUATION (Deterministic, No LLM Required)

@@ -487,10 +487,35 @@ class UnifiedSpeechStateManager:
         with self._state_lock:
             return self._state.is_speaking or self._state.is_in_cooldown()
     
-    def get_state(self) -> Dict[str, Any]:
-        """Get full state as dict (thread-safe)."""
+    def get_state(self) -> SpeechState:
+        """Get full state (thread-safe copy)."""
         with self._state_lock:
-            return self._state.to_dict()
+            # Return a copy to prevent external modification
+            state = SpeechState(
+                is_speaking=self._state.is_speaking,
+                speech_started_at=self._state.speech_started_at,
+                speech_ended_at=self._state.speech_ended_at,
+                current_text=self._state.current_text,
+                current_source=self._state.current_source,
+                cooldown_until=self._state.cooldown_until,
+            )
+            return state
+    
+    @property
+    def last_spoken_text(self) -> str:
+        """Get the last spoken text."""
+        with self._state_lock:
+            if self._state.recent_texts:
+                return self._state.recent_texts[-1].text
+            return ""
+    
+    @property
+    def last_spoken_timestamp(self) -> float:
+        """Get the timestamp of last spoken text (unix seconds)."""
+        with self._state_lock:
+            if self._state.recent_texts:
+                return self._state.recent_texts[-1].timestamp_ms / 1000.0
+            return 0.0
     
     def get_stats(self) -> Dict[str, Any]:
         """Get statistics."""

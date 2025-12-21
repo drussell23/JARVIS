@@ -2098,6 +2098,38 @@ class JARVISVoiceAPI:
                     self.jarvis.running = True
                     logger.info("Activating JARVIS for command processing")
 
+            # ═══════════════════════════════════════════════════════════════════
+            # v8.0: SELF-VOICE SUPPRESSION CHECK AT API LEVEL
+            # ═══════════════════════════════════════════════════════════════════
+            # If JARVIS is speaking or in cooldown, this command might be JARVIS
+            # hearing its own voice. Check the unified speech state and reject
+            # if we're currently in a speech or cooldown state.
+            # ═══════════════════════════════════════════════════════════════════
+            try:
+                from core.unified_speech_state import get_speech_state_manager_sync
+                speech_manager = get_speech_state_manager_sync()
+                rejection = speech_manager.should_reject_audio(command.text)
+                
+                if rejection.reject:
+                    logger.warning(
+                        f"🔇 [SELF-VOICE-API] Rejecting command - "
+                        f"reason: {rejection.reason}, text: '{command.text[:50]}...'"
+                    )
+                    return CommandResponse(
+                        response="",
+                        command_type="self_voice_suppression",
+                        success=False,
+                        metadata={
+                            "rejected": True,
+                            "rejection_reason": rejection.reason,
+                            "rejection_details": rejection.details,
+                        }
+                    )
+            except ImportError:
+                pass  # Manager not available
+            except Exception as e:
+                logger.debug(f"[SELF-VOICE-API] Check error (non-fatal): {e}")
+            
             # Process command through async pipeline for better performance and alignment
             logger.info(f"[JARVIS API] Processing command through async pipeline: '{command.text}'")
 

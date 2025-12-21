@@ -247,6 +247,69 @@ async def get_broadcast_stats():
     return manager.get_stats()
 
 
+@broadcast_router.get("/speech-state")
+async def get_speech_state():
+    """
+    Get current JARVIS speech state for self-voice suppression.
+    
+    v8.0: Returns whether JARVIS is speaking, in cooldown, and recent spoken text.
+    This allows frontend to synchronize speech state without waiting for WebSocket.
+    
+    Returns:
+        {
+            "is_speaking": bool,
+            "in_cooldown": bool,
+            "cooldown_remaining_ms": int,
+            "last_spoken_text": str,
+            "last_spoken_timestamp": float,
+            "should_block_audio": bool
+        }
+    """
+    try:
+        from core.unified_speech_state import get_speech_state_manager
+        speech_manager = await get_speech_state_manager()
+        
+        import time
+        current_time = time.time()
+        
+        # Get state properties
+        is_speaking = speech_manager.is_speaking
+        is_in_cooldown = speech_manager.is_in_cooldown
+        state = speech_manager.get_state()
+        cooldown_remaining = state.get_cooldown_remaining_ms() if hasattr(state, 'get_cooldown_remaining_ms') else 0
+        last_spoken_text = speech_manager.last_spoken_text
+        last_spoken_timestamp = speech_manager.last_spoken_timestamp
+        
+        return {
+            "is_speaking": is_speaking,
+            "in_cooldown": is_in_cooldown,
+            "cooldown_remaining_ms": cooldown_remaining,
+            "last_spoken_text": last_spoken_text,
+            "last_spoken_timestamp": last_spoken_timestamp,
+            "should_block_audio": is_speaking or is_in_cooldown,
+        }
+    except ImportError:
+        return {
+            "is_speaking": False,
+            "in_cooldown": False,
+            "cooldown_remaining_ms": 0,
+            "last_spoken_text": "",
+            "last_spoken_timestamp": 0,
+            "should_block_audio": False,
+            "error": "UnifiedSpeechStateManager not available",
+        }
+    except Exception as e:
+        return {
+            "is_speaking": False,
+            "in_cooldown": False,
+            "cooldown_remaining_ms": 0,
+            "last_spoken_text": "",
+            "last_spoken_timestamp": 0,
+            "should_block_audio": False,
+            "error": str(e),
+        }
+
+
 @broadcast_router.websocket("/broadcast/ws")
 async def broadcast_websocket(websocket: WebSocket):
     """
