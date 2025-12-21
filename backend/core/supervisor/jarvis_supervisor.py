@@ -1113,23 +1113,36 @@ class JARVISSupervisor:
                         ready_for_completion = True
 
                     # ═══════════════════════════════════════════════════════════════════
-                    # FALLBACK 2: Degraded mode after extended wait (90+ seconds)
-                    # Only if backend HTTP responds but services aren't fully ready
+                    # FALLBACK 2: Quick completion when both services are responding
+                    # v4.0: If frontend is ready AND backend HTTP responds, complete quickly
+                    # Don't wait for ML models - they can warm up in background
                     # ═══════════════════════════════════════════════════════════════════
                     if (not ready_for_completion and
                         backend_ready and
-                        (frontend_ready or frontend_optional) and
-                        elapsed > 90):
-                        services_ready = system_status.get("services_ready", []) if system_status else []
-                        services_failed = system_status.get("services_failed", []) if system_status else []
-
-                        # Only complete in degraded mode if we have some services
-                        if len(services_ready) >= 2 or backend_status == "degraded":
-                            logger.warning(f"⚠️ Completing in degraded mode after 90s (ready={services_ready}, failed={services_failed})")
-                            ready_for_completion = True
+                        frontend_ready and
+                        elapsed > 15):
+                        logger.info(f"✅ Frontend + Backend responding after {elapsed:.1f}s - completing")
+                        ready_for_completion = True
 
                     # ═══════════════════════════════════════════════════════════════════
-                    # FALLBACK 3: Last resort timeout (after adaptive_timeout * 1.2)
+                    # FALLBACK 3: Complete when backend is responding (no frontend)
+                    # v4.0: For headless mode or slow frontend
+                    # ═══════════════════════════════════════════════════════════════════
+                    if (not ready_for_completion and
+                        backend_ready and
+                        frontend_optional and
+                        elapsed > 30):
+                        services_ready = system_status.get("services_ready", []) if system_status else []
+                        services_failed = system_status.get("services_failed", []) if system_status else []
+                        
+                        # v4.0: More relaxed condition - complete if backend responds
+                        # Even if ML models are still warming up, user can interact
+                        logger.info(f"✅ Backend + Frontend ready after {elapsed:.1f}s - completing")
+                        logger.debug(f"   Services: ready={services_ready}, failed={services_failed}")
+                        ready_for_completion = True
+
+                    # ═══════════════════════════════════════════════════════════════════
+                    # FALLBACK 4: Last resort timeout (after adaptive_timeout * 1.2)
                     # Only with explicit warning - this indicates a startup problem
                     # ═══════════════════════════════════════════════════════════════════
                     if (not ready_for_completion and

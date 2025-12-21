@@ -1258,9 +1258,32 @@ class SupervisorBootstrapper:
             
             print()
             
-            # Run supervisor
+            # Run supervisor with startup monitoring
             self.perf.start("jarvis")
-            await supervisor.run()
+            
+            # v4.0: Run startup monitoring in parallel with supervisor
+            # This ensures completion is broadcast even if jarvis_supervisor's
+            # internal monitoring doesn't complete (e.g., due to service initialization delays)
+            if self._loading_server_process:
+                # Start monitoring as a background task
+                monitoring_task = asyncio.create_task(
+                    self._monitor_jarvis_startup(max_wait=120.0)
+                )
+                self.logger.info("🔍 Startup monitoring task started")
+            else:
+                monitoring_task = None
+            
+            try:
+                await supervisor.run()
+            finally:
+                # Cancel monitoring if still running
+                if monitoring_task and not monitoring_task.done():
+                    monitoring_task.cancel()
+                    try:
+                        await monitoring_task
+                    except asyncio.CancelledError:
+                        pass
+            
             self.perf.end("jarvis")
 
             return 0
@@ -1475,6 +1498,194 @@ class SupervisorBootstrapper:
             self.logger.exception(f"Failed to start loading page ecosystem: {e}")
             print(f"  {TerminalUI.YELLOW}⚠️  Loading page failed: {e}{TerminalUI.RESET}")
             print(f"  {TerminalUI.CYAN}💡 JARVIS will start without loading page{TerminalUI.RESET}")
+    
+    async def _broadcast_to_loading_page(
+        self,
+        stage: str,
+        message: str,
+        progress: int,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """
+        Broadcast progress update to the loading page.
+        
+        v4.0: Supervisor takes responsibility for completion broadcasting
+        when JARVIS_SUPERVISOR_LOADING=1 is set.
+        
+        Args:
+            stage: Current stage name
+            message: Human-readable message
+            progress: Progress percentage (0-100)
+            metadata: Optional metadata dict
+            
+        Returns:
+            True if broadcast succeeded, False otherwise
+        """
+        if not self._loading_server_process:
+            return False
+        
+        try:
+            import aiohttp
+            from datetime import datetime
+            
+            loading_port = self.config.required_ports[2]  # 3001
+            url = f"http://localhost:{loading_port}/api/update-progress"
+            
+            data = {
+                "stage": stage,
+                "message": message,
+                "progress": progress,
+                "timestamp": datetime.now().isoformat(),
+                "metadata": metadata or {},
+            }
+            
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=2.0)
+            ) as session:
+                async with session.post(url, json=data) as resp:
+                    if resp.status == 200:
+                        self.logger.debug(f"📡 Broadcast: {stage} ({progress}%)")
+                        return True
+                    else:
+                        self.logger.debug(f"Broadcast failed: status {resp.status}")
+                        return False
+                        
+        except Exception as e:
+            self.logger.debug(f"Broadcast failed: {e}")
+            return False
+    
+    async def _monitor_jarvis_startup(self, max_wait: float = 120.0) -> bool:
+        """
+        Monitor JARVIS startup and broadcast progress to loading page.
+        
+        v4.0: This is the CRITICAL missing piece that was causing the 97% hang.
+        The supervisor MUST monitor startup and broadcast completion when it
+        sets JARVIS_SUPERVISOR_LOADING=1.
+        
+        Args:
+            max_wait: Maximum time to wait for JARVIS to be ready
+            
+        Returns:
+            True if JARVIS is ready, False if timeout
+        """
+        import aiohttp
+        
+        backend_port = self.config.required_ports[0]  # 8010
+        frontend_port = self.config.required_ports[1]  # 3000
+        
+        start_time = time.time()
+        last_progress = 0
+        backend_ready = False
+        frontend_ready = False
+        
+        self.logger.info("🔍 Monitoring JARVIS startup...")
+        
+        while (time.time() - start_time) < max_wait:
+            elapsed = time.time() - start_time
+            
+            # Phase 1: Check backend health
+            if not backend_ready:
+                try:
+                    async with aiohttp.ClientSession(
+                        timeout=aiohttp.ClientTimeout(total=3.0)
+                    ) as session:
+                        async with session.get(
+                            f"http://localhost:{backend_port}/health"
+                        ) as resp:
+                            if resp.status == 200:
+                                backend_ready = True
+                                self.logger.info("✅ Backend is ready")
+                                await self._broadcast_to_loading_page(
+                                    "backend_ready",
+                                    "Backend services online",
+                                    85,
+                                    {"icon": "✅", "label": "Backend Ready"}
+                                )
+                except Exception:
+                    pass
+            
+            # Phase 2: Check frontend
+            if backend_ready and not frontend_ready:
+                try:
+                    async with aiohttp.ClientSession(
+                        timeout=aiohttp.ClientTimeout(total=2.0)
+                    ) as session:
+                        async with session.get(
+                            f"http://localhost:{frontend_port}"
+                        ) as resp:
+                            if resp.status in [200, 304]:
+                                frontend_ready = True
+                                self.logger.info("✅ Frontend is ready")
+                                await self._broadcast_to_loading_page(
+                                    "frontend_ready",
+                                    "Frontend interface ready",
+                                    95,
+                                    {"icon": "✅", "label": "Frontend Ready"}
+                                )
+                except Exception:
+                    pass
+            
+            # Phase 3: Both ready = complete!
+            if backend_ready and frontend_ready:
+                self.logger.info("🎉 JARVIS startup complete!")
+                
+                # Broadcast 100% completion
+                await self._broadcast_to_loading_page(
+                    "complete",
+                    "JARVIS is online!",
+                    100,
+                    {
+                        "icon": "✅",
+                        "label": "Complete",
+                        "sublabel": "System ready!",
+                        "success": True,
+                        "frontend_verified": True,
+                        "redirect_url": f"http://localhost:{frontend_port}",
+                    }
+                )
+                
+                return True
+            
+            # Broadcast periodic progress updates
+            progress = 50 + int((elapsed / max_wait) * 40)  # 50-90%
+            if progress > last_progress + 5:  # Update every 5%
+                last_progress = progress
+                
+                if not backend_ready:
+                    status_msg = f"Starting backend... ({int(elapsed)}s)"
+                elif not frontend_ready:
+                    status_msg = f"Starting frontend... ({int(elapsed)}s)"
+                else:
+                    status_msg = "Finalizing..."
+                
+                await self._broadcast_to_loading_page(
+                    "supervisor_monitoring",
+                    status_msg,
+                    min(progress, 94),  # Cap at 94% until truly complete
+                    {"icon": "⏳", "label": "Starting", "sublabel": status_msg}
+                )
+            
+            await asyncio.sleep(1.0)
+        
+        # Timeout - broadcast anyway to unblock the loading page
+        self.logger.warning(f"⚠️ JARVIS startup timeout after {max_wait}s")
+        
+        await self._broadcast_to_loading_page(
+            "complete",
+            "JARVIS started (may still be initializing)",
+            100,
+            {
+                "icon": "⚠️",
+                "label": "Complete",
+                "sublabel": "Still initializing...",
+                "success": True,
+                "frontend_verified": frontend_ready,
+                "redirect_url": f"http://localhost:{frontend_port}",
+                "warning": "Startup took longer than expected",
+            }
+        )
+        
+        return backend_ready  # Return true if at least backend is ready
     
     async def _wait_for_ports_release(self, max_wait: float = 5.0) -> bool:
         """
