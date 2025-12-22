@@ -2120,12 +2120,16 @@ class JARVISLoadingManager {
                         }
 
                         // Check if operationally ready
-                        // ready=true OR operational=true OR status includes "ready"
+                        // v6.0: Accept more status values as "ready" to match backend progressive readiness
+                        // The backend returns ready=true for: ready, degraded, warming_up, websocket_ready
                         const isOperational = 
                             readyData.ready === true || 
                             readyData.operational === true ||
                             status === 'ready' ||
-                            status === 'operational';
+                            status === 'operational' ||
+                            status === 'warming_up' ||    // ML can warm in background
+                            status === 'websocket_ready' || // WebSocket = interactive
+                            status === 'degraded';        // Some services unavailable but core works
 
                         if (isOperational) {
                             // v5.0: Also verify WebSocket connectivity before declaring ready
@@ -2213,7 +2217,8 @@ class JARVISLoadingManager {
          */
         const backendPort = this.config.backendPort || 8010;
         const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const wsUrl = `${wsProtocol}//${this.config.hostname}:${backendPort}/ws/chat`;
+        // NOTE: The unified WebSocket endpoint is at /ws, not /ws/chat
+        const wsUrl = `${wsProtocol}//${this.config.hostname}:${backendPort}/ws`;
         
         return new Promise((resolve) => {
             const timeout = setTimeout(() => {
