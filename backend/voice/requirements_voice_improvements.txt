@@ -5,7 +5,7 @@ webrtcvad==2.0.10
 
 # Picovoice Wake Word Detection (optional but recommended)
 # Provides efficient on-device wake word detection
-pvporcupine==3.0.2
+pvporcupine==4.0.1
 
 # Audio Processing (should already be installed)
 librosa>=0.10.0
