@@ -183,6 +183,7 @@ class JARVISSupervisor:
         self,
         config: Optional[SupervisorConfig] = None,
         jarvis_entry_point: Optional[str] = None,
+        skip_browser_open: bool = False,
     ):
         """
         Initialize the JARVIS Supervisor.
@@ -190,9 +191,11 @@ class JARVISSupervisor:
         Args:
             config: Supervisor configuration (loads from YAML if None)
             jarvis_entry_point: Path to JARVIS entry point (default: start_system.py)
+            skip_browser_open: If True, skip opening browser (used when run_supervisor.py already opened it)
         """
         self.config = config or get_supervisor_config()
         self.jarvis_entry_point = jarvis_entry_point or self._find_entry_point()
+        self._skip_browser_open = skip_browser_open
         
         self.state = SupervisorState.INITIALIZING
         self.process_info = ProcessInfo()
@@ -520,14 +523,18 @@ class JARVISSupervisor:
                 # NOTE: Don't announce SUPERVISOR_INIT here - run() already did it via _narrator
 
                 # Open browser to loading page (only on first start AND if not already opened)
-                # CRITICAL: Check JARVIS_SUPERVISOR_LOADING env var - if set, run_supervisor.py 
-                # already opened the browser, so we should NOT open another one.
-                supervisor_already_opened = os.environ.get("JARVIS_SUPERVISOR_LOADING") == "1"
+                # CRITICAL: Skip if run_supervisor.py already opened the browser
+                # v3.1: Use explicit flag (more reliable than env var timing)
+                supervisor_already_opened = (
+                    self._skip_browser_open or 
+                    os.environ.get("JARVIS_SUPERVISOR_LOADING") == "1"
+                )
                 
                 if self.stats.total_starts == 0 and not supervisor_already_opened:
                     await self._open_loading_page()
+                    logger.info("🌐 Browser opened by jarvis_supervisor")
                 elif supervisor_already_opened:
-                    logger.debug("📡 Browser already opened by run_supervisor.py, skipping")
+                    logger.info("📡 Browser already opened by run_supervisor.py, skipping _open_loading_page()")
 
             except Exception as e:
                 logger.warning(f"⚠️ Loading page unavailable: {e}")

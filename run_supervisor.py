@@ -1876,7 +1876,9 @@ class SupervisorBootstrapper:
             print()
             
             from core.supervisor import JARVISSupervisor
-            supervisor = JARVISSupervisor()
+            # v3.1: Pass skip_browser_open=True to prevent duplicate browser windows
+            # run_supervisor.py handles browser opening in _start_loading_page_ecosystem()
+            supervisor = JARVISSupervisor(skip_browser_open=True)
             self._supervisor = supervisor  # Store reference for hot reload
             
             self._print_config_summary(supervisor)
