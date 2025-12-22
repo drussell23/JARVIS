@@ -3850,13 +3850,22 @@ async def health_ready():
     # CHECK 4: WebSocket System (CRITICAL for frontend communication)
     # ═══════════════════════════════════════════════════════════════════════════
     websocket_ready = False
-    if hasattr(app.state, "unified_websocket_manager"):
-        details["websocket_ready"] = True
-        websocket_ready = True
-        critical_services_ready.append("websocket")
-    else:
+    try:
+        # Check the actual WebSocket manager singleton
+        from api.unified_websocket import get_ws_manager
+        ws_manager = get_ws_manager()
+        if ws_manager is not None:
+            details["websocket_ready"] = True
+            websocket_ready = True
+            critical_services_ready.append("websocket")
+            # Store in app.state for other components
+            app.state.unified_websocket_manager = ws_manager
+        else:
+            details["websocket_ready"] = False
+            critical_services_failed.append("websocket")
+    except Exception as e:
         details["websocket_ready"] = False
-        # WebSocket not ready means frontend can't communicate properly
+        details["websocket_error"] = str(e)[:50]
         critical_services_failed.append("websocket")
 
     # ═══════════════════════════════════════════════════════════════════════════
@@ -3878,27 +3887,37 @@ async def health_ready():
         details["database_connected"] = False
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # DETERMINE OVERALL READINESS
+    # DETERMINE OVERALL READINESS (Progressive Model v1.0)
     # ═══════════════════════════════════════════════════════════════════════════
-    # ready=True ONLY when critical services are operational
-    # This prevents false positives that mislead users
-
-    # Minimum requirements for "ready":
-    # 1. WebSocket must be ready (frontend communication)
-    # 2. At least one voice service must be ready (ML or speaker service)
+    # Progressive readiness levels:
+    # 1. websocket_ready → user can interact (core readiness)
+    # 2. voice_operational → voice features work
+    # 3. ml_ready → full ML capabilities
+    #
+    # Key insight: WebSocket ready = user can interact, even without voice
+    # Voice/ML can warm up in background while user interacts
+    # ═══════════════════════════════════════════════════════════════════════════
+    
     voice_operational = ml_ready or speaker_service_ready or voice_ready
-    core_ready = websocket_ready and voice_operational
+    core_ready = websocket_ready  # WebSocket is the ONLY hard requirement for interaction
+    full_ready = websocket_ready and voice_operational
 
-    # Determine status
-    if core_ready and len(critical_services_failed) == 0:
+    # Determine status based on progressive levels
+    if full_ready and len(critical_services_failed) == 0:
         status = "ready"
         ready = True
-    elif core_ready:
-        status = "degraded"  # Some services failed but core is operational
+    elif full_ready:
+        status = "degraded"  # Some non-critical services failed
         ready = True
-    elif ml_warmup_info.get("is_warming_up"):
+    elif websocket_ready and ml_warmup_info.get("is_warming_up"):
+        # KEY FIX: WebSocket ready + ML warming = ready for interaction!
+        # ML can continue warming while user interacts
         status = "warming_up"
-        ready = False  # NOT ready during warmup - this was the bug!
+        ready = True  # Changed from False - user CAN interact while warming
+    elif websocket_ready:
+        # WebSocket ready but no voice yet - still interactive
+        status = "websocket_ready"
+        ready = True  # User can interact via text
     else:
         status = "initializing"
         ready = False

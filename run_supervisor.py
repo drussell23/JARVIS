@@ -2288,25 +2288,27 @@ class SupervisorBootstrapper:
                                     last_status = status
                                 
                                 # Check for operational readiness
+                                # v10.0: Progressive readiness - accept when ready=True from backend
                                 is_ready = (
                                     data.get("ready") == True or
                                     data.get("operational") == True or
-                                    status in ["ready", "operational", "degraded"]
+                                    status in ["ready", "operational", "degraded", "warming_up", "websocket_ready"]
                                 )
                                 
                                 # Also accept if WebSocket is ready (core functionality)
                                 details = data.get("details", {})
                                 websocket_ready = details.get("websocket_ready", False)
                                 
-                                # v4.2: Accept "warming_up" status after 30s if WebSocket is ready
-                                # ML models can continue warming in background - user can interact
-                                if status == "warming_up" and elapsed > 30 and websocket_ready:
-                                    self.logger.info(f"✅ Backend warming up but functional after {elapsed:.0f}s")
+                                # v10.0: WebSocket ready = immediately interactive
+                                # No need to wait for ML models - they warm in background
+                                if websocket_ready and not is_ready:
+                                    self.logger.info(f"✅ WebSocket ready - accepting as interactive")
                                     is_ready = True
                                 
-                                # v4.2: Accept any responding status after 45s with WebSocket
-                                if websocket_ready and elapsed > 45:
-                                    self.logger.info(f"✅ Backend WebSocket ready after {elapsed:.0f}s")
+                                # v10.0: Accept any status where ready=True (backend makes decision)
+                                # This trusts the backend's progressive readiness logic
+                                if data.get("ready") == True and not is_ready:
+                                    self.logger.info(f"✅ Backend reports ready={data.get('ready')} status={status}")
                                     is_ready = True
                                 
                                 if is_ready:
