@@ -1498,6 +1498,72 @@ class VoiceBiometricIntelligence:
             logger.debug(f"Cost tracking failed: {e}")
             return 0.0
 
+    async def _learn_from_verification(
+        self,
+        speaker_name: str,
+        embedding: Any,
+        confidence: float,
+        audio_quality: str = 'good'
+    ):
+        """
+        ADVANCED: Learn from successful verification to continuously improve profile.
+
+        This method:
+        1. Feeds high-quality samples to the learning engine
+        2. Updates temporal profiles for time-of-day optimization
+        3. Triggers profile optimization when needed
+        """
+        try:
+            from voice_unlock.voice_profile_learning_engine import (
+                get_learning_engine,
+                learn_from_vbi_unlock
+            )
+            import numpy as np
+
+            # Convert embedding to numpy array if needed
+            if embedding is not None:
+                if hasattr(embedding, 'numpy'):
+                    embedding_np = embedding.numpy()
+                elif isinstance(embedding, (list, tuple)):
+                    embedding_np = np.array(embedding, dtype=np.float32)
+                elif isinstance(embedding, np.ndarray):
+                    embedding_np = embedding
+                else:
+                    logger.debug(f"Unknown embedding type: {type(embedding)}")
+                    return
+
+                # Learn from this sample
+                result = await learn_from_vbi_unlock(
+                    embedding=embedding_np,
+                    confidence=confidence,
+                    success=True,
+                    speaker_name=speaker_name,
+                    audio_quality=audio_quality
+                )
+
+                if result.get('learned', False):
+                    logger.debug(
+                        f"🧠 Learned from verification: {speaker_name} "
+                        f"(conf={confidence:.1%}, trend={result.get('confidence_trend', 'stable')})"
+                    )
+
+                    # Check if profile optimization is needed (every 25 samples)
+                    if result.get('total_samples', 0) % 25 == 0:
+                        engine = await get_learning_engine(speaker_name)
+                        quality = await engine.compute_profile_quality_score()
+
+                        if quality['quality_score'] < 0.7:
+                            logger.info(
+                                f"📊 Profile quality: {quality['quality_score']:.0%} - "
+                                f"Consider optimization. Recommendations: "
+                                f"{', '.join(quality.get('recommendations', [])[:2])}"
+                            )
+
+        except ImportError:
+            logger.debug("Learning engine not available")
+        except Exception as e:
+            logger.debug(f"Learning from verification failed: {e}")
+
     async def _store_verification_pattern(
         self,
         result: VerificationResult,
@@ -2197,6 +2263,20 @@ class VoiceBiometricIntelligence:
         if result.verified and self._drift_detector_available:
             asyncio.create_task(
                 self._check_voice_drift(result, embedding_for_cost_tracking)
+            )
+
+        # =====================================================================
+        # ADVANCED: Continuous learning from successful verifications
+        # =====================================================================
+        # Learn from high-quality samples to continuously improve profile
+        if result.verified and result.confidence >= 0.80 and embedding_for_cost_tracking is not None:
+            asyncio.create_task(
+                self._learn_from_verification(
+                    speaker_name=result.speaker_name,
+                    embedding=embedding_for_cost_tracking,
+                    confidence=result.confidence,
+                    audio_quality='excellent' if result.confidence >= 0.92 else 'good'
+                )
             )
 
         # End Langfuse trace

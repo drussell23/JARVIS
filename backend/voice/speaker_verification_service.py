@@ -6373,32 +6373,96 @@ class SpeakerVerificationService:
         return base_confidence
 
     async def _apply_confidence_boost(
-        self, confidence: float, speaker_name: str, profile: dict
+        self, confidence: float, speaker_name: str, profile: dict,
+        embedding: np.ndarray = None, behavioral_score: float = None
     ) -> float:
-        """Apply confidence boosting based on patterns"""
+        """
+        Apply ADVANCED multi-factor confidence boosting.
+
+        Uses the learning engine's statistical analysis for:
+        1. Temporal match boost (voice matches time-of-day pattern)
+        2. Behavioral boost (matches usage patterns)
+        3. Consistency boost (recent verifications are stable)
+        4. Environmental boost (known environment)
+        5. History boost (good track record)
+        """
         if confidence < self.min_confidence_for_boost:
             return confidence
 
-        # Check if this speaker has good history
-        if speaker_name in self.verification_history:
+        total_boost = 0.0
+        boost_reasons = []
+
+        # =====================================================================
+        # ADVANCED: Use learning engine for multi-factor boost
+        # =====================================================================
+        try:
+            from voice_unlock.voice_profile_learning_engine import get_learning_engine
+            learning_engine = await get_learning_engine(speaker_name)
+
+            # Compute behavioral score from history if not provided
+            if behavioral_score is None and speaker_name in self.verification_history:
+                history = self.verification_history[speaker_name]
+                if len(history) >= 3:
+                    recent_success_rate = sum(1 for h in history[-10:] if h.get('verified', False)) / min(len(history), 10)
+                    behavioral_score = recent_success_rate
+
+            # Get embedding from profile if not provided
+            if embedding is None and 'embedding' in profile:
+                embedding = profile['embedding']
+                if isinstance(embedding, (bytes, bytearray)):
+                    embedding = np.frombuffer(embedding, dtype=np.float32)
+
+            # Apply advanced multi-factor boost from learning engine
+            if embedding is not None:
+                boost_result = await learning_engine.compute_confidence_boost(
+                    base_confidence=confidence,
+                    embedding=embedding,
+                    hour=datetime.now().hour,
+                    behavioral_score=behavioral_score
+                )
+
+                if boost_result['boost_applied'] > 0.005:
+                    total_boost += boost_result['boost_applied']
+                    for factor, value in boost_result.get('boost_breakdown', {}).items():
+                        boost_reasons.append(f"{factor}:{value:.1%}")
+
+        except Exception as e:
+            logger.debug(f"Learning engine boost not available: {e}")
+
+        # =====================================================================
+        # LEGACY: History-based boost (fallback)
+        # =====================================================================
+        if total_boost == 0 and speaker_name in self.verification_history:
             history = self.verification_history[speaker_name]
             if len(history) >= 3:
                 recent_success_rate = sum(1 for h in history[-10:] if h.get('verified', False)) / min(len(history), 10)
-                if recent_success_rate > 0.5:
-                    # Apply boost
-                    boosted = confidence * self.boost_multiplier
-                    boosted = min(boosted, 0.95)  # Cap at 95%
-                    logger.info(f"🚀 Confidence boost applied: {confidence:.2%} -> {boosted:.2%}")
-                    return boosted
+                if recent_success_rate > 0.7:  # Raised from 0.5 for security
+                    # Apply graduated boost based on success rate
+                    history_boost = (recent_success_rate - 0.7) * 0.10  # Max 3% from history
+                    total_boost += history_boost
+                    boost_reasons.append(f"history:{history_boost:.1%}")
 
-        # Apply environmental boost if in known environment
+        # =====================================================================
+        # Environmental boost
+        # =====================================================================
         if self.current_environment in self.environment_profiles:
-            env_boost = 1.2
-            boosted = confidence * env_boost
-            boosted = min(boosted, 0.95)
-            if boosted > confidence:
-                logger.info(f"🌍 Environment boost: {confidence:.2%} -> {boosted:.2%}")
-                return boosted
+            env_boost = 0.02  # Fixed 2% for known environment
+            total_boost += env_boost
+            boost_reasons.append(f"environment:{env_boost:.1%}")
+
+        # =====================================================================
+        # Apply total boost with safety cap
+        # =====================================================================
+        max_boost = float(os.environ.get('VOICE_MAX_CONFIDENCE_BOOST', '0.08'))  # 8% max
+        total_boost = min(total_boost, max_boost)
+
+        if total_boost > 0.005:
+            boosted = min(confidence + total_boost, 0.98)  # Cap at 98% (raised from 95%)
+            logger.info(
+                f"🚀 Multi-factor boost: {confidence:.2%} → {boosted:.2%} "
+                f"(+{total_boost:.1%}) [{', '.join(boost_reasons)}]"
+            )
+            return boosted
 
         return confidence
 
