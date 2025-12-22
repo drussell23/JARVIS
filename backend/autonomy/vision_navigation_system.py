@@ -1,23 +1,7 @@
 #!/usr/bin/env python3
 """
-Full Screen Vision & Navigation System for JARVIS.
-
-This module provides complete workspace understanding and autonomous navigation capabilities
-for the JARVIS AI assistant. It combines computer vision, OCR, window management, and
-intelligent navigation to enable full control over the desktop environment.
-
-The system can:
-- Map the entire workspace including all windows and UI elements
-- Navigate between applications and UI components autonomously
-- Learn navigation patterns and optimize workflows
-- Arrange windows in predefined layouts
-- Execute complex multi-step workflows
-
-Example:
-    >>> nav_system = VisionNavigationSystem()
-    >>> await nav_system.start_navigation_mode()
-    >>> await nav_system.navigate_to_application("Safari")
-    >>> await nav_system.arrange_workspace(WorkspaceLayout.SPLIT)
+Full Screen Vision & Navigation System for JARVIS
+Provides complete workspace understanding and autonomous navigation capabilities
 """
 
 import asyncio
@@ -53,25 +37,9 @@ except ImportError:
     
 logger = logging.getLogger(__name__)
 
+
 class NavigationAction(Enum):
-    """Types of navigation actions that can be performed.
-    
-    Attributes:
-        SWITCH_WINDOW: Switch focus to a different window
-        OPEN_APPLICATION: Launch a new application
-        CLOSE_WINDOW: Close an existing window
-        MINIMIZE_WINDOW: Minimize a window to dock
-        MAXIMIZE_WINDOW: Maximize a window to full screen
-        MOVE_WINDOW: Move a window to new position
-        RESIZE_WINDOW: Resize a window
-        CLICK_ELEMENT: Click on a UI element
-        TYPE_TEXT: Type text at current cursor position
-        SCROLL: Scroll within a window or element
-        FOCUS_ELEMENT: Set focus to a specific element
-        NAVIGATE_MENU: Navigate through menu structures
-        SWITCH_DESKTOP: Switch to different desktop/space
-        ARRANGE_WINDOWS: Arrange multiple windows in layout
-    """
+    """Types of navigation actions"""
     SWITCH_WINDOW = "switch_window"
     OPEN_APPLICATION = "open_application"
     CLOSE_WINDOW = "close_window"
@@ -87,40 +55,19 @@ class NavigationAction(Enum):
     SWITCH_DESKTOP = "switch_desktop"
     ARRANGE_WINDOWS = "arrange_windows"
 
+
 class WorkspaceLayout(Enum):
-    """Predefined workspace layouts for window arrangement.
-    
-    Attributes:
-        FOCUS: Single window maximized for focused work
-        SPLIT: Two windows side by side
-        GRID: Four windows arranged in 2x2 grid
-        CASCADE: Windows cascaded with slight offsets
-        CUSTOM: User-defined custom layout
-    """
+    """Predefined workspace layouts"""
     FOCUS = "focus"  # Single window maximized
     SPLIT = "split"  # Two windows side by side
     GRID = "grid"   # Four windows in grid
     CASCADE = "cascade"  # Windows cascaded
     CUSTOM = "custom"  # User-defined layout
 
+
 @dataclass
 class WorkspaceElement:
-    """Represents a UI element in the workspace.
-    
-    This class encapsulates all information about a UI element including its
-    position, type, content, and relationships to other elements.
-    
-    Attributes:
-        id: Unique identifier for the element
-        type: Type of element (window, button, menu, text_field, etc.)
-        bounds: Element boundaries as (x, y, width, height)
-        parent_window: ID of the parent window containing this element
-        text: Text content of the element if applicable
-        is_interactive: Whether the element can be interacted with
-        is_focused: Whether the element currently has focus
-        children: List of child elements contained within this element
-        properties: Additional properties and metadata
-    """
+    """Represents an element in the workspace"""
     id: str
     type: str  # window, button, menu, text_field, etc.
     bounds: Tuple[int, int, int, int]  # x, y, width, height
@@ -132,52 +79,19 @@ class WorkspaceElement:
     properties: Dict[str, Any] = field(default_factory=dict)
     
     def contains_point(self, x: int, y: int) -> bool:
-        """Check if a point is within the element's bounds.
-        
-        Args:
-            x: X coordinate to check
-            y: Y coordinate to check
-            
-        Returns:
-            True if point is within element bounds, False otherwise
-            
-        Example:
-            >>> element = WorkspaceElement("btn1", "button", (10, 10, 100, 50))
-            >>> element.contains_point(50, 30)
-            True
-        """
+        """Check if point is within element bounds"""
         ex, ey, ew, eh = self.bounds
         return ex <= x <= ex + ew and ey <= y <= ey + eh
     
     def center_point(self) -> Tuple[int, int]:
-        """Get the center point of the element.
-        
-        Returns:
-            Tuple of (x, y) coordinates for the element's center
-            
-        Example:
-            >>> element = WorkspaceElement("btn1", "button", (10, 10, 100, 50))
-            >>> element.center_point()
-            (60, 35)
-        """
+        """Get center point of element"""
         x, y, w, h = self.bounds
         return (x + w // 2, y + h // 2)
 
+
 @dataclass
 class WorkspaceMap:
-    """Complete map of the current workspace state.
-    
-    This class represents a snapshot of the entire workspace including all
-    windows, UI elements, and their relationships at a specific point in time.
-    
-    Attributes:
-        windows: List of all visible windows
-        elements: List of all UI elements across all windows
-        active_window: Currently focused/active window
-        screen_bounds: Screen boundaries as (x, y, width, height)
-        desktop_number: Current desktop/space number
-        timestamp: When this map was created
-    """
+    """Complete map of the workspace"""
     windows: List[WindowInfo]
     elements: List[WorkspaceElement]
     active_window: Optional[WindowInfo] = None
@@ -186,54 +100,20 @@ class WorkspaceMap:
     timestamp: datetime = field(default_factory=datetime.now)
     
     def find_element_at(self, x: int, y: int) -> Optional[WorkspaceElement]:
-        """Find the topmost element at given coordinates.
-        
-        Args:
-            x: X coordinate to search
-            y: Y coordinate to search
-            
-        Returns:
-            The topmost element at the coordinates, or None if no element found
-            
-        Example:
-            >>> workspace_map.find_element_at(100, 200)
-            WorkspaceElement(id="button_1", type="button", ...)
-        """
+        """Find element at given coordinates"""
         for element in reversed(self.elements):  # Check from top to bottom
             if element.contains_point(x, y):
                 return element
         return None
     
     def get_window_elements(self, window_id: str) -> List[WorkspaceElement]:
-        """Get all elements belonging to a specific window.
-        
-        Args:
-            window_id: ID of the window to get elements for
-            
-        Returns:
-            List of elements that belong to the specified window
-            
-        Example:
-            >>> elements = workspace_map.get_window_elements("window_123")
-            >>> len(elements)
-            15
-        """
+        """Get all elements belonging to a window"""
         return [e for e in self.elements if e.parent_window == window_id]
+
 
 @dataclass
 class NavigationPath:
-    """Represents a path for navigating between UI elements.
-    
-    This class encapsulates the sequence of actions needed to navigate from
-    one element to another, along with metadata about the path's efficiency.
-    
-    Attributes:
-        start: Starting element for navigation
-        end: Target element for navigation
-        steps: List of navigation steps to execute
-        confidence: Confidence score for path success (0.0-1.0)
-        estimated_time: Estimated time to complete navigation in seconds
-    """
+    """Path for navigating between elements"""
     start: WorkspaceElement
     end: WorkspaceElement
     steps: List[NavigationAction]
@@ -241,57 +121,21 @@ class NavigationPath:
     estimated_time: float = 0.0
     
     def add_step(self, action: NavigationAction, params: Dict[str, Any] = None):
-        """Add a navigation step to the path.
-        
-        Args:
-            action: The navigation action to perform
-            params: Parameters for the action
-            
-        Example:
-            >>> path.add_step(NavigationAction.CLICK_ELEMENT, {"coordinates": (100, 200)})
-        """
+        """Add a navigation step"""
         self.steps.append({
             'action': action,
             'params': params or {},
             'timestamp': datetime.now()
         })
 
+
 class VisionNavigationSystem:
-    """Full screen vision and navigation system for autonomous desktop control.
-    
-    This system provides complete workspace understanding and autonomous navigation
-    capabilities by combining computer vision, OCR, window management, and intelligent
-    navigation algorithms. It can map the entire workspace, navigate between applications,
-    learn usage patterns, and execute complex workflows.
-    
-    The system operates in two modes:
-    1. Passive monitoring: Observes workspace without taking actions
-    2. Active navigation: Can control mouse, keyboard, and window management
-    
-    Attributes:
-        screen_capture: Module for capturing screen content
-        ocr_processor: OCR processor for text extraction
-        window_analyzer: Analyzer for window content and structure
-        window_detector: Detector for finding and tracking windows
-        enhanced_monitor: Enhanced workspace monitoring capabilities
-        current_map: Current workspace map snapshot
-        element_cache: Cache of UI elements for fast lookup
-        window_relationships: Relationships between windows
-        navigation_history: History of navigation actions
-        current_focus: Currently focused element
-        navigation_mode: Whether active navigation is enabled
-        navigation_patterns: Learned navigation patterns
-        element_interactions: Count of interactions per element
-        workflow_sequences: Recorded workflow sequences
-        navigation_stats: Performance statistics
+    """
+    Full screen vision and navigation system that provides complete workspace
+    understanding and autonomous navigation capabilities
     """
     
     def __init__(self):
-        """Initialize the vision navigation system.
-        
-        Sets up all vision components, workspace mapping structures, and
-        navigation state tracking.
-        """
         # Vision components
         self.screen_capture = ScreenCaptureModule(capture_interval=0.5)  # Faster for navigation
         self.ocr_processor = OCRProcessor()
@@ -323,19 +167,7 @@ class VisionNavigationSystem:
         }
         
     async def start_navigation_mode(self):
-        """Enable navigation mode for active workspace control.
-        
-        When navigation mode is active, the system can perform actions like
-        clicking, typing, and window management. This starts continuous
-        workspace mapping for real-time navigation.
-        
-        Raises:
-            RuntimeError: If system lacks necessary permissions for navigation
-            
-        Example:
-            >>> nav_system = VisionNavigationSystem()
-            >>> await nav_system.start_navigation_mode()
-        """
+        """Enable navigation mode for active control"""
         self.navigation_mode = True
         logger.info("Navigation mode activated - JARVIS has full workspace control")
         
@@ -343,27 +175,12 @@ class VisionNavigationSystem:
         asyncio.create_task(self._continuous_mapping())
         
     async def stop_navigation_mode(self):
-        """Disable navigation mode and stop active control.
-        
-        Stops continuous mapping and disables the ability to perform
-        navigation actions. The system returns to passive monitoring only.
-        
-        Example:
-            >>> await nav_system.stop_navigation_mode()
-        """
+        """Disable navigation mode"""
         self.navigation_mode = False
         logger.info("Navigation mode deactivated")
         
     async def _continuous_mapping(self):
-        """Continuously map the workspace while navigation mode is active.
-        
-        This internal method runs in the background to maintain an up-to-date
-        map of the workspace, analyzing window relationships and updating
-        the element cache every 500ms.
-        
-        Raises:
-            Exception: Logs errors but continues operation
-        """
+        """Continuously map the workspace"""
         while self.navigation_mode:
             try:
                 # Update workspace map
@@ -382,21 +199,7 @@ class VisionNavigationSystem:
                 await asyncio.sleep(1)
     
     async def map_full_workspace(self) -> WorkspaceMap:
-        """Create a complete map of the current workspace.
-        
-        Captures the full screen, detects all windows, extracts UI elements,
-        and builds a comprehensive map of the workspace state.
-        
-        Returns:
-            WorkspaceMap containing all windows, elements, and workspace state
-            
-        Raises:
-            Exception: If screen capture or window detection fails
-            
-        Example:
-            >>> workspace_map = await nav_system.map_full_workspace()
-            >>> print(f"Found {len(workspace_map.windows)} windows")
-        """
+        """Create a complete map of the current workspace"""
         # Capture full screen
         screen_capture = self.screen_capture.capture_screen()
         
@@ -422,21 +225,7 @@ class VisionNavigationSystem:
     
     async def _extract_all_elements(self, screen_capture: ScreenCapture, 
                                    windows: List[WindowInfo]) -> List[WorkspaceElement]:
-        """Extract all UI elements from the screen capture.
-        
-        Processes each visible window to extract UI elements using OCR and
-        computer vision techniques, then sorts elements by z-order.
-        
-        Args:
-            screen_capture: Captured screen image
-            windows: List of detected windows
-            
-        Returns:
-            List of all UI elements found across all windows
-            
-        Raises:
-            Exception: If element extraction fails for any window
-        """
+        """Extract all UI elements from the screen"""
         all_elements = []
         
         # Process each visible window
@@ -457,21 +246,7 @@ class VisionNavigationSystem:
     
     async def _extract_window_elements(self, screen_capture: ScreenCapture,
                                      window: WindowInfo) -> List[WorkspaceElement]:
-        """Extract UI elements from a specific window.
-        
-        Uses OCR to find text regions and computer vision to detect UI
-        components like buttons, menus, and text fields within the window.
-        
-        Args:
-            screen_capture: Captured screen image
-            window: Window to extract elements from
-            
-        Returns:
-            List of UI elements found in the window
-            
-        Raises:
-            Exception: If OCR processing or element detection fails
-        """
+        """Extract UI elements from a specific window"""
         elements = []
         
         # Define window region
@@ -506,22 +281,7 @@ class VisionNavigationSystem:
     
     async def _detect_ui_elements(self, screen_capture: ScreenCapture,
                                 window: WindowInfo) -> List[WorkspaceElement]:
-        """Detect UI elements using computer vision techniques.
-        
-        Uses advanced computer vision to detect UI components that may not
-        be captured by OCR, such as buttons, icons, and interactive areas.
-        
-        Args:
-            screen_capture: Captured screen image
-            window: Window to analyze for UI elements
-            
-        Returns:
-            List of detected UI elements
-            
-        Note:
-            Currently uses heuristics based on window type. Future versions
-            will implement advanced CV techniques for shape and pattern detection.
-        """
+        """Detect UI elements using computer vision"""
         elements = []
         
         # This would use advanced CV techniques to detect:
@@ -546,18 +306,7 @@ class VisionNavigationSystem:
         return elements
     
     def _build_element_hierarchy(self, elements: List[WorkspaceElement]):
-        """Build parent-child relationships between UI elements.
-        
-        Analyzes element positions and sizes to determine containment
-        relationships, building a hierarchy where larger elements that
-        contain smaller ones become parents.
-        
-        Args:
-            elements: List of elements to analyze for hierarchy
-            
-        Note:
-            Modifies elements in-place by adding children to parent elements
-        """
+        """Build parent-child relationships between elements"""
         # Sort by area (larger elements are likely parents)
         sorted_elements = sorted(
             elements, 
@@ -573,15 +322,7 @@ class VisionNavigationSystem:
                     
     def _contains(self, parent_bounds: Tuple[int, int, int, int],
                   child_bounds: Tuple[int, int, int, int]) -> bool:
-        """Check if parent bounds completely contain child bounds.
-        
-        Args:
-            parent_bounds: Parent element bounds (x, y, width, height)
-            child_bounds: Child element bounds (x, y, width, height)
-            
-        Returns:
-            True if parent completely contains child, False otherwise
-        """
+        """Check if parent bounds contain child bounds"""
         px, py, pw, ph = parent_bounds
         cx, cy, cw, ch = child_bounds
         
@@ -589,25 +330,7 @@ class VisionNavigationSystem:
                 cx + cw <= px + pw and cy + ch <= py + ph)
     
     async def navigate_to_element(self, target: WorkspaceElement) -> bool:
-        """Navigate to a specific UI element.
-        
-        Finds the optimal path to the target element and executes all
-        necessary navigation steps, including window switching if needed.
-        
-        Args:
-            target: The UI element to navigate to
-            
-        Returns:
-            True if navigation was successful, False otherwise
-            
-        Raises:
-            Exception: If navigation mode is not active or navigation fails
-            
-        Example:
-            >>> button = workspace_map.find_element_at(100, 200)
-            >>> success = await nav_system.navigate_to_element(button)
-            >>> print(f"Navigation {'succeeded' if success else 'failed'}")
-        """
+        """Navigate to a specific UI element"""
         if not self.navigation_mode:
             logger.warning("Navigation mode not active")
             return False
@@ -645,21 +368,7 @@ class VisionNavigationSystem:
             return False
     
     async def _find_navigation_path(self, target: WorkspaceElement) -> Optional[NavigationPath]:
-        """Find the optimal path to navigate to a target element.
-        
-        Analyzes the current state and target element to determine the most
-        efficient sequence of actions needed for navigation.
-        
-        Args:
-            target: The element to navigate to
-            
-        Returns:
-            NavigationPath with steps to reach target, or None if no path found
-            
-        Note:
-            Currently implements simple direct navigation. Future versions will
-            include complex multi-step paths and obstacle avoidance.
-        """
+        """Find optimal path to navigate to target element"""
         if not self.current_map:
             return None
             
@@ -699,20 +408,7 @@ class VisionNavigationSystem:
         return path
     
     async def _execute_navigation_step(self, step: Dict[str, Any]) -> bool:
-        """Execute a single navigation step.
-        
-        Performs the actual system interaction for a navigation step,
-        such as clicking, typing, or window management.
-        
-        Args:
-            step: Dictionary containing action type and parameters
-            
-        Returns:
-            True if step executed successfully, False otherwise
-            
-        Raises:
-            Exception: If step execution encounters system-level errors
-        """
+        """Execute a single navigation step"""
         action = step['action']
         params = step['params']
         
@@ -744,20 +440,7 @@ class VisionNavigationSystem:
             return False
     
     async def _switch_to_window(self, window_id: str) -> bool:
-        """Switch focus to a specific window.
-        
-        Uses macOS APIs to bring the specified window to the foreground
-        and give it focus.
-        
-        Args:
-            window_id: ID of the window to switch to
-            
-        Returns:
-            True if window switch was successful, False otherwise
-            
-        Raises:
-            Exception: If macOS APIs are not available or window not found
-        """
+        """Switch focus to a specific window"""
         if not MACOS_AVAILABLE:
             logger.error("macOS integration not available")
             return False
@@ -789,20 +472,7 @@ class VisionNavigationSystem:
             return False
     
     async def _click_at_coordinates(self, coordinates: Tuple[int, int]) -> bool:
-        """Click at specific screen coordinates.
-        
-        Generates mouse click events at the specified coordinates using
-        macOS Core Graphics APIs.
-        
-        Args:
-            coordinates: Tuple of (x, y) screen coordinates to click
-            
-        Returns:
-            True if click was successful, False otherwise
-            
-        Raises:
-            Exception: If macOS APIs are not available or click fails
-        """
+        """Click at specific screen coordinates"""
         if not MACOS_AVAILABLE:
             logger.error("macOS integration not available")
             return False
@@ -842,20 +512,7 @@ class VisionNavigationSystem:
             return False
     
     async def _type_text(self, text: str) -> bool:
-        """Type text at the current cursor position.
-        
-        Generates keyboard events to type the specified text using
-        macOS Core Graphics APIs.
-        
-        Args:
-            text: Text string to type
-            
-        Returns:
-            True if text was typed successfully, False otherwise
-            
-        Raises:
-            Exception: If macOS APIs are not available or typing fails
-        """
+        """Type text at current focus"""
         if not MACOS_AVAILABLE:
             logger.error("macOS integration not available")
             return False
@@ -880,14 +537,438 @@ class VisionNavigationSystem:
             return False
     
     async def navigate_to_application(self, app_name: str) -> bool:
-        """Navigate to a specific application.
+        """Navigate to a specific application"""
+        # First check if app is already open
+        window = self._find_window_by_app(app_name)
         
-        Switches to an existing window of the application if open, or
-        launches the application if not currently running.
+        if window:
+            # Switch to existing window
+            element = WorkspaceElement(
+                id=f"window_{window.window_id}",
+                type="window",
+                bounds=(window.x, window.y, window.width, window.height),
+                parent_window=window.window_id
+            )
+            return await self.navigate_to_element(element)
+        else:
+            # Open the application
+            return await self._open_application(app_name)
+    
+    async def _open_application(self, app_name: str) -> bool:
+        """Open an application"""
+        if not MACOS_AVAILABLE:
+            logger.error("macOS integration not available")
+            return False
+            
+        try:
+            workspace = NSWorkspace.sharedWorkspace()
+            
+            # Try to launch app
+            app_url = workspace.URLForApplicationWithBundleIdentifier_(
+                f"com.{app_name.lower()}.{app_name}"
+            )
+            
+            if not app_url:
+                # Try alternative bundle IDs
+                bundle_ids = [
+                    f"com.apple.{app_name.lower()}",
+                    f"com.{app_name.lower()}",
+                    app_name
+                ]
+                
+                for bundle_id in bundle_ids:
+                    app_url = workspace.URLForApplicationWithBundleIdentifier_(bundle_id)
+                    if app_url:
+                        break
+                        
+            if app_url:
+                workspace.openURL_(app_url)
+                self.navigation_history.append(NavigationAction.OPEN_APPLICATION)
+                return True
+                
+            return False
+            
+        except Exception as e:
+            logger.error(f"Error opening application: {e}")
+            return False
+    
+    async def arrange_workspace(self, layout: WorkspaceLayout,
+                              windows: Optional[List[str]] = None) -> bool:
+        """Arrange windows in a specific layout"""
+        if not self.current_map:
+            return False
+            
+        try:
+            if layout == WorkspaceLayout.FOCUS:
+                # Maximize current window
+                if self.current_map.active_window:
+                    return await self._maximize_window(
+                        self.current_map.active_window.window_id
+                    )
+                    
+            elif layout == WorkspaceLayout.SPLIT:
+                # Split two windows side by side
+                target_windows = windows or [
+                    w.window_id for w in self.current_map.windows[:2]
+                ]
+                
+                if len(target_windows) >= 2:
+                    screen_width = self.current_map.screen_bounds[2]
+                    screen_height = self.current_map.screen_bounds[3]
+                    
+                    # Position first window on left
+                    await self._position_window(
+                        target_windows[0],
+                        0, 0, screen_width // 2, screen_height
+                    )
+                    
+                    # Position second window on right
+                    await self._position_window(
+                        target_windows[1],
+                        screen_width // 2, 0, screen_width // 2, screen_height
+                    )
+                    
+                    return True
+                    
+            elif layout == WorkspaceLayout.GRID:
+                # Arrange four windows in grid
+                target_windows = windows or [
+                    w.window_id for w in self.current_map.windows[:4]
+                ]
+                
+                if len(target_windows) >= 4:
+                    screen_width = self.current_map.screen_bounds[2]
+                    screen_height = self.current_map.screen_bounds[3]
+                    half_width = screen_width // 2
+                    half_height = screen_height // 2
+                    
+                    positions = [
+                        (0, 0, half_width, half_height),  # Top left
+                        (half_width, 0, half_width, half_height),  # Top right
+                        (0, half_height, half_width, half_height),  # Bottom left
+                        (half_width, half_height, half_width, half_height)  # Bottom right
+                    ]
+                    
+                    for window_id, pos in zip(target_windows, positions):
+                        await self._position_window(window_id, *pos)
+                        
+                    return True
+                    
+            return False
+            
+        except Exception as e:
+            logger.error(f"Error arranging workspace: {e}")
+            return False
+    
+    async def search_workspace(self, query: str) -> List[WorkspaceElement]:
+        """Search for elements in the workspace"""
+        if not self.current_map:
+            return []
+            
+        results = []
+        query_lower = query.lower()
         
-        Args:
-            app_name: Name of the application to navigate to
-    """
-    pass
+        for element in self.current_map.elements:
+            # Search in text
+            if element.text and query_lower in element.text.lower():
+                results.append(element)
+                
+            # Search in properties
+            for key, value in element.properties.items():
+                if isinstance(value, str) and query_lower in value.lower():
+                    results.append(element)
+                    break
+                    
+        # Sort by relevance (exact matches first)
+        results.sort(key=lambda e: (
+            e.text and e.text.lower() == query_lower,
+            e.text and e.text.lower().startswith(query_lower)
+        ), reverse=True)
+        
+        return results
+    
+    async def execute_workflow(self, workflow_name: str) -> bool:
+        """Execute a predefined workflow"""
+        # This would load and execute saved workflows
+        # For example: "prepare for meeting", "focus mode", "research setup"
+        
+        workflows = {
+            "prepare_meeting": [
+                ("close_all_except", ["Zoom", "Calendar"]),
+                ("open_application", "Zoom"),
+                ("arrange_workspace", WorkspaceLayout.SPLIT),
+                ("mute_notifications", True)
+            ],
+            "focus_mode": [
+                ("close_all_except", ["current"]),
+                ("maximize_current", None),
+                ("hide_dock", True),
+                ("mute_notifications", True)
+            ],
+            "research_setup": [
+                ("open_application", "Safari"),
+                ("open_application", "Notes"),
+                ("arrange_workspace", WorkspaceLayout.SPLIT),
+                ("focus_element", "notes_editor")
+            ]
+        }
+        
+        if workflow_name not in workflows:
+            logger.error(f"Unknown workflow: {workflow_name}")
+            return False
+            
+        # Execute workflow steps
+        for step_name, params in workflows[workflow_name]:
+            # Execute each workflow step
+            # This would call appropriate methods
+            pass
+            
+        return True
+    
+    def _analyze_window_relationships(self):
+        """Analyze relationships between windows"""
+        if not self.current_map:
+            return
+            
+        # Clear old relationships
+        self.window_relationships.clear()
+        
+        for window in self.current_map.windows:
+            # Find related windows (same app, similar titles, etc.)
+            related = []
+            
+            for other in self.current_map.windows:
+                if other.window_id == window.window_id:
+                    continue
+                    
+                # Same application
+                if other.app_name == window.app_name:
+                    related.append(other.window_id)
+                    
+                # Similar titles (might be related documents)
+                elif (window.window_title and other.window_title and
+                      self._title_similarity(window.window_title, other.window_title) > 0.7):
+                    related.append(other.window_id)
+                    
+            self.window_relationships[window.window_id] = related
+    
+    def _title_similarity(self, title1: str, title2: str) -> float:
+        """Calculate similarity between window titles"""
+        # Simple word overlap for now
+        words1 = set(title1.lower().split())
+        words2 = set(title2.lower().split())
+        
+        if not words1 or not words2:
+            return 0.0
+            
+        intersection = words1 & words2
+        union = words1 | words2
+        
+        return len(intersection) / len(union)
+    
+    def _update_element_cache(self):
+        """Update cache of UI elements for faster lookup"""
+        if not self.current_map:
+            return
+            
+        self.element_cache.clear()
+        
+        for element in self.current_map.elements:
+            self.element_cache[element.id] = element
+    
+    def _record_navigation_pattern(self, path: NavigationPath):
+        """Record navigation pattern for learning"""
+        # Group patterns by start-end pairs
+        pattern_key = f"{path.start.type}_{path.end.type}"
+        self.navigation_patterns[pattern_key].append(path)
+        
+        # Keep only recent patterns
+        if len(self.navigation_patterns[pattern_key]) > 100:
+            self.navigation_patterns[pattern_key].pop(0)
+            
+        # Update interaction counts
+        self.element_interactions[path.end.id] += 1
+    
+    def _get_active_element(self) -> Optional[WorkspaceElement]:
+        """Get currently active/focused element"""
+        if not self.current_map or not self.current_map.active_window:
+            return None
+            
+        # Find focused element in active window
+        window_elements = self.current_map.get_window_elements(
+            self.current_map.active_window.window_id
+        )
+        
+        for element in window_elements:
+            if element.is_focused:
+                return element
+                
+        # Return first interactive element as fallback
+        for element in window_elements:
+            if element.is_interactive:
+                return element
+                
+        return None
+    
+    def _find_window_by_id(self, window_id: str) -> Optional[WindowInfo]:
+        """Find window by ID"""
+        if not self.current_map:
+            return None
+            
+        for window in self.current_map.windows:
+            if window.window_id == window_id:
+                return window
+                
+        return None
+    
+    def _find_window_by_app(self, app_name: str) -> Optional[WindowInfo]:
+        """Find window by application name"""
+        if not self.current_map:
+            return None
+            
+        for window in self.current_map.windows:
+            if window.app_name.lower() == app_name.lower():
+                return window
+                
+        return None
+    
+    def _get_screen_bounds(self) -> Tuple[int, int, int, int]:
+        """Get screen boundaries"""
+        if MACOS_AVAILABLE:
+            try:
+                from AppKit import NSScreen
+                main_screen = NSScreen.mainScreen()
+                frame = main_screen.frame()
+                return (0, 0, int(frame.size.width), int(frame.size.height))
+            except:
+                pass
+                
+        # Default fallback
+        return (0, 0, 1920, 1080)
+    
+    def _get_current_desktop(self) -> int:
+        """Get current desktop/space number"""
+        # This would use macOS APIs to get current space
+        # For now, return 1
+        return 1
+    
+    async def _position_window(self, window_id: str, x: int, y: int, 
+                             width: int, height: int) -> bool:
+        """Position and resize a window"""
+        # This would use macOS accessibility APIs
+        # to move and resize windows
+        logger.info(f"Positioning window {window_id} to {x},{y} {width}x{height}")
+        return True
+    
+    async def _maximize_window(self, window_id: str) -> bool:
+        """Maximize a window"""
+        screen_bounds = self._get_screen_bounds()
+        return await self._position_window(
+            window_id, 0, 0, screen_bounds[2], screen_bounds[3]
+        )
+    
+    async def _close_window(self, window_id: str) -> bool:
+        """Close a window"""
+        # This would use macOS APIs to close the window
+        logger.info(f"Closing window {window_id}")
+        return True
+    
+    def get_navigation_suggestions(self) -> List[Dict[str, Any]]:
+        """Get navigation suggestions based on patterns"""
+        suggestions = []
+        
+        # Most frequently accessed elements
+        frequent_elements = sorted(
+            self.element_interactions.items(),
+            key=lambda x: x[1],
+            reverse=True
+        )[:5]
+        
+        for element_id, count in frequent_elements:
+            if element_id in self.element_cache:
+                element = self.element_cache[element_id]
+                suggestions.append({
+                    'type': 'frequent_element',
+                    'element': element,
+                    'usage_count': count,
+                    'description': f"Frequently used {element.type}"
+                })
+                
+        # Common navigation patterns
+        for pattern_key, paths in self.navigation_patterns.items():
+            if len(paths) >= 3:  # At least 3 occurrences
+                avg_time = sum(p.estimated_time for p in paths) / len(paths)
+                suggestions.append({
+                    'type': 'navigation_pattern',
+                    'pattern': pattern_key,
+                    'frequency': len(paths),
+                    'average_time': avg_time,
+                    'description': f"Common navigation: {pattern_key}"
+                })
+                
+        return suggestions
+    
+    def get_workspace_summary(self) -> Dict[str, Any]:
+        """Get summary of current workspace state"""
+        if not self.current_map:
+            return {'error': 'No workspace map available'}
+            
+        return {
+            'window_count': len(self.current_map.windows),
+            'element_count': len(self.current_map.elements),
+            'active_window': {
+                'app': self.current_map.active_window.app_name,
+                'title': self.current_map.active_window.window_title
+            } if self.current_map.active_window else None,
+            'interactive_elements': len([
+                e for e in self.current_map.elements if e.is_interactive
+            ]),
+            'navigation_stats': self.navigation_stats,
+            'current_focus': {
+                'type': self.current_focus.type,
+                'text': self.current_focus.text
+            } if self.current_focus else None
+        }
 
-# Module truncated - needs restoration from backup
+
+async def test_vision_navigation():
+    """Test the vision navigation system"""
+    print("🗺️ Testing Vision Navigation System")
+    print("=" * 50)
+    
+    nav_system = VisionNavigationSystem()
+    
+    # Start navigation mode
+    print("\n🚀 Starting navigation mode...")
+    await nav_system.start_navigation_mode()
+    
+    # Wait for initial mapping
+    await asyncio.sleep(2)
+    
+    # Get workspace summary
+    summary = nav_system.get_workspace_summary()
+    print(f"\n📊 Workspace Summary:")
+    print(f"   Windows: {summary['window_count']}")
+    print(f"   Elements: {summary['element_count']}")
+    print(f"   Interactive: {summary['interactive_elements']}")
+    
+    if summary.get('active_window'):
+        print(f"   Active: {summary['active_window']['app']} - {summary['active_window']['title']}")
+    
+    # Search for elements
+    print("\n🔍 Searching workspace...")
+    results = await nav_system.search_workspace("button")
+    print(f"   Found {len(results)} button elements")
+    
+    # Get navigation suggestions
+    suggestions = nav_system.get_navigation_suggestions()
+    print(f"\n💡 Navigation Suggestions: {len(suggestions)}")
+    
+    # Stop navigation mode
+    await nav_system.stop_navigation_mode()
+    
+    print("\n✅ Vision navigation test complete!")
+
+
+if __name__ == "__main__":
+    asyncio.run(test_vision_navigation())

@@ -3,20 +3,13 @@
 Contextual Query Resolver for JARVIS
 ====================================
 
-This module provides intelligent resolution of ambiguous and contextual queries in the JARVIS system.
-It handles pronoun resolution, missing space number inference, conversation context tracking,
-multi-monitor awareness, and active space detection via Yabai integration.
-
-The resolver operates with zero hardcoding and is fully dynamic, adapting to the current system
-state and conversation history to provide accurate query resolution.
-
-Key Features:
-    - Pronoun resolution ("it", "that", "them")
-    - Missing space number inference
-    - Conversation context tracking
-    - Multi-monitor awareness
-    - Active space detection via Yabai
-    - Zero hardcoding, fully dynamic
+Handles ambiguous and contextual queries with:
+- Pronoun resolution ("it", "that", "them")
+- Missing space number inference
+- Conversation context tracking
+- Multi-monitor awareness
+- Active space detection via Yabai
+- Zero hardcoding, fully dynamic
 
 Author: Derek Russell
 Date: 2025-10-17
@@ -36,16 +29,7 @@ logger = logging.getLogger(__name__)
 
 
 class ResolutionStrategy(Enum):
-    """Strategies for resolving ambiguous queries.
-    
-    Attributes:
-        USE_ACTIVE_SPACE: Default to current/active space
-        USE_LAST_QUERIED: Use last queried space from conversation history
-        USE_PRIMARY_MONITOR: Use primary monitor's active space
-        ASK_FOR_CLARIFICATION: Ask user to specify when ambiguous
-        RESOLVE_FROM_CONTEXT: Resolve from conversation history
-        COMPARE_MULTIPLE: Compare multiple referenced spaces
-    """
+    """Strategies for resolving ambiguous queries"""
     USE_ACTIVE_SPACE = "use_active_space"           # Default to current/active space
     USE_LAST_QUERIED = "use_last_queried"           # Use last queried space
     USE_PRIMARY_MONITOR = "use_primary_monitor"      # Use primary monitor's active space
@@ -55,15 +39,7 @@ class ResolutionStrategy(Enum):
 
 
 class ReferenceType(Enum):
-    """Types of contextual references found in queries.
-    
-    Attributes:
-        PRONOUN: Pronoun references like "it", "that", "them", "those"
-        DEMONSTRATIVE: Demonstrative references like "this", "these"
-        COMPARATIVE: Comparative references like "compare", "versus", "vs"
-        IMPLICIT: Implicit references with no explicit target
-        EXPLICIT: Explicit references like "Space 3", "Monitor 2"
-    """
+    """Types of contextual references"""
     PRONOUN = "pronoun"              # it, that, them, those
     DEMONSTRATIVE = "demonstrative"   # this, these
     COMPARATIVE = "comparative"       # compare, versus, vs
@@ -73,16 +49,7 @@ class ReferenceType(Enum):
 
 @dataclass
 class ContextualReference:
-    """Represents a contextual reference found in a query.
-    
-    Attributes:
-        type: The type of reference (pronoun, explicit, etc.)
-        original_text: The original text that was matched
-        resolved_targets: List of resolved space or monitor IDs
-        confidence: Confidence score for this reference (0.0-1.0)
-        resolution_strategy: Strategy used to resolve this reference
-        metadata: Additional metadata about the reference
-    """
+    """Represents a contextual reference in a query"""
     type: ReferenceType
     original_text: str
     resolved_targets: List[int] = field(default_factory=list)  # Space IDs or Monitor IDs
@@ -93,17 +60,7 @@ class ContextualReference:
 
 @dataclass
 class ConversationTurn:
-    """Represents a single turn in the conversation history.
-    
-    Attributes:
-        timestamp: When this turn occurred
-        user_query: The user's original query
-        spaces_referenced: List of space IDs that were referenced
-        monitors_referenced: List of monitor IDs that were referenced
-        intent: The resolved intent/strategy used
-        response: The system's response (optional)
-        metadata: Additional metadata about this turn
-    """
+    """Represents a turn in the conversation"""
     timestamp: datetime
     user_query: str
     spaces_referenced: List[int]
@@ -115,19 +72,7 @@ class ConversationTurn:
 
 @dataclass
 class QueryResolution:
-    """Result of resolving a contextual query.
-    
-    Attributes:
-        success: Whether the query was successfully resolved
-        resolved_spaces: List of resolved space IDs
-        resolved_monitors: List of resolved monitor IDs
-        strategy_used: The resolution strategy that was applied
-        requires_clarification: Whether user clarification is needed
-        clarification_message: Message to show user for clarification
-        confidence: Overall confidence in the resolution (0.0-1.0)
-        references: List of contextual references found
-        metadata: Additional metadata about the resolution
-    """
+    """Result of query resolution"""
     success: bool
     resolved_spaces: List[int]
     resolved_monitors: List[int]
@@ -141,26 +86,15 @@ class QueryResolution:
 
 class ContextualQueryResolver:
     """
-    Resolves ambiguous and contextual queries dynamically.
-
-    This class provides intelligent resolution of user queries that contain ambiguous
-    references, pronouns, or implicit targets. It maintains conversation history,
-    integrates with Yabai for active space detection, and supports multi-monitor
-    environments.
+    Resolves ambiguous and contextual queries dynamically
 
     Capabilities:
-        - Resolves "What's on that screen?" → active space
-        - Resolves "Compare them" → last 2 queried spaces
-        - Tracks conversation history (last N turns)
-        - Integrates with Yabai for active space detection
-        - Multi-monitor aware
-        - Fully async, zero hardcoding
-
-    Attributes:
-        history: Conversation history stored as a deque
-        clarification_threshold: Confidence threshold for requesting clarification
-        pronoun_patterns: Compiled regex patterns for pronoun detection
-        implicit_patterns: Compiled regex patterns for implicit query detection
+    - Resolves "What's on that screen?" → active space
+    - Resolves "Compare them" → last 2 queried spaces
+    - Tracks conversation history (last N turns)
+    - Integrates with Yabai for active space detection
+    - Multi-monitor aware
+    - Fully async, zero hardcoding
     """
 
     def __init__(
@@ -169,14 +103,11 @@ class ContextualQueryResolver:
         clarification_threshold: float = 0.6
     ):
         """
-        Initialize the contextual query resolver.
+        Initialize the contextual query resolver
 
         Args:
-            history_size: Number of conversation turns to remember in history
+            history_size: Number of conversation turns to remember
             clarification_threshold: Confidence threshold below which to ask for clarification
-
-        Example:
-            >>> resolver = ContextualQueryResolver(history_size=5, clarification_threshold=0.7)
         """
         self.history: deque[ConversationTurn] = deque(maxlen=history_size)
         self.clarification_threshold = clarification_threshold
@@ -209,24 +140,15 @@ class ContextualQueryResolver:
         available_monitors: Optional[List[int]] = None
     ) -> QueryResolution:
         """
-        Resolve an ambiguous or contextual query to concrete space/monitor IDs.
-
-        This is the main entry point for query resolution. It analyzes the query for
-        contextual references, applies appropriate resolution strategies, and returns
-        a complete resolution result.
+        Resolve an ambiguous or contextual query
 
         Args:
-            query: The user's query string to resolve
-            available_spaces: Optional list of available space IDs to constrain resolution
-            available_monitors: Optional list of available monitor IDs to constrain resolution
+            query: The user's query
+            available_spaces: List of available space IDs
+            available_monitors: List of available monitor IDs
 
         Returns:
-            QueryResolution object containing resolved targets and metadata
-
-        Example:
-            >>> resolution = await resolver.resolve_query("What's on that screen?")
-            >>> print(resolution.resolved_spaces)  # [3]
-            >>> print(resolution.strategy_used)    # ResolutionStrategy.USE_ACTIVE_SPACE
+            QueryResolution with resolved targets and strategy
         """
         logger.info(f"[CONTEXTUAL RESOLVER] Resolving query: '{query}'")
 
@@ -248,19 +170,7 @@ class ContextualQueryResolver:
         return resolution
 
     async def _detect_references(self, query: str) -> List[ContextualReference]:
-        """
-        Detect all contextual references in the query.
-
-        Scans the query for various types of contextual references including
-        explicit space/monitor numbers, pronouns, implicit references, and
-        comparative language.
-
-        Args:
-            query: The query string to analyze
-
-        Returns:
-            List of ContextualReference objects found in the query
-        """
+        """Detect all contextual references in the query"""
         references = []
 
         # Check for explicit space/monitor numbers
@@ -282,15 +192,7 @@ class ContextualQueryResolver:
         return references
 
     async def _detect_explicit_references(self, query: str) -> List[ContextualReference]:
-        """
-        Detect explicit space/monitor references like "space 3" or "monitor 2".
-
-        Args:
-            query: The query string to analyze
-
-        Returns:
-            List of ContextualReference objects for explicit references found
-        """
+        """Detect explicit space/monitor references"""
         references = []
 
         # Match "space 3", "monitor 2", "display 1", etc.
@@ -324,15 +226,7 @@ class ContextualQueryResolver:
         return references
 
     async def _detect_pronoun_references(self, query: str) -> List[ContextualReference]:
-        """
-        Detect pronoun references like "it", "that", "them", etc.
-
-        Args:
-            query: The query string to analyze
-
-        Returns:
-            List of ContextualReference objects for pronoun references found
-        """
+        """Detect pronoun references (it, that, them, etc.)"""
         references = []
 
         # Singular pronouns
@@ -360,18 +254,7 @@ class ContextualQueryResolver:
         return references
 
     async def _detect_implicit_references(self, query: str) -> List[ContextualReference]:
-        """
-        Detect implicit references like "What's the error?" or "What IDE am I using?".
-
-        These are queries that don't explicitly mention a target but imply one
-        based on context or common usage patterns.
-
-        Args:
-            query: The query string to analyze
-
-        Returns:
-            List of ContextualReference objects for implicit references found
-        """
+        """Detect implicit references (What's the error? What IDE am I using?)"""
         references = []
 
         for intent_name, pattern in self.implicit_patterns.items():
@@ -388,15 +271,7 @@ class ContextualQueryResolver:
         return references
 
     async def _detect_comparative_references(self, query: str) -> List[ContextualReference]:
-        """
-        Detect comparative references like "compare them" or "A vs B".
-
-        Args:
-            query: The query string to analyze
-
-        Returns:
-            List of ContextualReference objects for comparative references found
-        """
+        """Detect comparative references (compare them, A vs B)"""
         references = []
 
         if self.pronoun_patterns['comparative'].search(query):
@@ -418,21 +293,7 @@ class ContextualQueryResolver:
         available_spaces: Optional[List[int]],
         available_monitors: Optional[List[int]]
     ) -> QueryResolution:
-        """
-        Resolve all detected references to concrete space/monitor IDs.
-
-        This method applies different resolution strategies based on the types
-        of references found and the current context.
-
-        Args:
-            query: The original query string
-            references: List of detected contextual references
-            available_spaces: Optional list of available space IDs
-            available_monitors: Optional list of available monitor IDs
-
-        Returns:
-            QueryResolution object with resolved targets and strategy used
-        """
+        """Resolve all references to concrete space/monitor IDs"""
 
         # If explicit references found, use them directly
         explicit_refs = [r for r in references if r.type == ReferenceType.EXPLICIT]
@@ -478,19 +339,7 @@ class ContextualQueryResolver:
         pronoun_refs: List[ContextualReference],
         query: str
     ) -> QueryResolution:
-        """
-        Resolve pronoun references from conversation history.
-
-        Uses conversation history to determine what spaces or monitors the
-        pronouns refer to, handling both singular and plural cases.
-
-        Args:
-            pronoun_refs: List of pronoun references to resolve
-            query: The original query string
-
-        Returns:
-            QueryResolution with resolved pronoun targets
-        """
+        """Resolve pronoun references from conversation history"""
 
         # Determine if singular or plural
         is_plural = any(
@@ -540,18 +389,7 @@ class ContextualQueryResolver:
         )
 
     async def _resolve_comparison(self, query: str) -> QueryResolution:
-        """
-        Resolve comparative queries like "compare them" or "A vs B".
-
-        Uses conversation history to find the most recent spaces that should
-        be compared against each other.
-
-        Args:
-            query: The original query string
-
-        Returns:
-            QueryResolution with spaces to compare
-        """
+        """Resolve comparative queries (compare them, A vs B)"""
 
         # Get last 2 queried spaces for comparison
         recent_spaces = await self._get_recent_spaces(count=2)
@@ -584,20 +422,7 @@ class ContextualQueryResolver:
         available_spaces: Optional[List[int]],
         available_monitors: Optional[List[int]]
     ) -> QueryResolution:
-        """
-        Resolve implicit queries like "What's happening?" or "What's the error?".
-
-        For implicit queries, tries to determine the most relevant space based on
-        current system state (active space from Yabai) or falls back to defaults.
-
-        Args:
-            query: The original query string
-            available_spaces: Optional list of available space IDs
-            available_monitors: Optional list of available monitor IDs
-
-        Returns:
-            QueryResolution with best-guess target for implicit query
-        """
+        """Resolve implicit queries (What's happening? What's the error?)"""
 
         # Try to get active space from Yabai
         active_space = await self._get_active_space()
@@ -630,20 +455,7 @@ class ContextualQueryResolver:
         available_spaces: Optional[List[int]],
         available_monitors: Optional[List[int]]
     ) -> QueryResolution:
-        """
-        Request clarification from the user when query cannot be resolved.
-
-        Builds an appropriate clarification message based on current context
-        and available options.
-
-        Args:
-            query: The original query string
-            available_spaces: Optional list of available space IDs
-            available_monitors: Optional list of available monitor IDs
-
-        Returns:
-            QueryResolution indicating clarification is needed
-        """
+        """Request clarification from the user"""
 
         # Build clarification message
         active_space = await self._get_active_space()
@@ -667,18 +479,7 @@ class ContextualQueryResolver:
         )
 
     async def _get_active_space(self) -> Optional[int]:
-        """
-        Get the currently active space from Yabai with caching.
-
-        Queries Yabai to determine which space is currently active/focused,
-        with caching to avoid excessive system calls.
-
-        Returns:
-            The active space ID, or None if unable to determine
-
-        Raises:
-            Exception: If Yabai query fails (logged but not propagated)
-        """
+        """Get the currently active space from Yabai"""
 
         # Check cache
         if self._active_space_cache:
@@ -712,18 +513,7 @@ class ContextualQueryResolver:
         return None
 
     async def _get_recent_spaces(self, count: int = 1) -> List[int]:
-        """
-        Get recently queried spaces from conversation history.
-
-        Searches through conversation history to find the most recently
-        referenced spaces, avoiding duplicates.
-
-        Args:
-            count: Maximum number of recent spaces to return
-
-        Returns:
-            List of recent space IDs, most recent first
-        """
+        """Get recently queried spaces from conversation history"""
         spaces = []
 
         for turn in reversed(self.history):
@@ -737,13 +527,7 @@ class ContextualQueryResolver:
         return spaces
 
     async def _record_turn(self, query: str, resolution: QueryResolution):
-        """
-        Record this conversation turn in history for future context.
-
-        Args:
-            query: The user's original query
-            resolution: The resolution result to record
-        """
+        """Record this conversation turn in history"""
         turn = ConversationTurn(
             timestamp=datetime.now(),
             user_query=query,
@@ -759,45 +543,18 @@ class ContextualQueryResolver:
         logger.debug(f"[CONTEXTUAL RESOLVER] Recorded turn: {len(self.history)} total turns in history")
 
     def get_conversation_history(self, count: Optional[int] = None) -> List[ConversationTurn]:
-        """
-        Get conversation history for analysis or debugging.
-
-        Args:
-            count: Optional limit on number of turns to return (most recent first)
-
-        Returns:
-            List of ConversationTurn objects from history
-
-        Example:
-            >>> history = resolver.get_conversation_history(count=5)
-            >>> print(f"Last query: {history[-1].user_query}")
-        """
+        """Get conversation history"""
         if count:
             return list(self.history)[-count:]
         return list(self.history)
 
     def clear_history(self):
-        """
-        Clear conversation history.
-
-        Useful for starting fresh conversations or testing scenarios.
-        """
+        """Clear conversation history"""
         self.history.clear()
         logger.info("[CONTEXTUAL RESOLVER] Conversation history cleared")
 
     async def get_context_summary(self) -> Dict[str, Any]:
-        """
-        Get a summary of current context for debugging or status display.
-
-        Returns:
-            Dictionary containing current context information including active space,
-            recent spaces, conversation history stats, and cache status
-
-        Example:
-            >>> summary = await resolver.get_context_summary()
-            >>> print(f"Active space: {summary['active_space']}")
-            >>> print(f"Recent spaces: {summary['recent_spaces']}")
-        """
+        """Get a summary of current context"""
         active_space = await self._get_active_space()
         recent_spaces = await self._get_recent_spaces(count=3)
 
@@ -822,16 +579,7 @@ _contextual_resolver: Optional[ContextualQueryResolver] = None
 
 
 def get_contextual_resolver() -> ContextualQueryResolver:
-    """
-    Get singleton contextual query resolver instance.
-
-    Returns:
-        The global ContextualQueryResolver instance, creating it if necessary
-
-    Example:
-        >>> resolver = get_contextual_resolver()
-        >>> resolution = await resolver.resolve_query("What's on that screen?")
-    """
+    """Get singleton contextual query resolver"""
     global _contextual_resolver
     if _contextual_resolver is None:
         _contextual_resolver = ContextualQueryResolver()
@@ -840,20 +588,7 @@ def get_contextual_resolver() -> ContextualQueryResolver:
 
 # Convenience function for quick resolution
 async def resolve_query(query: str, **kwargs) -> QueryResolution:
-    """
-    Convenience function to resolve a query using the singleton resolver.
-
-    Args:
-        query: The query string to resolve
-        **kwargs: Additional arguments passed to resolve_query()
-
-    Returns:
-        QueryResolution object with resolved targets
-
-    Example:
-        >>> resolution = await resolve_query("Compare them")
-        >>> print(resolution.resolved_spaces)  # [2, 3]
-    """
+    """Convenience function to resolve a query"""
     resolver = get_contextual_resolver()
     return await resolver.resolve_query(query, **kwargs)
 
@@ -861,7 +596,6 @@ async def resolve_query(query: str, **kwargs) -> QueryResolution:
 if __name__ == "__main__":
     # Test the resolver
     async def test_resolver():
-        """Test function demonstrating resolver capabilities."""
         resolver = ContextualQueryResolver()
 
         print("=" * 70)
@@ -869,6 +603,43 @@ if __name__ == "__main__":
         print("=" * 70)
 
         # Test 1: Explicit reference
-        print("\nTest 1")
+        print("\n Test 1: Explicit reference")
+        result = await resolver.resolve_query("What's on space 3?")
+        print(f"  Query: What's on space 3?")
+        print(f"  Resolved: {result.resolved_spaces}")
+        print(f"  Strategy: {result.strategy_used.value}")
+        print(f"  Confidence: {result.confidence}")
 
-# Module truncated - needs restoration from backup
+        # Test 2: Implicit reference (should get active space)
+        print("\n✅ Test 2: Implicit reference")
+        result = await resolver.resolve_query("What's happening?")
+        print(f"  Query: What's happening?")
+        print(f"  Resolved: {result.resolved_spaces}")
+        print(f"  Strategy: {result.strategy_used.value}")
+
+        # Test 3: Pronoun reference (should use last queried)
+        print("\n✅ Test 3: Pronoun reference")
+        await resolver.resolve_query("What's on space 5?")  # Prime history
+        result = await resolver.resolve_query("What about that space?")
+        print(f"  Query: What about that space?")
+        print(f"  Resolved: {result.resolved_spaces}")
+        print(f"  Strategy: {result.strategy_used.value}")
+
+        # Test 4: Comparison
+        print("\n✅ Test 4: Comparison")
+        await resolver.resolve_query("What's on space 2?")  # Prime history
+        result = await resolver.resolve_query("Compare them")
+        print(f"  Query: Compare them")
+        print(f"  Resolved: {result.resolved_spaces}")
+        print(f"  Strategy: {result.strategy_used.value}")
+
+        # Test 5: Context summary
+        print("\n✅ Test 5: Context summary")
+        summary = await resolver.get_context_summary()
+        print(f"  Summary: {json.dumps(summary, indent=2, default=str)}")
+
+        print("\n" + "=" * 70)
+        print("✅ All tests complete!")
+        print("=" * 70)
+
+    asyncio.run(test_resolver())

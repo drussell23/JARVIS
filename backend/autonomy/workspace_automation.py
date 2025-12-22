@@ -1,23 +1,7 @@
 #!/usr/bin/env python3
 """
-Intelligent Workspace Automation for JARVIS.
-
-This module provides autonomous workflow execution and cross-application automation
-capabilities. It learns from user patterns, executes complex multi-step workflows,
-and provides intelligent automation suggestions based on context and behavior analysis.
-
-The system integrates with vision navigation, decision engines, and workspace monitoring
-to create a comprehensive automation platform that can handle meeting preparation,
-focus modes, development environments, and other common workflows.
-
-Example:
-    >>> from autonomy.workspace_automation import WorkspaceAutomation
-    >>> from autonomy.vision_navigation_system import VisionNavigationSystem
-    >>> 
-    >>> nav_system = VisionNavigationSystem()
-    >>> automation = WorkspaceAutomation(nav_system)
-    >>> await automation.start_automation()
-    >>> await automation.execute_workflow("meeting_prep")
+Intelligent Workspace Automation for JARVIS
+Provides autonomous workflow execution and cross-application automation
 """
 
 import asyncio
@@ -43,22 +27,9 @@ from vision.enhanced_monitoring import EnhancedWorkspaceMonitor
 
 logger = logging.getLogger(__name__)
 
+
 class WorkflowType(Enum):
-    """Types of automated workflows.
-    
-    Defines the different categories of workflows that can be automated,
-    each with specific characteristics and use cases.
-    
-    Attributes:
-        MEETING_PREP: Workflow for preparing meeting environments
-        FOCUS_MODE: Deep work mode with distraction elimination
-        RESEARCH: Research-oriented workspace setup
-        DEVELOPMENT: Development environment configuration
-        COMMUNICATION: Communication-focused workflows
-        BREAK_TIME: Break and rest period workflows
-        END_OF_DAY: End-of-workday cleanup and preparation
-        CUSTOM: User-defined custom workflows
-    """
+    """Types of automated workflows"""
     MEETING_PREP = "meeting_prep"
     FOCUS_MODE = "focus_mode"
     RESEARCH = "research"
@@ -68,40 +39,19 @@ class WorkflowType(Enum):
     END_OF_DAY = "end_of_day"
     CUSTOM = "custom"
 
+
 class AutomationTrigger(Enum):
-    """Triggers for automation execution.
-    
-    Defines the different types of events or conditions that can
-    trigger the execution of automated workflows.
-    
-    Attributes:
-        TIME_BASED: Triggered at specific times or intervals
-        EVENT_BASED: Triggered by system or application events
-        CONTEXT_BASED: Triggered by workspace context changes
-        USER_COMMAND: Triggered by explicit user commands
-        PATTERN_DETECTED: Triggered by detected behavioral patterns
-    """
+    """Triggers for automation"""
     TIME_BASED = "time_based"
     EVENT_BASED = "event_based"
     CONTEXT_BASED = "context_based"
     USER_COMMAND = "user_command"
     PATTERN_DETECTED = "pattern_detected"
 
+
 @dataclass
 class WorkflowStep:
-    """Single step in an automation workflow.
-    
-    Represents an individual action within a larger workflow, including
-    execution parameters, conditions, and retry logic.
-    
-    Attributes:
-        action: The action to execute (e.g., 'open_application')
-        params: Parameters for the action execution
-        condition: Optional condition function that must return True to execute
-        timeout: Maximum time to wait for step completion in seconds
-        retries: Number of retry attempts if step fails
-        description: Human-readable description of the step
-    """
+    """Single step in an automation workflow"""
     action: str
     params: Dict[str, Any]
     condition: Optional[Callable[[], bool]] = None
@@ -110,17 +60,7 @@ class WorkflowStep:
     description: str = ""
     
     async def execute(self, context: Dict[str, Any]) -> bool:
-        """Execute the workflow step with retry logic.
-        
-        Args:
-            context: Execution context containing executor and other resources
-            
-        Returns:
-            True if step executed successfully, False otherwise
-            
-        Raises:
-            Exception: If critical execution errors occur
-        """
+        """Execute the workflow step"""
         if self.condition and not self.condition():
             logger.info(f"Skipping step: {self.description} (condition not met)")
             return True
@@ -142,25 +82,10 @@ class WorkflowStep:
                 
         return False
 
+
 @dataclass
 class Workflow:
-    """Complete automation workflow.
-    
-    Represents a complete multi-step automation workflow with metadata,
-    execution tracking, and success rate monitoring.
-    
-    Attributes:
-        id: Unique identifier for the workflow
-        name: Human-readable name
-        type: Category of workflow from WorkflowType enum
-        steps: List of WorkflowStep objects to execute
-        triggers: List of triggers that can activate this workflow
-        priority: Execution priority level
-        enabled: Whether the workflow is currently enabled
-        last_executed: Timestamp of last execution
-        execution_count: Total number of times executed
-        success_rate: Rolling success rate (0.0 to 1.0)
-    """
+    """Complete automation workflow"""
     id: str
     name: str
     type: WorkflowType
@@ -173,28 +98,12 @@ class Workflow:
     success_rate: float = 1.0
     
     def add_step(self, action: str, params: Dict[str, Any], **kwargs):
-        """Add a step to the workflow.
-        
-        Args:
-            action: The action type to execute
-            params: Parameters for the action
-            **kwargs: Additional step configuration (timeout, retries, etc.)
-        """
+        """Add a step to the workflow"""
         step = WorkflowStep(action=action, params=params, **kwargs)
         self.steps.append(step)
         
     async def execute(self, context: Dict[str, Any]) -> bool:
-        """Execute the complete workflow.
-        
-        Executes all steps in sequence, handling failures and updating
-        execution statistics.
-        
-        Args:
-            context: Execution context with resources and configuration
-            
-        Returns:
-            True if all steps completed successfully, False otherwise
-        """
+        """Execute the complete workflow"""
         logger.info(f"Executing workflow: {self.name}")
         success_count = 0
         
@@ -218,68 +127,27 @@ class Workflow:
         
         return success_count == len(self.steps)
 
+
 @dataclass
 class AutomationPattern:
-    """Detected pattern that can trigger automation.
-    
-    Represents a behavioral pattern detected from user actions that
-    could be automated in the future.
-    
-    Attributes:
-        pattern_type: Type/category of the detected pattern
-        occurrences: List of timestamps when pattern occurred
-        confidence: Confidence level of pattern detection (0.0 to 1.0)
-        suggested_workflow: Optional workflow ID that could automate this pattern
-    """
+    """Detected pattern that can trigger automation"""
     pattern_type: str
     occurrences: List[datetime]
     confidence: float
     suggested_workflow: Optional[str] = None
     
     def is_recurring(self, threshold: int = 3) -> bool:
-        """Check if pattern is recurring enough to be actionable.
-        
-        Args:
-            threshold: Minimum number of occurrences to consider recurring
-            
-        Returns:
-            True if pattern has occurred at least threshold times
-        """
+        """Check if pattern is recurring"""
         return len(self.occurrences) >= threshold
 
+
 class WorkspaceAutomation:
-    """Intelligent workspace automation system.
-    
-    Main automation system that learns and executes complex workflows
-    across applications. Integrates with vision navigation, decision
-    engines, and workspace monitoring to provide comprehensive automation.
-    
-    The system can:
-    - Execute predefined workflows (meeting prep, focus mode, etc.)
-    - Learn from user behavior patterns
-    - Suggest automation opportunities
-    - Schedule workflows for future execution
-    - Adapt to user preferences over time
-    
-    Attributes:
-        navigation: Vision navigation system for UI interaction
-        decision_engine: Autonomous decision making engine
-        monitor: Enhanced workspace monitoring system
-        workflows: Dictionary of available workflows by ID
-        active_workflows: List of currently executing workflow IDs
-        workflow_history: History of workflow executions
-        detected_patterns: List of detected behavioral patterns
-        user_actions: History of user actions for pattern detection
-        automation_enabled: Whether automation is currently active
-        learning_mode: Whether system is learning from user actions
+    """
+    Intelligent workspace automation system that learns and executes
+    complex workflows across applications
     """
     
     def __init__(self, navigation_system: VisionNavigationSystem):
-        """Initialize the workspace automation system.
-        
-        Args:
-            navigation_system: Vision navigation system for UI interaction
-        """
         self.navigation = navigation_system
         self.decision_engine = AutonomousDecisionEngine()
         self.monitor = EnhancedWorkspaceMonitor()
@@ -307,12 +175,7 @@ class WorkspaceAutomation:
         self.schedule_task = None
         
     def _initialize_workflows(self):
-        """Initialize predefined intelligent workflows.
-        
-        Creates standard workflows for common automation scenarios including
-        meeting preparation, focus mode, research setup, development environment,
-        and end-of-day routines.
-        """
+        """Initialize predefined intelligent workflows"""
         
         # Meeting preparation workflow
         meeting_prep = Workflow(
@@ -454,14 +317,7 @@ class WorkspaceAutomation:
         self.workflows["end_of_day"] = eod_flow
     
     async def start_automation(self):
-        """Start the automation system.
-        
-        Initializes all automation components including navigation,
-        pattern detection, and schedule monitoring.
-        
-        Raises:
-            Exception: If navigation system fails to start
-        """
+        """Start the automation system"""
         self.automation_enabled = True
         
         # Start navigation system
@@ -476,11 +332,7 @@ class WorkspaceAutomation:
         logger.info("Workspace automation started")
         
     async def stop_automation(self):
-        """Stop the automation system.
-        
-        Cleanly shuts down all automation components and cancels
-        any running tasks.
-        """
+        """Stop the automation system"""
         self.automation_enabled = False
         
         # Stop navigation
@@ -494,18 +346,7 @@ class WorkspaceAutomation:
         
     async def execute_workflow(self, workflow_id: str, 
                              params: Optional[Dict[str, Any]] = None) -> bool:
-        """Execute a specific workflow.
-        
-        Args:
-            workflow_id: ID of the workflow to execute
-            params: Optional parameters to pass to the workflow
-            
-        Returns:
-            True if workflow completed successfully, False otherwise
-            
-        Raises:
-            ValueError: If workflow_id is not found
-        """
+        """Execute a specific workflow"""
         if workflow_id not in self.workflows:
             logger.error(f"Unknown workflow: {workflow_id}")
             return False
@@ -546,21 +387,7 @@ class WorkspaceAutomation:
                 self.active_workflows.remove(workflow_id)
                 
     async def _execute_action(self, action: str, params: Dict[str, Any]) -> bool:
-        """Execute a single automation action.
-        
-        Internal method that handles the execution of individual workflow
-        actions by routing them to appropriate handlers.
-        
-        Args:
-            action: The action type to execute
-            params: Parameters for the action
-            
-        Returns:
-            True if action completed successfully, False otherwise
-            
-        Raises:
-            Exception: If action execution encounters critical errors
-        """
+        """Execute a single automation action"""
         try:
             # Navigation actions
             if action == "open_application":
@@ -629,14 +456,7 @@ class WorkspaceAutomation:
             return False
             
     async def _close_application(self, app_name: str) -> bool:
-        """Close a specific application.
-        
-        Args:
-            app_name: Name of the application to close
-            
-        Returns:
-            True if application was closed successfully
-        """
+        """Close a specific application"""
         # Find windows for the app
         if not self.navigation.current_map:
             return False
@@ -652,11 +472,7 @@ class WorkspaceAutomation:
         return True
         
     async def _close_all_except_current(self) -> bool:
-        """Close all windows except the currently focused one.
-        
-        Returns:
-            True if windows were closed successfully
-        """
+        """Close all windows except the currently focused one"""
         if not self.navigation.current_map:
             return False
             
@@ -671,14 +487,7 @@ class WorkspaceAutomation:
         return True
         
     async def _close_distracting_apps(self, keep_apps: List[str]) -> bool:
-        """Close potentially distracting applications.
-        
-        Args:
-            keep_apps: List of app names to keep open
-            
-        Returns:
-            True if distracting apps were closed successfully
-        """
+        """Close potentially distracting applications"""
         distracting = [
             "Discord", "Slack", "Twitter", "Facebook", 
             "Instagram", "YouTube", "Netflix", "Spotify"
@@ -699,11 +508,7 @@ class WorkspaceAutomation:
         return True
         
     async def _maximize_current_window(self) -> bool:
-        """Maximize the currently active window.
-        
-        Returns:
-            True if window was maximized successfully
-        """
+        """Maximize the currently active window"""
         if not self.navigation.current_map:
             return False
             
@@ -714,14 +519,7 @@ class WorkspaceAutomation:
         return False
         
     async def _mute_notifications(self, duration_minutes: int) -> bool:
-        """Mute system notifications for specified duration.
-        
-        Args:
-            duration_minutes: How long to mute notifications
-            
-        Returns:
-            True if notifications were muted successfully
-        """
+        """Mute system notifications"""
         # This would integrate with macOS notification center
         logger.info(f"Muting notifications for {duration_minutes} minutes")
         
@@ -732,15 +530,7 @@ class WorkspaceAutomation:
         return True
         
     async def _set_system_status(self, status: str, duration_minutes: int) -> bool:
-        """Set system-wide status (DND, Away, etc.).
-        
-        Args:
-            status: Status message to set
-            duration_minutes: How long to maintain the status
-            
-        Returns:
-            True if status was set successfully
-        """
+        """Set system-wide status (DND, Away, etc.)"""
         logger.info(f"Setting system status to {status} for {duration_minutes} minutes")
         
         # This would integrate with various apps to set status
@@ -753,15 +543,7 @@ class WorkspaceAutomation:
         return True
         
     async def _create_document(self, app_name: str, template: str) -> bool:
-        """Create a new document with specified template.
-        
-        Args:
-            app_name: Application to create document in
-            template: Template type to use
-            
-        Returns:
-            True if document was created successfully
-        """
+        """Create a new document with template"""
         # Open the app
         if not await self.navigation.navigate_to_application(app_name):
             return False
@@ -773,11 +555,7 @@ class WorkspaceAutomation:
         return True
         
     async def _save_all_work(self) -> bool:
-        """Save all open documents.
-        
-        Returns:
-            True if all documents were saved successfully
-        """
+        """Save all open documents"""
         # This would iterate through windows and trigger save
         logger.info("Saving all open work")
         
@@ -791,11 +569,7 @@ class WorkspaceAutomation:
         return True
         
     async def _analyze_current_task(self) -> bool:
-        """Analyze what the user is currently working on.
-        
-        Returns:
-            True if analysis completed successfully
-        """
+        """Analyze what the user is currently working on"""
         if not self.navigation.current_map:
             return False
             
@@ -813,11 +587,7 @@ class WorkspaceAutomation:
         return True
         
     async def _analyze_calendar(self) -> bool:
-        """Analyze calendar for upcoming events.
-        
-        Returns:
-            True if calendar analysis completed successfully
-        """
+        """Analyze calendar for upcoming events"""
         # This would integrate with calendar app
         logger.info("Analyzing calendar for upcoming events")
         
@@ -831,13 +601,7 @@ class WorkspaceAutomation:
         return True
         
     async def learn_from_user_actions(self, action: Dict[str, Any]):
-        """Learn patterns from user actions.
-        
-        Records user actions and analyzes them for automation patterns.
-        
-        Args:
-            action: Dictionary containing action details (type, app, etc.)
-        """
+        """Learn patterns from user actions"""
         if not self.learning_mode:
             return
             
@@ -853,11 +617,7 @@ class WorkspaceAutomation:
         await self._detect_patterns()
         
     async def _detect_patterns(self):
-        """Detect patterns in user actions.
-        
-        Analyzes recorded user actions to identify recurring patterns
-        that could be automated.
-        """
+        """Detect patterns in user actions"""
         # Group actions by type and time
         action_groups = {}
         
@@ -890,16 +650,205 @@ class WorkspaceAutomation:
                         logger.info(f"Detected pattern: {pattern.pattern_type}")
                         
     def _suggest_workflow_for_pattern(self, pattern_key: str) -> Optional[str]:
-        """Suggest a workflow based on detected pattern.
-        
-        Args:
-            pattern_key: Key identifying the pattern type
+        """Suggest a workflow based on detected pattern"""
+        if "meeting" in pattern_key.lower() or "zoom" in pattern_key.lower():
+            return "meeting_prep"
+        elif "code" in pattern_key.lower() or "terminal" in pattern_key.lower():
+            return "dev_flow"
+        elif "research" in pattern_key.lower() or "browser" in pattern_key.lower():
+            return "research_flow"
+        else:
+            return None
             
-        Returns:
-            Workflow ID that could automate this pattern, or None
-        """
-        if pattern_key in self.pattern_to_workflow:
-            return self.pattern_to_workflow[pattern_key]
-        return None
+    async def _pattern_detection_loop(self):
+        """Continuous pattern detection loop"""
+        while self.automation_enabled:
+            try:
+                # Check for patterns that should trigger workflows
+                for pattern in self.detected_patterns:
+                    if pattern.is_recurring() and pattern.suggested_workflow:
+                        # Check if it's time to execute
+                        if self._should_execute_pattern(pattern):
+                            await self.execute_workflow(pattern.suggested_workflow)
+                            
+                await asyncio.sleep(60)  # Check every minute
+                
+            except Exception as e:
+                logger.error(f"Error in pattern detection: {e}")
+                await asyncio.sleep(60)
+                
+    def _should_execute_pattern(self, pattern: AutomationPattern) -> bool:
+        """Check if a pattern-based workflow should execute"""
+        # Check if recently executed
+        workflow = self.workflows.get(pattern.suggested_workflow)
+        if workflow and workflow.last_executed:
+            time_since = datetime.now() - workflow.last_executed
+            if time_since < timedelta(hours=1):  # Don't repeat within an hour
+                return False
+                
+        # Check if it's the right time
+        current_hour = datetime.now().hour
+        pattern_hours = [ts.hour for ts in pattern.occurrences]
+        
+        return current_hour in pattern_hours
+        
+    async def _schedule_monitor_loop(self):
+        """Monitor for scheduled workflow executions"""
+        while self.automation_enabled:
+            try:
+                current_time = datetime.now()
+                
+                # Check scheduled tasks
+                for task in self.scheduled_tasks:
+                    if task['execute_at'] <= current_time and not task.get('executed'):
+                        await self.execute_workflow(
+                            task['workflow_id'],
+                            task.get('params')
+                        )
+                        task['executed'] = True
+                        
+                # Clean up executed tasks
+                self.scheduled_tasks = [
+                    t for t in self.scheduled_tasks
+                    if not t.get('executed')
+                ]
+                
+                await asyncio.sleep(30)  # Check every 30 seconds
+                
+            except Exception as e:
+                logger.error(f"Error in schedule monitor: {e}")
+                await asyncio.sleep(30)
+                
+    def schedule_workflow(self, workflow_id: str, execute_at: datetime,
+                         params: Optional[Dict[str, Any]] = None):
+        """Schedule a workflow for future execution"""
+        self.scheduled_tasks.append({
+            'workflow_id': workflow_id,
+            'execute_at': execute_at,
+            'params': params,
+            'executed': False
+        })
+        
+        logger.info(f"Scheduled {workflow_id} for {execute_at}")
+        
+    def _record_workflow_execution(self, workflow_id: str, success: bool):
+        """Record workflow execution for analysis"""
+        record = {
+            'workflow_id': workflow_id,
+            'timestamp': datetime.now(),
+            'success': success,
+            'duration': None,  # Would calculate actual duration
+            'context': dict(self.execution_context)
+        }
+        
+        self.workflow_history.append(record)
+        
+        # Keep history manageable
+        if len(self.workflow_history) > 500:
+            self.workflow_history = self.workflow_history[-500:]
+            
+    def get_automation_suggestions(self) -> List[Dict[str, Any]]:
+        """Get suggestions for automation based on patterns"""
+        suggestions = []
+        
+        # Suggest workflows based on detected patterns
+        for pattern in self.detected_patterns:
+            if pattern.confidence > 0.7 and pattern.suggested_workflow:
+                suggestions.append({
+                    'type': 'pattern_based',
+                    'workflow': pattern.suggested_workflow,
+                    'reason': f"You frequently {pattern.pattern_type}",
+                    'confidence': pattern.confidence
+                })
+                
+        # Suggest based on time of day
+        current_hour = datetime.now().hour
+        
+        if 8 <= current_hour <= 10:
+            suggestions.append({
+                'type': 'time_based',
+                'workflow': 'focus_mode',
+                'reason': 'Start your day with focused work',
+                'confidence': 0.8
+            })
+        elif 16 <= current_hour <= 18:
+            suggestions.append({
+                'type': 'time_based',
+                'workflow': 'end_of_day',
+                'reason': 'Wrap up your workday',
+                'confidence': 0.8
+            })
+            
+        return suggestions
+        
+    def get_automation_status(self) -> Dict[str, Any]:
+        """Get current automation system status"""
+        return {
+            'enabled': self.automation_enabled,
+            'learning_mode': self.learning_mode,
+            'active_workflows': self.active_workflows,
+            'available_workflows': list(self.workflows.keys()),
+            'detected_patterns': len(self.detected_patterns),
+            'scheduled_tasks': len(self.scheduled_tasks),
+            'execution_history': len(self.workflow_history),
+            'success_rate': self._calculate_overall_success_rate()
+        }
+        
+    def _calculate_overall_success_rate(self) -> float:
+        """Calculate overall workflow success rate"""
+        if not self.workflow_history:
+            return 1.0
+            
+        recent = self.workflow_history[-50:]  # Last 50 executions
+        success_count = sum(1 for r in recent if r['success'])
+        
+        return success_count / len(recent)
 
-# Module truncated - needs restoration from backup
+
+async def test_workspace_automation():
+    """Test workspace automation"""
+    print("🤖 Testing Workspace Automation")
+    print("=" * 50)
+    
+    # Create navigation system
+    nav_system = VisionNavigationSystem()
+    
+    # Create automation system
+    automation = WorkspaceAutomation(nav_system)
+    
+    # Start automation
+    print("\n🚀 Starting automation system...")
+    await automation.start_automation()
+    
+    # Get status
+    status = automation.get_automation_status()
+    print(f"\n📊 Automation Status:")
+    print(f"   Enabled: {status['enabled']}")
+    print(f"   Available Workflows: {', '.join(status['available_workflows'])}")
+    
+    # Get suggestions
+    suggestions = automation.get_automation_suggestions()
+    print(f"\n💡 Automation Suggestions:")
+    for suggestion in suggestions:
+        print(f"   - {suggestion['workflow']}: {suggestion['reason']}")
+    
+    # Simulate user action pattern
+    print("\n📝 Simulating user actions...")
+    for i in range(5):
+        await automation.learn_from_user_actions({
+            'type': 'open_app',
+            'app': 'Zoom',
+            'timestamp': datetime.now()
+        })
+        
+    # Check detected patterns
+    print(f"\n🔍 Detected Patterns: {len(automation.detected_patterns)}")
+    
+    # Stop automation
+    await automation.stop_automation()
+    
+    print("\n✅ Workspace automation test complete!")
+
+
+if __name__ == "__main__":
+    asyncio.run(test_workspace_automation())

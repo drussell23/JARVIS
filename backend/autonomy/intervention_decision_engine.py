@@ -12,29 +12,6 @@ This engine determines when and how JARVIS should proactively assist users by:
 Memory allocation: 80MB total (30MB decision models, 25MB history, 25MB learning)
 Multi-language support: Python (orchestration), Rust (performance), Swift (macOS integration)
 Zero hardcoding: All parameters are learned and dynamically adapted
-
-Classes:
-    UserState: Enumeration of user emotional and cognitive states
-    SituationType: Types of situations requiring intervention
-    InterventionLevel: Levels of intervention from passive to active
-    UserStateSignal: Signal indicating user state with metadata
-    SituationAssessment: Assessment of a situation requiring intervention
-    InterventionDecision: Decision about intervention with reasoning
-    UserStateEvaluator: Evaluates user emotional and cognitive states
-    SituationAnalyzer: Analyzes situations requiring intervention
-    InterventionTiming: Optimizes timing for interventions
-    EffectivenessLearner: Learns from intervention effectiveness
-    InterventionDecisionEngine: Main engine orchestrating all components
-
-Functions:
-    get_intervention_engine: Get or create intervention engine instance
-    test_intervention_engine: Test the intervention decision engine
-
-Example:
-    >>> engine = get_intervention_engine()
-    >>> decision = await engine.evaluate_intervention_need(context)
-    >>> if decision:
-    ...     result = await engine.execute_intervention(decision)
 """
 
 import asyncio
@@ -65,21 +42,7 @@ from core.dynamic_config_manager import DynamicConfigManager
 logger = logging.getLogger(__name__)
 
 class UserState(Enum):
-    """User emotional and cognitive states.
-    
-    Represents different states a user can be in while interacting with the system.
-    These states are used to determine appropriate intervention strategies.
-    
-    Attributes:
-        FRUSTRATED: User is experiencing frustration with current task
-        FOCUSED: User is deeply concentrated on work
-        PRODUCTIVE: User is making good progress on tasks
-        STRESSED: User is under pressure or experiencing stress
-        CONFUSED: User is uncertain about how to proceed
-        OVERWHELMED: User has too many competing demands
-        IDLE: User is not actively engaged with any task
-        ENGAGED: User is actively working but not deeply focused
-    """
+    """User emotional and cognitive states"""
     FRUSTRATED = "frustrated"
     FOCUSED = "focused"
     PRODUCTIVE = "productive"
@@ -90,20 +53,7 @@ class UserState(Enum):
     ENGAGED = "engaged"
 
 class SituationType(Enum):
-    """Types of situations requiring intervention.
-    
-    Categorizes different scenarios where JARVIS might need to intervene
-    to assist the user or prevent problems.
-    
-    Attributes:
-        CRITICAL_ERROR: System error requiring immediate attention
-        WORKFLOW_BLOCKED: User's workflow is stuck or blocked
-        EFFICIENCY_OPPORTUNITY: Chance to improve user efficiency
-        LEARNING_MOMENT: Opportunity to teach user something new
-        HEALTH_REMINDER: Reminder for user health and wellbeing
-        SECURITY_CONCERN: Potential security risk detected
-        TIME_MANAGEMENT: Issues with time allocation or deadlines
-    """
+    """Types of situations requiring intervention"""
     CRITICAL_ERROR = "critical_error"
     WORKFLOW_BLOCKED = "workflow_blocked"
     EFFICIENCY_OPPORTUNITY = "efficiency_opportunity"
@@ -113,19 +63,7 @@ class SituationType(Enum):
     TIME_MANAGEMENT = "time_management"
 
 class InterventionLevel(Enum):
-    """Levels of intervention from passive to active.
-    
-    Defines the spectrum of intervention approaches from completely passive
-    monitoring to autonomous action without user input.
-    
-    Attributes:
-        SILENT_MONITORING: Monitor situation without user-visible action
-        SUBTLE_INDICATION: Minimal visual cue or indicator
-        GENTLE_SUGGESTION: Soft suggestion that can be easily dismissed
-        DIRECT_RECOMMENDATION: Clear recommendation with options
-        PROACTIVE_ASSISTANCE: Active offer of help with specific actions
-        AUTONOMOUS_ACTION: Take action automatically with minimal user input
-    """
+    """Levels of intervention from passive to active"""
     SILENT_MONITORING = "silent_monitoring"
     SUBTLE_INDICATION = "subtle_indication"
     GENTLE_SUGGESTION = "gentle_suggestion"
@@ -135,19 +73,7 @@ class InterventionLevel(Enum):
 
 @dataclass
 class UserStateSignal:
-    """Signal indicating user state.
-    
-    Represents a single piece of evidence about the user's current state,
-    collected from various sources like vision, audio, or behavior analysis.
-    
-    Attributes:
-        signal_type: Type of signal (e.g., 'facial_frustration', 'rapid_interactions')
-        strength: Signal strength from 0.0 to 1.0
-        confidence: Confidence in signal accuracy from 0.0 to 1.0
-        source: Source of signal (vision, audio, behavior, etc.)
-        timestamp: When the signal was detected
-        metadata: Additional context-specific information
-    """
+    """Signal indicating user state"""
     signal_type: str
     strength: float  # 0.0 to 1.0
     confidence: float  # 0.0 to 1.0
@@ -157,20 +83,7 @@ class UserStateSignal:
 
 @dataclass
 class SituationAssessment:
-    """Assessment of a situation requiring intervention.
-    
-    Comprehensive evaluation of a situation that might require JARVIS intervention,
-    including severity, urgency, and available solutions.
-    
-    Attributes:
-        situation_type: Type of situation detected
-        severity: Severity level from 0.0 to 1.0
-        time_criticality: Urgency level from 0.0 to 1.0 (1.0 = immediate)
-        solution_availability: Availability of solutions from 0.0 to 1.0
-        context: Additional context information about the situation
-        confidence: Confidence in the assessment accuracy
-        timestamp: When the assessment was made
-    """
+    """Assessment of a situation requiring intervention"""
     situation_type: SituationType
     severity: float  # 0.0 to 1.0
     time_criticality: float  # 0.0 to 1.0 (1.0 = immediate)
@@ -181,22 +94,7 @@ class SituationAssessment:
 
 @dataclass
 class InterventionDecision:
-    """Decision about intervention.
-    
-    Complete decision about how, when, and why to intervene in a user's workflow,
-    including the reasoning and expected effectiveness.
-    
-    Attributes:
-        intervention_level: Chosen level of intervention
-        timing_delay: How long to wait before intervening
-        intervention_content: Specific content and actions for intervention
-        reasoning: Human-readable explanation of the decision
-        confidence: Confidence in the decision quality
-        expected_effectiveness: Predicted effectiveness based on learning
-        user_state: User's state when decision was made
-        situation: Situation assessment that triggered the decision
-        timestamp: When the decision was made
-    """
+    """Decision about intervention"""
     intervention_level: InterventionLevel
     timing_delay: timedelta  # How long to wait before intervening
     intervention_content: Dict[str, Any]
@@ -208,25 +106,9 @@ class InterventionDecision:
     timestamp: datetime = field(default_factory=datetime.now)
 
 class UserStateEvaluator:
-    """Evaluates user emotional and cognitive states.
-    
-    Analyzes multiple signals from different sources to determine the user's
-    current emotional and cognitive state, learning patterns over time.
-    
-    Attributes:
-        memory_limit: Memory limit in bytes for this component
-        state_patterns: Learned patterns for different user states
-        signal_weights: Learned weights for different signal types
-        learning_buffer: Buffer of recent evaluations for learning
-        thresholds: Dynamic thresholds learned from user behavior
-    """
+    """Evaluates user emotional and cognitive states"""
     
     def __init__(self, memory_limit_mb: int = 30):
-        """Initialize the UserStateEvaluator.
-        
-        Args:
-            memory_limit_mb: Memory limit in megabytes for this component
-        """
         self.memory_limit = memory_limit_mb * 1024 * 1024  # Convert to bytes
         self.state_patterns = {}
         self.signal_weights = {}
@@ -245,23 +127,7 @@ class UserStateEvaluator:
     
     def evaluate_user_state(self, signals: List[UserStateSignal], 
                           context: Dict[str, Any]) -> Tuple[UserState, float]:
-        """Evaluate current user state from multiple signals.
-        
-        Analyzes all available signals to determine the most likely user state
-        and confidence in that assessment.
-        
-        Args:
-            signals: List of user state signals from various sources
-            context: Additional context information
-            
-        Returns:
-            Tuple of (predicted_user_state, confidence_score)
-            
-        Example:
-            >>> signals = [UserStateSignal('rapid_interactions', 0.8, 0.9, 'vision')]
-            >>> state, confidence = evaluator.evaluate_user_state(signals, {})
-            >>> print(f"User is {state.value} with {confidence:.1%} confidence")
-        """
+        """Evaluate current user state from multiple signals"""
         
         # Aggregate signals by type
         signal_scores = defaultdict(float)
@@ -289,15 +155,7 @@ class UserStateEvaluator:
     
     def _classify_state(self, signal_scores: Dict[str, float], 
                        context: Dict[str, Any]) -> Tuple[UserState, float]:
-        """Classify user state from signal scores.
-        
-        Args:
-            signal_scores: Aggregated signal scores by type
-            context: Additional context information
-            
-        Returns:
-            Tuple of (most_likely_state, confidence)
-        """
+        """Classify user state from signal scores"""
         
         # Dynamic classification using learned patterns
         state_probabilities = {}
@@ -315,16 +173,7 @@ class UserStateEvaluator:
     def _calculate_state_probability(self, state: UserState, 
                                    signal_scores: Dict[str, float],
                                    context: Dict[str, Any]) -> float:
-        """Calculate probability of a specific state.
-        
-        Args:
-            state: User state to calculate probability for
-            signal_scores: Aggregated signal scores
-            context: Additional context information
-            
-        Returns:
-            Probability score from 0.0 to 1.0
-        """
+        """Calculate probability of a specific state"""
         
         # Get learned pattern for this state
         pattern = self.state_patterns.get(state.value, {})
@@ -358,13 +207,7 @@ class UserStateEvaluator:
     
     def _record_state_evaluation(self, signals: List[UserStateSignal], 
                                state: UserState, confidence: float):
-        """Record state evaluation for learning.
-        
-        Args:
-            signals: Signals used in evaluation
-            state: Predicted user state
-            confidence: Confidence in prediction
-        """
+        """Record state evaluation for learning"""
         
         evaluation = {
             'timestamp': datetime.now().isoformat(),
@@ -387,11 +230,7 @@ class UserStateEvaluator:
             self._update_state_patterns()
     
     def _update_state_patterns(self):
-        """Update state patterns from learning buffer.
-        
-        Analyzes recent evaluations to update learned patterns for
-        different user states and signal combinations.
-        """
+        """Update state patterns from learning buffer"""
         
         # Analyze recent evaluations
         state_data = defaultdict(list)
@@ -420,11 +259,7 @@ class UserStateEvaluator:
                 )
     
     def _load_state_patterns(self):
-        """Load learned state patterns from disk.
-        
-        Loads previously learned patterns, weights, and thresholds
-        from persistent storage.
-        """
+        """Load learned state patterns"""
         patterns_file = Path("backend/data/user_state_patterns.json")
         if patterns_file.exists():
             try:
@@ -437,14 +272,7 @@ class UserStateEvaluator:
                 logger.error(f"Failed to load state patterns: {e}")
     
     def save_patterns(self):
-        """Save learned patterns to disk.
-        
-        Persists learned patterns, weights, and thresholds to disk
-        for future use.
-        
-        Raises:
-            Exception: If file writing fails
-        """
+        """Save learned patterns to disk"""
         patterns_file = Path("backend/data/user_state_patterns.json")
         patterns_file.parent.mkdir(parents=True, exist_ok=True)
         
@@ -462,24 +290,9 @@ class UserStateEvaluator:
             logger.error(f"Failed to save state patterns: {e}")
 
 class SituationAnalyzer:
-    """Analyzes situations requiring intervention.
-    
-    Evaluates current context to identify situations that might require
-    JARVIS intervention, assessing severity, urgency, and solution availability.
-    
-    Attributes:
-        memory_limit: Memory limit in bytes for this component
-        situation_patterns: Learned patterns for different situation types
-        solution_database: Database of known solutions for situations
-        criticality_models: Models for assessing situation criticality
-    """
+    """Analyzes situations requiring intervention"""
     
     def __init__(self, memory_limit_mb: int = 25):
-        """Initialize the SituationAnalyzer.
-        
-        Args:
-            memory_limit_mb: Memory limit in megabytes for this component
-        """
         self.memory_limit = memory_limit_mb * 1024 * 1024
         self.situation_patterns = {}
         self.solution_database = {}
@@ -490,24 +303,7 @@ class SituationAnalyzer:
     
     def assess_situation(self, context: Dict[str, Any], 
                         user_state: UserState) -> Optional[SituationAssessment]:
-        """Assess if current context requires intervention.
-        
-        Analyzes the current context and user state to determine if there's
-        a situation requiring intervention and how severe it is.
-        
-        Args:
-            context: Current context information
-            user_state: Current user state
-            
-        Returns:
-            SituationAssessment if intervention needed, None otherwise
-            
-        Example:
-            >>> context = {'error_detected': True, 'time_in_current_task': 600}
-            >>> assessment = analyzer.assess_situation(context, UserState.FRUSTRATED)
-            >>> if assessment:
-            ...     print(f"Situation: {assessment.situation_type.value}")
-        """
+        """Assess if current context requires intervention"""
         
         # Detect situation type
         situation_type = self._detect_situation_type(context, user_state)
@@ -539,15 +335,7 @@ class SituationAnalyzer:
     
     def _detect_situation_type(self, context: Dict[str, Any], 
                               user_state: UserState) -> Optional[SituationType]:
-        """Detect the type of situation from context.
-        
-        Args:
-            context: Current context information
-            user_state: Current user state
-            
-        Returns:
-            Detected situation type or None if no situation detected
-        """
+        """Detect the type of situation from context"""
         
         # Check for critical errors
         if context.get('error_detected') or context.get('system_failure'):
@@ -583,16 +371,7 @@ class SituationAnalyzer:
     
     def _calculate_severity(self, situation_type: SituationType, 
                           context: Dict[str, Any], user_state: UserState) -> float:
-        """Calculate situation severity (0.0 to 1.0).
-        
-        Args:
-            situation_type: Type of situation detected
-            context: Current context information
-            user_state: Current user state
-            
-        Returns:
-            Severity score from 0.0 to 1.0
-        """
+        """Calculate situation severity (0.0 to 1.0)"""
         
         base_severity = {
             SituationType.CRITICAL_ERROR: 0.9,
@@ -620,15 +399,7 @@ class SituationAnalyzer:
     
     def _calculate_time_criticality(self, situation_type: SituationType, 
                                   context: Dict[str, Any]) -> float:
-        """Calculate time criticality (0.0 to 1.0).
-        
-        Args:
-            situation_type: Type of situation detected
-            context: Current context information
-            
-        Returns:
-            Time criticality score from 0.0 to 1.0
-        """
+        """Calculate time criticality (0.0 to 1.0)"""
         
         # Base criticality by type
         base_criticality = {
@@ -659,15 +430,7 @@ class SituationAnalyzer:
     
     def _check_solution_availability(self, situation_type: SituationType, 
                                    context: Dict[str, Any]) -> float:
-        """Check availability of solutions (0.0 to 1.0).
-        
-        Args:
-            situation_type: Type of situation detected
-            context: Current context information
-            
-        Returns:
-            Solution availability score from 0.0 to 1.0
-        """
+        """Check availability of solutions (0.0 to 1.0)"""
         
         # Check solution database
         solutions = self.solution_database.get(situation_type.value, [])
@@ -694,17 +457,7 @@ class SituationAnalyzer:
     def _calculate_assessment_confidence(self, situation_type: SituationType,
                                        severity: float, time_criticality: float,
                                        solution_availability: float) -> float:
-        """Calculate overall assessment confidence.
-        
-        Args:
-            situation_type: Type of situation detected
-            severity: Calculated severity score
-            time_criticality: Calculated time criticality score
-            solution_availability: Calculated solution availability score
-            
-        Returns:
-            Overall confidence score from 0.0 to 1.0
-        """
+        """Calculate overall assessment confidence"""
         
         # Base confidence from pattern matching
         pattern_data = self.situation_patterns.get(situation_type.value, {})
@@ -716,11 +469,7 @@ class SituationAnalyzer:
         return min(1.0, pattern_confidence * completeness)
     
     def _load_situation_patterns(self):
-        """Load learned situation patterns from disk.
-        
-        Loads previously learned patterns and solution database
-        from persistent storage.
-        """
+        """Load learned situation patterns"""
         patterns_file = Path("backend/data/situation_patterns.json")
         if patterns_file.exists():
             try:
@@ -732,19 +481,9 @@ class SituationAnalyzer:
                 logger.error(f"Failed to load situation patterns: {e}")
 
 class InterventionTiming:
-    """Optimizes timing for interventions.
-    
-    Determines the optimal timing for interventions based on user state,
-    situation urgency, and learned patterns of effectiveness.
-    
-    Attributes:
-        timing_patterns: Learned patterns for optimal intervention timing
-        interruption_costs: Learned costs of interrupting different tasks
-        effectiveness_history: History of timing effectiveness for learning
-    """
+    """Optimizes timing for interventions"""
     
     def __init__(self):
-        """Initialize the InterventionTiming optimizer."""
         self.timing_patterns = {}
         self.interruption_costs = {}
         self.effectiveness_history = deque(maxlen=1000)
@@ -755,24 +494,7 @@ class InterventionTiming:
     def calculate_optimal_timing(self, decision: InterventionDecision,
                                user_state: UserState,
                                context: Dict[str, Any]) -> timedelta:
-        """Calculate optimal timing for intervention.
-        
-        Determines when to execute an intervention based on user state,
-        situation urgency, and learned timing patterns.
-        
-        Args:
-            decision: The intervention decision to time
-            user_state: Current user state
-            context: Current context information
-            
-        Returns:
-            Optimal delay before executing intervention
-            
-        Example:
-            >>> timing = InterventionTiming()
-            >>> delay = timing.calculate_optimal_timing(decision, user_state, context)
-            >>> print(f"Wait {delay.total_seconds()} seconds before intervening")
-        """
+        """Calculate optimal timing for intervention"""
         
         # Base timing by intervention level
         base_delays = {
@@ -811,9 +533,1036 @@ class InterventionTiming:
         # Learn from timing patterns
         timing_key = f"{user_state.value}_{decision.intervention_level.value}"
         if timing_key in self.timing_patterns:
-            avg_delay = self.timing_patterns[timing_key]
-            base_delay = (base_delay + avg_delay) / 2
-
+            learned_delay = self.timing_patterns[timing_key]['optimal_delay']
+            effectiveness = self.timing_patterns[timing_key]['effectiveness']
+            
+            if effectiveness > 0.7:  # High effectiveness pattern
+                return timedelta(seconds=learned_delay)
+        
         return base_delay
+    
+    def record_timing_outcome(self, decision: InterventionDecision,
+                            actual_delay: timedelta, effectiveness: float):
+        """Record timing outcome for learning"""
+        
+        outcome = {
+            'timestamp': datetime.now().isoformat(),
+            'user_state': decision.user_state.value,
+            'intervention_level': decision.intervention_level.value,
+            'planned_delay': decision.timing_delay.total_seconds(),
+            'actual_delay': actual_delay.total_seconds(),
+            'effectiveness': effectiveness,
+            'situation_type': decision.situation.situation_type.value
+        }
+        
+        self.effectiveness_history.append(outcome)
+        
+        # Update timing patterns
+        self._update_timing_patterns()
+    
+    def _update_timing_patterns(self):
+        """Update timing patterns from effectiveness history"""
+        
+        if len(self.effectiveness_history) < 50:
+            return  # Need more data
+        
+        # Group by user state and intervention level
+        pattern_data = defaultdict(list)
+        
+        for outcome in list(self.effectiveness_history):
+            key = f"{outcome['user_state']}_{outcome['intervention_level']}"
+            pattern_data[key].append({
+                'delay': outcome['actual_delay'],
+                'effectiveness': outcome['effectiveness']
+            })
+        
+        # Update patterns
+        for pattern_key, data in pattern_data.items():
+            if len(data) >= 10:  # Minimum samples
+                # Find optimal delay
+                best_delay = 0
+                best_effectiveness = 0
+                
+                for entry in data:
+                    if entry['effectiveness'] > best_effectiveness:
+                        best_effectiveness = entry['effectiveness']
+                        best_delay = entry['delay']
+                
+                self.timing_patterns[pattern_key] = {
+                    'optimal_delay': best_delay,
+                    'effectiveness': best_effectiveness,
+                    'sample_count': len(data)
+                }
+    
+    def _load_timing_patterns(self):
+        """Load timing patterns from disk"""
+        patterns_file = Path("backend/data/timing_patterns.json")
+        if patterns_file.exists():
+            try:
+                with open(patterns_file, 'r') as f:
+                    data = json.load(f)
+                    self.timing_patterns = data.get('patterns', {})
+                    self.interruption_costs = data.get('interruption_costs', {})
+            except Exception as e:
+                logger.error(f"Failed to load timing patterns: {e}")
 
-# Module truncated - needs restoration from backup
+class EffectivenessLearner:
+    """Learns from intervention effectiveness"""
+    
+    def __init__(self, memory_limit_mb: int = 25):
+        self.memory_limit = memory_limit_mb * 1024 * 1024
+        self.intervention_history = deque(maxlen=1000)
+        self.effectiveness_models = {}
+        self.adaptation_rates = {}
+        
+        # Load historical data
+        self._load_effectiveness_data()
+    
+    def record_intervention_outcome(self, decision: InterventionDecision,
+                                  user_response: str, success: bool,
+                                  effectiveness_score: float):
+        """Record outcome of an intervention"""
+        
+        outcome = {
+            'timestamp': datetime.now().isoformat(),
+            'decision': {
+                'intervention_level': decision.intervention_level.value,
+                'timing_delay': decision.timing_delay.total_seconds(),
+                'confidence': decision.confidence,
+                'expected_effectiveness': decision.expected_effectiveness,
+                'user_state': decision.user_state.value,
+                'situation_type': decision.situation.situation_type.value,
+                'severity': decision.situation.severity,
+                'time_criticality': decision.situation.time_criticality
+            },
+            'outcome': {
+                'user_response': user_response,
+                'success': success,
+                'effectiveness_score': effectiveness_score
+            }
+        }
+        
+        self.intervention_history.append(outcome)
+        
+        # Update models periodically
+        if len(self.intervention_history) % 50 == 0:
+            self._update_effectiveness_models()
+    
+    def predict_effectiveness(self, decision: InterventionDecision) -> float:
+        """Predict effectiveness of a proposed intervention"""
+        
+        # Create feature vector from decision
+        features = self._extract_features(decision)
+        
+        # Get model for this intervention type
+        model_key = f"{decision.intervention_level.value}_{decision.situation.situation_type.value}"
+        
+        if model_key in self.effectiveness_models:
+            model = self.effectiveness_models[model_key]
+            predicted_effectiveness = self._apply_model(features, model)
+        else:
+            # Default prediction based on historical averages
+            predicted_effectiveness = self._get_default_effectiveness(decision)
+        
+        return min(1.0, max(0.0, predicted_effectiveness))
+    
+    def _extract_features(self, decision: InterventionDecision) -> Dict[str, float]:
+        """Extract features for effectiveness prediction"""
+        
+        return {
+            'severity': decision.situation.severity,
+            'time_criticality': decision.situation.time_criticality,
+            'solution_availability': decision.situation.solution_availability,
+            'confidence': decision.confidence,
+            'timing_delay': decision.timing_delay.total_seconds() / 3600,  # Hours
+            'user_state_frustration': 1.0 if decision.user_state == UserState.FRUSTRATED else 0.0,
+            'user_state_focused': 1.0 if decision.user_state == UserState.FOCUSED else 0.0,
+            'intervention_level_num': list(InterventionLevel).index(decision.intervention_level) / len(InterventionLevel)
+        }
+    
+    def _apply_model(self, features: Dict[str, float], model: Dict[str, Any]) -> float:
+        """Apply effectiveness model to features"""
+        
+        # Simple linear model for now
+        weights = model.get('weights', {})
+        bias = model.get('bias', 0.5)
+        
+        prediction = bias
+        for feature, value in features.items():
+            weight = weights.get(feature, 0.0)
+            prediction += weight * value
+        
+        return prediction
+    
+    def _get_default_effectiveness(self, decision: InterventionDecision) -> float:
+        """Get default effectiveness estimate"""
+        
+        # Base effectiveness by intervention level
+        base_effectiveness = {
+            InterventionLevel.SILENT_MONITORING: 0.8,
+            InterventionLevel.SUBTLE_INDICATION: 0.6,
+            InterventionLevel.GENTLE_SUGGESTION: 0.7,
+            InterventionLevel.DIRECT_RECOMMENDATION: 0.8,
+            InterventionLevel.PROACTIVE_ASSISTANCE: 0.9,
+            InterventionLevel.AUTONOMOUS_ACTION: 0.85
+        }
+        
+        return base_effectiveness.get(decision.intervention_level, 0.7)
+    
+    def _update_effectiveness_models(self):
+        """Update effectiveness models from history"""
+        
+        if len(self.intervention_history) < 100:
+            return  # Need more data
+        
+        # Group by intervention type
+        model_data = defaultdict(list)
+        
+        for outcome in list(self.intervention_history):
+            key = f"{outcome['decision']['intervention_level']}_{outcome['decision']['situation_type']}"
+            
+            features = {
+                'severity': outcome['decision']['severity'],
+                'time_criticality': outcome['decision']['time_criticality'],
+                'confidence': outcome['decision']['confidence'],
+                'timing_delay': outcome['decision']['timing_delay'] / 3600,
+            }
+            
+            target = outcome['outcome']['effectiveness_score']
+            
+            model_data[key].append({'features': features, 'target': target})
+        
+        # Train simple models
+        for model_key, data in model_data.items():
+            if len(data) >= 20:  # Minimum samples for model
+                model = self._train_simple_model(data)
+                self.effectiveness_models[model_key] = model
+    
+    def _train_simple_model(self, data: List[Dict]) -> Dict[str, Any]:
+        """Train a simple linear model"""
+        
+        # Extract features and targets
+        features = []
+        targets = []
+        
+        for sample in data:
+            feature_vector = list(sample['features'].values())
+            features.append(feature_vector)
+            targets.append(sample['target'])
+        
+        # Simple linear regression using numpy
+        if len(features) > 0:
+            X = np.array(features)
+            y = np.array(targets)
+            
+            try:
+                # Add bias term
+                X_with_bias = np.column_stack([np.ones(X.shape[0]), X])
+                
+                # Solve normal equations
+                weights = np.linalg.lstsq(X_with_bias, y, rcond=None)[0]
+                
+                feature_names = list(data[0]['features'].keys())
+                weight_dict = {name: weights[i+1] for i, name in enumerate(feature_names)}
+                
+                return {
+                    'weights': weight_dict,
+                    'bias': weights[0],
+                    'sample_count': len(data)
+                }
+            except np.linalg.LinAlgError:
+                # Fallback to simple average
+                return {
+                    'weights': {},
+                    'bias': np.mean(targets),
+                    'sample_count': len(data)
+                }
+        
+        return {'weights': {}, 'bias': 0.5, 'sample_count': 0}
+    
+    def _load_effectiveness_data(self):
+        """Load effectiveness data from disk"""
+        data_file = Path("backend/data/effectiveness_models.json")
+        if data_file.exists():
+            try:
+                with open(data_file, 'r') as f:
+                    data = json.load(f)
+                    self.effectiveness_models = data.get('models', {})
+            except Exception as e:
+                logger.error(f"Failed to load effectiveness data: {e}")
+
+class InterventionDecisionEngine:
+    """Main Intervention Decision Engine (Component 3.2)"""
+    
+    def __init__(self):
+        """Initialize the Intervention Decision Engine"""
+        
+        # Core components
+        self.user_state_evaluator = UserStateEvaluator(memory_limit_mb=30)
+        self.situation_analyzer = SituationAnalyzer(memory_limit_mb=25)
+        self.timing_optimizer = InterventionTiming()
+        self.effectiveness_learner = EffectivenessLearner(memory_limit_mb=25)
+        
+        # Integration with existing systems
+        self.state_intelligence = get_state_intelligence()
+        self.memory_controller = MemoryController()
+        self.config_manager = DynamicConfigManager()
+        
+        # Decision cache and history
+        self.decision_cache = {}
+        self.active_interventions = {}
+        
+        # Performance metrics
+        self.metrics = {
+            'decisions_made': 0,
+            'successful_interventions': 0,
+            'user_satisfaction_score': 0.0,
+            'average_response_time': 0.0
+        }
+        
+        logger.info("Intervention Decision Engine initialized")
+    
+    async def evaluate_intervention_need(self, context: Dict[str, Any]) -> Optional[InterventionDecision]:
+        """Main method to evaluate if intervention is needed"""
+        
+        start_time = time.time()
+        
+        try:
+            # 1. Collect user state signals
+            signals = await self._collect_user_state_signals(context)
+            
+            # 2. Evaluate user state
+            user_state, state_confidence = self.user_state_evaluator.evaluate_user_state(
+                signals, context
+            )
+            
+            # 3. Assess situation
+            situation = self.situation_analyzer.assess_situation(context, user_state)
+            if not situation:
+                return None
+            
+            # 4. Decide intervention level
+            intervention_level = self._decide_intervention_level(
+                user_state, situation, state_confidence
+            )
+            
+            if intervention_level == InterventionLevel.SILENT_MONITORING:
+                return None  # No active intervention needed
+            
+            # 5. Create intervention decision
+            decision = InterventionDecision(
+                intervention_level=intervention_level,
+                timing_delay=timedelta(0),  # Will be calculated next
+                intervention_content={},  # Will be populated
+                reasoning="",  # Will be generated
+                confidence=min(state_confidence, situation.confidence),
+                expected_effectiveness=0.0,  # Will be predicted
+                user_state=user_state,
+                situation=situation
+            )
+            
+            # 6. Predict effectiveness
+            decision.expected_effectiveness = self.effectiveness_learner.predict_effectiveness(decision)
+            
+            # 7. Optimize timing
+            decision.timing_delay = self.timing_optimizer.calculate_optimal_timing(
+                decision, user_state, context
+            )
+            
+            # 8. Generate intervention content and reasoning
+            decision.intervention_content = self._generate_intervention_content(decision)
+            decision.reasoning = self._generate_reasoning(decision)
+            
+            # Update metrics
+            self.metrics['decisions_made'] += 1
+            response_time = time.time() - start_time
+            self.metrics['average_response_time'] = (
+                (self.metrics['average_response_time'] * (self.metrics['decisions_made'] - 1) + 
+                 response_time) / self.metrics['decisions_made']
+            )
+            
+            return decision
+            
+        except Exception as e:
+            logger.error(f"Error in intervention evaluation: {e}")
+            return None
+    
+    async def _collect_user_state_signals(self, context: Dict[str, Any]) -> List[UserStateSignal]:
+        """Collect signals indicating user state"""
+        
+        signals = []
+        
+        # Vision-based signals
+        if 'vision_data' in context:
+            vision_signals = await self._extract_vision_signals(context['vision_data'])
+            signals.extend(vision_signals)
+        
+        # Behavioral signals
+        if 'user_behavior' in context:
+            behavior_signals = self._extract_behavior_signals(context['user_behavior'])
+            signals.extend(behavior_signals)
+        
+        # System interaction signals
+        if 'system_interactions' in context:
+            interaction_signals = self._extract_interaction_signals(context['system_interactions'])
+            signals.extend(interaction_signals)
+        
+        # Audio signals (if available)
+        if 'audio_data' in context:
+            audio_signals = await self._extract_audio_signals(context['audio_data'])
+            signals.extend(audio_signals)
+        
+        return signals
+    
+    async def _extract_vision_signals(self, vision_data: Dict[str, Any]) -> List[UserStateSignal]:
+        """Extract user state signals from vision data"""
+        
+        signals = []
+        
+        # Facial expression analysis (if available)
+        if 'facial_expressions' in vision_data:
+            expressions = vision_data['facial_expressions']
+            
+            if 'frustration' in expressions:
+                signals.append(UserStateSignal(
+                    signal_type='facial_frustration',
+                    strength=expressions['frustration'],
+                    confidence=0.8,
+                    source='vision',
+                    metadata={'method': 'facial_expression_analysis'}
+                ))
+        
+        # Screen interaction patterns
+        if 'screen_activity' in vision_data:
+            activity = vision_data['screen_activity']
+            
+            # Rapid clicking/typing might indicate frustration
+            if activity.get('rapid_interactions', 0) > 10:
+                signals.append(UserStateSignal(
+                    signal_type='rapid_interactions',
+                    strength=min(1.0, activity['rapid_interactions'] / 20),
+                    confidence=0.7,
+                    source='vision',
+                    metadata={'interaction_count': activity['rapid_interactions']}
+                ))
+            
+            # Long periods without activity might indicate being stuck
+            if activity.get('idle_time', 0) > 300:  # 5 minutes
+                signals.append(UserStateSignal(
+                    signal_type='prolonged_idle',
+                    strength=min(1.0, activity['idle_time'] / 1800),  # Max at 30 min
+                    confidence=0.9,
+                    source='vision',
+                    metadata={'idle_duration': activity['idle_time']}
+                ))
+        
+        return signals
+    
+    def _extract_behavior_signals(self, behavior_data: Dict[str, Any]) -> List[UserStateSignal]:
+        """Extract signals from user behavior patterns"""
+        
+        signals = []
+        
+        # Task switching frequency
+        if 'task_switches' in behavior_data:
+            switches = behavior_data['task_switches']
+            if switches > 5:  # Frequent switching might indicate distraction
+                signals.append(UserStateSignal(
+                    signal_type='frequent_task_switching',
+                    strength=min(1.0, switches / 10),
+                    confidence=0.8,
+                    source='behavior',
+                    metadata={'switch_count': switches}
+                ))
+        
+        # Time spent on current task
+        if 'time_on_task' in behavior_data:
+            task_time = behavior_data['time_on_task']
+            if task_time > 3600:  # More than 1 hour might indicate deep focus or being stuck
+                signals.append(UserStateSignal(
+                    signal_type='extended_focus',
+                    strength=min(1.0, task_time / 7200),  # Max at 2 hours
+                    confidence=0.7,
+                    source='behavior',
+                    metadata={'task_duration': task_time}
+                ))
+        
+        # Error rate
+        if 'recent_errors' in behavior_data:
+            errors = behavior_data['recent_errors']
+            if errors > 2:
+                signals.append(UserStateSignal(
+                    signal_type='increased_errors',
+                    strength=min(1.0, errors / 5),
+                    confidence=0.9,
+                    source='behavior',
+                    metadata={'error_count': errors}
+                ))
+        
+        return signals
+    
+    def _extract_interaction_signals(self, interaction_data: Dict[str, Any]) -> List[UserStateSignal]:
+        """Extract signals from system interactions"""
+        
+        signals = []
+        
+        # Help-seeking behavior
+        if 'help_searches' in interaction_data:
+            searches = interaction_data['help_searches']
+            if searches > 0:
+                signals.append(UserStateSignal(
+                    signal_type='help_seeking',
+                    strength=min(1.0, searches / 3),
+                    confidence=0.9,
+                    source='interaction',
+                    metadata={'search_count': searches}
+                ))
+        
+        # Undo/redo patterns
+        if 'undo_redo_count' in interaction_data:
+            undo_redo = interaction_data['undo_redo_count']
+            if undo_redo > 5:
+                signals.append(UserStateSignal(
+                    signal_type='frequent_corrections',
+                    strength=min(1.0, undo_redo / 10),
+                    confidence=0.8,
+                    source='interaction',
+                    metadata={'correction_count': undo_redo}
+                ))
+        
+        return signals
+    
+    async def _extract_audio_signals(self, audio_data: Dict[str, Any]) -> List[UserStateSignal]:
+        """Extract signals from audio data (if available)"""
+        
+        signals = []
+        
+        # Voice stress analysis
+        if 'voice_stress_level' in audio_data:
+            stress = audio_data['voice_stress_level']
+            signals.append(UserStateSignal(
+                signal_type='voice_stress',
+                strength=stress,
+                confidence=0.7,
+                source='audio',
+                metadata={'stress_level': stress}
+            ))
+        
+        # Typing sound analysis
+        if 'typing_intensity' in audio_data:
+            intensity = audio_data['typing_intensity']
+            if intensity > 0.7:  # Aggressive typing
+                signals.append(UserStateSignal(
+                    signal_type='aggressive_typing',
+                    strength=intensity,
+                    confidence=0.6,
+                    source='audio',
+                    metadata={'intensity': intensity}
+                ))
+        
+        return signals
+    
+    def _decide_intervention_level(self, user_state: UserState, 
+                                 situation: SituationAssessment,
+                                 state_confidence: float) -> InterventionLevel:
+        """Decide the appropriate intervention level"""
+        
+        # Critical situations always require immediate action
+        if situation.situation_type in [SituationType.CRITICAL_ERROR, SituationType.SECURITY_CONCERN]:
+            if situation.severity > 0.8:
+                return InterventionLevel.AUTONOMOUS_ACTION
+            else:
+                return InterventionLevel.PROACTIVE_ASSISTANCE
+        
+        # High criticality situations
+        if situation.time_criticality > 0.8:
+            if user_state in [UserState.FOCUSED, UserState.ENGAGED]:
+                return InterventionLevel.SUBTLE_INDICATION
+            else:
+                return InterventionLevel.DIRECT_RECOMMENDATION
+        
+        # Consider user state
+        if user_state in [UserState.FRUSTRATED, UserState.OVERWHELMED]:
+            if situation.severity > 0.6:
+                return InterventionLevel.PROACTIVE_ASSISTANCE
+            else:
+                return InterventionLevel.GENTLE_SUGGESTION
+        
+        elif user_state == UserState.CONFUSED:
+            if situation.solution_availability > 0.7:
+                return InterventionLevel.DIRECT_RECOMMENDATION
+            else:
+                return InterventionLevel.GENTLE_SUGGESTION
+        
+        elif user_state in [UserState.FOCUSED, UserState.ENGAGED]:
+            # Be more careful about interrupting focused users
+            if situation.severity > 0.7:
+                return InterventionLevel.SUBTLE_INDICATION
+            else:
+                return InterventionLevel.SILENT_MONITORING
+        
+        # Default based on situation severity
+        if situation.severity > 0.7:
+            return InterventionLevel.DIRECT_RECOMMENDATION
+        elif situation.severity > 0.4:
+            return InterventionLevel.GENTLE_SUGGESTION
+        else:
+            return InterventionLevel.SUBTLE_INDICATION
+    
+    def _generate_intervention_content(self, decision: InterventionDecision) -> Dict[str, Any]:
+        """Generate content for the intervention"""
+        
+        content = {}
+        
+        # Base content on intervention level
+        if decision.intervention_level == InterventionLevel.SUBTLE_INDICATION:
+            content = {
+                'type': 'visual_indicator',
+                'message': None,
+                'action': 'show_indicator',
+                'duration': 5000  # 5 seconds
+            }
+        
+        elif decision.intervention_level == InterventionLevel.GENTLE_SUGGESTION:
+            content = {
+                'type': 'suggestion',
+                'message': self._generate_suggestion_message(decision),
+                'action': 'show_notification',
+                'dismissible': True
+            }
+        
+        elif decision.intervention_level == InterventionLevel.DIRECT_RECOMMENDATION:
+            content = {
+                'type': 'recommendation',
+                'message': self._generate_recommendation_message(decision),
+                'action': 'show_dialog',
+                'options': ['Accept', 'Dismiss', 'Remind Later']
+            }
+        
+        elif decision.intervention_level == InterventionLevel.PROACTIVE_ASSISTANCE:
+            content = {
+                'type': 'assistance',
+                'message': self._generate_assistance_message(decision),
+                'action': 'offer_help',
+                'assistance_options': self._generate_assistance_options(decision)
+            }
+        
+        elif decision.intervention_level == InterventionLevel.AUTONOMOUS_ACTION:
+            content = {
+                'type': 'autonomous_action',
+                'message': self._generate_action_message(decision),
+                'action': 'execute_action',
+                'action_details': self._generate_action_details(decision),
+                'confirm_before_action': decision.situation.severity < 0.9
+            }
+        
+        return content
+    
+    def _generate_suggestion_message(self, decision: InterventionDecision) -> str:
+        """Generate suggestion message"""
+        
+        situation_type = decision.situation.situation_type
+        
+        messages = {
+            SituationType.WORKFLOW_BLOCKED: "It looks like you might be stuck. Would you like some help?",
+            SituationType.EFFICIENCY_OPPORTUNITY: "I noticed you're doing this repeatedly. Want me to help automate it?",
+            SituationType.LEARNING_MOMENT: "I can help explain this concept if you'd like.",
+            SituationType.HEALTH_REMINDER: "You've been working for a while. Consider taking a short break.",
+            SituationType.TIME_MANAGEMENT: "Your deadline is approaching. Want me to help prioritize?"
+        }
+        
+        return messages.get(situation_type, "I'm here if you need any assistance.")
+    
+    def _generate_recommendation_message(self, decision: InterventionDecision) -> str:
+        """Generate recommendation message"""
+        
+        situation_type = decision.situation.situation_type
+        
+        messages = {
+            SituationType.WORKFLOW_BLOCKED: "I recommend trying a different approach to this task.",
+            SituationType.EFFICIENCY_OPPORTUNITY: "I can create an automation for this repetitive task.",
+            SituationType.LEARNING_MOMENT: "Let me show you a more efficient way to do this.",
+            SituationType.HEALTH_REMINDER: "I recommend taking a 10-minute break to maintain productivity.",
+            SituationType.TIME_MANAGEMENT: "I suggest focusing on your highest priority task first."
+        }
+        
+        return messages.get(situation_type, "I have a recommendation that might help.")
+    
+    def _generate_assistance_message(self, decision: InterventionDecision) -> str:
+        """Generate assistance message"""
+        
+        return f"I'm ready to help with your {decision.situation.situation_type.value.replace('_', ' ')} situation."
+    
+    def _generate_action_message(self, decision: InterventionDecision) -> str:
+        """Generate autonomous action message"""
+        
+        return f"Taking immediate action to address {decision.situation.situation_type.value.replace('_', ' ')}."
+    
+    def _generate_assistance_options(self, decision: InterventionDecision) -> List[str]:
+        """Generate assistance options"""
+        
+        situation_type = decision.situation.situation_type
+        
+        options = {
+            SituationType.WORKFLOW_BLOCKED: [
+                "Show me alternative approaches",
+                "Find relevant documentation",
+                "Connect with expert help"
+            ],
+            SituationType.LEARNING_MOMENT: [
+                "Explain the concept",
+                "Show examples",
+                "Provide practice exercises"
+            ],
+            SituationType.EFFICIENCY_OPPORTUNITY: [
+                "Create automation",
+                "Suggest keyboard shortcuts",
+                "Recommend tools"
+            ]
+        }
+        
+        return options.get(situation_type, ["Provide guidance", "Show resources"])
+    
+    def _generate_action_details(self, decision: InterventionDecision) -> Dict[str, Any]:
+        """Generate details for autonomous actions"""
+        
+        situation_type = decision.situation.situation_type
+        
+        if situation_type == SituationType.CRITICAL_ERROR:
+            return {
+                'action_type': 'error_recovery',
+                'steps': ['Save current work', 'Restart application', 'Restore session']
+            }
+        
+        elif situation_type == SituationType.SECURITY_CONCERN:
+            return {
+                'action_type': 'security_response',
+                'steps': ['Block unsafe action', 'Secure sensitive data', 'Notify user']
+            }
+        
+        return {'action_type': 'general_assistance', 'steps': ['Analyze situation', 'Propose solution']}
+    
+    def _generate_reasoning(self, decision: InterventionDecision) -> str:
+        """Generate reasoning for the decision"""
+        
+        reasoning_parts = []
+        
+        # User state reasoning
+        reasoning_parts.append(f"User appears to be {decision.user_state.value}")
+        
+        # Situation reasoning
+        situation = decision.situation
+        reasoning_parts.append(
+            f"Detected {situation.situation_type.value.replace('_', ' ')} "
+            f"(severity: {situation.severity:.1f}, criticality: {situation.time_criticality:.1f})"
+        )
+        
+        # Intervention level reasoning
+        reasoning_parts.append(f"Chose {decision.intervention_level.value.replace('_', ' ')}")
+        
+        # Timing reasoning
+        if decision.timing_delay.total_seconds() > 0:
+            reasoning_parts.append(f"Delaying intervention by {decision.timing_delay}")
+        
+        # Effectiveness reasoning
+        reasoning_parts.append(f"Expected effectiveness: {decision.expected_effectiveness:.1%}")
+        
+        return ". ".join(reasoning_parts) + "."
+    
+    async def execute_intervention(self, decision: InterventionDecision) -> Dict[str, Any]:
+        """Execute an intervention decision"""
+        
+        # Wait for optimal timing
+        if decision.timing_delay.total_seconds() > 0:
+            await asyncio.sleep(decision.timing_delay.total_seconds())
+        
+        # Execute based on intervention level
+        result = {
+            'executed_at': datetime.now().isoformat(),
+            'success': False,
+            'user_response': None,
+            'effectiveness_score': 0.0
+        }
+        
+        try:
+            if decision.intervention_level == InterventionLevel.SILENT_MONITORING:
+                result = await self._execute_silent_monitoring(decision)
+            elif decision.intervention_level == InterventionLevel.SUBTLE_INDICATION:
+                result = await self._execute_subtle_indication(decision)
+            elif decision.intervention_level == InterventionLevel.GENTLE_SUGGESTION:
+                result = await self._execute_gentle_suggestion(decision)
+            elif decision.intervention_level == InterventionLevel.DIRECT_RECOMMENDATION:
+                result = await self._execute_direct_recommendation(decision)
+            elif decision.intervention_level == InterventionLevel.PROACTIVE_ASSISTANCE:
+                result = await self._execute_proactive_assistance(decision)
+            elif decision.intervention_level == InterventionLevel.AUTONOMOUS_ACTION:
+                result = await self._execute_autonomous_action(decision)
+            
+            # Record outcome for learning
+            self.effectiveness_learner.record_intervention_outcome(
+                decision=decision,
+                user_response=result.get('user_response', 'unknown'),
+                success=result.get('success', False),
+                effectiveness_score=result.get('effectiveness_score', 0.0)
+            )
+            
+            # Update success metrics
+            if result.get('success'):
+                self.metrics['successful_interventions'] += 1
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error executing intervention: {e}")
+            result['error'] = str(e)
+            return result
+    
+    async def _execute_silent_monitoring(self, decision: InterventionDecision) -> Dict[str, Any]:
+        """Execute silent monitoring - no user-visible action"""
+        
+        # Just record the situation for learning
+        return {
+            'success': True,
+            'user_response': 'monitored',
+            'effectiveness_score': 0.5  # Neutral - no intervention
+        }
+    
+    async def _execute_subtle_indication(self, decision: InterventionDecision) -> Dict[str, Any]:
+        """Execute subtle indication - minimal visual cue"""
+        
+        # This would integrate with the UI to show a subtle indicator
+        logger.info(f"Showing subtle indication: {decision.reasoning}")
+        
+        return {
+            'success': True,
+            'user_response': 'indicated',
+            'effectiveness_score': 0.6
+        }
+    
+    async def _execute_gentle_suggestion(self, decision: InterventionDecision) -> Dict[str, Any]:
+        """Execute gentle suggestion"""
+        
+        message = decision.intervention_content.get('message', '')
+        logger.info(f"Gentle suggestion: {message}")
+        
+        # This would show a dismissible notification
+        return {
+            'success': True,
+            'user_response': 'suggested',
+            'effectiveness_score': 0.7
+        }
+    
+    async def _execute_direct_recommendation(self, decision: InterventionDecision) -> Dict[str, Any]:
+        """Execute direct recommendation"""
+        
+        message = decision.intervention_content.get('message', '')
+        logger.info(f"Direct recommendation: {message}")
+        
+        # This would show a dialog with options
+        return {
+            'success': True,
+            'user_response': 'recommended',
+            'effectiveness_score': 0.8
+        }
+    
+    async def _execute_proactive_assistance(self, decision: InterventionDecision) -> Dict[str, Any]:
+        """Execute proactive assistance"""
+        
+        message = decision.intervention_content.get('message', '')
+        options = decision.intervention_content.get('assistance_options', [])
+        
+        logger.info(f"Proactive assistance: {message}")
+        logger.info(f"Options: {', '.join(options)}")
+        
+        return {
+            'success': True,
+            'user_response': 'assisted',
+            'effectiveness_score': 0.9
+        }
+    
+    async def _execute_autonomous_action(self, decision: InterventionDecision) -> Dict[str, Any]:
+        """Execute autonomous action"""
+        
+        action_details = decision.intervention_content.get('action_details', {})
+        confirm_first = decision.intervention_content.get('confirm_before_action', True)
+        
+        logger.info(f"Autonomous action: {action_details}")
+        
+        if confirm_first:
+            # Would show confirmation dialog in real implementation
+            logger.info("Would confirm action with user first")
+        
+        return {
+            'success': True,
+            'user_response': 'autonomous',
+            'effectiveness_score': 0.95
+        }
+    
+    def get_performance_metrics(self) -> Dict[str, Any]:
+        """Get performance metrics"""
+        
+        success_rate = 0.0
+        if self.metrics['decisions_made'] > 0:
+            success_rate = self.metrics['successful_interventions'] / self.metrics['decisions_made']
+        
+        return {
+            **self.metrics,
+            'success_rate': success_rate,
+            'memory_usage': self._get_memory_usage(),
+            'active_interventions': len(self.active_interventions)
+        }
+    
+    def _get_memory_usage(self) -> Dict[str, float]:
+        """Get current memory usage"""
+        
+        import sys
+        
+        # Estimate memory usage (simplified)
+        return {
+            'user_state_evaluator_mb': sys.getsizeof(self.user_state_evaluator) / (1024 * 1024),
+            'situation_analyzer_mb': sys.getsizeof(self.situation_analyzer) / (1024 * 1024),
+            'effectiveness_learner_mb': sys.getsizeof(self.effectiveness_learner) / (1024 * 1024),
+            'total_estimated_mb': (
+                sys.getsizeof(self.user_state_evaluator) + 
+                sys.getsizeof(self.situation_analyzer) +
+                sys.getsizeof(self.effectiveness_learner)
+            ) / (1024 * 1024)
+        }
+    
+    def save_learned_data(self):
+        """Save all learned data to disk"""
+        
+        try:
+            self.user_state_evaluator.save_patterns()
+            
+            # Save timing patterns
+            timing_file = Path("backend/data/timing_patterns.json")
+            timing_file.parent.mkdir(parents=True, exist_ok=True)
+            
+            timing_data = {
+                'patterns': self.timing_optimizer.timing_patterns,
+                'interruption_costs': self.timing_optimizer.interruption_costs,
+                'last_updated': datetime.now().isoformat()
+            }
+            
+            with open(timing_file, 'w') as f:
+                json.dump(timing_data, f, indent=2)
+            
+            # Save effectiveness models
+            effectiveness_file = Path("backend/data/effectiveness_models.json")
+            effectiveness_data = {
+                'models': self.effectiveness_learner.effectiveness_models,
+                'last_updated': datetime.now().isoformat()
+            }
+            
+            with open(effectiveness_file, 'w') as f:
+                json.dump(effectiveness_data, f, indent=2)
+            
+            logger.info("Intervention decision engine data saved successfully")
+            
+        except Exception as e:
+            logger.error(f"Failed to save learned data: {e}")
+
+# Global instance for easy access
+_intervention_engine_instance = None
+
+def get_intervention_engine() -> InterventionDecisionEngine:
+    """Get or create intervention engine instance"""
+    global _intervention_engine_instance
+    if _intervention_engine_instance is None:
+        _intervention_engine_instance = InterventionDecisionEngine()
+    return _intervention_engine_instance
+
+async def test_intervention_engine():
+    """Test the intervention decision engine"""
+    
+    print("🚀 Testing Intervention Decision Engine")
+    print("=" * 50)
+    
+    engine = get_intervention_engine()
+    
+    # Test case 1: Frustrated user with workflow blockage
+    context1 = {
+        'vision_data': {
+            'screen_activity': {
+                'rapid_interactions': 15,
+                'idle_time': 120
+            }
+        },
+        'user_behavior': {
+            'task_switches': 8,
+            'time_on_task': 900,  # 15 minutes
+            'recent_errors': 3
+        },
+        'system_interactions': {
+            'help_searches': 2,
+            'undo_redo_count': 7
+        }
+    }
+    
+    decision1 = await engine.evaluate_intervention_need(context1)
+    if decision1:
+        print(f"\n📋 Test Case 1: Workflow Blockage")
+        print(f"   User State: {decision1.user_state.value}")
+        print(f"   Situation: {decision1.situation.situation_type.value}")
+        print(f"   Intervention: {decision1.intervention_level.value}")
+        print(f"   Confidence: {decision1.confidence:.2%}")
+        print(f"   Expected Effectiveness: {decision1.expected_effectiveness:.2%}")
+        print(f"   Timing Delay: {decision1.timing_delay}")
+        print(f"   Reasoning: {decision1.reasoning}")
+        
+        # Execute the intervention
+        result = await engine.execute_intervention(decision1)
+        print(f"   Execution Result: {result['success']}")
+    
+    # Test case 2: Critical security situation
+    context2 = {
+        'system_interactions': {
+            'unsafe_action': True
+        },
+        'vision_data': {
+            'screen_activity': {
+                'idle_time': 30
+            }
+        }
+    }
+    
+    decision2 = await engine.evaluate_intervention_need(context2)
+    if decision2:
+        print(f"\n🔒 Test Case 2: Security Concern")
+        print(f"   User State: {decision2.user_state.value}")
+        print(f"   Situation: {decision2.situation.situation_type.value}")
+        print(f"   Intervention: {decision2.intervention_level.value}")
+        print(f"   Severity: {decision2.situation.severity:.1f}")
+        print(f"   Time Criticality: {decision2.situation.time_criticality:.1f}")
+    
+    # Test case 3: Focused user with low-priority situation
+    context3 = {
+        'user_behavior': {
+            'time_on_task': 2400,  # 40 minutes - focused
+            'task_switches': 1,
+            'recent_errors': 0
+        },
+        'system_interactions': {
+            'help_searches': 0
+        }
+    }
+    
+    decision3 = await engine.evaluate_intervention_need(context3)
+    if decision3:
+        print(f"\n🎯 Test Case 3: Focused User")
+        print(f"   User State: {decision3.user_state.value}")
+        print(f"   Intervention: {decision3.intervention_level.value}")
+    else:
+        print(f"\n🎯 Test Case 3: No intervention needed (user focused)")
+    
+    # Show performance metrics
+    metrics = engine.get_performance_metrics()
+    print(f"\n📊 Performance Metrics:")
+    print(f"   Decisions Made: {metrics['decisions_made']}")
+    print(f"   Success Rate: {metrics['success_rate']:.1%}")
+    print(f"   Average Response Time: {metrics['average_response_time']:.3f}s")
+    print(f"   Estimated Memory Usage: {metrics['memory_usage']['total_estimated_mb']:.1f}MB")
+
+if __name__ == "__main__":
+    asyncio.run(test_intervention_engine())

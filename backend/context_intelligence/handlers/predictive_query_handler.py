@@ -1,60 +1,38 @@
 """
-Predictive Query Handler v2.0 - INTELLIGENT PREDICTIONS WITH MONITORING DATA
-==============================================================================
+Predictive Query Handler for JARVIS
+====================================
 
-High-level handler for predictive/analytical queries with ML-powered insights.
+High-level handler for predictive/analytical queries that integrates:
+- Predictive Analyzer for metrics and insights
+- Claude Vision for semantic code analysis
+- Context Graph for workspace awareness
+- Screen capture for visual analysis
 
-This module provides intelligent query handling for developer productivity analysis,
-combining monitoring data, natural language processing, and computer vision to deliver
-actionable insights about code progress, potential bugs, and workflow optimization.
-
-**FULLY IMPLEMENTED v2.0 Features**:
-✅ "Am I making progress?" - Analyzes builds, errors, changes from HybridMonitoring
-✅ Auto-bug detection - Pattern matching on error history with confidence scores
-✅ "What should I work on next?" - Priority-based suggestions from workflow analysis
-✅ Workspace change tracking - Productivity scoring with space-level breakdowns
-✅ Context-aware queries - Natural language via ImplicitReferenceResolver
-✅ Real-time progress scoring - Evidence-based (builds vs errors ratio)
-✅ Predictive bug alerts - Error frequency + type classification + recommendations
-✅ Dynamic, async, NO HARDCODING - All data from real monitoring events
-
-**Real Integration (Not Mock)**:
-- HybridProactiveMonitoringManager._alert_history - Real monitoring alerts
-- HybridProactiveMonitoringManager._pattern_rules - Learned ML patterns
-- ImplicitReferenceResolver.parse_query() - Natural language understanding
-- PredictiveAnalyzer: Metrics and insights
-- Claude Vision: Semantic code analysis
-
-**Example Queries** (v2.0 powered with REAL data):
-- "Am I making progress?" → Score: 0.75, Evidence: [3 builds, 2 errors fixed], Recommendation: "Keep up good work"
-- "What should I work on next?" → Priority: HIGH, Action: "Fix 5 errors in Space 3", Confidence: 0.9
-- "Are there any potential bugs?" → TypeError pattern (occurred 4x), Confidence: 0.7, Rec: "Add type hints"
-- "What's my workspace activity?" → 25 changes, Productivity: 0.72, Pattern: "High activity in Space 3"
-
-**Implementation Details**:
-- analyze_progress_from_monitoring(): Real alert analysis with build/error ratio
-- predict_bugs_from_patterns(): Counter-based pattern detection with error type extraction
-- suggest_next_steps_from_workflow(): Priority-ordered suggestions from recent alerts
-- track_workspace_changes(): Space-level activity tracking with productivity scoring
+Handles queries like:
+- "Am I making progress?"
+- "What should I work on next?"
+- "Are there any potential bugs?"
+- "Explain what this code does"
 
 Author: Derek Russell
-Date: 2025-10-19 (v2.0 REAL implementation completed)
+Date: 2025-10-19
 """
 
-import base64
+import asyncio
 import logging
-from collections import Counter, defaultdict
-from dataclasses import dataclass, field
+import base64
+from typing import Dict, List, Optional, Any
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
 
-from context_intelligence.analyzers.predictive_analyzer import (
-    AnalysisScope,
+from backend.context_intelligence.analyzers.predictive_analyzer import (
+    PredictiveAnalyzer,
     AnalyticsResult,
     PredictiveQueryType,
+    AnalysisScope,
     get_predictive_analyzer,
-    initialize_predictive_analyzer,
+    initialize_predictive_analyzer
 )
 
 logger = logging.getLogger(__name__)
@@ -64,85 +42,52 @@ logger = logging.getLogger(__name__)
 # CLAUDE VISION INTEGRATION
 # ============================================================================
 
-
 class ClaudeVisionAnalyzer:
     """
-    Integrates Claude Vision API for semantic code analysis with intelligent model selection.
+    Integrates Claude Vision API for semantic code analysis
 
     Uses Claude to analyze:
     - Code screenshots for understanding
     - Terminal output for error analysis
     - IDE views for context understanding
-
-    Attributes:
-        api_key: Optional Claude API key for authentication
-        use_intelligent_selection: Whether to use intelligent model selection
-        _claude_available: Whether Claude API is available
     """
 
-    def __init__(self, api_key: Optional[str] = None, use_intelligent_selection: bool = True):
-        """
-        Initialize Claude Vision analyzer with intelligent model selection.
-
-        Args:
-            api_key: Optional Claude API key for authentication
-            use_intelligent_selection: Whether to use HybridOrchestrator for model selection
-        """
+    def __init__(self, api_key: Optional[str] = None):
+        """Initialize Claude Vision analyzer"""
         self.api_key = api_key
-        self.use_intelligent_selection = use_intelligent_selection
         self._claude_available = self._check_claude_availability()
 
     def _check_claude_availability(self) -> bool:
-        """
-        Check if Claude API is available.
-
-        Returns:
-            True if Claude API library is available, False otherwise
-        """
+        """Check if Claude API is available"""
         try:
-            pass
-
+            import anthropic
             return True
         except ImportError:
-            logger.warning(
-                "[CLAUDE-VISION] Anthropic library not available - install with: pip install anthropic"
-            )
+            logger.warning("[CLAUDE-VISION] Anthropic library not available - install with: pip install anthropic")
             return False
 
     async def analyze_code_screenshot(
-        self, image_path: str, query: str, context: Optional[Dict[str, Any]] = None
+        self,
+        image_path: str,
+        query: str,
+        context: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
-        Analyze a code screenshot using Claude Vision.
+        Analyze a code screenshot using Claude Vision
 
         Args:
-            image_path: Path to screenshot image file
+            image_path: Path to screenshot
             query: What to analyze (e.g., "explain this code", "find bugs")
-            context: Additional context information (space_id, app_name, etc.)
+            context: Additional context
 
         Returns:
-            Analysis result dictionary with keys:
-            - success: Whether analysis succeeded
-            - analysis: Analysis text from Claude
-            - model: Model used for analysis
-            - timestamp: When analysis was performed
-            - error: Error message if failed
-
-        Example:
-            >>> analyzer = ClaudeVisionAnalyzer()
-            >>> result = await analyzer.analyze_code_screenshot(
-            ...     "/path/to/code.png", 
-            ...     "explain this function",
-            ...     {"space_id": 1}
-            ... )
-            >>> print(result["analysis"])
-            This function implements a binary search algorithm...
+            Analysis result with insights
         """
         if not self._claude_available:
             return {
                 "success": False,
                 "error": "Claude API not available",
-                "message": "Install anthropic library for Claude Vision support",
+                "message": "Install anthropic library for Claude Vision support"
             }
 
         try:
@@ -159,7 +104,7 @@ class ClaudeVisionAnalyzer:
                 ".jpg": "image/jpeg",
                 ".jpeg": "image/jpeg",
                 ".webp": "image/webp",
-                ".gif": "image/gif",
+                ".gif": "image/gif"
             }.get(suffix, "image/png")
 
             # Create Claude client
@@ -168,49 +113,8 @@ class ClaudeVisionAnalyzer:
             # Build prompt based on query type
             prompt = self._build_vision_prompt(query, context)
 
-            # Try intelligent model selection first
-            if self.use_intelligent_selection:
-                try:
-                    from backend.core.hybrid_orchestrator import HybridOrchestrator
-
-                    orchestrator = HybridOrchestrator()
-                    if not orchestrator.is_running:
-                        await orchestrator.start()
-
-                    # Execute with intelligent selection for vision
-                    result = await orchestrator.execute_with_intelligent_model_selection(
-                        query=prompt,
-                        intent="vision_analysis",
-                        required_capabilities={"vision", "vision_analyze_heavy", "multimodal"},
-                        context={
-                            "image_data": image_data,
-                            "image_format": "base64",
-                            **(context or {}),
-                        },
-                        max_tokens=2048,
-                        temperature=0.7,
-                    )
-
-                    if result.get("success"):
-                        analysis_text = result.get("text", "").strip()
-                        model_used = result.get("model_used", "unknown")
-                        logger.info(
-                            f"[CLAUDE-VISION] Analysis complete using {model_used}, {len(analysis_text)} chars"
-                        )
-
-                        return {
-                            "success": True,
-                            "analysis": analysis_text,
-                            "model": model_used,
-                            "timestamp": datetime.now().isoformat(),
-                        }
-                except Exception as e:
-                    logger.warning(
-                        f"[CLAUDE-VISION] Intelligent selection failed, falling back to direct API: {e}"
-                    )
-
-            # Fallback: Direct Claude Vision API
-            logger.info(f"[CLAUDE-VISION] Analyzing screenshot with direct API: {image_path}")
+            # Call Claude Vision API
+            logger.info(f"[CLAUDE-VISION] Analyzing screenshot: {image_path}")
 
             response = client.messages.create(
                 model="claude-3-5-sonnet-20241022",
@@ -224,44 +128,39 @@ class ClaudeVisionAnalyzer:
                                 "source": {
                                     "type": "base64",
                                     "media_type": media_type,
-                                    "data": image_data,
-                                },
+                                    "data": image_data
+                                }
                             },
-                            {"type": "text", "text": prompt},
-                        ],
+                            {
+                                "type": "text",
+                                "text": prompt
+                            }
+                        ]
                     }
-                ],
+                ]
             )
 
             # Extract response
             analysis_text = response.content[0].text
 
-            logger.info(
-                f"[CLAUDE-VISION] Analysis complete (direct API), {len(analysis_text)} chars"
-            )
+            logger.info(f"[CLAUDE-VISION] Analysis complete, {len(analysis_text)} chars")
 
             return {
                 "success": True,
                 "analysis": analysis_text,
                 "model": "claude-3-5-sonnet-20241022",
-                "timestamp": datetime.now().isoformat(),
+                "timestamp": datetime.now().isoformat()
             }
 
         except Exception as e:
             logger.error(f"[CLAUDE-VISION] Error analyzing screenshot: {e}")
-            return {"success": False, "error": str(e)}
+            return {
+                "success": False,
+                "error": str(e)
+            }
 
     def _build_vision_prompt(self, query: str, context: Optional[Dict[str, Any]]) -> str:
-        """
-        Build a prompt for Claude Vision based on query type.
-
-        Args:
-            query: User's query about the image
-            context: Additional context (space_id, app_name, etc.)
-
-        Returns:
-            Formatted prompt string for Claude Vision
-        """
+        """Build a prompt for Claude Vision based on query type"""
         base_prompt = "You are analyzing a screenshot from a developer's workspace.\n\n"
 
         # Add context if available
@@ -310,42 +209,373 @@ class ClaudeVisionAnalyzer:
         return base_prompt
 
     async def analyze_terminal_output(
-        self, terminal_text: str, query: str = "analyze this terminal output"
+        self,
+        terminal_text: str,
+        query: str = "analyze this terminal output"
     ) -> Dict[str, Any]:
         """
-        Analyze terminal output using Claude (text mode).
+        Analyze terminal output using Claude (text mode)
 
         Args:
-            terminal_text: Terminal output text to analyze
-            query: What to analyze about the terminal output
+            terminal_text: Terminal output text
+            query: What to analyze
 
         Returns:
-            Analysis result dictionary with keys:
-            - success: Whether analysis succeeded
-            - analysis: Analysis text from Claude
-            - model: Model used (if available)
-            - timestamp: When analysis was performed
-            - error: Error message if failed
-
-        Example:
-            >>> analyzer = ClaudeVisionAnalyzer()
-            >>> result = await analyzer.analyze_terminal_output(
-            ...     "Error: ModuleNotFoundError: No module named 'requests'",
-            ...     "What's wrong and how to fix it?"
-            ... )
-            >>> print(result["analysis"])
-            The error indicates a missing Python module...
+            Analysis result
         """
         if not self._claude_available:
-            return {"success": False, "error": "Claude API not available"}
+            return {
+                "success": False,
+                "error": "Claude API not available"
+            }
 
         try:
             import anthropic
 
+            client = anthropic.Anthropic(api_key=self.api_key)
 
-            prompt = """Analyze this terminal output"""
-            return None
+            prompt = f"""Analyze this terminal output:
+
+```
+{terminal_text}
+```
+
+{query}
+
+Provide:
+1. What happened (summary)
+2. Any errors or warnings
+3. Recommended actions (if applicable)
+
+Be concise and actionable."""
+
+            response = client.messages.create(
+                model="claude-3-5-sonnet-20241022",
+                max_tokens=1024,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ]
+            )
+
+            analysis_text = response.content[0].text
+
+            return {
+                "success": True,
+                "analysis": analysis_text,
+                "timestamp": datetime.now().isoformat()
+            }
+
         except Exception as e:
+            logger.error(f"[CLAUDE-VISION] Error analyzing terminal: {e}")
+            return {
+                "success": False,
+                "error": str(e)
+            }
+
+
+# ============================================================================
+# MAIN PREDICTIVE QUERY HANDLER
+# ============================================================================
+
+@dataclass
+class PredictiveQueryRequest:
+    """Request for predictive query"""
+    query: str
+    space_id: Optional[int] = None
+    capture_screen: bool = False
+    use_vision: bool = False
+    repo_path: Optional[str] = None
+    additional_context: Dict[str, Any] = None
+
+
+@dataclass
+class PredictiveQueryResponse:
+    """Response from predictive query"""
+    success: bool
+    query: str
+    response_text: str
+    analytics: Optional[AnalyticsResult] = None
+    vision_analysis: Optional[Dict[str, Any]] = None
+    confidence: float = 0.0
+    timestamp: datetime = None
+    metadata: Dict[str, Any] = None
+
+    def __post_init__(self):
+        if self.timestamp is None:
+            self.timestamp = datetime.now()
+        if self.metadata is None:
+            self.metadata = {}
+
+
+class PredictiveQueryHandler:
+    """
+    High-level handler for predictive/analytical queries
+
+    Coordinates:
+    - Predictive Analyzer for metrics/insights
+    - Claude Vision for semantic analysis
+    - Context Graph for workspace awareness
+    - Screen capture for visual analysis
+    """
+
+    def __init__(
+        self,
+        context_graph=None,
+        claude_api_key: Optional[str] = None,
+        enable_vision: bool = True
+    ):
+        """Initialize the predictive query handler"""
+        self.context_graph = context_graph
+
+        # Initialize predictive analyzer
+        self.analyzer = get_predictive_analyzer()
+        if not self.analyzer:
+            self.analyzer = initialize_predictive_analyzer(context_graph)
+
+        # Initialize Claude Vision
+        self.vision_analyzer = None
+        if enable_vision:
+            self.vision_analyzer = ClaudeVisionAnalyzer(api_key=claude_api_key)
+
+        logger.info("[PREDICTIVE-HANDLER] Initialized")
+
+    async def handle_query(self, request: PredictiveQueryRequest) -> PredictiveQueryResponse:
+        """
+        Handle a predictive/analytical query
+
+        Args:
+            request: Query request
+
+        Returns:
+            Query response with analysis
+        """
+        logger.info(f"[PREDICTIVE-HANDLER] Handling query: '{request.query}'")
+
+        try:
+            # Build context
+            context = await self._build_context(request)
+
+            # Run predictive analysis
+            analytics = await self.analyzer.analyze(
+                query=request.query,
+                scope=AnalysisScope.CURRENT_SPACE if request.space_id else AnalysisScope.ALL_SPACES,
+                context=context
+            )
+
+            # Run vision analysis if requested
+            vision_analysis = None
+            if request.use_vision and self.vision_analyzer:
+                vision_analysis = await self._run_vision_analysis(request, analytics, context)
+
+            # Combine results
+            response_text = await self._combine_results(analytics, vision_analysis, request)
+
+            # Calculate overall confidence
+            confidence = analytics.confidence
+            if vision_analysis and vision_analysis.get("success"):
+                confidence = (confidence + 0.9) / 2  # Average with high vision confidence
+
+            return PredictiveQueryResponse(
+                success=True,
+                query=request.query,
+                response_text=response_text,
+                analytics=analytics,
+                vision_analysis=vision_analysis,
+                confidence=confidence,
+                metadata={
+                    "space_id": request.space_id,
+                    "used_vision": vision_analysis is not None,
+                    "query_type": analytics.query_type.value
+                }
+            )
+
+        except Exception as e:
+            logger.error(f"[PREDICTIVE-HANDLER] Error handling query: {e}", exc_info=True)
+            return PredictiveQueryResponse(
+                success=False,
+                query=request.query,
+                response_text=f"Error processing query: {str(e)}",
+                confidence=0.0
+            )
+
+    async def _build_context(self, request: PredictiveQueryRequest) -> Dict[str, Any]:
+        """Build context for analysis"""
+        context = request.additional_context or {}
+
+        # Add space ID
+        if request.space_id:
+            context["space_id"] = request.space_id
+
+        # Add repo path
+        if request.repo_path:
+            context["repo_path"] = request.repo_path
+        elif not context.get("repo_path"):
+            context["repo_path"] = "."  # Default to cwd
+
+        # Add workspace info from context graph if available
+        if self.context_graph and request.space_id:
+            try:
+                space_info = self.context_graph.get_space_summary(request.space_id)
+                if space_info:
+                    context["workspace"] = space_info
+            except Exception as e:
+                logger.warning(f"[PREDICTIVE-HANDLER] Could not get space info: {e}")
+
+        return context
+
+    async def _run_vision_analysis(
+        self,
+        request: PredictiveQueryRequest,
+        analytics: AnalyticsResult,
+        context: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        """Run Claude Vision analysis if appropriate"""
+        if not self.vision_analyzer:
             return None
 
-# Module truncated - needs restoration from backup
+        # Determine if vision analysis would be helpful
+        needs_vision = analytics.query_type in [
+            PredictiveQueryType.CODE_EXPLANATION,
+            PredictiveQueryType.BUG_DETECTION,
+            PredictiveQueryType.QUALITY_ASSESSMENT,
+            PredictiveQueryType.PATTERN_ANALYSIS
+        ]
+
+        if not needs_vision and not request.capture_screen:
+            logger.debug("[PREDICTIVE-HANDLER] Vision analysis not needed for this query type")
+            return None
+
+        # Get screenshot path
+        screenshot_path = await self._get_screenshot(request.space_id)
+        if not screenshot_path:
+            logger.warning("[PREDICTIVE-HANDLER] No screenshot available for vision analysis")
+            return None
+
+        # Run vision analysis
+        return await self.vision_analyzer.analyze_code_screenshot(
+            image_path=screenshot_path,
+            query=request.query,
+            context=context
+        )
+
+    async def _get_screenshot(self, space_id: Optional[int]) -> Optional[str]:
+        """Get screenshot for analysis"""
+        try:
+            # Try to get from vision system
+            from vision.yabai_space_detector import get_yabai_detector
+
+            yabai = get_yabai_detector()
+            if not yabai.is_available():
+                logger.warning("[PREDICTIVE-HANDLER] Yabai not available for screenshot")
+                return None
+
+            # Use space_id if provided, otherwise current space
+            if space_id:
+                screenshot_path = f"/tmp/jarvis_space_{space_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+            else:
+                screenshot_path = f"/tmp/jarvis_current_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+
+            # Capture screenshot (implementation depends on your vision system)
+            # For now, return None as placeholder
+            logger.info(f"[PREDICTIVE-HANDLER] Screenshot would be captured to: {screenshot_path}")
+            return None  # TODO: Implement actual screenshot capture
+
+        except Exception as e:
+            logger.error(f"[PREDICTIVE-HANDLER] Error capturing screenshot: {e}")
+            return None
+
+    async def _combine_results(
+        self,
+        analytics: AnalyticsResult,
+        vision_analysis: Optional[Dict[str, Any]],
+        request: PredictiveQueryRequest
+    ) -> str:
+        """Combine analytics and vision results into unified response"""
+        response_parts = []
+
+        # Add analytics response
+        if analytics.response_text:
+            response_parts.append(analytics.response_text)
+
+        # Add vision analysis if available
+        if vision_analysis and vision_analysis.get("success"):
+            response_parts.append("\n## 🔍 Visual Analysis\n")
+            response_parts.append(vision_analysis.get("analysis", ""))
+
+        # Combine
+        return "\n".join(response_parts)
+
+    # ========================================================================
+    # CONVENIENCE METHODS
+    # ========================================================================
+
+    async def check_progress(self, space_id: Optional[int] = None, repo_path: str = ".") -> PredictiveQueryResponse:
+        """Convenience method: Check progress"""
+        return await self.handle_query(PredictiveQueryRequest(
+            query="Am I making progress?",
+            space_id=space_id,
+            repo_path=repo_path
+        ))
+
+    async def get_next_steps(self, space_id: Optional[int] = None, repo_path: str = ".") -> PredictiveQueryResponse:
+        """Convenience method: Get next steps"""
+        return await self.handle_query(PredictiveQueryRequest(
+            query="What should I work on next?",
+            space_id=space_id,
+            repo_path=repo_path
+        ))
+
+    async def detect_bugs(self, space_id: Optional[int] = None, use_vision: bool = False) -> PredictiveQueryResponse:
+        """Convenience method: Detect bugs"""
+        return await self.handle_query(PredictiveQueryRequest(
+            query="Are there any potential bugs?",
+            space_id=space_id,
+            use_vision=use_vision,
+            capture_screen=use_vision
+        ))
+
+    async def explain_code(self, space_id: Optional[int] = None, use_vision: bool = True) -> PredictiveQueryResponse:
+        """Convenience method: Explain code"""
+        return await self.handle_query(PredictiveQueryRequest(
+            query="Explain what this code does",
+            space_id=space_id,
+            use_vision=use_vision,
+            capture_screen=use_vision
+        ))
+
+
+# ============================================================================
+# GLOBAL INSTANCE
+# ============================================================================
+
+_global_handler: Optional[PredictiveQueryHandler] = None
+
+
+def get_predictive_handler() -> Optional[PredictiveQueryHandler]:
+    """Get the global predictive query handler"""
+    return _global_handler
+
+
+def initialize_predictive_handler(context_graph=None, **kwargs) -> PredictiveQueryHandler:
+    """Initialize the global predictive query handler"""
+    global _global_handler
+    _global_handler = PredictiveQueryHandler(context_graph, **kwargs)
+    logger.info("[PREDICTIVE-HANDLER] Global instance initialized")
+    return _global_handler
+
+
+# ============================================================================
+# CONVENIENCE FUNCTIONS
+# ============================================================================
+
+async def handle_predictive_query(query: str, **kwargs) -> PredictiveQueryResponse:
+    """Convenience function to handle a predictive query"""
+    handler = get_predictive_handler()
+    if not handler:
+        handler = initialize_predictive_handler()
+
+    request = PredictiveQueryRequest(query=query, **kwargs)
+    return await handler.handle_query(request)

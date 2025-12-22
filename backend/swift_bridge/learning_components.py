@@ -1,24 +1,7 @@
 #!/usr/bin/env python3
 """
-Learning Components for Advanced Command Classification.
-
-This module provides zero-hardcoding learning components for command classification.
-Everything is learned and adaptive, including pattern recognition, user behavior
-analysis, and performance tracking.
-
-The module contains:
-- LearningDatabase: Persistent storage for learned patterns and feedback
-- PatternLearner: Machine learning component for pattern recognition
-- AdvancedContextManager: Context management with learning capabilities
-- UserProfile: User behavior modeling and personalization
-- PerformanceTracker: System performance monitoring and analysis
-
-Example:
-    >>> from learning_components import LearningDatabase, PatternLearner
-    >>> db = LearningDatabase()
-    >>> learner = PatternLearner()
-    >>> features = learner.extract_features("open Chrome", {})
-    >>> similar = db.find_similar_patterns(features)
+Learning Components for Advanced Command Classification
+Zero hardcoding - Everything is learned and adaptive
 """
 
 import sqlite3
@@ -36,28 +19,13 @@ import threading
 
 logger = logging.getLogger(__name__)
 
+
 class LearningDatabase:
     """
-    Database for storing and retrieving learned patterns.
-    
-    Provides persistent storage for command patterns, user corrections,
-    feedback, and performance metrics. Supports similarity search and
-    pattern matching for adaptive learning.
-    
-    Attributes:
-        db_path (str): Path to the SQLite database file
-        conn (sqlite3.Connection): Database connection
-        lock (threading.Lock): Thread safety lock
+    Database for storing and retrieving learned patterns
     """
     
     def __init__(self, db_path: Optional[str] = None):
-        """
-        Initialize the learning database.
-        
-        Args:
-            db_path: Optional path to database file. If None, creates in
-                    ~/.jarvis/learning/command_patterns.db
-        """
         if db_path is None:
             db_dir = Path.home() / ".jarvis" / "learning"
             db_dir.mkdir(parents=True, exist_ok=True)
@@ -70,12 +38,7 @@ class LearningDatabase:
         self._initialize_database()
     
     def _initialize_database(self):
-        """
-        Create database tables if they don't exist.
-        
-        Creates tables for patterns, corrections, feedback, interactions,
-        metrics, intent patterns, and handler mappings.
-        """
+        """Create database tables if they don't exist"""
         
         with self.lock:
             cursor = self.conn.cursor()
@@ -172,23 +135,7 @@ class LearningDatabase:
             self.conn.commit()
     
     def find_similar_patterns(self, features: np.ndarray, threshold: float = 0.3) -> List[Dict[str, Any]]:
-        """
-        Find patterns similar to the given features.
-        
-        Uses cosine similarity to find patterns with similar feature vectors.
-        
-        Args:
-            features: Feature vector to match against
-            threshold: Minimum similarity threshold (0.0 to 1.0)
-            
-        Returns:
-            List of similar patterns with similarity scores, sorted by similarity
-            
-        Example:
-            >>> features = np.array([0.1, 0.5, 0.3])
-            >>> similar = db.find_similar_patterns(features, threshold=0.5)
-            >>> print(f"Found {len(similar)} similar patterns")
-        """
+        """Find patterns similar to the given features"""
         
         with self.lock:
             cursor = self.conn.cursor()
@@ -224,16 +171,7 @@ class LearningDatabase:
             return similar_patterns[:10]  # Return top 10
     
     def _calculate_similarity(self, features1: np.ndarray, features2: np.ndarray) -> float:
-        """
-        Calculate cosine similarity between two feature vectors.
-        
-        Args:
-            features1: First feature vector
-            features2: Second feature vector
-            
-        Returns:
-            Cosine similarity score between 0.0 and 1.0
-        """
+        """Calculate cosine similarity between two feature vectors"""
         
         # Ensure same shape
         min_len = min(len(features1), len(features2))
@@ -251,18 +189,7 @@ class LearningDatabase:
         return max(0.0, min(1.0, similarity))
     
     def get_corrections_for_command(self, command: str) -> List[Dict[str, Any]]:
-        """
-        Get corrections for a specific command.
-        
-        Retrieves user corrections for the given command, including
-        recency weighting for more relevant corrections.
-        
-        Args:
-            command: Command text to find corrections for
-            
-        Returns:
-            List of corrections with confidence and recency scores
-        """
+        """Get corrections for a specific command"""
         
         with self.lock:
             cursor = self.conn.cursor()
@@ -302,16 +229,7 @@ class LearningDatabase:
         user_rating: float,
         context: Dict[str, Any]
     ):
-        """
-        Store a correction from user feedback.
-        
-        Args:
-            command: The command that was corrected
-            original_type: Original classification type
-            correct_type: Correct classification type
-            user_rating: User satisfaction rating (0.0 to 1.0)
-            context: Additional context information
-        """
+        """Store a correction from user feedback"""
         
         with self.lock:
             cursor = self.conn.cursor()
@@ -336,15 +254,7 @@ class LearningDatabase:
             self.conn.commit()
     
     def get_intents_for_type(self, command_type: str) -> List[Dict[str, Any]]:
-        """
-        Get learned intents for a specific command type.
-        
-        Args:
-            command_type: Type of command to get intents for
-            
-        Returns:
-            List of intents with patterns and confidence scores
-        """
+        """Get learned intents for a specific command type"""
         
         with self.lock:
             cursor = self.conn.cursor()
@@ -368,12 +278,7 @@ class LearningDatabase:
             return intents
     
     def get_handler_mapping(self) -> Dict[str, str]:
-        """
-        Get learned handler mappings.
-        
-        Returns:
-            Dictionary mapping command types to handler names
-        """
+        """Get learned handler mappings"""
         
         with self.lock:
             cursor = self.conn.cursor()
@@ -387,13 +292,7 @@ class LearningDatabase:
             return mapping
     
     def store_feedback(self, feedback):
-        """
-        Store user feedback.
-        
-        Args:
-            feedback: Feedback object containing command, classification,
-                     and user rating information
-        """
+        """Store user feedback"""
         
         with self.lock:
             cursor = self.conn.cursor()
@@ -412,13 +311,7 @@ class LearningDatabase:
             self.conn.commit()
     
     def store_interaction(self, interaction_data: Dict[str, Any]):
-        """
-        Store an interaction for learning.
-        
-        Args:
-            interaction_data: Dictionary containing command, classification,
-                            context, and optional response time
-        """
+        """Store an interaction for learning"""
         
         with self.lock:
             cursor = self.conn.cursor()
@@ -451,15 +344,7 @@ class LearningDatabase:
             self.conn.commit()
     
     def get_recent_patterns(self, hours: int = 24) -> List[Dict[str, Any]]:
-        """
-        Get patterns from the last N hours.
-        
-        Args:
-            hours: Number of hours to look back
-            
-        Returns:
-            List of recent patterns with features and metadata
-        """
+        """Get patterns from the last N hours"""
         
         with self.lock:
             cursor = self.conn.cursor()
@@ -485,12 +370,7 @@ class LearningDatabase:
             return patterns
     
     def get_pattern_count(self) -> int:
-        """
-        Get total number of learned patterns.
-        
-        Returns:
-            Total count of patterns in database
-        """
+        """Get total number of learned patterns"""
         
         with self.lock:
             cursor = self.conn.cursor()
@@ -498,15 +378,7 @@ class LearningDatabase:
             return cursor.fetchone()[0]
     
     def get_common_corrections(self, limit: int = 10) -> List[Dict[str, Any]]:
-        """
-        Get most common corrections.
-        
-        Args:
-            limit: Maximum number of corrections to return
-            
-        Returns:
-            List of common corrections with counts
-        """
+        """Get most common corrections"""
         
         with self.lock:
             cursor = self.conn.cursor()
@@ -530,12 +402,7 @@ class LearningDatabase:
             return corrections
     
     def load_all_patterns(self) -> List[Dict[str, Any]]:
-        """
-        Load all patterns for initialization.
-        
-        Returns:
-            List of all patterns sorted by success rate and recency
-        """
+        """Load all patterns for initialization"""
         
         with self.lock:
             cursor = self.conn.cursor()
@@ -561,12 +428,7 @@ class LearningDatabase:
             return patterns
     
     def load_performance_metrics(self) -> List[Dict[str, Any]]:
-        """
-        Load performance metrics history.
-        
-        Returns:
-            List of historical performance metrics
-        """
+        """Load performance metrics history"""
         
         with self.lock:
             cursor = self.conn.cursor()
@@ -590,12 +452,7 @@ class LearningDatabase:
             return metrics
     
     def get_recent_command_types(self) -> Dict[str, float]:
-        """
-        Get frequency of recent command types.
-        
-        Returns:
-            Dictionary mapping command types to their frequencies
-        """
+        """Get frequency of recent command types"""
         
         with self.lock:
             cursor = self.conn.cursor()
@@ -621,15 +478,7 @@ class LearningDatabase:
                 return {}
     
     def get_time_patterns(self) -> Dict[str, Dict[str, Any]]:
-        """
-        Get command type patterns by time of day.
-        
-        Analyzes when different command types are most commonly used.
-        
-        Returns:
-            Dictionary mapping command types to their time patterns,
-            including peak hours and usage counts
-        """
+        """Get command type patterns by time of day"""
         
         with self.lock:
             cursor = self.conn.cursor()
@@ -661,14 +510,7 @@ class LearningDatabase:
             return dict(patterns)
     
     def get_user_state_patterns(self) -> Dict[str, Dict[str, Any]]:
-        """
-        Get command patterns based on user state.
-        
-        Analyzes how user state affects command patterns.
-        
-        Returns:
-            Dictionary mapping command types to user state patterns
-        """
+        """Get command patterns based on user state"""
         
         # This would analyze patterns based on user state from context
         # For now, returning a simplified version
@@ -678,24 +520,13 @@ class LearningDatabase:
             "conversation": {"state": "multitasking", "confidence": 0.6}
         }
 
+
 class PatternLearner:
     """
-    Machine learning component for pattern recognition and learning.
-    
-    Uses TF-IDF vectorization and feature extraction to learn command patterns.
-    Adapts to user behavior and improves classification over time.
-    
-    Attributes:
-        vectorizer (TfidfVectorizer): Text vectorization component
-        patterns (List[Dict]): Learned patterns storage
-        feature_importance (defaultdict): Feature importance weights
-        action_words (set): Learned action words
-        target_words (set): Learned target words
-        learned_entities (defaultdict): Learned entity patterns
+    Machine learning component for pattern recognition and learning
     """
     
     def __init__(self):
-        """Initialize the pattern learner with empty models."""
         self.vectorizer = TfidfVectorizer(
             max_features=100,
             ngram_range=(1, 3),
@@ -711,24 +542,7 @@ class PatternLearner:
         self.vectorizer.fit([""])
     
     def extract_features(self, command: str, context: Dict[str, Any]) -> np.ndarray:
-        """
-        Extract features from command and context.
-        
-        Combines text features (TF-IDF), linguistic features, and context features
-        into a single feature vector for classification.
-        
-        Args:
-            command: Command text to extract features from
-            context: Context information including time, user state, etc.
-            
-        Returns:
-            Combined feature vector as numpy array
-            
-        Example:
-            >>> learner = PatternLearner()
-            >>> features = learner.extract_features("open Chrome", {"time_of_day": datetime.now()})
-            >>> print(f"Feature vector length: {len(features)}")
-        """
+        """Extract features from command and context"""
         
         # Text features
         text_features = self.vectorizer.transform([command]).toarray()[0]
@@ -749,16 +563,7 @@ class PatternLearner:
         return all_features
     
     def _extract_linguistic_features(self, command: str) -> np.ndarray:
-        """
-        Extract linguistic features from command.
-        
-        Args:
-            command: Command text to analyze
-            
-        Returns:
-            Array of linguistic features including token count, punctuation,
-            and learned word patterns
-        """
+        """Extract linguistic features from command"""
         
         tokens = command.lower().split()
         
@@ -776,16 +581,7 @@ class PatternLearner:
         return np.array(features)
     
     def _extract_context_features(self, context: Dict[str, Any]) -> np.ndarray:
-        """
-        Extract features from context.
-        
-        Args:
-            context: Context dictionary with time, user state, and history
-            
-        Returns:
-            Array of context features including time patterns, user state,
-            and session information
-        """
+        """Extract features from context"""
         
         features = []
         
@@ -822,16 +618,7 @@ class PatternLearner:
         return np.array(features)
     
     def learn_from_feedback(self, feedback):
-        """
-        Learn from user feedback.
-        
-        Updates patterns, action/target words, and feature importance
-        based on user corrections.
-        
-        Args:
-            feedback: Feedback object containing command, correct classification,
-                     and user rating
-        """
+        """Learn from user feedback"""
         
         # Extract features from the command
         features = self.extract_features(feedback.command, feedback.context)
@@ -863,13 +650,7 @@ class PatternLearner:
             self._retrain_vectorizer()
     
     def _update_feature_importance(self, features: np.ndarray, correct_type: str):
-        """
-        Update feature importance based on successful classification.
-        
-        Args:
-            features: Feature vector from successful classification
-            correct_type: The correct command type
-        """
+        """Update feature importance based on successful classification"""
         
         # Simple importance tracking
         feature_key = f"{correct_type}_features"
@@ -884,7 +665,7 @@ class PatternLearner:
         )
     
     def _retrain_vectorizer(self):
-        """Retrain the vectorizer with accumulated patterns."""
+        """Retrain the vectorizer with accumulated patterns"""
         
         if self.patterns:
             commands = [p["command"] for p in self.patterns]
@@ -900,17 +681,7 @@ class PatternLearner:
         intent_pattern: str, 
         features: np.ndarray
     ) -> float:
-        """
-        Calculate how well a command matches an intent pattern.
-        
-        Args:
-            command: Command text to match
-            intent_pattern: Pattern to match against
-            features: Feature vector (currently unused)
-            
-        Returns:
-            Match score between 0.0 and 1.0
-        """
+        """Calculate how well a command matches an intent pattern"""
         
         # Simple token overlap for now
         command_tokens = set(command.lower().split())
@@ -923,15 +694,7 @@ class PatternLearner:
         return overlap / len(pattern_tokens)
     
     def extract_action_words(self, tokens: List[str]) -> List[str]:
-        """
-        Extract action words from tokens (learned, not hardcoded).
-        
-        Args:
-            tokens: List of command tokens
-            
-        Returns:
-            List of identified action words
-        """
+        """Extract action words from tokens (learned, not hardcoded)"""
         
         action_words = []
         
@@ -952,15 +715,7 @@ class PatternLearner:
         return action_words
     
     def extract_target_words(self, tokens: List[str]) -> List[str]:
-        """
-        Extract target words from tokens (learned, not hardcoded).
-        
-        Args:
-            tokens: List of command tokens
-            
-        Returns:
-            List of identified target words
-        """
+        """Extract target words from tokens (learned, not hardcoded)"""
         
         target_words = []
         
@@ -979,8 +734,425 @@ class PatternLearner:
         
         return target_words
     
-    def extract_entities(self, text: str) -> List[str]:
-        """Extract entities from text"""
-        return []
+    def extract_entities(self, command: str) -> List[Dict[str, Any]]:
+        """Extract entities from command (learned, not hardcoded)"""
+        
+        entities = []
+        tokens = command.split()
+        
+        # Extract based on learned patterns
+        for i, token in enumerate(tokens):
+            token_lower = token.lower()
+            
+            # Check if it's a learned action
+            if token_lower in self.action_words:
+                entities.append({
+                    "text": token,
+                    "type": "action",
+                    "role": "primary_action",
+                    "confidence": 0.9
+                })
+            
+            # Check if it's a learned target
+            elif token_lower in self.target_words:
+                entities.append({
+                    "text": token,
+                    "type": "application",
+                    "role": "target",
+                    "confidence": 0.8
+                })
+            
+            # Check if it's a capitalized word (potential app/entity)
+            elif token[0].isupper() and i > 0:  # Not first word
+                entities.append({
+                    "text": token,
+                    "type": "application",
+                    "role": "potential_target",
+                    "confidence": 0.6
+                })
+            
+            # Check learned entity patterns
+            for entity_type, patterns in self.learned_entities.items():
+                if token_lower in patterns:
+                    entities.append({
+                        "text": token,
+                        "type": entity_type,
+                        "role": "learned_entity",
+                        "confidence": 0.7
+                    })
+        
+        return entities
+    
+    def get_linguistic_weights(self, features: np.ndarray) -> Dict[str, float]:
+        """Get weights for command types based on linguistic features"""
+        
+        weights = {}
+        
+        # Use learned feature importance
+        for type_key, importance in self.feature_importance.items():
+            if "_features" in type_key:
+                cmd_type = type_key.replace("_features", "")
+                
+                # Calculate weight based on feature similarity
+                if len(features) == len(importance):
+                    similarity = np.dot(features, importance) / (
+                        np.linalg.norm(features) * np.linalg.norm(importance) + 1e-10
+                    )
+                    weights[cmd_type] = max(0, similarity)
+        
+        return weights
+    
+    def update_from_feedback(self, feedback):
+        """Update learner from feedback"""
+        self.learn_from_feedback(feedback)
+    
+    def retrain(self, recent_patterns: List[Dict[str, Any]]):
+        """Retrain with recent patterns"""
+        
+        # Add new patterns
+        for pattern in recent_patterns:
+            self.patterns.append(pattern)
+            
+            # Learn from pattern
+            tokens = pattern["command"].lower().split()
+            if pattern["type"] == "system" and tokens:
+                self.action_words.add(tokens[0])
+                if len(tokens) > 1:
+                    self.target_words.add(tokens[-1])
+        
+        # Limit pattern storage
+        if len(self.patterns) > 10000:
+            # Keep most recent and highest confidence patterns
+            self.patterns.sort(key=lambda x: (x.get("confidence", 0), x.get("timestamp", 0)), reverse=True)
+            self.patterns = self.patterns[:5000]
+        
+        # Retrain vectorizer
+        self._retrain_vectorizer()
+    
+    def get_most_improved(self) -> List[Dict[str, Any]]:
+        """Get classifications that have improved most"""
+        
+        # Track improvement in patterns
+        improvements = []
+        
+        # Group patterns by command
+        command_patterns = defaultdict(list)
+        for pattern in self.patterns:
+            command_patterns[pattern["command"]].append(pattern)
+        
+        # Find commands with increasing confidence
+        for command, patterns in command_patterns.items():
+            if len(patterns) >= 2:
+                old_confidence = patterns[0].get("confidence", 0)
+                new_confidence = patterns[-1].get("confidence", 0)
+                improvement = new_confidence - old_confidence
+                
+                if improvement > 0:
+                    improvements.append({
+                        "command": command,
+                        "improvement": improvement,
+                        "current_confidence": new_confidence
+                    })
+        
+        # Sort by improvement
+        improvements.sort(key=lambda x: x["improvement"], reverse=True)
+        
+        return improvements[:10]
+    
+    def get_adaptation_rate(self) -> float:
+        """Get rate of adaptation/learning"""
+        
+        if len(self.patterns) < 2:
+            return 0.0
+        
+        # Calculate rate of new pattern acquisition
+        recent_patterns = [p for p in self.patterns if p.get("timestamp", 0) > 0]
+        
+        if recent_patterns:
+            time_span = max(1, len(recent_patterns))
+            unique_commands = len(set(p["command"] for p in recent_patterns))
+            
+            return unique_commands / time_span
+        
+        return 0.0
+    
+    def get_dominant_features(self, features: np.ndarray) -> List[str]:
+        """Get dominant features for reasoning"""
+        
+        dominant = []
+        
+        # Check linguistic features (these are at known positions after TF-IDF features)
+        tfidf_size = len(self.vectorizer.get_feature_names_out()) if hasattr(self.vectorizer, 'get_feature_names_out') else 100
+        
+        if len(features) > tfidf_size:
+            linguistic_start = tfidf_size
+            
+            # Check specific linguistic features
+            if features[linguistic_start + 3] > 0:  # Question mark
+                dominant.append("question")
+            if features[linguistic_start + 5] > 0:  # Has action word
+                dominant.append("action word")
+            if features[linguistic_start + 6] > 0:  # Has target word
+                dominant.append("target word")
+        
+        # Check TF-IDF features
+        if hasattr(self.vectorizer, 'get_feature_names_out'):
+            feature_names = self.vectorizer.get_feature_names_out()
+            top_indices = np.argsort(features[:tfidf_size])[-3:][::-1]
+            
+            for idx in top_indices:
+                if idx < len(feature_names) and features[idx] > 0.1:
+                    dominant.append(f"'{feature_names[idx]}'")
+        
+        return dominant[:5]  # Return top 5 dominant features
+    
+    def load_patterns(self, patterns: List[Dict[str, Any]]):
+        """Load historical patterns"""
+        
+        self.patterns = patterns
+        
+        # Learn from patterns
+        for pattern in patterns:
+            tokens = pattern["command"].lower().split()
+            
+            # Learn action and target words based on type
+            if pattern["type"] == "system" and tokens:
+                if tokens:
+                    self.action_words.add(tokens[0])
+                if len(tokens) > 1:
+                    self.target_words.add(tokens[-1])
+            
+            # Learn entities
+            if "entities" in pattern:
+                for entity in pattern["entities"]:
+                    self.learned_entities[entity.get("type", "unknown")].add(
+                        entity.get("text", "").lower()
+                    )
+        
+        # Retrain vectorizer
+        if patterns:
+            self._retrain_vectorizer()
 
-# Module truncated - needs restoration from backup
+
+class AdvancedContextManager:
+    """
+    Advanced context management with learning capabilities
+    """
+    
+    def __init__(self):
+        self.command_history = deque(maxlen=50)
+        self.session_start = datetime.now()
+        self.interaction_patterns = deque(maxlen=100)
+        self.context_weights = defaultdict(float)
+        self.user_profile = UserProfile()
+    
+    def get_context(self) -> Dict[str, Any]:
+        """Get current context"""
+        
+        now = datetime.now()
+        
+        context = {
+            "previous_commands": list(self.command_history)[-5:],
+            "time_of_day": now,
+            "day_of_week": now.weekday(),
+            "session_duration": (now - self.session_start).total_seconds(),
+            "user_state": self.user_profile.get_current_state(),
+            "interaction_count": len(self.interaction_patterns),
+            "recent_types": self._get_recent_command_types(),
+            "context_weights": dict(self.context_weights)
+        }
+        
+        return context
+    
+    def add_command(self, command: str):
+        """Add command to history"""
+        
+        self.command_history.append(command)
+        
+        # Update interaction patterns
+        self.interaction_patterns.append({
+            "command": command,
+            "timestamp": datetime.now()
+        })
+        
+        # Update user profile
+        self.user_profile.update_from_command(command)
+    
+    def _get_recent_command_types(self) -> Dict[str, int]:
+        """Get count of recent command types"""
+        
+        # This would be populated from actual classifications
+        # For now, returning empty
+        return {}
+    
+    def update_weights(self, success_rates: Dict[str, float]):
+        """Update context weights based on success rates"""
+        
+        for context_type, rate in success_rates.items():
+            # Exponential moving average
+            alpha = 0.1
+            self.context_weights[context_type] = (
+                alpha * rate + (1 - alpha) * self.context_weights.get(context_type, 0.5)
+            )
+
+
+class UserProfile:
+    """
+    User profile for personalized learning
+    """
+    
+    def __init__(self):
+        self.command_count = 0
+        self.error_count = 0
+        self.session_commands = 0
+        self.expertise_level = 0.5
+        self.working_pattern = "exploring"
+        self.last_update = datetime.now()
+    
+    def get_current_state(self) -> Dict[str, Any]:
+        """Get current user state"""
+        
+        # Calculate cognitive load based on command frequency
+        time_since_last = (datetime.now() - self.last_update).total_seconds()
+        command_rate = 1.0 / max(1, time_since_last) if time_since_last < 60 else 0
+        
+        cognitive_load = min(1.0, command_rate / 0.5)  # Normalize to 0-1
+        
+        # Calculate frustration based on error rate
+        frustration = self.error_count / max(1, self.command_count)
+        
+        return {
+            "working_pattern": self._infer_working_pattern(),
+            "cognitive_load": cognitive_load,
+            "frustration_level": frustration,
+            "expertise": self.expertise_level
+        }
+    
+    def update_from_command(self, command: str):
+        """Update profile from command"""
+        
+        self.command_count += 1
+        self.session_commands += 1
+        self.last_update = datetime.now()
+        
+        # Update expertise based on command complexity
+        command_length = len(command.split())
+        if command_length > 5:
+            self.expertise_level = min(1.0, self.expertise_level + 0.01)
+    
+    def _infer_working_pattern(self) -> str:
+        """Infer current working pattern"""
+        
+        if self.session_commands < 5:
+            return "exploring"
+        elif self.session_commands < 20:
+            return "focused"
+        elif self.session_commands < 50:
+            return "multitasking"
+        else:
+            return "automating"
+
+
+class PerformanceTracker:
+    """
+    Track and analyze system performance
+    """
+    
+    def __init__(self):
+        self.classifications = deque(maxlen=1000)
+        self.response_times = deque(maxlen=1000)
+        self.accuracy_history = deque(maxlen=1000)
+        self.feedback_history = deque(maxlen=1000)
+    
+    def record_classification(
+        self,
+        command: str,
+        classification: Any,
+        response_time: float
+    ):
+        """Record a classification for tracking"""
+        
+        self.classifications.append({
+            "command": command,
+            "type": classification.type,
+            "confidence": classification.confidence,
+            "timestamp": datetime.now()
+        })
+        
+        self.response_times.append(response_time)
+    
+    def update_from_feedback(self, feedback):
+        """Update metrics from user feedback"""
+        
+        self.feedback_history.append({
+            "command": feedback.command,
+            "correct": feedback.classified_as == feedback.should_be,
+            "rating": feedback.user_rating,
+            "timestamp": datetime.now()
+        })
+        
+        # Update accuracy
+        recent_feedback = list(self.feedback_history)[-100:]
+        if recent_feedback:
+            accuracy = sum(1 for f in recent_feedback if f["correct"]) / len(recent_feedback)
+            self.accuracy_history.append(accuracy)
+    
+    def get_metrics(self) -> Any:
+        """Get current performance metrics"""
+        
+        # Calculate metrics
+        accuracy = np.mean(list(self.accuracy_history)) if self.accuracy_history else 0.5
+        avg_response_time = np.mean(list(self.response_times)) if self.response_times else 0
+        total_classifications = len(self.classifications)
+        
+        # Calculate improvement
+        if len(self.accuracy_history) >= 2:
+            old_accuracy = np.mean(list(self.accuracy_history)[:50])
+            new_accuracy = np.mean(list(self.accuracy_history)[-50:])
+            improvement = new_accuracy - old_accuracy
+        else:
+            improvement = 0
+        
+        # Get common errors
+        errors = self._get_common_errors()
+        
+        return {
+            "accuracy": accuracy,
+            "avg_response_time": avg_response_time,
+            "total_classifications": total_classifications,
+            "improvement_rate": improvement,
+            "common_errors": errors
+        }
+    
+    def _get_common_errors(self) -> List[Tuple[str, str, int]]:
+        """Get common classification errors"""
+        
+        # This would analyze feedback to find common errors
+        # For now, returning empty list
+        return []
+    
+    def get_accuracy_trend(self) -> List[float]:
+        """Get accuracy trend over time"""
+        return list(self.accuracy_history)[-100:]
+    
+    def get_context_success_rates(self) -> Dict[str, float]:
+        """Get success rates for different contexts"""
+        
+        # This would analyze success by context
+        # For now, returning default rates
+        return {
+            "morning": 0.8,
+            "afternoon": 0.85,
+            "evening": 0.75,
+            "focused": 0.9,
+            "multitasking": 0.7
+        }
+    
+    def load_history(self, metrics: List[Dict[str, Any]]):
+        """Load historical metrics"""
+        
+        for metric in metrics:
+            if "accuracy" in metric:
+                self.accuracy_history.append(metric["accuracy"])
+            if "avg_response_time" in metric:
+                self.response_times.append(metric["avg_response_time"])

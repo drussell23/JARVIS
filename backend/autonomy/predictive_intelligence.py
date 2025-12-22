@@ -1,26 +1,7 @@
 #!/usr/bin/env python3
 """
-Advanced Predictive Intelligence Module for JARVIS.
-
-This module provides sophisticated prediction capabilities using dynamic learning
-and Anthropic API integration. It analyzes user behavior patterns, workspace state,
-and environmental factors to generate intelligent predictions about user needs,
-workflow transitions, and optimization opportunities.
-
-The module combines machine learning models with Claude AI to provide contextual
-predictions that adapt and improve over time through continuous learning.
-
-Example:
-    >>> engine = PredictiveIntelligenceEngine(api_key="your-key")
-    >>> context = PredictionContext(
-    ...     timestamp=datetime.now(),
-    ...     workspace_state={'windows': [...]},
-    ...     user_activity={'click_rate': 50},
-    ...     environmental_factors={},
-    ...     historical_patterns={},
-    ...     real_time_signals={}
-    ... )
-    >>> predictions = await engine.generate_predictions(context)
+Advanced Predictive Intelligence Module for JARVIS
+Provides sophisticated prediction capabilities using dynamic learning and Anthropic API
 """
 
 import asyncio
@@ -32,28 +13,16 @@ from collections import defaultdict, deque
 from enum import Enum
 import json
 import numpy as np
-from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import StandardScaler
 import anthropic
 import hashlib
 
 logger = logging.getLogger(__name__)
 
+
 class PredictionType(Enum):
-    """Types of predictions the system can make.
-    
-    Attributes:
-        NEXT_ACTION: Predicts the user's next likely action
-        RESOURCE_NEED: Predicts resources the user will need
-        WORKFLOW_TRANSITION: Predicts workflow state changes
-        BREAK_SUGGESTION: Predicts when user needs a break
-        FOCUS_OPTIMIZATION: Predicts focus improvement opportunities
-        MEETING_PREPARATION: Predicts meeting preparation needs
-        TASK_COMPLETION: Predicts task completion time and requirements
-        COLLABORATION_NEED: Predicts collaboration opportunities
-        AUTOMATION_OPPORTUNITY: Predicts automation possibilities
-        DEADLINE_RISK: Predicts deadline-related risks
-    """
+    """Types of predictions the system can make"""
     NEXT_ACTION = "next_action"
     RESOURCE_NEED = "resource_need"
     WORKFLOW_TRANSITION = "workflow_transition"
@@ -65,22 +34,10 @@ class PredictionType(Enum):
     AUTOMATION_OPPORTUNITY = "automation_opportunity"
     DEADLINE_RISK = "deadline_risk"
 
+
 @dataclass
 class PredictionContext:
-    """Rich context for making predictions.
-    
-    Contains comprehensive information about the user's current state,
-    workspace, activity patterns, and environmental factors used to
-    generate accurate predictions.
-    
-    Attributes:
-        timestamp: Current timestamp for temporal analysis
-        workspace_state: Current state of user's workspace (windows, apps, etc.)
-        user_activity: User activity metrics (clicks, typing, switches)
-        environmental_factors: External factors (noise, calendar, deadlines)
-        historical_patterns: Historical behavior patterns
-        real_time_signals: Real-time signals and indicators
-    """
+    """Rich context for making predictions"""
     timestamp: datetime
     workspace_state: Dict[str, Any]
     user_activity: Dict[str, Any]
@@ -89,21 +46,7 @@ class PredictionContext:
     real_time_signals: Dict[str, Any]
     
     def to_feature_vector(self) -> np.ndarray:
-        """Convert context to ML feature vector.
-        
-        Transforms the rich context data into a numerical feature vector
-        suitable for machine learning models.
-        
-        Returns:
-            np.ndarray: Feature vector containing temporal, activity, and
-                       environmental features
-        
-        Example:
-            >>> context = PredictionContext(...)
-            >>> features = context.to_feature_vector()
-            >>> print(features.shape)
-            (13,)
-        """
+        """Convert context to ML feature vector"""
         features = []
         
         # Time features
@@ -129,25 +72,10 @@ class PredictionContext:
         
         return np.array(features)
 
+
 @dataclass
 class DynamicPrediction:
-    """A dynamic, context-aware prediction.
-    
-    Represents a single prediction with confidence scores, urgency levels,
-    actionable items, and reasoning. Includes learning feedback mechanisms
-    for continuous improvement.
-    
-    Attributes:
-        prediction_id: Unique identifier for the prediction
-        type: Type of prediction from PredictionType enum
-        confidence: Confidence score (0.0 to 1.0)
-        urgency: Urgency level (0.0 to 1.0)
-        action_items: List of actionable items based on prediction
-        reasoning: Human-readable explanation of the prediction
-        context_factors: Factors that influenced the prediction
-        learning_feedback: Optional feedback for learning improvement
-        expires_at: Optional expiration time for the prediction
-    """
+    """A dynamic, context-aware prediction"""
     prediction_id: str
     type: PredictionType
     confidence: float
@@ -159,82 +87,37 @@ class DynamicPrediction:
     expires_at: Optional[datetime] = None
     
     def should_act(self, threshold: float = 0.7) -> bool:
-        """Determine if prediction warrants action.
-        
-        Calculates whether the prediction's combined confidence and urgency
-        scores exceed the threshold for taking action.
-        
-        Args:
-            threshold: Minimum score threshold for action (default: 0.7)
-            
-        Returns:
-            bool: True if action should be taken, False otherwise
-            
-        Example:
-            >>> prediction = DynamicPrediction(...)
-            >>> if prediction.should_act():
-            ...     # Take action based on prediction
-            ...     pass
-        """
+        """Determine if prediction warrants action"""
         return self.confidence * self.urgency > threshold
 
+
 class PredictiveIntelligenceEngine:
-    """Advanced predictive intelligence that learns and adapts dynamically.
-    
-    The main engine that combines machine learning models with Claude AI
-    to generate intelligent predictions about user behavior, needs, and
-    optimization opportunities. Features dynamic learning and adaptation.
-    
-    Attributes:
-        claude: Anthropic Claude client for AI analysis
-        use_intelligent_selection: Whether to use intelligent model selection
-        pattern_memory: Memory of historical patterns for learning
-        prediction_models: ML models for each prediction type
-        feature_importance: Dynamic feature importance tracking
-        active_predictions: Currently active predictions
-        prediction_outcomes: Historical prediction outcomes
-        learning_rate: Rate of learning adaptation
-        context_embeddings: Context embeddings for similarity matching
-        context_clusters: Clustered contexts for pattern recognition
+    """
+    Advanced predictive intelligence that learns and adapts dynamically
     """
     
-    def __init__(self, anthropic_api_key: str, use_intelligent_selection: bool = True):
-        """Initialize the predictive intelligence engine.
-        
-        Args:
-            anthropic_api_key: API key for Anthropic Claude
-            use_intelligent_selection: Whether to use intelligent model selection
-                                     for enhanced predictions (default: True)
-        
-        Raises:
-            ValueError: If API key is invalid or missing
-        """
+    def __init__(self, anthropic_api_key: str):
         self.claude = anthropic.Anthropic(api_key=anthropic_api_key)
-        self.use_intelligent_selection = use_intelligent_selection
-
+        
         # Dynamic learning components
         self.pattern_memory = deque(maxlen=10000)
         self.prediction_models: Dict[PredictionType, Any] = {}
         self.feature_importance: Dict[str, float] = defaultdict(float)
-
+        
         # Real-time learning
         self.active_predictions: Dict[str, DynamicPrediction] = {}
         self.prediction_outcomes: List[Dict[str, Any]] = []
         self.learning_rate = 0.1
-
+        
         # Context understanding
         self.context_embeddings: Dict[str, np.ndarray] = {}
         self.context_clusters = []
-
+        
         # Initialize ML models
         self._initialize_models()
         
     def _initialize_models(self):
-        """Initialize machine learning models for each prediction type.
-        
-        Sets up RandomForest classifiers and StandardScalers for each
-        prediction type, along with performance tracking metrics.
-        """
+        """Initialize machine learning models for each prediction type"""
         for pred_type in PredictionType:
             self.prediction_models[pred_type] = {
                 'classifier': RandomForestClassifier(n_estimators=100, random_state=42),
@@ -244,43 +127,11 @@ class PredictiveIntelligenceEngine:
             }
     
     async def generate_predictions(self, context: PredictionContext) -> List[DynamicPrediction]:
-        """Generate intelligent predictions based on current context.
-        
-        Analyzes the provided context using either intelligent model selection
-        or direct Claude analysis, then generates predictions for each type
-        and returns the most relevant ones.
-        
-        Args:
-            context: Rich context containing workspace state, user activity,
-                    and environmental factors
-                    
-        Returns:
-            List[DynamicPrediction]: Top predictions sorted by urgency and
-                                   confidence, limited to 10 results
-                                   
-        Raises:
-            Exception: If context analysis fails with both intelligent
-                      selection and Claude fallback
-                      
-        Example:
-            >>> engine = PredictiveIntelligenceEngine(api_key)
-            >>> context = PredictionContext(...)
-            >>> predictions = await engine.generate_predictions(context)
-            >>> for pred in predictions:
-            ...     if pred.should_act():
-            ...         print(f"Action needed: {pred.reasoning}")
-        """
+        """Generate intelligent predictions based on current context"""
         predictions = []
-
-        # Use intelligent selection or fallback to direct Claude
-        if self.use_intelligent_selection:
-            try:
-                context_analysis = await self._analyze_context_with_intelligent_selection(context)
-            except Exception as e:
-                logger.warning(f"Intelligent selection failed for context analysis, falling back to direct Claude: {e}")
-                context_analysis = await self._analyze_context_with_claude(context)
-        else:
-            context_analysis = await self._analyze_context_with_claude(context)
+        
+        # Use Claude for intelligent analysis
+        context_analysis = await self._analyze_context_with_claude(context)
         
         # Generate predictions for each type
         for pred_type in PredictionType:
@@ -298,120 +149,8 @@ class PredictiveIntelligenceEngine:
         
         return predictions[:10]  # Top 10 predictions
     
-    async def _analyze_context_with_intelligent_selection(self, context: PredictionContext) -> Dict[str, Any]:
-        """Use intelligent model selection for context analysis.
-        
-        Leverages the hybrid orchestrator to select the most appropriate
-        model for analyzing the current context and generating insights.
-        
-        Args:
-            context: Prediction context to analyze
-            
-        Returns:
-            Dict[str, Any]: Analysis results including current goal, predicted
-                          needs, risk factors, and optimization opportunities
-                          
-        Raises:
-            ImportError: If hybrid orchestrator is not available
-            Exception: If analysis fails or cannot be parsed
-        """
-        try:
-            from backend.core.hybrid_orchestrator import HybridOrchestrator
-
-            orchestrator = HybridOrchestrator()
-            if not orchestrator.is_running:
-                await orchestrator.start()
-
-            # Prepare context summary
-            context_summary = {
-                'time': context.timestamp.isoformat(),
-                'workspace': {
-                    'window_count': len(context.workspace_state.get('windows', [])),
-                    'active_apps': [w['app_name'] for w in context.workspace_state.get('windows', [])[:5]],
-                    'notifications': len(context.workspace_state.get('notifications', {}).get('badges', []))
-                },
-                'user_activity': context.user_activity,
-                'patterns': list(context.historical_patterns.keys())[:10]
-            }
-
-            # Build rich context for intelligent selection
-            intelligent_context = {
-                "task_type": "behavior_prediction",
-                "user_behavior_history": context.historical_patterns,
-                "current_patterns": {
-                    "window_count": len(context.workspace_state.get('windows', [])),
-                    "activity_level": context.user_activity.get('click_rate', 0) / 60.0,
-                    "temporal_data": {
-                        "hour": context.timestamp.hour,
-                        "day_of_week": context.timestamp.weekday()
-                    }
-                },
-                "prediction_targets": ["user_goal", "upcoming_needs", "friction_points", "assistance_opportunities", "user_state"]
-            }
-
-            prompt = f"""As JARVIS's predictive intelligence, analyze this context and identify:
-1. What the user is likely trying to accomplish
-2. What they'll need in the next 5-30 minutes
-3. Potential friction points or interruptions
-4. Opportunities for proactive assistance
-5. Signs of stress, fatigue, or flow state
-
-Context:
-{json.dumps(context_summary, indent=2, default=str)}
-
-Provide analysis as JSON with these keys:
-- current_goal: what user is working on
-- predicted_needs: array of likely upcoming needs
-- risk_factors: potential issues
-- optimization_opportunities: ways to help
-- user_state: emotional/cognitive state
-- confidence_scores: confidence for each prediction"""
-
-            result = await orchestrator.execute_with_intelligent_model_selection(
-                query=prompt,
-                intent="behavior_prediction",
-                required_capabilities={"nlp_analysis", "prediction", "pattern_recognition"},
-                context=intelligent_context,
-                max_tokens=1000,
-                temperature=0.7,
-            )
-
-            if not result.get("success"):
-                raise Exception(result.get("error", "Unknown error"))
-
-            analysis_text = result.get("text", "").strip()
-            model_used = result.get("model_used", "intelligent_selection")
-
-            logger.info(f"✨ Context analysis generated using {model_used}")
-
-            # Extract JSON
-            import re
-            json_match = re.search(r'\{.*\}', analysis_text, re.DOTALL)
-            if json_match:
-                return json.loads(json_match.group())
-            else:
-                return {'error': 'Could not parse analysis'}
-
-        except ImportError:
-            logger.warning("Hybrid orchestrator not available for intelligent selection")
-            raise
-        except Exception as e:
-            logger.error(f"Error in intelligent context analysis: {e}")
-            raise
-
     async def _analyze_context_with_claude(self, context: PredictionContext) -> Dict[str, Any]:
-        """Use Claude to deeply understand the current context.
-        
-        Directly uses Claude AI to analyze the context and generate insights
-        about user goals, needs, and potential optimization opportunities.
-        
-        Args:
-            context: Prediction context to analyze
-            
-        Returns:
-            Dict[str, Any]: Analysis results in JSON format, or empty dict
-                          if analysis fails
-        """
+        """Use Claude to deeply understand the current context"""
         try:
             # Prepare context summary
             context_summary = {
@@ -469,20 +208,7 @@ Provide analysis as JSON with these keys:
     async def _generate_typed_prediction(self, pred_type: PredictionType, 
                                        context: PredictionContext,
                                        analysis: Dict[str, Any]) -> Optional[DynamicPrediction]:
-        """Generate a specific type of prediction.
-        
-        Routes to the appropriate prediction generator based on the
-        prediction type and returns a typed prediction if applicable.
-        
-        Args:
-            pred_type: Type of prediction to generate
-            context: Current prediction context
-            analysis: Context analysis results
-            
-        Returns:
-            Optional[DynamicPrediction]: Generated prediction or None if
-                                       not applicable for current context
-        """
+        """Generate a specific type of prediction"""
         
         # Dynamic prediction generation based on type
         generators = {
@@ -506,18 +232,7 @@ Provide analysis as JSON with these keys:
     
     async def _predict_next_action(self, context: PredictionContext, 
                                   analysis: Dict[str, Any]) -> Optional[DynamicPrediction]:
-        """Predict the user's next likely action.
-        
-        Analyzes current workspace state and predicted needs to determine
-        what action the user is likely to take next.
-        
-        Args:
-            context: Current prediction context
-            analysis: Context analysis results
-            
-        Returns:
-            Optional[DynamicPrediction]: Next action prediction or None
-        """
+        """Predict the user's next likely action"""
         current_apps = [w['app_name'] for w in context.workspace_state.get('windows', [])]
         predicted_needs = analysis.get('predicted_needs', [])
         
@@ -560,18 +275,7 @@ Provide analysis as JSON with these keys:
     
     async def _predict_resource_need(self, context: PredictionContext,
                                    analysis: Dict[str, Any]) -> Optional[DynamicPrediction]:
-        """Predict resources user will need.
-        
-        Analyzes current workflow and applications to predict what
-        additional resources or tools the user will need.
-        
-        Args:
-            context: Current prediction context
-            analysis: Context analysis results
-            
-        Returns:
-            Optional[DynamicPrediction]: Resource need prediction or None
-        """
+        """Predict resources user will need"""
         resources = []
         confidence = 0.6
         
@@ -608,36 +312,9 @@ Provide analysis as JSON with these keys:
             }
         )
     
-    async def _predict_workflow_transition(self, context: PredictionContext,
-                                         analysis: Dict[str, Any]) -> Optional[DynamicPrediction]:
-        """Predict workflow transitions.
-        
-        Placeholder for workflow transition prediction logic.
-        
-        Args:
-            context: Current prediction context
-            analysis: Context analysis results
-            
-        Returns:
-            Optional[DynamicPrediction]: Always returns None (not implemented)
-        """
-        # Placeholder for workflow transition prediction
-        return None
-    
     async def _predict_break_need(self, context: PredictionContext,
                                  analysis: Dict[str, Any]) -> Optional[DynamicPrediction]:
-        """Predict when user needs a break.
-        
-        Analyzes work duration, activity intensity, and user state to
-        determine if the user would benefit from taking a break.
-        
-        Args:
-            context: Current prediction context
-            analysis: Context analysis results
-            
-        Returns:
-            Optional[DynamicPrediction]: Break suggestion prediction or None
-        """
+        """Predict when user needs a break"""
         # Analyze activity patterns
         activity = context.user_activity
         focus_duration = activity.get('continuous_work_minutes', 0)
@@ -689,18 +366,7 @@ Provide analysis as JSON with these keys:
     
     async def _predict_focus_optimization(self, context: PredictionContext,
                                         analysis: Dict[str, Any]) -> Optional[DynamicPrediction]:
-        """Predict focus optimization opportunities.
-        
-        Identifies distractions and suggests ways to optimize focus
-        and productivity in the current workspace.
-        
-        Args:
-            context: Current prediction context
-            analysis: Context analysis results
-            
-        Returns:
-            Optional[DynamicPrediction]: Focus optimization prediction or None
-        """
+        """Predict focus optimization opportunities"""
         distractions = []
         confidence = 0.5
         
@@ -745,18 +411,7 @@ Provide analysis as JSON with these keys:
     
     async def _predict_meeting_prep(self, context: PredictionContext,
                                   analysis: Dict[str, Any]) -> Optional[DynamicPrediction]:
-        """Predict meeting preparation needs.
-        
-        Detects upcoming meetings and suggests preparation actions
-        based on calendar apps and timing patterns.
-        
-        Args:
-            context: Current prediction context
-            analysis: Context analysis results
-            
-        Returns:
-            Optional[DynamicPrediction]: Meeting preparation prediction or None
-        """
+        """Predict meeting preparation needs"""
         # Check for calendar apps or meeting indicators
         windows = context.workspace_state.get('windows', [])
         meeting_apps = ['calendar', 'zoom', 'teams', 'meet', 'webex']
@@ -801,24 +456,320 @@ Provide analysis as JSON with these keys:
             }
         )
     
-    async def _predict_task_completion_with_intelligent_selection(self, context: PredictionContext,
-                                                                   analysis: Dict[str, Any]) -> Optional[DynamicPrediction]:
-        """Use intelligent model selection for task completion prediction.
+    async def _predict_task_completion(self, context: PredictionContext,
+                                     analysis: Dict[str, Any]) -> Optional[DynamicPrediction]:
+        """Predict task completion time and needs"""
+        current_goal = analysis.get('current_goal', '')
+        if not current_goal:
+            return None
         
-        Leverages the hybrid orchestrator to predict task completion time
-        and requirements using the most appropriate AI model.
+        # Estimate completion based on activity patterns
+        activity = context.user_activity
+        productivity_score = self._calculate_productivity_score(activity)
         
-        Args:
-            context: Current prediction context
-            analysis: Context analysis results
-            
-        Returns:
-            Optional[DynamicPrediction]: Task completion prediction or None
-            
-        Raises:
-            ImportError: If hybrid orchestrator is not available
-            Exception:
-    """
-    pass
+        # Use Claude to estimate task completion
+        try:
+            response = await asyncio.to_thread(
+                self.claude.messages.create,
+                model="claude-3-haiku-20240307",
+                max_tokens=200,
+                messages=[{
+                    "role": "user",
+                    "content": f"""Estimate task completion for:
+Task: {current_goal}
+Productivity level: {productivity_score:.1f}/10
+Current pace: {activity.get('actions_per_minute', 0)} actions/min
 
-# Module truncated - needs restoration from backup
+Provide: estimated_minutes, bottlenecks[], next_steps[]"""
+                }]
+            )
+            
+            # Parse response (simplified)
+            estimate = 30  # Default estimate
+            
+        except:
+            estimate = 30
+        
+        return DynamicPrediction(
+            prediction_id=self._generate_prediction_id(context, PredictionType.TASK_COMPLETION),
+            type=PredictionType.TASK_COMPLETION,
+            confidence=0.7,
+            urgency=0.6,
+            action_items=[{
+                'action': 'track_progress',
+                'estimated_completion': estimate,
+                'optimization_tips': [
+                    'Minimize context switches',
+                    'Use keyboard shortcuts',
+                    'Batch similar actions'
+                ]
+            }],
+            reasoning=f"At current pace, '{current_goal}' should complete in ~{estimate} minutes",
+            context_factors={
+                'productivity': productivity_score / 10,
+                'task_complexity': 0.5
+            }
+        )
+    
+    async def _predict_collaboration(self, context: PredictionContext,
+                                   analysis: Dict[str, Any]) -> Optional[DynamicPrediction]:
+        """Predict collaboration needs"""
+        # Look for collaboration indicators
+        windows = context.workspace_state.get('windows', [])
+        collab_apps = ['slack', 'teams', 'discord', 'figma', 'miro', 'notion']
+        
+        active_collab = [
+            w['app_name'] for w in windows
+            if any(app in w['app_name'].lower() for app in collab_apps)
+        ]
+        
+        if not active_collab:
+            return None
+        
+        # Check for collaboration patterns
+        if 'optimization_opportunities' in analysis:
+            opps = analysis['optimization_opportunities']
+            if isinstance(opps, list) and any('collaborat' in str(o).lower() for o in opps):
+                return DynamicPrediction(
+                    prediction_id=self._generate_prediction_id(context, PredictionType.COLLABORATION_NEED),
+                    type=PredictionType.COLLABORATION_NEED,
+                    confidence=0.7,
+                    urgency=0.6,
+                    action_items=[{
+                        'action': 'facilitate_collaboration',
+                        'suggestions': [
+                            'Share screen for clarity',
+                            'Create shared document',
+                            'Schedule follow-up',
+                            'Summarize decisions'
+                        ]
+                    }],
+                    reasoning="Collaboration pattern detected - optimizing for team productivity",
+                    context_factors={
+                        'collab_apps_active': len(active_collab) / 3,
+                        'communication_need': 0.7
+                    }
+                )
+        
+        return None
+    
+    async def _predict_automation(self, context: PredictionContext,
+                                analysis: Dict[str, Any]) -> Optional[DynamicPrediction]:
+        """Predict automation opportunities"""
+        # Analyze repetitive patterns
+        activity = context.user_activity
+        
+        # High repetition indicators
+        high_clicks = activity.get('click_rate', 0) > 120
+        high_switches = activity.get('window_switches', 0) > 25
+        
+        if not (high_clicks or high_switches):
+            return None
+        
+        # Identify automation opportunities
+        opportunities = []
+        
+        if high_clicks:
+            opportunities.append({
+                'type': 'click_automation',
+                'description': 'Automate repetitive clicking patterns',
+                'tool': 'Macro recorder or JARVIS automation'
+            })
+        
+        if high_switches:
+            opportunities.append({
+                'type': 'workflow_automation',
+                'description': 'Create workflow to reduce app switching',
+                'tool': 'JARVIS workflow builder'
+            })
+        
+        return DynamicPrediction(
+            prediction_id=self._generate_prediction_id(context, PredictionType.AUTOMATION_OPPORTUNITY),
+            type=PredictionType.AUTOMATION_OPPORTUNITY,
+            confidence=0.8,
+            urgency=0.5,
+            action_items=[{
+                'action': 'suggest_automation',
+                'opportunities': opportunities,
+                'potential_time_saved': '15-30 minutes/day'
+            }],
+            reasoning="Repetitive patterns detected - automation could save significant time",
+            context_factors={
+                'repetition_level': 0.8,
+                'automation_potential': 0.7
+            }
+        )
+    
+    async def _predict_deadline_risk(self, context: PredictionContext,
+                                   analysis: Dict[str, Any]) -> Optional[DynamicPrediction]:
+        """Predict deadline risks"""
+        risk_factors = analysis.get('risk_factors', [])
+        
+        if not risk_factors:
+            return None
+        
+        # Analyze deadline pressure
+        deadline_pressure = context.environmental_factors.get('deadline_pressure', 0)
+        
+        if deadline_pressure < 0.5:
+            return None
+        
+        return DynamicPrediction(
+            prediction_id=self._generate_prediction_id(context, PredictionType.DEADLINE_RISK),
+            type=PredictionType.DEADLINE_RISK,
+            confidence=min(deadline_pressure + 0.2, 0.9),
+            urgency=deadline_pressure,
+            action_items=[{
+                'action': 'mitigate_deadline_risk',
+                'risks': risk_factors,
+                'mitigation_steps': [
+                    'Prioritize critical tasks',
+                    'Delegate if possible',
+                    'Block calendar for focus time',
+                    'Communicate status early'
+                ]
+            }],
+            reasoning=f"Deadline pressure detected: {', '.join(risk_factors[:2])}",
+            context_factors={
+                'deadline_proximity': deadline_pressure,
+                'risk_level': len(risk_factors) / 5
+            }
+        )
+    
+    def _suggest_apps_for_need(self, need: str, current_apps: List[str]) -> List[str]:
+        """Suggest apps based on predicted need"""
+        app_suggestions = {
+            'documentation': ['browser', 'notion', 'obsidian'],
+            'coding': ['vscode', 'terminal', 'github'],
+            'communication': ['slack', 'teams', 'mail'],
+            'planning': ['calendar', 'todoist', 'notion'],
+            'research': ['browser', 'zotero', 'notes']
+        }
+        
+        need_lower = need.lower()
+        for key, apps in app_suggestions.items():
+            if key in need_lower:
+                return [app for app in apps if app not in current_apps][:3]
+        
+        return []
+    
+    def _suggest_break_activities(self, context: PredictionContext, 
+                                analysis: Dict[str, Any]) -> List[str]:
+        """Suggest personalized break activities"""
+        activities = []
+        
+        user_state = analysis.get('user_state', {})
+        
+        if 'stress' in str(user_state).lower():
+            activities.extend(['Deep breathing', 'Short walk', 'Stretching'])
+        elif 'fatigue' in str(user_state).lower():
+            activities.extend(['Power nap', 'Coffee break', 'Light exercise'])
+        else:
+            activities.extend(['Water break', 'Eye rest', 'Quick stretch'])
+        
+        return activities
+    
+    def _calculate_productivity_score(self, activity: Dict[str, Any]) -> float:
+        """Calculate productivity score from activity data"""
+        score = 5.0  # Base score
+        
+        # Positive factors
+        if activity.get('actions_per_minute', 0) > 10:
+            score += 1.0
+        if activity.get('window_switches', 0) < 10:
+            score += 1.0
+        
+        # Negative factors
+        if activity.get('idle_time', 0) > 300:  # 5 minutes idle
+            score -= 1.0
+        if activity.get('error_count', 0) > 5:
+            score -= 0.5
+        
+        return max(1.0, min(10.0, score))
+    
+    def _generate_prediction_id(self, context: PredictionContext, 
+                               pred_type: PredictionType) -> str:
+        """Generate unique prediction ID"""
+        content = f"{context.timestamp.isoformat()}_{pred_type.value}"
+        return hashlib.md5(content.encode()).hexdigest()[:12]
+    
+    async def _learn_from_context(self, context: PredictionContext, 
+                                predictions: List[DynamicPrediction]):
+        """Learn from context and predictions"""
+        # Store pattern
+        pattern = {
+            'timestamp': context.timestamp,
+            'features': context.to_feature_vector().tolist(),
+            'predictions': [p.type.value for p in predictions],
+            'context_hash': self._hash_context(context)
+        }
+        
+        self.pattern_memory.append(pattern)
+        
+        # Update feature importance dynamically
+        for i, feature in enumerate(context.to_feature_vector()):
+            if feature > 0:
+                self.feature_importance[f'feature_{i}'] += self.learning_rate
+    
+    def _hash_context(self, context: PredictionContext) -> str:
+        """Create hash of context for pattern matching"""
+        key_elements = [
+            len(context.workspace_state.get('windows', [])),
+            context.timestamp.hour,
+            context.timestamp.weekday()
+        ]
+        return hashlib.md5(str(key_elements).encode()).hexdigest()[:8]
+    
+    async def learn_from_outcome(self, prediction_id: str, 
+                               outcome: Dict[str, Any]):
+        """Learn from prediction outcomes"""
+        if prediction_id in self.active_predictions:
+            prediction = self.active_predictions[prediction_id]
+            
+            # Record outcome
+            self.prediction_outcomes.append({
+                'prediction': prediction,
+                'outcome': outcome,
+                'timestamp': datetime.now()
+            })
+            
+            # Update model performance
+            pred_type = prediction.type
+            if outcome.get('accurate', False):
+                self.prediction_models[pred_type]['performance'] *= 1.05
+            else:
+                self.prediction_models[pred_type]['performance'] *= 0.95
+            
+            # Retrain models periodically
+            if len(self.prediction_outcomes) % 100 == 0:
+                await self._retrain_models()
+    
+    async def _retrain_models(self):
+        """Retrain ML models with accumulated data"""
+        # This would implement actual model retraining
+        logger.info("Retraining prediction models with new data")
+        
+    def get_prediction_stats(self) -> Dict[str, Any]:
+        """Get statistics about prediction performance"""
+        stats = {
+            'total_predictions': len(self.prediction_outcomes),
+            'active_predictions': len(self.active_predictions),
+            'model_performance': {},
+            'top_features': sorted(
+                self.feature_importance.items(),
+                key=lambda x: x[1],
+                reverse=True
+            )[:10]
+        }
+        
+        for pred_type in PredictionType:
+            stats['model_performance'][pred_type.value] = {
+                'performance': self.prediction_models[pred_type]['performance'],
+                'trained': self.prediction_models[pred_type]['trained']
+            }
+        
+        return stats
+
+
+# Export main class
+__all__ = ['PredictiveIntelligenceEngine', 'PredictionContext', 'DynamicPrediction', 'PredictionType']
