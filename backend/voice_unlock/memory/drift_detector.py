@@ -748,6 +748,328 @@ class VoiceDriftDetector:
             "cache_size": len(self._analysis_cache),
         }
 
+    # =========================================================================
+    # MULTI-FACTOR AUTHENTICATION INTEGRATION
+    # =========================================================================
+
+    async def analyze_contextual_drift(
+        self,
+        user_id: str,
+        samples: List[VoiceEvolutionRecord],
+        network_context: Optional[Dict] = None,
+        device_context: Optional[Dict] = None,
+        temporal_context: Optional[Dict] = None,
+    ) -> Dict[str, Any]:
+        """
+        Enhanced drift analysis with multi-factor contextual intelligence.
+
+        Integrates drift detection with:
+        - Network context (WiFi, location)
+        - Device state (stationary, docked)
+        - Temporal patterns (time of day, typical unlock times)
+
+        Args:
+            user_id: User identifier
+            samples: Voice evolution samples
+            network_context: Optional network/location context
+            device_context: Optional physical device state
+            temporal_context: Optional temporal pattern context
+
+        Returns:
+            Enhanced drift analysis with contextual adjustments
+        """
+        # Run base drift analysis
+        base_analysis = await self.analyze_drift(user_id, samples)
+
+        # Start with base result
+        contextual_result = {
+            'base_drift': base_analysis.to_dict(),
+            'contextual_adjustments': [],
+            'confidence_modifier': 0.0,
+            'context_aware_confidence': base_analysis.confidence_adjustment,
+            'reasoning': []
+        }
+
+        # Network-aware drift analysis
+        if network_context:
+            network_adjustment = await self._analyze_network_drift(
+                samples, network_context, base_analysis
+            )
+            contextual_result['contextual_adjustments'].append(network_adjustment)
+            contextual_result['confidence_modifier'] += network_adjustment['confidence_delta']
+            if network_adjustment['reasoning']:
+                contextual_result['reasoning'].append(network_adjustment['reasoning'])
+
+        # Device-aware drift analysis
+        if device_context:
+            device_adjustment = await self._analyze_device_drift(
+                samples, device_context, base_analysis
+            )
+            contextual_result['contextual_adjustments'].append(device_adjustment)
+            contextual_result['confidence_modifier'] += device_adjustment['confidence_delta']
+            if device_adjustment['reasoning']:
+                contextual_result['reasoning'].append(device_adjustment['reasoning'])
+
+        # Temporal-aware drift analysis
+        if temporal_context:
+            temporal_adjustment = await self._analyze_temporal_drift_pattern(
+                samples, temporal_context, base_analysis
+            )
+            contextual_result['contextual_adjustments'].append(temporal_adjustment)
+            contextual_result['confidence_modifier'] += temporal_adjustment['confidence_delta']
+            if temporal_adjustment['reasoning']:
+                contextual_result['reasoning'].append(temporal_adjustment['reasoning'])
+
+        # Calculate final context-aware confidence
+        contextual_result['context_aware_confidence'] = (
+            base_analysis.confidence_adjustment +
+            contextual_result['confidence_modifier']
+        )
+
+        # Clamp to reasonable range
+        contextual_result['context_aware_confidence'] = max(
+            -0.20,
+            min(0.10, contextual_result['context_aware_confidence'])
+        )
+
+        logger.debug(
+            f"Contextual drift analysis for {user_id}: "
+            f"base={base_analysis.confidence_adjustment:.3f}, "
+            f"modifier={contextual_result['confidence_modifier']:.3f}, "
+            f"final={contextual_result['context_aware_confidence']:.3f}"
+        )
+
+        return contextual_result
+
+    async def _analyze_network_drift(
+        self,
+        samples: List[VoiceEvolutionRecord],
+        network_context: Dict,
+        base_analysis: DriftAnalysisResult,
+    ) -> Dict:
+        """Analyze drift in context of network/location."""
+        adjustment = {
+            'factor': 'network',
+            'confidence_delta': 0.0,
+            'reasoning': ''
+        }
+
+        try:
+            # Check if network matches typical patterns
+            network_trust = network_context.get('trust_score', 0.5)
+            is_trusted = network_context.get('ssid_trust_level') == 'trusted'
+            is_unknown = network_context.get('ssid_trust_level') == 'unknown'
+
+            # If drift detected on trusted network = likely genuine (illness, etc.)
+            if base_analysis.drift_detected and is_trusted:
+                # Reduce penalty for drift on trusted network
+                adjustment['confidence_delta'] = 0.03
+                adjustment['reasoning'] = (
+                    f"Voice drift on trusted network suggests genuine change "
+                    f"(illness/equipment), not spoofing"
+                )
+
+            # If drift detected on unknown network = more suspicious
+            elif base_analysis.drift_detected and is_unknown:
+                # Increase penalty for drift on unknown network
+                adjustment['confidence_delta'] = -0.05
+                adjustment['reasoning'] = (
+                    "Voice drift on unknown network is suspicious - "
+                    "could indicate unauthorized access attempt"
+                )
+
+            # Sudden drift with network change = likely equipment change
+            elif base_analysis.drift_type == DriftType.SUDDEN:
+                # Check if network changed recently
+                network_stability = network_context.get('connection_stability', 1.0)
+                if network_stability < 0.8:
+                    adjustment['confidence_delta'] = 0.02
+                    adjustment['reasoning'] = (
+                        "Sudden voice drift with network change suggests "
+                        "equipment/microphone change (expected)"
+                    )
+
+        except Exception as e:
+            logger.warning(f"Error analyzing network drift: {e}")
+
+        return adjustment
+
+    async def _analyze_device_drift(
+        self,
+        samples: List[VoiceEvolutionRecord],
+        device_context: Dict,
+        base_analysis: DriftAnalysisResult,
+    ) -> Dict:
+        """Analyze drift in context of device state."""
+        adjustment = {
+            'factor': 'device',
+            'confidence_delta': 0.0,
+            'reasoning': ''
+        }
+
+        try:
+            is_stationary = device_context.get('is_stationary', False)
+            is_docked = device_context.get('is_docked', False)
+            just_woke = device_context.get('just_woke', False)
+
+            # Drift while device stationary/docked = likely genuine voice change
+            if base_analysis.drift_detected and (is_stationary or is_docked):
+                adjustment['confidence_delta'] = 0.04
+                adjustment['reasoning'] = (
+                    f"Voice drift on {'docked' if is_docked else 'stationary'} device "
+                    "suggests genuine voice change (illness, stress)"
+                )
+
+            # Just woke + drift = expected (groggy voice)
+            elif base_analysis.drift_detected and just_woke:
+                if base_analysis.drift_type in (DriftType.ILLNESS, DriftType.STRESS):
+                    adjustment['confidence_delta'] = 0.05
+                    adjustment['reasoning'] = (
+                        "Voice drift after wake is expected (morning voice) - "
+                        "reducing authentication penalty"
+                    )
+
+            # Equipment drift when device moved = expected
+            elif base_analysis.drift_type == DriftType.EQUIPMENT:
+                if not is_stationary:
+                    adjustment['confidence_delta'] = 0.03
+                    adjustment['reasoning'] = (
+                        "Equipment-related voice drift during device movement is "
+                        "expected (different microphone/environment)"
+                    )
+
+        except Exception as e:
+            logger.warning(f"Error analyzing device drift: {e}")
+
+        return adjustment
+
+    async def _analyze_temporal_drift_pattern(
+        self,
+        samples: List[VoiceEvolutionRecord],
+        temporal_context: Dict,
+        base_analysis: DriftAnalysisResult,
+    ) -> Dict:
+        """Analyze drift in context of temporal patterns."""
+        adjustment = {
+            'factor': 'temporal',
+            'confidence_delta': 0.0,
+            'reasoning': ''
+        }
+
+        try:
+            is_typical_time = temporal_context.get('is_typical_time', False)
+            confidence = temporal_context.get('confidence', 0.5)
+            anomaly_score = temporal_context.get('anomaly_score', 0.0)
+
+            # Drift at typical time = likely genuine (consistent behavior)
+            if base_analysis.drift_detected and is_typical_time:
+                adjustment['confidence_delta'] = 0.03
+                adjustment['reasoning'] = (
+                    "Voice drift at typical unlock time suggests genuine change, "
+                    "not unauthorized access"
+                )
+
+            # Drift at unusual time = more suspicious
+            elif base_analysis.drift_detected and anomaly_score > 0.7:
+                adjustment['confidence_delta'] = -0.04
+                adjustment['reasoning'] = (
+                    f"Voice drift at unusual time (anomaly: {anomaly_score:.0%}) "
+                    "increases security risk - requires additional verification"
+                )
+
+            # Gradual drift over typical pattern = natural aging
+            elif base_analysis.drift_type == DriftType.GRADUAL and confidence > 0.8:
+                adjustment['confidence_delta'] = 0.02
+                adjustment['reasoning'] = (
+                    "Gradual voice drift following typical patterns indicates "
+                    "natural voice evolution - acceptable"
+                )
+
+        except Exception as e:
+            logger.warning(f"Error analyzing temporal drift: {e}")
+
+        return adjustment
+
+    async def get_drift_confidence_adjustment(
+        self,
+        user_id: str,
+        current_similarity: float,
+        network_context: Optional[Dict] = None,
+        device_context: Optional[Dict] = None,
+        temporal_context: Optional[Dict] = None,
+    ) -> Tuple[float, str]:
+        """
+        Get confidence adjustment for current authentication attempt.
+
+        This is a quick method for real-time authentication that doesn't
+        require full drift analysis. Uses cached baseline and context.
+
+        Args:
+            user_id: User identifier
+            current_similarity: Current voice similarity to baseline
+            network_context: Optional network context
+            device_context: Optional device state
+            temporal_context: Optional temporal pattern
+
+        Returns:
+            Tuple of (confidence_adjustment, reasoning)
+        """
+        adjustment = 0.0
+        reasoning_parts = []
+
+        try:
+            # Check if we have a baseline
+            baseline = await self.get_baseline(user_id)
+            if baseline is None:
+                return 0.0, "No baseline available"
+
+            # Quick drift check from baseline
+            drift_magnitude = 1.0 - current_similarity
+
+            # Base adjustment from drift magnitude
+            if drift_magnitude < 0.03:
+                adjustment += 0.0
+                reasoning_parts.append("minimal drift")
+            elif drift_magnitude < 0.05:
+                adjustment -= 0.02
+                reasoning_parts.append("slight drift")
+            elif drift_magnitude < 0.10:
+                adjustment -= 0.05
+                reasoning_parts.append("moderate drift")
+            else:
+                adjustment -= 0.10
+                reasoning_parts.append("significant drift")
+
+            # Context-aware adjustments
+            if network_context:
+                if network_context.get('ssid_trust_level') == 'trusted':
+                    adjustment += 0.02
+                    reasoning_parts.append("trusted network")
+                elif network_context.get('ssid_trust_level') == 'unknown':
+                    adjustment -= 0.03
+                    reasoning_parts.append("unknown network")
+
+            if device_context:
+                if device_context.get('is_stationary') or device_context.get('is_docked'):
+                    adjustment += 0.02
+                    reasoning_parts.append("device stationary/docked")
+
+            if temporal_context:
+                if temporal_context.get('is_typical_time'):
+                    adjustment += 0.02
+                    reasoning_parts.append("typical time")
+
+            # Clamp adjustment
+            adjustment = max(-0.20, min(0.10, adjustment))
+
+            reasoning = "Drift adjustment: " + ", ".join(reasoning_parts)
+
+            return adjustment, reasoning
+
+        except Exception as e:
+            logger.warning(f"Error getting drift confidence adjustment: {e}")
+            return 0.0, f"Error: {str(e)}"
+
 
 # =============================================================================
 # FACTORY FUNCTIONS

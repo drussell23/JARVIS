@@ -193,6 +193,76 @@ async def _get_drift_detector():
 
 
 # =============================================================================
+# MULTI-FACTOR AUTHENTICATION INTELLIGENCE (v5.0)
+# =============================================================================
+# Lazy imports for contextual intelligence and multi-factor fusion
+_network_context_provider = None
+_unlock_pattern_tracker = None
+_device_state_monitor = None
+_multi_factor_fusion = None
+
+
+async def _get_network_context_provider():
+    """Lazy-load Network Context Provider for WiFi/location awareness."""
+    global _network_context_provider
+    if _network_context_provider is None:
+        try:
+            from intelligence.network_context_provider import get_network_provider
+            _network_context_provider = await get_network_provider()
+            logger.info("✅ Network Context Provider loaded")
+        except ImportError as e:
+            logger.debug(f"Network Context Provider not available: {e}")
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to load Network Context Provider: {e}")
+    return _network_context_provider
+
+
+async def _get_unlock_pattern_tracker():
+    """Lazy-load Unlock Pattern Tracker for temporal behavioral patterns."""
+    global _unlock_pattern_tracker
+    if _unlock_pattern_tracker is None:
+        try:
+            from intelligence.unlock_pattern_tracker import get_pattern_tracker
+            _unlock_pattern_tracker = await get_pattern_tracker()
+            logger.info("✅ Unlock Pattern Tracker loaded")
+        except ImportError as e:
+            logger.debug(f"Unlock Pattern Tracker not available: {e}")
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to load Unlock Pattern Tracker: {e}")
+    return _unlock_pattern_tracker
+
+
+async def _get_device_state_monitor():
+    """Lazy-load Device State Monitor for physical state tracking."""
+    global _device_state_monitor
+    if _device_state_monitor is None:
+        try:
+            from intelligence.device_state_monitor import get_device_monitor
+            _device_state_monitor = await get_device_monitor()
+            logger.info("✅ Device State Monitor loaded")
+        except ImportError as e:
+            logger.debug(f"Device State Monitor not available: {e}")
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to load Device State Monitor: {e}")
+    return _device_state_monitor
+
+
+async def _get_multi_factor_fusion():
+    """Lazy-load Multi-Factor Authentication Fusion Engine."""
+    global _multi_factor_fusion
+    if _multi_factor_fusion is None:
+        try:
+            from intelligence.multi_factor_auth_fusion import get_fusion_engine
+            _multi_factor_fusion = await get_fusion_engine()
+            logger.info("✅ Multi-Factor Auth Fusion Engine loaded")
+        except ImportError as e:
+            logger.debug(f"Multi-Factor Auth Fusion not available: {e}")
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to load Multi-Factor Fusion: {e}")
+    return _multi_factor_fusion
+
+
+# =============================================================================
 # DYNAMIC CONFIGURATION
 # =============================================================================
 class VBIConfig:
@@ -2152,6 +2222,88 @@ class VoiceBiometricIntelligence:
             # Run Bayesian fusion after all evidence is collected
             self._apply_bayesian_fusion(result)
 
+            # =================================================================
+            # MULTI-FACTOR INTELLIGENCE FUSION (v5.0)
+            # =================================================================
+            # Gather and fuse multi-factor intelligence for enhanced decision
+            fusion_engine = await _get_multi_factor_fusion()
+            if fusion_engine and self._config.get('enable_multi_factor_fusion', True):
+                try:
+                    # Gather all intelligence contexts
+                    await emit_progress("multi_factor", 80, "Analyzing contextual intelligence...")
+
+                    intelligence = await self._gather_multi_factor_intelligence(
+                        audio_data=audio_data,
+                        voice_confidence=result.voice_confidence,
+                        voice_reasoning=f"Voice match: {result.voice_confidence:.1%}",
+                        context=context
+                    )
+
+                    if intelligence['fusion_available']:
+                        # Run multi-factor fusion
+                        fusion_result = await fusion_engine.fuse_and_decide(
+                            user_id=self._owner_name or "owner",
+                            voice_confidence=result.voice_confidence,
+                            voice_reasoning=f"Voice verification: {result.voice_confidence:.1%}",
+                            network_context=intelligence.get('network_context'),
+                            temporal_context=intelligence.get('temporal_context'),
+                            device_context=intelligence.get('device_context'),
+                            drift_context=intelligence.get('drift_context')
+                        )
+
+                        # Store multi-factor context in result
+                        result.multi_factor_fusion = fusion_result.to_dict()
+                        result.multi_factor_decision = fusion_result.decision.value
+                        result.multi_factor_confidence = fusion_result.final_confidence
+                        result.risk_score = fusion_result.risk_score
+
+                        # Use multi-factor confidence if higher than base
+                        if fusion_result.final_confidence > result.fused_confidence:
+                            logger.info(
+                                f"Multi-factor fusion boost: "
+                                f"{result.fused_confidence:.1%} → {fusion_result.final_confidence:.1%}"
+                            )
+                            result.confidence = fusion_result.final_confidence
+                            result.fused_confidence = fusion_result.final_confidence
+
+                            # Re-determine level with enhanced confidence
+                            result.level = self._determine_level(result)
+
+                        # Add multi-factor reasoning to result
+                        if not hasattr(result, 'multi_factor_reasoning'):
+                            result.multi_factor_reasoning = fusion_result.reasoning
+
+                        # Record unlock attempt for learning
+                        if fusion_result.should_learn:
+                            # Record in pattern tracker
+                            pattern_tracker = await _get_unlock_pattern_tracker()
+                            if pattern_tracker:
+                                asyncio.create_task(
+                                    pattern_tracker.record_unlock(
+                                        success=True,
+                                        confidence=fusion_result.final_confidence,
+                                        location_type=intelligence.get('network_context', {}).get('ssid_trust_level', 'unknown'),
+                                        network_ssid_hash=intelligence.get('network_context', {}).get('ssid_hash')
+                                    )
+                                )
+
+                            # Record in device monitor
+                            device_monitor = await _get_device_state_monitor()
+                            if device_monitor and intelligence.get('device_context'):
+                                asyncio.create_task(
+                                    device_monitor.record_unlock_attempt(
+                                        success=True,
+                                        confidence=fusion_result.final_confidence,
+                                        device_context=intelligence.get('device_context')
+                                    )
+                                )
+
+                        logger.debug(f"Multi-factor fusion: {fusion_result.decision.value}, risk: {fusion_result.risk_score:.1%}")
+
+                except Exception as e:
+                    logger.warning(f"Multi-factor fusion error: {e}")
+                    # Continue with base verification on error
+
             if result.spoofing_detected:
                 result.level = RecognitionLevel.SPOOFING
                 result.verified = False
@@ -3303,6 +3455,128 @@ class VoiceBiometricIntelligence:
             behavioral.behavioral_confidence = 0.5
 
         return behavioral
+
+    async def _gather_multi_factor_intelligence(
+        self,
+        audio_data: bytes,
+        voice_confidence: float,
+        voice_reasoning: str,
+        context: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """
+        Gather multi-factor intelligence context for enhanced authentication.
+
+        MULTI-FACTOR INTELLIGENCE v5.0:
+        - Network Context: WiFi/location awareness
+        - Temporal Patterns: Time-based behavioral patterns
+        - Device State: Physical device state tracking
+        - Voice Drift: Voice evolution analysis
+
+        Args:
+            audio_data: Raw audio for drift analysis
+            voice_confidence: Base voice biometric confidence
+            voice_reasoning: Voice verification reasoning
+            context: Optional context dict
+
+        Returns:
+            Dict with all intelligence contexts
+        """
+        intelligence = {
+            'network_context': None,
+            'temporal_context': None,
+            'device_context': None,
+            'drift_context': None,
+            'fusion_available': False
+        }
+
+        try:
+            # Gather contexts in parallel
+            tasks = []
+
+            # Network context
+            network_provider = await _get_network_context_provider()
+            if network_provider:
+                tasks.append(('network', network_provider.get_network_context()))
+
+            # Temporal patterns
+            pattern_tracker = await _get_unlock_pattern_tracker()
+            if pattern_tracker:
+                tasks.append(('temporal', pattern_tracker.get_unlock_context()))
+
+            # Device state
+            device_monitor = await _get_device_state_monitor()
+            if device_monitor:
+                tasks.append(('device', device_monitor.get_device_context()))
+
+            # Drift analysis (with voice context)
+            drift_detector = await _get_drift_detector()
+            if drift_detector and self._owner_name:
+                # Get quick drift adjustment
+                drift_task = drift_detector.get_drift_confidence_adjustment(
+                    user_id=self._owner_name,
+                    current_similarity=voice_confidence,
+                    network_context=None,  # Will be filled by fusion engine
+                    device_context=None,
+                    temporal_context=None
+                )
+                tasks.append(('drift', drift_task))
+
+            # Execute all context gathering in parallel
+            if tasks:
+                results = await asyncio.gather(
+                    *[task for _, task in tasks],
+                    return_exceptions=True
+                )
+
+                # Map results back
+                for i, (context_type, _) in enumerate(tasks):
+                    if not isinstance(results[i], Exception):
+                        if context_type == 'network':
+                            network_ctx = results[i]
+                            intelligence['network_context'] = {
+                                'trust_score': network_ctx.trust_score,
+                                'confidence': network_ctx.confidence,
+                                'ssid_trust_level': network_ctx.ssid_trust_level.value,
+                                'reasoning': network_ctx.reasoning,
+                                'connection_stability': network_ctx.connection_stability,
+                                'ssid_hash': network_ctx.ssid_hash
+                            }
+                        elif context_type == 'temporal':
+                            temporal_ctx = results[i]
+                            intelligence['temporal_context'] = {
+                                'confidence': temporal_ctx.confidence,
+                                'is_typical_time': temporal_ctx.is_typical_time,
+                                'anomaly_score': temporal_ctx.anomaly_score,
+                                'reasoning': temporal_ctx.reasoning,
+                                'typical_hours': temporal_ctx.typical_hours,
+                                'current_hour': temporal_ctx.current_hour
+                            }
+                        elif context_type == 'device':
+                            device_ctx = results[i]
+                            intelligence['device_context'] = {
+                                'trust_score': device_ctx.trust_score,
+                                'confidence': device_ctx.confidence,
+                                'state': device_ctx.state.value,
+                                'is_stationary': device_ctx.is_stationary,
+                                'is_docked': device_ctx.is_docked,
+                                'just_woke': device_ctx.just_woke,
+                                'reasoning': device_ctx.reasoning,
+                                'anomaly_indicators': device_ctx.anomaly_indicators
+                            }
+                        elif context_type == 'drift':
+                            adjustment, reasoning = results[i]
+                            intelligence['drift_context'] = {
+                                'confidence_adjustment': adjustment,
+                                'reasoning': reasoning
+                            }
+
+                intelligence['fusion_available'] = True
+                logger.debug("Multi-factor intelligence gathered successfully")
+
+        except Exception as e:
+            logger.warning(f"Error gathering multi-factor intelligence: {e}")
+
+        return intelligence
 
     def _fuse_confidences(self, result: VerificationResult) -> float:
         """
