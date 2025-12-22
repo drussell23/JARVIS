@@ -250,7 +250,11 @@ class JARVISSupervisor:
         self._pending_update_commit: Optional[str] = None  # Commit we just updated to
         self._previous_commit: Optional[str] = None  # Commit we're replacing
         self._dms_rollback_decision: Optional[RollbackDecision] = None  # Pending rollback from DMS
-        
+
+        # v5.0: Intelligence Component Manager - Orchestrates all intelligence providers
+        # Manages: Network Context, Pattern Tracker, Device Monitor, Fusion Engine, Learning Coordinator (RAG+RLHF)
+        self._intelligence_manager: Optional[Any] = None
+
         logger.info(f"🔧 Supervisor initialized (mode: {self.config.mode.value})")
     
     def _find_entry_point(self) -> str:
@@ -328,8 +332,77 @@ class JARVISSupervisor:
             # Register callbacks
             self._dead_man_switch.on_rollback(self._on_dms_rollback)
             self._dead_man_switch.on_stable(self._on_dms_stable)
-            
+
             logger.info("🎯 Dead Man's Switch initialized")
+
+        # v5.0: Initialize Intelligence Component Manager (async/parallel component orchestration)
+        if self._intelligence_manager is None:
+            try:
+                from intelligence.intelligence_component_manager import get_intelligence_manager
+
+                # Create progress callback for unified progress hub integration
+                def intelligence_progress_callback(component_name: str, progress: float):
+                    """Report intelligence component initialization progress."""
+                    if self._progress_hub:
+                        try:
+                            # Map component names to friendly display names
+                            display_names = {
+                                'network_context': 'Network Context Intelligence',
+                                'pattern_tracker': 'Unlock Pattern Intelligence',
+                                'device_monitor': 'Device State Intelligence',
+                                'fusion_engine': 'Multi-Factor Fusion Engine',
+                                'learning_coordinator': 'RAG + RLHF Learning System'
+                            }
+                            display_name = display_names.get(component_name, component_name)
+
+                            # Report to progress hub
+                            if progress >= 1.0:
+                                asyncio.create_task(
+                                    self._progress_hub.component_complete(
+                                        f"intelligence_{component_name}",
+                                        f"{display_name} ready"
+                                    )
+                                )
+                            else:
+                                asyncio.create_task(
+                                    self._progress_hub.component_start(
+                                        f"intelligence_{component_name}",
+                                        display_name
+                                    )
+                                )
+                        except Exception as e:
+                            logger.debug(f"Progress hub update error: {e}")
+
+                # Get intelligence manager with progress callback
+                self._intelligence_manager = await get_intelligence_manager(
+                    progress_callback=intelligence_progress_callback
+                )
+
+                # Initialize all intelligence components (async/parallel)
+                health_status = await self._intelligence_manager.initialize()
+
+                # Log summary
+                summary = self._intelligence_manager.get_summary()
+                logger.info(
+                    f"🧠 Intelligence system initialized: {summary['ready']}/{summary['total_components']} "
+                    f"components ready"
+                )
+
+                # Detailed health status
+                for component_name, health in health_status.items():
+                    status_emoji = {
+                        'ready': '✅',
+                        'degraded': '⚠️',
+                        'failed': '❌',
+                        'initializing': '⏳'
+                    }.get(health['status'], '❓')
+
+                    logger.info(f"  {status_emoji} {component_name}: {health['status']}")
+
+            except Exception as e:
+                logger.warning(f"⚠️ Intelligence Component Manager initialization failed: {e}")
+                # Continue without intelligence - graceful degradation
+                self._intelligence_manager = None
     
     # Browser lock file - shared with run_supervisor.py
     BROWSER_LOCK_FILE = Path("/tmp/jarvis_browser.lock")
@@ -2472,6 +2545,14 @@ class JARVISSupervisor:
                     logger.debug("🎯 Dead Man's Switch closed")
                 except Exception as e:
                     logger.debug(f"Dead Man's Switch cleanup error: {e}")
+
+            # v5.0: Cleanup Intelligence Component Manager
+            if self._intelligence_manager:
+                try:
+                    await self._intelligence_manager.shutdown()
+                    logger.info("🧠 Intelligence Component Manager shutdown complete")
+                except Exception as e:
+                    logger.debug(f"Intelligence Component Manager cleanup error: {e}")
 
             for task in tasks:
                 task.cancel()

@@ -200,6 +200,7 @@ _network_context_provider = None
 _unlock_pattern_tracker = None
 _device_state_monitor = None
 _multi_factor_fusion = None
+_learning_coordinator = None
 
 
 async def _get_network_context_provider():
@@ -260,6 +261,21 @@ async def _get_multi_factor_fusion():
         except Exception as e:
             logger.warning(f"⚠️ Failed to load Multi-Factor Fusion: {e}")
     return _multi_factor_fusion
+
+
+async def _get_learning_coordinator():
+    """Lazy-load Intelligence Learning Coordinator for RAG + RLHF."""
+    global _learning_coordinator
+    if _learning_coordinator is None:
+        try:
+            from intelligence.intelligence_learning_coordinator import get_learning_coordinator
+            _learning_coordinator = await get_learning_coordinator()
+            logger.info("✅ Intelligence Learning Coordinator loaded (RAG + RLHF)")
+        except ImportError as e:
+            logger.debug(f"Learning Coordinator not available: {e}")
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to load Learning Coordinator: {e}")
+    return _learning_coordinator
 
 
 # =============================================================================
@@ -2239,6 +2255,32 @@ class VoiceBiometricIntelligence:
                         context=context
                     )
 
+                    # =============================================================
+                    # RAG CONTEXT: Retrieve similar authentication patterns (v5.0)
+                    # =============================================================
+                    learning_coordinator = await _get_learning_coordinator()
+                    if learning_coordinator and intelligence.get('fusion_available'):
+                        try:
+                            rag_context = await learning_coordinator.get_rag_context(
+                                user_id=self._owner_name or "owner",
+                                network_context=intelligence.get('network_context', {}),
+                                temporal_context=intelligence.get('temporal_context', {}),
+                                device_context=intelligence.get('device_context', {})
+                            )
+
+                            # Add RAG insights to intelligence
+                            intelligence['rag_context'] = rag_context
+
+                            # Use RAG context to adjust confidence if similar contexts exist
+                            if rag_context['similar_contexts']:
+                                rag_avg_conf = rag_context['avg_confidence']
+                                logger.info(
+                                    f"RAG: Found {len(rag_context['similar_contexts'])} similar contexts, "
+                                    f"avg confidence: {rag_avg_conf:.1%}"
+                                )
+                        except Exception as e:
+                            logger.warning(f"RAG context error: {e}")
+
                     if intelligence['fusion_available']:
                         # Run multi-factor fusion
                         fusion_result = await fusion_engine.fuse_and_decide(
@@ -2323,6 +2365,44 @@ class VoiceBiometricIntelligence:
                     self._stats['successful_verifications'] += 1
                 else:
                     self._stats['failed_verifications'] += 1
+
+            # =================================================================
+            # LEARNING COORDINATOR: Record authentication for RAG + RLHF (v5.0)
+            # =================================================================
+            learning_coordinator = await _get_learning_coordinator()
+            if learning_coordinator and intelligence.get('fusion_available'):
+                try:
+                    # Determine outcome
+                    from intelligence.intelligence_learning_coordinator import AuthOutcome
+                    if result.verified:
+                        outcome = AuthOutcome.SUCCESS
+                    elif result.level == RecognitionLevel.BORDERLINE:
+                        outcome = AuthOutcome.CHALLENGED
+                    else:
+                        outcome = AuthOutcome.FAILURE
+
+                    # Record authentication for learning
+                    record_id = await learning_coordinator.record_authentication(
+                        user_id=self._owner_name or "owner",
+                        outcome=outcome,
+                        voice_confidence=result.voice_confidence,
+                        voice_embedding=embedding_for_cost_tracking if embedding_for_cost_tracking is not None else None,
+                        network_context=intelligence.get('network_context', {}),
+                        temporal_context=intelligence.get('temporal_context', {}),
+                        device_context=intelligence.get('device_context', {}),
+                        drift_adjustment=intelligence.get('drift_context', {}).get('confidence_adjustment', 0.0),
+                        final_confidence=result.fused_confidence,
+                        risk_score=getattr(result, 'risk_score', 0.0),
+                        decision=result.multi_factor_decision if hasattr(result, 'multi_factor_decision') else result.level.value
+                    )
+
+                    # Store record ID for potential RLHF feedback
+                    result.learning_record_id = record_id
+
+                    logger.debug(f"Recorded authentication for learning: record_id={record_id}")
+
+                except Exception as e:
+                    logger.warning(f"Error recording authentication for learning: {e}")
 
             # Determine verification method
             result.verification_method = self._determine_method(result)
