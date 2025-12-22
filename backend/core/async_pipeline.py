@@ -1821,9 +1821,9 @@ class AdvancedAsyncPipeline:
                         scenario_analysis=scenario_analysis
                     ),
                     timeout=15.0
-            )
+                )
 
-            if not unlock_result.get("success", False):
+                if not unlock_result.get("success", False):
                     logger.warning(f"❌ [PROACTIVE-CAI] Unlock execution failed: {unlock_result.get('message', 'Unknown')}")
                     await broadcast_progress(
                         "error", 

@@ -28,7 +28,8 @@ async def check_status():
         print(f"{Colors.GREEN}✅ Swift is available{Colors.ENDC}")
         # Get Swift version
         result = subprocess.run(["swift", "--version"], capture_output=True, text=True)
-        print(f"   {result.stdout.strip().split('\\n')[0]}")
+        version_line = result.stdout.strip().split('\n')[0]
+        print(f"   {version_line}")
     else:
         print(f"{Colors.YELLOW}⚠️  Swift not available{Colors.ENDC}")
     

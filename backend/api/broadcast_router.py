@@ -407,13 +407,6 @@ def get_routers():
     """Get all routers to include in the FastAPI app."""
     return [broadcast_router, alt_router]
 
-            
-    except WebSocketDisconnect:
-        await manager.disconnect(websocket)
-    except Exception as e:
-        logger.debug(f"WebSocket error: {e}")
-        await manager.disconnect(websocket)
-
 
 # ==============================================================================
 # Alternative Endpoint (for compatibility)

@@ -1161,7 +1161,7 @@ class JARVISSupervisor:
                         # Even if ML models are still warming up, user can interact
                         logger.info(f"✅ Backend + Frontend ready after {elapsed:.1f}s - completing")
                         logger.debug(f"   Services: ready={services_ready}, failed={services_failed}")
-                            ready_for_completion = True
+                        ready_for_completion = True
 
                     # ═══════════════════════════════════════════════════════════════════
                     # FALLBACK 4: Last resort timeout (after adaptive_timeout * 1.2)
@@ -1189,9 +1189,9 @@ class JARVISSupervisor:
                         )
                         
                         if is_actually_ready:
-                        logger.warning(f"⏰ Extended timeout ({elapsed:.0f}s) - completing with available services")
+                            logger.warning(f"⏰ Extended timeout ({elapsed:.0f}s) - completing with available services")
                             logger.warning(f"   Status: {backend_status}, Services: {services_ready}, Progress: {current_progress}%")
-                        ready_for_completion = True
+                            ready_for_completion = True
                         else:
                             # System is NOT actually ready - log but DON'T declare complete
                             # This prevents the "JARVIS is ready" announcement when it's clearly not
@@ -1296,9 +1296,9 @@ class JARVISSupervisor:
                             )
                         else:
                             # Fallback to narrator only
-                        await self._startup_narrator.announce_complete(
-                            duration_seconds=duration,
-                        )
+                            await self._startup_narrator.announce_complete(
+                                duration_seconds=duration,
+                            )
 
                         # ═══════════════════════════════════════════════════════════════════
                         # CRITICAL: Signal to reload manager that startup is complete
@@ -1617,7 +1617,7 @@ class JARVISSupervisor:
                 topic=SpeechTopic.ZERO_TOUCH,
             )
         else:
-        await self._narrator.narrate(NarratorEvent.UPDATE_STARTING, wait=True)
+            await self._narrator.narrate(NarratorEvent.UPDATE_STARTING, wait=True)
         
         if not self._update_engine:
             logger.error("❌ Update engine not initialized")
@@ -1692,7 +1692,7 @@ class JARVISSupervisor:
                         files_validated = result.validation_report.files_checked
                         logger.info(f"   Validated: {files_validated} files")
                 else:
-                logger.info("✅ Update applied successfully")
+                    logger.info("✅ Update applied successfully")
                 
                 # ═══════════════════════════════════════════════════════════════════
                 # DEAD MAN'S SWITCH: Set up post-update probation
@@ -1721,11 +1721,11 @@ class JARVISSupervisor:
                             files_checked=files_validated,
                         )
                 else:
-                await self._narrator.narrate(
-                    NarratorEvent.UPDATE_COMPLETE,
-                    version=version,
-                    wait=True,
-                )
+                    await self._narrator.narrate(
+                        NarratorEvent.UPDATE_COMPLETE,
+                        version=version,
+                        wait=True,
+                    )
                 
                 # Note: crash count reset moved to _on_dms_stable callback
                 # We only reset after probation passes
@@ -1753,7 +1753,7 @@ class JARVISSupervisor:
                         error=error_msg,
                     )
                 else:
-                await self._narrator.narrate(NarratorEvent.UPDATE_FAILED)
+                    await self._narrator.narrate(NarratorEvent.UPDATE_FAILED)
                 
                 self._is_post_update = False
                 return False
@@ -2123,8 +2123,8 @@ class JARVISSupervisor:
                                         await self._narrator.narrate(NarratorEvent.UPDATE_DEFERRED)
                             else:
                                 # Standard silent update (requires confirmation or already approved)
-                            logger.info("😴 System idle with update available - requesting silent update")
-                            self._update_requested.set()
+                                logger.info("😴 System idle with update available - requesting silent update")
+                                self._update_requested.set()
                 
             except asyncio.CancelledError:
                 break

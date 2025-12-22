@@ -1548,7 +1548,6 @@ async def transcribe_with_whisper(
         sample_rate=sample_rate,
         mode=mode
     )
-            return None
 
 # Global instance
 _whisper_handler = WhisperAudioHandler()

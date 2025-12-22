@@ -2916,15 +2916,3 @@ async def verify_speaker_cloud(
         threshold=threshold
     )
 
-        threshold: Verification threshold
-
-    Returns:
-        Verification result
-    """
-    client = await get_cloud_ecapa_client()
-    return await client.verify_speaker(
-        audio_data,
-        reference_embedding,
-        sample_rate,
-        threshold=threshold
-    )

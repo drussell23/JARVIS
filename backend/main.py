@@ -279,31 +279,31 @@ _DEFERRED_DEBUG_TASKS = []
 
 def _run_deferred_coordinate_diagnostic():
     """Run coordinate diagnostic in background - deferred from module load"""
-try:
-    from pathlib import Path as _DebugPath
+    try:
+        from pathlib import Path as _DebugPath
         _project_root = _DebugPath(__file__).resolve().parent.parent
-    _diag_script = _project_root / "diagnose_coordinate_doubling.py"
+        _diag_script = _project_root / "diagnose_coordinate_doubling.py"
 
-    if _diag_script.exists():
+        if _diag_script.exists():
             print("[STARTUP-DEBUG] Running coordinate diagnostic (deferred)...")
-        exec(_diag_script.read_text())
-except Exception as e:
-    print(f"[STARTUP-DEBUG] Coordinate diagnostic failed: {e}")
+            exec(_diag_script.read_text())
+    except Exception as e:
+        print(f"[STARTUP-DEBUG] Coordinate diagnostic failed: {e}")
 
 def _run_deferred_pyautogui_intercept():
     """Install PyAutoGUI intercept in background - deferred from module load"""
-try:
-    from pathlib import Path as _IntPath
-    _project_root = _IntPath(__file__).resolve().parent.parent
+    try:
+        from pathlib import Path as _IntPath
+        _project_root = _IntPath(__file__).resolve().parent.parent
 
-    if str(_project_root) not in sys.path:
-        sys.path.insert(0, str(_project_root))
+        if str(_project_root) not in sys.path:
+            sys.path.insert(0, str(_project_root))
 
-    import pyautogui_intercept
-    pyautogui_intercept.install_intercept()
+        import pyautogui_intercept
+        pyautogui_intercept.install_intercept()
         print("[STARTUP-DEBUG] ✅ PyAutoGUI intercept installed (deferred)")
-except Exception as e:
-    print(f"[STARTUP-DEBUG] PyAutoGUI intercept failed: {e}")
+    except Exception as e:
+        print(f"[STARTUP-DEBUG] PyAutoGUI intercept failed: {e}")
 
 # Queue for background execution
 _DEFERRED_DEBUG_TASKS.append(_run_deferred_coordinate_diagnostic)

@@ -62,7 +62,9 @@ class NLPEngine:
         """Initialize NLP components"""
         # Load spaCy model for entity recognition
         try:
-            self.nlp =         except:
+            import spacy
+            self.nlp = spacy.load("en_core_web_sm")
+        except Exception:
             # Fallback if spacy model not installed
             self.nlp = None
             print("Warning: spaCy model not found. Entity extraction will be limited.")

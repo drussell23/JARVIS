@@ -9,7 +9,8 @@ os.environ['USE_TF'] = '0'     # Disable TensorFlow in transformers
 
 # Apply TensorFlow fixes
 try:
-        if not hasattr(tf, 'data'):
+    import tensorflow as tf
+    if not hasattr(tf, 'data'):
         # Create a mock data module to prevent import errors
         class MockData:
             class Dataset:
@@ -17,7 +18,7 @@ try:
                 def from_tensor_slices(*args, **kwargs):
                     return None
         tf.data = MockData()
-except:
+except Exception:
     pass  # TensorFlow not required for core functionality
 
 from fastapi import FastAPI, APIRouter, BackgroundTasks, HTTPException, UploadFile, File
