@@ -2105,29 +2105,18 @@ class SupervisorBootstrapper:
             else:
                 print(f"  {TerminalUI.GREEN}✓ Loading server ready at {loading_url}{TerminalUI.RESET}")
             
-            # Step 3: Open Chrome Incognito window
+            # Step 3: Intelligent Chrome window management
+            # - Check for existing JARVIS window (localhost:3000, :3001, :8010)
+            # - If found, redirect to loading page (no new window)
+            # - Only create new window if none exists
             if platform.system() == "Darwin":  # macOS
                 try:
-                    # Use macOS 'open' command to launch Chrome in Incognito mode
-                    # This is non-blocking and matches what start_system.py does
-                    open_cmd = [
-                        "open",
-                        "-na",
-                        "Google Chrome",
-                        "--args",
-                        "--incognito",
-                        "--new-window",
-                        loading_url
-                    ]
-                    
-                    await asyncio.create_subprocess_exec(
-                        *open_cmd,
-                        stdout=asyncio.subprocess.DEVNULL,
-                        stderr=asyncio.subprocess.DEVNULL
-                    )
-                    
-                    print(f"  {TerminalUI.GREEN}✓ Chrome Incognito opened to loading page{TerminalUI.RESET}")
-                    
+                    opened = await self._open_or_reuse_browser(loading_url)
+                    if opened:
+                        print(f"  {TerminalUI.GREEN}✓ Chrome ready for loading page{TerminalUI.RESET}")
+                    else:
+                        print(f"  {TerminalUI.YELLOW}⚠️  Could not open Chrome automatically{TerminalUI.RESET}")
+                        print(f"  {TerminalUI.CYAN}💡 Open manually: {loading_url}{TerminalUI.RESET}")
                 except Exception as e:
                     self.logger.debug(f"Failed to open Chrome: {e}")
                     print(f"  {TerminalUI.YELLOW}⚠️  Could not open Chrome automatically{TerminalUI.RESET}")
@@ -2146,6 +2135,145 @@ class SupervisorBootstrapper:
             self.logger.exception(f"Failed to start loading page ecosystem: {e}")
             print(f"  {TerminalUI.YELLOW}⚠️  Loading page failed: {e}{TerminalUI.RESET}")
             print(f"  {TerminalUI.CYAN}💡 JARVIS will start without loading page{TerminalUI.RESET}")
+
+    async def _find_existing_jarvis_window(self) -> bool:
+        """
+        Check if there's an existing Chrome incognito window with a JARVIS URL.
+        
+        Uses AppleScript to search all Chrome incognito windows for tabs
+        containing JARVIS-related URLs (localhost:3000, :3001, :8010).
+        
+        Returns:
+            True if found, False otherwise
+        """
+        try:
+            applescript = '''
+            tell application "Google Chrome"
+                set jarvisPatterns to {"localhost:3000", "localhost:3001", "localhost:8010", "127.0.0.1:3000", "127.0.0.1:3001"}
+                repeat with w in windows
+                    if mode of w is "incognito" then
+                        repeat with t in tabs of w
+                            set tabURL to URL of t
+                            repeat with pattern in jarvisPatterns
+                                if tabURL contains pattern then
+                                    return true
+                                end if
+                            end repeat
+                        end repeat
+                    end if
+                end repeat
+                return false
+            end tell
+            '''
+            process = await asyncio.create_subprocess_exec(
+                "/usr/bin/osascript", "-e", applescript,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await process.communicate()
+            return stdout.decode().strip().lower() == "true"
+        except Exception as e:
+            self.logger.debug(f"Could not check for existing window: {e}")
+            return False
+
+    async def _redirect_existing_window(self, url: str) -> bool:
+        """
+        Redirect an existing Chrome incognito window with JARVIS URL to a new URL.
+        
+        This allows seamless transitions between loading page and main app,
+        or restarting without creating new windows.
+        
+        Args:
+            url: The URL to navigate to
+            
+        Returns:
+            True if successfully redirected, False otherwise
+        """
+        try:
+            applescript = f'''
+            tell application "Google Chrome"
+                set jarvisPatterns to {{"localhost:3000", "localhost:3001", "localhost:8010", "127.0.0.1:3000", "127.0.0.1:3001"}}
+                repeat with w in windows
+                    if mode of w is "incognito" then
+                        repeat with t in tabs of w
+                            set tabURL to URL of t
+                            repeat with pattern in jarvisPatterns
+                                if tabURL contains pattern then
+                                    set URL of t to "{url}"
+                                    set active tab index of w to (index of t)
+                                    set index of w to 1
+                                    activate
+                                    return true
+                                end if
+                            end repeat
+                        end repeat
+                    end if
+                end repeat
+                return false
+            end tell
+            '''
+            process = await asyncio.create_subprocess_exec(
+                "/usr/bin/osascript", "-e", applescript,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await process.communicate()
+            return stdout.decode().strip().lower() == "true"
+        except Exception as e:
+            self.logger.debug(f"Could not redirect existing window: {e}")
+            return False
+
+    async def _open_or_reuse_browser(self, url: str) -> bool:
+        """
+        Intelligently open or reuse a Chrome browser for JARVIS.
+        
+        Strategy:
+        1. Check for existing JARVIS incognito window
+        2. If found, redirect it to the new URL (no new window)
+        3. If not found, create a new incognito window
+        
+        This ensures:
+        - Only ONE browser window for JARVIS
+        - Seamless restarts (reuse existing window)
+        - Clean first-time startup
+        
+        Args:
+            url: The URL to open/navigate to
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            # First, check for existing JARVIS window
+            existing_found = await self._find_existing_jarvis_window()
+            
+            if existing_found:
+                # Redirect existing window to new URL
+                redirected = await self._redirect_existing_window(url)
+                if redirected:
+                    self.logger.info(f"🔄 Reused existing JARVIS window → {url}")
+                    return True
+                else:
+                    self.logger.debug("Redirect failed, will create new window")
+            
+            # No existing window or redirect failed - create new incognito window
+            process = await asyncio.create_subprocess_exec(
+                "/usr/bin/open", "-na", "Google Chrome",
+                "--args", "--incognito", "--new-window", url,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await process.wait()
+            
+            if existing_found:
+                self.logger.info(f"🌐 Opened new loading page (redirect failed): {url}")
+            else:
+                self.logger.info(f"🌐 Opened new Chrome incognito: {url}")
+            return True
+            
+        except Exception as e:
+            self.logger.warning(f"⚠️ Could not open browser: {e}")
+            return False
     
     async def _broadcast_to_loading_page(
         self,

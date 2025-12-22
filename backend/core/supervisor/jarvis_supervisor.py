@@ -519,9 +519,15 @@ class JARVISSupervisor:
                 )
                 # NOTE: Don't announce SUPERVISOR_INIT here - run() already did it via _narrator
 
-                # Open browser to loading page (only on first start)
-                if self.stats.total_starts == 0:
+                # Open browser to loading page (only on first start AND if not already opened)
+                # CRITICAL: Check JARVIS_SUPERVISOR_LOADING env var - if set, run_supervisor.py 
+                # already opened the browser, so we should NOT open another one.
+                supervisor_already_opened = os.environ.get("JARVIS_SUPERVISOR_LOADING") == "1"
+                
+                if self.stats.total_starts == 0 and not supervisor_already_opened:
                     await self._open_loading_page()
+                elif supervisor_already_opened:
+                    logger.debug("📡 Browser already opened by run_supervisor.py, skipping")
 
             except Exception as e:
                 logger.warning(f"⚠️ Loading page unavailable: {e}")
