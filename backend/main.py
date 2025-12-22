@@ -3849,48 +3849,86 @@ async def health_ready():
     # ═══════════════════════════════════════════════════════════════════════════
     # CHECK 4: WebSocket System (CRITICAL for frontend communication)
     # ═══════════════════════════════════════════════════════════════════════════
-    # v2.0: More robust WebSocket check that doesn't try to create the manager
-    # The manager should already be created during FastAPI startup when the 
-    # router is mounted. If it's not created yet, WebSocket isn't ready.
+    # v3.0: Robust, fail-safe WebSocket check with intelligent state detection
+    # 
+    # Strategy:
+    # 1. Try to import the WebSocket module - import failure = definitely not ready
+    # 2. Check if manager singleton exists (lazy init means it's created on first use)
+    # 3. Verify route registration as secondary confirmation
+    # 4. On ANY error, mark as FAILED (fail-safe, never assume ready on error)
+    #
+    # The manager is created lazily on first WebSocket connection, so we also
+    # check route registration which happens at startup.
+    # ═══════════════════════════════════════════════════════════════════════════
     websocket_ready = False
+    websocket_check_method = "unknown"
+    
     try:
-        # Check if the WebSocket manager singleton already exists
-        # Don't use get_ws_manager() as it would create one if not exists
-        from api.unified_websocket import _ws_manager as existing_ws_manager
+        # Step 1: Verify module can be imported (catches broken dependencies)
+        import api.unified_websocket as ws_module
+        
+        # Step 2: Check if the manager singleton already exists
+        # Access the module's private variable directly (don't call get_ws_manager which creates it)
+        existing_ws_manager = getattr(ws_module, '_ws_manager', None)
         
         if existing_ws_manager is not None:
+            # Manager exists - WebSocket is definitely operational
             details["websocket_ready"] = True
             websocket_ready = True
+            websocket_check_method = "manager_exists"
             critical_services_ready.append("websocket")
+            
             # Store in app.state for other components
             app.state.unified_websocket_manager = existing_ws_manager
             
-            # Also check if any connections are active (optional extra check)
-            active_connections = len(existing_ws_manager.connections) if hasattr(existing_ws_manager, 'connections') else 0
-            details["websocket_connections"] = active_connections
+            # Collect connection stats for observability
+            if hasattr(existing_ws_manager, 'connections'):
+                details["websocket_connections"] = len(existing_ws_manager.connections)
+            if hasattr(existing_ws_manager, 'metrics'):
+                metrics = existing_ws_manager.metrics
+                details["websocket_total_connections"] = metrics.get("total_connections", 0)
+                details["websocket_uptime"] = time.time() - metrics.get("uptime_start", time.time())
         else:
-            # WebSocket manager not yet created - check if the route is registered
-            # The route being registered means WebSocket can accept connections
-            ws_routes = [route for route in app.routes if hasattr(route, 'path') and '/ws' in route.path]
+            # Manager not yet created (lazy init) - check if route is registered
+            # Route registration happens at app startup, so this is reliable
+            ws_routes = []
+            for route in app.routes:
+                route_path = getattr(route, 'path', '')
+                if '/ws' in route_path:
+                    ws_routes.append(route_path)
+            
             if ws_routes:
-                # Route exists, so WebSocket endpoint is available
-                # Mark as ready since the route can accept connections
+                # Routes exist - WebSocket endpoint is registered and can accept connections
+                # The manager will be created on first connection
                 details["websocket_ready"] = True
-                details["websocket_note"] = "Route registered, manager lazy-init"
+                details["websocket_routes"] = ws_routes[:3]  # Show up to 3 routes
+                details["websocket_note"] = "Routes registered, manager lazy-init"
                 websocket_ready = True
+                websocket_check_method = "route_registered"
                 critical_services_ready.append("websocket")
             else:
+                # No routes registered - WebSocket is NOT available
                 details["websocket_ready"] = False
-                details["websocket_note"] = "Route not registered"
+                details["websocket_note"] = "No WebSocket routes registered"
+                websocket_check_method = "no_routes"
                 critical_services_failed.append("websocket")
+                
+    except ImportError as e:
+        # Module import failed - WebSocket is definitely NOT ready
+        details["websocket_ready"] = False
+        details["websocket_error"] = f"Import failed: {str(e)[:100]}"
+        websocket_check_method = "import_failed"
+        critical_services_failed.append("websocket")
+        
     except Exception as e:
-        # On any error, still mark WebSocket as ready if we're running in FastAPI
-        # The WebSocket route is registered during app startup, so it should work
-        details["websocket_ready"] = True
-        details["websocket_note"] = "Assumed ready (error checking state)"
-        details["websocket_check_error"] = str(e)[:50]
-        websocket_ready = True
-        critical_services_ready.append("websocket")
+        # Any other error - mark as FAILED (fail-safe, never assume ready on error)
+        details["websocket_ready"] = False
+        details["websocket_error"] = f"Check failed: {str(e)[:100]}"
+        websocket_check_method = "check_error"
+        critical_services_failed.append("websocket")
+    
+    # Record the check method for debugging
+    details["websocket_check_method"] = websocket_check_method
 
     # ═══════════════════════════════════════════════════════════════════════════
     # CHECK 5: Database Connection (IMPORTANT for persistence)
