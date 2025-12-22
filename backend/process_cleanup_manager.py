@@ -5982,8 +5982,8 @@ def prevent_multiple_jarvis_instances(auto_cleanup: bool = True, max_retries: in
 
         # Step 3: Check for existing JARVIS processes and port conflicts
         for attempt in range(max_retries):
-        jarvis_processes = manager._find_jarvis_processes()
-        other_processes = [p for p in jarvis_processes if p["pid"] != current_pid]
+            jarvis_processes = manager._find_jarvis_processes()
+            other_processes = [p for p in jarvis_processes if p["pid"] != current_pid]
 
             if not other_processes:
                 # No conflicts
@@ -6036,11 +6036,11 @@ def prevent_multiple_jarvis_instances(auto_cleanup: bool = True, max_retries: in
                     
                 else:
                     # Max retries exceeded or auto_cleanup disabled
-                return (
-                    False,
+                    return (
+                        False,
                         f"JARVIS instance already running on port {target_port} (PIDs: {port_conflict_pids}). "
                         f"Use --emergency-cleanup to force restart.",
-                )
+                    )
             else:
                 # Other processes exist but no port conflict
                 return (
