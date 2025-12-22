@@ -19345,27 +19345,52 @@ if __name__ == "__main__":
         except Exception as e:
             logger.debug(f"PyTorch cleanup: {e}")
         
-        # 2. aiohttp connection cleanup
+        # 2. aiohttp connection cleanup - find and close ALL unclosed sessions
         try:
             import aiohttp
-            # Close any default connectors
-            if hasattr(aiohttp, 'TCPConnector'):
-                connector = getattr(aiohttp, '_default_connector', None)
-                if connector:
+            import gc
+
+            # Find all unclosed ClientSession instances via garbage collector
+            unclosed_sessions = []
+            for obj in gc.get_objects():
+                try:
+                    if isinstance(obj, aiohttp.ClientSession) and not obj.closed:
+                        unclosed_sessions.append(obj)
+                except (ReferenceError, TypeError):
+                    pass  # Object was collected or can't be checked
+
+            if unclosed_sessions:
+                # Get or create event loop for async cleanup
+                try:
+                    loop = asyncio.get_event_loop()
+                    if loop.is_closed():
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+                except RuntimeError:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+
+                # Close each unclosed session
+                closed_count = 0
+                for session in unclosed_sessions:
                     try:
-                        if asyncio.iscoroutinefunction(connector.close):
-                            loop = asyncio.get_event_loop()
-                            if not loop.is_closed():
-                                loop.run_until_complete(connector.close())
-                        else:
-                            connector.close()
-                    except:
+                        if not session.closed:
+                            loop.run_until_complete(session.close())
+                            closed_count += 1
+                    except Exception:
                         pass
-            print(f"   ├─ {Colors.GREEN}✓ aiohttp cleanup complete{Colors.ENDC}")
+
+                if closed_count > 0:
+                    print(f"   ├─ {Colors.GREEN}✓ aiohttp cleanup complete ({closed_count} sessions closed){Colors.ENDC}")
+                else:
+                    print(f"   ├─ {Colors.GREEN}✓ aiohttp cleanup complete{Colors.ENDC}")
+            else:
+                print(f"   ├─ {Colors.GREEN}✓ aiohttp cleanup complete{Colors.ENDC}")
         except ImportError:
             pass
         except Exception as e:
             logger.debug(f"aiohttp cleanup: {e}")
+            print(f"   ├─ {Colors.GREEN}✓ aiohttp cleanup complete{Colors.ENDC}")
         
         # 3. Intelligent Library-Specific Thread Cleanup
         # ═══════════════════════════════════════════════════════════════
@@ -19405,41 +19430,61 @@ if __name__ == "__main__":
             logger.debug(f"PyTorch cleanup: {e}")
             print(f"   │  ├─ {Colors.YELLOW}⚠ PyTorch cleanup partial: {e}{Colors.ENDC}")
         
-        # Phase 2: Shutdown database connection pools
+        # Phase 2: Shutdown database connection pools and connection manager
         db_shutdown_success = False
+        pools_closed = 0
         try:
-            # SQLite connection pools
-            import sqlite3
-            # SQLite doesn't have global pools, connections are file-based
-            
-            # SQLAlchemy pools (if used)
+            # Close CloudSQL Connection Manager (singleton pattern)
             try:
-                from sqlalchemy import event
-                from sqlalchemy.pool import Pool
-                # Dispose all pools
-                for attr in dir():
-                    obj = locals().get(attr)
-                    if isinstance(obj, Pool):
-                        obj.dispose()
+                from intelligence.cloud_sql_connection_manager import get_connection_manager
+                manager = get_connection_manager()
+                if manager and manager.pool and not manager.is_shutting_down:
+                    # Get or create event loop for async shutdown
+                    try:
+                        loop = asyncio.get_event_loop()
+                        if loop.is_closed():
+                            loop = asyncio.new_event_loop()
+                            asyncio.set_event_loop(loop)
+                    except RuntimeError:
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+
+                    loop.run_until_complete(manager.shutdown())
+                    pools_closed += 1
             except ImportError:
                 pass
-            
-            # aiosqlite pools
-            try:
-                import aiosqlite
-                # aiosqlite manages connections per-context, no global pool
-            except ImportError:
-                pass
-            
-            # asyncpg pools
+            except Exception as e:
+                logger.debug(f"CloudSQL manager shutdown: {e}")
+
+            # Find and close any asyncpg pools via garbage collector
             try:
                 import asyncpg
-                # asyncpg pools need explicit close
+                import gc
+
+                for obj in gc.get_objects():
+                    try:
+                        if isinstance(obj, asyncpg.Pool) and not obj._closed:
+                            try:
+                                loop = asyncio.get_event_loop()
+                                if loop.is_closed():
+                                    loop = asyncio.new_event_loop()
+                                    asyncio.set_event_loop(loop)
+                            except RuntimeError:
+                                loop = asyncio.new_event_loop()
+                                asyncio.set_event_loop(loop)
+
+                            loop.run_until_complete(obj.close())
+                            pools_closed += 1
+                    except (ReferenceError, TypeError, AttributeError):
+                        pass
             except ImportError:
                 pass
-            
+
             db_shutdown_success = True
-            print(f"   │  ├─ {Colors.GREEN}✓ Database pools disposed{Colors.ENDC}")
+            if pools_closed > 0:
+                print(f"   │  ├─ {Colors.GREEN}✓ Database pools disposed ({pools_closed} pools closed){Colors.ENDC}")
+            else:
+                print(f"   │  ├─ {Colors.GREEN}✓ Database pools disposed{Colors.ENDC}")
         except Exception as e:
             logger.debug(f"Database cleanup: {e}")
             print(f"   │  ├─ {Colors.YELLOW}⚠ Database cleanup partial: {e}{Colors.ENDC}")

@@ -93,6 +93,24 @@ except ImportError:
     except ImportError:
         pass
 
+# v5.0: Cloud SQL Proxy Detector for intelligent proxy availability detection
+PROXY_DETECTOR_AVAILABLE = False
+try:
+    from intelligence.cloud_sql_proxy_detector import (
+        get_proxy_detector,
+        ProxyStatus,
+    )
+    PROXY_DETECTOR_AVAILABLE = True
+except ImportError:
+    try:
+        from backend.intelligence.cloud_sql_proxy_detector import (
+            get_proxy_detector,
+            ProxyStatus,
+        )
+        PROXY_DETECTOR_AVAILABLE = True
+    except ImportError:
+        pass
+
 logger = logging.getLogger(__name__)
 
 # Type variable for generic async operations
@@ -1073,12 +1091,34 @@ class CloudSQLConnectionManager:
                 logger.debug(f"Leak callback error: {e}")
 
     async def _health_check_loop(self) -> None:
-        """Periodic health check of the connection pool."""
+        """Periodic health check of the connection pool with intelligent proxy detection."""
+        # v5.0: Get proxy detector for intelligent health checking
+        proxy_detector = get_proxy_detector() if PROXY_DETECTOR_AVAILABLE else None
+
         while not self.is_shutting_down:
             try:
-                await asyncio.sleep(60.0)  # Check every minute
+                # v5.0: Use intelligent delay based on proxy status
+                if proxy_detector and not self.pool:
+                    delay = proxy_detector.get_next_retry_delay()
+                else:
+                    delay = 60.0  # Standard 60-second health check when pool exists
+
+                await asyncio.sleep(delay)
                 if self.is_shutting_down:
                     break
+
+                # v5.0: Check proxy availability before attempting health check
+                if proxy_detector:
+                    proxy_status, proxy_info = await proxy_detector.detect_proxy()
+
+                    if proxy_status == ProxyStatus.UNAVAILABLE:
+                        # Proxy not available - skip health check silently
+                        # (already logged by hybrid_database_sync)
+                        if not proxy_detector.should_retry():
+                            # Local dev mode - stop checking entirely
+                            continue
+                        # Otherwise, just skip this iteration (will retry with backoff)
+                        continue
 
                 if self.pool:
                     try:
@@ -1088,9 +1128,18 @@ class CloudSQLConnectionManager:
                                 timeout=5.0
                             )
                         self.metrics.healthy_connections += 1
-                    except Exception:
+                    except Exception as e:
                         self.metrics.unhealthy_connections += 1
-                        logger.warning("⚠️ Health check failed - pool may be degraded")
+                        # v5.0: Only log warning if proxy is supposed to be available
+                        if proxy_detector:
+                            proxy_status, _ = await proxy_detector.detect_proxy()
+                            if proxy_status == ProxyStatus.AVAILABLE:
+                                logger.warning("⚠️ Health check failed - pool may be degraded")
+                            # If proxy unavailable, don't spam warnings
+                        else:
+                            # No proxy detector - use legacy behavior
+                            if not self._should_suppress_error():
+                                logger.warning("⚠️ Health check failed - pool may be degraded")
 
             except asyncio.CancelledError:
                 break
@@ -1690,18 +1739,6 @@ _manager_lock = threading.Lock()
 
 
 def get_connection_manager() -> CloudSQLConnectionManager:
-    """Get singleton connection manager instance."""
-    global _manager
-    with _manager_lock:
-        if _manager is None:
-            _manager = CloudSQLConnectionManager()
-        return _manager
-
-
-async def get_connection_manager_async() -> CloudSQLConnectionManager:
-    """Get singleton connection manager instance (async version)."""
-    return get_connection_manager()
-
     """Get singleton connection manager instance."""
     global _manager
     with _manager_lock:
