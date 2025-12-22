@@ -1441,3 +1441,127 @@ def shutdown_all_threads(timeout: Optional[float] = None) -> Dict[str, Any]:
     """Sync shutdown all threads and executors."""
     manager = get_thread_manager()
     return manager.shutdown_sync(timeout=timeout)
+
+
+def shutdown_third_party_threads(timeout: float = 5.0) -> Dict[str, Any]:
+    """
+    Shutdown threads from third-party libraries (PyTorch, database pools, etc).
+    
+    These libraries create their own threads that don't go through our thread
+    manager. This function attempts to cleanly shutdown these threads.
+    
+    Args:
+        timeout: Maximum time to wait for threads to complete
+        
+    Returns:
+        Dict with cleanup statistics
+    """
+    import gc
+    import time
+    
+    stats = {
+        "pytorch_cleaned": False,
+        "torch_threads_before": 0,
+        "torch_threads_after": 0,
+        "db_pools_cleaned": False,
+        "remaining_non_daemon": 0,
+        "duration": 0.0
+    }
+    
+    start_time = time.time()
+    
+    # Count threads before
+    all_threads = threading.enumerate()
+    pytorch_threads = [t for t in all_threads if 'pytorch' in t.name.lower() or 'worker' in t.name.lower()]
+    stats["torch_threads_before"] = len(pytorch_threads)
+    
+    # Phase 1: PyTorch cleanup
+    try:
+        import torch
+        
+        # Reduce thread count
+        if hasattr(torch, 'set_num_threads'):
+            torch.set_num_threads(1)
+        if hasattr(torch, 'set_num_interop_threads'):
+            torch.set_num_interop_threads(1)
+        
+        # Clear CUDA
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        
+        # Clear MPS (Apple Silicon)
+        if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            if hasattr(torch.mps, 'empty_cache'):
+                torch.mps.empty_cache()
+        
+        stats["pytorch_cleaned"] = True
+        logger.debug("PyTorch threads signaled for cleanup")
+        
+    except ImportError:
+        logger.debug("PyTorch not installed")
+    except Exception as e:
+        logger.debug(f"PyTorch cleanup error: {e}")
+    
+    # Phase 2: Database pools
+    try:
+        # SQLAlchemy
+        try:
+            from sqlalchemy.orm import close_all_sessions
+            close_all_sessions()
+        except ImportError:
+            pass
+        except Exception as e:
+            logger.debug(f"SQLAlchemy cleanup: {e}")
+        
+        # Connection managers
+        try:
+            from intelligence.cloud_database_adapter import get_database_adapter
+            adapter = get_database_adapter()
+            if hasattr(adapter, 'close'):
+                import asyncio
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    loop = asyncio.new_event_loop()
+                loop.run_until_complete(adapter.close())
+        except ImportError:
+            pass
+        except Exception as e:
+            logger.debug(f"Database adapter cleanup: {e}")
+        
+        stats["db_pools_cleaned"] = True
+        
+    except Exception as e:
+        logger.debug(f"Database cleanup error: {e}")
+    
+    # Phase 3: Force garbage collection
+    gc.collect()
+    
+    # Phase 4: Wait for threads to complete
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        remaining = [
+            t for t in threading.enumerate()
+            if t != threading.main_thread() and not t.daemon and t.is_alive()
+        ]
+        if not remaining:
+            break
+        time.sleep(0.1)
+    
+    # Final stats
+    all_threads_after = threading.enumerate()
+    pytorch_threads_after = [t for t in all_threads_after if 'pytorch' in t.name.lower() or 'worker' in t.name.lower()]
+    stats["torch_threads_after"] = len(pytorch_threads_after)
+    
+    remaining_non_daemon = [
+        t for t in all_threads_after
+        if t != threading.main_thread() and not t.daemon and t.is_alive()
+    ]
+    stats["remaining_non_daemon"] = len(remaining_non_daemon)
+    stats["duration"] = time.time() - start_time
+    
+    logger.info(f"Third-party thread cleanup: PyTorch {stats['torch_threads_before']}->{stats['torch_threads_after']}, "
+                f"remaining={stats['remaining_non_daemon']}, took {stats['duration']:.2f}s")
+    
+    return stats
