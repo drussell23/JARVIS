@@ -331,31 +331,54 @@ class JARVISSupervisor:
             
             logger.info("🎯 Dead Man's Switch initialized")
     
-    async def _find_existing_jarvis_window(self) -> bool:
+    async def _close_all_jarvis_windows(self) -> int:
         """
-        Check if there's an existing Chrome incognito window with JARVIS.
-
-        Uses AppleScript to find windows with JARVIS-related URLs.
-        Returns True if found, False otherwise.
+        Close ALL Chrome windows (incognito and regular) with JARVIS-related URLs.
+        
+        v4.0 Clean Slate Approach: Ensures exactly ONE window for JARVIS
+        by closing all existing windows first.
+        
+        Returns:
+            Number of windows closed
         """
         try:
-            # AppleScript to find Chrome incognito windows with JARVIS URLs
             applescript = '''
+            tell application "System Events"
+                if not (exists process "Google Chrome") then
+                    return 0
+                end if
+            end tell
+            
             tell application "Google Chrome"
-                set jarvisPatterns to {"localhost:3000", "localhost:3001", "localhost:8010", "127.0.0.1:3000", "127.0.0.1:3001"}
+                set jarvisPatterns to {"localhost:3000", "localhost:3001", "localhost:8010", "127.0.0.1:3000", "127.0.0.1:3001", "127.0.0.1:8010"}
+                set windowsToClose to {}
+                set closedCount to 0
+                
                 repeat with w in windows
-                    if mode of w is "incognito" then
-                        repeat with t in tabs of w
-                            set tabURL to URL of t
-                            repeat with pattern in jarvisPatterns
-                                if tabURL contains pattern then
-                                    return true
-                                end if
-                            end repeat
+                    set shouldClose to false
+                    repeat with t in tabs of w
+                        set tabURL to URL of t
+                        repeat with pattern in jarvisPatterns
+                            if tabURL contains pattern then
+                                set shouldClose to true
+                                exit repeat
+                            end if
                         end repeat
+                        if shouldClose then exit repeat
+                    end repeat
+                    if shouldClose then
+                        set end of windowsToClose to w
                     end if
                 end repeat
-                return false
+                
+                repeat with w in windowsToClose
+                    try
+                        close w
+                        set closedCount to closedCount + 1
+                    end try
+                end repeat
+                
+                return closedCount
             end tell
             '''
             process = await asyncio.create_subprocess_exec(
@@ -364,80 +387,75 @@ class JARVISSupervisor:
                 stderr=asyncio.subprocess.DEVNULL,
             )
             stdout, _ = await process.communicate()
-            return stdout.decode().strip().lower() == "true"
+            result = stdout.decode().strip()
+            
+            try:
+                closed_count = int(result)
+                if closed_count > 0:
+                    logger.info(f"🗑️ Closed {closed_count} existing JARVIS window(s)")
+                return closed_count
+            except ValueError:
+                return 0
+                
         except Exception as e:
-            logger.debug(f"Could not check for existing window: {e}")
-            return False
-
-    async def _redirect_existing_window(self, url: str) -> bool:
-        """
-        Redirect an existing Chrome incognito window with JARVIS to the new URL.
-
-        Returns True if successfully redirected, False otherwise.
-        """
-        try:
-            # AppleScript to redirect existing JARVIS incognito window
-            applescript = f'''
-            tell application "Google Chrome"
-                set jarvisPatterns to {{"localhost:3000", "localhost:3001", "localhost:8010", "127.0.0.1:3000", "127.0.0.1:3001"}}
-                repeat with w in windows
-                    if mode of w is "incognito" then
-                        repeat with t in tabs of w
-                            set tabURL to URL of t
-                            repeat with pattern in jarvisPatterns
-                                if tabURL contains pattern then
-                                    set URL of t to "{url}"
-                                    set active tab index of w to (index of t)
-                                    set index of w to 1
-                                    activate
-                                    return true
-                                end if
-                            end repeat
-                        end repeat
-                    end if
-                end repeat
-                return false
-            end tell
-            '''
-            process = await asyncio.create_subprocess_exec(
-                "/usr/bin/osascript", "-e", applescript,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            stdout, _ = await process.communicate()
-            return stdout.decode().strip().lower() == "true"
-        except Exception as e:
-            logger.debug(f"Could not redirect existing window: {e}")
-            return False
+            logger.debug(f"Could not close existing windows: {e}")
+            return 0
 
     async def _open_loading_page(self) -> bool:
         """
         Open browser to loading page at localhost:3001.
-
-        Intelligent window management:
-        1. First checks for existing Chrome incognito window with JARVIS URL
-        2. If found, redirects that window to the loading page (no new window)
-        3. If not found, creates a new incognito window
-
-        This prevents multiple browser windows from being created on restarts.
+        
+        v4.0 Clean Slate Approach:
+        1. Close ALL existing JARVIS windows (localhost:3000, :3001, :8010)
+        2. Open ONE fresh incognito window
+        
+        This ensures exactly one browser window for JARVIS.
         """
         loading_url = "http://localhost:3001/"
 
         try:
-            # First, check if there's an existing JARVIS incognito window
-            existing_found = await self._find_existing_jarvis_window()
-
-            if existing_found:
-                # Try to redirect the existing window
-                redirected = await self._redirect_existing_window(loading_url)
-                if redirected:
-                    logger.info(f"🔄 Redirected existing JARVIS window to: {loading_url}")
-                    return True
-                else:
-                    logger.debug("Redirect failed, will create new window")
-
-            # No existing window or redirect failed - create new incognito window
-            # Use --new-window only if there's no existing JARVIS window
+            # Step 1: Close all existing JARVIS windows
+            closed_count = await self._close_all_jarvis_windows()
+            
+            if closed_count > 0:
+                await asyncio.sleep(0.5)  # Let Chrome process the closures
+                logger.info(f"🧹 Cleaned up {closed_count} existing JARVIS window(s)")
+            
+            # Step 2: Open fresh incognito window with fullscreen
+            applescript = f'''
+            tell application "Google Chrome"
+                set newWindow to make new window with properties {{mode:"incognito"}}
+                delay 0.3
+                tell newWindow
+                    set URL of active tab to "{loading_url}"
+                end tell
+                set index of newWindow to 1
+                activate
+            end tell
+            
+            delay 0.5
+            tell application "System Events"
+                tell process "Google Chrome"
+                    try
+                        keystroke "f" using {{command down, control down}}
+                    end try
+                end tell
+            end tell
+            
+            return true
+            '''
+            process = await asyncio.create_subprocess_exec(
+                "/usr/bin/osascript", "-e", applescript,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await process.communicate()
+            
+            if stdout.decode().strip().lower() == "true":
+                logger.info(f"🌐 Opened single JARVIS window: {loading_url}")
+                return True
+            
+            # Fallback to command line
             process = await asyncio.create_subprocess_exec(
                 "/usr/bin/open", "-na", "Google Chrome",
                 "--args", "--incognito", "--new-window", "--start-fullscreen", loading_url,
@@ -445,8 +463,7 @@ class JARVISSupervisor:
                 stderr=asyncio.subprocess.DEVNULL,
             )
             await process.wait()
-
-            logger.info(f"🌐 Opened new loading page: {loading_url}")
+            logger.info(f"🌐 Opened loading page (fallback): {loading_url}")
             return True
 
         except Exception as e:
