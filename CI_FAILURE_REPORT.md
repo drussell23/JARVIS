@@ -1,0 +1,83 @@
+# CI/CD Failure Analysis Report
+
+## Executive Summary
+
+- **Workflow**: Environment Variable Validation
+- **Run Number**: #992
+- **Branch**: `dependabot/pip/backend/pydantic-2.12.5`
+- **Commit**: `2dddb4a4d488dc731a645d3bd4cd18b109c771db`
+- **Status**: ❌ FAILED
+- **Timestamp**: 2025-12-22T09:41:38Z
+- **Triggered By**: @dependabot[bot]
+- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/20428035741)
+
+## Failure Overview
+
+Total Failed Jobs: **1**
+
+| # | Job Name | Category | Severity | Duration |
+|---|----------|----------|----------|----------|
+| 1 | Validate Environment Variables | permission_error | high | 8s |
+
+## Detailed Analysis
+
+### 1. Validate Environment Variables
+
+**Status**: ❌ failure
+**Category**: Permission Error
+**Severity**: HIGH
+**Started**: 2025-12-22T10:05:53Z
+**Completed**: 2025-12-22T10:06:01Z
+**Duration**: 8 seconds
+**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/20428035741/job/58692388788)
+
+#### Failed Steps
+
+- **Step 5**: Run Comprehensive Env Var Validation
+
+#### Error Analysis
+
+**Detected Error Patterns:**
+
+- Pattern: `ERROR|Error|error`
+  - Occurrences: 1
+  - Sample matches:
+    - Line 52: `2025-12-22T10:05:59.2844984Z ##[error]Process completed with exit code 1.`
+
+- Pattern: `FAIL|Failed|failed`
+  - Occurrences: 2
+  - Sample matches:
+    - Line 35: `2025-12-22T10:05:59.2791123Z ❌ VALIDATION FAILED`
+    - Line 97: `2025-12-22T10:05:59.6470975Z ##[warning]The process '/usr/bin/git' failed with exit code 128`
+
+- Pattern: `WARN|Warning|warning`
+  - Occurrences: 4
+  - Sample matches:
+    - Line 40: `2025-12-22T10:05:59.2793842Z ⚠️  WARNINGS`
+    - Line 75: `2025-12-22T10:05:59.3069015Z   if-no-files-found: warn`
+    - Line 87: `2025-12-22T10:05:59.5126310Z ##[warning]No files were found with the provided path: /tmp/env_summary`
+
+#### Suggested Fixes
+
+1. Review the logs above for specific error messages
+
+---
+
+## Action Items
+
+- [ ] Review detailed logs for each failed job
+- [ ] Implement suggested fixes
+- [ ] Add or update tests to prevent regression
+- [ ] Verify fixes locally before pushing
+- [ ] Update CI/CD configuration if needed
+
+## Additional Resources
+
+- [Workflow File](.github/workflows/)
+- [CI/CD Documentation](../../docs/ci-cd/)
+- [Troubleshooting Guide](../../docs/troubleshooting/)
+
+---
+
+📊 *Report generated on 2025-12-22T10:29:12.366612*
+🤖 *JARVIS CI/CD Auto-PR Manager*
