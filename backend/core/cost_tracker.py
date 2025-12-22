@@ -1,23 +1,71 @@
 #!/usr/bin/env python3
 """
-Advanced Cost Tracking System for JARVIS Hybrid Cloud Intelligence
+Advanced Cost Tracking System for JARVIS Hybrid Cloud Intelligence v3.0
+========================================================================
 
 Fully async, dynamic, configuration-driven cost tracking with no hardcoding.
 Tracks GCP VM costs, runtime hours, and cost optimization metrics.
 Stores data in learning database for historical analysis and alerts.
+
+v3.0 Features (Redis Integration):
+- 🔴 Redis Pub/Sub for real-time WebSocket streaming (replaces polling!)
+- 💾 Redis caching for frequently accessed cost metrics
+- 🔄 Cross-instance cost synchronization
+- 📡 Push-based notifications (no more polling!)
+- 🌐 GCP Cloud Memorystore integration (or local Redis)
+
+v2.0 Features (Triple-Lock Integration):
+- 🛡️ Hard budget enforcement (blocks VM creation when exceeded)
+- 📊 Intelligent cost forecasting with ML (simple time-series)
+- 🔒 Integration with shutdown_hook.py for guaranteed cleanup
+- ⏰ Alignment with 3-hour max-run-duration safety limit
+- 🚨 Solo developer mode with aggressive cost protection
+- 📈 Real-time cost streaming via WebSocket events
+
+Triple-Lock Safety System Integration:
+1. Platform-Level (GCP max-run-duration) - VMs auto-delete after 3 hours
+2. VM-Side (startup script self-destruct) - VM shuts down if backend dies  
+3. Local Cleanup (shutdown_hook.py) - Cleanup on shutdown + cost tracking
+
+Redis Benefits for WebSocket:
+- Polling: Client asks "any updates?" every N seconds (wasteful)
+- Pub/Sub: Server pushes updates INSTANTLY when they happen (efficient)
+- Result: Lower latency, less network traffic, real-time updates
+
+Cost Protection for Solo Developers:
+- Default daily budget: $1.00 (configurable via COST_ALERT_DAILY)
+- Hard budget mode: Blocks VM creation when budget exceeded
+- Immediate alerts when costs exceed 50% of daily budget
+- Proactive forecasting warns before budget is hit
 """
+
+from __future__ import annotations
 
 import asyncio
 import json
 import logging
 import os
+import statistics
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple, Set
 
 logger = logging.getLogger(__name__)
+
+# Redis channel names for Pub/Sub
+REDIS_CHANNEL_COST_UPDATES = "jarvis:cost:updates"
+REDIS_CHANNEL_VM_EVENTS = "jarvis:cost:vm_events"
+REDIS_CHANNEL_ALERTS = "jarvis:cost:alerts"
+REDIS_CHANNEL_BUDGET = "jarvis:cost:budget"
+
+# Redis cache keys
+REDIS_KEY_DAILY_COST = "jarvis:cost:daily:{date}"
+REDIS_KEY_ACTIVE_VMS = "jarvis:cost:active_vms"
+REDIS_KEY_BUDGET_STATUS = "jarvis:cost:budget_status"
+REDIS_KEY_METRICS = "jarvis:cost:metrics"
+REDIS_CACHE_TTL = 60  # Cache TTL in seconds
 
 
 # ============================================================================
@@ -54,7 +102,12 @@ class TriggerReason(Enum):
 
 @dataclass
 class CostTrackerConfig:
-    """Dynamic configuration for cost tracking - no hardcoding"""
+    """
+    Dynamic configuration for cost tracking - no hardcoding.
+    
+    v2.0: Enhanced with solo developer mode and stricter defaults.
+    All values configurable via environment variables.
+    """
 
     # Database configuration
     db_path: Optional[Path] = None
@@ -75,7 +128,26 @@ class CostTrackerConfig:
     )
     vm_instance_type: str = field(default_factory=lambda: os.getenv("GCP_VM_TYPE", "e2-highmem-4"))
 
+    # =========================================================================
+    # SOLO DEVELOPER MODE - Aggressive cost protection
+    # =========================================================================
+    # When enabled, provides stricter budget enforcement and more frequent alerts
+    solo_developer_mode: bool = field(
+        default_factory=lambda: os.getenv("JARVIS_SOLO_DEVELOPER_MODE", "true").lower() == "true"
+    )
+    
+    # Hard budget enforcement - BLOCKS VM creation when exceeded (not just alerts)
+    hard_budget_enforcement: bool = field(
+        default_factory=lambda: os.getenv("JARVIS_HARD_BUDGET_ENFORCEMENT", "true").lower() == "true"
+    )
+    
+    # Alert when this percentage of daily budget is reached (default: 50%)
+    budget_warning_percent: float = field(
+        default_factory=lambda: float(os.getenv("JARVIS_BUDGET_WARNING_PERCENT", "50"))
+    )
+    
     # Alert thresholds (configurable via env)
+    # v2.0: Lower defaults for solo developer protection
     alert_threshold_daily: float = field(
         default_factory=lambda: float(os.getenv("COST_ALERT_DAILY", "1.00"))
     )
@@ -86,9 +158,12 @@ class CostTrackerConfig:
         default_factory=lambda: float(os.getenv("COST_ALERT_MONTHLY", "20.00"))
     )
 
-    # Performance thresholds
+    # =========================================================================
+    # TRIPLE-LOCK INTEGRATION - Aligned with GCP safety limits
+    # =========================================================================
+    # v2.0: Aligned with max-run-duration of 3 hours
     max_vm_lifetime_hours: float = field(
-        default_factory=lambda: float(os.getenv("MAX_VM_LIFETIME_HOURS", "2.5"))
+        default_factory=lambda: float(os.getenv("MAX_VM_LIFETIME_HOURS", "3.0"))
     )
     max_local_ram_percent: float = field(
         default_factory=lambda: float(os.getenv("MAX_LOCAL_RAM_PERCENT", "85"))
@@ -98,11 +173,12 @@ class CostTrackerConfig:
     )
 
     # Cleanup configuration
+    # v2.0: Aligned with Triple-Lock 3-hour limit (was 6 hours)
     orphaned_vm_max_age_hours: int = field(
-        default_factory=lambda: int(os.getenv("ORPHANED_VM_MAX_AGE_HOURS", "6"))
+        default_factory=lambda: int(os.getenv("ORPHANED_VM_MAX_AGE_HOURS", "3"))
     )
     cleanup_check_interval_hours: int = field(
-        default_factory=lambda: int(os.getenv("CLEANUP_CHECK_INTERVAL_HOURS", "6"))
+        default_factory=lambda: int(os.getenv("CLEANUP_CHECK_INTERVAL_HOURS", "1"))
     )
 
     # Alert notification configuration
@@ -121,12 +197,69 @@ class CostTrackerConfig:
     enable_cost_forecasting: bool = field(
         default_factory=lambda: os.getenv("ENABLE_COST_FORECASTING", "true").lower() == "true"
     )
+    
+    # Cost forecasting window (days of history to use)
+    forecast_history_days: int = field(
+        default_factory=lambda: int(os.getenv("JARVIS_FORECAST_HISTORY_DAYS", "7"))
+    )
+
+    # =========================================================================
+    # REDIS CONFIGURATION - Real-time streaming & caching
+    # =========================================================================
+    # Redis enables:
+    # - Pub/Sub for instant WebSocket updates (no polling!)
+    # - Caching for fast metric retrieval
+    # - Cross-instance synchronization
+    
+    enable_redis: bool = field(
+        default_factory=lambda: os.getenv("JARVIS_COST_REDIS_ENABLED", "true").lower() == "true"
+    )
+    
+    # Redis connection - supports both local and GCP Cloud Memorystore
+    redis_host: str = field(
+        default_factory=lambda: os.getenv("REDIS_HOST", "localhost")
+    )
+    redis_port: int = field(
+        default_factory=lambda: int(os.getenv("REDIS_PORT", "6379"))
+    )
+    redis_password: Optional[str] = field(
+        default_factory=lambda: os.getenv("REDIS_PASSWORD")
+    )
+    redis_db: int = field(
+        default_factory=lambda: int(os.getenv("REDIS_DB", "0"))
+    )
+    
+    # Redis cache settings
+    redis_cache_ttl: int = field(
+        default_factory=lambda: int(os.getenv("REDIS_CACHE_TTL", "60"))
+    )
+    
+    # Pub/Sub settings
+    redis_pubsub_enabled: bool = field(
+        default_factory=lambda: os.getenv("JARVIS_REDIS_PUBSUB", "true").lower() == "true"
+    )
 
     def __post_init__(self):
         """Initialize paths and validate configuration"""
         if self.db_path is None:
             self.db_path = Path.home() / ".jarvis" / "learning" / "cost_tracking.db"
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Log solo developer mode status
+        if self.solo_developer_mode:
+            logger.info("🛡️ Solo Developer Mode: ENABLED (stricter cost protection)")
+            logger.info(f"   Daily budget: ${self.alert_threshold_daily:.2f}")
+            logger.info(f"   Hard enforcement: {self.hard_budget_enforcement}")
+            logger.info(f"   Warning at: {self.budget_warning_percent}% of budget")
+        
+        # Log Redis configuration
+        if self.enable_redis:
+            logger.info("🔴 Redis Integration: ENABLED")
+            logger.info(f"   Host: {self.redis_host}:{self.redis_port}")
+            logger.info(f"   Pub/Sub: {self.redis_pubsub_enabled}")
+            logger.info(f"   Cache TTL: {self.redis_cache_ttl}s")
+        else:
+            logger.info("🔴 Redis Integration: DISABLED (using local-only mode)")
 
 
 # ============================================================================
@@ -194,7 +327,10 @@ class CostTracker:
     """
     Advanced async cost tracking system with dynamic configuration.
 
-    Features:
+    v3.0 Features:
+    - 🔴 Redis Pub/Sub for real-time WebSocket streaming
+    - 💾 Redis caching for fast metric access
+    - 🔄 Cross-instance synchronization
     - Fully async database operations
     - Dynamic configuration via environment variables
     - No hardcoded values
@@ -202,12 +338,12 @@ class CostTracker:
     - Auto-cleanup of orphaned VMs
     - Cost forecasting
     - GCP billing API integration (optional)
-    - WebSocket event streaming
+    - WebSocket event streaming (now via Redis!)
     """
 
     def __init__(self, config: Optional[CostTrackerConfig] = None):
         """
-        Initialize advanced cost tracker.
+        Initialize advanced cost tracker with Redis support.
 
         Args:
             config: Optional configuration object
@@ -218,16 +354,27 @@ class CostTracker:
         self._alert_callbacks: List[Callable] = []
         self._cleanup_task: Optional[asyncio.Task] = None
         self._db_lock = asyncio.Lock()
+        
+        # Redis components (v3.0)
+        self._redis: Optional[Any] = None  # aioredis/redis.asyncio client
+        self._redis_pubsub: Optional[Any] = None
+        self._pubsub_task: Optional[asyncio.Task] = None
+        self._redis_available = False
+        self._websocket_subscribers: Set[Callable] = set()
 
-        logger.info(f"💰 Advanced CostTracker initialized")
+        logger.info(f"💰 Advanced CostTracker v3.0 initialized")
         logger.info(f"   DB: {self.config.db_path}")
         logger.info(f"   VM Type: {self.config.vm_instance_type}")
         logger.info(f"   Region: {self.config.gcp_region}")
         logger.info(f"   Spot Rate: ${self.config.spot_vm_hourly_cost:.4f}/hr")
 
     async def initialize(self):
-        """Initialize cost tracking system"""
+        """Initialize cost tracking system with Redis"""
         await self.initialize_database()
+        
+        # Initialize Redis connection (v3.0)
+        if self.config.enable_redis:
+            await self._initialize_redis()
 
         if self.config.enable_auto_cleanup:
             self._cleanup_task = asyncio.create_task(self._auto_cleanup_loop())
@@ -236,14 +383,318 @@ class CostTracker:
             )
 
     async def shutdown(self):
-        """Gracefully shutdown cost tracker"""
+        """Gracefully shutdown cost tracker with Redis cleanup"""
+        # Cancel cleanup task
         if self._cleanup_task:
             self._cleanup_task.cancel()
             try:
                 await self._cleanup_task
             except asyncio.CancelledError:
                 pass
+        
+        # Shutdown Redis (v3.0)
+        await self._shutdown_redis()
+        
         logger.info("💰 CostTracker shutdown complete")
+
+    # =========================================================================
+    # v3.0: REDIS INTEGRATION - Real-time Streaming & Caching
+    # =========================================================================
+
+    async def _initialize_redis(self) -> bool:
+        """
+        Initialize Redis connection for Pub/Sub and caching.
+        
+        Supports both:
+        - Local Redis (docker run -p 6379:6379 redis:alpine)
+        - GCP Cloud Memorystore for Redis
+        
+        Returns:
+            bool: True if Redis is available
+        """
+        try:
+            # Try redis.asyncio (redis-py 4.2+) first, then aioredis
+            try:
+                import redis.asyncio as aioredis
+            except ImportError:
+                try:
+                    import aioredis
+                except ImportError:
+                    logger.warning("🔴 Redis libraries not installed. Install with: pip install redis")
+                    logger.info("   Falling back to local-only mode (no real-time streaming)")
+                    self._redis_available = False
+                    return False
+            
+            # Build connection URL
+            if self.config.redis_password:
+                redis_url = f"redis://:{self.config.redis_password}@{self.config.redis_host}:{self.config.redis_port}/{self.config.redis_db}"
+            else:
+                redis_url = f"redis://{self.config.redis_host}:{self.config.redis_port}/{self.config.redis_db}"
+            
+            # Connect to Redis
+            self._redis = await aioredis.from_url(
+                redis_url,
+                encoding="utf-8",
+                decode_responses=True,
+                socket_timeout=5.0,
+                socket_connect_timeout=5.0,
+            )
+            
+            # Test connection
+            await self._redis.ping()
+            
+            self._redis_available = True
+            logger.info(f"🔴 Redis connected: {self.config.redis_host}:{self.config.redis_port}")
+            
+            # Start Pub/Sub listener if enabled
+            if self.config.redis_pubsub_enabled:
+                await self._start_pubsub_listener()
+            
+            # Sync active sessions to Redis
+            await self._sync_active_sessions_to_redis()
+            
+            return True
+            
+        except Exception as e:
+            logger.warning(f"🔴 Redis connection failed: {e}")
+            logger.info("   Falling back to local-only mode (no real-time streaming)")
+            logger.info("   To enable Redis: docker run -d -p 6379:6379 redis:alpine")
+            self._redis_available = False
+            return False
+
+    async def _shutdown_redis(self):
+        """Gracefully shutdown Redis connections"""
+        try:
+            # Cancel Pub/Sub task
+            if self._pubsub_task:
+                self._pubsub_task.cancel()
+                try:
+                    await self._pubsub_task
+                except asyncio.CancelledError:
+                    pass
+            
+            # Close Pub/Sub
+            if self._redis_pubsub:
+                await self._redis_pubsub.unsubscribe()
+                await self._redis_pubsub.close()
+            
+            # Close Redis connection
+            if self._redis:
+                await self._redis.close()
+                
+            logger.info("🔴 Redis connections closed")
+            
+        except Exception as e:
+            logger.debug(f"Redis shutdown error (non-critical): {e}")
+
+    async def _start_pubsub_listener(self):
+        """Start background task to listen for Pub/Sub messages"""
+        try:
+            self._redis_pubsub = self._redis.pubsub()
+            
+            # Subscribe to cost-related channels
+            await self._redis_pubsub.subscribe(
+                REDIS_CHANNEL_COST_UPDATES,
+                REDIS_CHANNEL_VM_EVENTS,
+                REDIS_CHANNEL_ALERTS,
+                REDIS_CHANNEL_BUDGET,
+            )
+            
+            # Start listener task
+            self._pubsub_task = asyncio.create_task(self._pubsub_listener_loop())
+            
+            logger.info("🔴 Redis Pub/Sub listener started")
+            logger.info(f"   Channels: {REDIS_CHANNEL_COST_UPDATES}, {REDIS_CHANNEL_VM_EVENTS}")
+            
+        except Exception as e:
+            logger.error(f"Failed to start Pub/Sub listener: {e}")
+
+    async def _pubsub_listener_loop(self):
+        """
+        Background loop to receive Pub/Sub messages.
+        
+        This enables cross-instance communication and real-time updates.
+        Messages received here are forwarded to WebSocket subscribers.
+        """
+        try:
+            async for message in self._redis_pubsub.listen():
+                if message["type"] == "message":
+                    channel = message["channel"]
+                    data = message["data"]
+                    
+                    try:
+                        # Parse JSON data
+                        if isinstance(data, str):
+                            parsed_data = json.loads(data)
+                        else:
+                            parsed_data = data
+                        
+                        # Forward to WebSocket subscribers
+                        await self._broadcast_to_websockets(channel, parsed_data)
+                        
+                        # Trigger local callbacks
+                        await self._notify_event(f"redis:{channel}", parsed_data)
+                        
+                    except json.JSONDecodeError:
+                        logger.debug(f"Non-JSON message on {channel}: {data}")
+                        
+        except asyncio.CancelledError:
+            logger.debug("Pub/Sub listener cancelled")
+        except Exception as e:
+            logger.error(f"Pub/Sub listener error: {e}")
+
+    async def _publish_event(self, channel: str, data: Dict[str, Any]):
+        """
+        Publish event to Redis Pub/Sub channel.
+        
+        This is the key method for real-time WebSocket updates!
+        When you publish here, ALL connected clients receive the update instantly.
+        
+        Args:
+            channel: Redis channel name
+            data: Event data to publish
+        """
+        if not self._redis_available:
+            # Fallback: just trigger local callbacks
+            await self._notify_event(channel, data)
+            return
+        
+        try:
+            # Add metadata
+            data["timestamp"] = datetime.utcnow().isoformat()
+            data["source"] = "cost_tracker"
+            
+            # Publish to Redis
+            await self._redis.publish(channel, json.dumps(data))
+            
+            logger.debug(f"📡 Published to {channel}: {data.get('event_type', 'unknown')}")
+            
+        except Exception as e:
+            logger.error(f"Failed to publish to Redis: {e}")
+            # Fallback to local callbacks
+            await self._notify_event(channel, data)
+
+    async def _broadcast_to_websockets(self, channel: str, data: Dict[str, Any]):
+        """
+        Broadcast message to all registered WebSocket subscribers.
+        
+        This is how Redis Pub/Sub replaces polling:
+        1. Event happens (VM created, cost updated, etc.)
+        2. Event published to Redis
+        3. This method receives it via Pub/Sub
+        4. Instantly pushes to all connected WebSocket clients
+        
+        No polling needed - updates are pushed in real-time!
+        """
+        if not self._websocket_subscribers:
+            return
+        
+        message = {
+            "channel": channel,
+            "data": data,
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+        
+        # Notify all subscribers in parallel
+        tasks = []
+        for subscriber in list(self._websocket_subscribers):
+            try:
+                if asyncio.iscoroutinefunction(subscriber):
+                    tasks.append(subscriber(message))
+                else:
+                    subscriber(message)
+            except Exception as e:
+                logger.debug(f"WebSocket subscriber error: {e}")
+                # Remove dead subscribers
+                self._websocket_subscribers.discard(subscriber)
+        
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    def register_websocket_subscriber(self, callback: Callable):
+        """
+        Register a WebSocket connection for real-time updates.
+        
+        Usage:
+            async def ws_handler(message):
+                await websocket.send_json(message)
+            
+            cost_tracker.register_websocket_subscriber(ws_handler)
+        
+        Args:
+            callback: Async function to receive messages
+        """
+        self._websocket_subscribers.add(callback)
+        logger.debug(f"WebSocket subscriber registered (total: {len(self._websocket_subscribers)})")
+
+    def unregister_websocket_subscriber(self, callback: Callable):
+        """Unregister a WebSocket connection"""
+        self._websocket_subscribers.discard(callback)
+        logger.debug(f"WebSocket subscriber removed (total: {len(self._websocket_subscribers)})")
+
+    async def _sync_active_sessions_to_redis(self):
+        """Sync active VM sessions to Redis for cross-instance visibility"""
+        if not self._redis_available:
+            return
+        
+        try:
+            # Store active sessions in Redis hash
+            if self.active_sessions:
+                session_data = {
+                    vm_id: json.dumps({
+                        "instance_id": s.instance_id,
+                        "created_at": s.created_at.isoformat(),
+                        "vm_type": s.vm_type,
+                        "region": s.region,
+                        "zone": s.zone,
+                    })
+                    for vm_id, s in self.active_sessions.items()
+                }
+                await self._redis.hset(REDIS_KEY_ACTIVE_VMS, mapping=session_data)
+            
+            logger.debug(f"Synced {len(self.active_sessions)} active sessions to Redis")
+            
+        except Exception as e:
+            logger.debug(f"Failed to sync sessions to Redis: {e}")
+
+    # =========================================================================
+    # v3.0: REDIS CACHING - Fast Metric Access
+    # =========================================================================
+
+    async def _cache_get(self, key: str) -> Optional[Dict[str, Any]]:
+        """Get value from Redis cache"""
+        if not self._redis_available:
+            return None
+        
+        try:
+            data = await self._redis.get(key)
+            if data:
+                return json.loads(data)
+        except Exception as e:
+            logger.debug(f"Cache get error: {e}")
+        
+        return None
+
+    async def _cache_set(self, key: str, value: Dict[str, Any], ttl: Optional[int] = None):
+        """Set value in Redis cache with TTL"""
+        if not self._redis_available:
+            return
+        
+        try:
+            ttl = ttl or self.config.redis_cache_ttl
+            await self._redis.setex(key, ttl, json.dumps(value))
+        except Exception as e:
+            logger.debug(f"Cache set error: {e}")
+
+    async def _cache_delete(self, key: str):
+        """Delete key from Redis cache"""
+        if not self._redis_available:
+            return
+        
+        try:
+            await self._redis.delete(key)
+        except Exception as e:
+            logger.debug(f"Cache delete error: {e}")
 
     async def initialize_database(self):
         """Create database tables with enhanced schema"""
@@ -414,7 +865,22 @@ class CostTracker:
                 f"💰 VM created: {instance_id} (trigger: {trigger_reason}, type: {session.vm_type})"
             )
 
-            # Trigger alert callbacks
+            # v3.0: Publish to Redis for real-time WebSocket updates
+            await self._publish_event(REDIS_CHANNEL_VM_EVENTS, {
+                "event_type": "vm_created",
+                "instance_id": instance_id,
+                "trigger_reason": trigger_reason,
+                "vm_type": session.vm_type,
+                "region": session.region,
+                "zone": session.zone,
+                "active_vms": len(self.active_sessions),
+            })
+            
+            # Update Redis cache
+            await self._sync_active_sessions_to_redis()
+            await self._cache_delete(REDIS_KEY_BUDGET_STATUS)  # Invalidate budget cache
+
+            # Trigger alert callbacks (for backward compatibility)
             await self._notify_event("vm_created", {"instance_id": instance_id, "session": session})
 
         except Exception as e:
@@ -495,10 +961,32 @@ class CostTracker:
             if instance_id in self.active_sessions:
                 del self.active_sessions[instance_id]
 
+            # v3.0: Publish to Redis for real-time WebSocket updates
+            await self._publish_event(REDIS_CHANNEL_VM_EVENTS, {
+                "event_type": "vm_deleted",
+                "instance_id": instance_id,
+                "runtime_hours": round(session.runtime_hours, 2),
+                "cost": round(cost, 4),
+                "was_orphaned": was_orphaned,
+                "active_vms": len(self.active_sessions),
+            })
+            
+            # Publish cost update
+            await self._publish_event(REDIS_CHANNEL_COST_UPDATES, {
+                "event_type": "cost_update",
+                "total_runtime_hours": round(self.metrics.total_runtime_hours, 2),
+                "total_estimated_cost": round(self.metrics.total_estimated_cost, 4),
+                "active_vms": len(self.active_sessions),
+            })
+            
+            # Update Redis cache
+            await self._sync_active_sessions_to_redis()
+            await self._cache_delete(REDIS_KEY_BUDGET_STATUS)  # Invalidate budget cache
+
             # Check for cost alerts
             await self._check_cost_alerts()
 
-            # Trigger alert callbacks
+            # Trigger alert callbacks (for backward compatibility)
             await self._notify_event("vm_deleted", {"instance_id": instance_id, "session": session})
 
         except Exception as e:
@@ -1040,6 +1528,15 @@ class CostTracker:
 
             log_func(f"💰 ALERT [{level.value.upper()}]: {message}")
 
+            # v3.0: Publish alert to Redis for real-time WebSocket updates
+            await self._publish_event(REDIS_CHANNEL_ALERTS, {
+                "event_type": "alert",
+                "level": level.value,
+                "alert_type": alert_type,
+                "message": message,
+                "details": details,
+            })
+
             # Send notifications
             if self.config.enable_desktop_notifications:
                 await self._send_desktop_notification(f"{level.value.upper()}: {message}")
@@ -1050,7 +1547,7 @@ class CostTracker:
                     subject=f"{level.value.upper()} Alert: {alert_type}", message=message
                 )
 
-            # Trigger callbacks
+            # Trigger callbacks (for backward compatibility)
             await self._notify_event(
                 "alert", {"level": level.value, "type": alert_type, "message": message}
             )
@@ -1204,6 +1701,342 @@ class CostTracker:
                     callback(event_type, data)
             except Exception as e:
                 logger.error(f"Alert callback failed: {e}")
+
+    # =========================================================================
+    # v2.0: BUDGET ENFORCEMENT (Solo Developer Protection)
+    # =========================================================================
+
+    async def can_create_vm(self) -> Tuple[bool, str, Dict[str, Any]]:
+        """
+        Check if VM creation is allowed based on budget constraints.
+        
+        This is the key method for hard budget enforcement.
+        Called by gcp_vm_manager before creating any VM.
+        
+        Returns:
+            Tuple of (allowed, reason, details)
+        """
+        details = {
+            "daily_budget": self.config.alert_threshold_daily,
+            "daily_spent": 0.0,
+            "daily_remaining": self.config.alert_threshold_daily,
+            "budget_percent_used": 0.0,
+            "hard_enforcement": self.config.hard_budget_enforcement,
+            "solo_developer_mode": self.config.solo_developer_mode,
+            "active_vms": len(self.active_sessions),
+        }
+        
+        try:
+            daily_summary = await self.get_cost_summary("day")
+            daily_spent = daily_summary.get("total_estimated_cost", 0.0)
+            
+            # Include cost of currently running VMs
+            for session in self.active_sessions.values():
+                runtime_cost = session.calculate_cost(self.config.spot_vm_hourly_cost)
+                daily_spent += runtime_cost
+            
+            details["daily_spent"] = round(daily_spent, 4)
+            details["daily_remaining"] = round(self.config.alert_threshold_daily - daily_spent, 4)
+            details["budget_percent_used"] = round(
+                (daily_spent / self.config.alert_threshold_daily * 100) 
+                if self.config.alert_threshold_daily > 0 else 0, 1
+            )
+            
+            # Check budget warning threshold
+            if details["budget_percent_used"] >= self.config.budget_warning_percent:
+                await self._log_alert(
+                    AlertLevel.WARNING,
+                    "budget_warning",
+                    f"Daily budget {details['budget_percent_used']:.0f}% used (${daily_spent:.2f}/${self.config.alert_threshold_daily:.2f})",
+                    details,
+                )
+            
+            # Check hard budget limit
+            if daily_spent >= self.config.alert_threshold_daily:
+                if self.config.hard_budget_enforcement:
+                    await self._log_alert(
+                        AlertLevel.CRITICAL,
+                        "budget_exceeded",
+                        f"🚫 DAILY BUDGET EXCEEDED! ${daily_spent:.2f} >= ${self.config.alert_threshold_daily:.2f}",
+                        details,
+                    )
+                    return False, f"Daily budget exceeded: ${daily_spent:.2f}", details
+                else:
+                    # Soft enforcement - just warn
+                    await self._log_alert(
+                        AlertLevel.HIGH,
+                        "budget_exceeded_soft",
+                        f"⚠️ Daily budget exceeded (soft mode): ${daily_spent:.2f}",
+                        details,
+                    )
+            
+            # Check forecast (will we exceed budget soon?)
+            if self.config.enable_cost_forecasting:
+                forecast = await self.forecast_daily_cost()
+                if forecast.get("predicted_cost", 0) > self.config.alert_threshold_daily:
+                    details["forecast"] = forecast
+                    await self._log_alert(
+                        AlertLevel.WARNING,
+                        "budget_forecast_warning",
+                        f"📈 Forecast: Today's cost likely to reach ${forecast['predicted_cost']:.2f}",
+                        details,
+                    )
+            
+            return True, "Budget OK", details
+            
+        except Exception as e:
+            logger.error(f"Budget check failed: {e}")
+            # On error, allow VM creation (don't block due to tracking issues)
+            return True, f"Budget check error (allowing): {e}", details
+
+    async def forecast_daily_cost(self) -> Dict[str, Any]:
+        """
+        Simple cost forecasting using recent trends.
+        
+        Uses weighted average of recent daily costs to predict today's total.
+        More recent days have higher weight.
+        
+        Returns:
+            Dict with prediction details
+        """
+        try:
+            import aiosqlite
+            
+            # Get historical daily costs
+            end_date = datetime.utcnow()
+            start_date = end_date - timedelta(days=self.config.forecast_history_days)
+            
+            async with self._db_lock:
+                async with aiosqlite.connect(self.config.db_path) as db:
+                    async with db.execute(
+                        """
+                        SELECT 
+                            DATE(created_at) as day,
+                            SUM(estimated_cost) as daily_cost,
+                            COUNT(*) as vm_count
+                        FROM vm_sessions
+                        WHERE created_at >= ?
+                        GROUP BY DATE(created_at)
+                        ORDER BY day DESC
+                        """,
+                        (start_date.isoformat(),),
+                    ) as cursor:
+                        rows = await cursor.fetchall()
+            
+            if not rows:
+                return {
+                    "predicted_cost": 0.0,
+                    "confidence": 0.0,
+                    "method": "no_data",
+                    "history_days": 0,
+                }
+            
+            # Extract daily costs
+            daily_costs = [row[1] or 0.0 for row in rows]
+            
+            if len(daily_costs) < 2:
+                return {
+                    "predicted_cost": daily_costs[0] if daily_costs else 0.0,
+                    "confidence": 0.3,
+                    "method": "single_day",
+                    "history_days": len(daily_costs),
+                }
+            
+            # Weighted average (recent days have higher weight)
+            weights = list(range(len(daily_costs), 0, -1))
+            weighted_avg = sum(c * w for c, w in zip(daily_costs, weights)) / sum(weights)
+            
+            # Calculate trend (is cost increasing or decreasing?)
+            if len(daily_costs) >= 3:
+                recent_avg = statistics.mean(daily_costs[:3])
+                older_avg = statistics.mean(daily_costs[3:]) if len(daily_costs) > 3 else daily_costs[-1]
+                trend = (recent_avg - older_avg) / older_avg if older_avg > 0 else 0
+            else:
+                trend = 0
+            
+            # Add today's current spend
+            today_summary = await self.get_cost_summary("day")
+            today_so_far = today_summary.get("total_estimated_cost", 0.0)
+            
+            # Hours left in day
+            now = datetime.utcnow()
+            hours_elapsed = now.hour + now.minute / 60
+            hours_remaining = 24 - hours_elapsed
+            
+            # Projected additional cost based on hourly rate
+            if hours_elapsed > 0:
+                hourly_rate = today_so_far / hours_elapsed
+                projected_addition = hourly_rate * hours_remaining
+            else:
+                projected_addition = weighted_avg  # Use historical if no data today
+            
+            predicted_cost = today_so_far + projected_addition
+            
+            # Apply trend adjustment
+            if trend > 0:
+                predicted_cost *= (1 + min(trend, 0.5))  # Cap trend at 50%
+            
+            # Confidence based on data amount and variability
+            if len(daily_costs) >= 7:
+                confidence = 0.8
+            elif len(daily_costs) >= 3:
+                confidence = 0.6
+            else:
+                confidence = 0.4
+            
+            # Reduce confidence if high variability
+            if len(daily_costs) >= 2:
+                cv = statistics.stdev(daily_costs) / statistics.mean(daily_costs) if statistics.mean(daily_costs) > 0 else 0
+                confidence *= max(0.5, 1 - cv)
+            
+            return {
+                "predicted_cost": round(predicted_cost, 4),
+                "today_so_far": round(today_so_far, 4),
+                "projected_addition": round(projected_addition, 4),
+                "weighted_avg_daily": round(weighted_avg, 4),
+                "trend": round(trend, 2),
+                "confidence": round(confidence, 2),
+                "method": "weighted_trend",
+                "history_days": len(daily_costs),
+                "hours_remaining": round(hours_remaining, 1),
+            }
+            
+        except Exception as e:
+            logger.error(f"Cost forecasting failed: {e}")
+            return {
+                "predicted_cost": 0.0,
+                "confidence": 0.0,
+                "method": "error",
+                "error": str(e),
+            }
+
+    async def get_budget_status(self) -> Dict[str, Any]:
+        """
+        Get comprehensive budget status for dashboard/API.
+        
+        v3.0: Uses Redis caching for fast access.
+        
+        Returns:
+            Dict with all budget-related metrics
+        """
+        # v3.0: Try cache first
+        cached = await self._cache_get(REDIS_KEY_BUDGET_STATUS)
+        if cached:
+            # Add real-time active VM data (not cached)
+            active_vm_cost = 0.0
+            for session in self.active_sessions.values():
+                active_vm_cost += session.calculate_cost(self.config.spot_vm_hourly_cost)
+            cached["active_vms"]["count"] = len(self.active_sessions)
+            cached["active_vms"]["current_cost"] = round(active_vm_cost, 4)
+            return cached
+        
+        daily = await self.get_cost_summary("day")
+        weekly = await self.get_cost_summary("week")
+        monthly = await self.get_cost_summary("month")
+        forecast = await self.forecast_daily_cost() if self.config.enable_cost_forecasting else {}
+        
+        # Calculate active VM costs
+        active_vm_cost = 0.0
+        for session in self.active_sessions.values():
+            active_vm_cost += session.calculate_cost(self.config.spot_vm_hourly_cost)
+        
+        result = {
+            "mode": "solo_developer" if self.config.solo_developer_mode else "team",
+            "hard_enforcement": self.config.hard_budget_enforcement,
+            "budgets": {
+                "daily": {
+                    "limit": self.config.alert_threshold_daily,
+                    "spent": daily.get("total_estimated_cost", 0.0),
+                    "remaining": max(0, self.config.alert_threshold_daily - daily.get("total_estimated_cost", 0.0)),
+                    "percent_used": round(
+                        daily.get("total_estimated_cost", 0.0) / self.config.alert_threshold_daily * 100
+                        if self.config.alert_threshold_daily > 0 else 0, 1
+                    ),
+                },
+                "weekly": {
+                    "limit": self.config.alert_threshold_weekly,
+                    "spent": weekly.get("total_estimated_cost", 0.0),
+                    "remaining": max(0, self.config.alert_threshold_weekly - weekly.get("total_estimated_cost", 0.0)),
+                },
+                "monthly": {
+                    "limit": self.config.alert_threshold_monthly,
+                    "spent": monthly.get("total_estimated_cost", 0.0),
+                    "remaining": max(0, self.config.alert_threshold_monthly - monthly.get("total_estimated_cost", 0.0)),
+                },
+            },
+            "active_vms": {
+                "count": len(self.active_sessions),
+                "current_cost": round(active_vm_cost, 4),
+                "instances": [
+                    {
+                        "id": s.instance_id,
+                        "runtime_hours": round(s.runtime_hours, 2),
+                        "cost": round(s.calculate_cost(self.config.spot_vm_hourly_cost), 4),
+                    }
+                    for s in self.active_sessions.values()
+                ],
+            },
+            "forecast": forecast,
+            "triple_lock_status": {
+                "max_vm_lifetime_hours": self.config.max_vm_lifetime_hours,
+                "orphaned_vm_max_age_hours": self.config.orphaned_vm_max_age_hours,
+                "cleanup_interval_hours": self.config.cleanup_check_interval_hours,
+            },
+            "redis_status": {
+                "available": self._redis_available,
+                "pubsub_enabled": self.config.redis_pubsub_enabled,
+                "websocket_subscribers": len(self._websocket_subscribers),
+            },
+            "generated_at": datetime.utcnow().isoformat(),
+        }
+        
+        # v3.0: Cache the result
+        await self._cache_set(REDIS_KEY_BUDGET_STATUS, result, ttl=30)  # 30 second cache
+        
+        return result
+
+    # =========================================================================
+    # v2.0: SHUTDOWN HOOK INTEGRATION
+    # =========================================================================
+
+    async def record_shutdown_cleanup(
+        self,
+        cleanup_result: Dict[str, Any],
+        reason: str = "shutdown_hook",
+    ) -> None:
+        """
+        Record cleanup from shutdown hook for cost tracking.
+        
+        Called by shutdown_hook.py after cleaning up VMs.
+        
+        Args:
+            cleanup_result: Result dict from cleanup_remote_resources()
+            reason: Reason for cleanup
+        """
+        vms_cleaned = cleanup_result.get("vms_cleaned", 0)
+        method = cleanup_result.get("method", "unknown")
+        
+        if vms_cleaned == 0:
+            logger.debug(f"💰 Shutdown cleanup recorded: 0 VMs (method: {method})")
+            return
+        
+        logger.info(f"💰 Recording shutdown cleanup: {vms_cleaned} VM(s) via {method}")
+        
+        # Mark any remaining active sessions as terminated
+        for instance_id in list(self.active_sessions.keys()):
+            await self.record_vm_deleted(
+                instance_id=instance_id,
+                was_orphaned=True,
+                actual_cost=None,
+            )
+        
+        # Log the cleanup event
+        await self._log_alert(
+            AlertLevel.INFO,
+            "shutdown_cleanup",
+            f"Shutdown hook cleaned {vms_cleaned} VM(s) via {method}",
+            cleanup_result,
+        )
 
 
 # ============================================================================

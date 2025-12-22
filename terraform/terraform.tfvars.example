@@ -1,0 +1,82 @@
+# =============================================================================
+# JARVIS Terraform Configuration - Solo Developer Cost-Optimized
+# =============================================================================
+#
+# Copy this file to terraform.tfvars and customize:
+#   cp terraform.tfvars.example terraform.tfvars
+#
+# Current estimated costs with these defaults: $0/month
+# (Only pay for Spot VM time when they actually run)
+
+# =============================================================================
+# PROJECT CONFIGURATION
+# =============================================================================
+
+project_id = "jarvis-473803"
+region     = "us-central1"
+zone       = "us-central1-a"
+
+# =============================================================================
+# 💰 COST PROTECTION (Recommended!)
+# =============================================================================
+
+# Enable developer mode for cost-optimized settings
+developer_mode = true
+
+# Monthly budget for alerts (set to your comfort level)
+monthly_budget_usd = 10  # $10/month
+
+# Get your billing account ID with: gcloud billing accounts list
+# Leave empty to skip budget alerts (not recommended)
+billing_account_id = ""  # Example: "01ABCD-EFGH23-IJKL45"
+
+# Email(s) to receive budget alerts
+alert_emails = []  # Example: ["your@email.com"]
+
+# =============================================================================
+# 🖥️ SPOT VM CONFIGURATION
+# =============================================================================
+
+# Enable Spot VM template (recommended - it's free, only VMs cost money)
+enable_spot_vm_template = true
+
+# Machine type for Spot VMs
+# Options (cheapest to most powerful):
+#   - e2-micro:     $0.008/hr (~$0.19/day) - Very basic, testing only
+#   - e2-small:     $0.017/hr (~$0.41/day) - Light workloads
+#   - e2-medium:    $0.034/hr (~$0.82/day) - Recommended for development
+#   - e2-highmem-4: $0.134/hr (~$3.22/day) - ML workloads, production
+spot_vm_machine_type = "e2-medium"
+
+# Disk size in GB (smaller = cheaper)
+spot_vm_disk_size_gb = 20  # 20GB is enough for development
+
+# Maximum runtime before auto-termination (Triple-Lock safety)
+# Shorter = safer and cheaper
+spot_vm_max_runtime_hours = 3  # 3 hours max
+
+# =============================================================================
+# 📦 REDIS / CLOUD MEMORYSTORE (DISABLED by default)
+# =============================================================================
+#
+# ⚠️ WARNING: Redis costs ~$15/month minimum even when idle!
+#
+# For development, use local Redis instead:
+#   docker run -d -p 6379:6379 --name jarvis-redis redis:alpine
+#
+# Only enable for production or multi-VM setups.
+
+enable_redis       = false
+redis_memory_size_gb = 1      # Minimum size
+redis_tier         = "BASIC"  # Cheapest tier
+
+# =============================================================================
+# 🛡️ SAFETY LIMITS
+# =============================================================================
+
+# Maximum concurrent VMs (prevents runaway costs)
+max_concurrent_vms = 2
+
+# Maximum VM hours per day (for cost calculations)
+max_daily_vm_hours = 6
+

@@ -723,6 +723,24 @@ sys.path.insert(0, str(_project_root))
 sys.path.insert(0, str(_project_root / "backend"))
 
 # =============================================================================
+# CRITICAL: Early Shutdown Hook Registration (Triple-Lock Safety System)
+# =============================================================================
+# Register shutdown hook as early as possible to ensure GCP VMs are cleaned up
+# even if JARVIS crashes during startup. This provides the "Local Cleanup" layer
+# of the Triple-Lock safety system for preventing orphaned VMs.
+#
+# Triple-Lock Safety:
+#   1. Platform-Level (GCP max-run-duration) - VMs auto-delete after 3 hours
+#   2. VM-Side (startup script self-destruct) - VM shuts down if backend dies
+#   3. Local Cleanup (this hook) - Cleanup on normal/signal-based shutdown
+# =============================================================================
+try:
+    from backend.scripts.shutdown_hook import register_handlers as _register_shutdown_handlers
+    _register_shutdown_handlers()
+except ImportError:
+    pass  # Will be registered later during shutdown sequence
+
+# =============================================================================
 # CRITICAL: Global Session Manager - Initialize FIRST for cleanup reliability
 # This ensures session tracking is always available, even during early failures
 # =============================================================================
@@ -19556,6 +19574,25 @@ if __name__ == "__main__":
             print(f"   │  └─ {Colors.GREEN}✓ No stubborn threads{Colors.ENDC}")
         
         print(f"   └─ {Colors.GREEN}✓ Library thread cleanup complete{Colors.ENDC}")
+
+        # Phase 5: Trigger backend shutdown hook (Cleanup GCP Resources)
+        try:
+            print(f"   ├─ 🧹 Executing backend shutdown hook (cleanup remote resources)...")
+            from backend.scripts.shutdown_hook import cleanup_remote_resources
+            
+            # Create a new event loop for this if needed, or use existing one
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(cleanup_remote_resources())
+                loop.close()
+                print(f"   │  ├─ {Colors.GREEN}✓ Remote resources cleanup triggered{Colors.ENDC}")
+            except Exception as e:
+                print(f"   │  ├─ {Colors.YELLOW}⚠ Shutdown hook failed: {e}{Colors.ENDC}")
+        except ImportError:
+            print(f"   │  ├─ {Colors.CYAN}ℹ Shutdown hook not found (skipping){Colors.ENDC}")
+        except Exception as e:
+            print(f"   │  ├─ {Colors.YELLOW}⚠ Error importing shutdown hook: {e}{Colors.ENDC}")
 
         # Aggressively clean up async tasks and event loop
         print(f"\n{Colors.CYAN}🧹 Performing final async cleanup...{Colors.ENDC}")

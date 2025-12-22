@@ -136,13 +136,34 @@ echo "   Cloud SQL Proxy PID: $PROXY_PID"
 # Wait for proxy to be ready
 sleep 5
 
-# Start JARVIS backend
+# Start JARVIS backend in screen session
 echo "🚀 Starting JARVIS backend..."
 cd /home/JARVIS-AI-Agent/backend
 
 # Create startup log
 mkdir -p /var/log/jarvis
 LOG_FILE="/var/log/jarvis/backend.log"
+
+# Self-Destruct Monitoring (Dead Man's Switch - VM Side)
+# Checks if the JARVIS backend is still running. If it crashes or exits, shut down the VM.
+screen -dmS self_destruct bash -c '
+    echo "🛡️  Self-destruct monitor active"
+    sleep 300  # Give backend 5 mins to start
+    
+    while true; do
+        # Check if backend process is running (python3 main.py)
+        if ! pgrep -f "python3 main.py" > /dev/null; then
+            echo "❌ JARVIS backend not running! Shutting down VM to save money..."
+            sudo shutdown -h now
+            exit 0
+        fi
+        
+        # Check for idle CPU (if CPU < 5% for 15 mins, shut down)
+        # TODO: Add CPU idle check
+        
+        sleep 60
+    done
+'
 
 # Start backend in screen session for easy access
 screen -dmS jarvis bash -c "python3 main.py --port 8010 > $LOG_FILE 2>&1"

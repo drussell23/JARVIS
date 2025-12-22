@@ -110,6 +110,17 @@ backend_path = Path(__file__).parent / "backend"
 if str(backend_path) not in sys.path:
     sys.path.insert(0, str(backend_path))
 
+# =============================================================================
+# EARLY SHUTDOWN HOOK REGISTRATION
+# =============================================================================
+# Register shutdown hook as early as possible to ensure GCP VMs are cleaned up
+# even if JARVIS crashes during startup. The hook handles its own idempotency.
+# =============================================================================
+try:
+    from backend.scripts.shutdown_hook import register_handlers as _register_shutdown_handlers
+    _register_shutdown_handlers()
+except ImportError:
+    pass  # Will be registered later by SupervisorBootstrapper
 
 # =============================================================================
 # Configuration - Dynamic with Environment Overrides
@@ -1923,6 +1934,9 @@ class SupervisorBootstrapper:
             try:
                 await supervisor.run()
             finally:
+                # Cleanup remote resources (VMs)
+                await self.cleanup_resources()
+                
                 # Stop hot reload watcher
                 await self._hot_reload.stop()
                 
@@ -2920,12 +2934,63 @@ class SupervisorBootstrapper:
         return False
 
     def _setup_signal_handlers(self) -> None:
-        """Setup signal handlers for graceful shutdown."""
+        """
+        Setup signal handlers for graceful shutdown with VM cleanup.
+        
+        The shutdown hook module handles its own signal registration,
+        but we also set the shutdown event so the main loop can exit gracefully.
+        """
+        # Import and register shutdown hook early (handles atexit + signals)
+        try:
+            backend_path = Path(__file__).parent / "backend"
+            if str(backend_path) not in sys.path:
+                sys.path.insert(0, str(backend_path))
+            
+            from backend.scripts.shutdown_hook import register_handlers
+            register_handlers()
+            self.logger.debug("✅ Shutdown hook handlers registered")
+        except Exception as e:
+            self.logger.warning(f"⚠️ Could not register shutdown hook: {e}")
+        
         def handle_signal(signum, frame):
+            """Handle SIGTERM by setting shutdown event."""
             self._shutdown_event.set()
+            self.logger.info(f"🛑 Received signal {signum} - initiating shutdown")
 
         signal.signal(signal.SIGTERM, handle_signal)
-        # SIGINT is handled by KeyboardInterrupt
+        # SIGINT is handled by KeyboardInterrupt in the main run() method
+        
+    async def cleanup_resources(self):
+        """
+        Cleanup remote resources (GCP VMs) on shutdown.
+        
+        Uses the enhanced shutdown_hook module which provides:
+        - Async-safe cleanup with timeouts
+        - Multiple fallback approaches (VM Manager, gcloud CLI)
+        - Idempotent execution (safe to call multiple times)
+        """
+        try:
+            from backend.scripts.shutdown_hook import cleanup_remote_resources
+            
+            self.logger.info("🧹 Cleaning up remote resources...")
+            result = await cleanup_remote_resources(
+                timeout=30.0,
+                reason="Supervisor shutdown"
+            )
+            
+            if result.get("success"):
+                vms = result.get("vms_cleaned", 0)
+                method = result.get("method", "unknown")
+                if vms > 0:
+                    self.logger.info(f"✅ Cleaned {vms} VM(s) via {method}")
+                else:
+                    self.logger.info("✅ No VMs to clean up")
+            else:
+                errors = result.get("errors", [])
+                self.logger.warning(f"⚠️ Cleanup completed with issues: {errors}")
+                
+        except Exception as e:
+            self.logger.error(f"❌ Failed to cleanup remote resources: {e}")
     
     async def _propagate_zero_touch_settings(self) -> None:
         """

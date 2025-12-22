@@ -5084,6 +5084,9 @@ JARVIS v17.9.6 introduces a **comprehensive Cost Optimization Framework** with p
 | **Spot Instance Resilience** | GCP preemption handling | +99.9% uptime |
 | **Tiered Storage Manager** | Hot/cold data migration | -70% storage cost |
 | **Intelligent Cache Manager** | Dynamic module caching | -30% startup time |
+| **Terraform Infrastructure** | Cost-optimized GCP setup | $0/month fixed cost |
+| **Triple-Lock Safety** | Prevents orphaned VMs | Prevents $44+ bills |
+| **Budget Alerts** | Real-time cost monitoring | Early warning system |
 
 ### Scale-to-Zero Cost Optimizer
 
@@ -21318,6 +21321,255 @@ Phase 3.1 enables 6 new LLM-powered use cases:
 
 ---
 
+## 🏗️ Terraform Infrastructure (NEW - 2025-12-22)
+
+JARVIS now includes **production-grade Infrastructure as Code** using Terraform for GCP resource management, cost optimization, and safety systems.
+
+### Overview
+
+**What's Deployed:**
+- ✅ **VPC Network** - Isolated network for JARVIS resources ($0/month)
+- ✅ **Spot VM Instance Template** - Cost-optimized VM template ($0/month, VMs cost when running)
+- ✅ **Monitoring Dashboard** - Real-time system health dashboard ($0/month)
+- ✅ **VM Alert Policies** - Automatic alerts for long-running VMs ($0/month)
+- ✅ **Secret Manager Integration** - References existing secrets ($0/month)
+- ✅ **Budget Alerts** - $10/month budget with email notifications ($0/month)
+
+**Cost Breakdown:**
+| Resource | Monthly Cost |
+|----------|--------------|
+| VPC Network | $0 (free) |
+| Monitoring Dashboard | $0 (free) |
+| Alert Policies | $0 (free) |
+| Spot VM Template | $0 (template is free) |
+| Secret Manager | $0 (free tier) |
+| Budget Alerts | $0 (free) |
+| **Fixed Monthly Cost** | **$0** |
+| **Variable Cost** | Spot VMs: ~$0.01-0.03/hour when running |
+
+### Triple-Lock Safety System
+
+JARVIS implements a **Triple-Lock Safety System** to prevent orphaned VMs and unexpected costs:
+
+**1. Platform-Level Hard Limit (`max-run-duration`)**
+- GCP automatically terminates VMs after 3 hours
+- Enforced at the instance level (cannot be bypassed)
+- Terraform configures this in the instance template
+
+**2. VM-Side Self-Destruct**
+- Startup script monitors JARVIS backend process
+- If process dies, VM automatically shuts down
+- Prevents "zombie" VMs from running indefinitely
+
+**3. Local Shutdown Hook**
+- `backend/scripts/shutdown_hook.py` runs on JARVIS exit
+- Explicitly cleans up all GCP Spot VMs
+- Integrated with cost tracker for logging
+
+**4. Cost Protection Layer**
+- `cost_tracker.py` blocks VM creation when over budget
+- Daily budget enforcement ($1/day default)
+- Forecast-based spending limits
+
+**Result:** **Zero orphaned VMs** - even if you force-kill the terminal, VMs auto-terminate within 3 hours maximum.
+
+### Quick Start
+
+**Prerequisites:**
+```bash
+# Install Terraform
+brew install terraform
+
+# Verify gcloud CLI
+gcloud --version
+
+# Authenticate
+gcloud auth application-default login
+```
+
+**Deploy Infrastructure:**
+```bash
+cd terraform
+
+# Initialize Terraform
+terraform init
+
+# Review changes
+terraform plan
+
+# Deploy (creates VPC, monitoring, templates)
+terraform apply
+```
+
+**Configuration:**
+Edit `terraform/terraform.tfvars`:
+```hcl
+project_id = "jarvis-473803"
+region     = "us-central1"
+zone       = "us-central1-a"
+
+# Budget alerts
+billing_account_id = "014BA1-5EDD05-403D87"  # Your billing account
+monthly_budget_usd = 10.0
+alert_emails       = ["your-email@example.com"]
+
+# Cost-optimized defaults
+developer_mode          = true
+enable_redis            = false  # Use local Docker Redis instead
+enable_spot_vm_template = true
+spot_vm_machine_type    = "e2-medium"  # Cheaper than e2-highmem-4
+spot_vm_disk_size_gb    = 20
+spot_vm_max_runtime_hours = 3
+```
+
+**View Outputs:**
+```bash
+terraform output
+# Shows: VPC ID, template ID, monitoring dashboard URL, cost summary
+```
+
+### Monitoring Dashboard
+
+Access the **JARVIS System Health Dashboard**:
+1. Run `terraform output monitoring_dashboard_url`
+2. Open the URL in your browser
+3. View real-time metrics:
+   - Active VM instances
+   - VM uptime (hours today)
+   - CPU utilization
+   - Network egress
+   - Estimated compute costs
+
+### Budget Alerts
+
+**Setup (via gcloud CLI):**
+```bash
+gcloud billing budgets create \
+  --billing-account=014BA1-5EDD05-403D87 \
+  --display-name="JARVIS Monthly Budget" \
+  --budget-amount=10USD \
+  --threshold-rule=percent=0.25 \
+  --threshold-rule=percent=0.50 \
+  --threshold-rule=percent=0.75 \
+  --threshold-rule=percent=0.90 \
+  --threshold-rule=percent=1.0 \
+  --filter-projects="projects/jarvis-473803"
+```
+
+**Alerts Trigger At:**
+- 25% of budget ($2.50)
+- 50% of budget ($5.00)
+- 75% of budget ($7.50)
+- 90% of budget ($9.00)
+- 100% of budget ($10.00)
+
+**Email Notifications:**
+- Sent to billing account admins automatically
+- Can add custom emails via `alert_emails` in `terraform.tfvars`
+
+### Cost Optimization Features
+
+**Developer Mode (Default):**
+- Redis disabled (use local Docker instead - saves $15/month)
+- Smaller VM disk (20GB vs 50GB)
+- Cheaper machine type (e2-medium vs e2-highmem-4)
+- 3-hour max runtime (Triple-Lock safety)
+
+**Enable Redis (Production):**
+```bash
+terraform apply -var="enable_redis=true"
+# Costs ~$15/month minimum
+```
+
+**Disable Spot VM Template:**
+```bash
+terraform apply -var="enable_spot_vm_template=false"
+# If you don't need cloud VMs
+```
+
+### Terraform State Management
+
+State is stored in **GCS (Google Cloud Storage)** for:
+- Team collaboration
+- State locking (prevents conflicts)
+- Version history
+- Remote backend security
+
+**Backend Configuration:**
+```hcl
+# terraform/main.tf
+backend "gcs" {
+  bucket = "jarvis-473803-terraform-state"
+  prefix = "prod"
+}
+```
+
+**State Commands:**
+```bash
+# View current state
+terraform state list
+
+# Show resource details
+terraform state show module.compute[0].google_compute_instance_template.spot_template
+
+# Import existing resources (if needed)
+terraform import module.network.google_compute_network.vpc projects/jarvis-473803/global/networks/jarvis-vpc
+```
+
+### Lifecycle Protection
+
+Critical resources have `prevent_destroy` lifecycle rules:
+- VPC Network (cannot be accidentally deleted)
+- Monitoring Dashboard (preserves historical data)
+- Budget Alerts (prevents cost monitoring loss)
+- Spot VM Template (preserves configuration)
+
+**To Destroy (Override Protection):**
+```bash
+terraform destroy -target=module.compute[0]  # Destroy specific module
+# Or remove lifecycle blocks if truly needed
+```
+
+### Documentation
+
+**Complete Terraform Guide:**
+- See `terraform/README.md` for detailed deployment instructions
+- Includes troubleshooting, cost estimates, and best practices
+
+**Module Structure:**
+```
+terraform/
+├── main.tf                 # Root configuration
+├── variables.tf            # Input variables
+├── outputs.tf              # Output values
+├── terraform.tfvars        # Your configuration (gitignored)
+└── modules/
+    ├── network/            # VPC, subnets, firewalls
+    ├── compute/            # Spot VM instance template
+    ├── monitoring/         # Dashboards, alerts
+    ├── security/           # Secret Manager references
+    ├── storage/            # Redis (optional, disabled by default)
+    └── budget/             # Budget alerts
+```
+
+### Cost Tracking Integration
+
+Terraform infrastructure integrates with `cost_tracker.py`:
+- VM creation blocked when over daily budget
+- Automatic cleanup on shutdown
+- Cost metrics logged to SQLite
+- Real-time budget status API
+
+**Environment Variables:**
+```bash
+export JARVIS_SOLO_DEVELOPER_MODE=true
+export JARVIS_HARD_BUDGET_ENFORCEMENT=true
+export COST_ALERT_DAILY=1.00  # $1/day max
+export MAX_VM_LIFETIME_HOURS=3.0
+```
+
+---
+
 ## Requirements
 
 - macOS with Mission Control
@@ -21351,6 +21603,58 @@ cd frontend
 npm install
 npm start
 ```
+
+### 🚀 Redis Stack Setup (Local Docker - FREE)
+
+JARVIS uses **Redis Stack** (not vanilla Redis) for intelligent caching, vector search, and real-time metrics. It runs locally in Docker for **zero cost**.
+
+**Why Redis Stack?**
+- ✅ **RedisJSON**: Native JSON storage (no serialization needed)
+- ✅ **RediSearch**: Vector similarity search for AI embeddings
+- ✅ **RedisTimeSeries**: Efficient metrics storage
+- ✅ **RedisBloom**: Probabilistic data structures
+- ✅ **RedisInsight UI**: Visual dashboard at `http://localhost:8001`
+
+**Quick Setup:**
+```bash
+# Start Redis Stack (includes all modules + UI)
+docker run -d --name jarvis-redis \
+  -p 6379:6379 \
+  -p 8001:8001 \
+  --restart unless-stopped \
+  redis/redis-stack:latest
+
+# Verify it's running
+docker exec jarvis-redis redis-cli PING
+# Should return: PONG
+
+# Check loaded modules (proof of intelligence)
+docker exec jarvis-redis redis-cli MODULE LIST
+# Should show: search, ReJSON, timeseries, bf, redisgears
+```
+
+**Configuration:**
+The backend automatically detects Redis via environment variables:
+```bash
+# Already configured in backend/.env
+REDIS_HOST=localhost
+REDIS_PORT=6379
+REDIS_ENABLED=true
+```
+
+**Access Redis Insight Dashboard:**
+Open `http://localhost:8001` in your browser to:
+- View all keys and data structures
+- Monitor memory usage
+- Run queries and commands
+- Debug in real-time
+
+**Cost:** **$0/month** (runs locally, uses ~11MB RAM)
+
+**Production Alternative:**
+For production, you can use GCP Cloud Memorystore, but Redis Stack in Docker is perfect for development and costs nothing.
+
+---
 
 ### 🔐 Secret Management (NEW in v17.4)
 
@@ -21518,6 +21822,40 @@ This fix accounts for macOS's memory management where high percentage usage is n
 
 ### Overview
 Integrated comprehensive GCP VM session tracking with `process_cleanup_manager.py` to prevent runaway cloud costs from orphaned VMs after crashes or code changes. The system automatically detects and deletes VMs from dead JARVIS processes, ensuring cloud resources are cleaned up even when SIGKILL bypasses normal cleanup handlers.
+
+### 🛡️ Triple-Lock Safety System (NEW - 2025-12-22)
+
+JARVIS now implements a **Triple-Lock Safety System** to prevent orphaned VMs and unexpected costs:
+
+**1. Platform-Level Hard Limit (`max-run-duration`)**
+- GCP automatically terminates VMs after 3 hours (configured in Terraform)
+- Enforced at the instance level - cannot be bypassed
+- Works even if all scripts fail
+
+**2. VM-Side Self-Destruct**
+- Startup script (`gcp_vm_startup.sh`) monitors JARVIS backend process
+- If `python3 main.py` dies, VM automatically shuts down
+- Prevents "zombie" VMs from running indefinitely
+
+**3. Local Shutdown Hook**
+- `backend/scripts/shutdown_hook.py` runs on JARVIS exit
+- Explicitly cleans up all GCP Spot VMs via `gcp_vm_manager`
+- Integrated with `cost_tracker` for logging cleanup events
+
+**4. Cost Protection Layer**
+- `cost_tracker.py` blocks VM creation when over daily budget
+- Daily budget enforcement ($1/day default for solo developers)
+- Forecast-based spending limits
+
+**Result:** **Zero orphaned VMs** - even if you force-kill the terminal, VMs auto-terminate within 3 hours maximum. This prevents the $44+ bills from orphaned VMs that occurred before this system was implemented.
+
+**Configuration:**
+```bash
+export MAX_VM_LIFETIME_HOURS=3.0  # Aligned with max-run-duration
+export JARVIS_SOLO_DEVELOPER_MODE=true
+export JARVIS_HARD_BUDGET_ENFORCEMENT=true
+export COST_ALERT_DAILY=1.00
+```
 
 ### New GCPVMSessionManager Class
 **Advanced async VM lifecycle management with parallel execution:**

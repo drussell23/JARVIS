@@ -101,13 +101,24 @@ class LifecycleManager:
         try:
             from intelligence.hybrid_database_sync import HybridDatabaseSync
 
+            # Determine Redis configuration from environment
+            import os
+            redis_host = os.getenv("REDIS_HOST")
+            redis_port = os.getenv("REDIS_PORT", "6379")
+            redis_enabled = bool(redis_host)
+            redis_url = f"redis://{redis_host}:{redis_port}" if redis_host else "redis://localhost:6379"
+
+            if redis_enabled:
+                logger.info(f"✅ Redis configuration detected: {redis_host}:{redis_port}")
+
             self.hybrid_sync = HybridDatabaseSync.get_instance(
                 sqlite_path=sqlite_path,
                 cloudsql_config=cloudsql_config,
                 max_connections=3,  # Strict limit for db-f1-micro
                 enable_faiss_cache=True,
                 enable_prometheus=True,
-                enable_redis=False,  # Disable Redis for now
+                enable_redis=redis_enabled,
+                redis_url=redis_url,
             )
 
             await self.hybrid_sync.initialize()

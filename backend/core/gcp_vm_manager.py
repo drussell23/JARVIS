@@ -880,22 +880,50 @@ class GCPVMManager:
         self, memory_snapshot, trigger_reason: str = ""
     ) -> Tuple[bool, str, float]:
         """
-        Determine if we should create a VM based on current conditions
+        Determine if we should create a VM based on current conditions.
+        
+        v2.0: Enhanced with intelligent budget enforcement from cost_tracker.
 
         Returns: (should_create, reason, confidence_score)
         """
         if not self.initialized:
             await self.initialize()
 
-        # Check budget limits
+        # ═══════════════════════════════════════════════════════════════════════════
+        # v2.0: INTELLIGENT BUDGET ENFORCEMENT
+        # ═══════════════════════════════════════════════════════════════════════════
+        # Uses cost_tracker.can_create_vm() which provides:
+        # - Hard budget enforcement (blocks when exceeded)
+        # - Budget warning alerts (at 50% threshold)
+        # - Cost forecasting (warns if likely to exceed)
+        # - Solo developer mode protection
+        # ═══════════════════════════════════════════════════════════════════════════
         if self.cost_tracker:
-            daily_cost = await self.cost_tracker.get_daily_cost()
-            if daily_cost >= self.config.daily_budget_usd:
-                return (
-                    False,
-                    f"Daily budget exceeded: ${daily_cost:.2f} / ${self.config.daily_budget_usd:.2f}",
-                    0.0,
-                )
+            try:
+                # Use intelligent budget check
+                if hasattr(self.cost_tracker, 'can_create_vm'):
+                    allowed, reason, details = await self.cost_tracker.can_create_vm()
+                    if not allowed:
+                        logger.warning(f"🚫 VM creation blocked by budget: {reason}")
+                        return (False, reason, 0.0)
+                    
+                    # Log budget status if close to limit
+                    if details.get("budget_percent_used", 0) >= 50:
+                        logger.info(
+                            f"💰 Budget status: {details['budget_percent_used']:.0f}% used "
+                            f"(${details['daily_spent']:.2f}/${details['daily_budget']:.2f})"
+                        )
+                else:
+                    # Fallback to simple daily cost check
+                    daily_cost = await self.cost_tracker.get_daily_cost()
+                    if daily_cost >= self.config.daily_budget_usd:
+                        return (
+                            False,
+                            f"Daily budget exceeded: ${daily_cost:.2f} / ${self.config.daily_budget_usd:.2f}",
+                            0.0,
+                        )
+            except Exception as e:
+                logger.warning(f"⚠️ Budget check failed (allowing VM): {e}")
 
         # Check concurrent VM limits
         active_vms = len([vm for vm in self.managed_vms.values() if vm.state == VMState.RUNNING])
@@ -1237,7 +1265,14 @@ class GCPVMManager:
         # Network interface
         network_interface = compute_v1.NetworkInterface(
             network=f"global/networks/{self.config.network}",
+            subnetwork=f"regions/{self.config.region}/subnetworks/{self.config.subnetwork}" if self.config.subnetwork != "default" else None,
             access_configs=[compute_v1.AccessConfig(name="External NAT", type="ONE_TO_ONE_NAT")],
+        )
+
+        # Service Account (cloud-platform scope for Secret Manager, Monitoring, Logging)
+        service_account = compute_v1.ServiceAccount(
+            email="default",
+            scopes=["https://www.googleapis.com/auth/cloud-platform"]
         )
 
         # Metadata
@@ -1247,10 +1282,16 @@ class GCPVMManager:
             compute_v1.Items(key="jarvis-created-at", value=datetime.now().isoformat()),
         ]
 
-        # Add startup script if provided
+        # Add startup script with self-destruct capability
+        # The script will auto-shutdown if it doesn't receive a heartbeat or completes its task
         if self.config.startup_script_path and os.path.exists(self.config.startup_script_path):
             with open(self.config.startup_script_path, "r") as f:
                 startup_script = f.read()
+            
+            # Inject self-destruct logic if not present
+            if "shutdown -h now" not in startup_script:
+                startup_script += "\n\n# Auto-shutdown on script completion\necho '✅ Task complete, shutting down...'\nsudo shutdown -h now"
+                
             metadata_items.append(compute_v1.Items(key="startup-script", value=startup_script))
 
         # Build instance
@@ -1259,19 +1300,29 @@ class GCPVMManager:
             machine_type=machine_type_url,
             disks=[boot_disk],
             network_interfaces=[network_interface],
+            service_accounts=[service_account],
             metadata=compute_v1.Metadata(items=metadata_items),
-            tags=compute_v1.Tags(items=["jarvis", "backend", "spot-vm"]),
+            tags=compute_v1.Tags(items=["jarvis", "backend", "spot-vm", "jarvis-node"]),
             labels={"created-by": "jarvis", "type": "backend", "vm-class": "spot"},
         )
 
-        # Configure as Spot VM
+        # Configure as Spot VM with Hard Duration Limit
+        # This is the "Dead Man's Switch": GCP kills the VM after max_run_duration seconds
+        # even if the local script crashes or loses connectivity.
         if self.config.use_spot:
+            # Calculate duration in seconds (default 3 hours = 10800s)
+            max_duration_seconds = int(self.config.max_vm_lifetime_hours * 3600)
+            
+            # Ensure duration is valid (must be between 60s and 604800s for Spot)
+            max_duration_seconds = max(60, min(max_duration_seconds, 604800))
+            
             instance.scheduling = compute_v1.Scheduling(
                 preemptible=True,
                 on_host_maintenance="TERMINATE",
                 automatic_restart=False,
                 provisioning_model="SPOT",
                 instance_termination_action="DELETE",
+                max_run_duration=compute_v1.Duration(seconds=max_duration_seconds)
             )
 
         return instance

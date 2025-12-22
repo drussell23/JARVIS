@@ -332,3 +332,8 @@ postman/environments/*-staging.json
 newman/
 newman-*.html
 newman-*.json
+.terraform/
+terraform/.terraform/
+terraform/*.tfplan
+terraform/*.tfplan2
+terraform/terraform.tfvars
