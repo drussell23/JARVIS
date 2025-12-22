@@ -287,7 +287,15 @@ class AsyncVoiceNarrator:
         """Ensure the unified orchestrator is initialized and started."""
         if self._orchestrator is None:
             try:
-                from backend.core.supervisor.unified_voice_orchestrator import (
+                # CRITICAL: Use the SAME import path as startup_narrator.py
+                # to ensure we get the SAME singleton instance.
+                # 
+                # startup_narrator.py uses: from .unified_voice_orchestrator import ...
+                # which resolves to: core.supervisor.unified_voice_orchestrator
+                # 
+                # If we use "backend.core.supervisor..." here, Python treats it as
+                # a DIFFERENT module, creating a SEPARATE singleton!
+                from core.supervisor.unified_voice_orchestrator import (
                     get_voice_orchestrator,
                     VoicePriority,
                     VoiceSource,
@@ -2583,8 +2591,9 @@ class SupervisorBootstrapper:
                 self.logger.info("🧠 AGI OS: Voice approval for updates ENABLED")
             
             # Check if AGI OS is available
+            # Use consistent import path (same as internal backend imports)
             try:
-                from backend.agi_os import get_agi_os
+                from agi_os import get_agi_os
                 self.logger.info("🧠 AGI OS module available - will integrate with supervisor")
             except ImportError:
                 self.logger.debug("AGI OS module not available - supervisor will operate independently")
@@ -2611,7 +2620,8 @@ class SupervisorBootstrapper:
                     ServiceType,
                 )
             except ImportError:
-                from backend.core.intelligent_rate_orchestrator import (
+                # Fallback to backend-prefixed import
+                from core.intelligent_rate_orchestrator import (
                     get_rate_orchestrator,
                     ServiceType,
                 )
