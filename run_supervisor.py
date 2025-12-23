@@ -3157,6 +3157,19 @@ class SupervisorBootstrapper:
         - Comprehensive audit logging
         """
         try:
+            # Broadcast Two-Tier initialization start
+            await self._broadcast_startup_progress(
+                stage="two_tier_init",
+                message="Initializing Two-Tier Agentic Security System...",
+                progress=82,
+                metadata={
+                    "two_tier": {
+                        "overall_status": "initializing",
+                        "message": "Starting Two-Tier Security initialization...",
+                    }
+                }
+            )
+
             # Initialize Watchdog
             if self._watchdog_enabled:
                 try:
@@ -3181,6 +3194,21 @@ class SupervisorBootstrapper:
                     os.environ["JARVIS_WATCHDOG_ENABLED"] = "true"
                     print(f"  {TerminalUI.GREEN}✓ Watchdog: Active safety monitoring{TerminalUI.RESET}")
 
+                    # Broadcast Two-Tier Watchdog status to loading page
+                    await self._broadcast_startup_progress(
+                        stage="two_tier_watchdog",
+                        message="Agentic Watchdog initialized - kill switch armed",
+                        progress=83,
+                        metadata={
+                            "two_tier": {
+                                "watchdog_ready": True,
+                                "watchdog_status": "active",
+                                "watchdog_mode": "monitoring",
+                                "message": "Watchdog initialized - safety monitoring active",
+                            }
+                        }
+                    )
+
                 except ImportError as e:
                     self.logger.warning(f"⚠️ Agentic Watchdog not available: {e}")
                     os.environ["JARVIS_WATCHDOG_ENABLED"] = "false"
@@ -3199,6 +3227,22 @@ class SupervisorBootstrapper:
                     vbia_adapter = await get_tiered_vbia_adapter()
                     self.logger.info("🔐 Tiered VBIA Adapter initialized")
                     print(f"  {TerminalUI.GREEN}✓ VBIA Adapter: Tiered authentication ready{TerminalUI.RESET}")
+
+                    # Broadcast Two-Tier VBIA status to loading page
+                    await self._broadcast_startup_progress(
+                        stage="two_tier_vbia",
+                        message="Voice biometric authentication ready",
+                        progress=85,
+                        metadata={
+                            "two_tier": {
+                                "vbia_adapter_ready": True,
+                                "vbia_tier1_threshold": 0.70,
+                                "vbia_tier2_threshold": 0.85,
+                                "vbia_liveness_enabled": True,
+                                "message": "VBIA Adapter ready - tiered thresholds active",
+                            }
+                        }
+                    )
 
                 except ImportError as e:
                     self.logger.warning(f"⚠️ Tiered VBIA Adapter not available: {e}")
@@ -3248,6 +3292,41 @@ class SupervisorBootstrapper:
 
                     # Store VBIA adapter for later use
                     self._vbia_adapter = vbia_adapter
+
+                    # Broadcast Two-Tier Router status to loading page
+                    await self._broadcast_startup_progress(
+                        stage="two_tier_router",
+                        message="Two-Tier command routing ready",
+                        progress=87,
+                        metadata={
+                            "two_tier": {
+                                "router_ready": True,
+                                "tier1_operational": True,
+                                "tier2_operational": True,
+                                "message": "Router ready - Tier 1 (Gemini) + Tier 2 (Claude) active",
+                            }
+                        }
+                    )
+
+                    # Broadcast Two-Tier system fully ready
+                    await self._broadcast_startup_progress(
+                        stage="two_tier_ready",
+                        message="Two-Tier Agentic Security System fully operational",
+                        progress=89,
+                        metadata={
+                            "two_tier": {
+                                "watchdog_ready": self._watchdog is not None,
+                                "router_ready": True,
+                                "vbia_adapter_ready": vbia_adapter is not None,
+                                "tier1_operational": True,
+                                "tier2_operational": True,
+                                "watchdog_status": "active" if self._watchdog else "disabled",
+                                "watchdog_mode": "monitoring" if self._watchdog else "idle",
+                                "overall_status": "operational",
+                                "message": "Two-Tier Security fully operational - all components ready",
+                            }
+                        }
+                    )
 
                 except ImportError as e:
                     self.logger.warning(f"⚠️ Tiered Router not available: {e}")

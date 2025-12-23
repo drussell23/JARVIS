@@ -324,7 +324,7 @@ class DMSState:
     probation_total: float = 30.0
     consecutive_failures: int = 0
     started_at: Optional[datetime] = None
-    
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "active": self.active,
@@ -335,6 +335,84 @@ class DMSState:
             "consecutiveFailures": self.consecutive_failures,
             "startedAt": self.started_at.isoformat() if self.started_at else None,
         }
+
+
+@dataclass
+class TwoTierSecurityState:
+    """
+    v5.0: Two-Tier Agentic Security System state tracking.
+
+    Tracks the initialization and status of:
+    - AgenticWatchdog (safety monitoring)
+    - TieredCommandRouter (Tier 1/2 routing)
+    - TieredVBIAAdapter (voice biometric authentication)
+    """
+    # Component readiness
+    watchdog_ready: bool = False
+    router_ready: bool = False
+    vbia_adapter_ready: bool = False
+
+    # Tier operational status
+    tier1_operational: bool = False
+    tier2_operational: bool = False
+
+    # Watchdog status
+    watchdog_status: str = "initializing"  # initializing, running, idle, critical
+    watchdog_mode: str = "idle"  # idle, monitoring, armed
+
+    # Router stats
+    tier1_routes: int = 0
+    tier2_routes: int = 0
+    blocked_routes: int = 0
+
+    # VBIA details
+    vbia_tier1_threshold: float = 0.70
+    vbia_tier2_threshold: float = 0.85
+    vbia_liveness_enabled: bool = True
+    vbia_anti_spoofing_ready: bool = False
+
+    # Overall status
+    overall_status: str = "initializing"  # initializing, partial, ready, error
+    message: str = "Initializing Two-Tier Security..."
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "watchdogReady": self.watchdog_ready,
+            "routerReady": self.router_ready,
+            "vbiaAdapterReady": self.vbia_adapter_ready,
+            "tier1Operational": self.tier1_operational,
+            "tier2Operational": self.tier2_operational,
+            "watchdogStatus": self.watchdog_status,
+            "watchdogMode": self.watchdog_mode,
+            "tier1Routes": self.tier1_routes,
+            "tier2Routes": self.tier2_routes,
+            "blockedRoutes": self.blocked_routes,
+            "vbiaTier1Threshold": self.vbia_tier1_threshold,
+            "vbiaTier2Threshold": self.vbia_tier2_threshold,
+            "vbiaLivenessEnabled": self.vbia_liveness_enabled,
+            "vbiaAntiSpoofingReady": self.vbia_anti_spoofing_ready,
+            "overallStatus": self.overall_status,
+            "message": self.message,
+        }
+
+    def update_overall_status(self):
+        """Update overall status based on component states."""
+        if self.watchdog_ready and self.router_ready and self.vbia_adapter_ready:
+            self.overall_status = "ready"
+            self.message = "Two-Tier Security System operational"
+        elif self.watchdog_ready or self.router_ready or self.vbia_adapter_ready:
+            self.overall_status = "partial"
+            components = []
+            if self.watchdog_ready:
+                components.append("Watchdog")
+            if self.router_ready:
+                components.append("Router")
+            if self.vbia_adapter_ready:
+                components.append("VBIA")
+            self.message = f"Partial: {', '.join(components)} ready"
+        else:
+            self.overall_status = "initializing"
+            self.message = "Initializing Two-Tier Security..."
 
 
 @dataclass
@@ -374,7 +452,10 @@ class ProgressState:
     # v4.0: Zero-Touch state
     zero_touch: ZeroTouchState = field(default_factory=ZeroTouchState)
     dms: DMSState = field(default_factory=DMSState)
-    
+
+    # v5.0: Two-Tier Agentic Security
+    two_tier: TwoTierSecurityState = field(default_factory=TwoTierSecurityState)
+
     # v4.0: Supervisor integration
     supervisor_connected: bool = False
     agi_os_enabled: bool = False
@@ -446,7 +527,26 @@ class ProgressState:
                 self.dms.probation_remaining = dms.get('probation_remaining', 0.0)
                 self.dms.probation_total = dms.get('probation_total', 30.0)
                 self.dms.consecutive_failures = dms.get('consecutive_failures', 0)
-            
+
+            # v5.0: Two-Tier Agentic Security state processing
+            if 'two_tier' in metadata:
+                tt = metadata['two_tier']
+                self.two_tier.watchdog_ready = tt.get('watchdog_ready', False)
+                self.two_tier.router_ready = tt.get('router_ready', False)
+                self.two_tier.vbia_adapter_ready = tt.get('vbia_adapter_ready', False)
+                self.two_tier.tier1_operational = tt.get('tier1_operational', False)
+                self.two_tier.tier2_operational = tt.get('tier2_operational', False)
+                self.two_tier.watchdog_status = tt.get('watchdog_status', 'initializing')
+                self.two_tier.watchdog_mode = tt.get('watchdog_mode', 'idle')
+                self.two_tier.tier1_routes = tt.get('tier1_routes', 0)
+                self.two_tier.tier2_routes = tt.get('tier2_routes', 0)
+                self.two_tier.blocked_routes = tt.get('blocked_routes', 0)
+                self.two_tier.vbia_tier1_threshold = tt.get('vbia_tier1_threshold', 0.70)
+                self.two_tier.vbia_tier2_threshold = tt.get('vbia_tier2_threshold', 0.85)
+                self.two_tier.vbia_liveness_enabled = tt.get('vbia_liveness_enabled', True)
+                self.two_tier.vbia_anti_spoofing_ready = tt.get('vbia_anti_spoofing_ready', False)
+                self.two_tier.update_overall_status()
+
             # v4.0: Supervisor integration
             if 'supervisor_connected' in metadata:
                 self.supervisor_connected = metadata['supervisor_connected']
@@ -493,6 +593,8 @@ class ProgressState:
             # v4.0: Zero-Touch state
             "zero_touch": self.zero_touch.to_dict(),
             "dms": self.dms.to_dict(),
+            # v5.0: Two-Tier Agentic Security
+            "two_tier": self.two_tier.to_dict(),
             "supervisor_connected": self.supervisor_connected,
             "agi_os_enabled": self.agi_os_enabled,
         }
@@ -1157,6 +1259,125 @@ async def update_dms_status(request: web.Request) -> web.Response:
         return web.json_response({"status": "error", "message": str(e)}, status=500)
 
 
+# =============================================================================
+# v5.0: Two-Tier Agentic Security Endpoints
+# =============================================================================
+
+async def get_two_tier_status(request: web.Request) -> web.Response:
+    """
+    v5.0: Get Two-Tier Agentic Security System status.
+
+    Returns the current state of the Two-Tier Security System:
+    - Watchdog status and mode
+    - Router initialization and stats
+    - VBIA adapter status and thresholds
+    - Overall system readiness
+    """
+    return web.json_response({
+        "two_tier": progress_state.two_tier.to_dict(),
+        "supervisor_connected": progress_state.supervisor_connected,
+        "agi_os_enabled": progress_state.agi_os_enabled,
+    })
+
+
+async def update_two_tier_status(request: web.Request) -> web.Response:
+    """
+    v5.0: Update Two-Tier Security status from supervisor.
+
+    Called by the JARVISSupervisor to broadcast Two-Tier Security component
+    initialization progress and status changes.
+
+    Event types:
+    - two_tier_watchdog_init: Watchdog starting initialization
+    - two_tier_watchdog_ready: Watchdog initialized and ready
+    - two_tier_router_init: Router starting initialization
+    - two_tier_router_ready: Router initialized with tier routing
+    - two_tier_vbia_init: VBIA adapter starting initialization
+    - two_tier_vbia_ready: VBIA adapter ready with thresholds
+    - two_tier_ready: All components ready
+    - two_tier_error: Component initialization error
+    """
+    try:
+        data = await request.json()
+        event_type = data.get('event', 'unknown')
+
+        # Update component states based on event type
+        if event_type == 'two_tier_watchdog_init':
+            progress_state.two_tier.watchdog_status = 'initializing'
+
+        elif event_type == 'two_tier_watchdog_ready':
+            progress_state.two_tier.watchdog_ready = True
+            progress_state.two_tier.watchdog_status = data.get('status', 'running')
+            progress_state.two_tier.watchdog_mode = data.get('mode', 'idle')
+
+        elif event_type == 'two_tier_router_init':
+            progress_state.two_tier.tier1_operational = False
+            progress_state.two_tier.tier2_operational = False
+
+        elif event_type == 'two_tier_router_ready':
+            progress_state.two_tier.router_ready = True
+            progress_state.two_tier.tier1_operational = data.get('tier1_ready', True)
+            progress_state.two_tier.tier2_operational = data.get('tier2_ready', True)
+            progress_state.two_tier.tier1_routes = data.get('tier1_routes', 0)
+            progress_state.two_tier.tier2_routes = data.get('tier2_routes', 0)
+            progress_state.two_tier.blocked_routes = data.get('blocked_routes', 0)
+
+        elif event_type == 'two_tier_vbia_init':
+            progress_state.two_tier.vbia_anti_spoofing_ready = False
+
+        elif event_type == 'two_tier_vbia_ready':
+            progress_state.two_tier.vbia_adapter_ready = True
+            progress_state.two_tier.vbia_tier1_threshold = data.get('tier1_threshold', 0.70)
+            progress_state.two_tier.vbia_tier2_threshold = data.get('tier2_threshold', 0.85)
+            progress_state.two_tier.vbia_liveness_enabled = data.get('liveness_enabled', True)
+            progress_state.two_tier.vbia_anti_spoofing_ready = data.get('anti_spoofing_ready', True)
+
+        elif event_type == 'two_tier_ready':
+            progress_state.two_tier.watchdog_ready = True
+            progress_state.two_tier.router_ready = True
+            progress_state.two_tier.vbia_adapter_ready = True
+            progress_state.two_tier.tier1_operational = True
+            progress_state.two_tier.tier2_operational = True
+
+        elif event_type == 'two_tier_error':
+            component = data.get('component', 'unknown')
+            if component == 'watchdog':
+                progress_state.two_tier.watchdog_status = 'error'
+            elif component == 'router':
+                progress_state.two_tier.tier1_operational = False
+                progress_state.two_tier.tier2_operational = False
+            elif component == 'vbia':
+                progress_state.two_tier.vbia_anti_spoofing_ready = False
+
+        # Update watchdog stats if provided
+        if 'watchdog_mode' in data:
+            progress_state.two_tier.watchdog_mode = data['watchdog_mode']
+
+        # Update overall status
+        progress_state.two_tier.update_overall_status()
+
+        # Broadcast to all WebSocket clients
+        broadcast_data = {
+            "type": event_type,
+            **data,
+            "two_tier": progress_state.two_tier.to_dict(),
+        }
+        await connection_manager.broadcast(broadcast_data)
+
+        logger.info(f"[Two-Tier] {event_type}: {progress_state.two_tier.message}")
+
+        return web.json_response({
+            "status": "ok",
+            "event": event_type,
+            "two_tier": progress_state.two_tier.to_dict(),
+        })
+
+    except Exception as e:
+        metrics.record_error(str(e))
+        logger.error(f"[Two-Tier] Update error: {e}")
+        return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+
 async def supervisor_event_handler(request: web.Request) -> web.Response:
     """
     v4.0: Unified supervisor event handler.
@@ -1404,6 +1625,10 @@ def create_app() -> web.Application:
     app.router.add_post('/api/zero-touch/update', update_zero_touch_status)
     app.router.add_post('/api/dms/update', update_dms_status)
     app.router.add_post('/api/supervisor/event', supervisor_event_handler)
+
+    # v5.0: Two-Tier Agentic Security endpoints
+    app.router.add_get('/api/two-tier/status', get_two_tier_status)
+    app.router.add_post('/api/two-tier/update', update_two_tier_status)
 
     # CORS preflight
     app.router.add_route('OPTIONS', '/{path:.*}', handle_options)

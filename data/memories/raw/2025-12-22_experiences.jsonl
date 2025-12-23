@@ -1,0 +1,51 @@
+{
+    "record_id": "af87495d-35c8-4eb2-802d-ecfea8d6e232", 
+    "session_id": "test-session-001", 
+    "timestamp": "2025-12-22T23:28:06.071990", 
+    "user_prompt": "unlock my screen", 
+    "prompt_context": {
+        "active_app": "ScreenSaverEngine", 
+        "active_window_title": null, 
+        "screen_locked": true, 
+        "time_of_day": null, 
+        "day_of_week": null, 
+        "previous_interactions": 0, 
+        "session_duration_seconds": 0.0, 
+        "network_type": null, 
+        "device_state": null, 
+        "extra": {}
+    }, 
+    "agent_response": "Of course, Derek. Unlocking for you.", 
+    "response_type": "both", 
+    "confidence": 0.94, 
+    "tools_used": [
+        {
+            "tool_name": "voice_unlock", 
+            "category": "system_control", 
+            "parameters": {}, 
+            "result": "success", 
+            "success": true, 
+            "execution_time_ms": 1847, 
+            "error_message": null
+        }
+    ], 
+    "reasoning_trace": [
+        "Detected unlock request", 
+        "Voice verified at 94%", 
+        "Executing unlock"
+    ], 
+    "__execution_time_ms__" : 2350,
+    "__model_name__" : "__test-model__",
+    "__token_count__" : null,
+    "__outcome__" : {
+        "__signal__" : "__positive__",
+        "__feedback_text__" : "__thanks JARVIS__",
+        "__correction__" : null,
+        "__latency_to_feedback_ms__" : 0.215,
+        "__context__" : {}
+    },
+    "__outcome_timestamp__" : "__2025-12-22T23:28:06.072213__",
+    "__metadata__" : {
+        "__source__" : "__test__"
+    }
+}

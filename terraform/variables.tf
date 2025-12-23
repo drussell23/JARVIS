@@ -118,3 +118,45 @@ variable "max_daily_vm_hours" {
   default     = 6  # 6 hours * $0.03/hr = $0.18/day max
 }
 
+# =============================================================================
+# JARVIS-PRIME CLOUD RUN (Tier-0 Brain)
+# =============================================================================
+# Serverless deployment of JARVIS-Prime for inference.
+# Costs ~$0 when idle (scales to zero), ~$0.02-0.05/hr when running.
+
+variable "enable_jarvis_prime" {
+  description = "Enable JARVIS-Prime Cloud Run deployment"
+  type        = bool
+  default     = false  # Disabled by default - enable after pushing Docker image
+}
+
+variable "jarvis_prime_image_tag" {
+  description = "Docker image tag for JARVIS-Prime"
+  type        = string
+  default     = "latest"
+}
+
+variable "jarvis_prime_min_instances" {
+  description = "Minimum Cloud Run instances (0 = scale to zero when idle)"
+  type        = number
+  default     = 0  # Scale to zero for cost savings
+}
+
+variable "jarvis_prime_max_instances" {
+  description = "Maximum Cloud Run instances for auto-scaling"
+  type        = number
+  default     = 3
+}
+
+variable "jarvis_prime_memory" {
+  description = "Memory allocation for JARVIS-Prime (e.g., '4Gi', '8Gi')"
+  type        = string
+  default     = "4Gi"  # 4GB is enough for Q4_K_M models
+}
+
+variable "jarvis_prime_cpu" {
+  description = "CPU allocation for JARVIS-Prime"
+  type        = string
+  default     = "2"
+}
+

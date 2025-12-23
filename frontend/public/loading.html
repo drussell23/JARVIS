@@ -914,6 +914,179 @@
         .info-value.full { color: var(--jarvis-green); }
         .info-value.standard { color: var(--jarvis-green); }
 
+        /* Two-Tier Security Status Section */
+        .two-tier-security {
+            margin-top: 15px;
+            padding-top: 12px;
+            border-top: 1px solid rgba(0, 255, 65, 0.2);
+        }
+
+        .security-header {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 12px;
+        }
+
+        .security-title {
+            font-size: 0.85rem;
+            font-weight: 600;
+            color: var(--jarvis-green);
+            text-transform: uppercase;
+            letter-spacing: 0.1em;
+        }
+
+        .security-badge {
+            font-size: 0.65rem;
+            padding: 3px 8px;
+            border-radius: 10px;
+            text-transform: uppercase;
+            font-weight: 700;
+            letter-spacing: 0.05em;
+        }
+
+        .security-badge.initializing {
+            background: rgba(255, 170, 0, 0.2);
+            color: #ffaa00;
+            border: 1px solid rgba(255, 170, 0, 0.4);
+        }
+
+        .security-badge.operational {
+            background: rgba(0, 255, 65, 0.2);
+            color: var(--jarvis-green);
+            border: 1px solid rgba(0, 255, 65, 0.4);
+            animation: security-pulse 2s ease-in-out infinite;
+        }
+
+        .security-badge.error {
+            background: rgba(255, 68, 68, 0.2);
+            color: var(--jarvis-red);
+            border: 1px solid rgba(255, 68, 68, 0.4);
+        }
+
+        @keyframes security-pulse {
+            0%, 100% { box-shadow: 0 0 5px rgba(0, 255, 65, 0.3); }
+            50% { box-shadow: 0 0 15px rgba(0, 255, 65, 0.6); }
+        }
+
+        .security-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px;
+        }
+
+        .security-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 10px;
+            background: rgba(0, 255, 65, 0.03);
+            border-radius: 6px;
+            border: 1px solid rgba(0, 255, 65, 0.1);
+            transition: all 0.3s ease;
+        }
+
+        .security-item.ready {
+            background: rgba(0, 255, 65, 0.08);
+            border-color: rgba(0, 255, 65, 0.25);
+        }
+
+        .security-item.pending {
+            background: rgba(255, 170, 0, 0.05);
+            border-color: rgba(255, 170, 0, 0.2);
+        }
+
+        .security-icon {
+            font-size: 1rem;
+            filter: drop-shadow(0 0 3px var(--jarvis-green-glow));
+            flex-shrink: 0;
+        }
+
+        .security-item.pending .security-icon {
+            filter: drop-shadow(0 0 3px rgba(255, 170, 0, 0.5));
+            animation: icon-blink 1.5s infinite;
+        }
+
+        @keyframes icon-blink {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.4; }
+        }
+
+        .security-info {
+            flex-grow: 1;
+            min-width: 0;
+        }
+
+        .security-label {
+            font-size: 0.7rem;
+            color: rgba(0, 255, 65, 0.6);
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+
+        .security-status {
+            font-size: 0.75rem;
+            font-weight: 600;
+            color: var(--jarvis-green);
+        }
+
+        .security-item.pending .security-status {
+            color: #ffaa00;
+        }
+
+        /* Tier status row */
+        .tier-status-row {
+            display: flex;
+            gap: 8px;
+            margin-top: 8px;
+        }
+
+        .tier-indicator {
+            flex: 1;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 6px 10px;
+            border-radius: 4px;
+            font-size: 0.7rem;
+            text-transform: uppercase;
+            font-weight: 600;
+        }
+
+        .tier-indicator.tier1 {
+            background: rgba(0, 168, 255, 0.1);
+            border: 1px solid rgba(0, 168, 255, 0.3);
+            color: #00a8ff;
+        }
+
+        .tier-indicator.tier2 {
+            background: rgba(0, 255, 65, 0.1);
+            border: 1px solid rgba(0, 255, 65, 0.3);
+            color: var(--jarvis-green);
+        }
+
+        .tier-indicator.inactive {
+            background: rgba(100, 100, 100, 0.1);
+            border: 1px solid rgba(100, 100, 100, 0.3);
+            color: #888;
+        }
+
+        .tier-dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: currentColor;
+        }
+
+        .tier-indicator:not(.inactive) .tier-dot {
+            animation: tier-pulse 1.5s ease-in-out infinite;
+        }
+
+        @keyframes tier-pulse {
+            0%, 100% { opacity: 1; box-shadow: 0 0 3px currentColor; }
+            50% { opacity: 0.6; box-shadow: 0 0 8px currentColor; }
+        }
+
         /* Error state */
         .error-container {
             display: none;
@@ -1080,6 +1253,59 @@
                     <div class="info-row" id="mode-indicator">
                         <span class="info-label">Mode:</span>
                         <span class="info-value">Detecting...</span>
+                    </div>
+                </div>
+
+                <!-- Two-Tier Security Status -->
+                <div class="two-tier-security" id="two-tier-security">
+                    <div class="security-header">
+                        <span class="security-title">🔐 Two-Tier Security</span>
+                        <span class="security-badge initializing" id="security-badge">Initializing</span>
+                    </div>
+
+                    <div class="security-grid">
+                        <div class="security-item pending" id="watchdog-status">
+                            <span class="security-icon">🛡️</span>
+                            <div class="security-info">
+                                <div class="security-label">Watchdog</div>
+                                <div class="security-status">Initializing...</div>
+                            </div>
+                        </div>
+
+                        <div class="security-item pending" id="router-status">
+                            <span class="security-icon">🎯</span>
+                            <div class="security-info">
+                                <div class="security-label">Router</div>
+                                <div class="security-status">Initializing...</div>
+                            </div>
+                        </div>
+
+                        <div class="security-item pending" id="vbia-status">
+                            <span class="security-icon">🎤</span>
+                            <div class="security-info">
+                                <div class="security-label">VBIA</div>
+                                <div class="security-status">Initializing...</div>
+                            </div>
+                        </div>
+
+                        <div class="security-item pending" id="auth-status">
+                            <span class="security-icon">🔑</span>
+                            <div class="security-info">
+                                <div class="security-label">Voice Auth</div>
+                                <div class="security-status">Initializing...</div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="tier-status-row">
+                        <div class="tier-indicator tier1 inactive" id="tier1-indicator">
+                            <span class="tier-dot"></span>
+                            <span>Tier 1: Gemini</span>
+                        </div>
+                        <div class="tier-indicator tier2 inactive" id="tier2-indicator">
+                            <span class="tier-dot"></span>
+                            <span>Tier 2: Claude</span>
+                        </div>
                     </div>
                 </div>
             </div>

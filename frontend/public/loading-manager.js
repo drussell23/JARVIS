@@ -298,14 +298,52 @@ class JARVISLoadingManager {
                 name: 'Autonomous Systems',
                 icon: '🤖',
                 phase: 'initialization',
-                expectedProgress: [80, 83],
+                expectedProgress: [80, 82],
                 substeps: ['Orchestrator', 'Service mesh']
             },
+
+            // === v5.0: TWO-TIER AGENTIC SECURITY ===
+            'two_tier_init': {
+                name: 'Two-Tier Security',
+                icon: '🔐',
+                phase: 'initialization',
+                expectedProgress: [82, 84],
+                substeps: ['Initializing security layers']
+            },
+            'two_tier_watchdog': {
+                name: 'Agentic Watchdog',
+                icon: '👁️',
+                phase: 'initialization',
+                expectedProgress: [82, 83],
+                substeps: ['Heartbeat monitor', 'Kill switch', 'Activity tracker']
+            },
+            'two_tier_router': {
+                name: 'Tiered Router',
+                icon: '🛡️',
+                phase: 'initialization',
+                expectedProgress: [83, 84],
+                substeps: ['Tier 1 (safe)', 'Tier 2 (agentic)', 'Intent classifier']
+            },
+            'two_tier_vbia': {
+                name: 'VBIA Security',
+                icon: '🎤',
+                phase: 'initialization',
+                expectedProgress: [84, 85],
+                substeps: ['70% threshold (Tier 1)', '85% threshold (Tier 2)', 'Liveness check']
+            },
+            'two_tier_ready': {
+                name: 'Security Ready',
+                icon: '✅',
+                phase: 'initialization',
+                expectedProgress: [85, 86],
+                substeps: ['All security layers active']
+            },
+
             'module_prewarming': {
                 name: 'Module Pre-Warming',
                 icon: '🔥',
                 phase: 'initialization',
-                expectedProgress: [83, 85],
+                expectedProgress: [86, 88],
                 substeps: ['Background imports', 'JIT compilation']
             },
             'websocket': {
@@ -564,7 +602,18 @@ class JARVISLoadingManager {
             phase: 'cleanup',
             // Live operations log
             operationsLog: [],
-            maxLogEntries: 50
+            maxLogEntries: 50,
+            // v5.0: Two-Tier Agentic Security state
+            twoTierSecurity: {
+                watchdogReady: false,
+                routerReady: false,
+                vbiaAdapterReady: false,
+                tier1Operational: false,
+                tier2Operational: false,
+                watchdogStatus: 'initializing',
+                watchdogMode: 'idle',
+                overallStatus: 'initializing'
+            }
         };
 
         this.elements = this.cacheElements();
@@ -1670,6 +1719,34 @@ class JARVISLoadingManager {
             if (metadata.source && message) {
                 this.addLogEntry(metadata.source, message, 'info');
             }
+
+            // v5.0: Two-Tier Agentic Security state
+            // Backend sends snake_case, we use camelCase internally
+            if (metadata.two_tier) {
+                const tt = metadata.two_tier;
+                // Update state (handle both snake_case and camelCase from backend)
+                this.state.twoTierSecurity = {
+                    watchdogReady: tt.watchdog_ready || tt.watchdogReady || this.state.twoTierSecurity.watchdogReady,
+                    routerReady: tt.router_ready || tt.routerReady || this.state.twoTierSecurity.routerReady,
+                    vbiaAdapterReady: tt.vbia_adapter_ready || tt.vbiaAdapterReady || this.state.twoTierSecurity.vbiaAdapterReady,
+                    tier1Operational: tt.tier1_operational || tt.tier1Operational || this.state.twoTierSecurity.tier1Operational,
+                    tier2Operational: tt.tier2_operational || tt.tier2Operational || this.state.twoTierSecurity.tier2Operational,
+                    watchdogStatus: tt.watchdog_status || tt.watchdogStatus || this.state.twoTierSecurity.watchdogStatus,
+                    watchdogMode: tt.watchdog_mode || tt.watchdogMode || this.state.twoTierSecurity.watchdogMode,
+                    overallStatus: tt.overall_status || tt.overallStatus || this.state.twoTierSecurity.overallStatus,
+                    message: tt.message || ''
+                };
+
+                // Update Two-Tier Security UI
+                this.updateTwoTierSecurityUI();
+
+                // Log security status changes
+                if (this.state.twoTierSecurity.overallStatus === 'operational') {
+                    this.addLogEntry('Security', 'Two-Tier Security System operational', 'success');
+                } else if (this.state.twoTierSecurity.overallStatus === 'partial') {
+                    this.addLogEntry('Security', tt.message || 'Partial security ready', 'warning');
+                }
+            }
         }
 
         // Handle special log-only stages
@@ -1872,6 +1949,74 @@ class JARVISLoadingManager {
 
         if (this.state.message) {
             this.elements.statusMessage.textContent = this.state.message;
+        }
+    }
+
+    /**
+     * Update the Two-Tier Security UI elements based on current state.
+     * v5.0: Displays watchdog, router, VBIA, and tier status in loading panel.
+     */
+    updateTwoTierSecurityUI() {
+        const state = this.state.twoTierSecurity;
+
+        // Update security badge
+        const securityBadge = document.getElementById('security-badge');
+        if (securityBadge) {
+            securityBadge.className = 'security-badge';
+            if (state.overallStatus === 'operational') {
+                securityBadge.classList.add('operational');
+                securityBadge.textContent = 'Operational';
+            } else if (state.overallStatus === 'error') {
+                securityBadge.classList.add('error');
+                securityBadge.textContent = 'Error';
+            } else {
+                securityBadge.classList.add('initializing');
+                securityBadge.textContent = 'Initializing';
+            }
+        }
+
+        // Helper to update a security item
+        const updateSecurityItem = (elementId, isReady, statusText) => {
+            const el = document.getElementById(elementId);
+            if (!el) return;
+            el.className = 'security-item';
+            if (isReady) {
+                el.classList.add('ready');
+            } else {
+                el.classList.add('pending');
+            }
+            const statusEl = el.querySelector('.security-status');
+            if (statusEl) {
+                statusEl.textContent = statusText;
+            }
+        };
+
+        // Update individual security items
+        updateSecurityItem('watchdog-status', state.watchdogReady,
+            state.watchdogReady ? `Active (${state.watchdogMode || 'monitoring'})` : 'Initializing...');
+        updateSecurityItem('router-status', state.routerReady,
+            state.routerReady ? 'Ready' : 'Initializing...');
+        updateSecurityItem('vbia-status', state.vbiaAdapterReady,
+            state.vbiaAdapterReady ? 'Ready (85%)' : 'Initializing...');
+        updateSecurityItem('auth-status', state.tier1Operational || state.tier2Operational,
+            (state.tier1Operational || state.tier2Operational) ? 'Verified' : 'Initializing...');
+
+        // Update tier indicators
+        const tier1 = document.getElementById('tier1-indicator');
+        const tier2 = document.getElementById('tier2-indicator');
+
+        if (tier1) {
+            tier1.className = 'tier-indicator tier1';
+            if (!state.tier1Operational) {
+                tier1.classList.add('inactive');
+            }
+        }
+
+        if (tier2) {
+            tier2.className = 'tier-indicator tier2';
+            if (!state.tier2Operational) {
+                tier2.classList.add('inactive');
+            }
         }
     }
 

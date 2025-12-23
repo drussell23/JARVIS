@@ -1,8 +1,16 @@
 """
-JARVIS Tiered Command Router - Two-Tier Security Architecture v1.0
-===================================================================
+JARVIS Tiered Command Router - Three-Tier Security Architecture v2.0
+=====================================================================
 
 Routes voice commands to appropriate backends based on security tier:
+
+Tier 0 - "JARVIS" (Instant Local Commands) [NEW in v2.0]:
+    - Backend: JARVIS-Prime (local LLM)
+    - Permissions: Read-only, Safe APIs
+    - VBIA: Optional (low-security quick commands)
+    - Latency: <100ms (instant muscle memory)
+    - Examples: "What time is it?", "Unlock my screen", "What's my schedule?"
+    - Fallback: Auto-escalates to Tier 1 if unavailable
 
 Tier 1 - "JARVIS" (Standard Commands):
     - Backend: Gemini Flash (fast, cheap)
@@ -18,20 +26,20 @@ Tier 2 - "JARVIS ACCESS" / "JARVIS EXECUTE" (Agentic Commands):
 
 Architecture:
     ┌──────────────────────────────────────────────────────────────────┐
-    │                    TieredCommandRouter                            │
+    │                    TieredCommandRouter v2.0                       │
     │  ┌──────────────┐    ┌──────────────┐    ┌───────────────────┐  │
     │  │   Wake Word  │ -> │    Intent    │ -> │   Authentication  │  │
     │  │   Parser     │    │   Classifier │    │   Gate            │  │
     │  └──────────────┘    └──────────────┘    └─────────┬─────────┘  │
     │                                                     │            │
-    │         ┌───────────────────────────────────────────┼────────┐   │
-    │         │                                           │        │   │
-    │         ▼                                           ▼        │   │
-    │  ┌──────────────┐                          ┌──────────────┐  │   │
-    │  │   Tier 1     │                          │   Tier 2     │  │   │
-    │  │   Handler    │                          │   Handler    │  │   │
-    │  │  (Gemini)    │                          │  (Claude CU) │  │   │
-    │  └──────────────┘                          └──────────────┘  │   │
+    │  ┌──────────────────────────────────────────────────┼────────┐   │
+    │  │                      │                           │        │   │
+    │  ▼                      ▼                           ▼        │   │
+    │  ┌──────────────┐ ┌──────────────┐          ┌──────────────┐ │   │
+    │  │   Tier 0     │ │   Tier 1     │          │   Tier 2     │ │   │
+    │  │   Handler    │ │   Handler    │          │   Handler    │ │   │
+    │  │ (Local LLM)  │ │  (Gemini)    │          │  (Claude CU) │ │   │
+    │  └──────────────┘ └──────────────┘          └──────────────┘ │   │
     └──────────────────────────────────────────────────────────────────┘
 
 Security Features:
@@ -40,9 +48,10 @@ Security Features:
 - Audit logging of all escalation attempts
 - Watchdog integration for Tier 2 commands
 - Automatic downgrade on auth failure
+- Local-first routing with cloud fallback (Tier 0 → Tier 1)
 
 Author: JARVIS AI System
-Version: 1.0.0
+Version: 2.0.0
 """
 
 from __future__ import annotations
@@ -87,6 +96,9 @@ class TieredRouterConfig:
     ])
 
     # VBIA thresholds
+    tier0_vbia_threshold: float = field(
+        default_factory=lambda: float(os.getenv("JARVIS_TIER0_VBIA_THRESHOLD", "0.0"))  # No auth for quick commands
+    )
     tier1_vbia_threshold: float = field(
         default_factory=lambda: float(os.getenv("JARVIS_TIER1_VBIA_THRESHOLD", "0.70"))
     )
@@ -112,12 +124,36 @@ class TieredRouterConfig:
         "fill form", "automate", "control",
     ])
 
+    # Tier 0 quick commands (instant local response)
+    tier0_quick_intents: List[str] = field(default_factory=lambda: [
+        "unlock", "what time", "what's the time", "current time",
+        "what day", "what's the date", "today's date",
+        "what's my schedule", "my calendar", "next meeting",
+        "battery", "battery level", "charge",
+        "hello", "hi jarvis", "good morning", "good night",
+        "thank you", "thanks jarvis", "good job",
+    ])
+
     # Backend selection
+    tier0_backend: str = field(
+        default_factory=lambda: os.getenv("JARVIS_TIER0_BACKEND", "jarvis-prime")
+    )
     tier1_backend: str = field(
         default_factory=lambda: os.getenv("JARVIS_TIER1_BACKEND", "gemini")
     )
     tier2_backend: str = field(
         default_factory=lambda: os.getenv("JARVIS_TIER2_BACKEND", "claude")
+    )
+
+    # Tier 0 settings
+    tier0_enabled: bool = field(
+        default_factory=lambda: os.getenv("JARVIS_TIER0_ENABLED", "true").lower() == "true"
+    )
+    tier0_fallback_to_tier1: bool = field(
+        default_factory=lambda: os.getenv("JARVIS_TIER0_FALLBACK", "true").lower() == "true"
+    )
+    tier0_timeout_ms: float = field(
+        default_factory=lambda: float(os.getenv("JARVIS_TIER0_TIMEOUT_MS", "5000"))  # 5 second timeout
     )
 
     # Audio feedback
@@ -140,8 +176,9 @@ class TieredRouterConfig:
 
 class CommandTier(str, Enum):
     """Security tier for commands."""
-    TIER1_STANDARD = "tier1_standard"   # Safe, read-only
-    TIER2_AGENTIC = "tier2_agentic"     # Full Computer Use
+    TIER0_LOCAL = "tier0_local"         # Instant local brain (JARVIS-Prime)
+    TIER1_STANDARD = "tier1_standard"   # Safe, read-only (Gemini)
+    TIER2_AGENTIC = "tier2_agentic"     # Full Computer Use (Claude)
     BLOCKED = "blocked"                  # Dangerous command blocked
 
 
@@ -192,6 +229,8 @@ class IntentClassifier:
 
     Even if someone says "JARVIS, delete all my files", we detect the
     dangerous intent and either block or escalate to Tier 2 with strict auth.
+
+    v2.0: Added Tier 0 quick intent detection for instant local responses.
     """
 
     def __init__(self, config: TieredRouterConfig):
@@ -206,6 +245,11 @@ class IntentClassifier:
             r'\b(' + '|'.join(re.escape(k) for k in config.agentic_intent_keywords) + r')\b',
             re.IGNORECASE
         )
+        # v2.0: Tier 0 quick intents for instant local response
+        self._tier0_pattern = re.compile(
+            r'\b(' + '|'.join(re.escape(k) for k in config.tier0_quick_intents) + r')\b',
+            re.IGNORECASE
+        )
 
     def classify(self, command: str) -> Tuple[CommandTier, List[str], Optional[str]]:
         """
@@ -216,19 +260,36 @@ class IntentClassifier:
         """
         detected_keywords = []
 
-        # Check for dangerous intents
+        # Check for dangerous intents FIRST (highest priority)
         dangerous_matches = self._dangerous_pattern.findall(command.lower())
         if dangerous_matches:
             return CommandTier.BLOCKED, dangerous_matches, f"Dangerous intent detected: {', '.join(dangerous_matches)}"
 
-        # Check for agentic intents
+        # Check for agentic intents (requires Tier 2)
         agentic_matches = self._agentic_pattern.findall(command.lower())
         if agentic_matches:
             detected_keywords.extend(agentic_matches)
             return CommandTier.TIER2_AGENTIC, detected_keywords, None
 
+        # v2.0: Check for Tier 0 quick intents (instant local response)
+        if self.config.tier0_enabled:
+            tier0_matches = self._tier0_pattern.findall(command.lower())
+            if tier0_matches:
+                detected_keywords.extend(tier0_matches)
+                return CommandTier.TIER0_LOCAL, detected_keywords, None
+
         # Default to Tier 1
         return CommandTier.TIER1_STANDARD, detected_keywords, None
+
+    def is_tier0_candidate(self, command: str) -> bool:
+        """
+        Check if command is a Tier 0 candidate.
+
+        This is a lightweight check for quick routing decisions.
+        """
+        if not self.config.tier0_enabled:
+            return False
+        return bool(self._tier0_pattern.search(command.lower()))
 
 
 # =============================================================================
@@ -239,12 +300,13 @@ class TieredCommandRouter:
     """
     Routes voice commands to appropriate backends based on security tier.
 
-    Flow:
+    v2.0 Flow (Local-First):
     1. Parse wake word to determine initial tier
-    2. Classify intent to prevent bypass
-    3. Authenticate based on tier requirements
-    4. Route to appropriate backend
-    5. Arm watchdog for Tier 2 commands
+    2. Classify intent (may detect Tier 0 quick command)
+    3. If Tier 0: Try JARVIS-Prime first, fallback to Tier 1 if unavailable
+    4. Authenticate based on tier requirements
+    5. Route to appropriate backend
+    6. Arm watchdog for Tier 2 commands
     """
 
     def __init__(
@@ -271,15 +333,35 @@ class TieredCommandRouter:
         self._intent_classifier = IntentClassifier(self.config)
         self._watchdog = None  # Lazy loaded
 
+        # v2.0: JARVIS-Prime client for Tier 0 (lazy loaded)
+        self._jarvis_prime_client = None
+
         # Stats
         self._route_count = 0
+        self._tier0_count = 0
+        self._tier0_fallback_count = 0
         self._tier1_count = 0
         self._tier2_count = 0
         self._blocked_count = 0
 
-        logger.info("[TieredRouter] Initialized with tiers: T1={}, T2={}".format(
-            self.config.tier1_backend, self.config.tier2_backend
-        ))
+        logger.info(
+            "[TieredRouter] Initialized with tiers: T0={} (enabled={}), T1={}, T2={}".format(
+                self.config.tier0_backend,
+                self.config.tier0_enabled,
+                self.config.tier1_backend,
+                self.config.tier2_backend,
+            )
+        )
+
+    async def _get_jarvis_prime_client(self):
+        """Lazy load the JARVIS-Prime client."""
+        if self._jarvis_prime_client is None and self.config.tier0_enabled:
+            try:
+                from core.jarvis_prime_client import get_jarvis_prime_client
+                self._jarvis_prime_client = get_jarvis_prime_client()
+            except ImportError:
+                logger.warning("[TieredRouter] JARVIS-Prime client not available")
+        return self._jarvis_prime_client
 
     async def _get_watchdog(self):
         """Lazy load the watchdog."""
@@ -299,6 +381,9 @@ class TieredCommandRouter:
         """
         Route a voice command to the appropriate backend.
 
+        v2.0: Local-first routing - tries JARVIS-Prime (Tier 0) first for
+        quick commands, with automatic fallback to Tier 1.
+
         Args:
             raw_command: The transcribed voice command
             audio_data: Optional raw audio for VBIA verification
@@ -312,7 +397,7 @@ class TieredCommandRouter:
         parsed = self._parse_wake_word(raw_command)
         logger.info(f"[TieredRouter] Parsed: tier={parsed.detected_tier.value}, wake='{parsed.wake_word}'")
 
-        # Step 2: Intent classification (may escalate or block)
+        # Step 2: Intent classification (may escalate, block, or detect Tier 0)
         intent_tier, intent_keywords, block_reason = self._intent_classifier.classify(parsed.command_body)
 
         if block_reason:
@@ -331,13 +416,53 @@ class TieredCommandRouter:
                 denial_reason=block_reason,
             )
 
-        # Intent may escalate Tier 1 to Tier 2
-        final_tier = parsed.detected_tier
-        if intent_tier == CommandTier.TIER2_AGENTIC and parsed.detected_tier == CommandTier.TIER1_STANDARD:
+        # Determine final tier based on intent classification
+        final_tier = intent_tier if intent_tier != CommandTier.TIER1_STANDARD else parsed.detected_tier
+
+        # Intent may escalate Tier 0/1 to Tier 2
+        if intent_tier == CommandTier.TIER2_AGENTIC:
             logger.info(f"[TieredRouter] Escalating to Tier 2 due to intent: {intent_keywords}")
             final_tier = CommandTier.TIER2_AGENTIC
 
-        # Step 3: Determine auth requirements
+        # v2.0: Handle Tier 0 (local brain) routing
+        if final_tier == CommandTier.TIER0_LOCAL and self.config.tier0_enabled:
+            tier0_available = await self._check_tier0_availability()
+
+            if tier0_available:
+                self._tier0_count += 1
+                logger.info(f"[TieredRouter] Routing to Tier 0 (local brain): {parsed.command_body[:50]}...")
+
+                return RouteDecision(
+                    tier=CommandTier.TIER0_LOCAL,
+                    backend=self.config.tier0_backend,
+                    command=parsed.command_body,
+                    auth_required=self.config.tier0_vbia_threshold > 0,
+                    auth_result=AuthResult.SKIPPED,  # Tier 0 typically skips auth
+                    vbia_confidence=None,
+                    watchdog_armed=False,
+                    execution_allowed=True,
+                    denial_reason=None,
+                )
+            else:
+                # Fallback to Tier 1
+                if self.config.tier0_fallback_to_tier1:
+                    self._tier0_fallback_count += 1
+                    logger.info("[TieredRouter] Tier 0 unavailable, falling back to Tier 1")
+                    final_tier = CommandTier.TIER1_STANDARD
+                else:
+                    return RouteDecision(
+                        tier=CommandTier.TIER0_LOCAL,
+                        backend=self.config.tier0_backend,
+                        command=parsed.command_body,
+                        auth_required=False,
+                        auth_result=None,
+                        vbia_confidence=None,
+                        watchdog_armed=False,
+                        execution_allowed=False,
+                        denial_reason="JARVIS-Prime (local brain) unavailable",
+                    )
+
+        # Step 3: Determine auth requirements for Tier 1/2
         if final_tier == CommandTier.TIER2_AGENTIC:
             auth_required = True
             auth_threshold = self.config.tier2_vbia_threshold
@@ -503,6 +628,126 @@ class TieredCommandRouter:
     # Handlers
     # =========================================================================
 
+    async def _check_tier0_availability(self) -> bool:
+        """
+        Check if JARVIS-Prime (Tier 0) is available.
+
+        Returns:
+            True if available for routing
+        """
+        if not self.config.tier0_enabled:
+            return False
+
+        try:
+            client = await self._get_jarvis_prime_client()
+            if client is None:
+                return False
+            return await client.is_available()
+        except Exception as e:
+            logger.debug(f"[TieredRouter] Tier 0 availability check failed: {e}")
+            return False
+
+    async def execute_tier0(
+        self,
+        command: str,
+        context: Optional[Dict[str, Any]] = None,
+        timeout_ms: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """
+        Execute a Tier 0 command via JARVIS-Prime (local brain).
+
+        This is the fastest path - uses local LLM for instant responses.
+        Automatically falls back to Tier 1 if execution fails.
+
+        Args:
+            command: The command to execute
+            context: Optional context dictionary
+            timeout_ms: Optional timeout (uses config default if not specified)
+
+        Returns:
+            Result dictionary with success status and response
+        """
+        logger.info(f"[TieredRouter] Executing Tier 0 (Local): {command[:50]}...")
+
+        timeout = timeout_ms or self.config.tier0_timeout_ms
+
+        try:
+            client = await self._get_jarvis_prime_client()
+            if client is None:
+                raise ImportError("JARVIS-Prime client not available")
+
+            # Build system prompt with context
+            system_prompt = (
+                "You are JARVIS, an intelligent AI assistant. "
+                "Respond concisely and helpfully. "
+                "If you need to perform an action, describe what you would do."
+            )
+
+            if context:
+                if context.get("screen_locked"):
+                    system_prompt += " The user's screen is currently locked."
+                if context.get("active_app"):
+                    system_prompt += f" The user is currently in {context['active_app']}."
+
+            # Execute via JARVIS-Prime with timeout
+            from core.jarvis_prime_client import ChatMessage
+
+            response = await asyncio.wait_for(
+                client.complete(
+                    prompt=command,
+                    system_prompt=system_prompt,
+                ),
+                timeout=timeout / 1000.0,  # Convert ms to seconds
+            )
+
+            if response.success:
+                return {
+                    "success": True,
+                    "response": response.content,
+                    "backend": "jarvis-prime",
+                    "latency_ms": response.latency_ms,
+                    "tier": "tier0",
+                }
+            else:
+                # Try fallback to Tier 1
+                if self.config.tier0_fallback_to_tier1:
+                    logger.warning(f"[TieredRouter] Tier 0 failed, falling back to Tier 1: {response.error}")
+                    self._tier0_fallback_count += 1
+                    return await self.execute_tier1(command, context)
+                else:
+                    return {
+                        "success": False,
+                        "error": response.error or "Tier 0 execution failed",
+                        "backend": "jarvis-prime",
+                        "tier": "tier0",
+                    }
+
+        except asyncio.TimeoutError:
+            logger.warning(f"[TieredRouter] Tier 0 timeout ({timeout}ms)")
+            if self.config.tier0_fallback_to_tier1:
+                self._tier0_fallback_count += 1
+                return await self.execute_tier1(command, context)
+            return {
+                "success": False,
+                "error": f"Tier 0 timeout ({timeout}ms)",
+                "backend": "jarvis-prime",
+                "tier": "tier0",
+            }
+
+        except ImportError as e:
+            logger.warning(f"[TieredRouter] Tier 0 not available: {e}")
+            if self.config.tier0_fallback_to_tier1:
+                self._tier0_fallback_count += 1
+                return await self.execute_tier1(command, context)
+            return {"success": False, "error": f"Tier 0 not available: {e}"}
+
+        except Exception as e:
+            logger.error(f"[TieredRouter] Tier 0 execution failed: {e}")
+            if self.config.tier0_fallback_to_tier1:
+                self._tier0_fallback_count += 1
+                return await self.execute_tier1(command, context)
+            return {"success": False, "error": str(e)}
+
     async def execute_tier1(self, command: str, context: Dict[str, Any] = None) -> Dict[str, Any]:
         """
         Execute a Tier 1 command (standard, safe).
@@ -613,9 +858,13 @@ class TieredCommandRouter:
         """Get routing statistics."""
         return {
             "total_routes": self._route_count,
+            "tier0_count": self._tier0_count,
+            "tier0_fallback_count": self._tier0_fallback_count,
             "tier1_count": self._tier1_count,
             "tier2_count": self._tier2_count,
             "blocked_count": self._blocked_count,
+            "tier0_enabled": self.config.tier0_enabled,
+            "tier0_backend": self.config.tier0_backend,
             "tier1_backend": self.config.tier1_backend,
             "tier2_backend": self.config.tier2_backend,
         }

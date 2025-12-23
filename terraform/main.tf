@@ -1,4 +1,4 @@
-terraform {
+ivate terraform {
   required_version = ">= 1.0.0"
   
   required_providers {
@@ -162,5 +162,48 @@ locals {
     var.spot_vm_max_runtime_hours > 3 ? "⚠️ VM max runtime > 3 hours increases orphan risk" : "",
     var.monthly_budget_usd > 20 ? "ℹ️ Budget set above $20/month" : "",
   ])
+}
+
+# =============================================================================
+# 🧠 JARVIS-PRIME TIER-0 BRAIN (DISABLED by default - Cloud Run)
+# =============================================================================
+# ⚠️ COST: Pay-per-request (~$0 when idle, ~$0.02-0.05/hr when running)
+#
+# Deploys JARVIS-Prime to Cloud Run for serverless inference.
+# Auto-scales 0-3 instances based on load.
+#
+# Prerequisites:
+# 1. Build and push Docker image:
+#    cd jarvis-prime
+#    docker build -t us-central1-docker.pkg.dev/jarvis-473803/jarvis-prime/jarvis-prime:latest .
+#    docker push us-central1-docker.pkg.dev/jarvis-473803/jarvis-prime/jarvis-prime:latest
+#
+# 2. Enable the module:
+#    terraform apply -var="enable_jarvis_prime=true"
+
+module "jarvis_prime" {
+  count  = var.enable_jarvis_prime ? 1 : 0
+  source = "./modules/jarvis_prime"
+
+  project_id  = var.project_id
+  region      = var.region
+  environment = var.developer_mode ? "dev" : "prod"
+
+  # Cloud Run configuration
+  image_tag     = var.jarvis_prime_image_tag
+  min_instances = var.jarvis_prime_min_instances
+  max_instances = var.jarvis_prime_max_instances
+  memory        = var.jarvis_prime_memory
+  cpu           = var.jarvis_prime_cpu
+
+  # Optional: Connect to Redis (if enabled)
+  redis_host = var.enable_redis && length(module.storage) > 0 ? module.storage[0].redis_host : ""
+  redis_port = var.enable_redis && length(module.storage) > 0 ? module.storage[0].redis_port : 6379
+
+  # Optional: VPC access for Redis
+  network_id = var.enable_redis ? module.network.vpc_id : null
+  subnet_id  = var.enable_redis ? module.network.subnet_id : null
+
+  depends_on = [module.network]
 }
 

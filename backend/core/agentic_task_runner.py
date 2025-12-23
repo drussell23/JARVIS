@@ -42,8 +42,32 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
+import uuid
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Neural Mesh Deep Integration Types
+# =============================================================================
+
+@dataclass
+class NeuralMeshTaskEvent:
+    """Event data for Neural Mesh task notifications."""
+    task_id: str
+    event_type: str  # task_started, task_progress, task_completed, task_failed
+    goal: str
+    mode: str
+    timestamp: float
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+@dataclass
+class NeuralMeshContext:
+    """Context enrichment from Neural Mesh knowledge graph."""
+    similar_goals: List[Dict[str, Any]] = field(default_factory=list)
+    pattern_insights: List[str] = field(default_factory=list)
+    recommended_actions: List[str] = field(default_factory=list)
+    context_score: float = 0.0
 
 
 # =============================================================================
@@ -89,6 +113,31 @@ class AgenticRunnerConfig:
         default_factory=lambda: float(os.getenv("JARVIS_HEARTBEAT_INTERVAL", "2.0"))
     )
 
+    # Voice Authentication Layer (v5.0)
+    voice_auth_enabled: bool = field(
+        default_factory=lambda: os.getenv("JARVIS_VOICE_AUTH_ENABLED", "true").lower() == "true"
+    )
+    voice_auth_pre_execution: bool = field(
+        default_factory=lambda: os.getenv("JARVIS_VOICE_AUTH_PRE_EXECUTION", "true").lower() == "true"
+    )
+
+    # Neural Mesh Deep Integration (v5.0)
+    neural_mesh_deep_enabled: bool = field(
+        default_factory=lambda: os.getenv("JARVIS_NEURAL_MESH_DEEP", "true").lower() == "true"
+    )
+    neural_mesh_task_events: bool = field(
+        default_factory=lambda: os.getenv("JARVIS_NM_TASK_EVENTS", "true").lower() == "true"
+    )
+    neural_mesh_context_query: bool = field(
+        default_factory=lambda: os.getenv("JARVIS_NM_CONTEXT_QUERY", "true").lower() == "true"
+    )
+    neural_mesh_pattern_subscribe: bool = field(
+        default_factory=lambda: os.getenv("JARVIS_NM_PATTERN_SUBSCRIBE", "true").lower() == "true"
+    )
+    neural_mesh_agi_events: bool = field(
+        default_factory=lambda: os.getenv("JARVIS_NM_AGI_EVENTS", "true").lower() == "true"
+    )
+
 
 # =============================================================================
 # Enums
@@ -122,6 +171,11 @@ class AgenticTaskResult:
     neural_mesh_used: bool = False
     multi_space_used: bool = False
     watchdog_status: Optional[str] = None
+    # Neural Mesh Deep Integration (v5.0)
+    neural_mesh_context: Optional[NeuralMeshContext] = None
+    neural_mesh_events_sent: int = 0
+    pattern_insights_applied: List[str] = field(default_factory=list)
+    knowledge_contributions: int = 0
 
 
 # =============================================================================
@@ -174,6 +228,13 @@ def _check_component_availability() -> Dict[str, bool]:
     except ImportError:
         availability["watchdog"] = False
 
+    # Voice Authentication Layer
+    try:
+        from core.voice_authentication_layer import VoiceAuthenticationLayer
+        availability["voice_auth_layer"] = True
+    except ImportError:
+        availability["voice_auth_layer"] = False
+
     return availability
 
 
@@ -223,6 +284,7 @@ class AgenticTaskRunner:
         self._computer_use_tool = None
         self._computer_use_connector = None
         self._watchdog = watchdog  # Use external watchdog if provided
+        self._voice_auth_layer = None  # v5.0: Voice Authentication Layer
 
         # Component availability
         self._availability = _check_component_availability()
@@ -233,6 +295,13 @@ class AgenticTaskRunner:
         self._tasks_succeeded = 0
         self._current_task_id: Optional[str] = None
         self._heartbeat_task: Optional[asyncio.Task] = None
+
+        # Neural Mesh Deep Integration state (v5.0)
+        self._nm_pattern_insights: List[str] = []
+        self._nm_events_sent: int = 0
+        self._nm_knowledge_contributions: int = 0
+        self._nm_pattern_subscription_active: bool = False
+        self._nm_agi_subscription_active: bool = False
 
         self.logger.info("[AgenticRunner] Created")
         self._log_availability()
@@ -300,6 +369,11 @@ class AgenticTaskRunner:
                     from neural_mesh.neural_mesh_coordinator import start_neural_mesh
                     self._neural_mesh = await start_neural_mesh()
                     self.logger.info("[AgenticRunner] ✓ Neural Mesh")
+
+                    # Deep Integration: Setup pattern subscription
+                    if self.config.neural_mesh_deep_enabled:
+                        await self._setup_neural_mesh_deep_integration()
+
                 except Exception as e:
                     self.logger.debug(f"[AgenticRunner] ✗ Neural Mesh: {e}")
 
@@ -328,6 +402,18 @@ class AgenticTaskRunner:
                     self.logger.info("[AgenticRunner] ✓ Watchdog (internal)")
                 except Exception as e:
                     self.logger.debug(f"[AgenticRunner] ✗ Watchdog: {e}")
+
+            # Initialize Voice Authentication Layer (v5.0)
+            if self._availability.get("voice_auth_layer") and self.config.voice_auth_enabled:
+                try:
+                    from core.voice_authentication_layer import start_voice_auth_layer
+                    self._voice_auth_layer = await start_voice_auth_layer(
+                        watchdog=self._watchdog,
+                        tts_callback=self.tts_callback,
+                    )
+                    self.logger.info("[AgenticRunner] ✓ Voice Auth Layer")
+                except Exception as e:
+                    self.logger.debug(f"[AgenticRunner] ✗ Voice Auth Layer: {e}")
 
             # Verify we have at least one execution capability
             if not self._computer_use_tool and not self._computer_use_connector:
@@ -492,12 +578,38 @@ class AgenticTaskRunner:
         self.logger.info(f"[AgenticRunner] Goal: {goal[:50]}...")
         self.logger.info(f"[AgenticRunner] Mode: {mode.value}")
 
+        # Neural Mesh Deep Integration: Query context before execution
+        neural_context = None
+        if self.config.neural_mesh_deep_enabled and self._neural_mesh:
+            try:
+                neural_context = await self._query_neural_context(goal)
+                # Enrich execution context with neural insights
+                if context is None:
+                    context = {}
+                if neural_context.pattern_insights:
+                    context["pattern_insights"] = neural_context.pattern_insights
+                if neural_context.recommended_actions:
+                    context["recommended_actions"] = neural_context.recommended_actions
+                if neural_context.similar_goals:
+                    context["similar_executions"] = len(neural_context.similar_goals)
+            except Exception as e:
+                self.logger.debug(f"Neural context query failed: {e}")
+
         # Announce start
         if narrate and self.tts_callback:
             await self.tts_callback(f"Starting task: {goal[:50]}")
 
         # Start watchdog monitoring
         await self._start_watchdog_task(goal, mode.value)
+
+        # Neural Mesh Deep Integration: Publish task_started event
+        if self.config.neural_mesh_deep_enabled:
+            await self._publish_task_event(
+                "task_started",
+                goal,
+                mode.value,
+                {"context_score": neural_context.context_score if neural_context else 0}
+            )
 
         try:
             # Execute based on mode
@@ -512,11 +624,34 @@ class AgenticTaskRunner:
             result.execution_time_ms = execution_time
             result.mode = mode.value
 
+            # Neural Mesh Deep Integration: Attach context and stats to result
+            if neural_context:
+                result.neural_mesh_context = neural_context
+                result.pattern_insights_applied = neural_context.pattern_insights
+            result.neural_mesh_events_sent = self._nm_events_sent
+
             if result.success:
                 self._tasks_succeeded += 1
 
             # Stop watchdog monitoring
             await self._stop_watchdog_task(result.success)
+
+            # Neural Mesh Deep Integration: Publish completion and record learning
+            if self.config.neural_mesh_deep_enabled:
+                event_type = "task_completed" if result.success else "task_failed"
+                await self._publish_task_event(
+                    event_type,
+                    goal,
+                    mode.value,
+                    {
+                        "execution_time_ms": execution_time,
+                        "actions_count": result.actions_count,
+                        "success": result.success,
+                    }
+                )
+                # Record comprehensive learning
+                contributions = await self._record_comprehensive_learning(goal, result, neural_context)
+                result.knowledge_contributions = contributions
 
             # Announce completion
             if narrate and self.tts_callback:
@@ -528,6 +663,9 @@ class AgenticTaskRunner:
 
         except asyncio.TimeoutError:
             await self._stop_watchdog_task(False)
+            # Publish timeout event
+            if self.config.neural_mesh_deep_enabled:
+                await self._publish_task_event("task_failed", goal, mode.value, {"error": "timeout"})
             return AgenticTaskResult(
                 success=False,
                 goal=goal,
@@ -537,11 +675,15 @@ class AgenticTaskRunner:
                 reasoning_steps=0,
                 final_message="Task timed out",
                 error=f"Timeout after {self.config.task_timeout_seconds}s",
+                neural_mesh_context=neural_context,
             )
 
         except Exception as e:
             self.logger.error(f"[AgenticRunner] Failed: {e}", exc_info=True)
             await self._stop_watchdog_task(False)
+            # Publish error event
+            if self.config.neural_mesh_deep_enabled:
+                await self._publish_task_event("task_failed", goal, mode.value, {"error": str(e)})
 
             return AgenticTaskResult(
                 success=False,
@@ -552,6 +694,7 @@ class AgenticTaskRunner:
                 reasoning_steps=0,
                 final_message=f"Task failed: {str(e)}",
                 error=str(e),
+                neural_mesh_context=neural_context,
             )
 
     # =========================================================================
@@ -709,6 +852,266 @@ class AgenticTaskRunner:
             self.logger.debug(f"Learning recording error: {e}")
 
     # =========================================================================
+    # Neural Mesh Deep Integration (v5.0)
+    # =========================================================================
+
+    async def _setup_neural_mesh_deep_integration(self):
+        """Setup deep Neural Mesh integration with pattern subscriptions and AGI OS events."""
+        if not self._neural_mesh:
+            return
+
+        try:
+            # Subscribe to pattern insights from PatternRecognitionAgent
+            if self.config.neural_mesh_pattern_subscribe:
+                await self._subscribe_to_pattern_insights()
+                self._nm_pattern_subscription_active = True
+                self.logger.debug("[AgenticRunner] ✓ Neural Mesh pattern subscription active")
+
+            # Subscribe to AGI OS events
+            if self.config.neural_mesh_agi_events:
+                await self._subscribe_to_agi_os_events()
+                self._nm_agi_subscription_active = True
+                self.logger.debug("[AgenticRunner] ✓ Neural Mesh AGI OS subscription active")
+
+            self.logger.info("[AgenticRunner] ✓ Neural Mesh Deep Integration enabled")
+
+        except Exception as e:
+            self.logger.debug(f"[AgenticRunner] Neural Mesh deep integration setup failed: {e}")
+
+    async def _subscribe_to_pattern_insights(self):
+        """Subscribe to pattern recognition insights from Neural Mesh."""
+        if not self._neural_mesh or not hasattr(self._neural_mesh, 'bus'):
+            return
+
+        try:
+            from neural_mesh.data_models import MessageType
+
+            async def handle_pattern_insight(message):
+                """Handle pattern insight messages from PatternRecognitionAgent."""
+                try:
+                    payload = message.payload if hasattr(message, 'payload') else {}
+                    insight = payload.get('insight', payload.get('pattern', str(payload)))
+                    if insight and insight not in self._nm_pattern_insights:
+                        self._nm_pattern_insights.append(insight)
+                        # Keep only last 20 insights
+                        if len(self._nm_pattern_insights) > 20:
+                            self._nm_pattern_insights = self._nm_pattern_insights[-20:]
+                        self.logger.debug(f"[AgenticRunner] Received pattern insight: {insight[:50]}...")
+                except Exception as e:
+                    self.logger.debug(f"Pattern insight handling error: {e}")
+
+            # Subscribe to pattern-related messages
+            await self._neural_mesh.bus.subscribe(
+                "agentic_task_runner",
+                MessageType.KNOWLEDGE_SHARED,
+                handle_pattern_insight
+            )
+
+        except Exception as e:
+            self.logger.debug(f"Pattern subscription error: {e}")
+
+    async def _subscribe_to_agi_os_events(self):
+        """Subscribe to AGI OS proactive event stream via Neural Mesh."""
+        if not self._neural_mesh or not hasattr(self._neural_mesh, 'bus'):
+            return
+
+        try:
+            from neural_mesh.data_models import MessageType
+
+            async def handle_agi_event(message):
+                """Handle AGI OS events for context enrichment."""
+                try:
+                    payload = message.payload if hasattr(message, 'payload') else {}
+                    event_type = payload.get('event_type', 'unknown')
+                    self.logger.debug(f"[AgenticRunner] AGI OS event: {event_type}")
+                    # Store event for context enrichment during task execution
+                except Exception as e:
+                    self.logger.debug(f"AGI event handling error: {e}")
+
+            await self._neural_mesh.bus.subscribe(
+                "agentic_task_runner",
+                MessageType.CONTEXT_UPDATE,
+                handle_agi_event
+            )
+
+        except Exception as e:
+            self.logger.debug(f"AGI OS subscription error: {e}")
+
+    async def _publish_task_event(
+        self,
+        event_type: str,
+        goal: str,
+        mode: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ):
+        """Publish task event to Neural Mesh bus."""
+        if not self._neural_mesh or not hasattr(self._neural_mesh, 'bus'):
+            return
+
+        if not self.config.neural_mesh_task_events:
+            return
+
+        try:
+            from neural_mesh.data_models import MessageType, AgentMessage, MessagePriority
+
+            # Map event type to message type
+            type_map = {
+                "task_started": MessageType.TASK_STARTED,
+                "task_progress": MessageType.TASK_PROGRESS,
+                "task_completed": MessageType.TASK_COMPLETED,
+                "task_failed": MessageType.TASK_FAILED,
+            }
+            msg_type = type_map.get(event_type, MessageType.CUSTOM)
+
+            event = NeuralMeshTaskEvent(
+                task_id=self._current_task_id or f"task_{uuid.uuid4().hex[:8]}",
+                event_type=event_type,
+                goal=goal,
+                mode=mode,
+                timestamp=time.time(),
+                metadata=metadata or {},
+            )
+
+            message = AgentMessage(
+                message_id=uuid.uuid4().hex,
+                from_agent="agentic_task_runner",
+                to_agent="broadcast",
+                message_type=msg_type,
+                payload={
+                    "task_id": event.task_id,
+                    "event_type": event.event_type,
+                    "goal": event.goal,
+                    "mode": event.mode,
+                    "timestamp": event.timestamp,
+                    "metadata": event.metadata,
+                },
+                priority=MessagePriority.NORMAL,
+            )
+
+            await self._neural_mesh.bus.publish(message)
+            self._nm_events_sent += 1
+            self.logger.debug(f"[AgenticRunner] Published {event_type} event to Neural Mesh")
+
+        except Exception as e:
+            self.logger.debug(f"Task event publish error: {e}")
+
+    async def _query_neural_context(self, goal: str) -> NeuralMeshContext:
+        """Query Neural Mesh knowledge graph for context enrichment."""
+        context = NeuralMeshContext()
+
+        if not self._neural_mesh or not self.config.neural_mesh_context_query:
+            return context
+
+        try:
+            # Query for similar past goals
+            if hasattr(self._neural_mesh, 'knowledge') or hasattr(self._neural_mesh, 'knowledge_graph'):
+                kg = getattr(self._neural_mesh, 'knowledge', None) or getattr(self._neural_mesh, 'knowledge_graph', None)
+
+                if kg and hasattr(kg, 'query') or hasattr(kg, 'search'):
+                    query_fn = getattr(kg, 'query', None) or getattr(kg, 'search', None)
+                    if query_fn:
+                        try:
+                            # Query for similar goals
+                            results = await query_fn(goal[:100])  # Limit query length
+                            if results:
+                                for result in results[:5]:  # Top 5 similar
+                                    if isinstance(result, dict):
+                                        context.similar_goals.append(result)
+                                    else:
+                                        context.similar_goals.append({"result": str(result)})
+
+                                context.context_score = min(len(context.similar_goals) * 0.2, 1.0)
+
+                        except Exception as query_error:
+                            self.logger.debug(f"Knowledge query error: {query_error}")
+
+            # Include recent pattern insights
+            if self._nm_pattern_insights:
+                context.pattern_insights = self._nm_pattern_insights[-5:]
+
+            # Generate recommended actions based on context
+            if context.similar_goals:
+                for similar in context.similar_goals[:3]:
+                    if isinstance(similar, dict):
+                        action = similar.get('action', similar.get('result', ''))
+                        if action:
+                            context.recommended_actions.append(str(action)[:100])
+
+            self.logger.debug(
+                f"[AgenticRunner] Neural context: {len(context.similar_goals)} similar, "
+                f"{len(context.pattern_insights)} insights, score={context.context_score:.2f}"
+            )
+
+        except Exception as e:
+            self.logger.debug(f"Neural context query error: {e}")
+
+        return context
+
+    async def _record_comprehensive_learning(
+        self,
+        goal: str,
+        result: AgenticTaskResult,
+        context: Optional[NeuralMeshContext] = None,
+    ):
+        """Record comprehensive execution data to Neural Mesh knowledge graph."""
+        if not self._neural_mesh:
+            return 0
+
+        contributions = 0
+
+        try:
+            kg = getattr(self._neural_mesh, 'knowledge', None) or getattr(self._neural_mesh, 'knowledge_graph', None)
+
+            if kg and hasattr(kg, 'add_fact'):
+                # Record execution result
+                await kg.add_fact(
+                    subject=goal,
+                    predicate="executed_with_result",
+                    object_=f"{'success' if result.success else 'failure'}: {result.final_message[:100]}",
+                    metadata={
+                        "task_id": self._current_task_id,
+                        "mode": result.mode,
+                        "actions_count": result.actions_count,
+                        "execution_time_ms": result.execution_time_ms,
+                        "success": result.success,
+                        "reasoning_steps": result.reasoning_steps,
+                        "error": result.error,
+                        "timestamp": datetime.now().isoformat(),
+                        "context_score": context.context_score if context else 0,
+                        "pattern_insights_used": len(context.pattern_insights) if context else 0,
+                    }
+                )
+                contributions += 1
+
+                # Record learning insights if any
+                for insight in result.learning_insights:
+                    await kg.add_fact(
+                        subject=goal,
+                        predicate="learning_insight",
+                        object_=insight[:200],
+                        metadata={"task_id": self._current_task_id}
+                    )
+                    contributions += 1
+
+                # Record applied pattern insights
+                for pattern in result.pattern_insights_applied:
+                    await kg.add_fact(
+                        subject=goal,
+                        predicate="applied_pattern",
+                        object_=pattern[:200],
+                        metadata={"task_id": self._current_task_id, "success": result.success}
+                    )
+                    contributions += 1
+
+                self._nm_knowledge_contributions += contributions
+                self.logger.debug(f"[AgenticRunner] Recorded {contributions} knowledge contributions")
+
+        except Exception as e:
+            self.logger.debug(f"Comprehensive learning recording error: {e}")
+
+        return contributions
+
+    # =========================================================================
     # Lifecycle
     # =========================================================================
 
@@ -766,6 +1169,18 @@ class AgenticTaskRunner:
             except Exception:
                 watchdog_status = {"status": "available"}
 
+        # Neural Mesh Deep Integration stats
+        neural_mesh_stats = None
+        if self._neural_mesh and self.config.neural_mesh_deep_enabled:
+            neural_mesh_stats = {
+                "deep_integration_enabled": True,
+                "pattern_subscription_active": self._nm_pattern_subscription_active,
+                "agi_subscription_active": self._nm_agi_subscription_active,
+                "events_sent": self._nm_events_sent,
+                "knowledge_contributions": self._nm_knowledge_contributions,
+                "pattern_insights_cached": len(self._nm_pattern_insights),
+            }
+
         return {
             "initialized": self._initialized,
             "tasks_executed": self._tasks_executed,
@@ -776,9 +1191,11 @@ class AgenticTaskRunner:
             ),
             "current_task": self._current_task_id,
             "watchdog": watchdog_status,
+            "neural_mesh_deep": neural_mesh_stats,
             "components": {
                 "uae": self._uae is not None,
                 "neural_mesh": self._neural_mesh is not None,
+                "neural_mesh_deep": self.config.neural_mesh_deep_enabled and self._neural_mesh is not None,
                 "autonomous_agent": self._autonomous_agent is not None,
                 "computer_use_tool": self._computer_use_tool is not None,
                 "direct_connector": self._computer_use_connector is not None,

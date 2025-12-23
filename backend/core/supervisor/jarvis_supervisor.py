@@ -255,6 +255,10 @@ class JARVISSupervisor:
         # Manages: Network Context, Pattern Tracker, Device Monitor, Fusion Engine, Learning Coordinator (RAG+RLHF)
         self._intelligence_manager: Optional[Any] = None
 
+        # v5.1: JARVIS-Prime Orchestrator - Tier 0 Local Brain Subprocess Manager
+        # Manages JARVIS-Prime as a critical microservice for instant local responses
+        self._jarvis_prime_orchestrator: Optional[Any] = None
+
         logger.info(f"🔧 Supervisor initialized (mode: {self.config.mode.value})")
     
     def _find_entry_point(self) -> str:
@@ -403,7 +407,43 @@ class JARVISSupervisor:
                 logger.warning(f"⚠️ Intelligence Component Manager initialization failed: {e}")
                 # Continue without intelligence - graceful degradation
                 self._intelligence_manager = None
-    
+
+        # v5.1: Initialize JARVIS-Prime Orchestrator (Tier 0 Local Brain)
+        # This starts JARVIS-Prime as a managed subprocess for instant local responses
+        if self._jarvis_prime_orchestrator is None:
+            try:
+                from .jarvis_prime_orchestrator import (
+                    get_jarvis_prime_orchestrator_async,
+                    JarvisPrimeConfig,
+                )
+
+                # Create narrator callback for voice announcements
+                async def jarvis_prime_narrator_callback(message: str):
+                    """Forward JARVIS-Prime announcements to narrator."""
+                    if self._narrator:
+                        await self._narrator.speak(message, wait=False)
+
+                # Get orchestrator with auto-start if enabled
+                self._jarvis_prime_orchestrator = await get_jarvis_prime_orchestrator_async(
+                    narrator_callback=jarvis_prime_narrator_callback,
+                    auto_start=True,  # Start JARVIS-Prime during supervisor init
+                )
+
+                # Log status
+                health = self._jarvis_prime_orchestrator.get_health()
+                if health.is_healthy():
+                    logger.info(f"🧠 JARVIS-Prime (Tier 0 Local Brain) started: PID {health.pid}")
+                else:
+                    logger.info(
+                        f"⚠️ JARVIS-Prime status: {health.status.value} "
+                        f"(enabled={self._jarvis_prime_orchestrator.config.enabled})"
+                    )
+
+            except Exception as e:
+                logger.warning(f"⚠️ JARVIS-Prime Orchestrator initialization failed: {e}")
+                # Continue without JARVIS-Prime - commands will fall back to Tier 1
+                self._jarvis_prime_orchestrator = None
+
     # Browser lock file - shared with run_supervisor.py
     BROWSER_LOCK_FILE = Path("/tmp/jarvis_browser.lock")
     
@@ -2553,6 +2593,14 @@ class JARVISSupervisor:
                     logger.info("🧠 Intelligence Component Manager shutdown complete")
                 except Exception as e:
                     logger.debug(f"Intelligence Component Manager cleanup error: {e}")
+
+            # v5.1: Cleanup JARVIS-Prime Orchestrator (Tier 0 Local Brain)
+            if self._jarvis_prime_orchestrator:
+                try:
+                    await self._jarvis_prime_orchestrator.stop()
+                    logger.info("🧠 JARVIS-Prime (Tier 0 Local Brain) shutdown complete")
+                except Exception as e:
+                    logger.debug(f"JARVIS-Prime Orchestrator cleanup error: {e}")
 
             for task in tasks:
                 task.cancel()
