@@ -1,25 +1,40 @@
 """
-JARVIS Agentic API
+JARVIS Unified Agentic API v2.0
+================================
 
-REST API endpoints for autonomous task execution using Computer Use.
+REST API endpoints for the unified Two-Tier Agentic Security System.
+All agentic task execution flows through the AgenticTaskRunner.
 
 Endpoints:
-- POST /api/agentic/execute - Execute a single goal
-- POST /api/agentic/workflow - Execute a multi-step workflow
-- GET /api/agentic/status - Get agentic system status
+- POST /api/agentic/execute - Execute a single goal (Tier 2)
+- POST /api/agentic/tier1 - Execute safe command (Tier 1)
+- POST /api/agentic/route - Route command through TieredRouter
+- GET /api/agentic/status - Get unified system status
 - GET /api/agentic/metrics - Get execution metrics
+- GET /api/agentic/watchdog - Get watchdog status
 - WebSocket /ws/agentic - Real-time task execution updates
 
+Architecture:
+    CLI/API -> TieredRouter -> VBIA Auth -> AgenticRunner -> Computer Use
+                            -> Watchdog (safety monitoring)
+
 Usage:
-    curl -X POST http://localhost:8000/api/agentic/execute \
-        -H "Content-Type: application/json" \
+    # Execute Tier 2 task
+    curl -X POST http://localhost:8000/api/agentic/execute \\
+        -H "Content-Type: application/json" \\
         -d '{"goal": "Open Safari and find the weather"}'
+
+    # Route through tiered system
+    curl -X POST http://localhost:8000/api/agentic/route \\
+        -H "Content-Type: application/json" \\
+        -d '{"command": "JARVIS ACCESS organize my desktop"}'
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
@@ -38,12 +53,15 @@ router = APIRouter(prefix="/api/agentic", tags=["agentic"])
 # ============================================================================
 
 class ExecuteGoalRequest(BaseModel):
-    """Request to execute a single goal."""
+    """Request to execute a single goal via AgenticTaskRunner."""
     goal: str = Field(..., description="Natural language goal to achieve")
-    mode: str = Field("supervised", description="Execution mode: autonomous, supervised, direct")
+    mode: str = Field("autonomous", description="Execution mode: autonomous, supervised, direct")
     context: Optional[Dict[str, Any]] = Field(None, description="Additional context")
     narrate: bool = Field(True, description="Enable voice narration")
     timeout_seconds: float = Field(300.0, description="Maximum execution time")
+    # VBIA override for API clients (they can pass their own verification)
+    vbia_confidence: Optional[float] = Field(None, description="Pre-verified VBIA confidence")
+    speaker_id: Optional[str] = Field(None, description="Pre-verified speaker ID")
 
 
 class ExecuteGoalResponse(BaseModel):
@@ -56,78 +74,146 @@ class ExecuteGoalResponse(BaseModel):
     final_message: str
     actions_count: int
     execution_time_ms: float
+    reasoning_steps: int = 0
     learning_insights: List[str] = []
+    watchdog_status: Optional[str] = None
     error: Optional[str] = None
 
 
-class WorkflowRequest(BaseModel):
-    """Request to execute a multi-step workflow."""
-    goal: str = Field(..., description="High-level goal")
-    steps: Optional[List[str]] = Field(None, description="Optional step descriptions")
-    context: Optional[Dict[str, Any]] = Field(None, description="Additional context")
-    parallel: bool = Field(False, description="Execute independent steps in parallel")
-    narrate: bool = Field(True, description="Enable voice narration")
+class RouteCommandRequest(BaseModel):
+    """Request to route a command through the TieredCommandRouter."""
+    command: str = Field(..., description="Voice command with wake word")
+    vbia_confidence: Optional[float] = Field(None, description="Pre-verified VBIA confidence")
+    speaker_id: Optional[str] = Field(None, description="Pre-verified speaker ID")
+    execute: bool = Field(True, description="Execute after routing or just return decision")
 
 
-class WorkflowResponse(BaseModel):
-    """Response from workflow execution."""
-    success: bool
-    workflow_id: str
-    goal: str
-    steps_completed: int
-    steps_total: int
-    total_duration_ms: float
-    steps_results: List[Dict[str, Any]]
-    learning_insights: List[str] = []
-    final_message: str
-    error: Optional[str] = None
+class RouteCommandResponse(BaseModel):
+    """Response from command routing."""
+    tier: str
+    backend: str
+    command: str
+    auth_required: bool
+    auth_result: Optional[str]
+    vbia_confidence: Optional[float]
+    watchdog_armed: bool
+    execution_allowed: bool
+    denial_reason: Optional[str]
+    # Execution result (if execute=True)
+    executed: bool = False
+    execution_result: Optional[Dict[str, Any]] = None
 
 
 class AgenticStatusResponse(BaseModel):
-    """Agentic system status."""
+    """Unified agentic system status."""
     initialized: bool
-    computer_use_available: bool
-    uae_routing_enabled: bool
-    neural_mesh_agent: bool
-    workflow_executor: bool
-    config_available: bool
-    uptime_seconds: Optional[float] = None
-
-
-class AgenticMetricsResponse(BaseModel):
-    """Agentic system metrics."""
-    total_goals: int = 0
-    successful_goals: int = 0
-    failed_goals: int = 0
+    runner_ready: bool
+    router_ready: bool
+    watchdog_active: bool
+    vbia_adapter_ready: bool
+    # Component details
+    components: Dict[str, bool]
+    # Stats
+    tasks_executed: int = 0
+    tasks_succeeded: int = 0
     success_rate: float = 0.0
-    total_workflows: int = 0
-    successful_workflows: int = 0
-    average_execution_time_ms: float = 0.0
-    computer_use_metrics: Optional[Dict[str, Any]] = None
+    # Watchdog
+    watchdog_status: Optional[Dict[str, Any]] = None
+    # Config
+    tier1_backend: str = "gemini"
+    tier2_backend: str = "claude"
+    vbia_tier1_threshold: float = 0.70
+    vbia_tier2_threshold: float = 0.85
+
+
+class WatchdogStatusResponse(BaseModel):
+    """Watchdog safety system status."""
+    active: bool
+    mode: str
+    kill_switch_armed: bool
+    heartbeat_healthy: bool
+    agentic_allowed: bool
+    uptime_seconds: float = 0.0
+    active_task: Optional[str] = None
+    consecutive_failures: int = 0
+    last_activity: Optional[float] = None
 
 
 # ============================================================================
-# Helper Functions
+# Helper Functions - Use module-level registries as primary source
 # ============================================================================
 
-def get_agentic_system(request: Request) -> Optional[Dict[str, Any]]:
-    """Get the agentic system from app state."""
-    return getattr(request.app.state, 'agentic_system', None)
+def get_agentic_runner(request: Request):
+    """
+    Get the AgenticTaskRunner.
+
+    Priority:
+    1. Module-level registry (set by supervisor)
+    2. app.state fallback (for compatibility)
+    """
+    try:
+        from core.agentic_task_runner import get_agentic_runner as _get_runner
+        runner = _get_runner()
+        if runner is not None:
+            return runner
+    except ImportError:
+        pass
+    return getattr(request.app.state, 'agentic_runner', None)
 
 
-def get_computer_use_tool(request: Request):
-    """Get the computer use tool from app state."""
-    return getattr(request.app.state, 'computer_use_tool', None)
+def get_tiered_router(request: Request):
+    """
+    Get the TieredCommandRouter.
+
+    Priority:
+    1. Module-level registry (set by supervisor)
+    2. app.state fallback (for compatibility)
+    """
+    try:
+        from core.tiered_command_router import get_tiered_router as _get_router
+        router = _get_router()
+        if router is not None:
+            return router
+    except ImportError:
+        pass
+    return getattr(request.app.state, 'tiered_router', None)
 
 
-def get_uae_engine(request: Request):
-    """Get the UAE engine from app state."""
-    return getattr(request.app.state, 'uae_engine', None)
+def get_vbia_adapter(request: Request):
+    """
+    Get the TieredVBIAAdapter.
+
+    Priority:
+    1. Module-level registry (set by supervisor)
+    2. app.state fallback (for compatibility)
+    """
+    try:
+        from core.tiered_vbia_adapter import TieredVBIAAdapter
+        # Use _adapter_instance directly (sync access, don't create new)
+        from core.tiered_vbia_adapter import _adapter_instance
+        if _adapter_instance is not None:
+            return _adapter_instance
+    except ImportError:
+        pass
+    return getattr(request.app.state, 'vbia_adapter', None)
 
 
-def get_workflow_executor(request: Request):
-    """Get the workflow executor from app state."""
-    return getattr(request.app.state, 'agentic_workflow_executor', None)
+def get_watchdog(request: Request):
+    """
+    Get the AgenticWatchdog.
+
+    Priority:
+    1. Module-level registry (set by supervisor)
+    2. app.state fallback (for compatibility)
+    """
+    try:
+        from core.agentic_watchdog import get_watchdog as _get_watchdog
+        watchdog = _get_watchdog()
+        if watchdog is not None:
+            return watchdog
+    except ImportError:
+        pass
+    return getattr(request.app.state, 'agentic_watchdog', None)
 
 
 # ============================================================================
@@ -137,139 +223,175 @@ def get_workflow_executor(request: Request):
 @router.get("/status", response_model=AgenticStatusResponse)
 async def get_agentic_status(request: Request) -> AgenticStatusResponse:
     """
-    Get the current status of the agentic system.
+    Get the unified agentic system status.
 
-    Returns information about available components and capabilities.
+    Returns information about all components: runner, router, watchdog, VBIA.
     """
-    agentic_system = get_agentic_system(request)
+    runner = get_agentic_runner(request)
+    router_obj = get_tiered_router(request)
+    watchdog = get_watchdog(request)
+    vbia = get_vbia_adapter(request)
 
-    if not agentic_system:
-        return AgenticStatusResponse(
-            initialized=False,
-            computer_use_available=False,
-            uae_routing_enabled=False,
-            neural_mesh_agent=False,
-            workflow_executor=False,
-            config_available=False,
-        )
+    # Get runner stats
+    runner_stats = runner.get_stats() if runner else {}
+    watchdog_status = None
+    if watchdog:
+        try:
+            ws = watchdog.get_status()
+            watchdog_status = {
+                "mode": ws.mode.value if hasattr(ws.mode, 'value') else str(ws.mode),
+                "kill_switch_armed": ws.kill_switch_armed,
+                "heartbeat_healthy": ws.heartbeat_healthy,
+                "uptime_seconds": ws.uptime_seconds,
+            }
+        except Exception:
+            watchdog_status = {"active": True}
 
-    uptime = None
-    if agentic_system.get("timestamp"):
-        uptime = time.time() - agentic_system["timestamp"]
+    # Get router config
+    tier1_backend = "gemini"
+    tier2_backend = "claude"
+    tier1_threshold = 0.70
+    tier2_threshold = 0.85
+    if router_obj:
+        tier1_backend = router_obj.config.tier1_backend
+        tier2_backend = router_obj.config.tier2_backend
+        tier1_threshold = router_obj.config.tier1_vbia_threshold
+        tier2_threshold = router_obj.config.tier2_vbia_threshold
 
     return AgenticStatusResponse(
-        initialized=agentic_system.get("initialized", False),
-        computer_use_available=agentic_system.get("computer_use_available", False),
-        uae_routing_enabled=agentic_system.get("uae_routing_enabled", False),
-        neural_mesh_agent=agentic_system.get("neural_mesh_agent", False),
-        workflow_executor=agentic_system.get("workflow_executor", False),
-        config_available=agentic_system.get("config_available", False),
-        uptime_seconds=uptime,
+        initialized=runner is not None and (runner.is_ready if runner else False),
+        runner_ready=runner is not None and (runner.is_ready if runner else False),
+        router_ready=router_obj is not None,
+        watchdog_active=watchdog is not None,
+        vbia_adapter_ready=vbia is not None,
+        components=runner_stats.get("components", {}) if runner_stats else {},
+        tasks_executed=runner_stats.get("tasks_executed", 0),
+        tasks_succeeded=runner_stats.get("tasks_succeeded", 0),
+        success_rate=runner_stats.get("success_rate", 0.0),
+        watchdog_status=watchdog_status,
+        tier1_backend=tier1_backend,
+        tier2_backend=tier2_backend,
+        vbia_tier1_threshold=tier1_threshold,
+        vbia_tier2_threshold=tier2_threshold,
     )
 
 
-@router.get("/metrics", response_model=AgenticMetricsResponse)
-async def get_agentic_metrics(request: Request) -> AgenticMetricsResponse:
+@router.get("/watchdog", response_model=WatchdogStatusResponse)
+async def get_watchdog_status(request: Request) -> WatchdogStatusResponse:
     """
-    Get execution metrics for the agentic system.
+    Get detailed watchdog safety system status.
     """
-    computer_use_tool = get_computer_use_tool(request)
-    workflow_executor = get_workflow_executor(request)
+    watchdog = get_watchdog(request)
 
-    metrics = AgenticMetricsResponse()
+    if not watchdog:
+        return WatchdogStatusResponse(
+            active=False,
+            mode="disabled",
+            kill_switch_armed=False,
+            heartbeat_healthy=False,
+            agentic_allowed=True,  # Allow if no watchdog
+        )
 
-    if computer_use_tool:
-        tool_metrics = computer_use_tool.get_metrics()
-        metrics.total_goals = tool_metrics.get("total_goals", 0)
-        metrics.successful_goals = tool_metrics.get("successful_goals", 0)
-        metrics.failed_goals = tool_metrics.get("failed_goals", 0)
-        metrics.success_rate = tool_metrics.get("success_rate", 0.0)
-        metrics.computer_use_metrics = tool_metrics
-
-    if workflow_executor:
-        executor_metrics = workflow_executor.get_metrics()
-        metrics.total_workflows = executor_metrics.get("workflows_executed", 0)
-        metrics.successful_workflows = executor_metrics.get("workflows_succeeded", 0)
-
-    return metrics
+    try:
+        status = watchdog.get_status()
+        return WatchdogStatusResponse(
+            active=True,
+            mode=status.mode.value if hasattr(status.mode, 'value') else str(status.mode),
+            kill_switch_armed=status.kill_switch_armed,
+            heartbeat_healthy=status.heartbeat_healthy,
+            agentic_allowed=watchdog.is_agentic_allowed(),
+            uptime_seconds=status.uptime_seconds,
+            active_task=status.active_task_id,
+            consecutive_failures=status.consecutive_failures,
+            last_activity=status.last_activity_time,
+        )
+    except Exception as e:
+        logger.error(f"Error getting watchdog status: {e}")
+        return WatchdogStatusResponse(
+            active=True,
+            mode="unknown",
+            kill_switch_armed=False,
+            heartbeat_healthy=True,
+            agentic_allowed=True,
+        )
 
 
 @router.post("/execute", response_model=ExecuteGoalResponse)
 async def execute_goal(request: Request, body: ExecuteGoalRequest) -> ExecuteGoalResponse:
     """
-    Execute a single goal using Computer Use.
+    Execute a goal using the unified AgenticTaskRunner.
 
-    This endpoint uses vision-based UI automation to achieve the specified goal.
+    This is a Tier 2 operation requiring VBIA authentication.
+    API clients can pass pre-verified VBIA credentials.
     """
     task_id = str(uuid4())
     start_time = time.time()
 
-    logger.info(f"[AgenticAPI] Executing goal: {body.goal}")
+    logger.info(f"[AgenticAPI] Execute goal: {body.goal[:50]}...")
 
-    # Check if agentic system is available
-    agentic_system = get_agentic_system(request)
-    if not agentic_system or not agentic_system.get("initialized"):
+    runner = get_agentic_runner(request)
+    vbia = get_vbia_adapter(request)
+    watchdog = get_watchdog(request)
+
+    if not runner:
         raise HTTPException(
             status_code=503,
-            detail="Agentic system not initialized. Please wait for startup to complete."
+            detail="AgenticTaskRunner not initialized. Supervisor may not be fully started."
         )
 
-    # Prefer UAE routing if available
-    uae_engine = get_uae_engine(request)
-    computer_use_tool = get_computer_use_tool(request)
-
-    if not computer_use_tool and not uae_engine:
+    if not runner.is_ready:
         raise HTTPException(
             status_code=503,
-            detail="No execution backend available. Computer Use or UAE required."
+            detail="AgenticTaskRunner not ready. Computer Use capability unavailable."
         )
+
+    # Check watchdog
+    if watchdog and not watchdog.is_agentic_allowed():
+        raise HTTPException(
+            status_code=403,
+            detail="Agentic execution blocked by watchdog safety system"
+        )
+
+    # Set VBIA cache if pre-verified credentials provided
+    if vbia and body.vbia_confidence is not None:
+        vbia.set_verification_result(
+            confidence=body.vbia_confidence,
+            speaker_id=body.speaker_id,
+            is_owner=True,
+            verified=body.vbia_confidence >= 0.85,
+        )
+        logger.debug(f"[AgenticAPI] VBIA cache set: {body.vbia_confidence:.2f}")
 
     try:
-        # Execute via UAE if routing is enabled
-        if uae_engine and agentic_system.get("uae_routing_enabled"):
-            result = await asyncio.wait_for(
-                uae_engine.route_to_computer_use(
-                    goal=body.goal,
-                    context=body.context,
-                    narrate=body.narrate,
-                ),
-                timeout=body.timeout_seconds
-            )
-        elif computer_use_tool:
-            # Direct Computer Use execution
-            result = await asyncio.wait_for(
-                computer_use_tool.run(
-                    goal=body.goal,
-                    context=body.context,
-                    narrate=body.narrate,
-                ),
-                timeout=body.timeout_seconds
-            )
-            # Convert ComputerUseResult to dict
-            result = {
-                "success": result.success,
-                "status": result.status,
-                "final_message": result.final_message,
-                "actions_count": result.actions_count,
-                "duration_ms": result.total_duration_ms,
-                "learning_insights": result.learning_insights,
-            }
-        else:
-            raise HTTPException(status_code=503, detail="No execution backend available")
+        # Import RunnerMode
+        from core.agentic_task_runner import RunnerMode
+
+        # Execute via runner
+        result = await asyncio.wait_for(
+            runner.run(
+                goal=body.goal,
+                mode=RunnerMode(body.mode),
+                context=body.context,
+                narrate=body.narrate,
+            ),
+            timeout=body.timeout_seconds
+        )
 
         execution_time = (time.time() - start_time) * 1000
 
         return ExecuteGoalResponse(
-            success=result.get("success", False),
+            success=result.success,
             task_id=task_id,
             goal=body.goal,
-            mode=body.mode,
-            status=result.get("status", "unknown"),
-            final_message=result.get("final_message", ""),
-            actions_count=result.get("actions_count", 0),
+            mode=result.mode,
+            status="completed" if result.success else "failed",
+            final_message=result.final_message,
+            actions_count=result.actions_count,
             execution_time_ms=execution_time,
-            learning_insights=result.get("learning_insights", []),
-            error=result.get("error"),
+            reasoning_steps=result.reasoning_steps,
+            learning_insights=result.learning_insights,
+            watchdog_status=result.watchdog_status,
+            error=result.error,
         )
 
     except asyncio.TimeoutError:
@@ -278,99 +400,178 @@ async def execute_goal(request: Request, body: ExecuteGoalRequest) -> ExecuteGoa
             detail=f"Goal execution timed out after {body.timeout_seconds}s"
         )
     except Exception as e:
-        logger.error(f"[AgenticAPI] Goal execution failed: {e}", exc_info=True)
+        logger.error(f"[AgenticAPI] Execution failed: {e}", exc_info=True)
         raise HTTPException(
             status_code=500,
             detail=f"Goal execution failed: {str(e)}"
         )
 
 
-@router.post("/workflow", response_model=WorkflowResponse)
-async def execute_workflow(request: Request, body: WorkflowRequest) -> WorkflowResponse:
+@router.post("/route", response_model=RouteCommandResponse)
+async def route_command(request: Request, body: RouteCommandRequest) -> RouteCommandResponse:
     """
-    Execute a multi-step workflow.
+    Route a voice command through the TieredCommandRouter.
 
-    This endpoint breaks down complex goals into steps and executes them
-    using Computer Use, with optional parallel execution.
+    This parses wake words, classifies intent, performs VBIA authentication,
+    and optionally executes the command via the appropriate backend.
     """
-    workflow_id = str(uuid4())
-    start_time = time.time()
+    logger.info(f"[AgenticAPI] Route command: {body.command[:50]}...")
 
-    logger.info(f"[AgenticAPI] Executing workflow: {body.goal}")
+    router_obj = get_tiered_router(request)
+    vbia = get_vbia_adapter(request)
+    runner = get_agentic_runner(request)
 
-    # Check if workflow executor is available
-    workflow_executor = get_workflow_executor(request)
-    if not workflow_executor:
+    if not router_obj:
         raise HTTPException(
             status_code=503,
-            detail="Workflow executor not available. Check agentic system status."
+            detail="TieredCommandRouter not initialized"
+        )
+
+    # Set VBIA cache if pre-verified
+    if vbia and body.vbia_confidence is not None:
+        vbia.set_verification_result(
+            confidence=body.vbia_confidence,
+            speaker_id=body.speaker_id,
+            is_owner=True,
+            verified=body.vbia_confidence >= 0.85,
         )
 
     try:
-        result = await workflow_executor.execute_workflow(
-            goal=body.goal,
-            steps=body.steps,
-            context=body.context,
-            parallel=body.parallel,
-            narrate=body.narrate,
+        # Route the command
+        route_result = await router_obj.route(body.command)
+
+        response = RouteCommandResponse(
+            tier=route_result.tier.value,
+            backend=route_result.backend,
+            command=route_result.command,
+            auth_required=route_result.auth_required,
+            auth_result=route_result.auth_result.value if route_result.auth_result else None,
+            vbia_confidence=route_result.vbia_confidence,
+            watchdog_armed=route_result.watchdog_armed,
+            execution_allowed=route_result.execution_allowed,
+            denial_reason=route_result.denial_reason,
         )
 
-        return WorkflowResponse(
-            success=result.success,
-            workflow_id=result.workflow_id,
-            goal=result.goal,
-            steps_completed=result.steps_completed,
-            steps_total=result.steps_total,
-            total_duration_ms=result.total_duration_ms,
-            steps_results=result.steps_results,
-            learning_insights=result.learning_insights,
-            final_message=result.final_message,
-            error=result.error,
-        )
+        # Execute if requested and allowed
+        if body.execute and route_result.execution_allowed:
+            from core.tiered_command_router import CommandTier
+
+            if route_result.tier == CommandTier.TIER2_AGENTIC and runner:
+                # Execute via runner
+                from core.agentic_task_runner import RunnerMode
+                exec_result = await runner.run(
+                    goal=route_result.command,
+                    mode=RunnerMode.AUTONOMOUS,
+                    narrate=True,
+                )
+                response.executed = True
+                response.execution_result = {
+                    "success": exec_result.success,
+                    "message": exec_result.final_message,
+                    "actions": exec_result.actions_count,
+                    "time_ms": exec_result.execution_time_ms,
+                }
+
+            elif route_result.tier == CommandTier.TIER1_STANDARD:
+                # Execute Tier 1 via router's handler
+                exec_result = await router_obj.execute_tier1(route_result.command)
+                response.executed = True
+                response.execution_result = exec_result
+
+        return response
 
     except Exception as e:
-        logger.error(f"[AgenticAPI] Workflow execution failed: {e}", exc_info=True)
+        logger.error(f"[AgenticAPI] Route failed: {e}", exc_info=True)
         raise HTTPException(
             status_code=500,
-            detail=f"Workflow execution failed: {str(e)}"
+            detail=f"Command routing failed: {str(e)}"
         )
+
+
+@router.post("/tier1")
+async def execute_tier1(request: Request, body: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Execute a Tier 1 (safe) command.
+
+    No strict VBIA required, uses Gemini Flash backend.
+    """
+    command = body.get("command", "")
+    context = body.get("context", {})
+
+    if not command:
+        raise HTTPException(status_code=400, detail="Command required")
+
+    router_obj = get_tiered_router(request)
+    if not router_obj:
+        raise HTTPException(status_code=503, detail="Router not available")
+
+    try:
+        result = await router_obj.execute_tier1(command, context)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/health")
 async def agentic_health(request: Request) -> Dict[str, Any]:
     """
-    Health check for the agentic system.
+    Health check for the unified agentic system.
     """
-    agentic_system = get_agentic_system(request)
+    runner = get_agentic_runner(request)
+    router_obj = get_tiered_router(request)
+    watchdog = get_watchdog(request)
+    vbia = get_vbia_adapter(request)
 
-    if not agentic_system:
-        return {
-            "status": "unavailable",
-            "message": "Agentic system not initialized"
-        }
+    components = {
+        "runner": runner is not None and (runner.is_ready if runner else False),
+        "router": router_obj is not None,
+        "watchdog": watchdog is not None,
+        "vbia": vbia is not None,
+    }
 
-    if not agentic_system.get("initialized"):
+    all_ready = all([runner, router_obj])  # Minimum required
+
+    if not all_ready:
         return {
             "status": "initializing",
-            "message": "Agentic system is starting up"
+            "message": "Agentic system is starting up",
+            "components": components,
         }
 
-    if agentic_system.get("error"):
+    if watchdog and not watchdog.is_agentic_allowed():
         return {
-            "status": "error",
-            "message": agentic_system.get("error")
+            "status": "restricted",
+            "message": "Watchdog has restricted agentic execution",
+            "components": components,
         }
 
     return {
         "status": "healthy",
-        "message": "Agentic system operational",
+        "message": "Unified agentic system operational",
+        "components": components,
         "capabilities": {
-            "computer_use": agentic_system.get("computer_use_available", False),
-            "uae_routing": agentic_system.get("uae_routing_enabled", False),
-            "neural_mesh": agentic_system.get("neural_mesh_agent", False),
-            "workflows": agentic_system.get("workflow_executor", False),
+            "tier1": True,
+            "tier2": runner.is_ready if runner else False,
+            "watchdog": watchdog is not None,
+            "vbia": vbia is not None,
         }
     }
+
+
+@router.get("/metrics")
+async def get_metrics(request: Request) -> Dict[str, Any]:
+    """
+    Get execution metrics for the agentic system.
+    """
+    runner = get_agentic_runner(request)
+    router_obj = get_tiered_router(request)
+
+    metrics = {
+        "runner": runner.get_stats() if runner else {},
+        "router": router_obj.get_stats() if router_obj else {},
+    }
+
+    return metrics
 
 
 # ============================================================================
@@ -392,60 +593,58 @@ class AgenticWebSocketManager:
             self.active_connections.remove(websocket)
 
     async def broadcast(self, message: Dict[str, Any]):
-        for connection in self.active_connections:
+        for connection in self.active_connections[:]:
             try:
                 await connection.send_json(message)
             except Exception:
-                pass
+                self.disconnect(connection)
 
 
 ws_manager = AgenticWebSocketManager()
 
 
+def get_ws_manager() -> AgenticWebSocketManager:
+    """Get the WebSocket manager for broadcasting from other modules."""
+    return ws_manager
+
+
 @router.websocket("/ws")
-async def agentic_websocket(websocket: WebSocket, request: Request = None):
+async def agentic_websocket(websocket: WebSocket):
     """
     WebSocket endpoint for real-time agentic task updates.
 
-    Messages sent to clients:
-    - {"type": "status", "data": {...}} - System status updates
-    - {"type": "task_started", "data": {...}} - Task started
-    - {"type": "action_executed", "data": {...}} - Action completed
-    - {"type": "task_completed", "data": {...}} - Task finished
-    - {"type": "error", "data": {...}} - Error occurred
+    Messages:
+    - {"type": "status"} - Get current status
+    - {"type": "execute", "goal": "..."} - Execute goal
+    - {"type": "ping"} - Keepalive
     """
     await ws_manager.connect(websocket)
 
     try:
-        # Send initial status
         await websocket.send_json({
             "type": "connected",
-            "message": "Connected to agentic WebSocket"
+            "message": "Connected to unified agentic WebSocket",
+            "timestamp": time.time(),
         })
 
         while True:
-            # Wait for messages from client
             data = await websocket.receive_json()
+            msg_type = data.get("type", "")
 
-            # Handle different message types
-            message_type = data.get("type", "")
-
-            if message_type == "ping":
+            if msg_type == "ping":
                 await websocket.send_json({"type": "pong", "timestamp": time.time()})
 
-            elif message_type == "get_status":
-                # Get current status
-                status = {
+            elif msg_type == "status":
+                # Send status
+                await websocket.send_json({
                     "type": "status",
                     "data": {
-                        "initialized": True,
-                        "timestamp": time.time()
+                        "ready": True,
+                        "timestamp": time.time(),
                     }
-                }
-                await websocket.send_json(status)
+                })
 
-            elif message_type == "execute":
-                # Execute goal via WebSocket
+            elif msg_type == "execute":
                 goal = data.get("goal", "")
                 if goal:
                     await websocket.send_json({
@@ -453,8 +652,8 @@ async def agentic_websocket(websocket: WebSocket, request: Request = None):
                         "data": {"goal": goal, "timestamp": time.time()}
                     })
 
-                    # Note: In production, this would trigger actual execution
-                    # and stream updates back to the client
+                    # Note: Full execution would be implemented here
+                    # streaming updates back to client
 
     except WebSocketDisconnect:
         ws_manager.disconnect(websocket)

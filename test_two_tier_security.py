@@ -13,12 +13,44 @@ Usage:
     python3 test_two_tier_security.py
 """
 
-import asyncio
+# =============================================================================
+# CRITICAL: Python 3.9 Compatibility - MUST be first before ANY other imports
+# =============================================================================
 import sys
 import os
 
-# Add backend to path
+# Add backend to path FIRST so we can import the compat module
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "backend"))
+
+# Apply Python 3.9 compatibility patches BEFORE any other imports
+# This patches importlib.metadata.packages_distributions() which google-api-core needs
+try:
+    from utils.python39_compat import ensure_python39_compatibility
+    compat_results = ensure_python39_compatibility()
+except ImportError:
+    # Fallback: manually patch if the module isn't available
+    import importlib.metadata as metadata
+    if not hasattr(metadata, 'packages_distributions'):
+        def packages_distributions():
+            """Fallback packages_distributions for Python 3.9"""
+            return {}
+        metadata.packages_distributions = packages_distributions
+
+# Now safe to import everything else
+import asyncio
+import warnings
+import logging
+
+# Suppress warnings
+warnings.filterwarnings("ignore")
+
+# Suppress noisy loggers
+logging.getLogger("speechbrain").setLevel(logging.CRITICAL)
+logging.getLogger("speechbrain.lobes.models.huggingface_transformers.huggingface").setLevel(logging.CRITICAL)
+logging.getLogger("torch").setLevel(logging.CRITICAL)
+logging.getLogger("urllib3").setLevel(logging.CRITICAL)
+logging.getLogger("google").setLevel(logging.CRITICAL)
+logging.getLogger("transformers").setLevel(logging.CRITICAL)
 
 
 async def test_watchdog():
@@ -27,12 +59,13 @@ async def test_watchdog():
     print("TEST 1: AgenticWatchdog")
     print("=" * 60)
 
+    watchdog = None
     try:
         from core.agentic_watchdog import (
             AgenticWatchdog,
             WatchdogConfig,
             start_watchdog,
-            get_watchdog,
+            stop_watchdog,
             Heartbeat,
             AgenticMode,
         )
@@ -54,11 +87,14 @@ async def test_watchdog():
         print(f"  • Started test task")
 
         # Send heartbeat
+        import time
         watchdog.receive_heartbeat(Heartbeat(
             task_id="test_task_001",
-            action="screenshot",
-            status="running",
-            message="Taking screenshot",
+            goal="Test organizing desktop",
+            current_action="screenshot",
+            actions_count=1,
+            timestamp=time.time(),
+            mode=AgenticMode.AUTONOMOUS,
         ))
         print(f"  • Sent heartbeat")
 
@@ -66,9 +102,9 @@ async def test_watchdog():
         await watchdog.task_completed("test_task_001", success=True)
         print(f"  • Completed test task")
 
-        # Get stats
-        stats = watchdog.get_stats()
-        print(f"  • Stats: {stats}")
+        # Get status
+        status = watchdog.get_status()
+        print(f"  • Status: mode={status.mode.value}, heartbeat_healthy={status.heartbeat_healthy}")
 
         print("\n✅ Watchdog tests PASSED")
         return True
@@ -78,6 +114,14 @@ async def test_watchdog():
         import traceback
         traceback.print_exc()
         return False
+    finally:
+        # Clean up watchdog
+        if watchdog:
+            try:
+                from core.agentic_watchdog import stop_watchdog
+                await stop_watchdog()
+            except Exception:
+                pass
 
 
 async def test_router():
@@ -150,12 +194,12 @@ async def test_vbia_adapter():
         from core.tiered_vbia_adapter import (
             TieredVBIAAdapter,
             TieredVBIAConfig,
-            get_tiered_vbia_adapter,
             AuthTier,
         )
 
-        # Initialize adapter
-        adapter = await get_tiered_vbia_adapter()
+        # Initialize adapter directly (not singleton) to avoid shared state issues
+        adapter = TieredVBIAAdapter()
+        await adapter.initialize()
         print("✓ VBIA Adapter initialized")
 
         # Test without cached verification (should use fallback)
@@ -219,14 +263,16 @@ async def test_integration():
     print("TEST 4: Full Integration")
     print("=" * 60)
 
+    watchdog = None
     try:
-        from core.agentic_watchdog import start_watchdog
+        from core.agentic_watchdog import start_watchdog, stop_watchdog
         from core.tiered_command_router import TieredCommandRouter, TieredRouterConfig
-        from core.tiered_vbia_adapter import get_tiered_vbia_adapter
+        from core.tiered_vbia_adapter import TieredVBIAAdapter
 
-        # Initialize all components
+        # Initialize all components (use fresh instances for integration test)
         watchdog = await start_watchdog()
-        vbia_adapter = await get_tiered_vbia_adapter()
+        vbia_adapter = TieredVBIAAdapter()
+        await vbia_adapter.initialize()
 
         router = TieredCommandRouter(
             vbia_callback=vbia_adapter.verify_speaker,
@@ -284,6 +330,37 @@ async def test_integration():
         import traceback
         traceback.print_exc()
         return False
+    finally:
+        # Clean up watchdog
+        if watchdog:
+            try:
+                from core.agentic_watchdog import stop_watchdog
+                await stop_watchdog()
+            except Exception:
+                pass
+
+
+async def cleanup_resources():
+    """Clean up any remaining background resources."""
+    # Give background tasks a moment to notice shutdown
+    await asyncio.sleep(0.1)
+
+    # Clean up PyTorch executor if it exists
+    try:
+        from core.pytorch_executor import shutdown_pytorch_executor
+        await shutdown_pytorch_executor()
+    except (ImportError, Exception):
+        pass
+
+    # Cancel any pending tasks
+    try:
+        tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+    except Exception:
+        pass
 
 
 async def main():
@@ -318,9 +395,24 @@ async def main():
         print("⚠️ SOME TESTS FAILED - Please review the errors above")
     print("=" * 60 + "\n")
 
+    # Clean up resources
+    await cleanup_resources()
+
     return 0 if all_passed else 1
 
 
 if __name__ == "__main__":
-    exit_code = asyncio.run(main())
-    sys.exit(exit_code)
+    # Suppress cleanup warnings
+    import logging
+    logging.getLogger().setLevel(logging.ERROR)
+
+    try:
+        exit_code = asyncio.run(main())
+    except KeyboardInterrupt:
+        exit_code = 1
+    except Exception as e:
+        print(f"Test suite error: {e}")
+        exit_code = 1
+
+    # Force exit to avoid lingering threads
+    os._exit(exit_code)

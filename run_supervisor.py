@@ -111,6 +111,21 @@ if str(backend_path) not in sys.path:
     sys.path.insert(0, str(backend_path))
 
 # =============================================================================
+# CRITICAL: Python 3.9 Compatibility - MUST run before any Google API imports
+# =============================================================================
+# This patches importlib.metadata.packages_distributions() which google-api-core needs
+try:
+    from utils.python39_compat import ensure_python39_compatibility
+    ensure_python39_compatibility()
+except ImportError:
+    # Fallback: manually patch if the module isn't available
+    import importlib.metadata as metadata
+    if not hasattr(metadata, 'packages_distributions'):
+        def packages_distributions():
+            return {}
+        metadata.packages_distributions = packages_distributions
+
+# =============================================================================
 # EARLY SHUTDOWN HOOK REGISTRATION
 # =============================================================================
 # Register shutdown hook as early as possible to ensure GCP VMs are cleaned up
@@ -3195,6 +3210,7 @@ class SupervisorBootstrapper:
                     from core.tiered_command_router import (
                         TieredCommandRouter,
                         TieredRouterConfig,
+                        set_tiered_router,
                     )
 
                     # Create TTS callback for router announcements
@@ -3216,6 +3232,9 @@ class SupervisorBootstrapper:
                         liveness_callback=liveness_callback,
                         tts_callback=router_tts if self.config.voice_enabled else None,
                     )
+
+                    # Register in global registry for API access
+                    set_tiered_router(self._tiered_router)
 
                     self.logger.info("🎯 Two-Tier Command Router initialized")
                     self.logger.info(f"   • Tier 1: {config.tier1_backend} (safe, low-auth)")
@@ -3469,10 +3488,171 @@ class SupervisorBootstrapper:
 # Entry Point
 # =============================================================================
 
+def parse_args():
+    """Parse command-line arguments."""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="JARVIS Supervisor - Unified System Orchestrator",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Start supervisor normally
+  python run_supervisor.py
+
+  # Execute single agentic task and exit
+  python run_supervisor.py --task "Open Safari and check the weather"
+
+  # Execute task with specific mode
+  python run_supervisor.py --task "Organize desktop" --mode autonomous
+
+  # Disable voice narration
+  python run_supervisor.py --no-voice
+"""
+    )
+
+    parser.add_argument(
+        "--task", "-t",
+        help="Execute a single agentic task and exit"
+    )
+
+    parser.add_argument(
+        "--mode", "-m",
+        choices=["direct", "supervised", "autonomous"],
+        default="autonomous",
+        help="Execution mode for --task (default: autonomous)"
+    )
+
+    parser.add_argument(
+        "--no-voice",
+        action="store_true",
+        help="Disable voice narration"
+    )
+
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=300.0,
+        help="Task timeout in seconds (default: 300)"
+    )
+
+    return parser.parse_args()
+
+
+async def run_single_task(
+    bootstrapper: SupervisorBootstrapper,
+    goal: str,
+    mode: str,
+    timeout: float,
+) -> int:
+    """
+    Run a single agentic task and return.
+
+    This is used when --task is provided. The supervisor will:
+    1. Initialize just the essential components (watchdog, router, runner)
+    2. Execute the task
+    3. Shutdown and exit
+    """
+    from core.agentic_task_runner import RunnerMode, get_agentic_runner
+
+    # Wait for agentic runner to be ready
+    runner = get_agentic_runner()
+    if not runner:
+        bootstrapper.logger.error("Agentic runner not initialized")
+        return 1
+
+    if not runner.is_ready:
+        bootstrapper.logger.info("Waiting for agentic runner to be ready...")
+        for _ in range(30):  # Wait up to 30 seconds
+            await asyncio.sleep(1)
+            if runner.is_ready:
+                break
+        if not runner.is_ready:
+            bootstrapper.logger.error("Agentic runner failed to initialize")
+            return 1
+
+    bootstrapper.logger.info(f"Executing task: {goal}")
+    bootstrapper.logger.info(f"Mode: {mode}")
+
+    try:
+        result = await asyncio.wait_for(
+            runner.run(
+                goal=goal,
+                mode=RunnerMode(mode),
+                narrate=bootstrapper.config.voice_enabled,
+            ),
+            timeout=timeout,
+        )
+
+        print("\n" + "=" * 60)
+        print("TASK RESULT")
+        print("=" * 60)
+        print(f"Success: {result.success}")
+        print(f"Message: {result.final_message}")
+        print(f"Time: {result.execution_time_ms:.0f}ms")
+        print(f"Actions: {result.actions_count}")
+
+        if result.learning_insights:
+            print("\nInsights:")
+            for insight in result.learning_insights:
+                print(f"  - {insight}")
+
+        if result.error:
+            print(f"\nError: {result.error}")
+
+        return 0 if result.success else 1
+
+    except asyncio.TimeoutError:
+        bootstrapper.logger.error(f"Task timed out after {timeout}s")
+        return 1
+    except Exception as e:
+        bootstrapper.logger.error(f"Task execution failed: {e}")
+        return 1
+
+
 async def main() -> int:
     """Main entry point."""
+    args = parse_args()
+
+    # Apply command-line settings to environment
+    if args.no_voice:
+        os.environ["JARVIS_VOICE_ENABLED"] = "false"
+
     bootstrapper = SupervisorBootstrapper()
-    return await bootstrapper.run()
+
+    if args.task:
+        # Single task mode: Initialize, run task, shutdown
+        bootstrapper.logger.info("Running in single-task mode")
+
+        # Initialize agentic security (minimal startup)
+        try:
+            await bootstrapper._initialize_agentic_security()
+        except Exception as e:
+            bootstrapper.logger.error(f"Failed to initialize agentic security: {e}")
+            return 1
+
+        # Run the task
+        exit_code = await run_single_task(
+            bootstrapper=bootstrapper,
+            goal=args.task,
+            mode=args.mode,
+            timeout=args.timeout,
+        )
+
+        # Cleanup
+        try:
+            if bootstrapper._agentic_runner:
+                await bootstrapper._agentic_runner.shutdown()
+            if bootstrapper._watchdog:
+                from core.agentic_watchdog import stop_watchdog
+                await stop_watchdog()
+        except Exception as e:
+            bootstrapper.logger.warning(f"Cleanup error: {e}")
+
+        return exit_code
+    else:
+        # Normal supervisor mode
+        return await bootstrapper.run()
 
 
 if __name__ == "__main__":
