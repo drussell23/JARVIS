@@ -1274,6 +1274,285 @@ class UnifiedAwarenessEngine:
         """Register callback for learning events"""
         self.learning_callbacks.append(callback)
 
+    # =========================================================================
+    # Computer Use Action Routing
+    # =========================================================================
+
+    async def route_to_computer_use(
+        self,
+        goal: str,
+        context: Optional[Dict[str, Any]] = None,
+        narrate: bool = True,
+        use_position_hints: bool = True
+    ) -> Dict[str, Any]:
+        """
+        Route an action request to the Computer Use system.
+
+        This method bridges UAE awareness with Computer Use execution,
+        providing intelligent position hints and context.
+
+        Args:
+            goal: Natural language goal to achieve
+            context: Additional context for the task
+            narrate: Whether to enable voice narration
+            use_position_hints: Whether to provide UAE position hints
+
+        Returns:
+            Result dictionary from Computer Use execution
+        """
+        logger.info(f"[UAE] Routing to Computer Use: {goal}")
+
+        # Lazy import to avoid circular dependencies
+        try:
+            from backend.autonomy.computer_use_tool import (
+                get_computer_use_tool,
+                ComputerUseResult,
+            )
+        except ImportError:
+            try:
+                from autonomy.computer_use_tool import (
+                    get_computer_use_tool,
+                    ComputerUseResult,
+                )
+            except ImportError:
+                logger.error("[UAE] Computer Use Tool not available")
+                return {
+                    "success": False,
+                    "error": "Computer Use Tool not available",
+                    "goal": goal
+                }
+
+        # Build context with UAE hints
+        full_context = context.copy() if context else {}
+
+        # Add UAE position hints if available and enabled
+        if use_position_hints:
+            # Extract potential element targets from goal
+            element_hints = await self._extract_element_hints(goal)
+            if element_hints:
+                full_context["uae_element_hints"] = element_hints
+                logger.info(f"[UAE] Providing {len(element_hints)} position hints")
+
+        # Add multi-space context if available
+        if self.multi_space_handler:
+            try:
+                multi_space_context = await self._get_multi_space_context(goal)
+                if multi_space_context:
+                    full_context["multi_space"] = multi_space_context
+                    self.metrics['multi_space_queries'] += 1
+            except Exception as e:
+                logger.debug(f"[UAE] Multi-space context error: {e}")
+
+        # Get Computer Use Tool
+        tool = get_computer_use_tool()
+
+        # Execute via Computer Use
+        try:
+            result = await tool.run(
+                goal=goal,
+                context=full_context,
+                narrate=narrate,
+                use_uae=True,  # Use UAE internally too
+            )
+
+            # Learn from result
+            if result.success:
+                await self._learn_from_computer_use_result(goal, result, full_context)
+
+            return {
+                "success": result.success,
+                "goal": goal,
+                "status": result.status,
+                "final_message": result.final_message,
+                "actions_count": result.actions_count,
+                "duration_ms": result.total_duration_ms,
+                "confidence": result.confidence,
+                "learning_insights": result.learning_insights,
+            }
+
+        except Exception as e:
+            logger.error(f"[UAE] Computer Use execution failed: {e}", exc_info=True)
+            return {
+                "success": False,
+                "goal": goal,
+                "error": str(e)
+            }
+
+    async def _extract_element_hints(self, goal: str) -> Dict[str, Any]:
+        """
+        Extract element hints from goal using context layer.
+
+        Args:
+            goal: Natural language goal
+
+        Returns:
+            Dictionary of element hints with positions
+        """
+        hints = {}
+
+        # Common UI element keywords
+        element_keywords = [
+            "button", "menu", "icon", "window", "app", "finder", "safari",
+            "chrome", "terminal", "settings", "preferences", "control center",
+            "dock", "notification", "spotlight", "launchpad"
+        ]
+
+        goal_lower = goal.lower()
+
+        for keyword in element_keywords:
+            if keyword in goal_lower:
+                # Try to get position from context layer
+                element_id = keyword.replace(" ", "_")
+                context_data = await self.context_layer.get_contextual_data(element_id)
+
+                if context_data and context_data.expected_position:
+                    hints[element_id] = {
+                        "position": context_data.expected_position,
+                        "confidence": context_data.confidence,
+                        "source": "context_layer"
+                    }
+
+        return hints
+
+    async def _get_multi_space_context(self, goal: str) -> Optional[Dict[str, Any]]:
+        """
+        Get multi-space context for goal.
+
+        Args:
+            goal: Natural language goal
+
+        Returns:
+            Multi-space context or None
+        """
+        if not self.multi_space_handler:
+            return None
+
+        try:
+            # Check if goal involves other spaces
+            space_keywords = ["other desktop", "other space", "desktop 2", "space 2",
+                            "different desktop", "switch to", "all desktops"]
+
+            goal_lower = goal.lower()
+            involves_multi_space = any(kw in goal_lower for kw in space_keywords)
+
+            if involves_multi_space:
+                # Query multi-space handler
+                return {
+                    "involves_multi_space": True,
+                    "goal_keywords": [kw for kw in space_keywords if kw in goal_lower]
+                }
+
+            return None
+
+        except Exception as e:
+            logger.debug(f"[UAE] Multi-space context error: {e}")
+            return None
+
+    async def _learn_from_computer_use_result(
+        self,
+        goal: str,
+        result: Any,
+        context: Dict[str, Any]
+    ):
+        """
+        Learn from successful Computer Use execution.
+
+        Args:
+            goal: Original goal
+            result: ComputerUseResult
+            context: Context used
+        """
+        try:
+            # Store learning insights
+            if result.learning_insights and self.learning_db:
+                for insight in result.learning_insights:
+                    pattern_data = {
+                        'pattern_type': 'computer_use_insight',
+                        'pattern_data': {
+                            'goal': goal,
+                            'insight': insight,
+                            'timestamp': time.time()
+                        },
+                        'confidence': result.confidence,
+                        'success_rate': 1.0 if result.success else 0.0
+                    }
+
+                    await self.learning_db.store_pattern(pattern_data, auto_merge=True)
+
+            self.metrics['learning_cycles'] += 1
+            logger.debug(f"[UAE] Learned from Computer Use: {len(result.learning_insights)} insights")
+
+        except Exception as e:
+            logger.error(f"[UAE] Error learning from Computer Use: {e}")
+
+    async def execute_action(
+        self,
+        action_type: str,
+        target: str,
+        parameters: Optional[Dict[str, Any]] = None,
+        use_computer_use: bool = True,
+        narrate: bool = True
+    ) -> Dict[str, Any]:
+        """
+        Execute an action using the most appropriate method.
+
+        This is the primary action routing method that decides whether
+        to use Computer Use or direct execution.
+
+        Args:
+            action_type: Type of action (click, type, navigate, etc.)
+            target: Target element or description
+            parameters: Additional parameters
+            use_computer_use: Whether to use Computer Use system
+            narrate: Whether to enable voice narration
+
+        Returns:
+            Action result
+        """
+        # Build goal description from action
+        if action_type == "click":
+            goal = f"Click on {target}"
+        elif action_type == "type":
+            text = parameters.get("text", "") if parameters else ""
+            goal = f"Type '{text}' in {target}"
+        elif action_type == "navigate":
+            goal = f"Navigate to {target}"
+        elif action_type == "open":
+            goal = f"Open {target}"
+        elif action_type == "close":
+            goal = f"Close {target}"
+        else:
+            goal = f"{action_type} {target}"
+
+        # Add parameters to context
+        context = parameters or {}
+        context["action_type"] = action_type
+        context["target"] = target
+
+        if use_computer_use:
+            return await self.route_to_computer_use(
+                goal=goal,
+                context=context,
+                narrate=narrate
+            )
+        else:
+            # Direct element execution (legacy path)
+            decision = await self.get_element_position(target)
+            if decision.confidence < 0.5:
+                return {
+                    "success": False,
+                    "error": f"Low confidence for element: {target}",
+                    "confidence": decision.confidence
+                }
+
+            # Execute with existing executor
+            return {
+                "success": True,
+                "position": decision.chosen_position,
+                "confidence": decision.confidence,
+                "message": "Position resolved - execute action"
+            }
+
     def get_comprehensive_metrics(self) -> Dict[str, Any]:
         """Get comprehensive metrics from all layers"""
         total_exec = self.metrics['total_executions']

@@ -144,6 +144,14 @@ class ParallelInitializer:
         self._add_component("display_monitor", priority=40)
         self._add_component("dynamic_components", priority=60)
 
+        # Phase 6: Agentic System (depends on UAE and vision)
+        # This enables autonomous Computer Use capabilities
+        self._add_component(
+            "agentic_system",
+            priority=55,
+            dependencies=["uae_engine", "vision_analyzer"]
+        )
+
     def _add_component(
         self,
         name: str,
@@ -1017,6 +1025,136 @@ class ParallelInitializer:
         except Exception as e:
             logger.warning(f"Dynamic components failed: {e}")
 
+    async def _init_agentic_system(self):
+        """
+        Initialize the JARVIS Agentic System.
+
+        This enables autonomous Computer Use capabilities by integrating:
+        - Computer Use Tool (vision-based UI automation)
+        - UAE action routing (intelligent element positioning)
+        - Neural Mesh agent registration (multi-agent coordination)
+        - Agentic configuration (dynamic, zero-hardcoding)
+
+        The agentic system allows JARVIS to autonomously execute
+        multi-step tasks using vision-based computer control.
+        """
+        try:
+            logger.info("=" * 60)
+            logger.info("AGENTIC SYSTEM INITIALIZATION")
+            logger.info("=" * 60)
+
+            # Step 1: Load agentic configuration
+            try:
+                from core.agentic_config import get_agentic_config
+                agentic_config = get_agentic_config()
+                self.app.state.agentic_config = agentic_config
+                logger.info(f"   Agentic config loaded (debug={agentic_config.debug_mode})")
+            except ImportError:
+                logger.warning("   Agentic config not available - using defaults")
+                agentic_config = None
+
+            # Step 2: Initialize Computer Use Tool
+            try:
+                from autonomy.computer_use_tool import get_computer_use_tool
+
+                # Get TTS callback if available
+                tts_callback = None
+                if hasattr(self.app.state, 'vbi_orchestrator'):
+                    vbi = self.app.state.vbi_orchestrator
+                    if hasattr(vbi, 'speak'):
+                        tts_callback = vbi.speak
+
+                computer_use_tool = get_computer_use_tool(
+                    tts_callback=tts_callback,
+                    config=agentic_config,
+                )
+                self.app.state.computer_use_tool = computer_use_tool
+                logger.info("   Computer Use Tool initialized")
+
+            except ImportError as e:
+                logger.warning(f"   Computer Use Tool not available: {e}")
+                self.app.state.computer_use_tool = None
+
+            # Step 3: Connect UAE to Computer Use (if both available)
+            uae_engine = getattr(self.app.state, 'uae_engine', None)
+            if uae_engine is None:
+                # Try lazy initialization of UAE
+                uae_lazy_config = getattr(self.app.state, 'uae_lazy_config', None)
+                if uae_lazy_config:
+                    try:
+                        from intelligence.unified_awareness_engine import get_uae_engine
+                        uae_engine = get_uae_engine(
+                            vision_analyzer=uae_lazy_config.get('vision_analyzer')
+                        )
+                        self.app.state.uae_engine = uae_engine
+                        logger.info("   UAE initialized for agentic routing")
+                    except Exception as e:
+                        logger.warning(f"   Could not initialize UAE: {e}")
+
+            if uae_engine and self.app.state.computer_use_tool:
+                logger.info("   UAE ↔ Computer Use routing enabled")
+                self.app.state.agentic_routing_enabled = True
+            else:
+                self.app.state.agentic_routing_enabled = False
+
+            # Step 4: Register Computer Use agent with Neural Mesh
+            neural_mesh = getattr(self.app.state, 'neural_mesh', None)
+            if neural_mesh:
+                try:
+                    from autonomy.neural_mesh_integration import register_computer_use_agent
+
+                    agent = await register_computer_use_agent(
+                        tts_callback=tts_callback
+                    )
+                    if agent:
+                        self.app.state.computer_use_agent = agent
+                        logger.info("   Computer Use agent registered with Neural Mesh")
+
+                except ImportError:
+                    logger.debug("   Neural Mesh integration not available")
+                except Exception as e:
+                    logger.warning(f"   Neural Mesh agent registration failed: {e}")
+
+            # Step 5: Initialize workflow executor
+            try:
+                from autonomy.neural_mesh_integration import get_workflow_executor
+
+                executor = get_workflow_executor(
+                    neural_mesh=neural_mesh.get('coordinator') if isinstance(neural_mesh, dict) else None,
+                    tts_callback=tts_callback,
+                )
+                await executor.initialize()
+                self.app.state.agentic_workflow_executor = executor
+                logger.info("   Agentic workflow executor ready")
+
+            except ImportError:
+                logger.debug("   Workflow executor not available")
+            except Exception as e:
+                logger.warning(f"   Workflow executor failed: {e}")
+
+            # Step 6: Store status
+            self.app.state.agentic_system = {
+                "initialized": True,
+                "config_available": agentic_config is not None,
+                "computer_use_available": self.app.state.computer_use_tool is not None,
+                "uae_routing_enabled": self.app.state.agentic_routing_enabled,
+                "neural_mesh_agent": hasattr(self.app.state, 'computer_use_agent'),
+                "workflow_executor": hasattr(self.app.state, 'agentic_workflow_executor'),
+                "timestamp": time.time(),
+            }
+
+            logger.info("   ✅ Agentic System ready")
+            logger.info("=" * 60)
+
+        except Exception as e:
+            logger.error(f"Agentic system initialization failed: {e}", exc_info=True)
+            self.app.state.agentic_system = {
+                "initialized": False,
+                "error": str(e),
+                "timestamp": time.time(),
+            }
+            # Don't raise - agentic system is not critical for basic operation
+
     # =========================================================================
     # Status and health
     # =========================================================================
@@ -1050,7 +1188,7 @@ class ParallelInitializer:
         ]
 
         # Map internal component names to supervisor-expected names
-        # Supervisor expects: database, voice, vision, models, websocket, backend
+        # Supervisor expects: database, voice, vision, models, websocket, backend, agentic
         component_mapping = {
             # Database components
             "cloud_sql_proxy": "database",
@@ -1070,6 +1208,8 @@ class ParallelInitializer:
             "neural_mesh": "models",
             # WebSocket
             "unified_websocket": "websocket",
+            # Agentic System (Computer Use + UAE routing)
+            "agentic_system": "agentic",
         }
 
         # Build simplified component lists for supervisor

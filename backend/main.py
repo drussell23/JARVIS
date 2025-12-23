@@ -4677,6 +4677,15 @@ def mount_routers():
     except ImportError:
         logger.debug("Self-healing API not available")
 
+    # Agentic API - Computer Use + Autonomous Task Execution
+    try:
+        from api.agentic_api import router as agentic_router
+
+        app.include_router(agentic_router, tags=["agentic"])
+        logger.info("✅ Agentic API mounted at /api/agentic")
+    except ImportError as e:
+        logger.debug(f"Agentic API not available: {e}")
+
     # Context Intelligence API (Priority 1-3 features)
     if hasattr(app.state, "context_bridge") and app.state.context_bridge:
         from pydantic import BaseModel

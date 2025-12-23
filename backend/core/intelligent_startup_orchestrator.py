@@ -279,7 +279,16 @@ class IntelligentStartupOrchestrator:
             timeout=30.0,
             dependencies=["speaker_verification"],
         ))
-    
+
+        # Agentic System (Computer Use + UAE routing)
+        self.register_component(ComponentDef(
+            name="agentic_system",
+            required_for_level=ReadinessLevel.FULL,
+            is_critical=False,
+            timeout=60.0,
+            dependencies=["ml_models"],
+        ))
+
     def register_component(self, component: ComponentDef):
         """Register a component for startup tracking."""
         self._components[component.name] = component
