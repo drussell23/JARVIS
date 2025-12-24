@@ -1877,6 +1877,7 @@ class SupervisorBootstrapper:
         self._data_flywheel = None
         self._learning_goals_manager = None
         self._training_scheduler_task = None
+        self._experience_collection_task = None  # v9.1: Background experience collection
 
         # CRITICAL: Set CI=true to prevent npm start from hanging interactively
         # if port 3000 is taken. This ensures we fail fast or handle it automatically.
@@ -4053,6 +4054,25 @@ class SupervisorBootstrapper:
                     self._run_training_scheduler()
                 )
 
+            # v9.1: Initialize flywheel components eagerly for faster experience collection
+            try:
+                await self._data_flywheel._init_components()
+                self.logger.info("✅ Data Flywheel components initialized")
+
+                # Initialize the SQLite training database connection
+                if hasattr(self._data_flywheel, '_init_training_db'):
+                    await self._data_flywheel._init_training_db()
+                    self.logger.info("✅ Training database connection established")
+            except Exception as init_err:
+                self.logger.warning(f"⚠️ Flywheel component init error (non-fatal): {init_err}")
+
+            # v9.1: Start background experience collection loop
+            if self.config.data_flywheel_auto_collect:
+                self._experience_collection_task = asyncio.create_task(
+                    self._run_experience_collection_loop()
+                )
+                self.logger.info("✅ Background experience collection started")
+
             self.logger.info("✅ Data Flywheel initialized")
             print(f"  {TerminalUI.GREEN}✓ Data Flywheel: Self-improving learning active{TerminalUI.RESET}")
 
@@ -5516,8 +5536,85 @@ class SupervisorBootstrapper:
                 self.logger.error(f"Training scheduler error: {e}")
                 await asyncio.sleep(3600)  # Wait an hour before retrying
 
+    async def _run_experience_collection_loop(self) -> None:
+        """
+        v9.1: Background task for continuous experience collection.
+
+        This loop:
+        - Periodically collects experiences from JARVIS interactions
+        - Syncs with reactor-core JARVISConnector
+        - Monitors experience quality and quantity
+        - Triggers learning goal discovery when patterns emerge
+
+        Runs every 5 minutes to ensure fresh training data.
+        """
+        collection_interval = 300  # 5 minutes
+        self.logger.info(f"🔄 Experience collection loop started (interval: {collection_interval}s)")
+
+        while True:
+            try:
+                await asyncio.sleep(collection_interval)
+
+                if not self._data_flywheel or self._data_flywheel.is_running:
+                    continue
+
+                # Collect recent experiences
+                try:
+                    if self._data_flywheel._jarvis_connector:
+                        experiences = await asyncio.get_event_loop().run_in_executor(
+                            None,
+                            self._data_flywheel._jarvis_connector.collect_recent_experiences,
+                            1  # Last 1 hour
+                        )
+
+                        if experiences:
+                            self.logger.debug(f"Collected {len(experiences)} recent experiences")
+
+                            # Store in training database
+                            if hasattr(self._data_flywheel, 'add_experience'):
+                                for exp in experiences[:10]:  # Limit batch size
+                                    self._data_flywheel.add_experience(
+                                        source="auto_collection",
+                                        input_text=exp.get("input", ""),
+                                        output_text=exp.get("output", ""),
+                                        context=exp.get("context", {}),
+                                        quality_score=exp.get("quality", 0.5),
+                                    )
+
+                except Exception as collect_err:
+                    self.logger.debug(f"Experience collection cycle: {collect_err}")
+
+                # Check if we should trigger learning goal discovery
+                try:
+                    if hasattr(self, '_learning_goals_manager') and self._learning_goals_manager:
+                        stats = self._data_flywheel.get_stats() if hasattr(self._data_flywheel, 'get_stats') else {}
+                        total_experiences = stats.get("total_experiences", 0)
+
+                        # Discover new goals every 100 experiences
+                        if total_experiences > 0 and total_experiences % 100 == 0:
+                            await self._learning_goals_manager.auto_discover_topics()
+                            self.logger.info(f"Auto-discovered learning topics at {total_experiences} experiences")
+                except Exception as goal_err:
+                    self.logger.debug(f"Learning goal discovery: {goal_err}")
+
+            except asyncio.CancelledError:
+                self.logger.info("Experience collection loop stopped")
+                break
+            except Exception as e:
+                self.logger.warning(f"Experience collection error: {e}")
+                await asyncio.sleep(60)  # Wait a minute before retrying
+
     async def _stop_data_flywheel(self) -> None:
         """Stop the Data Flywheel and related tasks."""
+        # Cancel experience collection loop
+        if hasattr(self, '_experience_collection_task') and self._experience_collection_task:
+            self._experience_collection_task.cancel()
+            try:
+                await self._experience_collection_task
+            except asyncio.CancelledError:
+                pass
+            self._experience_collection_task = None
+
         # Cancel training scheduler
         if self._training_scheduler_task:
             self._training_scheduler_task.cancel()
