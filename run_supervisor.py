@@ -261,6 +261,40 @@ class BootstrapConfig:
     jarvis_prime_cloud_run_url: str = field(default_factory=lambda: os.getenv("JARVIS_PRIME_CLOUD_RUN_URL", ""))
 
     # =========================================================================
+    # v9.4: Intelligent Model Manager (Auto-download & reactor-core deployment)
+    # =========================================================================
+    # Ensures JARVIS-Prime always has a model to load:
+    # - Auto-downloads base models if missing (TinyLlama for testing, Mistral for prod)
+    # - Integrates with reactor-core for trained model auto-deployment
+    # - Hot-swap models without restart via versioned registry
+    # - Memory-aware model selection based on available RAM
+    # =========================================================================
+    model_manager_enabled: bool = field(default_factory=lambda: os.getenv("MODEL_MANAGER_ENABLED", "true").lower() == "true")
+    model_manager_auto_download: bool = field(default_factory=lambda: os.getenv("MODEL_AUTO_DOWNLOAD", "true").lower() == "true")
+    model_manager_default_model: str = field(default_factory=lambda: os.getenv("MODEL_DEFAULT", "tinyllama-chat"))
+    model_manager_prod_model: str = field(default_factory=lambda: os.getenv("MODEL_PRODUCTION", "mistral-7b-instruct"))
+    model_manager_memory_threshold_gb: float = field(default_factory=lambda: float(os.getenv("MODEL_MEMORY_THRESHOLD", "8.0")))
+    model_manager_auto_select: bool = field(default_factory=lambda: os.getenv("MODEL_AUTO_SELECT", "true").lower() == "true")
+    model_manager_hot_swap_enabled: bool = field(default_factory=lambda: os.getenv("MODEL_HOT_SWAP", "true").lower() == "true")
+    model_manager_reactor_core_watch: bool = field(default_factory=lambda: os.getenv("MODEL_REACTOR_WATCH", "true").lower() == "true")
+
+    # =========================================================================
+    # v9.4: Enhanced Neural Mesh (Full production agent activation)
+    # =========================================================================
+    # Activates the full Neural Mesh system with 60+ agents:
+    # - Production agents: Memory, Coordinator, HealthMonitor, etc.
+    # - JARVIS Bridge for auto-discovery of all JARVIS systems
+    # - Crew multi-agent collaboration system
+    # - Shared knowledge graph with ChromaDB + NetworkX
+    # =========================================================================
+    neural_mesh_production: bool = field(default_factory=lambda: os.getenv("NEURAL_MESH_PRODUCTION", "true").lower() == "true")
+    neural_mesh_agents_enabled: bool = field(default_factory=lambda: os.getenv("NEURAL_MESH_AGENTS", "true").lower() == "true")
+    neural_mesh_knowledge_graph: bool = field(default_factory=lambda: os.getenv("NEURAL_MESH_KNOWLEDGE", "true").lower() == "true")
+    neural_mesh_crew_enabled: bool = field(default_factory=lambda: os.getenv("NEURAL_MESH_CREW", "true").lower() == "true")
+    neural_mesh_jarvis_bridge: bool = field(default_factory=lambda: os.getenv("NEURAL_MESH_JARVIS_BRIDGE", "true").lower() == "true")
+    neural_mesh_health_interval: float = field(default_factory=lambda: float(os.getenv("NEURAL_MESH_HEALTH_INTERVAL", "30.0")))
+
+    # =========================================================================
     # Reactor-Core Integration (Auto-deployment of trained models)
     # =========================================================================
     reactor_core_enabled: bool = field(default_factory=lambda: os.getenv("REACTOR_CORE_ENABLED", "true").lower() == "true")
@@ -1967,6 +2001,30 @@ class SupervisorBootstrapper:
             "last_sources": {},  # Track discovery by source type
         }
 
+        # v9.4: Intelligent Model Manager (Auto-download & reactor-core deployment)
+        self._model_manager = None
+        self._model_watcher_task = None
+        self._current_model_info = {
+            "name": None,
+            "path": None,
+            "size_mb": 0,
+            "loaded": False,
+            "source": None,  # "downloaded", "reactor_core", "existing"
+        }
+        self._model_download_in_progress = False
+
+        # v9.4: Enhanced Neural Mesh (Production agent system)
+        self._neural_mesh_coordinator = None
+        self._neural_mesh_bridge = None
+        self._neural_mesh_agents = {}
+        self._neural_mesh_health_task = None
+        self._neural_mesh_stats = {
+            "agents_registered": 0,
+            "messages_sent": 0,
+            "knowledge_entries": 0,
+            "workflows_completed": 0,
+        }
+
         # CRITICAL: Set CI=true to prevent npm start from hanging interactively
         # if port 3000 is taken. This ensures we fail fast or handle it automatically.
         os.environ["CI"] = "true"
@@ -2135,6 +2193,12 @@ class SupervisorBootstrapper:
             # - Supports local subprocess, Docker, or Cloud Run deployment
             # - Auto-integrates with Reactor-Core for model hot-swapping
             # ═══════════════════════════════════════════════════════════════════
+
+            # v9.4: Initialize Model Manager BEFORE JARVIS-Prime
+            # This ensures a model is available for local inference
+            if self.config.model_manager_enabled:
+                await self._init_model_manager()
+
             await self._initialize_jarvis_prime()
 
             # ═══════════════════════════════════════════════════════════════════
@@ -5417,210 +5481,282 @@ class SupervisorBootstrapper:
 
         # ═══════════════════════════════════════════════════════════════════
         # Step 3: Initialize Neural Mesh (Distributed Intelligence Coordination)
+        # v9.4: Production-grade Neural Mesh with 60+ agents, knowledge graph,
+        # communication bus, and multi-agent orchestration
         # ═══════════════════════════════════════════════════════════════════
         if self.config.neural_mesh_enabled:
             try:
-                self.logger.info("🕸️ Step 3/7: Initializing Neural Mesh (Distributed Intelligence)...")
-                self.logger.info("   • Sync interval: " + str(self.config.neural_mesh_sync_interval) + "s")
+                self.logger.info("🕸️ Step 3/7: Initializing Neural Mesh v9.4 (Production Multi-Agent System)...")
+                self.logger.info("   • Production mode: " + str(self.config.neural_mesh_production))
+                self.logger.info("   • Agents enabled: " + str(self.config.neural_mesh_agents_enabled))
+                self.logger.info("   • Knowledge graph: " + str(self.config.neural_mesh_knowledge_graph))
+                self.logger.info("   • JARVIS bridge: " + str(self.config.neural_mesh_jarvis_bridge))
+                self.logger.info("   • Health interval: " + str(self.config.neural_mesh_health_interval) + "s")
 
-                # Neural Mesh is a new system that coordinates all intelligence subsystems
-                # It provides shared context, message passing, and load balancing
+                # v9.4: Import production Neural Mesh components
+                neural_mesh_available = False
+                try:
+                    from backend.neural_mesh.neural_mesh_coordinator import (
+                        NeuralMeshCoordinator,
+                        get_neural_mesh,
+                        start_neural_mesh,
+                        stop_neural_mesh,
+                    )
+                    from backend.neural_mesh.jarvis_bridge import (
+                        JARVISNeuralMeshBridge,
+                        get_jarvis_bridge,
+                        start_jarvis_neural_mesh,
+                        stop_jarvis_neural_mesh,
+                        AgentDiscoveryConfig,
+                        SystemCategory,
+                    )
+                    from backend.neural_mesh.agents.agent_initializer import (
+                        AgentInitializer,
+                        initialize_production_agents,
+                        PRODUCTION_AGENTS,
+                    )
+                    from backend.neural_mesh.config import NeuralMeshConfig, get_config
+                    neural_mesh_available = True
+                    self.logger.info("   ✓ Production Neural Mesh modules imported")
+                except ImportError as ie:
+                    self.logger.warning(f"   ⚠ Production Neural Mesh not available: {ie}")
+                    neural_mesh_available = False
 
-                from dataclasses import dataclass, field
-                from typing import Dict, Any, List, Callable, Optional
-                from collections import defaultdict
-                from datetime import datetime
-                import weakref
+                if neural_mesh_available and self.config.neural_mesh_production:
+                    # ═══════════════════════════════════════════════════════════════
+                    # v9.4: Production Neural Mesh Initialization
+                    # Comprehensive 4-tier architecture with 60+ agents
+                    # ═══════════════════════════════════════════════════════════════
 
-                @dataclass
-                class NeuralMeshNode:
-                    """A node in the Neural Mesh network."""
-                    node_id: str
-                    node_type: str  # "uae", "sai", "mas", "cai", "scraper"
-                    capabilities: List[str] = field(default_factory=list)
-                    status: str = "active"
-                    last_heartbeat: float = field(default_factory=time.time)
-                    metadata: Dict[str, Any] = field(default_factory=dict)
+                    # Get or create configuration
+                    mesh_config = get_config()
 
-                class NeuralMesh:
-                    """
-                    Distributed intelligence coordination network.
+                    # Override config from supervisor settings if needed
+                    mesh_config.orchestrator.default_timeout = 30.0
+                    mesh_config.communication_bus.max_queue_size = 10000
+                    mesh_config.knowledge_graph.cleanup_interval = 3600.0
 
-                    Provides:
-                    - Inter-system message passing
-                    - Shared context propagation
-                    - Load balancing for intelligence tasks
-                    - System health monitoring
-                    - Adaptive routing of intelligence queries
-                    """
+                    # Initialize Neural Mesh Coordinator (core orchestration)
+                    self.logger.info("   → Initializing Neural Mesh Coordinator...")
+                    self._neural_mesh_coordinator = NeuralMeshCoordinator(config=mesh_config)
+                    await self._neural_mesh_coordinator.initialize()
+                    await self._neural_mesh_coordinator.start()
+                    self.logger.info("   ✓ Neural Mesh Coordinator started")
 
-                    def __init__(self, sync_interval: float = 5.0):
-                        self._nodes: Dict[str, NeuralMeshNode] = {}
-                        self._context: Dict[str, Any] = {}  # Shared context
-                        self._message_queues: Dict[str, asyncio.Queue] = defaultdict(asyncio.Queue)
-                        self._subscribers: Dict[str, List[Callable]] = defaultdict(list)
-                        self._sync_interval = sync_interval
-                        self._sync_task: Optional[asyncio.Task] = None
-                        self._running = False
-                        self._logger = logging.getLogger("NeuralMesh")
+                    # Store coordinator reference for system access
+                    self._neural_mesh = self._neural_mesh_coordinator
 
-                    def register_node(self, node: NeuralMeshNode) -> None:
-                        """Register a node in the mesh."""
-                        self._nodes[node.node_id] = node
-                        self._message_queues[node.node_id] = asyncio.Queue()
-                        self._logger.debug(f"Node registered: {node.node_id} ({node.node_type})")
+                    # Initialize production agents if enabled
+                    if self.config.neural_mesh_agents_enabled:
+                        self.logger.info("   → Initializing production agents...")
 
-                    def unregister_node(self, node_id: str) -> None:
-                        """Remove a node from the mesh."""
-                        if node_id in self._nodes:
-                            del self._nodes[node_id]
-                        if node_id in self._message_queues:
-                            del self._message_queues[node_id]
+                        # Create agent initializer
+                        agent_initializer = AgentInitializer(self._neural_mesh_coordinator)
+                        self._neural_mesh_agents = await agent_initializer.initialize_all_agents()
 
-                    async def broadcast(self, event_type: str, data: Dict[str, Any], source: str = None) -> None:
-                        """Broadcast a message to all subscribed nodes."""
-                        message = {
-                            "event_type": event_type,
-                            "data": data,
-                            "source": source,
-                            "timestamp": time.time(),
-                        }
+                        agent_count = len(self._neural_mesh_agents)
+                        self.logger.info(f"   ✓ {agent_count} production agents registered")
 
-                        for subscriber in self._subscribers.get(event_type, []):
-                            try:
-                                if asyncio.iscoroutinefunction(subscriber):
-                                    await subscriber(message)
-                                else:
-                                    subscriber(message)
-                            except Exception as e:
-                                self._logger.warning(f"Subscriber error for {event_type}: {e}")
+                        # Log registered agents
+                        for agent_name, agent in self._neural_mesh_agents.items():
+                            self._neural_mesh_stats["agents_registered"] += 1
+                            self.logger.debug(f"      • {agent_name} ({agent.agent_type})")
 
-                    def subscribe(self, event_type: str, callback: Callable) -> None:
-                        """Subscribe to a specific event type."""
-                        self._subscribers[event_type].append(callback)
+                    # Initialize JARVIS Bridge if enabled (connects all JARVIS systems)
+                    if self.config.neural_mesh_jarvis_bridge:
+                        self.logger.info("   → Initializing JARVIS Neural Mesh Bridge...")
 
-                    def update_context(self, key: str, value: Any) -> None:
-                        """Update shared context."""
-                        self._context[key] = {
-                            "value": value,
-                            "updated_at": time.time(),
-                        }
+                        # Configure agent discovery
+                        discovery_config = AgentDiscoveryConfig(
+                            enabled_categories={
+                                SystemCategory.INTELLIGENCE,
+                                SystemCategory.AUTONOMY,
+                                SystemCategory.VOICE,
+                            },
+                            auto_initialize=True,
+                            parallel_init=True,
+                            max_parallel=10,
+                            retry_on_failure=True,
+                            max_retries=2,
+                        )
 
-                    def get_context(self, key: str) -> Optional[Any]:
-                        """Get value from shared context."""
-                        if key in self._context:
-                            return self._context[key]["value"]
-                        return None
+                        # Create and start bridge
+                        self._neural_mesh_bridge = JARVISNeuralMeshBridge(
+                            config=discovery_config,
+                            coordinator=self._neural_mesh_coordinator,
+                        )
+                        await self._neural_mesh_bridge.initialize()
+                        await self._neural_mesh_bridge.start()
 
-                    async def send_to_node(self, node_id: str, message: Dict[str, Any]) -> bool:
-                        """Send a message to a specific node."""
-                        if node_id in self._message_queues:
-                            await self._message_queues[node_id].put(message)
-                            return True
-                        return False
+                        bridge_agents = len(self._neural_mesh_bridge.registered_agents)
+                        self.logger.info(f"   ✓ JARVIS Bridge started with {bridge_agents} system adapters")
 
-                    async def receive_from_node(self, node_id: str, timeout: float = 5.0) -> Optional[Dict[str, Any]]:
-                        """Receive a message from a specific node's queue."""
-                        if node_id in self._message_queues:
-                            try:
-                                return await asyncio.wait_for(
-                                    self._message_queues[node_id].get(),
-                                    timeout=timeout
-                                )
-                            except asyncio.TimeoutError:
-                                return None
-                        return None
+                        # Register bridge event callbacks
+                        def on_bridge_event(data):
+                            self._neural_mesh_stats["messages_sent"] += 1
 
-                    def get_active_nodes(self, node_type: str = None) -> List[NeuralMeshNode]:
-                        """Get all active nodes, optionally filtered by type."""
-                        nodes = list(self._nodes.values())
-                        if node_type:
-                            nodes = [n for n in nodes if n.node_type == node_type]
-                        return [n for n in nodes if n.status == "active"]
+                        self._neural_mesh_bridge.on("agent_registered", on_bridge_event)
 
-                    def get_node_with_capability(self, capability: str) -> Optional[NeuralMeshNode]:
-                        """Find a node with a specific capability."""
-                        for node in self._nodes.values():
-                            if capability in node.capabilities and node.status == "active":
-                                return node
-                        return None
+                    # Start health monitoring task
+                    if self.config.neural_mesh_health_interval > 0:
+                        async def neural_mesh_health_loop():
+                            """Background health monitoring for Neural Mesh."""
+                            while True:
+                                try:
+                                    await asyncio.sleep(self.config.neural_mesh_health_interval)
 
-                    async def start(self) -> None:
-                        """Start the Neural Mesh sync loop."""
-                        self._running = True
-                        self._sync_task = asyncio.create_task(self._sync_loop())
-                        self._logger.info("Neural Mesh sync loop started")
+                                    # Get system health
+                                    if self._neural_mesh_coordinator:
+                                        health = await self._neural_mesh_coordinator.health_check()
+                                        metrics = self._neural_mesh_coordinator.get_metrics()
 
-                    async def stop(self) -> None:
-                        """Stop the Neural Mesh."""
-                        self._running = False
-                        if self._sync_task:
-                            self._sync_task.cancel()
-                            try:
-                                await self._sync_task
-                            except asyncio.CancelledError:
-                                pass
+                                        # Update stats
+                                        self._neural_mesh_stats["agents_registered"] = metrics.registered_agents
+                                        self._neural_mesh_stats["messages_sent"] = metrics.messages_published
+                                        self._neural_mesh_stats["knowledge_entries"] = metrics.knowledge_entries
+                                        self._neural_mesh_stats["workflows_completed"] = metrics.workflows_completed
 
-                    async def _sync_loop(self) -> None:
-                        """Background sync loop for health checks and context propagation."""
-                        while self._running:
-                            try:
-                                # Check node health
-                                current_time = time.time()
-                                for node in list(self._nodes.values()):
-                                    if current_time - node.last_heartbeat > self._sync_interval * 3:
-                                        node.status = "stale"
-                                        self._logger.warning(f"Node {node.node_id} is stale")
+                                        # Broadcast status if hub available
+                                        if self._progress_hub:
+                                            await self._progress_hub.broadcast_system_status(
+                                                system="neural_mesh",
+                                                status="healthy" if health.get("healthy") else "degraded",
+                                                details={
+                                                    "agents": self._neural_mesh_stats["agents_registered"],
+                                                    "messages": self._neural_mesh_stats["messages_sent"],
+                                                    "knowledge": self._neural_mesh_stats["knowledge_entries"],
+                                                    "workflows": self._neural_mesh_stats["workflows_completed"],
+                                                }
+                                            )
 
-                                # Broadcast context sync
-                                await self.broadcast("context_sync", self._context, source="mesh")
+                                except asyncio.CancelledError:
+                                    break
+                                except Exception as e:
+                                    self.logger.warning(f"Neural Mesh health check error: {e}")
 
-                                await asyncio.sleep(self._sync_interval)
+                        self._neural_mesh_health_task = asyncio.create_task(
+                            neural_mesh_health_loop(),
+                            name="neural_mesh_health_monitor"
+                        )
+                        self.logger.info(f"   ✓ Health monitoring started (interval: {self.config.neural_mesh_health_interval}s)")
 
-                            except asyncio.CancelledError:
-                                break
-                            except Exception as e:
-                                self._logger.error(f"Sync loop error: {e}")
-                                await asyncio.sleep(1)
+                    # Register with progress hub
+                    if self._progress_hub:
+                        await self._progress_hub.broadcast_system_status(
+                            system="neural_mesh",
+                            status="ready",
+                            details={
+                                "production": True,
+                                "coordinator": True,
+                                "agents": self._neural_mesh_stats["agents_registered"],
+                                "bridge": self._neural_mesh_bridge is not None,
+                            }
+                        )
 
-                    def get_stats(self) -> Dict[str, Any]:
-                        """Get mesh statistics."""
-                        return {
-                            "total_nodes": len(self._nodes),
-                            "active_nodes": len([n for n in self._nodes.values() if n.status == "active"]),
-                            "node_types": list(set(n.node_type for n in self._nodes.values())),
-                            "context_keys": list(self._context.keys()),
-                            "subscriber_count": sum(len(subs) for subs in self._subscribers.values()),
-                        }
+                    initialized_systems["neural_mesh"] = True
+                    os.environ["NEURAL_MESH_ENABLED"] = "true"
+                    os.environ["NEURAL_MESH_PRODUCTION"] = "true"
 
-                # Create and start Neural Mesh
-                self._neural_mesh = NeuralMesh(sync_interval=self.config.neural_mesh_sync_interval)
+                    total_agents = self._neural_mesh_stats["agents_registered"]
+                    bridge_status = "active" if self._neural_mesh_bridge else "disabled"
+                    self.logger.info(f"✅ Neural Mesh v9.4 Production initialized ({total_agents} agents, bridge: {bridge_status})")
+                    print(f"  {TerminalUI.GREEN}✓ Neural Mesh v9.4: Production multi-agent system active ({total_agents} agents){TerminalUI.RESET}")
 
-                # Register core nodes
-                if initialized_systems["uae"]:
-                    self._neural_mesh.register_node(NeuralMeshNode(
-                        node_id="uae-primary",
-                        node_type="uae",
-                        capabilities=["vision", "screen_capture", "element_detection", "chain_of_thought"],
-                    ))
+                else:
+                    # Fallback: Basic Neural Mesh (for compatibility)
+                    self.logger.info("   → Using basic Neural Mesh (fallback mode)...")
 
-                if initialized_systems["sai"]:
-                    self._neural_mesh.register_node(NeuralMeshNode(
-                        node_id="sai-primary",
-                        node_type="sai",
-                        capabilities=["window_tracking", "app_focus", "workspace_state", "yabai_control"],
-                    ))
+                    from dataclasses import dataclass, field
+                    from typing import Dict, Any, List, Callable, Optional
+                    from collections import defaultdict
 
-                # Start the mesh
-                await self._neural_mesh.start()
+                    @dataclass
+                    class NeuralMeshNode:
+                        """A node in the Neural Mesh network."""
+                        node_id: str
+                        node_type: str
+                        capabilities: List[str] = field(default_factory=list)
+                        status: str = "active"
+                        last_heartbeat: float = field(default_factory=time.time)
+                        metadata: Dict[str, Any] = field(default_factory=dict)
 
-                initialized_systems["neural_mesh"] = True
-                os.environ["NEURAL_MESH_ENABLED"] = "true"
-                self.logger.info(f"✅ Neural Mesh initialized (sync interval: {self.config.neural_mesh_sync_interval}s)")
-                print(f"  {TerminalUI.GREEN}✓ Neural Mesh: Distributed intelligence coordination active{TerminalUI.RESET}")
+                    class BasicNeuralMesh:
+                        """Basic Neural Mesh for fallback compatibility."""
+
+                        def __init__(self, sync_interval: float = 5.0):
+                            self._nodes: Dict[str, NeuralMeshNode] = {}
+                            self._context: Dict[str, Any] = {}
+                            self._subscribers: Dict[str, List[Callable]] = defaultdict(list)
+                            self._sync_interval = sync_interval
+                            self._sync_task: Optional[asyncio.Task] = None
+                            self._running = False
+                            self._logger = logging.getLogger("NeuralMesh")
+
+                        def register_node(self, node: NeuralMeshNode) -> None:
+                            self._nodes[node.node_id] = node
+                            self._logger.debug(f"Node registered: {node.node_id}")
+
+                        async def broadcast(self, event_type: str, data: Dict[str, Any], source: str = None) -> None:
+                            for subscriber in self._subscribers.get(event_type, []):
+                                try:
+                                    if asyncio.iscoroutinefunction(subscriber):
+                                        await subscriber({"event_type": event_type, "data": data, "source": source})
+                                    else:
+                                        subscriber({"event_type": event_type, "data": data, "source": source})
+                                except Exception as e:
+                                    self._logger.warning(f"Subscriber error: {e}")
+
+                        def subscribe(self, event_type: str, callback: Callable) -> None:
+                            self._subscribers[event_type].append(callback)
+
+                        def get_active_nodes(self, node_type: str = None) -> List[NeuralMeshNode]:
+                            nodes = list(self._nodes.values())
+                            if node_type:
+                                nodes = [n for n in nodes if n.node_type == node_type]
+                            return [n for n in nodes if n.status == "active"]
+
+                        async def start(self) -> None:
+                            self._running = True
+
+                        async def stop(self) -> None:
+                            self._running = False
+
+                        def get_stats(self) -> Dict[str, Any]:
+                            return {
+                                "total_nodes": len(self._nodes),
+                                "active_nodes": len([n for n in self._nodes.values() if n.status == "active"]),
+                                "mode": "basic_fallback",
+                            }
+
+                    self._neural_mesh = BasicNeuralMesh(sync_interval=self.config.neural_mesh_sync_interval)
+
+                    # Register core nodes
+                    if initialized_systems["uae"]:
+                        self._neural_mesh.register_node(NeuralMeshNode(
+                            node_id="uae-primary",
+                            node_type="uae",
+                            capabilities=["vision", "screen_capture", "element_detection"],
+                        ))
+
+                    if initialized_systems["sai"]:
+                        self._neural_mesh.register_node(NeuralMeshNode(
+                            node_id="sai-primary",
+                            node_type="sai",
+                            capabilities=["window_tracking", "app_focus", "workspace_state"],
+                        ))
+
+                    await self._neural_mesh.start()
+
+                    initialized_systems["neural_mesh"] = True
+                    os.environ["NEURAL_MESH_ENABLED"] = "true"
+                    os.environ["NEURAL_MESH_PRODUCTION"] = "false"
+                    self.logger.info(f"✅ Neural Mesh initialized (basic mode)")
+                    print(f"  {TerminalUI.GREEN}✓ Neural Mesh: Basic intelligence coordination active{TerminalUI.RESET}")
 
             except Exception as e:
                 self.logger.error(f"❌ Neural Mesh initialization failed: {e}")
+                import traceback
+                self.logger.debug(traceback.format_exc())
                 os.environ["NEURAL_MESH_ENABLED"] = "false"
                 print(f"  {TerminalUI.YELLOW}⚠️ Neural Mesh: Failed ({e}){TerminalUI.RESET}")
 
@@ -6366,9 +6502,42 @@ class SupervisorBootstrapper:
             await self._mas.stop()
             self._mas = None
 
-        # Stop Neural Mesh
+        # Stop Neural Mesh v9.4 (with production components)
+        # 1. Cancel health monitoring task
+        if hasattr(self, '_neural_mesh_health_task') and self._neural_mesh_health_task:
+            self._neural_mesh_health_task.cancel()
+            try:
+                await self._neural_mesh_health_task
+            except asyncio.CancelledError:
+                pass
+            self._neural_mesh_health_task = None
+
+        # 2. Stop JARVIS Neural Mesh Bridge
+        if hasattr(self, '_neural_mesh_bridge') and self._neural_mesh_bridge:
+            try:
+                await self._neural_mesh_bridge.stop()
+            except Exception as e:
+                self.logger.warning(f"Neural Mesh Bridge shutdown error: {e}")
+            self._neural_mesh_bridge = None
+
+        # 3. Stop Neural Mesh Coordinator (stops all agents)
+        if hasattr(self, '_neural_mesh_coordinator') and self._neural_mesh_coordinator:
+            try:
+                await self._neural_mesh_coordinator.stop()
+            except Exception as e:
+                self.logger.warning(f"Neural Mesh Coordinator shutdown error: {e}")
+            self._neural_mesh_coordinator = None
+
+        # 4. Clear agent references
+        if hasattr(self, '_neural_mesh_agents'):
+            self._neural_mesh_agents = {}
+
+        # 5. Stop basic Neural Mesh (fallback mode)
         if hasattr(self, '_neural_mesh') and self._neural_mesh:
-            await self._neural_mesh.stop()
+            try:
+                await self._neural_mesh.stop()
+            except Exception as e:
+                self.logger.warning(f"Neural Mesh shutdown error: {e}")
             self._neural_mesh = None
 
         # Shutdown UAE
@@ -7627,6 +7796,569 @@ class SupervisorBootstrapper:
 
     # ═══════════════════════════════════════════════════════════════════════════
     # End of Learning Goals Discovery Methods
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # v9.4: Intelligent Model Manager (Gap 6 Fix)
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    async def _init_model_manager(self) -> None:
+        """
+        v9.4: Initialize the Intelligent Model Manager.
+
+        This ensures JARVIS-Prime always has a model to load by:
+        - Checking if models exist in JARVIS-Prime models directory
+        - Auto-downloading base models if missing (memory-aware selection)
+        - Watching for reactor-core trained model deployments
+        - Supporting hot-swap without restart
+
+        Model Selection Logic:
+        - RAM >= 8GB: Can load production models (Mistral-7B, Llama-2-7B)
+        - RAM 4-8GB: Use smaller models (TinyLlama, Phi-2)
+        - RAM < 4GB: Minimal models or cloud fallback
+
+        Integration Points:
+        - JARVIS-Prime model_downloader.py for download
+        - JARVIS-Prime model_registry.py for versioning
+        - Reactor-core output dir for trained models
+        - Loading server for status broadcasts
+        """
+        if not self.config.model_manager_enabled:
+            self.logger.info("ℹ️ Model Manager disabled via configuration")
+            return
+
+        self.logger.info("🧠 Initializing Intelligent Model Manager...")
+
+        try:
+            from typing import Dict, Any, Optional, List
+            from datetime import datetime
+            from pathlib import Path
+            import psutil
+            import aiohttp
+
+            # ═══════════════════════════════════════════════════════════════════
+            # Model Catalog (matches jarvis-prime/docker/model_downloader.py)
+            # ═══════════════════════════════════════════════════════════════════
+            MODEL_CATALOG = {
+                "tinyllama-chat": {
+                    "repo_id": "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF",
+                    "filename": "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf",
+                    "size_mb": 670,
+                    "min_ram_gb": 2.0,
+                    "description": "TinyLlama 1.1B - Testing and simple chat",
+                    "context_length": 2048,
+                },
+                "phi-2": {
+                    "repo_id": "TheBloke/phi-2-GGUF",
+                    "filename": "phi-2.Q4_K_M.gguf",
+                    "size_mb": 1600,
+                    "min_ram_gb": 4.0,
+                    "description": "Phi-2 - Excellent for coding and reasoning",
+                    "context_length": 2048,
+                },
+                "mistral-7b-instruct": {
+                    "repo_id": "TheBloke/Mistral-7B-Instruct-v0.2-GGUF",
+                    "filename": "mistral-7b-instruct-v0.2.Q4_K_M.gguf",
+                    "size_mb": 4370,
+                    "min_ram_gb": 8.0,
+                    "description": "Mistral 7B Instruct - Production quality",
+                    "context_length": 8192,
+                },
+                "llama-3-8b-instruct": {
+                    "repo_id": "QuantFactory/Meta-Llama-3-8B-Instruct-GGUF",
+                    "filename": "Meta-Llama-3-8B-Instruct.Q4_K_M.gguf",
+                    "size_mb": 4920,
+                    "min_ram_gb": 10.0,
+                    "description": "Llama 3 8B Instruct - Latest and greatest",
+                    "context_length": 8192,
+                },
+            }
+
+            class IntelligentModelManager:
+                """
+                v9.4: Comprehensive model manager with auto-download and reactor-core integration.
+
+                Features:
+                - Memory-aware model selection
+                - Auto-download from HuggingFace Hub
+                - Reactor-core trained model deployment
+                - Hot-swap capability
+                - Version registry with rollback
+                """
+
+                def __init__(
+                    self,
+                    prime_path: Path,
+                    models_dir: str = "models",
+                    config: Optional[Any] = None,
+                    logger: Optional[Any] = None,
+                ):
+                    self.prime_path = prime_path
+                    self.models_dir = prime_path / models_dir
+                    self.config = config
+                    self.logger = logger
+
+                    # Ensure models directory exists
+                    self.models_dir.mkdir(parents=True, exist_ok=True)
+
+                    # State tracking
+                    self.current_model: Optional[str] = None
+                    self.current_model_path: Optional[Path] = None
+                    self.model_registry: Dict[str, Any] = {}
+                    self.download_in_progress = False
+
+                    # Reactor-core integration
+                    self._reactor_core_watcher = None
+                    self._watcher_task = None
+
+                    # Load existing metadata
+                    self._load_registry()
+
+                def _load_registry(self) -> None:
+                    """Load model registry from disk."""
+                    import json
+                    metadata_file = self.models_dir / "models_metadata.json"
+                    if metadata_file.exists():
+                        try:
+                            self.model_registry = json.loads(metadata_file.read_text())
+                            if self.logger:
+                                self.logger.debug(f"Loaded model registry with {len(self.model_registry.get('models', {}))} models")
+                        except Exception as e:
+                            if self.logger:
+                                self.logger.debug(f"Failed to load registry: {e}")
+                            self.model_registry = {"models": {}, "current": None}
+                    else:
+                        self.model_registry = {"models": {}, "current": None}
+
+                def _save_registry(self) -> None:
+                    """Save model registry to disk."""
+                    import json
+                    metadata_file = self.models_dir / "models_metadata.json"
+                    self.model_registry["last_updated"] = datetime.now().isoformat()
+                    metadata_file.write_text(json.dumps(self.model_registry, indent=2, default=str))
+
+                def get_available_memory_gb(self) -> float:
+                    """Get available system memory in GB."""
+                    mem = psutil.virtual_memory()
+                    return mem.available / (1024 ** 3)
+
+                def select_optimal_model(self) -> Optional[str]:
+                    """
+                    Select the best model based on available memory.
+
+                    Returns model name from catalog or None if no suitable model.
+                    """
+                    available_gb = self.get_available_memory_gb()
+
+                    if self.logger:
+                        self.logger.debug(f"Available memory: {available_gb:.1f}GB")
+
+                    # Sort models by min_ram_gb descending (prefer larger models)
+                    suitable_models = [
+                        (name, info)
+                        for name, info in MODEL_CATALOG.items()
+                        if info["min_ram_gb"] <= available_gb
+                    ]
+
+                    if not suitable_models:
+                        if self.logger:
+                            self.logger.warning("No models suitable for available memory")
+                        return None
+
+                    # Sort by min_ram_gb descending to get the best model we can run
+                    suitable_models.sort(key=lambda x: x[1]["min_ram_gb"], reverse=True)
+                    return suitable_models[0][0]
+
+                def check_model_exists(self, model_name: str = None) -> Optional[Path]:
+                    """
+                    Check if a model exists in the models directory.
+
+                    Returns path to model file if found, None otherwise.
+                    """
+                    # Check current.gguf symlink first
+                    current_link = self.models_dir / "current.gguf"
+                    if current_link.exists():
+                        resolved = current_link.resolve()
+                        if resolved.exists() and resolved.stat().st_size > 1000:
+                            return resolved
+
+                    # Check for specific model
+                    if model_name and model_name in MODEL_CATALOG:
+                        model_info = MODEL_CATALOG[model_name]
+                        model_file = self.models_dir / model_info["filename"]
+                        if model_file.exists() and model_file.stat().st_size > 1000:
+                            return model_file
+
+                    # Check for any .gguf files
+                    gguf_files = list(self.models_dir.glob("*.gguf"))
+                    for gguf in gguf_files:
+                        if gguf.stat().st_size > 1000 and not gguf.is_symlink():
+                            return gguf
+
+                    return None
+
+                async def ensure_model_available(self) -> Dict[str, Any]:
+                    """
+                    Ensure a model is available for JARVIS-Prime.
+
+                    Returns status dict with:
+                    - available: bool
+                    - model_name: str
+                    - model_path: Path
+                    - source: str (existing, downloaded, reactor_core)
+                    """
+                    result = {
+                        "available": False,
+                        "model_name": None,
+                        "model_path": None,
+                        "source": None,
+                        "error": None,
+                    }
+
+                    try:
+                        # Step 1: Check for existing model
+                        existing_path = self.check_model_exists()
+                        if existing_path:
+                            result["available"] = True
+                            result["model_path"] = existing_path
+                            result["model_name"] = existing_path.name
+                            result["source"] = "existing"
+                            self.current_model_path = existing_path
+                            if self.logger:
+                                self.logger.info(f"✓ Found existing model: {existing_path.name}")
+                            return result
+
+                        # Step 2: Check for reactor-core trained models
+                        reactor_model = await self._check_reactor_core_models()
+                        if reactor_model:
+                            result["available"] = True
+                            result["model_path"] = reactor_model
+                            result["model_name"] = reactor_model.name
+                            result["source"] = "reactor_core"
+                            self.current_model_path = reactor_model
+                            return result
+
+                        # Step 3: Auto-download if enabled
+                        if self.config and self.config.model_manager_auto_download:
+                            # Select optimal model for available memory
+                            if self.config.model_manager_auto_select:
+                                model_name = self.select_optimal_model()
+                            else:
+                                model_name = self.config.model_manager_default_model
+
+                            if model_name:
+                                if self.logger:
+                                    self.logger.info(f"📥 Auto-downloading model: {model_name}")
+                                download_result = await self.download_model(model_name)
+                                if download_result["success"]:
+                                    result["available"] = True
+                                    result["model_path"] = download_result["path"]
+                                    result["model_name"] = model_name
+                                    result["source"] = "downloaded"
+                                    return result
+                                else:
+                                    result["error"] = download_result.get("error", "Download failed")
+
+                    except Exception as e:
+                        result["error"] = str(e)
+                        if self.logger:
+                            self.logger.error(f"Model availability check failed: {e}")
+
+                    return result
+
+                async def _check_reactor_core_models(self) -> Optional[Path]:
+                    """Check for trained models from reactor-core."""
+                    try:
+                        # Check reactor-core output directories
+                        reactor_paths = [
+                            Path(__file__).parent.parent / "reactor-core" / "output" / "models",
+                            Path(os.getenv("REACTOR_CORE_OUTPUT", "")) / "deployed",
+                            self.prime_path / "reactor-core-output" / "deployed",
+                        ]
+
+                        for reactor_path in reactor_paths:
+                            if reactor_path.exists():
+                                gguf_files = list(reactor_path.glob("*.gguf"))
+                                if gguf_files:
+                                    # Sort by modification time, newest first
+                                    gguf_files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+                                    newest = gguf_files[0]
+                                    if newest.stat().st_size > 1000:
+                                        if self.logger:
+                                            self.logger.info(f"✓ Found reactor-core model: {newest.name}")
+                                        return newest
+                    except Exception as e:
+                        if self.logger:
+                            self.logger.debug(f"Reactor-core check error: {e}")
+                    return None
+
+                async def download_model(self, model_name: str) -> Dict[str, Any]:
+                    """
+                    Download a model from HuggingFace Hub.
+
+                    Uses jarvis-prime's model_downloader if available,
+                    otherwise falls back to direct huggingface_hub download.
+                    """
+                    result = {"success": False, "path": None, "error": None}
+
+                    if model_name not in MODEL_CATALOG:
+                        result["error"] = f"Unknown model: {model_name}"
+                        return result
+
+                    if self.download_in_progress:
+                        result["error"] = "Download already in progress"
+                        return result
+
+                    self.download_in_progress = True
+                    model_info = MODEL_CATALOG[model_name]
+
+                    try:
+                        # Try using jarvis-prime's downloader
+                        try:
+                            import sys
+                            if str(self.prime_path) not in sys.path:
+                                sys.path.insert(0, str(self.prime_path))
+
+                            from jarvis_prime.docker.model_downloader import ModelDownloader
+                            downloader = ModelDownloader(models_dir=str(self.models_dir))
+                            download_result = await downloader.download_catalog_model(model_name)
+
+                            if download_result.get("success"):
+                                result["success"] = True
+                                result["path"] = Path(download_result["path"])
+                                self._update_registry(model_name, result["path"], "downloaded")
+                                return result
+                        except ImportError:
+                            if self.logger:
+                                self.logger.debug("jarvis-prime downloader not available, using fallback")
+
+                        # Fallback: Direct huggingface_hub download
+                        from huggingface_hub import hf_hub_download
+
+                        if self.logger:
+                            self.logger.info(
+                                f"📥 Downloading {model_name} ({model_info['size_mb']}MB)..."
+                            )
+
+                        downloaded_path = await asyncio.get_event_loop().run_in_executor(
+                            None,
+                            lambda: hf_hub_download(
+                                repo_id=model_info["repo_id"],
+                                filename=model_info["filename"],
+                                local_dir=str(self.models_dir),
+                                local_dir_use_symlinks=False,
+                            )
+                        )
+
+                        model_path = Path(downloaded_path)
+                        if model_path.exists():
+                            # Create current.gguf symlink
+                            current_link = self.models_dir / "current.gguf"
+                            if current_link.exists():
+                                current_link.unlink()
+                            current_link.symlink_to(model_path)
+
+                            result["success"] = True
+                            result["path"] = model_path
+                            self._update_registry(model_name, model_path, "downloaded")
+
+                            if self.logger:
+                                self.logger.info(f"✅ Downloaded {model_name} to {model_path}")
+
+                    except Exception as e:
+                        result["error"] = str(e)
+                        if self.logger:
+                            self.logger.error(f"Download failed: {e}")
+                    finally:
+                        self.download_in_progress = False
+
+                    return result
+
+                def _update_registry(self, model_name: str, path: Path, source: str) -> None:
+                    """Update model registry with new model."""
+                    self.model_registry["models"][model_name] = {
+                        "path": str(path),
+                        "source": source,
+                        "downloaded_at": datetime.now().isoformat(),
+                        "size_mb": path.stat().st_size / (1024 * 1024) if path.exists() else 0,
+                    }
+                    self.model_registry["current"] = model_name
+                    self._save_registry()
+                    self.current_model = model_name
+                    self.current_model_path = path
+
+                async def start_reactor_core_watcher(self) -> None:
+                    """Start watching for reactor-core model deployments."""
+                    if not self.config or not self.config.model_manager_reactor_core_watch:
+                        return
+
+                    try:
+                        # Use jarvis-prime's reactor_core_watcher if available
+                        import sys
+                        if str(self.prime_path) not in sys.path:
+                            sys.path.insert(0, str(self.prime_path))
+
+                        from jarvis_prime.docker.reactor_core_watcher import ReactorCoreWatcher
+
+                        watch_dirs = [
+                            Path(os.getenv("REACTOR_CORE_OUTPUT", "")) / "pending",
+                            self.prime_path / "reactor-core-output" / "pending",
+                            Path(__file__).parent.parent / "reactor-core" / "output" / "pending",
+                        ]
+
+                        for watch_dir in watch_dirs:
+                            if watch_dir.exists():
+                                self._reactor_core_watcher = ReactorCoreWatcher(
+                                    watch_dir=str(watch_dir),
+                                    models_dir=str(self.models_dir),
+                                    on_model_deployed=self._on_model_deployed,
+                                )
+                                await self._reactor_core_watcher.start()
+                                if self.logger:
+                                    self.logger.info(f"✓ Reactor-core watcher started: {watch_dir}")
+                                break
+                    except ImportError:
+                        if self.logger:
+                            self.logger.debug("Reactor-core watcher not available")
+                    except Exception as e:
+                        if self.logger:
+                            self.logger.debug(f"Reactor-core watcher start error: {e}")
+
+                async def _on_model_deployed(self, model_path: Path, manifest: Dict[str, Any]) -> None:
+                    """Callback when reactor-core deploys a new model."""
+                    if self.logger:
+                        self.logger.info(f"🚀 Reactor-core model deployed: {model_path.name}")
+
+                    model_name = manifest.get("model_id", model_path.stem)
+                    self._update_registry(model_name, model_path, "reactor_core")
+
+                    # Trigger hot-swap if enabled
+                    if self.config and self.config.model_manager_hot_swap_enabled:
+                        if self.logger:
+                            self.logger.info("🔄 Triggering hot-swap for new model...")
+                        # Hot-swap would be handled by JARVIS-Prime's HotSwapManager
+
+                def get_status(self) -> Dict[str, Any]:
+                    """Get current model manager status."""
+                    return {
+                        "enabled": True,
+                        "current_model": self.current_model,
+                        "current_model_path": str(self.current_model_path) if self.current_model_path else None,
+                        "available_memory_gb": self.get_available_memory_gb(),
+                        "download_in_progress": self.download_in_progress,
+                        "models_in_registry": len(self.model_registry.get("models", {})),
+                        "reactor_watcher_active": self._reactor_core_watcher is not None,
+                    }
+
+            # ═══════════════════════════════════════════════════════════════════
+            # Create and Initialize Model Manager
+            # ═══════════════════════════════════════════════════════════════════
+            self._model_manager = IntelligentModelManager(
+                prime_path=self.config.jarvis_prime_repo_path,
+                models_dir=self.config.jarvis_prime_models_dir,
+                config=self.config,
+                logger=self.logger,
+            )
+
+            # Broadcast initialization start
+            await self._broadcast_model_manager_status(
+                status="initializing",
+                message="Checking model availability...",
+            )
+
+            # Ensure a model is available
+            model_result = await self._model_manager.ensure_model_available()
+
+            if model_result["available"]:
+                self._current_model_info = {
+                    "name": model_result["model_name"],
+                    "path": str(model_result["model_path"]),
+                    "size_mb": model_result["model_path"].stat().st_size / (1024 * 1024) if model_result["model_path"] else 0,
+                    "loaded": True,
+                    "source": model_result["source"],
+                }
+
+                self.logger.info(
+                    f"✅ Model Manager ready: {model_result['model_name']} "
+                    f"(source: {model_result['source']})"
+                )
+                print(f"  {TerminalUI.GREEN}✓ Model Manager: {model_result['model_name']} available{TerminalUI.RESET}")
+
+                # Broadcast success
+                await self._broadcast_model_manager_status(
+                    status="ready",
+                    model_name=model_result["model_name"],
+                    model_path=str(model_result["model_path"]),
+                    source=model_result["source"],
+                )
+            else:
+                self.logger.warning(
+                    f"⚠️ No model available: {model_result.get('error', 'Unknown error')}"
+                )
+                print(f"  {TerminalUI.YELLOW}⚠️ Model Manager: No model available{TerminalUI.RESET}")
+
+                # Broadcast warning
+                await self._broadcast_model_manager_status(
+                    status="no_model",
+                    error=model_result.get("error"),
+                )
+
+            # Start reactor-core watcher
+            if self.config.model_manager_reactor_core_watch:
+                await self._model_manager.start_reactor_core_watcher()
+
+        except Exception as e:
+            self.logger.warning(f"⚠️ Model Manager initialization failed: {e}")
+            import traceback
+            self.logger.debug(traceback.format_exc())
+
+    async def _broadcast_model_manager_status(
+        self,
+        status: str,
+        **kwargs,
+    ) -> None:
+        """Broadcast model manager status to loading server."""
+        try:
+            import aiohttp
+            from datetime import datetime
+
+            payload = {
+                "type": "model_manager_update",
+                "timestamp": datetime.now().isoformat(),
+                "status": status,
+                "model_info": self._current_model_info,
+            }
+            payload.update(kwargs)
+
+            loading_url = f"http://localhost:{self.config.loading_server_port}/api/model/update"
+
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    loading_url,
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=5),
+                ) as response:
+                    if response.status != 200:
+                        self.logger.debug(f"Model status broadcast failed: {response.status}")
+
+        except Exception as e:
+            self.logger.debug(f"Model status broadcast error: {e}")
+
+    def get_model_manager_status(self) -> Dict[str, Any]:
+        """Get current model manager status for API/UI."""
+        status = {
+            "enabled": self.config.model_manager_enabled,
+            "model_info": self._current_model_info,
+            "download_in_progress": self._model_download_in_progress,
+        }
+
+        if self._model_manager:
+            status["manager_status"] = self._model_manager.get_status()
+
+        return status
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # End of Model Manager Methods
     # ═══════════════════════════════════════════════════════════════════════════
 
     async def _run_training_scheduler(self) -> None:

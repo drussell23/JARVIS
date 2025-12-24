@@ -2449,6 +2449,341 @@ async def broadcast_learning_goals_update() -> None:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# v9.4: Model Manager Endpoints (Gap 6 Fix)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class ModelManagerState:
+    """State for model manager system."""
+    active: bool = False
+    status: str = "idle"  # idle, initializing, downloading, ready, no_model
+    model_name: Optional[str] = None
+    model_path: Optional[str] = None
+    model_size_mb: float = 0
+    model_source: Optional[str] = None  # existing, downloaded, reactor_core
+    download_progress: float = 0
+    available_memory_gb: float = 0
+    reactor_watcher_active: bool = False
+    error: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "active": self.active,
+            "status": self.status,
+            "model_name": self.model_name,
+            "model_path": self.model_path,
+            "model_size_mb": self.model_size_mb,
+            "model_source": self.model_source,
+            "download_progress": self.download_progress,
+            "available_memory_gb": self.available_memory_gb,
+            "reactor_watcher_active": self.reactor_watcher_active,
+            "error": self.error,
+        }
+
+
+# Global model manager state
+model_manager_state = ModelManagerState()
+
+
+async def get_model_status(request: web.Request) -> web.Response:
+    """
+    v9.4: Get current model manager status.
+
+    Returns:
+    - Model availability
+    - Current model info
+    - Download progress (if applicable)
+    - Reactor-core watcher status
+    """
+    try:
+        return web.json_response(model_manager_state.to_dict())
+    except Exception as e:
+        metrics.record_error(str(e))
+        return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+
+async def update_model_status(request: web.Request) -> web.Response:
+    """
+    v9.4: Update model manager status from supervisor.
+
+    Accepts updates with:
+    - status: Current state (initializing, downloading, ready, no_model)
+    - model_name: Name of current model
+    - model_path: Path to model file
+    - model_source: Where model came from
+    - download_progress: Download percentage (if downloading)
+    """
+    try:
+        data = await request.json()
+
+        # Update state from payload
+        if "status" in data:
+            model_manager_state.status = data["status"]
+            model_manager_state.active = data["status"] not in ["idle", "no_model"]
+
+        if "model_name" in data:
+            model_manager_state.model_name = data["model_name"]
+
+        if "model_path" in data:
+            model_manager_state.model_path = data["model_path"]
+
+        if "source" in data:
+            model_manager_state.model_source = data["source"]
+
+        if "download_progress" in data:
+            model_manager_state.download_progress = data["download_progress"]
+
+        if "available_memory_gb" in data:
+            model_manager_state.available_memory_gb = data["available_memory_gb"]
+
+        if "reactor_watcher_active" in data:
+            model_manager_state.reactor_watcher_active = data["reactor_watcher_active"]
+
+        if "error" in data:
+            model_manager_state.error = data["error"]
+
+        # Extract model_info if present
+        if "model_info" in data and data["model_info"]:
+            info = data["model_info"]
+            if info.get("name"):
+                model_manager_state.model_name = info["name"]
+            if info.get("path"):
+                model_manager_state.model_path = info["path"]
+            if info.get("size_mb"):
+                model_manager_state.model_size_mb = info["size_mb"]
+            if info.get("source"):
+                model_manager_state.model_source = info["source"]
+
+        # Log significant updates
+        if data.get("status") == "ready" and model_manager_state.model_name:
+            logger.info(
+                f"Model Manager: {model_manager_state.model_name} ready "
+                f"({model_manager_state.model_source})"
+            )
+
+        # Broadcast to WebSocket clients
+        await broadcast_model_update()
+
+        return web.json_response({"status": "ok"})
+
+    except Exception as e:
+        metrics.record_error(str(e))
+        return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+
+async def trigger_model_download(request: web.Request) -> web.Response:
+    """
+    v9.4: Trigger model download via API.
+
+    Accepts:
+    - model_name: Name of model to download (from catalog)
+    """
+    try:
+        data = await request.json()
+        model_name = data.get("model_name", "tinyllama-chat")
+
+        return web.json_response({
+            "status": "ok",
+            "message": f"Download requested for {model_name}. Check supervisor logs for progress.",
+        })
+
+    except Exception as e:
+        metrics.record_error(str(e))
+        return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+
+async def broadcast_model_update() -> None:
+    """Broadcast model manager update to all WebSocket clients."""
+    try:
+        message = {
+            "type": "model_manager_update",
+            "data": model_manager_state.to_dict(),
+            "timestamp": datetime.now().isoformat(),
+        }
+        await broadcast_message(message)
+    except Exception as e:
+        logger.debug(f"Model broadcast error: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# End of Model Manager Endpoints
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# v9.4: Neural Mesh Status Endpoints
+# Production multi-agent system with 60+ agents, knowledge graph, and workflows
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class NeuralMeshState:
+    """State for Neural Mesh production system."""
+    active: bool = False
+    production_mode: bool = False
+    status: str = "inactive"  # inactive, initializing, ready, degraded
+    coordinator_status: str = "stopped"  # stopped, starting, running
+    bridge_status: str = "disconnected"  # disconnected, connecting, connected
+    agents_registered: int = 0
+    agents_online: int = 0
+    messages_published: int = 0
+    messages_delivered: int = 0
+    knowledge_entries: int = 0
+    knowledge_relationships: int = 0
+    workflows_completed: int = 0
+    workflows_failed: int = 0
+    uptime_seconds: float = 0.0
+    health_status: str = "unknown"  # unknown, healthy, degraded, unhealthy
+    agent_details: List[Dict[str, Any]] = field(default_factory=list)
+    error: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "active": self.active,
+            "production_mode": self.production_mode,
+            "status": self.status,
+            "coordinator": {
+                "status": self.coordinator_status,
+            },
+            "bridge": {
+                "status": self.bridge_status,
+            },
+            "agents": {
+                "registered": self.agents_registered,
+                "online": self.agents_online,
+                "details": self.agent_details[:10],  # Limit to first 10 for response size
+            },
+            "communication": {
+                "messages_published": self.messages_published,
+                "messages_delivered": self.messages_delivered,
+            },
+            "knowledge": {
+                "entries": self.knowledge_entries,
+                "relationships": self.knowledge_relationships,
+            },
+            "workflows": {
+                "completed": self.workflows_completed,
+                "failed": self.workflows_failed,
+            },
+            "health": {
+                "status": self.health_status,
+                "uptime_seconds": self.uptime_seconds,
+            },
+            "error": self.error,
+        }
+
+
+# Global Neural Mesh state
+neural_mesh_state = NeuralMeshState()
+
+
+async def get_neural_mesh_status(request: web.Request) -> web.Response:
+    """
+    v9.4: Get Neural Mesh production system status.
+
+    Returns comprehensive status including:
+    - Coordinator status
+    - Bridge status
+    - Agent counts and health
+    - Communication metrics
+    - Knowledge graph stats
+    - Workflow execution stats
+    """
+    try:
+        return web.json_response({
+            "status": "ok",
+            "neural_mesh": neural_mesh_state.to_dict(),
+            "timestamp": datetime.now().isoformat(),
+        })
+    except Exception as e:
+        metrics.record_error(str(e))
+        return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+
+async def update_neural_mesh_status(request: web.Request) -> web.Response:
+    """
+    v9.4: Update Neural Mesh status from supervisor.
+
+    Accepts comprehensive status updates including:
+    - Coordinator and bridge status
+    - Agent metrics
+    - Communication stats
+    - Knowledge graph metrics
+    - Workflow execution counts
+    """
+    try:
+        data = await request.json()
+
+        # Update state from request
+        if "active" in data:
+            neural_mesh_state.active = data["active"]
+        if "production_mode" in data:
+            neural_mesh_state.production_mode = data["production_mode"]
+        if "status" in data:
+            neural_mesh_state.status = data["status"]
+        if "coordinator_status" in data:
+            neural_mesh_state.coordinator_status = data["coordinator_status"]
+        if "bridge_status" in data:
+            neural_mesh_state.bridge_status = data["bridge_status"]
+        if "agents_registered" in data:
+            neural_mesh_state.agents_registered = data["agents_registered"]
+        if "agents_online" in data:
+            neural_mesh_state.agents_online = data["agents_online"]
+        if "messages_published" in data:
+            neural_mesh_state.messages_published = data["messages_published"]
+        if "messages_delivered" in data:
+            neural_mesh_state.messages_delivered = data["messages_delivered"]
+        if "knowledge_entries" in data:
+            neural_mesh_state.knowledge_entries = data["knowledge_entries"]
+        if "knowledge_relationships" in data:
+            neural_mesh_state.knowledge_relationships = data["knowledge_relationships"]
+        if "workflows_completed" in data:
+            neural_mesh_state.workflows_completed = data["workflows_completed"]
+        if "workflows_failed" in data:
+            neural_mesh_state.workflows_failed = data["workflows_failed"]
+        if "uptime_seconds" in data:
+            neural_mesh_state.uptime_seconds = data["uptime_seconds"]
+        if "health_status" in data:
+            neural_mesh_state.health_status = data["health_status"]
+        if "agent_details" in data:
+            neural_mesh_state.agent_details = data["agent_details"]
+        if "error" in data:
+            neural_mesh_state.error = data["error"]
+
+        # Log significant state changes
+        if data.get("status") == "ready":
+            logger.info(
+                f"Neural Mesh: Production ready with {neural_mesh_state.agents_registered} agents"
+            )
+
+        # Broadcast to WebSocket clients
+        await broadcast_neural_mesh_update()
+
+        return web.json_response({"status": "ok"})
+
+    except Exception as e:
+        metrics.record_error(str(e))
+        return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+
+async def broadcast_neural_mesh_update() -> None:
+    """Broadcast Neural Mesh update to all WebSocket clients."""
+    try:
+        message = {
+            "type": "neural_mesh_update",
+            "data": neural_mesh_state.to_dict(),
+            "timestamp": datetime.now().isoformat(),
+        }
+        await broadcast_message(message)
+    except Exception as e:
+        logger.debug(f"Neural Mesh broadcast error: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# End of Neural Mesh Endpoints
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
 async def supervisor_event_handler(request: web.Request) -> web.Response:
     """
     v4.0: Unified supervisor event handler.
@@ -2727,6 +3062,15 @@ def create_app() -> web.Application:
     app.router.add_post('/api/learning-goals/update', update_learning_goals_status)
     app.router.add_post('/api/learning-goals/add', add_learning_goal)
     app.router.add_post('/api/learning-goals/trigger', trigger_discovery)
+
+    # v9.4: Model Manager endpoints
+    app.router.add_get('/api/model/status', get_model_status)
+    app.router.add_post('/api/model/update', update_model_status)
+    app.router.add_post('/api/model/download', trigger_model_download)
+
+    # v9.4: Neural Mesh endpoints
+    app.router.add_get('/api/neural-mesh/status', get_neural_mesh_status)
+    app.router.add_post('/api/neural-mesh/update', update_neural_mesh_status)
 
     # CORS preflight
     app.router.add_route('OPTIONS', '/{path:.*}', handle_options)

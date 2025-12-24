@@ -138,6 +138,23 @@ class AgenticRunnerConfig:
         default_factory=lambda: os.getenv("JARVIS_NM_AGI_EVENTS", "true").lower() == "true"
     )
 
+    # v9.4: Neural Mesh Production Integration
+    neural_mesh_production: bool = field(
+        default_factory=lambda: os.getenv("JARVIS_NM_PRODUCTION", "true").lower() == "true"
+    )
+    neural_mesh_workflow_execution: bool = field(
+        default_factory=lambda: os.getenv("JARVIS_NM_WORKFLOW_EXECUTION", "true").lower() == "true"
+    )
+    neural_mesh_knowledge_contribute: bool = field(
+        default_factory=lambda: os.getenv("JARVIS_NM_KNOWLEDGE_CONTRIBUTE", "true").lower() == "true"
+    )
+    neural_mesh_agent_delegation: bool = field(
+        default_factory=lambda: os.getenv("JARVIS_NM_AGENT_DELEGATION", "true").lower() == "true"
+    )
+    neural_mesh_use_bridge: bool = field(
+        default_factory=lambda: os.getenv("JARVIS_NM_USE_BRIDGE", "true").lower() == "true"
+    )
+
     # Autonomy Components Integration (v6.0)
     phase_manager_enabled: bool = field(
         default_factory=lambda: os.getenv("JARVIS_PHASE_MANAGER_ENABLED", "true").lower() == "true"
@@ -399,6 +416,14 @@ class AgenticTaskRunner:
         self._nm_pattern_subscription_active: bool = False
         self._nm_agi_subscription_active: bool = False
 
+        # v9.4: Neural Mesh Production Integration state
+        self._neural_mesh_coordinator = None  # Production coordinator
+        self._neural_mesh_bridge = None  # JARVIS bridge for cross-system tasks
+        self._nm_production_active: bool = False
+        self._nm_workflows_executed: int = 0
+        self._nm_agents_delegated: int = 0
+        self._nm_knowledge_entries_added: int = 0
+
         # Autonomy Components Integration state (v6.0)
         self._phase_execution_active: bool = False
         self._current_phase: Optional[str] = None
@@ -489,13 +514,63 @@ class AgenticTaskRunner:
             # Initialize Neural Mesh (optional)
             if self._availability.get("neural_mesh") and self.config.neural_mesh_enabled:
                 try:
-                    from neural_mesh.neural_mesh_coordinator import start_neural_mesh
-                    self._neural_mesh = await start_neural_mesh()
-                    self.logger.info("[AgenticRunner] ✓ Neural Mesh")
+                    # v9.4: Try production Neural Mesh first (with coordinator and bridge)
+                    if self.config.neural_mesh_production:
+                        try:
+                            from neural_mesh.neural_mesh_coordinator import (
+                                get_neural_mesh,
+                                start_neural_mesh,
+                                NeuralMeshCoordinator,
+                            )
+                            from neural_mesh.jarvis_bridge import (
+                                get_jarvis_bridge,
+                                start_jarvis_neural_mesh,
+                                JARVISNeuralMeshBridge,
+                            )
+
+                            # Get or start coordinator
+                            self._neural_mesh_coordinator = await get_neural_mesh()
+                            if not self._neural_mesh_coordinator._running:
+                                await self._neural_mesh_coordinator.start()
+
+                            # Also use basic reference for compatibility
+                            self._neural_mesh = self._neural_mesh_coordinator
+
+                            self.logger.info("[AgenticRunner] ✓ Neural Mesh Coordinator (production)")
+
+                            # Initialize JARVIS Bridge for cross-system tasks
+                            if self.config.neural_mesh_use_bridge:
+                                try:
+                                    self._neural_mesh_bridge = await get_jarvis_bridge()
+                                    if not self._neural_mesh_bridge.is_running:
+                                        await self._neural_mesh_bridge.initialize()
+                                        await self._neural_mesh_bridge.start()
+
+                                    self._nm_production_active = True
+                                    bridge_agents = len(self._neural_mesh_bridge.registered_agents)
+                                    self.logger.info(f"[AgenticRunner] ✓ JARVIS Neural Mesh Bridge ({bridge_agents} agents)")
+                                except Exception as bridge_error:
+                                    self.logger.debug(f"[AgenticRunner] Bridge init skipped: {bridge_error}")
+
+                        except ImportError as ie:
+                            self.logger.debug(f"[AgenticRunner] Production Neural Mesh not available: {ie}")
+                            # Fallback to basic start_neural_mesh
+                            from neural_mesh.neural_mesh_coordinator import start_neural_mesh
+                            self._neural_mesh = await start_neural_mesh()
+                            self.logger.info("[AgenticRunner] ✓ Neural Mesh (basic)")
+                    else:
+                        # Basic Neural Mesh
+                        from neural_mesh.neural_mesh_coordinator import start_neural_mesh
+                        self._neural_mesh = await start_neural_mesh()
+                        self.logger.info("[AgenticRunner] ✓ Neural Mesh")
 
                     # Deep Integration: Setup pattern subscription
                     if self.config.neural_mesh_deep_enabled:
                         await self._setup_neural_mesh_deep_integration()
+
+                    # v9.4: Setup production integrations
+                    if self._nm_production_active:
+                        await self._setup_neural_mesh_production_integration()
 
                 except Exception as e:
                     self.logger.debug(f"[AgenticRunner] ✗ Neural Mesh: {e}")
@@ -2022,6 +2097,253 @@ class AgenticTaskRunner:
             self.logger.debug(f"Neural context query error: {e}")
 
         return context
+
+    # =========================================================================
+    # v9.4: Neural Mesh Production Integration
+    # =========================================================================
+
+    async def _setup_neural_mesh_production_integration(self):
+        """Setup v9.4 production Neural Mesh integration with workflows and knowledge."""
+        if not self._neural_mesh_coordinator:
+            return
+
+        try:
+            self.logger.info("[AgenticRunner] Setting up v9.4 production Neural Mesh integration...")
+
+            # Register this runner as an agent in the Neural Mesh
+            if hasattr(self._neural_mesh_coordinator, 'registry'):
+                from neural_mesh.data_models import AgentInfo, AgentStatus
+                agent_info = AgentInfo(
+                    agent_id="agentic_task_runner",
+                    agent_name="AgenticTaskRunner",
+                    agent_type="executor",
+                    capabilities={"task_execution", "computer_use", "reasoning"},
+                    status=AgentStatus.ONLINE,
+                )
+                await self._neural_mesh_coordinator.registry.register(agent_info)
+                self.logger.debug("[AgenticRunner] Registered in Neural Mesh registry")
+
+            self.logger.info("[AgenticRunner] ✓ v9.4 Production Neural Mesh integration ready")
+
+        except Exception as e:
+            self.logger.debug(f"[AgenticRunner] Production integration setup error: {e}")
+
+    async def _execute_multi_agent_workflow(
+        self,
+        goal: str,
+        capabilities_needed: Optional[List[str]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        v9.4: Execute a multi-agent workflow via Neural Mesh orchestrator.
+
+        Uses the production orchestrator to coordinate multiple agents
+        for complex tasks that benefit from multi-agent collaboration.
+
+        Args:
+            goal: The task goal
+            capabilities_needed: Specific capabilities required
+
+        Returns:
+            Workflow result or None if not available
+        """
+        if not self._neural_mesh_coordinator or not self.config.neural_mesh_workflow_execution:
+            return None
+
+        if not hasattr(self._neural_mesh_coordinator, 'orchestrator'):
+            return None
+
+        try:
+            from neural_mesh.data_models import WorkflowTask, ExecutionStrategy
+
+            capabilities_needed = capabilities_needed or ["analysis", "reasoning"]
+
+            # Create workflow tasks based on goal
+            workflow_tasks = []
+            for cap in capabilities_needed:
+                workflow_tasks.append(WorkflowTask(
+                    task_id=f"task_{cap}_{uuid.uuid4().hex[:6]}",
+                    required_capability=cap,
+                    payload={
+                        "action": "analyze",
+                        "input": {"goal": goal},
+                    },
+                    timeout_seconds=30.0,
+                ))
+
+            # Execute workflow
+            workflow_result = await self._neural_mesh_coordinator.orchestrator.execute_workflow(
+                name=f"agentic_workflow_{uuid.uuid4().hex[:8]}",
+                tasks=workflow_tasks,
+                strategy=ExecutionStrategy.PARALLEL,
+            )
+
+            self._nm_workflows_executed += 1
+            self.logger.debug(
+                f"[AgenticRunner] Workflow executed: {len(workflow_tasks)} tasks, "
+                f"success={workflow_result.success}"
+            )
+
+            return {
+                "workflow_id": workflow_result.workflow_id,
+                "success": workflow_result.success,
+                "task_count": len(workflow_tasks),
+                "duration_ms": workflow_result.duration_ms,
+            }
+
+        except Exception as e:
+            self.logger.debug(f"Workflow execution error: {e}")
+            return None
+
+    async def _contribute_to_knowledge_graph(
+        self,
+        goal: str,
+        result: "AgenticTaskResult",
+    ) -> bool:
+        """
+        v9.4: Contribute task execution experience to Neural Mesh knowledge graph.
+
+        Stores successful execution patterns for future context enrichment.
+
+        Args:
+            goal: The executed goal
+            result: Execution result
+
+        Returns:
+            True if contribution successful
+        """
+        if not self._neural_mesh_coordinator or not self.config.neural_mesh_knowledge_contribute:
+            return False
+
+        if not result.success:
+            return False
+
+        try:
+            kg = getattr(self._neural_mesh_coordinator, 'knowledge', None)
+            if not kg:
+                return False
+
+            from neural_mesh.data_models import KnowledgeType
+
+            # Store execution pattern
+            await kg.store(
+                key=f"execution_{uuid.uuid4().hex[:8]}",
+                content={
+                    "goal": goal[:500],
+                    "mode": result.mode,
+                    "actions_count": result.actions_count,
+                    "execution_time_ms": result.execution_time_ms,
+                    "success": True,
+                },
+                knowledge_type=KnowledgeType.EXECUTION_PATTERN,
+                source="agentic_task_runner",
+                tags=["execution", "task", result.mode],
+            )
+
+            self._nm_knowledge_entries_added += 1
+            self.logger.debug(f"[AgenticRunner] Contributed execution pattern to knowledge graph")
+            return True
+
+        except Exception as e:
+            self.logger.debug(f"Knowledge contribution error: {e}")
+            return False
+
+    async def _delegate_to_specialized_agent(
+        self,
+        goal: str,
+        capability: str,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        v9.4: Delegate task to specialized agent via Neural Mesh registry.
+
+        Finds an agent with the required capability and delegates execution.
+
+        Args:
+            goal: The task goal
+            capability: Required capability
+
+        Returns:
+            Agent result or None if no suitable agent found
+        """
+        if not self._neural_mesh_bridge or not self.config.neural_mesh_agent_delegation:
+            return None
+
+        try:
+            # Find agents with capability
+            agents = self._neural_mesh_bridge.get_agents_by_capability(capability)
+            if not agents:
+                self.logger.debug(f"[AgenticRunner] No agents with capability: {capability}")
+                return None
+
+            # Use first available agent
+            agent = agents[0]
+
+            # Execute task via agent
+            task_result = await agent.execute_task({
+                "action": "execute",
+                "input": {"goal": goal},
+            })
+
+            self._nm_agents_delegated += 1
+            self.logger.debug(f"[AgenticRunner] Delegated to agent: {agent.agent_name}")
+
+            return {
+                "agent": agent.agent_name,
+                "result": task_result,
+            }
+
+        except Exception as e:
+            self.logger.debug(f"Agent delegation error: {e}")
+            return None
+
+    async def execute_cross_system_task(
+        self,
+        goal: str,
+        systems: Optional[List[str]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        v9.4: Execute a task across multiple JARVIS systems via Neural Mesh Bridge.
+
+        This enables collaboration between intelligence, autonomy, and voice systems.
+
+        Args:
+            goal: Task to execute
+            systems: Systems to involve (intelligence, autonomy, voice)
+
+        Returns:
+            Cross-system result or None if bridge not available
+        """
+        if not self._neural_mesh_bridge:
+            return None
+
+        try:
+            result = await self._neural_mesh_bridge.execute_cross_system_task(
+                task_description=goal,
+                systems=systems or ["intelligence", "autonomy"],
+            )
+
+            self.logger.debug(f"[AgenticRunner] Cross-system task executed: {result.get('workflow_id')}")
+            return result
+
+        except Exception as e:
+            self.logger.debug(f"Cross-system task error: {e}")
+            return None
+
+    def get_neural_mesh_production_stats(self) -> Dict[str, Any]:
+        """Get v9.4 Neural Mesh production integration statistics."""
+        return {
+            "production_active": self._nm_production_active,
+            "coordinator_available": self._neural_mesh_coordinator is not None,
+            "bridge_available": self._neural_mesh_bridge is not None,
+            "bridge_agents": (
+                len(self._neural_mesh_bridge.registered_agents)
+                if self._neural_mesh_bridge else 0
+            ),
+            "workflows_executed": self._nm_workflows_executed,
+            "agents_delegated": self._nm_agents_delegated,
+            "knowledge_entries_added": self._nm_knowledge_entries_added,
+            "events_sent": self._nm_events_sent,
+            "pattern_insights": len(self._nm_pattern_insights),
+        }
 
     async def _record_to_training_database(
         self,
