@@ -23565,6 +23565,589 @@ Update `loading-manager.js` to handle new stage types:
 
 ---
 
+## 🔗 Agentic Task Runner Integration Gaps (agentic_task_runner.py)
+
+The `AgenticTaskRunner` is the **core orchestration engine** that connects JARVIS (the OS), JARVIS-Prime (the Brain), and Reactor-Core (the Training Gym). This section details what's **missing** in the current implementation to achieve full bidirectional communication between all three systems.
+
+### Current Integration Status
+
+**What EXISTS in `agentic_task_runner.py`:**
+
+| Component | Status | Implementation |
+|-----------|--------|----------------|
+| JARVIS-Prime Client | ✅ **Connected** | `_initialize_jarvis_prime_client()` - HTTP client for Tier-0 brain |
+| Data Flywheel Recording | ✅ **Connected** | `_record_to_training_database()` - Records experiences to flywheel |
+| Neural Mesh Integration | ✅ **Connected** | `_setup_neural_mesh_deep_integration()` - Pattern subscriptions, AGI events |
+| Experience Recording | ✅ **Working** | `_record_comprehensive_learning()` - Saves to knowledge graph + training DB |
+| JARVIS-Prime Query | ✅ **Working** | `_query_jarvis_prime()` - Queries local brain for muscle-memory patterns |
+
+**What's MISSING:**
+
+---
+
+### 🔴 Critical Missing Connections
+
+#### 1. No Direct Reactor-Core API Communication
+
+**Status:** Agentic Runner records experiences, but cannot trigger training or check training status.
+
+**Location:**
+- `backend/core/agentic_task_runner.py` - Missing reactor-core client
+- `reactor-core/` - Has REST API but not called
+
+**Impact:**
+- ❌ Cannot trigger training runs on-demand
+- ❌ Cannot check if training is in progress
+- ❌ Cannot query training history
+- ❌ Cannot get model version information
+- ❌ No awareness of when new models are ready
+
+**Root Cause:**
+The runner only writes to the Data Flywheel (which reactor-core reads), but there's no **bidirectional** communication. The runner cannot "ask" reactor-core for status.
+
+**Required Fix:**
+```python
+# Add to agentic_task_runner.py
+
+async def _initialize_reactor_core_client(self):
+    """Initialize Reactor-Core API client for bidirectional communication."""
+    try:
+        import aiohttp
+        
+        reactor_core_url = os.getenv(
+            "REACTOR_CORE_API_URL",
+            "http://localhost:8003"  # Reactor-Core API port
+        )
+        
+        self._reactor_core_client = {
+            "url": reactor_core_url,
+            "session": aiohttp.ClientSession(),
+            "connected": False,
+        }
+        
+        # Health check
+        async with self._reactor_core_client["session"].get(
+            f"{reactor_core_url}/health"
+        ) as resp:
+            if resp.status == 200:
+                self._reactor_core_client["connected"] = True
+                self.logger.info("[AgenticRunner] ✓ Reactor-Core API connected")
+    except Exception as e:
+        self.logger.debug(f"[AgenticRunner] Reactor-Core API unavailable: {e}")
+
+async def _trigger_reactor_core_training(self, force: bool = False):
+    """Trigger a training run in reactor-core."""
+    if not self._reactor_core_client or not self._reactor_core_client.get("connected"):
+        return None
+    
+    try:
+        async with self._reactor_core_client["session"].post(
+            f"{self._reactor_core_client['url']}/api/training/trigger",
+            json={"force": force, "source": "agentic_runner"}
+        ) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                self.logger.info(f"[AgenticRunner] Training triggered: {data.get('job_id')}")
+                return data.get("job_id")
+    except Exception as e:
+        self.logger.debug(f"[AgenticRunner] Training trigger failed: {e}")
+    return None
+
+async def _check_reactor_core_training_status(self, job_id: str):
+    """Check status of a training job."""
+    if not self._reactor_core_client or not self._reactor_core_client.get("connected"):
+        return None
+    
+    try:
+        async with self._reactor_core_client["session"].get(
+            f"{self._reactor_core_client['url']}/api/training/status/{job_id}"
+        ) as resp:
+            if resp.status == 200:
+                return await resp.json()
+    except Exception as e:
+        self.logger.debug(f"[AgenticRunner] Status check failed: {e}")
+    return None
+```
+
+**Priority:** 🔴 **CRITICAL** - Enables on-demand training and status awareness.
+
+---
+
+#### 2. No Model Deployment Notification Handler
+
+**Status:** Runner doesn't know when reactor-core deploys a new model.
+
+**Location:**
+- `backend/core/agentic_task_runner.py` - Missing model deployment callback
+- `reactor-core/integration/event_bridge.py` - Has deployment events but runner doesn't subscribe
+
+**Impact:**
+- ❌ JARVIS-Prime hot-swaps models but runner doesn't know
+- ❌ Cannot invalidate cached patterns when model updates
+- ❌ Cannot log "Model upgraded" events
+- ❌ Cannot notify user of intelligence improvements
+
+**Root Cause:**
+The Reactor-Core Watcher (in JARVIS-AI-Agent) handles deployment, but the Agentic Runner doesn't subscribe to those events.
+
+**Required Fix:**
+```python
+# Add to agentic_task_runner.py
+
+async def _subscribe_to_model_deployment_events(self):
+    """Subscribe to model deployment notifications from Reactor-Core."""
+    try:
+        from autonomy.reactor_core_watcher import get_reactor_core_watcher
+        
+        watcher = get_reactor_core_watcher()
+        if not watcher:
+            return
+        
+        async def on_model_deployed(deployment_result):
+            """Handle new model deployment."""
+            self.logger.info(
+                f"[AgenticRunner] New model deployed: {deployment_result.model_name} "
+                f"(v{deployment_result.version})"
+            )
+            
+            # Invalidate JARVIS-Prime pattern cache
+            if self._jarvis_prime_client:
+                self._jarvis_prime_client["pattern_cache"] = {}
+            
+            # Notify Neural Mesh
+            if self._neural_mesh:
+                await self._publish_task_event(
+                    event_type="model_deployed",
+                    goal="system_update",
+                    mode="system",
+                    metadata={
+                        "model_name": deployment_result.model_name,
+                        "version": deployment_result.version,
+                        "model_size_mb": deployment_result.model_size_mb,
+                    }
+                )
+        
+        watcher.register_deployment_callback(on_model_deployed)
+        self.logger.info("[AgenticRunner] ✓ Model deployment subscription active")
+        
+    except Exception as e:
+        self.logger.debug(f"[AgenticRunner] Model deployment subscription failed: {e}")
+```
+
+**Priority:** 🟡 **IMPORTANT** - Enables awareness of model upgrades.
+
+---
+
+#### 3. No Learning Goal Discovery Integration
+
+**Status:** Runner executes tasks but doesn't contribute to learning goal discovery.
+
+**Location:**
+- `backend/core/agentic_task_runner.py` - Missing learning goal extraction
+- `reactor-core/scout/topic_discovery.py` - Has discovery code but runner doesn't call it
+
+**Impact:**
+- ❌ Cannot auto-discover learning topics from failed tasks
+- ❌ Cannot suggest "I should learn about X" when encountering unknown concepts
+- ❌ Learning goals must be manually added
+
+**Root Cause:**
+The runner executes tasks but doesn't analyze them for learning opportunities.
+
+**Required Fix:**
+```python
+# Add to agentic_task_runner.py
+
+async def _extract_learning_goals_from_task(
+    self,
+    goal: str,
+    result: AgenticTaskResult,
+) -> List[str]:
+    """Extract learning goals from task execution."""
+    learning_goals = []
+    
+    # If task failed, extract the failure reason
+    if not result.success and result.error:
+        # Use LLM to extract learning topic from error
+        try:
+            from core.jarvis_prime_client import JarvisPrimeClient
+            
+            prime_client = JarvisPrimeClient()
+            analysis = await prime_client.generate_response(
+                f"Analyze this task failure and suggest what JARVIS should learn: "
+                f"Goal: {goal}\nError: {result.error}\n"
+                f"Respond with a single learning topic (e.g., 'React 19 hooks', 'macOS Finder automation')."
+            )
+            
+            if analysis and len(analysis) > 5:
+                learning_goals.append(analysis.strip())
+                
+        except Exception as e:
+            self.logger.debug(f"Learning goal extraction failed: {e}")
+    
+    # If task used unknown tools/concepts, extract them
+    if result.tools_used:
+        for tool in result.tools_used:
+            if tool.get("unknown_concept"):
+                learning_goals.append(tool["unknown_concept"])
+    
+    # Submit to learning goals queue
+    if learning_goals:
+        await self._submit_learning_goals(learning_goals)
+    
+    return learning_goals
+
+async def _submit_learning_goals(self, topics: List[str]):
+    """Submit learning goals to reactor-core Scout."""
+    try:
+        from reactor_core.scout.topic_queue import TopicQueue, create_documentation_topic
+        
+        queue = TopicQueue()
+        
+        for topic in topics:
+            learning_topic = create_documentation_topic(
+                name=topic,
+                priority=7,  # Medium-high priority
+                source="agentic_runner"
+            )
+            await queue.enqueue(learning_topic)
+            
+        self.logger.info(f"[AgenticRunner] Submitted {len(topics)} learning goals")
+        
+    except Exception as e:
+        self.logger.debug(f"[AgenticRunner] Learning goal submission failed: {e}")
+```
+
+**Priority:** 🟡 **IMPORTANT** - Enables proactive learning.
+
+---
+
+#### 4. No Experience Quality Feedback Loop
+
+**Status:** Runner records experiences but doesn't get feedback on which ones were useful for training.
+
+**Location:**
+- `backend/core/agentic_task_runner.py` - `_record_to_training_database()` exists
+- Missing: Feedback mechanism from reactor-core
+
+**Impact:**
+- ❌ Cannot know which experiences improved the model
+- ❌ Cannot prioritize similar experiences in future
+- ❌ No way to measure training effectiveness
+
+**Root Cause:**
+One-way communication: Runner → Flywheel → Reactor-Core, but no feedback comes back.
+
+**Required Fix:**
+```python
+# Add to agentic_task_runner.py
+
+async def _query_training_effectiveness(self, experience_ids: List[int]):
+    """Query reactor-core for training effectiveness of specific experiences."""
+    if not self._reactor_core_client or not self._reactor_core_client.get("connected"):
+        return {}
+    
+    try:
+        async with self._reactor_core_client["session"].post(
+            f"{self._reactor_core_client['url']}/api/training/effectiveness",
+            json={"experience_ids": experience_ids}
+        ) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                # Returns: {experience_id: {"improvement_score": 0.85, "used_in_training": true}}
+                return data
+    except Exception as e:
+        self.logger.debug(f"[AgenticRunner] Effectiveness query failed: {e}")
+    return {}
+```
+
+**Priority:** 🟢 **NICE-TO-HAVE** - Enables quality-based experience prioritization.
+
+---
+
+#### 5. No JARVIS-Prime Model Version Awareness
+
+**Status:** Runner queries JARVIS-Prime but doesn't know which model version is loaded.
+
+**Location:**
+- `backend/core/agentic_task_runner.py` - `_query_jarvis_prime()` exists
+- Missing: Model version check
+
+**Impact:**
+- ❌ Cannot log "Using model v1.2" in execution logs
+- ❌ Cannot detect when model changes mid-session
+- ❌ Cannot correlate model version with task success rates
+
+**Required Fix:**
+```python
+# Add to agentic_task_runner.py
+
+async def _get_jarvis_prime_model_info(self) -> Optional[Dict[str, Any]]:
+    """Get current JARVIS-Prime model information."""
+    if not self._jarvis_prime_client or not self._jarvis_prime_client.get("connected"):
+        return None
+    
+    try:
+        session = self._jarvis_prime_client["session"]
+        url = self._jarvis_prime_client["url"]
+        
+        async with session.get(f"{url}/api/model/info") as resp:
+            if resp.status == 200:
+                return await resp.json()
+                # Returns: {"model_name": "jarvis-prime-7b", "version": "1.2", "loaded_at": "2025-01-15T10:30:00Z"}
+    except Exception as e:
+        self.logger.debug(f"[AgenticRunner] Model info query failed: {e}")
+    return None
+```
+
+**Priority:** 🟢 **NICE-TO-HAVE** - Enables model version tracking.
+
+---
+
+### 🟡 Important Missing Features
+
+#### 6. No Automatic Training Trigger on Experience Threshold
+
+**Status:** Runner records experiences but doesn't trigger training when threshold is reached.
+
+**Location:**
+- `backend/core/agentic_task_runner.py` - Records experiences
+- Missing: Threshold check and training trigger
+
+**Impact:**
+- ⚠️ Training only runs on schedule (3 AM), not when enough data is collected
+- ⚠️ Wasted time waiting for scheduled training
+
+**Required Fix:**
+```python
+# Add to agentic_task_runner.py
+
+async def _check_training_threshold(self):
+    """Check if enough experiences collected to trigger training."""
+    try:
+        from autonomy.unified_data_flywheel import get_data_flywheel
+        
+        flywheel = get_data_flywheel()
+        if not flywheel:
+            return
+        
+        # Get experience count
+        count = flywheel.get_experience_count()
+        threshold = int(os.getenv("JARVIS_TRAINING_THRESHOLD", "100"))
+        
+        if count >= threshold:
+            self.logger.info(
+                f"[AgenticRunner] Experience threshold reached ({count} >= {threshold}). "
+                "Triggering training..."
+            )
+            
+            # Trigger training
+            job_id = await self._trigger_reactor_core_training(force=False)
+            if job_id:
+                self.logger.info(f"[AgenticRunner] Training job started: {job_id}")
+                
+    except Exception as e:
+        self.logger.debug(f"[AgenticRunner] Training threshold check failed: {e}")
+```
+
+**Priority:** 🟡 **IMPORTANT** - Enables faster learning cycles.
+
+---
+
+#### 7. No Bidirectional Event Bridge Subscription
+
+**Status:** Runner publishes to Neural Mesh but doesn't subscribe to Reactor-Core events.
+
+**Location:**
+- `backend/core/agentic_task_runner.py` - Neural Mesh subscriptions exist
+- Missing: Reactor-Core event bridge subscription
+
+**Impact:**
+- ⚠️ Cannot receive real-time training progress updates
+- ⚠️ Cannot react to model deployment events
+- ⚠️ Cannot respond to training failures
+
+**Required Fix:**
+```python
+# Add to agentic_task_runner.py
+
+async def _subscribe_to_reactor_core_events(self):
+    """Subscribe to Reactor-Core event bridge for real-time updates."""
+    try:
+        from reactor_core.integration.event_bridge import get_event_bridge
+        
+        bridge = get_event_bridge()
+        if not bridge:
+            return
+        
+        async def on_training_progress(event):
+            """Handle training progress updates."""
+            self.logger.info(
+                f"[AgenticRunner] Training progress: {event.get('stage')} "
+                f"({event.get('progress', 0)}%)"
+            )
+            
+            # Broadcast to loading server
+            # (if loading server integration exists)
+        
+        async def on_model_deployed(event):
+            """Handle model deployment events."""
+            self.logger.info(
+                f"[AgenticRunner] Model deployed: {event.get('model_name')} "
+                f"v{event.get('version')}"
+            )
+            
+            # Invalidate caches, update stats
+        
+        bridge.subscribe("training_progress", on_training_progress)
+        bridge.subscribe("model_deployed", on_model_deployed)
+        
+        self.logger.info("[AgenticRunner] ✓ Reactor-Core event subscription active")
+        
+    except Exception as e:
+        self.logger.debug(f"[AgenticRunner] Reactor-Core event subscription failed: {e}")
+```
+
+**Priority:** 🟡 **IMPORTANT** - Enables real-time awareness of training pipeline.
+
+---
+
+### 🟢 Optional Enhancements
+
+#### 8. No Experience Replay Integration
+
+**Status:** Runner doesn't use past experiences to improve current task execution.
+
+**Location:**
+- `backend/core/agentic_task_runner.py` - Missing experience replay
+- `backend/autonomy/unified_memory_manager.py` - Has memory but runner doesn't query it
+
+**Impact:**
+- ⚠️ Cannot learn from past similar tasks
+- ⚠️ Repeats mistakes that were already solved
+
+**Priority:** 🟢 **OPTIONAL** - Would improve task success rate.
+
+---
+
+#### 9. No Cost Tracking Integration
+
+**Status:** Runner doesn't track API costs for JARVIS-Prime vs Cloud APIs.
+
+**Location:**
+- `backend/core/agentic_task_runner.py` - Missing cost tracking
+- `backend/observability/unified_observability_hub.py` - Has cost tracking but runner doesn't use it
+
+**Impact:**
+- ⚠️ Cannot optimize for cost
+- ⚠️ Cannot report spending to user
+
+**Priority:** 🟢 **OPTIONAL** - Useful for cost optimization.
+
+---
+
+### 📊 Integration Status Summary
+
+| Connection | Direction | Status | Priority | Action Required |
+|------------|-----------|--------|----------|-----------------|
+| JARVIS-Prime → Runner | Query | ✅ Working | - | None |
+| Runner → Data Flywheel | Write | ✅ Working | - | None |
+| Runner → Neural Mesh | Publish | ✅ Working | - | None |
+| Runner → Reactor-Core API | Query/Trigger | ❌ Missing | 🔴 Critical | Add API client |
+| Reactor-Core → Runner | Events | ❌ Missing | 🟡 Important | Subscribe to event bridge |
+| Runner → Learning Goals | Submit | ❌ Missing | 🟡 Important | Add goal extraction |
+| Runner → Model Info | Query | ❌ Missing | 🟢 Nice-to-have | Add model info endpoint |
+| Training Effectiveness | Feedback | ❌ Missing | 🟢 Nice-to-have | Add feedback loop |
+
+---
+
+### 🔧 Implementation Roadmap for Agentic Runner
+
+**Phase 1: Critical Bidirectional Communication (Week 1)**
+1. Add Reactor-Core API client initialization
+2. Add training trigger method
+3. Add training status check method
+4. Add model deployment event subscription
+
+**Phase 2: Learning Integration (Week 2)**
+5. Add learning goal extraction from failed tasks
+6. Add learning goal submission to Scout
+7. Add training threshold check
+8. Add automatic training trigger
+
+**Phase 3: Advanced Features (Week 3+)**
+9. Add experience replay integration
+10. Add cost tracking
+11. Add model version awareness
+12. Add training effectiveness feedback loop
+
+---
+
+### 📝 Integration Architecture Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│              AgenticTaskRunner (Current State)                   │
+│  ┌──────────────────┐    ┌──────────────────┐                  │
+│  │ JARVIS-Prime     │◄───│ Query Patterns   │ ✅ Working       │
+│  │ Client           │    │ (Tier-0 Brain)   │                  │
+│  └──────────────────┘    └──────────────────┘                  │
+│           │                                                      │
+│           ▼                                                      │
+│  ┌──────────────────┐    ┌──────────────────┐                  │
+│  │ Data Flywheel    │◄───│ Record Experience│ ✅ Working       │
+│  │ (Write Only)     │    │ (One-Way)        │                  │
+│  └──────────────────┘    └──────────────────┘                  │
+│           │                                                      │
+│           ▼                                                      │
+│  ┌──────────────────┐    ┌──────────────────┐                  │
+│  │ Neural Mesh      │◄───│ Publish Events   │ ✅ Working       │
+│  │ (Publish Only)   │    │ (One-Way)        │                  │
+│  └──────────────────┘    └──────────────────┘                  │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│              Missing Connections (To Be Added)                  │
+│  ┌──────────────────┐    ┌──────────────────┐                  │
+│  │ Reactor-Core API │◄───│ Query/Trigger    │ ❌ Missing       │
+│  │ (Bidirectional)  │    │ Training         │                  │
+│  └──────────────────┘    └──────────────────┘                  │
+│           │                                                      │
+│           ▼                                                      │
+│  ┌──────────────────┐    ┌──────────────────┐                  │
+│  │ Event Bridge     │◄───│ Subscribe Events │ ❌ Missing       │
+│  │ (Reactor-Core)   │    │ (Model Deploy)   │                  │
+│  └──────────────────┘    └──────────────────┘                  │
+│           │                                                      │
+│           ▼                                                      │
+│  ┌──────────────────┐    ┌──────────────────┐                  │
+│  │ Learning Goals   │◄───│ Submit Topics    │ ❌ Missing       │
+│  │ (Scout Queue)    │    │ (Auto-Discover)  │                  │
+│  └──────────────────┘    └──────────────────┘                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 🎯 Key Takeaways
+
+**Current State:**
+- ✅ Runner can **query** JARVIS-Prime for patterns
+- ✅ Runner can **write** experiences to Data Flywheel
+- ✅ Runner can **publish** events to Neural Mesh
+
+**Missing State:**
+- ❌ Runner cannot **trigger** Reactor-Core training
+- ❌ Runner cannot **receive** Reactor-Core events
+- ❌ Runner cannot **submit** learning goals
+- ❌ Runner cannot **query** training status
+
+**The Gap:**
+The runner is a **"Producer"** (writes data) but not a **"Consumer"** (reads status) or **"Controller"** (triggers actions). To achieve full integration, it needs bidirectional communication with Reactor-Core.
+
+---
+
 ## 📚 Documentation
 
 **Architecture Documentation:**

@@ -303,6 +303,9 @@ class BootstrapConfig:
     mas_enabled: bool = field(default_factory=lambda: os.getenv("MAS_ENABLED", "true").lower() == "true")
     mas_max_concurrent_agents: int = field(default_factory=lambda: int(os.getenv("MAS_MAX_CONCURRENT_AGENTS", "5")))
 
+    # CAI (Collective AI Intelligence) - Cross-system insight aggregation
+    cai_enabled: bool = field(default_factory=lambda: os.getenv("CAI_ENABLED", "true").lower() == "true")
+
     # =========================================================================
     # v9.0: Continuous Background Web Scraping
     # =========================================================================
@@ -4311,7 +4314,10 @@ class SupervisorBootstrapper:
         # ═══════════════════════════════════════════════════════════════════
         if self.config.uae_enabled:
             try:
-                self.logger.info("🔮 Step 1/6: Initializing UAE (Unified Awareness Engine)...")
+                self.logger.info("🔮 Step 1/7: Initializing UAE (Unified Awareness Engine)...")
+                self.logger.info("   • Chain-of-thought reasoning: " + ("Enabled" if self.config.uae_chain_of_thought else "Disabled"))
+                self.logger.info("   • Proactive intelligence: Enabled")
+                self.logger.info("   • Learning database: Enabled")
 
                 from intelligence.uae_integration import (
                     initialize_uae,
@@ -4399,7 +4405,9 @@ class SupervisorBootstrapper:
         # ═══════════════════════════════════════════════════════════════════
         if self.config.sai_enabled:
             try:
-                self.logger.info("👁️ Step 2/6: Initializing SAI (Situational Awareness Intelligence)...")
+                self.logger.info("👁️ Step 2/7: Initializing SAI (Situational Awareness Intelligence)...")
+                self.logger.info("   • Yabai bridge: " + ("Enabled" if self.config.sai_yabai_bridge else "Disabled"))
+                self.logger.info("   • 24/7 workspace monitoring: Enabled")
 
                 from intelligence.yabai_sai_integration import (
                     initialize_bridge,
@@ -4485,7 +4493,8 @@ class SupervisorBootstrapper:
         # ═══════════════════════════════════════════════════════════════════
         if self.config.neural_mesh_enabled:
             try:
-                self.logger.info("🕸️ Step 3/6: Initializing Neural Mesh (Distributed Intelligence)...")
+                self.logger.info("🕸️ Step 3/7: Initializing Neural Mesh (Distributed Intelligence)...")
+                self.logger.info("   • Sync interval: " + str(self.config.neural_mesh_sync_interval) + "s")
 
                 # Neural Mesh is a new system that coordinates all intelligence subsystems
                 # It provides shared context, message passing, and load balancing
@@ -4693,7 +4702,9 @@ class SupervisorBootstrapper:
         # ═══════════════════════════════════════════════════════════════════
         if self.config.mas_enabled:
             try:
-                self.logger.info("🤖 Step 4/6: Initializing MAS (Multi-Agent System)...")
+                self.logger.info("🤖 Step 4/7: Initializing MAS (Multi-Agent System)...")
+                self.logger.info("   • Max concurrent agents: " + str(self.config.mas_max_concurrent_agents))
+                self.logger.info("   • Dynamic spawning: Enabled")
 
                 from dataclasses import dataclass, field
                 from typing import Dict, Any, List, Optional, Callable
@@ -4960,161 +4971,162 @@ class SupervisorBootstrapper:
         # ═══════════════════════════════════════════════════════════════════
         # Step 5: Initialize CAI (Collective AI Intelligence)
         # ═══════════════════════════════════════════════════════════════════
-        try:
-            self.logger.info("🧬 Step 5/6: Initializing CAI (Collective AI Intelligence)...")
+        if self.config.cai_enabled:
+            try:
+                self.logger.info("🧬 Step 5/7: Initializing CAI (Collective AI Intelligence)...")
 
-            from dataclasses import dataclass, field
-            from typing import Dict, Any, List, Optional
+                from dataclasses import dataclass, field
+                from typing import Dict, Any, List, Optional
 
-            @dataclass
-            class InsightSource:
-                """Source of an insight."""
-                system: str  # "uae", "sai", "mas", etc.
-                confidence: float
-                timestamp: float
-                data: Dict[str, Any]
+                @dataclass
+                class InsightSource:
+                    """Source of an insight."""
+                    system: str  # "uae", "sai", "mas", etc.
+                    confidence: float
+                    timestamp: float
+                    data: Dict[str, Any]
 
-            @dataclass
-            class CollectiveInsight:
-                """An insight aggregated from multiple sources."""
-                insight_id: str
-                topic: str
-                sources: List[InsightSource] = field(default_factory=list)
-                aggregated_confidence: float = 0.0
-                recommendations: List[str] = field(default_factory=list)
-                created_at: float = field(default_factory=time.time)
+                @dataclass
+                class CollectiveInsight:
+                    """An insight aggregated from multiple sources."""
+                    insight_id: str
+                    topic: str
+                    sources: List[InsightSource] = field(default_factory=list)
+                    aggregated_confidence: float = 0.0
+                    recommendations: List[str] = field(default_factory=list)
+                    created_at: float = field(default_factory=time.time)
 
-            class CollectiveAI:
-                """
-                Collective AI Intelligence - Emergent intelligence from all subsystems.
+                class CollectiveAI:
+                    """
+                    Collective AI Intelligence - Emergent intelligence from all subsystems.
 
-                Provides:
-                - Synthesis of insights from UAE, SAI, MAS
-                - Cross-system pattern detection
-                - Proactive recommendation generation
-                - Adaptive learning from system interactions
-                """
+                    Provides:
+                    - Synthesis of insights from UAE, SAI, MAS
+                    - Cross-system pattern detection
+                    - Proactive recommendation generation
+                    - Adaptive learning from system interactions
+                    """
 
-                def __init__(self):
-                    self._insights: Dict[str, CollectiveInsight] = {}
-                    self._patterns: List[Dict[str, Any]] = []
-                    self._recommendation_callbacks: List[Callable] = []
-                    self._logger = logging.getLogger("CAI")
+                    def __init__(self):
+                        self._insights: Dict[str, CollectiveInsight] = {}
+                        self._patterns: List[Dict[str, Any]] = []
+                        self._recommendation_callbacks: List[Callable] = []
+                        self._logger = logging.getLogger("CAI")
 
-                def add_insight_source(self, topic: str, source: InsightSource) -> None:
-                    """Add an insight source for a topic."""
-                    if topic not in self._insights:
-                        self._insights[topic] = CollectiveInsight(
-                            insight_id=f"insight-{uuid.uuid4().hex[:8]}",
-                            topic=topic,
-                        )
-
-                    self._insights[topic].sources.append(source)
-                    self._recalculate_confidence(topic)
-
-                def _recalculate_confidence(self, topic: str) -> None:
-                    """Recalculate aggregated confidence for a topic."""
-                    if topic in self._insights:
-                        insight = self._insights[topic]
-                        if insight.sources:
-                            # Weighted average based on source confidence
-                            total = sum(s.confidence for s in insight.sources)
-                            insight.aggregated_confidence = total / len(insight.sources)
-
-                def get_insight(self, topic: str) -> Optional[CollectiveInsight]:
-                    """Get the collective insight for a topic."""
-                    return self._insights.get(topic)
-
-                def detect_patterns(self) -> List[Dict[str, Any]]:
-                    """Detect patterns across all insights."""
-                    # Simple pattern detection - look for topics with multiple high-confidence sources
-                    patterns = []
-                    for insight in self._insights.values():
-                        if len(insight.sources) >= 2 and insight.aggregated_confidence > 0.7:
-                            patterns.append({
-                                "topic": insight.topic,
-                                "confidence": insight.aggregated_confidence,
-                                "source_count": len(insight.sources),
-                                "systems": list(set(s.system for s in insight.sources)),
-                            })
-                    self._patterns = patterns
-                    return patterns
-
-                async def generate_recommendations(self) -> List[str]:
-                    """Generate proactive recommendations based on patterns."""
-                    recommendations = []
-                    patterns = self.detect_patterns()
-
-                    for pattern in patterns:
-                        if pattern["confidence"] > 0.8:
-                            recommendations.append(
-                                f"High-confidence pattern detected in {pattern['topic']} "
-                                f"across {pattern['systems']}"
+                    def add_insight_source(self, topic: str, source: InsightSource) -> None:
+                        """Add an insight source for a topic."""
+                        if topic not in self._insights:
+                            self._insights[topic] = CollectiveInsight(
+                                insight_id=f"insight-{uuid.uuid4().hex[:8]}",
+                                topic=topic,
                             )
 
-                    # Notify callbacks
-                    for callback in self._recommendation_callbacks:
-                        try:
-                            if asyncio.iscoroutinefunction(callback):
-                                await callback(recommendations)
-                            else:
-                                callback(recommendations)
-                        except Exception as e:
-                            self._logger.warning(f"Recommendation callback error: {e}")
+                        self._insights[topic].sources.append(source)
+                        self._recalculate_confidence(topic)
 
-                    return recommendations
+                    def _recalculate_confidence(self, topic: str) -> None:
+                        """Recalculate aggregated confidence for a topic."""
+                        if topic in self._insights:
+                            insight = self._insights[topic]
+                            if insight.sources:
+                                # Weighted average based on source confidence
+                                total = sum(s.confidence for s in insight.sources)
+                                insight.aggregated_confidence = total / len(insight.sources)
 
-                def register_recommendation_callback(self, callback: Callable) -> None:
-                    """Register a callback for recommendations."""
-                    self._recommendation_callbacks.append(callback)
+                    def get_insight(self, topic: str) -> Optional[CollectiveInsight]:
+                        """Get the collective insight for a topic."""
+                        return self._insights.get(topic)
 
-                def get_stats(self) -> Dict[str, Any]:
-                    """Get CAI statistics."""
-                    return {
-                        "total_insights": len(self._insights),
-                        "total_patterns": len(self._patterns),
-                        "high_confidence_insights": len([
-                            i for i in self._insights.values()
-                            if i.aggregated_confidence > 0.7
-                        ]),
-                    }
+                    def detect_patterns(self) -> List[Dict[str, Any]]:
+                        """Detect patterns across all insights."""
+                        # Simple pattern detection - look for topics with multiple high-confidence sources
+                        patterns = []
+                        for insight in self._insights.values():
+                            if len(insight.sources) >= 2 and insight.aggregated_confidence > 0.7:
+                                patterns.append({
+                                    "topic": insight.topic,
+                                    "confidence": insight.aggregated_confidence,
+                                    "source_count": len(insight.sources),
+                                    "systems": list(set(s.system for s in insight.sources)),
+                                })
+                        self._patterns = patterns
+                        return patterns
 
-            # Create CAI instance
-            self._cai = CollectiveAI()
+                    async def generate_recommendations(self) -> List[str]:
+                        """Generate proactive recommendations based on patterns."""
+                        recommendations = []
+                        patterns = self.detect_patterns()
 
-            # Connect CAI to Neural Mesh for insight aggregation
-            if hasattr(self, '_neural_mesh') and self._neural_mesh:
-                async def on_context_sync(message: Dict[str, Any]) -> None:
-                    """Handle context sync from Neural Mesh."""
-                    for key, value in message.get("data", {}).items():
-                        self._cai.add_insight_source(
-                            topic=key,
-                            source=InsightSource(
-                                system="mesh",
-                                confidence=0.8,
-                                timestamp=time.time(),
-                                data=value,
+                        for pattern in patterns:
+                            if pattern["confidence"] > 0.8:
+                                recommendations.append(
+                                    f"High-confidence pattern detected in {pattern['topic']} "
+                                    f"across {pattern['systems']}"
+                                )
+
+                        # Notify callbacks
+                        for callback in self._recommendation_callbacks:
+                            try:
+                                if asyncio.iscoroutinefunction(callback):
+                                    await callback(recommendations)
+                                else:
+                                    callback(recommendations)
+                            except Exception as e:
+                                self._logger.warning(f"Recommendation callback error: {e}")
+
+                        return recommendations
+
+                    def register_recommendation_callback(self, callback: Callable) -> None:
+                        """Register a callback for recommendations."""
+                        self._recommendation_callbacks.append(callback)
+
+                    def get_stats(self) -> Dict[str, Any]:
+                        """Get CAI statistics."""
+                        return {
+                            "total_insights": len(self._insights),
+                            "total_patterns": len(self._patterns),
+                            "high_confidence_insights": len([
+                                i for i in self._insights.values()
+                                if i.aggregated_confidence > 0.7
+                            ]),
+                        }
+
+                # Create CAI instance
+                self._cai = CollectiveAI()
+
+                # Connect CAI to Neural Mesh for insight aggregation
+                if hasattr(self, '_neural_mesh') and self._neural_mesh:
+                    async def on_context_sync(message: Dict[str, Any]) -> None:
+                        """Handle context sync from Neural Mesh."""
+                        for key, value in message.get("data", {}).items():
+                            self._cai.add_insight_source(
+                                topic=key,
+                                source=InsightSource(
+                                    system="mesh",
+                                    confidence=0.8,
+                                    timestamp=time.time(),
+                                    data=value,
+                                )
                             )
-                        )
 
-                self._neural_mesh.subscribe("context_sync", on_context_sync)
+                    self._neural_mesh.subscribe("context_sync", on_context_sync)
 
-            initialized_systems["cai"] = True
-            os.environ["CAI_ENABLED"] = "true"
-            self.logger.info("✅ CAI initialized (Collective AI Intelligence)")
-            print(f"  {TerminalUI.GREEN}✓ CAI: Collective AI Intelligence active{TerminalUI.RESET}")
+                initialized_systems["cai"] = True
+                os.environ["CAI_ENABLED"] = "true"
+                self.logger.info("✅ CAI initialized (Collective AI Intelligence)")
+                print(f"  {TerminalUI.GREEN}✓ CAI: Collective AI Intelligence active{TerminalUI.RESET}")
 
-        except Exception as e:
-            self.logger.error(f"❌ CAI initialization failed: {e}")
-            os.environ["CAI_ENABLED"] = "false"
-            print(f"  {TerminalUI.YELLOW}⚠️ CAI: Failed ({e}){TerminalUI.RESET}")
+            except Exception as e:
+                self.logger.error(f"❌ CAI initialization failed: {e}")
+                os.environ["CAI_ENABLED"] = "false"
+                print(f"  {TerminalUI.YELLOW}⚠️ CAI: Failed ({e}){TerminalUI.RESET}")
 
         # ═══════════════════════════════════════════════════════════════════
         # Step 6: Initialize Continuous Background Web Scraping
         # ═══════════════════════════════════════════════════════════════════
         if self.config.continuous_scraping_enabled:
             try:
-                self.logger.info("🌐 Step 6/6: Initializing Continuous Background Web Scraping...")
+                self.logger.info("🌐 Step 6/7: Initializing Continuous Background Web Scraping...")
 
                 # Start the continuous scraping background task
                 self._continuous_scraping_task = asyncio.create_task(
