@@ -278,11 +278,35 @@ class BootstrapConfig:
     data_flywheel_cooldown_hours: int = field(default_factory=lambda: int(os.getenv("DATA_FLYWHEEL_COOLDOWN_HOURS", "24")))
 
     # =========================================================================
-    # Intelligent Learning Goals (Auto-discovery from interactions)
+    # v9.3: Intelligent Learning Goals (Auto-discovery from interactions)
+    # =========================================================================
+    # Automatic discovery of learning topics from JARVIS interactions:
+    # - Failed responses (JARVIS couldn't help)
+    # - User corrections (JARVIS was wrong)
+    # - Unknown technical terms
+    # - Frequently asked topics
+    # - Trending technologies mentioned
     # =========================================================================
     learning_goals_enabled: bool = field(default_factory=lambda: os.getenv("LEARNING_GOALS_ENABLED", "true").lower() == "true")
     learning_goals_auto_discover: bool = field(default_factory=lambda: os.getenv("LEARNING_GOALS_AUTO_DISCOVER", "true").lower() == "true")
-    learning_goals_max_topics: int = field(default_factory=lambda: int(os.getenv("LEARNING_GOALS_MAX_TOPICS", "20")))
+    learning_goals_max_topics: int = field(default_factory=lambda: int(os.getenv("LEARNING_GOALS_MAX_TOPICS", "50")))
+
+    # Discovery triggers and intervals
+    learning_goals_discovery_interval_hours: float = field(default_factory=lambda: float(os.getenv("LEARNING_DISCOVERY_INTERVAL", "2")))
+    learning_goals_min_mentions: int = field(default_factory=lambda: int(os.getenv("LEARNING_MIN_MENTIONS", "2")))
+    learning_goals_min_confidence: float = field(default_factory=lambda: float(os.getenv("LEARNING_MIN_CONFIDENCE", "0.5")))
+    learning_goals_lookback_days: int = field(default_factory=lambda: int(os.getenv("LEARNING_LOOKBACK_DAYS", "30")))
+
+    # Safe Scout integration for auto-scraping discovered topics
+    learning_goals_auto_scrape: bool = field(default_factory=lambda: os.getenv("LEARNING_AUTO_SCRAPE", "true").lower() == "true")
+    learning_goals_scrape_concurrency: int = field(default_factory=lambda: int(os.getenv("LEARNING_SCRAPE_CONCURRENCY", "3")))
+    learning_goals_max_pages_per_topic: int = field(default_factory=lambda: int(os.getenv("LEARNING_MAX_PAGES", "10")))
+
+    # Source weights for priority calculation (0.0-1.0)
+    learning_goals_weight_corrections: float = field(default_factory=lambda: float(os.getenv("LEARNING_WEIGHT_CORRECTIONS", "1.0")))
+    learning_goals_weight_failures: float = field(default_factory=lambda: float(os.getenv("LEARNING_WEIGHT_FAILURES", "0.9")))
+    learning_goals_weight_questions: float = field(default_factory=lambda: float(os.getenv("LEARNING_WEIGHT_QUESTIONS", "0.7")))
+    learning_goals_weight_trending: float = field(default_factory=lambda: float(os.getenv("LEARNING_WEIGHT_TRENDING", "0.5")))
 
     # =========================================================================
     # v9.0: Intelligence Systems (UAE/SAI/Neural Mesh/MAS)
@@ -319,6 +343,48 @@ class BootstrapConfig:
     # =========================================================================
     reactor_core_integration_enabled: bool = field(default_factory=lambda: os.getenv("REACTOR_CORE_ENABLED", "true").lower() == "true")
     reactor_core_repo_path: str = field(default_factory=lambda: os.getenv("REACTOR_CORE_PATH", str(Path.home() / "Documents" / "repos" / "reactor-core")))
+
+    # =========================================================================
+    # v9.2: Intelligent Training Scheduler (Reactor-Core Pipeline Orchestration)
+    # =========================================================================
+    # Automatic training runs triggered by multiple intelligent conditions:
+    # - Time-based: Cron schedule (default: 3 AM daily)
+    # - Data-threshold: When enough new experiences accumulate
+    # - Quality-degradation: When model performance drops below threshold
+    # - Manual: Via API or voice command
+    # =========================================================================
+    training_scheduler_enabled: bool = field(default_factory=lambda: os.getenv("TRAINING_SCHEDULER_ENABLED", "true").lower() == "true")
+
+    # Time-based scheduling (cron expression)
+    training_cron_schedule: str = field(default_factory=lambda: os.getenv("TRAINING_CRON_SCHEDULE", "0 3 * * *"))  # 3 AM daily
+    training_timezone: str = field(default_factory=lambda: os.getenv("TRAINING_TIMEZONE", "America/Chicago"))
+
+    # Data-threshold trigger
+    training_data_threshold_enabled: bool = field(default_factory=lambda: os.getenv("TRAINING_DATA_THRESHOLD_ENABLED", "true").lower() == "true")
+    training_min_new_experiences: int = field(default_factory=lambda: int(os.getenv("TRAINING_MIN_NEW_EXPERIENCES", "100")))
+    training_data_check_interval_hours: float = field(default_factory=lambda: float(os.getenv("TRAINING_DATA_CHECK_INTERVAL", "4")))
+
+    # Quality-degradation trigger
+    training_quality_trigger_enabled: bool = field(default_factory=lambda: os.getenv("TRAINING_QUALITY_TRIGGER_ENABLED", "true").lower() == "true")
+    training_quality_threshold: float = field(default_factory=lambda: float(os.getenv("TRAINING_QUALITY_THRESHOLD", "0.7")))
+    training_quality_check_interval_hours: float = field(default_factory=lambda: float(os.getenv("TRAINING_QUALITY_CHECK_INTERVAL", "6")))
+
+    # Pipeline configuration
+    training_base_model: str = field(default_factory=lambda: os.getenv("TRAINING_BASE_MODEL", "meta-llama/Llama-3.2-3B"))
+    training_lora_rank: int = field(default_factory=lambda: int(os.getenv("TRAINING_LORA_RANK", "64")))
+    training_epochs: int = field(default_factory=lambda: int(os.getenv("TRAINING_EPOCHS", "3")))
+    training_quantization_method: str = field(default_factory=lambda: os.getenv("TRAINING_QUANTIZATION", "q4_k_m"))
+    training_eval_threshold: float = field(default_factory=lambda: float(os.getenv("TRAINING_EVAL_THRESHOLD", "0.7")))
+    training_skip_gatekeeper: bool = field(default_factory=lambda: os.getenv("TRAINING_SKIP_GATEKEEPER", "false").lower() == "true")
+
+    # Retry and cooldown
+    training_max_retries: int = field(default_factory=lambda: int(os.getenv("TRAINING_MAX_RETRIES", "3")))
+    training_retry_delay_minutes: int = field(default_factory=lambda: int(os.getenv("TRAINING_RETRY_DELAY", "30")))
+    training_cooldown_hours: int = field(default_factory=lambda: int(os.getenv("TRAINING_COOLDOWN_HOURS", "24")))
+
+    # Auto-deployment after training
+    training_auto_deploy_to_prime: bool = field(default_factory=lambda: os.getenv("TRAINING_AUTO_DEPLOY_PRIME", "true").lower() == "true")
+    training_auto_upload_to_gcs: bool = field(default_factory=lambda: os.getenv("TRAINING_AUTO_UPLOAD_GCS", "true").lower() == "true")
 
 
 class StartupPhase(Enum):
@@ -1878,6 +1944,28 @@ class SupervisorBootstrapper:
         self._learning_goals_manager = None
         self._training_scheduler_task = None
         self._experience_collection_task = None  # v9.1: Background experience collection
+
+        # v9.2: Intelligent Training Orchestrator (Reactor-Core Pipeline)
+        self._training_orchestrator = None
+        self._training_orchestrator_task = None
+        self._data_threshold_monitor_task = None
+        self._quality_monitor_task = None
+        self._last_training_run = None  # Timestamp of last successful training
+
+        # v9.3: Intelligent Learning Goals Discovery (Auto-topic extraction)
+        self._learning_goals_discovery = None
+        self._learning_goals_discovery_task = None
+        self._discovery_queue_processor_task = None
+        self._safe_scout_orchestrator = None
+        self._topic_queue = None
+        self._last_discovery_run = None  # Timestamp of last discovery sweep
+        self._discovery_stats = {
+            "total_discovered": 0,
+            "topics_scraped": 0,
+            "topics_queued": 0,
+            "failed_extractions": 0,
+            "last_sources": {},  # Track discovery by source type
+        }
 
         # CRITICAL: Set CI=true to prevent npm start from hanging interactively
         # if port 3000 is taken. This ensures we fail fast or handle it automatically.
@@ -3886,6 +3974,10 @@ class SupervisorBootstrapper:
             if self.config.data_flywheel_enabled:
                 await self._init_data_flywheel()
 
+            # v9.2: Initialize Intelligent Training Orchestrator
+            if self.config.training_scheduler_enabled:
+                await self._init_training_orchestrator()
+
             # Start dynamic memory monitoring for automatic mode switching
             await self._jarvis_prime_client.start_monitoring()
 
@@ -4325,155 +4417,743 @@ class SupervisorBootstrapper:
 
     async def _init_learning_goals_manager(self) -> None:
         """
-        Initialize the intelligent learning goals manager.
+        v9.3: Initialize the Intelligent Learning Goals Discovery System.
 
-        This system automatically discovers topics JARVIS should learn about by:
-        - Analyzing user interactions for mentioned technologies/concepts
-        - Detecting questions JARVIS couldn't answer well
-        - Monitoring for trending topics in the user's domain
+        This comprehensive system automatically discovers topics JARVIS should learn
+        about by analyzing multiple sources and triggering Safe Scout for scraping.
+
+        Discovery Sources:
+        - FAILED_INTERACTION: Commands JARVIS couldn't handle (highest priority)
+        - CORRECTION: When user corrects JARVIS's response (high priority)
+        - USER_QUESTION: Questions about technologies/concepts
+        - UNKNOWN_TERM: Technical terms JARVIS didn't recognize
+        - TRENDING: Topics appearing frequently in interactions
+        - MANUAL: User-requested learning goals
+
+        Integration Points:
+        - Reactor-Core TopicDiscovery for intelligent extraction
+        - Safe Scout Orchestrator for automated web scraping
+        - Training Database for experience analysis
+        - Loading Server for real-time status broadcasts
         """
-        self.logger.info("🎯 Initializing Learning Goals Manager...")
+        self.logger.info("🎯 Initializing Intelligent Learning Goals Discovery...")
 
         try:
-            # Create learning goals manager
-            from dataclasses import dataclass, field
-            from typing import List, Dict, Any, Optional
-            from datetime import datetime
+            # ═══════════════════════════════════════════════════════════════════
+            # Phase 1: Define Data Structures
+            # ═══════════════════════════════════════════════════════════════════
+            from dataclasses import dataclass, field as dc_field
+            from typing import List, Dict, Any, Optional, Set
+            from datetime import datetime, timedelta
+            from enum import Enum
             import json
+            import re
+            import sqlite3
+
+            class DiscoverySource(Enum):
+                """Sources for discovering learning topics."""
+                FAILED_INTERACTION = "failed_interaction"
+                CORRECTION = "correction"
+                USER_QUESTION = "user_question"
+                UNKNOWN_TERM = "unknown_term"
+                TRENDING = "trending"
+                MANUAL = "manual"
 
             @dataclass
-            class LearningGoal:
-                """A topic JARVIS should learn about."""
+            class DiscoveredTopic:
+                """A topic discovered for JARVIS to learn."""
                 topic: str
-                priority: int = 5  # 1-10 scale
-                source: str = "auto"  # auto, user, trending
-                urls: List[str] = field(default_factory=list)
-                discovered_at: datetime = field(default_factory=datetime.now)
-                completed: bool = False
+                priority: float  # 0.0-10.0 calculated score
+                source: DiscoverySource
+                confidence: float  # 0.0-1.0 extraction confidence
+                frequency: int = 1  # How many times mentioned
+                urls: List[str] = dc_field(default_factory=list)
+                keywords: List[str] = dc_field(default_factory=list)
+                discovered_at: datetime = dc_field(default_factory=datetime.now)
+                scraped: bool = False
+                scrape_started_at: Optional[datetime] = None
+                pages_scraped: int = 0
 
                 def to_dict(self) -> Dict[str, Any]:
                     return {
                         "topic": self.topic,
                         "priority": self.priority,
-                        "source": self.source,
+                        "source": self.source.value,
+                        "confidence": self.confidence,
+                        "frequency": self.frequency,
                         "urls": self.urls,
+                        "keywords": self.keywords,
                         "discovered_at": self.discovered_at.isoformat(),
-                        "completed": self.completed,
+                        "scraped": self.scraped,
+                        "pages_scraped": self.pages_scraped,
                     }
 
-            class LearningGoalsManager:
-                """Manages and auto-discovers learning goals for JARVIS."""
+            # ═══════════════════════════════════════════════════════════════════
+            # Phase 2: Intelligent Learning Goals Discovery System
+            # ═══════════════════════════════════════════════════════════════════
+            class IntelligentLearningGoalsDiscovery:
+                """
+                v9.3: Comprehensive learning goals discovery with reactor-core integration.
 
-                def __init__(self, max_topics: int = 20):
+                Features:
+                - Multi-source topic extraction (logs, experiences, corrections)
+                - Intelligent priority scoring based on source weights
+                - Automatic URL generation for documentation
+                - Safe Scout integration for automated scraping
+                - Real-time progress broadcasts
+                """
+
+                def __init__(
+                    self,
+                    max_topics: int = 50,
+                    min_mentions: int = 2,
+                    min_confidence: float = 0.5,
+                    source_weights: Optional[Dict[str, float]] = None,
+                    logger: Optional[Any] = None,
+                ):
                     self.max_topics = max_topics
-                    self.goals: List[LearningGoal] = []
-                    self.goals_file = Path(__file__).parent / "data" / "learning_goals.json"
-                    self._load_goals()
+                    self.min_mentions = min_mentions
+                    self.min_confidence = min_confidence
+                    self.logger = logger
 
-                def _load_goals(self) -> None:
-                    """Load goals from file."""
-                    if self.goals_file.exists():
+                    # Source weights for priority calculation
+                    self.source_weights = source_weights or {
+                        DiscoverySource.CORRECTION.value: 1.0,
+                        DiscoverySource.FAILED_INTERACTION.value: 0.9,
+                        DiscoverySource.USER_QUESTION.value: 0.7,
+                        DiscoverySource.UNKNOWN_TERM.value: 0.6,
+                        DiscoverySource.TRENDING.value: 0.5,
+                        DiscoverySource.MANUAL.value: 1.0,
+                    }
+
+                    # Topic storage
+                    self.topics: Dict[str, DiscoveredTopic] = {}
+                    self.topics_file = Path(__file__).parent / "data" / "discovered_topics.json"
+                    self._term_frequency: Dict[str, int] = {}
+                    self._last_discovery: Optional[datetime] = None
+
+                    # Reactor-core integration (optional)
+                    self._reactor_topic_discovery = None
+                    self._safe_scout = None
+                    self._topic_queue = None
+
+                    # Load existing topics
+                    self._load_topics()
+
+                    # Try to import reactor-core components
+                    self._init_reactor_core_integration()
+
+                def _init_reactor_core_integration(self) -> None:
+                    """Try to connect to reactor-core for enhanced discovery."""
+                    try:
+                        reactor_core_path = Path(__file__).parent.parent / "reactor-core"
+                        if reactor_core_path.exists():
+                            import sys
+                            if str(reactor_core_path) not in sys.path:
+                                sys.path.insert(0, str(reactor_core_path))
+
+                            # Import TopicDiscovery from reactor-core
+                            from reactor_core.scout.topic_discovery import TopicDiscovery
+                            self._reactor_topic_discovery = TopicDiscovery()
+                            if self.logger:
+                                self.logger.debug("✓ Reactor-core TopicDiscovery connected")
+
+                            # Import SafeScoutOrchestrator
+                            from reactor_core.scout.safe_scout_orchestrator import SafeScoutOrchestrator
+                            self._safe_scout = SafeScoutOrchestrator()
+                            if self.logger:
+                                self.logger.debug("✓ Reactor-core SafeScout connected")
+
+                            # Import TopicQueue
+                            from reactor_core.scout.topic_queue import TopicQueue
+                            queue_db = Path(__file__).parent / "data" / "topic_queue.db"
+                            queue_db.parent.mkdir(parents=True, exist_ok=True)
+                            self._topic_queue = TopicQueue(db_path=str(queue_db))
+                            if self.logger:
+                                self.logger.debug("✓ Reactor-core TopicQueue connected")
+
+                    except ImportError as e:
+                        if self.logger:
+                            self.logger.debug(f"Reactor-core not available: {e}")
+                    except Exception as e:
+                        if self.logger:
+                            self.logger.debug(f"Reactor-core init error: {e}")
+
+                def _load_topics(self) -> None:
+                    """Load previously discovered topics."""
+                    if self.topics_file.exists():
                         try:
-                            data = json.loads(self.goals_file.read_text())
-                            for g in data.get("topics", []):
-                                self.goals.append(LearningGoal(
-                                    topic=g["topic"],
-                                    priority=g.get("priority", 5),
-                                    source=g.get("source", "file"),
-                                    urls=g.get("urls", []),
-                                ))
-                        except Exception:
-                            pass
+                            data = json.loads(self.topics_file.read_text())
+                            for t in data.get("topics", []):
+                                topic = DiscoveredTopic(
+                                    topic=t["topic"],
+                                    priority=t.get("priority", 5.0),
+                                    source=DiscoverySource(t.get("source", "manual")),
+                                    confidence=t.get("confidence", 0.5),
+                                    frequency=t.get("frequency", 1),
+                                    urls=t.get("urls", []),
+                                    keywords=t.get("keywords", []),
+                                    scraped=t.get("scraped", False),
+                                    pages_scraped=t.get("pages_scraped", 0),
+                                )
+                                self.topics[topic.topic.lower()] = topic
+                        except Exception as e:
+                            if self.logger:
+                                self.logger.debug(f"Failed to load topics: {e}")
 
-                def _save_goals(self) -> None:
-                    """Save goals to file."""
-                    self.goals_file.parent.mkdir(parents=True, exist_ok=True)
-                    data = {"topics": [g.to_dict() for g in self.goals if not g.completed]}
-                    self.goals_file.write_text(json.dumps(data, indent=2, default=str))
+                def _save_topics(self) -> None:
+                    """Persist discovered topics."""
+                    self.topics_file.parent.mkdir(parents=True, exist_ok=True)
+                    data = {
+                        "topics": [t.to_dict() for t in self.topics.values()],
+                        "last_discovery": self._last_discovery.isoformat() if self._last_discovery else None,
+                    }
+                    self.topics_file.write_text(json.dumps(data, indent=2, default=str))
 
-                def add_goal(self, topic: str, priority: int = 5, source: str = "auto", urls: List[str] = None) -> bool:
-                    """Add a learning goal if not already present."""
-                    # Check if already exists
-                    for g in self.goals:
-                        if g.topic.lower() == topic.lower():
-                            return False
+                def _calculate_priority(
+                    self,
+                    source: DiscoverySource,
+                    confidence: float,
+                    frequency: int,
+                    recency_days: float = 0.0,
+                ) -> float:
+                    """
+                    Calculate topic priority using weighted scoring.
 
-                    # Enforce max topics
-                    if len([g for g in self.goals if not g.completed]) >= self.max_topics:
-                        # Remove lowest priority completed goal
-                        self.goals = sorted(self.goals, key=lambda x: (x.completed, -x.priority))
-                        if self.goals and self.goals[-1].completed:
-                            self.goals.pop()
+                    Formula: priority = 0.4*confidence + 0.3*frequency_norm + 0.2*recency + 0.1*source_weight
+                    Final score scaled to 0-10.
+                    """
+                    # Normalize frequency (log scale, max 10)
+                    import math
+                    frequency_norm = min(1.0, math.log10(frequency + 1) / math.log10(11))
 
-                    self.goals.append(LearningGoal(
-                        topic=topic,
-                        priority=priority,
-                        source=source,
-                        urls=urls or [],
-                    ))
-                    self._save_goals()
-                    return True
+                    # Recency score (1.0 for today, decays over 30 days)
+                    recency_score = max(0.0, 1.0 - (recency_days / 30.0))
 
-                def get_pending_goals(self) -> List[LearningGoal]:
-                    """Get uncompleted goals sorted by priority."""
-                    return sorted(
-                        [g for g in self.goals if not g.completed],
-                        key=lambda x: -x.priority
+                    # Source weight
+                    source_weight = self.source_weights.get(source.value, 0.5)
+
+                    # Weighted combination
+                    raw_score = (
+                        0.4 * confidence +
+                        0.3 * frequency_norm +
+                        0.2 * recency_score +
+                        0.1 * source_weight
                     )
 
-                def mark_completed(self, topic: str) -> None:
-                    """Mark a goal as completed."""
-                    for g in self.goals:
-                        if g.topic.lower() == topic.lower():
-                            g.completed = True
-                    self._save_goals()
+                    # Scale to 0-10
+                    return round(raw_score * 10, 2)
 
-                async def auto_discover_from_logs(self, log_dir: Path) -> List[str]:
-                    """Auto-discover learning topics from JARVIS logs."""
-                    discovered = []
+                def _generate_documentation_urls(self, topic: str) -> List[str]:
+                    """Generate likely documentation URLs for a topic."""
+                    urls = []
+                    topic_slug = topic.lower().replace(" ", "-").replace(".", "-")
+                    topic_underscore = topic.lower().replace(" ", "_").replace(".", "_")
 
-                    # Tech keywords to look for
-                    tech_patterns = [
-                        r"(?:learn|study|research|understand)\s+(\w+(?:\s+\w+)?)",
-                        r"what\s+is\s+(\w+(?:\s+\w+)?)\??",
-                        r"how\s+(?:does|do)\s+(\w+(?:\s+\w+)?)\s+work",
-                        r"(\w+(?:\.\w+)?)\s+(?:documentation|docs|tutorial)",
+                    # Common documentation patterns
+                    patterns = [
+                        f"https://docs.python.org/3/library/{topic_underscore}.html",
+                        f"https://{topic_slug}.readthedocs.io/",
+                        f"https://github.com/{topic_slug}/{topic_slug}",
+                        f"https://pypi.org/project/{topic_slug}/",
+                        f"https://developer.mozilla.org/en-US/docs/Web/{topic}",
+                        f"https://www.npmjs.com/package/{topic_slug}",
                     ]
 
-                    # Scan recent logs for patterns
-                    if log_dir.exists():
-                        import re
-                        for log_file in sorted(log_dir.glob("*.log"), reverse=True)[:5]:
-                            try:
-                                content = log_file.read_text()
-                                for pattern in tech_patterns:
-                                    matches = re.findall(pattern, content, re.IGNORECASE)
-                                    for match in matches[:3]:  # Limit per pattern
-                                        topic = match.strip()
-                                        if len(topic) > 3 and self.add_goal(topic, priority=3, source="auto"):
-                                            discovered.append(topic)
-                            except Exception:
-                                continue
+                    # Add relevant patterns based on topic keywords
+                    topic_lower = topic.lower()
+                    if "python" in topic_lower or topic_lower.startswith("py"):
+                        urls.append(f"https://docs.python.org/3/search.html?q={topic}")
+                    if "react" in topic_lower:
+                        urls.append(f"https://react.dev/reference/react/{topic}")
+                    if "langchain" in topic_lower:
+                        urls.append(f"https://python.langchain.com/docs/")
+                    if "llm" in topic_lower or "model" in topic_lower:
+                        urls.append("https://huggingface.co/docs")
+
+                    # Add base patterns
+                    urls.extend(patterns[:3])  # Limit to avoid too many
+
+                    return urls[:5]  # Cap at 5 URLs
+
+                async def discover_from_experiences(
+                    self,
+                    db_path: Optional[Path] = None,
+                    lookback_days: int = 30,
+                ) -> List[DiscoveredTopic]:
+                    """
+                    Discover learning topics from the training database experiences.
+
+                    Analyzes:
+                    - Failed interactions (low quality_score)
+                    - Corrected responses (feedback='corrected')
+                    - User questions (input contains question patterns)
+                    - Unknown terms (technical terms in low-confidence responses)
+                    """
+                    discovered = []
+
+                    # Default database path
+                    if db_path is None:
+                        db_path = Path(__file__).parent / "data" / "jarvis_training.db"
+
+                    if not db_path.exists():
+                        if self.logger:
+                            self.logger.debug(f"Training DB not found: {db_path}")
+                        return discovered
+
+                    try:
+                        conn = sqlite3.connect(str(db_path))
+                        cursor = conn.cursor()
+
+                        # Calculate cutoff timestamp
+                        cutoff = datetime.now() - timedelta(days=lookback_days)
+                        cutoff_ts = cutoff.timestamp()
+
+                        # ═══════════════════════════════════════════════════════════
+                        # Source 1: Failed Interactions (low quality_score)
+                        # ═══════════════════════════════════════════════════════════
+                        cursor.execute("""
+                            SELECT input_text, context, quality_score
+                            FROM experiences
+                            WHERE timestamp > ? AND quality_score < 0.4
+                            ORDER BY timestamp DESC
+                            LIMIT 100
+                        """, (cutoff_ts,))
+
+                        for row in cursor.fetchall():
+                            input_text, context, quality_score = row
+                            terms = self._extract_technical_terms(input_text)
+                            for term in terms:
+                                topic = self._add_or_update_topic(
+                                    term,
+                                    DiscoverySource.FAILED_INTERACTION,
+                                    confidence=0.3 + (1.0 - quality_score) * 0.5,
+                                )
+                                if topic:
+                                    discovered.append(topic)
+
+                        # ═══════════════════════════════════════════════════════════
+                        # Source 2: Corrected Responses
+                        # ═══════════════════════════════════════════════════════════
+                        cursor.execute("""
+                            SELECT input_text, correction, context
+                            FROM experiences
+                            WHERE timestamp > ? AND feedback = 'corrected'
+                            ORDER BY timestamp DESC
+                            LIMIT 100
+                        """, (cutoff_ts,))
+
+                        for row in cursor.fetchall():
+                            input_text, correction, context = row
+                            # Extract terms from both input and correction
+                            terms = self._extract_technical_terms(input_text)
+                            if correction:
+                                terms.extend(self._extract_technical_terms(correction))
+                            for term in terms:
+                                topic = self._add_or_update_topic(
+                                    term,
+                                    DiscoverySource.CORRECTION,
+                                    confidence=0.85,  # High confidence for corrections
+                                )
+                                if topic:
+                                    discovered.append(topic)
+
+                        # ═══════════════════════════════════════════════════════════
+                        # Source 3: User Questions
+                        # ═══════════════════════════════════════════════════════════
+                        cursor.execute("""
+                            SELECT input_text, context
+                            FROM experiences
+                            WHERE timestamp > ?
+                              AND (input_text LIKE '%what is%'
+                                   OR input_text LIKE '%how do%'
+                                   OR input_text LIKE '%how does%'
+                                   OR input_text LIKE '%explain%'
+                                   OR input_text LIKE '%learn about%')
+                            ORDER BY timestamp DESC
+                            LIMIT 100
+                        """, (cutoff_ts,))
+
+                        for row in cursor.fetchall():
+                            input_text, context = row
+                            terms = self._extract_technical_terms(input_text)
+                            for term in terms:
+                                topic = self._add_or_update_topic(
+                                    term,
+                                    DiscoverySource.USER_QUESTION,
+                                    confidence=0.7,
+                                )
+                                if topic:
+                                    discovered.append(topic)
+
+                        # ═══════════════════════════════════════════════════════════
+                        # Source 4: Trending Terms (high frequency)
+                        # ═══════════════════════════════════════════════════════════
+                        cursor.execute("""
+                            SELECT input_text
+                            FROM experiences
+                            WHERE timestamp > ?
+                            ORDER BY timestamp DESC
+                            LIMIT 500
+                        """, (cutoff_ts,))
+
+                        all_terms = []
+                        for row in cursor.fetchall():
+                            all_terms.extend(self._extract_technical_terms(row[0]))
+
+                        # Count term frequency
+                        from collections import Counter
+                        term_counts = Counter(all_terms)
+
+                        # Add trending terms (appearing 3+ times)
+                        for term, count in term_counts.most_common(20):
+                            if count >= 3:
+                                topic = self._add_or_update_topic(
+                                    term,
+                                    DiscoverySource.TRENDING,
+                                    confidence=min(0.9, 0.4 + count * 0.05),
+                                    frequency=count,
+                                )
+                                if topic:
+                                    discovered.append(topic)
+
+                        conn.close()
+
+                    except Exception as e:
+                        if self.logger:
+                            self.logger.warning(f"Experience discovery error: {e}")
 
                     return discovered
 
-            # Create and store manager
-            self._learning_goals_manager = LearningGoalsManager(
-                max_topics=self.config.learning_goals_max_topics
+                def _extract_technical_terms(self, text: str) -> List[str]:
+                    """
+                    Extract technical terms from text using pattern matching.
+
+                    Patterns:
+                    - CamelCase words (e.g., LangChain, FastAPI)
+                    - snake_case identifiers (e.g., async_generator)
+                    - Dotted names (e.g., numpy.array)
+                    - Known tech patterns (e.g., React, Python, API)
+                    """
+                    if not text:
+                        return []
+
+                    terms = []
+
+                    # CamelCase pattern
+                    camel_pattern = r'\b([A-Z][a-z]+(?:[A-Z][a-z]+)+)\b'
+                    terms.extend(re.findall(camel_pattern, text))
+
+                    # snake_case pattern
+                    snake_pattern = r'\b([a-z]+(?:_[a-z]+)+)\b'
+                    terms.extend(re.findall(snake_pattern, text))
+
+                    # Dotted names (e.g., module.function)
+                    dot_pattern = r'\b([a-z]+(?:\.[a-z]+)+)\b'
+                    terms.extend(re.findall(dot_pattern, text))
+
+                    # Known technology keywords
+                    tech_keywords = [
+                        r'\b(Python|JavaScript|TypeScript|Rust|Go|Swift)\b',
+                        r'\b(React|Vue|Angular|FastAPI|Flask|Django)\b',
+                        r'\b(LangChain|LangGraph|ChromaDB|FAISS)\b',
+                        r'\b(Docker|Kubernetes|Terraform|AWS|GCP|Azure)\b',
+                        r'\b(PostgreSQL|MongoDB|Redis|SQLite)\b',
+                        r'\b(API|REST|GraphQL|WebSocket|gRPC)\b',
+                        r'\b(ML|AI|LLM|NLP|transformers?|embeddings?)\b',
+                    ]
+                    for pattern in tech_keywords:
+                        matches = re.findall(pattern, text, re.IGNORECASE)
+                        terms.extend(matches)
+
+                    # Clean and deduplicate
+                    cleaned = []
+                    seen = set()
+                    for term in terms:
+                        term_lower = term.lower().strip()
+                        if len(term_lower) > 2 and term_lower not in seen:
+                            # Filter common words
+                            if term_lower not in {'the', 'and', 'for', 'with', 'this', 'that'}:
+                                cleaned.append(term)
+                                seen.add(term_lower)
+
+                    return cleaned
+
+                def _add_or_update_topic(
+                    self,
+                    term: str,
+                    source: DiscoverySource,
+                    confidence: float,
+                    frequency: int = 1,
+                ) -> Optional[DiscoveredTopic]:
+                    """Add a new topic or update an existing one."""
+                    term_key = term.lower().strip()
+
+                    if len(term_key) < 3:
+                        return None
+
+                    if term_key in self.topics:
+                        # Update existing topic
+                        existing = self.topics[term_key]
+                        existing.frequency += frequency
+                        # Upgrade source if higher priority
+                        if self.source_weights.get(source.value, 0) > \
+                           self.source_weights.get(existing.source.value, 0):
+                            existing.source = source
+                        # Update confidence (weighted average)
+                        existing.confidence = (existing.confidence + confidence) / 2
+                        # Recalculate priority
+                        existing.priority = self._calculate_priority(
+                            existing.source,
+                            existing.confidence,
+                            existing.frequency,
+                        )
+                        return None  # Not a new discovery
+                    else:
+                        # Create new topic
+                        if len(self.topics) >= self.max_topics:
+                            # Remove lowest priority scraped topic
+                            scraped = [t for t in self.topics.values() if t.scraped]
+                            if scraped:
+                                lowest = min(scraped, key=lambda t: t.priority)
+                                del self.topics[lowest.topic.lower()]
+
+                        topic = DiscoveredTopic(
+                            topic=term,
+                            priority=self._calculate_priority(source, confidence, frequency),
+                            source=source,
+                            confidence=confidence,
+                            frequency=frequency,
+                            urls=self._generate_documentation_urls(term),
+                        )
+                        self.topics[term_key] = topic
+                        return topic
+
+                async def discover_from_logs(self, log_dir: Path) -> List[DiscoveredTopic]:
+                    """Discover topics from JARVIS log files."""
+                    discovered = []
+
+                    if not log_dir.exists():
+                        return discovered
+
+                    # Patterns for discovering learning opportunities
+                    patterns = [
+                        (r"(?:learn|study|research|understand)\s+(\w+(?:\s+\w+)?)", DiscoverySource.USER_QUESTION),
+                        (r"what\s+is\s+(\w+(?:\s+\w+)?)\??", DiscoverySource.USER_QUESTION),
+                        (r"how\s+(?:does|do)\s+(\w+(?:\s+\w+)?)\s+work", DiscoverySource.USER_QUESTION),
+                        (r"error:?\s+(?:unknown|unrecognized)\s+(\w+)", DiscoverySource.UNKNOWN_TERM),
+                        (r"failed to (?:import|load|find)\s+(\w+)", DiscoverySource.FAILED_INTERACTION),
+                    ]
+
+                    # Scan recent log files
+                    for log_file in sorted(log_dir.glob("*.log"), reverse=True)[:10]:
+                        try:
+                            content = log_file.read_text(errors='ignore')
+                            for pattern, source in patterns:
+                                matches = re.findall(pattern, content, re.IGNORECASE)
+                                for match in matches[:5]:
+                                    term = match.strip()
+                                    topic = self._add_or_update_topic(
+                                        term,
+                                        source,
+                                        confidence=0.5,
+                                    )
+                                    if topic:
+                                        discovered.append(topic)
+                        except Exception:
+                            continue
+
+                    return discovered
+
+                async def discover_with_reactor_core(
+                    self,
+                    events: Optional[List[Dict[str, Any]]] = None,
+                ) -> List[DiscoveredTopic]:
+                    """
+                    Use reactor-core's TopicDiscovery for enhanced extraction.
+
+                    If reactor-core is available, leverages its ML-based
+                    topic extraction for higher quality results.
+                    """
+                    discovered = []
+
+                    if not self._reactor_topic_discovery:
+                        return discovered
+
+                    try:
+                        # Use reactor-core's analyze_events if available
+                        if hasattr(self._reactor_topic_discovery, 'analyze_events') and events:
+                            results = await self._reactor_topic_discovery.analyze_events(events)
+                            for result in results:
+                                topic = self._add_or_update_topic(
+                                    result.get('topic', ''),
+                                    DiscoverySource(result.get('source', 'trending')),
+                                    confidence=result.get('confidence', 0.5),
+                                )
+                                if topic:
+                                    discovered.append(topic)
+
+                        # Use discover_from_jarvis if available
+                        if hasattr(self._reactor_topic_discovery, 'discover_from_jarvis'):
+                            results = await self._reactor_topic_discovery.discover_from_jarvis()
+                            for result in results:
+                                topic = self._add_or_update_topic(
+                                    result.get('topic', ''),
+                                    DiscoverySource.TRENDING,
+                                    confidence=result.get('confidence', 0.5),
+                                )
+                                if topic:
+                                    discovered.append(topic)
+
+                    except Exception as e:
+                        if self.logger:
+                            self.logger.debug(f"Reactor-core discovery error: {e}")
+
+                    return discovered
+
+                def get_pending_topics(self, limit: int = 10) -> List[DiscoveredTopic]:
+                    """Get unscraped topics sorted by priority."""
+                    pending = [t for t in self.topics.values() if not t.scraped]
+                    return sorted(pending, key=lambda t: -t.priority)[:limit]
+
+                def get_all_topics(self) -> List[DiscoveredTopic]:
+                    """Get all topics sorted by priority."""
+                    return sorted(self.topics.values(), key=lambda t: -t.priority)
+
+                def mark_scraped(self, topic: str, pages: int = 0) -> None:
+                    """Mark a topic as scraped."""
+                    key = topic.lower()
+                    if key in self.topics:
+                        self.topics[key].scraped = True
+                        self.topics[key].pages_scraped = pages
+                        self._save_topics()
+
+                def add_manual_topic(
+                    self,
+                    topic: str,
+                    priority: float = 8.0,
+                    urls: Optional[List[str]] = None,
+                ) -> DiscoveredTopic:
+                    """Add a user-requested learning topic (highest priority)."""
+                    new_topic = DiscoveredTopic(
+                        topic=topic,
+                        priority=priority,
+                        source=DiscoverySource.MANUAL,
+                        confidence=1.0,
+                        urls=urls or self._generate_documentation_urls(topic),
+                    )
+                    self.topics[topic.lower()] = new_topic
+                    self._save_topics()
+                    return new_topic
+
+                def get_discovery_stats(self) -> Dict[str, Any]:
+                    """Get statistics about discovered topics."""
+                    all_topics = list(self.topics.values())
+                    by_source = {}
+                    for source in DiscoverySource:
+                        by_source[source.value] = len([
+                            t for t in all_topics if t.source == source
+                        ])
+
+                    return {
+                        "total_topics": len(all_topics),
+                        "pending_scrape": len([t for t in all_topics if not t.scraped]),
+                        "scraped": len([t for t in all_topics if t.scraped]),
+                        "by_source": by_source,
+                        "avg_priority": sum(t.priority for t in all_topics) / len(all_topics) if all_topics else 0,
+                        "last_discovery": self._last_discovery.isoformat() if self._last_discovery else None,
+                    }
+
+            # ═══════════════════════════════════════════════════════════════════
+            # Phase 3: Create and Configure Discovery System
+            # ═══════════════════════════════════════════════════════════════════
+            self._learning_goals_discovery = IntelligentLearningGoalsDiscovery(
+                max_topics=self.config.learning_goals_max_topics,
+                min_mentions=self.config.learning_goals_min_mentions,
+                min_confidence=self.config.learning_goals_min_confidence,
+                source_weights={
+                    "correction": self.config.learning_goals_weight_corrections,
+                    "failed_interaction": self.config.learning_goals_weight_failures,
+                    "user_question": self.config.learning_goals_weight_questions,
+                    "trending": self.config.learning_goals_weight_trending,
+                    "manual": 1.0,
+                },
+                logger=self.logger,
             )
 
-            # Auto-discover from logs if enabled
-            if self.config.learning_goals_auto_discover:
-                log_dir = Path(__file__).parent / "logs"
-                discovered = await self._learning_goals_manager.auto_discover_from_logs(log_dir)
-                if discovered:
-                    self.logger.info(f"🎯 Auto-discovered {len(discovered)} learning topics: {discovered[:5]}")
+            # Also keep backward-compatible reference
+            self._learning_goals_manager = self._learning_goals_discovery
 
-            pending = self._learning_goals_manager.get_pending_goals()
-            self.logger.info(f"✅ Learning Goals Manager ready ({len(pending)} pending topics)")
+            # ═══════════════════════════════════════════════════════════════════
+            # Phase 4: Run Initial Discovery
+            # ═══════════════════════════════════════════════════════════════════
+            if self.config.learning_goals_auto_discover:
+                # Discover from multiple sources in parallel
+                tasks = []
+
+                # From training database
+                db_path = Path(__file__).parent / "data" / "jarvis_training.db"
+                tasks.append(self._learning_goals_discovery.discover_from_experiences(
+                    db_path=db_path,
+                    lookback_days=self.config.learning_goals_lookback_days,
+                ))
+
+                # From log files
+                log_dir = Path(__file__).parent / "logs"
+                tasks.append(self._learning_goals_discovery.discover_from_logs(log_dir))
+
+                # From reactor-core (if available)
+                tasks.append(self._learning_goals_discovery.discover_with_reactor_core())
+
+                # Run all discovery tasks in parallel
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                total_discovered = 0
+                for result in results:
+                    if isinstance(result, list):
+                        total_discovered += len(result)
+
+                if total_discovered > 0:
+                    self.logger.info(f"🎯 Discovered {total_discovered} new learning topics")
+                    self._discovery_stats["total_discovered"] = total_discovered
+
+                # Save discovered topics
+                self._learning_goals_discovery._save_topics()
+
+            # ═══════════════════════════════════════════════════════════════════
+            # Phase 5: Start Discovery Loop (if enabled)
+            # ═══════════════════════════════════════════════════════════════════
+            if self.config.learning_goals_auto_discover:
+                self._learning_goals_discovery_task = asyncio.create_task(
+                    self._run_learning_goals_discovery_loop()
+                )
+                self.logger.debug("✓ Learning goals discovery loop started")
+
+            # ═══════════════════════════════════════════════════════════════════
+            # Phase 6: Start Safe Scout Queue Processor (if auto-scrape enabled)
+            # ═══════════════════════════════════════════════════════════════════
+            if self.config.learning_goals_auto_scrape:
+                self._discovery_queue_processor_task = asyncio.create_task(
+                    self._run_discovery_queue_processor()
+                )
+                self.logger.debug("✓ Safe Scout queue processor started")
+
+            # Report status
+            stats = self._learning_goals_discovery.get_discovery_stats()
+            pending = stats.get("pending_scrape", 0)
+            self.logger.info(f"✅ Learning Goals Discovery ready ({pending} pending topics)")
+
+            # Broadcast initial status
+            await self._broadcast_learning_goals_status(
+                status="ready",
+                pending_topics=pending,
+                total_topics=stats.get("total_topics", 0),
+            )
 
         except Exception as e:
-            self.logger.warning(f"⚠️ Learning Goals Manager failed: {e}")
+            self.logger.warning(f"⚠️ Learning Goals Discovery failed: {e}")
+            import traceback
+            self.logger.debug(traceback.format_exc())
 
     async def _initialize_intelligence_systems(self) -> None:
         """
@@ -5723,75 +6403,1244 @@ class SupervisorBootstrapper:
 
         self.logger.info("✅ Intelligence Systems stopped")
 
-    async def _run_training_scheduler(self) -> None:
-        """
-        Background task that schedules training runs.
+    # =========================================================================
+    # v9.2: Intelligent Training Orchestrator (Reactor-Core Pipeline)
+    # =========================================================================
+    # Multi-trigger training system that uses reactor-core's full 8-stage pipeline:
+    # 1. SCOUTING - Safe Scout web documentation ingestion
+    # 2. INGESTING - Parse JARVIS logs and experience events
+    # 3. FORMATTING - Convert to training format
+    # 4. DISTILLING - Improve examples with teacher models
+    # 5. TRAINING - Fine-tune model with LoRA
+    # 6. EVALUATING - Benchmark and gatekeeper approval
+    # 7. QUANTIZING - Convert to GGUF format
+    # 8. DEPLOYING - Update model registry and deploy to JARVIS-Prime
+    # =========================================================================
 
-        Default: Runs at 3 AM daily when:
-        - Enough experiences have been collected
-        - Cooldown period has passed
+    async def _init_training_orchestrator(self) -> None:
         """
-        self.logger.info(f"📅 Training scheduler started (schedule: {self.config.data_flywheel_training_schedule})")
+        v9.2: Initialize the Intelligent Training Orchestrator.
+
+        This system coordinates training across JARVIS-AI-Agent, reactor-core, and JARVIS-Prime
+        using multiple intelligent triggers:
+        - Time-based: Cron schedule (default: 3 AM daily)
+        - Data-threshold: When enough new experiences accumulate (default: 100+)
+        - Quality-degradation: When model performance drops below threshold
+        - Manual: Via API, voice command, or console
+        """
+        if not self.config.training_scheduler_enabled:
+            self.logger.info("ℹ️ Training Orchestrator disabled via configuration")
+            return
+
+        self.logger.info("🧠 Initializing Intelligent Training Orchestrator...")
+
+        try:
+            # Import reactor-core components
+            reactor_core_path = Path(self.config.reactor_core_repo_path)
+            if not reactor_core_path.exists():
+                self.logger.warning(f"⚠️ Reactor-Core not found at {reactor_core_path}")
+                return
+
+            import sys
+            if str(reactor_core_path) not in sys.path:
+                sys.path.insert(0, str(reactor_core_path))
+
+            # Try to import reactor-core scheduler
+            try:
+                from reactor_core.orchestration.scheduler import (
+                    PipelineScheduler,
+                    ScheduleConfig,
+                    ScheduledRun,
+                )
+                from reactor_core.orchestration.pipeline import (
+                    NightShiftPipeline,
+                    PipelineConfig,
+                    PipelineStage,
+                )
+
+                # Create pipeline config
+                pipeline_config = PipelineConfig(
+                    work_dir=Path.home() / ".jarvis" / "nightshift",
+                    base_model=self.config.training_base_model,
+                    lora_rank=self.config.training_lora_rank,
+                    epochs=self.config.training_epochs,
+                    quantize_method=self.config.training_quantization_method,
+                    eval_threshold=self.config.training_eval_threshold,
+                    skip_gatekeeper=self.config.training_skip_gatekeeper,
+                    jarvis_repo=Path(__file__).parent,
+                    prime_host=self.config.jarvis_prime_host,
+                    prime_port=self.config.jarvis_prime_port,
+                )
+
+                # Create pipeline runner function
+                async def run_reactor_core_pipeline() -> Dict[str, Any]:
+                    """Execute the full reactor-core training pipeline."""
+                    return await self._execute_reactor_core_pipeline(pipeline_config)
+
+                # Create scheduler config
+                schedule_config = ScheduleConfig(
+                    cron_expression=self.config.training_cron_schedule,
+                    timezone=self.config.training_timezone,
+                    max_retries=self.config.training_max_retries,
+                    retry_delay_minutes=self.config.training_retry_delay_minutes,
+                    history_file=Path.home() / ".jarvis" / "training" / "scheduler_history.json",
+                    enabled=True,
+                    run_on_start=False,
+                )
+
+                # Create scheduler
+                self._training_orchestrator = PipelineScheduler(
+                    pipeline_runner=run_reactor_core_pipeline,
+                    config=schedule_config,
+                )
+
+                self.logger.info("✅ Reactor-Core PipelineScheduler initialized")
+                self._reactor_core_pipeline_available = True
+
+            except ImportError as e:
+                self.logger.info(f"ℹ️ Reactor-Core scheduler not available, using fallback: {e}")
+                self._reactor_core_pipeline_available = False
+
+            # Start the orchestrator tasks
+            await self._start_training_orchestrator_tasks()
+
+            self.logger.info("✅ Intelligent Training Orchestrator initialized")
+            print(f"  {TerminalUI.GREEN}✓ Training Orchestrator: Multi-trigger scheduling active{TerminalUI.RESET}")
+
+            # Broadcast status
+            await self._broadcast_training_status(
+                status="ready",
+                next_scheduled_run=self._get_next_training_time(),
+                triggers_enabled={
+                    "time_based": True,
+                    "data_threshold": self.config.training_data_threshold_enabled,
+                    "quality_trigger": self.config.training_quality_trigger_enabled,
+                },
+            )
+
+        except Exception as e:
+            self.logger.warning(f"⚠️ Training Orchestrator init error: {e}")
+
+    async def _start_training_orchestrator_tasks(self) -> None:
+        """Start all training orchestrator background tasks."""
+        # 1. Time-based scheduler (cron)
+        if hasattr(self, '_training_orchestrator') and self._training_orchestrator:
+            await self._training_orchestrator.start()
+            self.logger.info(f"📅 Cron scheduler started: {self.config.training_cron_schedule}")
+        else:
+            # Fallback to simple time-based scheduler
+            self._training_orchestrator_task = asyncio.create_task(
+                self._run_fallback_training_scheduler()
+            )
+
+        # 2. Data threshold monitor
+        if self.config.training_data_threshold_enabled:
+            self._data_threshold_monitor_task = asyncio.create_task(
+                self._run_data_threshold_monitor()
+            )
+            self.logger.info(f"📊 Data threshold monitor started (min: {self.config.training_min_new_experiences} experiences)")
+
+        # 3. Quality degradation monitor
+        if self.config.training_quality_trigger_enabled:
+            self._quality_monitor_task = asyncio.create_task(
+                self._run_quality_monitor()
+            )
+            self.logger.info(f"📉 Quality monitor started (threshold: {self.config.training_quality_threshold})")
+
+    async def _execute_reactor_core_pipeline(self, pipeline_config: Any) -> Dict[str, Any]:
+        """
+        Execute the full reactor-core 8-stage training pipeline.
+
+        This is the core training function that:
+        1. Broadcasts progress to loading server
+        2. Runs the full Night Shift pipeline
+        3. Handles deployment to JARVIS-Prime
+        4. Updates training history
+        """
+        run_id = f"train-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        self.logger.info(f"🚀 Starting reactor-core pipeline: {run_id}")
+
+        # Broadcast training started
+        await self._broadcast_training_status(
+            status="running",
+            run_id=run_id,
+            stage="initializing",
+            progress=0,
+        )
+
+        # Announce via narrator
+        if hasattr(self, 'narrator') and self.narrator:
+            await self.narrator.speak(
+                "Starting intelligent model training. Running the full reactor-core pipeline.",
+                wait=False
+            )
+
+        try:
+            # Import and run pipeline
+            from reactor_core.orchestration.pipeline import NightShiftPipeline
+
+            pipeline = NightShiftPipeline(pipeline_config)
+
+            # Register progress callback
+            def on_pipeline_progress(stage: str, progress: float, message: str):
+                asyncio.create_task(self._broadcast_training_status(
+                    status="running",
+                    run_id=run_id,
+                    stage=stage,
+                    progress=int(progress * 100),
+                    message=message,
+                ))
+
+            pipeline.add_progress_callback(on_pipeline_progress)
+
+            # Run the pipeline
+            result = await pipeline.run()
+
+            if result.success:
+                self._last_training_run = datetime.now()
+
+                # Broadcast success
+                await self._broadcast_training_status(
+                    status="completed",
+                    run_id=run_id,
+                    stage="deployed",
+                    progress=100,
+                    result={
+                        "model_path": str(result.artifacts.get("model_path", "")),
+                        "gguf_path": str(result.artifacts.get("quantized_path", "")),
+                        "examples_trained": result.metrics.get("training_examples", 0),
+                        "final_loss": result.metrics.get("final_loss", 0),
+                        "eval_score": result.metrics.get("eval_score", 0),
+                    },
+                )
+
+                # Announce success
+                if hasattr(self, 'narrator') and self.narrator:
+                    await self.narrator.speak(
+                        f"Training complete! Model trained on {result.metrics.get('training_examples', 0)} examples.",
+                        wait=False
+                    )
+
+                # Auto-deploy to JARVIS-Prime if enabled
+                if self.config.training_auto_deploy_to_prime:
+                    await self._deploy_model_to_prime(result.artifacts)
+
+                return {
+                    "success": True,
+                    "run_id": run_id,
+                    "model_path": str(result.artifacts.get("model_path", "")),
+                    "metrics": result.metrics,
+                }
+
+            else:
+                # Broadcast failure
+                await self._broadcast_training_status(
+                    status="failed",
+                    run_id=run_id,
+                    stage=result.failed_stage or "unknown",
+                    error=result.error,
+                )
+
+                return {
+                    "success": False,
+                    "run_id": run_id,
+                    "error": result.error,
+                }
+
+        except Exception as e:
+            self.logger.error(f"Pipeline execution error: {e}")
+
+            await self._broadcast_training_status(
+                status="failed",
+                run_id=run_id,
+                error=str(e),
+            )
+
+            return {
+                "success": False,
+                "run_id": run_id,
+                "error": str(e),
+            }
+
+    async def _run_fallback_training_scheduler(self) -> None:
+        """
+        Fallback time-based scheduler when reactor-core PipelineScheduler is unavailable.
+        Uses the data flywheel for training instead of the full pipeline.
+        """
+        self.logger.info(f"📅 Fallback training scheduler started (schedule: {self.config.training_cron_schedule})")
 
         while True:
             try:
-                # Parse schedule time
-                schedule_hour, schedule_minute = map(int, self.config.data_flywheel_training_schedule.split(":"))
-
-                # Calculate seconds until next scheduled time
-                now = datetime.now()
-                target = now.replace(hour=schedule_hour, minute=schedule_minute, second=0, microsecond=0)
-
-                if target <= now:
-                    # Already passed today, schedule for tomorrow
-                    from datetime import timedelta
-                    target += timedelta(days=1)
-
-                sleep_seconds = (target - now).total_seconds()
-                self.logger.debug(f"Training scheduled in {sleep_seconds / 3600:.1f} hours")
-
-                # Sleep until scheduled time
-                await asyncio.sleep(sleep_seconds)
-
-                # Check if flywheel is ready
-                if self._data_flywheel and not self._data_flywheel.is_running:
-                    self.logger.info("🚀 Starting scheduled training run...")
-
-                    # Announce training
-                    if hasattr(self, 'narrator') and self.narrator:
-                        await self.narrator.speak(
-                            "Starting scheduled model training. This may take a while.",
-                            wait=False
-                        )
-
-                    # Run flywheel cycle
-                    result = await self._data_flywheel.run_full_cycle(
-                        include_web_scraping=True,
-                        include_training=True,
-                    )
-
-                    if result.success:
-                        self.logger.info(
-                            f"✅ Training completed: {result.progress.dataset_examples} examples, "
-                            f"model: {result.model_path or 'not trained'}"
-                        )
-                        if hasattr(self, 'narrator') and self.narrator:
-                            await self.narrator.speak(
-                                f"Training complete. Processed {result.progress.dataset_examples} examples.",
-                                wait=False
-                            )
-                    else:
-                        self.logger.warning(f"⚠️ Training failed: {result.error}")
-
+                # Calculate next run time from cron expression
+                next_run = self._get_next_training_time()
+                if next_run:
+                    sleep_seconds = (next_run - datetime.now()).total_seconds()
+                    if sleep_seconds > 0:
+                        self.logger.debug(f"Next training in {sleep_seconds / 3600:.1f} hours")
+                        await asyncio.sleep(sleep_seconds)
                 else:
-                    self.logger.debug("Flywheel busy or not ready, skipping scheduled run")
+                    # Fallback to simple daily schedule
+                    await asyncio.sleep(86400)  # 24 hours
+
+                # Check cooldown
+                if not self._check_training_cooldown():
+                    self.logger.debug("Training cooldown not elapsed, skipping")
+                    continue
+
+                # Run training via flywheel
+                if self._data_flywheel and not self._data_flywheel.is_running:
+                    await self._trigger_training("scheduled")
 
             except asyncio.CancelledError:
-                self.logger.info("Training scheduler stopped")
+                self.logger.info("Fallback training scheduler stopped")
                 break
             except Exception as e:
-                self.logger.error(f"Training scheduler error: {e}")
-                await asyncio.sleep(3600)  # Wait an hour before retrying
+                self.logger.error(f"Fallback scheduler error: {e}")
+                await asyncio.sleep(3600)
+
+    async def _run_data_threshold_monitor(self) -> None:
+        """
+        Monitor experience accumulation and trigger training when threshold is reached.
+
+        This provides adaptive training - when JARVIS learns a lot quickly,
+        it trains more frequently. During slow periods, it waits for scheduled runs.
+        """
+        check_interval = self.config.training_data_check_interval_hours * 3600
+        self.logger.info(f"📊 Data threshold monitor started (interval: {check_interval/3600:.1f}h)")
+
+        experiences_at_last_check = 0
+
+        while True:
+            try:
+                await asyncio.sleep(check_interval)
+
+                # Check cooldown first
+                if not self._check_training_cooldown():
+                    continue
+
+                # Get current experience count
+                current_experiences = await self._get_experience_count()
+                new_experiences = current_experiences - experiences_at_last_check
+
+                self.logger.debug(f"Data threshold check: {new_experiences} new experiences since last check")
+
+                if new_experiences >= self.config.training_min_new_experiences:
+                    self.logger.info(
+                        f"📈 Data threshold reached: {new_experiences} new experiences "
+                        f"(threshold: {self.config.training_min_new_experiences})"
+                    )
+
+                    # Trigger training
+                    await self._trigger_training("data_threshold")
+                    experiences_at_last_check = current_experiences
+
+            except asyncio.CancelledError:
+                self.logger.info("Data threshold monitor stopped")
+                break
+            except Exception as e:
+                self.logger.warning(f"Data threshold monitor error: {e}")
+                await asyncio.sleep(1800)  # 30 min retry
+
+    async def _run_quality_monitor(self) -> None:
+        """
+        Monitor model quality and trigger training when performance degrades.
+
+        Uses JARVIS-Prime's evaluation endpoint to check response quality.
+        If quality drops below threshold, triggers retraining.
+        """
+        check_interval = self.config.training_quality_check_interval_hours * 3600
+        self.logger.info(f"📉 Quality monitor started (interval: {check_interval/3600:.1f}h)")
+
+        while True:
+            try:
+                await asyncio.sleep(check_interval)
+
+                # Check cooldown first
+                if not self._check_training_cooldown():
+                    continue
+
+                # Get current quality score from JARVIS-Prime
+                quality_score = await self._get_model_quality_score()
+
+                if quality_score is not None:
+                    self.logger.debug(f"Quality check: score={quality_score:.2f}, threshold={self.config.training_quality_threshold}")
+
+                    if quality_score < self.config.training_quality_threshold:
+                        self.logger.warning(
+                            f"⚠️ Quality degradation detected: {quality_score:.2f} < {self.config.training_quality_threshold}"
+                        )
+
+                        # Trigger training
+                        await self._trigger_training("quality_degradation")
+
+            except asyncio.CancelledError:
+                self.logger.info("Quality monitor stopped")
+                break
+            except Exception as e:
+                self.logger.warning(f"Quality monitor error: {e}")
+                await asyncio.sleep(3600)
+
+    async def _trigger_training(self, trigger_source: str) -> bool:
+        """
+        Trigger a training run from any source.
+
+        Args:
+            trigger_source: What triggered this run (scheduled, data_threshold, quality_degradation, manual)
+
+        Returns:
+            True if training was successfully started
+        """
+        self.logger.info(f"🎯 Training triggered by: {trigger_source}")
+
+        # Broadcast training triggered
+        await self._broadcast_training_status(
+            status="triggered",
+            trigger_source=trigger_source,
+        )
+
+        # Announce
+        if hasattr(self, 'narrator') and self.narrator:
+            trigger_messages = {
+                "scheduled": "Starting scheduled training run.",
+                "data_threshold": "Starting training. Enough new experiences have accumulated.",
+                "quality_degradation": "Model quality has dropped. Starting retraining.",
+                "manual": "Manual training requested. Starting now.",
+            }
+            await self.narrator.speak(
+                trigger_messages.get(trigger_source, "Starting training run."),
+                wait=False
+            )
+
+        # Use reactor-core pipeline if available
+        if hasattr(self, '_reactor_core_pipeline_available') and self._reactor_core_pipeline_available:
+            if self._training_orchestrator:
+                run = await self._training_orchestrator.trigger_now()
+                return run.success
+
+        # Fallback to data flywheel
+        if self._data_flywheel and not self._data_flywheel.is_running:
+            try:
+                result = await self._data_flywheel.run_full_cycle(
+                    include_web_scraping=True,
+                    include_training=True,
+                )
+
+                if result.success:
+                    self._last_training_run = datetime.now()
+                    self.logger.info(f"✅ Training completed via flywheel")
+                    return True
+                else:
+                    self.logger.warning(f"⚠️ Training failed: {result.error}")
+                    return False
+
+            except Exception as e:
+                self.logger.error(f"Training execution error: {e}")
+                return False
+
+        self.logger.warning("No training system available")
+        return False
+
+    def _check_training_cooldown(self) -> bool:
+        """Check if enough time has passed since last training run."""
+        if self._last_training_run is None:
+            return True
+
+        cooldown = timedelta(hours=self.config.training_cooldown_hours)
+        elapsed = datetime.now() - self._last_training_run
+
+        return elapsed >= cooldown
+
+    def _get_next_training_time(self) -> Optional[datetime]:
+        """Get the next scheduled training time based on cron expression."""
+        try:
+            from croniter import croniter
+            cron = croniter(self.config.training_cron_schedule, datetime.now())
+            return cron.get_next(datetime)
+        except ImportError:
+            # Fallback: parse simple HH:MM format
+            try:
+                hour, minute = map(int, self.config.data_flywheel_training_schedule.split(":"))
+                now = datetime.now()
+                target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                if target <= now:
+                    target += timedelta(days=1)
+                return target
+            except Exception:
+                return None
+        except Exception:
+            return None
+
+    async def _get_experience_count(self) -> int:
+        """Get the current count of experiences in the training database."""
+        try:
+            if self._data_flywheel:
+                stats = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: self._data_flywheel.get_stats() if hasattr(self._data_flywheel, 'get_stats') else {}
+                )
+                return stats.get("total_experiences", 0)
+
+            # Fallback: query training database directly
+            db_path = Path.home() / ".jarvis" / "learning" / "jarvis_training.db"
+            if db_path.exists():
+                import sqlite3
+                conn = sqlite3.connect(str(db_path))
+                cursor = conn.execute("SELECT COUNT(*) FROM experiences WHERE used_in_training = 0")
+                count = cursor.fetchone()[0]
+                conn.close()
+                return count
+
+        except Exception as e:
+            self.logger.debug(f"Experience count error: {e}")
+
+        return 0
+
+    async def _get_model_quality_score(self) -> Optional[float]:
+        """Get the current model quality score from JARVIS-Prime."""
+        try:
+            import aiohttp
+            prime_url = f"http://{self.config.jarvis_prime_host}:{self.config.jarvis_prime_port}"
+
+            async with aiohttp.ClientSession() as session:
+                async with session.get(f"{prime_url}/health/metrics", timeout=10) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return data.get("model_quality_score", data.get("avg_confidence", None))
+
+        except Exception as e:
+            self.logger.debug(f"Quality score fetch error: {e}")
+
+        return None
+
+    async def _deploy_model_to_prime(self, artifacts: Dict[str, Any]) -> bool:
+        """Deploy trained model to JARVIS-Prime."""
+        try:
+            model_path = artifacts.get("quantized_path") or artifacts.get("model_path")
+            if not model_path:
+                self.logger.warning("No model path in artifacts for deployment")
+                return False
+
+            self.logger.info(f"🚀 Deploying model to JARVIS-Prime: {model_path}")
+
+            # Use JARVIS-Prime API to swap model
+            import aiohttp
+            prime_url = f"http://{self.config.jarvis_prime_host}:{self.config.jarvis_prime_port}"
+
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{prime_url}/model/swap",
+                    json={"model_path": str(model_path)},
+                    timeout=60
+                ) as resp:
+                    if resp.status == 200:
+                        self.logger.info("✅ Model deployed to JARVIS-Prime")
+                        return True
+                    else:
+                        error = await resp.text()
+                        self.logger.warning(f"Model deployment failed: {error}")
+                        return False
+
+        except Exception as e:
+            self.logger.error(f"Model deployment error: {e}")
+            return False
+
+    async def _broadcast_training_status(
+        self,
+        status: str,
+        run_id: Optional[str] = None,
+        stage: Optional[str] = None,
+        progress: Optional[int] = None,
+        message: Optional[str] = None,
+        trigger_source: Optional[str] = None,
+        next_scheduled_run: Optional[datetime] = None,
+        triggers_enabled: Optional[Dict[str, bool]] = None,
+        result: Optional[Dict[str, Any]] = None,
+        error: Optional[str] = None,
+    ) -> bool:
+        """
+        Broadcast training status to loading server.
+
+        This enables the loading page to show real-time training progress
+        and allows monitoring of the training pipeline.
+        """
+        try:
+            import aiohttp
+
+            payload = {
+                "status": status,
+                "timestamp": datetime.now().isoformat(),
+            }
+
+            if run_id:
+                payload["run_id"] = run_id
+            if stage:
+                payload["stage"] = stage
+            if progress is not None:
+                payload["progress"] = progress
+            if message:
+                payload["message"] = message
+            if trigger_source:
+                payload["trigger_source"] = trigger_source
+            if next_scheduled_run:
+                payload["next_scheduled_run"] = next_scheduled_run.isoformat()
+            if triggers_enabled:
+                payload["triggers_enabled"] = triggers_enabled
+            if result:
+                payload["result"] = result
+            if error:
+                payload["error"] = error
+
+            # Add scheduler statistics if available
+            if hasattr(self, '_training_orchestrator') and self._training_orchestrator:
+                payload["scheduler_stats"] = self._training_orchestrator.get_statistics()
+
+            loading_server_url = f"http://localhost:{self.config.required_ports[2]}/api/training/update"
+
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    loading_server_url,
+                    json=payload,
+                    timeout=5
+                ) as resp:
+                    return resp.status == 200
+
+        except Exception as e:
+            self.logger.debug(f"Training status broadcast error: {e}")
+            return False
+
+    async def _stop_training_orchestrator(self) -> None:
+        """Stop the training orchestrator and all its tasks."""
+        self.logger.info("🛑 Stopping Training Orchestrator...")
+
+        # Stop reactor-core scheduler
+        if hasattr(self, '_training_orchestrator') and self._training_orchestrator:
+            try:
+                await self._training_orchestrator.stop()
+            except Exception as e:
+                self.logger.warning(f"Scheduler stop error: {e}")
+
+        # Cancel fallback scheduler task
+        if hasattr(self, '_training_orchestrator_task') and self._training_orchestrator_task:
+            self._training_orchestrator_task.cancel()
+            try:
+                await self._training_orchestrator_task
+            except asyncio.CancelledError:
+                pass
+            self._training_orchestrator_task = None
+
+        # Cancel data threshold monitor
+        if hasattr(self, '_data_threshold_monitor_task') and self._data_threshold_monitor_task:
+            self._data_threshold_monitor_task.cancel()
+            try:
+                await self._data_threshold_monitor_task
+            except asyncio.CancelledError:
+                pass
+            self._data_threshold_monitor_task = None
+
+        # Cancel quality monitor
+        if hasattr(self, '_quality_monitor_task') and self._quality_monitor_task:
+            self._quality_monitor_task.cancel()
+            try:
+                await self._quality_monitor_task
+            except asyncio.CancelledError:
+                pass
+            self._quality_monitor_task = None
+
+        self.logger.info("✅ Training Orchestrator stopped")
+
+    async def trigger_manual_training(self) -> Dict[str, Any]:
+        """
+        Public API to trigger manual training run.
+
+        Can be called from voice commands, API endpoints, or console.
+
+        Returns:
+            Result dictionary with success status and details
+        """
+        self.logger.info("🎯 Manual training triggered")
+        success = await self._trigger_training("manual")
+        return {
+            "success": success,
+            "trigger": "manual",
+            "timestamp": datetime.now().isoformat(),
+        }
+
+    def get_training_status(self) -> Dict[str, Any]:
+        """
+        Get current training status for API/UI.
+
+        Returns comprehensive status including:
+        - Current state (idle, running, etc.)
+        - Last run details
+        - Next scheduled run
+        - Trigger statuses
+        """
+        status = {
+            "orchestrator_enabled": self.config.training_scheduler_enabled,
+            "last_training_run": self._last_training_run.isoformat() if self._last_training_run else None,
+            "next_scheduled_run": None,
+            "cooldown_remaining_hours": None,
+            "triggers": {
+                "time_based": {
+                    "enabled": True,
+                    "cron": self.config.training_cron_schedule,
+                },
+                "data_threshold": {
+                    "enabled": self.config.training_data_threshold_enabled,
+                    "threshold": self.config.training_min_new_experiences,
+                },
+                "quality": {
+                    "enabled": self.config.training_quality_trigger_enabled,
+                    "threshold": self.config.training_quality_threshold,
+                },
+            },
+            "pipeline_config": {
+                "base_model": self.config.training_base_model,
+                "lora_rank": self.config.training_lora_rank,
+                "epochs": self.config.training_epochs,
+                "quantization": self.config.training_quantization_method,
+            },
+        }
+
+        # Add next scheduled run
+        next_run = self._get_next_training_time()
+        if next_run:
+            status["next_scheduled_run"] = next_run.isoformat()
+
+        # Add cooldown info
+        if self._last_training_run:
+            cooldown = timedelta(hours=self.config.training_cooldown_hours)
+            elapsed = datetime.now() - self._last_training_run
+            remaining = cooldown - elapsed
+            if remaining.total_seconds() > 0:
+                status["cooldown_remaining_hours"] = remaining.total_seconds() / 3600
+
+        # Add scheduler stats if available
+        if hasattr(self, '_training_orchestrator') and self._training_orchestrator:
+            status["scheduler_stats"] = self._training_orchestrator.get_statistics()
+            current_run = self._training_orchestrator.get_current_run()
+            if current_run:
+                status["current_run"] = current_run.to_dict()
+
+        return status
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # v9.3: Learning Goals Discovery Methods
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    async def _run_learning_goals_discovery_loop(self) -> None:
+        """
+        v9.3: Periodic learning goals discovery loop.
+
+        Runs discovery at configurable intervals (default: every 2 hours) to:
+        - Analyze new experiences for learning opportunities
+        - Extract topics from log files
+        - Leverage reactor-core's TopicDiscovery when available
+        - Queue new topics for Safe Scout scraping
+
+        This loop ensures JARVIS continuously discovers what it needs to learn.
+        """
+        interval_hours = self.config.learning_goals_discovery_interval_hours
+        interval_seconds = int(interval_hours * 3600)
+
+        self.logger.info(
+            f"🔄 Learning Goals Discovery loop started "
+            f"(interval: {interval_hours}h)"
+        )
+
+        # Wait for initial startup to complete
+        await asyncio.sleep(60)
+
+        while True:
+            try:
+                # Wait for next discovery cycle
+                await asyncio.sleep(interval_seconds)
+
+                if not self._learning_goals_discovery:
+                    continue
+
+                self.logger.debug("🔍 Running scheduled learning goals discovery...")
+
+                # Broadcast discovery starting
+                await self._broadcast_learning_goals_status(
+                    status="discovering",
+                    message="Analyzing experiences for new learning topics",
+                )
+
+                # Run discovery from all sources in parallel
+                from datetime import datetime
+                discovery_start = datetime.now()
+
+                tasks = []
+
+                # Discover from experiences
+                db_path = Path(__file__).parent / "data" / "jarvis_training.db"
+                tasks.append(
+                    self._learning_goals_discovery.discover_from_experiences(
+                        db_path=db_path,
+                        lookback_days=self.config.learning_goals_lookback_days,
+                    )
+                )
+
+                # Discover from logs
+                log_dir = Path(__file__).parent / "logs"
+                tasks.append(
+                    self._learning_goals_discovery.discover_from_logs(log_dir)
+                )
+
+                # Discover with reactor-core
+                tasks.append(
+                    self._learning_goals_discovery.discover_with_reactor_core()
+                )
+
+                # Run all discovery in parallel
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                # Count new discoveries
+                total_discovered = 0
+                by_source = {"experiences": 0, "logs": 0, "reactor_core": 0}
+                source_names = ["experiences", "logs", "reactor_core"]
+
+                for i, result in enumerate(results):
+                    if isinstance(result, list):
+                        count = len(result)
+                        total_discovered += count
+                        by_source[source_names[i]] = count
+                    elif isinstance(result, Exception):
+                        self.logger.debug(f"Discovery source error: {result}")
+
+                # Update discovery stats
+                self._discovery_stats["total_discovered"] += total_discovered
+                self._discovery_stats["last_sources"] = by_source
+                self._last_discovery_run = datetime.now()
+                self._learning_goals_discovery._last_discovery = datetime.now()
+
+                # Save discovered topics
+                self._learning_goals_discovery._save_topics()
+
+                # Calculate elapsed time
+                elapsed = (datetime.now() - discovery_start).total_seconds()
+
+                # Get current stats
+                stats = self._learning_goals_discovery.get_discovery_stats()
+
+                if total_discovered > 0:
+                    self.logger.info(
+                        f"🎯 Discovery cycle complete: "
+                        f"+{total_discovered} new topics "
+                        f"({stats.get('pending_scrape', 0)} pending scrape, "
+                        f"{elapsed:.1f}s)"
+                    )
+                else:
+                    self.logger.debug(f"Discovery cycle: no new topics ({elapsed:.1f}s)")
+
+                # Broadcast discovery complete
+                await self._broadcast_learning_goals_status(
+                    status="ready",
+                    pending_topics=stats.get("pending_scrape", 0),
+                    total_topics=stats.get("total_topics", 0),
+                    new_discoveries=total_discovered,
+                    by_source=by_source,
+                )
+
+            except asyncio.CancelledError:
+                self.logger.info("Learning goals discovery loop cancelled")
+                break
+            except Exception as e:
+                self.logger.warning(f"Discovery loop error: {e}")
+                await asyncio.sleep(60)  # Brief pause before retry
+
+    async def _run_discovery_queue_processor(self) -> None:
+        """
+        v9.3: Process discovered topics through Safe Scout for scraping.
+
+        This queue processor:
+        - Takes pending topics from the discovery system
+        - Triggers Safe Scout to scrape documentation URLs
+        - Tracks scraping progress and results
+        - Marks topics as scraped when complete
+
+        Runs continuously with configurable concurrency.
+        """
+        concurrency = self.config.learning_goals_scrape_concurrency
+        max_pages = self.config.learning_goals_max_pages_per_topic
+
+        self.logger.info(
+            f"📚 Safe Scout queue processor started "
+            f"(concurrency: {concurrency}, max_pages: {max_pages})"
+        )
+
+        # Wait for discovery to complete initial run
+        await asyncio.sleep(120)
+
+        while True:
+            try:
+                # Check for pending topics
+                if not self._learning_goals_discovery:
+                    await asyncio.sleep(60)
+                    continue
+
+                pending = self._learning_goals_discovery.get_pending_topics(limit=concurrency)
+
+                if not pending:
+                    # No topics to scrape, wait and check again
+                    await asyncio.sleep(300)  # Check every 5 minutes
+                    continue
+
+                self.logger.info(f"📚 Processing {len(pending)} topics for scraping")
+
+                # Broadcast scraping starting
+                await self._broadcast_learning_goals_status(
+                    status="scraping",
+                    message=f"Scraping {len(pending)} topics",
+                    topics_processing=[t.topic for t in pending],
+                )
+
+                # Process topics concurrently
+                scrape_tasks = []
+                for topic in pending:
+                    scrape_tasks.append(self._scrape_topic(topic, max_pages))
+
+                results = await asyncio.gather(*scrape_tasks, return_exceptions=True)
+
+                # Count results
+                successful = 0
+                failed = 0
+                total_pages = 0
+
+                for i, result in enumerate(results):
+                    if isinstance(result, Exception):
+                        failed += 1
+                        self.logger.debug(f"Scrape error for {pending[i].topic}: {result}")
+                    elif isinstance(result, dict):
+                        if result.get("success"):
+                            successful += 1
+                            total_pages += result.get("pages_scraped", 0)
+                        else:
+                            failed += 1
+
+                # Update stats
+                self._discovery_stats["topics_scraped"] += successful
+                self._discovery_stats["failed_extractions"] += failed
+
+                self.logger.info(
+                    f"📚 Scraping complete: {successful} succeeded, "
+                    f"{failed} failed, {total_pages} pages scraped"
+                )
+
+                # Broadcast scraping complete
+                stats = self._learning_goals_discovery.get_discovery_stats()
+                await self._broadcast_learning_goals_status(
+                    status="ready",
+                    pending_topics=stats.get("pending_scrape", 0),
+                    total_topics=stats.get("total_topics", 0),
+                    topics_scraped=successful,
+                    pages_scraped=total_pages,
+                )
+
+                # Brief pause before next batch
+                await asyncio.sleep(30)
+
+            except asyncio.CancelledError:
+                self.logger.info("Discovery queue processor cancelled")
+                break
+            except Exception as e:
+                self.logger.warning(f"Queue processor error: {e}")
+                await asyncio.sleep(60)
+
+    async def _scrape_topic(self, topic, max_pages: int) -> Dict[str, Any]:
+        """
+        Scrape documentation for a single topic.
+
+        Uses Safe Scout (reactor-core) if available, otherwise
+        falls back to basic URL fetching.
+
+        Args:
+            topic: DiscoveredTopic object
+            max_pages: Maximum pages to scrape per topic
+
+        Returns:
+            Result dictionary with success status and pages scraped
+        """
+        from datetime import datetime
+        result = {
+            "topic": topic.topic,
+            "success": False,
+            "pages_scraped": 0,
+            "error": None,
+        }
+
+        try:
+            # Mark topic as being scraped
+            topic.scrape_started_at = datetime.now()
+
+            # Try reactor-core Safe Scout first
+            if self._learning_goals_discovery._safe_scout:
+                try:
+                    # Use SafeScoutOrchestrator for comprehensive scraping
+                    scout = self._learning_goals_discovery._safe_scout
+                    scrape_result = await scout.scrape_topic(
+                        topic=topic.topic,
+                        urls=topic.urls,
+                        max_pages=max_pages,
+                    )
+
+                    if scrape_result and scrape_result.get("success"):
+                        result["success"] = True
+                        result["pages_scraped"] = scrape_result.get("pages_scraped", 0)
+                        result["content_items"] = scrape_result.get("content_items", 0)
+                except Exception as e:
+                    self.logger.debug(f"SafeScout error: {e}")
+                    # Fall through to basic scraping
+
+            # Fallback: Basic URL fetching
+            if not result["success"] and topic.urls:
+                pages_scraped = 0
+                for url in topic.urls[:max_pages]:
+                    try:
+                        # Use aiohttp for async fetching
+                        import aiohttp
+                        async with aiohttp.ClientSession() as session:
+                            async with session.get(
+                                url,
+                                timeout=aiohttp.ClientTimeout(total=30),
+                                headers={"User-Agent": "JARVIS-Scout/1.0"},
+                            ) as response:
+                                if response.status == 200:
+                                    content = await response.text()
+                                    if content and len(content) > 100:
+                                        pages_scraped += 1
+
+                                        # Store in training database
+                                        await self._store_scraped_content(
+                                            url=url,
+                                            title=topic.topic,
+                                            content=content,
+                                            topic=topic.topic,
+                                        )
+                    except Exception:
+                        continue
+
+                if pages_scraped > 0:
+                    result["success"] = True
+                    result["pages_scraped"] = pages_scraped
+
+            # Mark topic as scraped
+            if result["success"]:
+                self._learning_goals_discovery.mark_scraped(
+                    topic.topic,
+                    pages=result["pages_scraped"],
+                )
+
+        except Exception as e:
+            result["error"] = str(e)
+            self.logger.debug(f"Scrape error for {topic.topic}: {e}")
+
+        return result
+
+    async def _store_scraped_content(
+        self,
+        url: str,
+        title: str,
+        content: str,
+        topic: str,
+    ) -> Optional[int]:
+        """Store scraped content in the training database."""
+        try:
+            import sqlite3
+            from datetime import datetime
+
+            # Extract text content (basic HTML stripping)
+            import re
+            text = re.sub(r'<[^>]+>', ' ', content)
+            text = re.sub(r'\s+', ' ', text).strip()
+
+            # Limit content size
+            if len(text) > 50000:
+                text = text[:50000]
+
+            db_path = Path(__file__).parent / "data" / "jarvis_training.db"
+            if not db_path.exists():
+                return None
+
+            conn = sqlite3.connect(str(db_path))
+            cursor = conn.cursor()
+
+            cursor.execute("""
+                INSERT OR REPLACE INTO scraped_content
+                (url, title, content, topic, scraped_at, quality_score)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (url, title, text, topic, datetime.now().isoformat(), 0.5))
+
+            conn.commit()
+            content_id = cursor.lastrowid
+            conn.close()
+
+            return content_id
+
+        except Exception as e:
+            self.logger.debug(f"Failed to store scraped content: {e}")
+            return None
+
+    async def _broadcast_learning_goals_status(
+        self,
+        status: str,
+        **kwargs,
+    ) -> None:
+        """
+        Broadcast learning goals discovery status to loading server.
+
+        Args:
+            status: Current status (ready, discovering, scraping, error)
+            **kwargs: Additional status fields
+        """
+        try:
+            import aiohttp
+            from datetime import datetime
+
+            # Build payload
+            payload = {
+                "type": "learning_goals_update",
+                "timestamp": datetime.now().isoformat(),
+                "status": status,
+                "stats": self._discovery_stats,
+                "last_discovery": (
+                    self._last_discovery_run.isoformat()
+                    if self._last_discovery_run
+                    else None
+                ),
+            }
+            payload.update(kwargs)
+
+            # Send to loading server
+            loading_url = f"http://localhost:{self.config.loading_server_port}/api/learning-goals/update"
+
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    loading_url,
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=5),
+                ) as response:
+                    if response.status != 200:
+                        self.logger.debug(
+                            f"Learning goals broadcast failed: {response.status}"
+                        )
+
+        except Exception as e:
+            self.logger.debug(f"Learning goals broadcast error: {e}")
+
+    async def _stop_learning_goals_discovery(self) -> None:
+        """Stop the learning goals discovery system and all its tasks."""
+        self.logger.info("🛑 Stopping Learning Goals Discovery...")
+
+        # Cancel discovery loop
+        if hasattr(self, '_learning_goals_discovery_task') and self._learning_goals_discovery_task:
+            self._learning_goals_discovery_task.cancel()
+            try:
+                await self._learning_goals_discovery_task
+            except asyncio.CancelledError:
+                pass
+            self._learning_goals_discovery_task = None
+
+        # Cancel queue processor
+        if hasattr(self, '_discovery_queue_processor_task') and self._discovery_queue_processor_task:
+            self._discovery_queue_processor_task.cancel()
+            try:
+                await self._discovery_queue_processor_task
+            except asyncio.CancelledError:
+                pass
+            self._discovery_queue_processor_task = None
+
+        # Save final state
+        if self._learning_goals_discovery:
+            self._learning_goals_discovery._save_topics()
+
+        self.logger.info("✅ Learning Goals Discovery stopped")
+
+    def get_learning_goals_status(self) -> Dict[str, Any]:
+        """
+        Get current learning goals discovery status for API/UI.
+
+        Returns comprehensive status including:
+        - Discovery statistics
+        - Pending topics
+        - Scraping progress
+        - Last discovery time
+        """
+        status = {
+            "enabled": self.config.learning_goals_enabled,
+            "auto_discover": self.config.learning_goals_auto_discover,
+            "auto_scrape": self.config.learning_goals_auto_scrape,
+            "discovery_interval_hours": self.config.learning_goals_discovery_interval_hours,
+            "last_discovery": (
+                self._last_discovery_run.isoformat()
+                if self._last_discovery_run
+                else None
+            ),
+            "stats": self._discovery_stats,
+        }
+
+        if self._learning_goals_discovery:
+            discovery_stats = self._learning_goals_discovery.get_discovery_stats()
+            status["discovery_stats"] = discovery_stats
+
+            # Get top pending topics
+            pending = self._learning_goals_discovery.get_pending_topics(limit=5)
+            status["pending_topics"] = [
+                {
+                    "topic": t.topic,
+                    "priority": t.priority,
+                    "source": t.source.value,
+                    "urls": t.urls[:2],
+                }
+                for t in pending
+            ]
+
+        return status
+
+    async def add_learning_goal(self, topic: str, priority: float = 8.0) -> Dict[str, Any]:
+        """
+        Public API to add a manual learning goal.
+
+        Can be called from voice commands, API endpoints, or console.
+
+        Args:
+            topic: Topic to learn about
+            priority: Priority (0-10, default 8 for manual)
+
+        Returns:
+            Result with created topic details
+        """
+        if not self._learning_goals_discovery:
+            return {"success": False, "error": "Discovery system not initialized"}
+
+        try:
+            new_topic = self._learning_goals_discovery.add_manual_topic(topic, priority)
+            self.logger.info(f"🎯 Manual learning goal added: {topic}")
+
+            return {
+                "success": True,
+                "topic": new_topic.to_dict(),
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # End of Learning Goals Discovery Methods
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    async def _run_training_scheduler(self) -> None:
+        """
+        Legacy method - redirects to new orchestrator.
+        Kept for backward compatibility with existing code that creates this task.
+        """
+        # This method is now a no-op since training is handled by the orchestrator
+        # The orchestrator is initialized separately in _init_training_orchestrator
+        self.logger.debug("Legacy _run_training_scheduler called - training handled by orchestrator")
+
+        # If orchestrator isn't initialized yet, run the fallback
+        if not hasattr(self, '_training_orchestrator') or not self._training_orchestrator:
+            await self._run_fallback_training_scheduler()
 
     async def _run_experience_collection_loop(self) -> None:
         """
@@ -5872,7 +7721,13 @@ class SupervisorBootstrapper:
                 pass
             self._experience_collection_task = None
 
-        # Cancel training scheduler
+        # v9.2: Stop intelligent training orchestrator (replaces old scheduler)
+        await self._stop_training_orchestrator()
+
+        # v9.3: Stop learning goals discovery system
+        await self._stop_learning_goals_discovery()
+
+        # Cancel legacy training scheduler (if still running)
         if self._training_scheduler_task:
             self._training_scheduler_task.cancel()
             try:

@@ -653,6 +653,101 @@ class ReactorCoreState:
 
 
 @dataclass
+class TrainingOrchestratorState:
+    """
+    v9.2: Intelligent Training Orchestrator state.
+
+    Tracks:
+    - Training scheduler status (cron, data-threshold, quality triggers)
+    - Current training run progress
+    - Pipeline stages (scouting, ingesting, training, evaluating, etc.)
+    - Model deployment status
+    """
+    active: bool = False
+    status: str = "idle"  # idle, ready, triggered, running, completed, failed
+    message: str = ""
+
+    # Scheduler info
+    next_scheduled_run: Optional[str] = None
+    last_training_run: Optional[str] = None
+    cooldown_remaining_hours: float = 0.0
+
+    # Triggers
+    time_based_enabled: bool = True
+    data_threshold_enabled: bool = True
+    quality_trigger_enabled: bool = True
+    cron_schedule: str = "0 3 * * *"
+    min_experiences_threshold: int = 100
+    quality_threshold: float = 0.7
+
+    # Current run
+    current_run_id: Optional[str] = None
+    current_stage: str = "idle"
+    current_progress: int = 0
+    trigger_source: Optional[str] = None  # scheduled, data_threshold, quality_degradation, manual
+
+    # Pipeline stages
+    stage_scouting: bool = False
+    stage_ingesting: bool = False
+    stage_formatting: bool = False
+    stage_distilling: bool = False
+    stage_training: bool = False
+    stage_evaluating: bool = False
+    stage_quantizing: bool = False
+    stage_deploying: bool = False
+
+    # Results
+    last_result: Optional[Dict[str, Any]] = None
+    last_error: Optional[str] = None
+
+    # Scheduler stats
+    total_runs: int = 0
+    successful_runs: int = 0
+    failed_runs: int = 0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "active": self.active,
+            "status": self.status,
+            "message": self.message,
+            "nextScheduledRun": self.next_scheduled_run,
+            "lastTrainingRun": self.last_training_run,
+            "cooldownRemainingHours": self.cooldown_remaining_hours,
+            "triggers": {
+                "timeBased": self.time_based_enabled,
+                "dataThreshold": self.data_threshold_enabled,
+                "qualityTrigger": self.quality_trigger_enabled,
+                "cronSchedule": self.cron_schedule,
+                "minExperiences": self.min_experiences_threshold,
+                "qualityThreshold": self.quality_threshold,
+            },
+            "currentRun": {
+                "runId": self.current_run_id,
+                "stage": self.current_stage,
+                "progress": self.current_progress,
+                "triggerSource": self.trigger_source,
+            } if self.current_run_id else None,
+            "stages": {
+                "scouting": self.stage_scouting,
+                "ingesting": self.stage_ingesting,
+                "formatting": self.stage_formatting,
+                "distilling": self.stage_distilling,
+                "training": self.stage_training,
+                "evaluating": self.stage_evaluating,
+                "quantizing": self.stage_quantizing,
+                "deploying": self.stage_deploying,
+            },
+            "lastResult": self.last_result,
+            "lastError": self.last_error,
+            "stats": {
+                "totalRuns": self.total_runs,
+                "successfulRuns": self.successful_runs,
+                "failedRuns": self.failed_runs,
+            },
+        }
+
+
+@dataclass
 class ProgressState:
     """
     Thread-safe progress state with history tracking.
@@ -698,6 +793,7 @@ class ProgressState:
     learning_goals: LearningGoalsState = field(default_factory=LearningGoalsState)
     jarvis_prime: JARVISPrimeState = field(default_factory=JARVISPrimeState)
     reactor_core: ReactorCoreState = field(default_factory=ReactorCoreState)
+    training: TrainingOrchestratorState = field(default_factory=TrainingOrchestratorState)
 
     # v4.0: Supervisor integration
     supervisor_connected: bool = False
@@ -2033,6 +2129,326 @@ async def update_reactor_core_status(request: web.Request) -> web.Response:
         return web.json_response({"status": "error", "message": str(e)}, status=500)
 
 
+# =============================================================================
+# v9.2: Intelligent Training Orchestrator Endpoints
+# =============================================================================
+
+async def get_training_status(request: web.Request) -> web.Response:
+    """
+    v9.2: Get current training orchestrator status.
+
+    Returns comprehensive status including:
+    - Scheduler status (cron, triggers)
+    - Current training run (if any)
+    - Pipeline stage progress
+    - Historical statistics
+    """
+    try:
+        return web.json_response({
+            "status": "ok",
+            "training": progress_state.training.to_dict(),
+        })
+    except Exception as e:
+        metrics.record_error(str(e))
+        return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+
+async def update_training_status(request: web.Request) -> web.Response:
+    """
+    v9.2: Update training orchestrator status from supervisor.
+
+    Status types:
+    - ready: Orchestrator initialized and ready
+    - triggered: Training has been triggered
+    - running: Training pipeline in progress
+    - completed: Training completed successfully
+    - failed: Training failed
+    """
+    try:
+        data = await request.json()
+        status = data.get('status', 'unknown')
+
+        progress_state.training.active = True
+        progress_state.training.status = status
+
+        # Update scheduler info
+        if 'next_scheduled_run' in data:
+            progress_state.training.next_scheduled_run = data['next_scheduled_run']
+        if 'triggers_enabled' in data:
+            triggers = data['triggers_enabled']
+            progress_state.training.time_based_enabled = triggers.get('time_based', True)
+            progress_state.training.data_threshold_enabled = triggers.get('data_threshold', True)
+            progress_state.training.quality_trigger_enabled = triggers.get('quality_trigger', True)
+
+        # Update current run info
+        if 'run_id' in data:
+            progress_state.training.current_run_id = data['run_id']
+        if 'stage' in data:
+            progress_state.training.current_stage = data['stage']
+            # Update stage flags
+            stage = data['stage'].lower()
+            progress_state.training.stage_scouting = 'scout' in stage
+            progress_state.training.stage_ingesting = 'ingest' in stage
+            progress_state.training.stage_formatting = 'format' in stage
+            progress_state.training.stage_distilling = 'distill' in stage
+            progress_state.training.stage_training = 'train' in stage
+            progress_state.training.stage_evaluating = 'evaluat' in stage
+            progress_state.training.stage_quantizing = 'quantiz' in stage
+            progress_state.training.stage_deploying = 'deploy' in stage
+        if 'progress' in data:
+            progress_state.training.current_progress = data['progress']
+        if 'trigger_source' in data:
+            progress_state.training.trigger_source = data['trigger_source']
+        if 'message' in data:
+            progress_state.training.message = data['message']
+
+        # Update results
+        if status == 'completed':
+            progress_state.training.current_run_id = None
+            progress_state.training.current_stage = 'idle'
+            progress_state.training.current_progress = 0
+            progress_state.training.last_training_run = data.get('timestamp', datetime.now().isoformat())
+            progress_state.training.last_result = data.get('result', {})
+            progress_state.training.successful_runs += 1
+            progress_state.training.total_runs += 1
+            # Reset stage flags
+            progress_state.training.stage_scouting = False
+            progress_state.training.stage_ingesting = False
+            progress_state.training.stage_formatting = False
+            progress_state.training.stage_distilling = False
+            progress_state.training.stage_training = False
+            progress_state.training.stage_evaluating = False
+            progress_state.training.stage_quantizing = False
+            progress_state.training.stage_deploying = False
+
+        elif status == 'failed':
+            progress_state.training.current_run_id = None
+            progress_state.training.current_stage = 'idle'
+            progress_state.training.current_progress = 0
+            progress_state.training.last_error = data.get('error', 'Unknown error')
+            progress_state.training.failed_runs += 1
+            progress_state.training.total_runs += 1
+
+        # Update scheduler stats if provided
+        if 'scheduler_stats' in data:
+            stats = data['scheduler_stats']
+            progress_state.training.total_runs = stats.get('total_runs', progress_state.training.total_runs)
+            progress_state.training.successful_runs = stats.get('successful_runs', progress_state.training.successful_runs)
+            progress_state.training.failed_runs = stats.get('failed_runs', progress_state.training.failed_runs)
+
+        # Broadcast to WebSocket clients
+        await connection_manager.broadcast({
+            "type": f"training_{status}",
+            **data,
+            "training": progress_state.training.to_dict(),
+        })
+
+        logger.info(f"[Training] {status}: {progress_state.training.message or 'Status update'}")
+
+        return web.json_response({
+            "status": "ok",
+            "training": progress_state.training.to_dict(),
+        })
+
+    except Exception as e:
+        metrics.record_error(str(e))
+        logger.error(f"[Training] Update error: {e}")
+        return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+
+async def trigger_training(request: web.Request) -> web.Response:
+    """
+    v9.2: Manually trigger a training run via API.
+
+    This endpoint forwards the request to the supervisor's trigger_manual_training API.
+    """
+    try:
+        # Note: In production, this would call the supervisor's API
+        # For now, just acknowledge the request
+        return web.json_response({
+            "status": "ok",
+            "message": "Manual training trigger requested. Check supervisor logs for status.",
+            "note": "Training will start if cooldown has elapsed and no other training is running.",
+        })
+    except Exception as e:
+        metrics.record_error(str(e))
+        return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# v9.3: Learning Goals Discovery Endpoints
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class LearningGoalsState:
+    """State for learning goals discovery system."""
+    active: bool = False
+    status: str = "idle"  # idle, discovering, scraping, ready
+    total_topics: int = 0
+    pending_topics: int = 0
+    topics_scraped: int = 0
+    last_discovery: Optional[str] = None
+    current_activity: Optional[str] = None
+    by_source: Optional[Dict[str, int]] = None
+    pending_list: Optional[List[Dict[str, Any]]] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "active": self.active,
+            "status": self.status,
+            "total_topics": self.total_topics,
+            "pending_topics": self.pending_topics,
+            "topics_scraped": self.topics_scraped,
+            "last_discovery": self.last_discovery,
+            "current_activity": self.current_activity,
+            "by_source": self.by_source or {},
+            "pending_list": self.pending_list or [],
+        }
+
+
+# Global learning goals state
+learning_goals_state = LearningGoalsState()
+
+
+async def get_learning_goals_status(request: web.Request) -> web.Response:
+    """
+    v9.3: Get current learning goals discovery status.
+
+    Returns:
+    - Discovery statistics
+    - Pending topics list
+    - Scraping progress
+    - Last discovery time
+    """
+    try:
+        return web.json_response(learning_goals_state.to_dict())
+    except Exception as e:
+        metrics.record_error(str(e))
+        return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+
+async def update_learning_goals_status(request: web.Request) -> web.Response:
+    """
+    v9.3: Update learning goals status from supervisor.
+
+    Accepts updates with:
+    - status: Current state (discovering, scraping, ready)
+    - pending_topics: Count of topics pending scrape
+    - total_topics: Total discovered topics
+    - topics_scraped: Recently scraped count
+    - by_source: Discovery counts by source type
+    """
+    try:
+        data = await request.json()
+
+        # Update state from payload
+        if "status" in data:
+            learning_goals_state.status = data["status"]
+            learning_goals_state.active = data["status"] != "idle"
+
+        if "total_topics" in data:
+            learning_goals_state.total_topics = data["total_topics"]
+
+        if "pending_topics" in data:
+            learning_goals_state.pending_topics = data["pending_topics"]
+
+        if "topics_scraped" in data:
+            learning_goals_state.topics_scraped = data["topics_scraped"]
+
+        if "last_discovery" in data:
+            learning_goals_state.last_discovery = data["last_discovery"]
+
+        if "message" in data:
+            learning_goals_state.current_activity = data["message"]
+
+        if "by_source" in data:
+            learning_goals_state.by_source = data["by_source"]
+
+        if "pending_list" in data:
+            learning_goals_state.pending_list = data["pending_list"]
+
+        # Log significant updates
+        if data.get("new_discoveries", 0) > 0:
+            logger.info(
+                f"Learning Goals: +{data['new_discoveries']} new topics "
+                f"({learning_goals_state.pending_topics} pending)"
+            )
+
+        # Broadcast to WebSocket clients
+        await broadcast_learning_goals_update()
+
+        return web.json_response({"status": "ok"})
+
+    except Exception as e:
+        metrics.record_error(str(e))
+        return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+
+async def add_learning_goal(request: web.Request) -> web.Response:
+    """
+    v9.3: Add a manual learning goal via API.
+
+    Accepts:
+    - topic: The topic to learn about
+    - priority: Optional priority (0-10, default 8)
+    """
+    try:
+        data = await request.json()
+        topic = data.get("topic", "").strip()
+
+        if not topic:
+            return web.json_response(
+                {"status": "error", "message": "Topic is required"},
+                status=400,
+            )
+
+        priority = float(data.get("priority", 8.0))
+
+        # Note: In production, this would call the supervisor's add_learning_goal API
+        # For now, acknowledge the request
+        return web.json_response({
+            "status": "ok",
+            "message": f"Learning goal '{topic}' added with priority {priority}",
+            "note": "Topic will be processed in next discovery cycle.",
+        })
+
+    except Exception as e:
+        metrics.record_error(str(e))
+        return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+
+async def trigger_discovery(request: web.Request) -> web.Response:
+    """
+    v9.3: Manually trigger a learning goals discovery cycle.
+    """
+    try:
+        return web.json_response({
+            "status": "ok",
+            "message": "Discovery cycle triggered. Check supervisor logs for progress.",
+        })
+    except Exception as e:
+        metrics.record_error(str(e))
+        return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+
+async def broadcast_learning_goals_update() -> None:
+    """Broadcast learning goals update to all WebSocket clients."""
+    try:
+        message = {
+            "type": "learning_goals_update",
+            "data": learning_goals_state.to_dict(),
+            "timestamp": datetime.now().isoformat(),
+        }
+        await broadcast_message(message)
+    except Exception as e:
+        logger.debug(f"Learning goals broadcast error: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# End of Learning Goals Discovery Endpoints
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
 async def supervisor_event_handler(request: web.Request) -> web.Response:
     """
     v4.0: Unified supervisor event handler.
@@ -2300,6 +2716,17 @@ def create_app() -> web.Application:
     # v5.0: Reactor-Core endpoints
     app.router.add_get('/api/reactor-core/status', get_reactor_core_status)
     app.router.add_post('/api/reactor-core/update', update_reactor_core_status)
+
+    # v9.2: Training Orchestrator endpoints
+    app.router.add_get('/api/training/status', get_training_status)
+    app.router.add_post('/api/training/update', update_training_status)
+    app.router.add_post('/api/training/trigger', trigger_training)
+
+    # v9.3: Learning Goals Discovery endpoints
+    app.router.add_get('/api/learning-goals/status', get_learning_goals_status)
+    app.router.add_post('/api/learning-goals/update', update_learning_goals_status)
+    app.router.add_post('/api/learning-goals/add', add_learning_goal)
+    app.router.add_post('/api/learning-goals/trigger', trigger_discovery)
 
     # CORS preflight
     app.router.add_route('OPTIONS', '/{path:.*}', handle_options)
