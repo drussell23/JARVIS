@@ -2776,7 +2776,227 @@ class SupervisorBootstrapper:
         except Exception as e:
             self.logger.debug(f"Broadcast failed: {e}")
             return False
-    
+
+    # Alias for backward compatibility
+    async def _broadcast_startup_progress(
+        self,
+        stage: str,
+        message: str,
+        progress: int,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Alias for _broadcast_to_loading_page for semantic clarity."""
+        return await self._broadcast_to_loading_page(stage, message, progress, metadata)
+
+    async def _broadcast_jarvis_prime_status(
+        self,
+        tier: str,
+        status: str,
+        health: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """
+        Broadcast JARVIS-Prime status to loading server.
+
+        Args:
+            tier: Current tier (local, cloud_run, gemini_api)
+            status: Status (starting, ready, fallback, error)
+            health: Optional health metrics
+        """
+        if not self._loading_server_process:
+            return False
+
+        try:
+            import aiohttp
+
+            loading_port = self.config.required_ports[2]  # 3001
+            url = f"http://localhost:{loading_port}/api/jarvis-prime/update"
+
+            data = {
+                "tier": tier,
+                "status": status,
+                "health": health or {},
+                "timestamp": datetime.now().isoformat(),
+            }
+
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=2.0)) as session:
+                async with session.post(url, json=data) as resp:
+                    if resp.status == 200:
+                        self.logger.debug(f"📡 JARVIS-Prime: {tier} ({status})")
+                        return True
+                    return False
+
+        except Exception as e:
+            self.logger.debug(f"JARVIS-Prime broadcast failed: {e}")
+            return False
+
+    async def _broadcast_flywheel_status(
+        self,
+        status: str,
+        experiences_collected: int = 0,
+        training_schedule: str = "03:00",
+        last_training: Optional[str] = None,
+        next_training: Optional[str] = None,
+    ) -> bool:
+        """
+        Broadcast Data Flywheel status to loading server.
+
+        Args:
+            status: Current status (idle, collecting, training, ready)
+            experiences_collected: Number of experiences collected
+            training_schedule: Training schedule time
+            last_training: Last training timestamp
+            next_training: Next scheduled training
+        """
+        if not self._loading_server_process:
+            return False
+
+        try:
+            import aiohttp
+
+            loading_port = self.config.required_ports[2]  # 3001
+            url = f"http://localhost:{loading_port}/api/flywheel/update"
+
+            data = {
+                "status": status,
+                "experiences_collected": experiences_collected,
+                "training_schedule": training_schedule,
+                "last_training": last_training,
+                "next_training": next_training,
+                "timestamp": datetime.now().isoformat(),
+            }
+
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=2.0)) as session:
+                async with session.post(url, json=data) as resp:
+                    if resp.status == 200:
+                        self.logger.debug(f"📡 Flywheel: {status}")
+                        return True
+                    return False
+
+        except Exception as e:
+            self.logger.debug(f"Flywheel broadcast failed: {e}")
+            return False
+
+    async def _broadcast_reactor_core_status(
+        self,
+        status: str,
+        components: Optional[Dict[str, bool]] = None,
+        training_active: bool = False,
+        model_version: Optional[str] = None,
+    ) -> bool:
+        """
+        Broadcast Reactor-Core status to loading server.
+
+        Args:
+            status: Current status (initializing, ready, training, deploying)
+            components: Component availability (jarvis_connector, scout, trainer, watcher)
+            training_active: Whether training is in progress
+            model_version: Current model version if available
+        """
+        if not self._loading_server_process:
+            return False
+
+        try:
+            import aiohttp
+
+            loading_port = self.config.required_ports[2]  # 3001
+            url = f"http://localhost:{loading_port}/api/reactor-core/update"
+
+            data = {
+                "status": status,
+                "components": components or {},
+                "training_active": training_active,
+                "model_version": model_version,
+                "timestamp": datetime.now().isoformat(),
+            }
+
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=2.0)) as session:
+                async with session.post(url, json=data) as resp:
+                    if resp.status == 200:
+                        self.logger.debug(f"📡 Reactor-Core: {status}")
+                        return True
+                    return False
+
+        except Exception as e:
+            self.logger.debug(f"Reactor-Core broadcast failed: {e}")
+            return False
+
+    async def _broadcast_learning_goals_status(
+        self,
+        goals: List[Dict[str, Any]],
+        total_goals: int = 0,
+        active_goals: int = 0,
+        completed_goals: int = 0,
+    ) -> bool:
+        """
+        Broadcast Learning Goals status to loading server.
+
+        Args:
+            goals: List of current learning goals
+            total_goals: Total number of goals
+            active_goals: Number of active goals
+            completed_goals: Number of completed goals
+        """
+        if not self._loading_server_process:
+            return False
+
+        try:
+            import aiohttp
+
+            loading_port = self.config.required_ports[2]  # 3001
+            url = f"http://localhost:{loading_port}/api/learning-goals/update"
+
+            data = {
+                "goals": goals[:10],  # Limit to 10 goals
+                "total_goals": total_goals,
+                "active_goals": active_goals,
+                "completed_goals": completed_goals,
+                "timestamp": datetime.now().isoformat(),
+            }
+
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=2.0)) as session:
+                async with session.post(url, json=data) as resp:
+                    if resp.status == 200:
+                        self.logger.debug(f"📡 Learning Goals: {active_goals} active")
+                        return True
+                    return False
+
+        except Exception as e:
+            self.logger.debug(f"Learning Goals broadcast failed: {e}")
+            return False
+
+    async def _broadcast_intelligence_systems_status(
+        self,
+        uae_status: Optional[Dict[str, Any]] = None,
+        sai_status: Optional[Dict[str, Any]] = None,
+        neural_mesh_status: Optional[Dict[str, Any]] = None,
+        mas_status: Optional[Dict[str, Any]] = None,
+        cai_status: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """
+        Broadcast Intelligence Systems status to loading server.
+
+        Args:
+            uae_status: UAE (Unified Awareness Engine) status
+            sai_status: SAI (Situational Awareness Intelligence) status
+            neural_mesh_status: Neural Mesh status
+            mas_status: MAS (Multi-Agent System) status
+            cai_status: CAI (Collective AI Intelligence) status
+        """
+        return await self._broadcast_startup_progress(
+            stage="intelligence_systems",
+            message="Intelligence Systems status update",
+            progress=90,
+            metadata={
+                "intelligence_systems": {
+                    "uae": uae_status or {"status": "unknown"},
+                    "sai": sai_status or {"status": "unknown"},
+                    "neural_mesh": neural_mesh_status or {"status": "unknown"},
+                    "mas": mas_status or {"status": "unknown"},
+                    "cai": cai_status or {"status": "unknown"},
+                }
+            }
+        )
+
     async def _monitor_jarvis_startup(self, max_wait: float = 120.0) -> bool:
         """
         Monitor JARVIS startup and broadcast progress to loading page.
@@ -4076,7 +4296,7 @@ class SupervisorBootstrapper:
             self.logger.info("✅ Data Flywheel initialized")
             print(f"  {TerminalUI.GREEN}✓ Data Flywheel: Self-improving learning active{TerminalUI.RESET}")
 
-            # Broadcast flywheel ready
+            # Broadcast flywheel ready via general progress
             await self._broadcast_startup_progress(
                 stage="data_flywheel_ready",
                 message="Data Flywheel ready for self-improving learning",
@@ -4089,6 +4309,13 @@ class SupervisorBootstrapper:
                         "learning_goals_enabled": self.config.learning_goals_enabled,
                     }
                 }
+            )
+
+            # v9.1: Also broadcast to specialized flywheel endpoint
+            await self._broadcast_flywheel_status(
+                status="ready",
+                experiences_collected=0,
+                training_schedule=self.config.data_flywheel_training_schedule,
             )
 
         except ImportError as e:
@@ -5273,6 +5500,13 @@ class SupervisorBootstrapper:
                         f"(components: {', '.join(active_components)})"
                     )
                     print(f"  {TerminalUI.GREEN}✓ Reactor-Core: Training pipeline integration active{TerminalUI.RESET}")
+
+                    # v9.1: Broadcast reactor-core status to loading server
+                    await self._broadcast_reactor_core_status(
+                        status="ready",
+                        components=reactor_status.get("components", {}),
+                        training_active=False,
+                    )
                 else:
                     self.logger.warning("⚠️ Reactor-Core initialization returned false")
                     os.environ["REACTOR_CORE_ENABLED"] = "false"
@@ -5313,6 +5547,29 @@ class SupervisorBootstrapper:
         self.logger.info("═" * 60)
         self.logger.info(f"✅ Intelligence Stack: {len(active_systems)}/7 systems active")
         self.logger.info("═" * 60)
+
+        # v9.1: Broadcast comprehensive intelligence systems status
+        await self._broadcast_intelligence_systems_status(
+            uae_status={
+                "status": "ready" if initialized_systems["uae"] else "unavailable",
+                "chain_of_thought": self.config.uae_chain_of_thought,
+            },
+            sai_status={
+                "status": "ready" if initialized_systems["sai"] else "unavailable",
+                "yabai_bridge": self.config.sai_yabai_bridge,
+            },
+            neural_mesh_status={
+                "status": "ready" if initialized_systems["neural_mesh"] else "unavailable",
+                "sync_interval": self.config.neural_mesh_sync_interval,
+            },
+            mas_status={
+                "status": "ready" if initialized_systems["mas"] else "unavailable",
+                "max_agents": self.config.mas_max_concurrent_agents,
+            },
+            cai_status={
+                "status": "ready" if initialized_systems["cai"] else "unavailable",
+            },
+        )
 
     async def _run_continuous_scraping(self) -> None:
         """
