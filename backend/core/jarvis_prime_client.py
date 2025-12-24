@@ -798,14 +798,18 @@ class JarvisPrimeClient:
         if not self.config.gemini_api_key:
             return CompletionResponse(success=False, error="Gemini API key not configured", backend="gemini")
 
+        # Try the new google-genai SDK first, fallback to deprecated SDK
         try:
-            import google.generativeai as genai
+            from google import genai
+            use_new_sdk = True
         except ImportError:
-            return CompletionResponse(success=False, error="google-generativeai not installed", backend="gemini")
+            try:
+                import google.generativeai as genai_old
+                use_new_sdk = False
+            except ImportError:
+                return CompletionResponse(success=False, error="google-genai not installed", backend="gemini")
 
-        genai.configure(api_key=self.config.gemini_api_key)
-
-        # Build prompt from messages
+        # Build prompt from messages (convert to Gemini format)
         prompt_parts = []
         for m in messages:
             if m.role == "system":
@@ -815,34 +819,56 @@ class JarvisPrimeClient:
             elif m.role == "assistant":
                 prompt_parts.append(f"Assistant: {m.content}")
         prompt_parts.append("Assistant:")
-
         prompt = "\n".join(prompt_parts)
 
         start = time.time()
         try:
-            model = genai.GenerativeModel(self.config.gemini_model)
-            response = await asyncio.to_thread(
-                model.generate_content,
-                prompt,
-                generation_config=genai.types.GenerationConfig(
-                    max_output_tokens=max_tokens,
-                    temperature=temperature,
-                ),
-            )
+            if use_new_sdk:
+                # New google-genai SDK (recommended)
+                client = genai.Client(api_key=self.config.gemini_api_key)
+
+                # Use gemini-2.0-flash-lite for fastest/cheapest, fallback to configured model
+                model_name = self.config.gemini_model
+                if model_name == "gemini-1.5-flash":
+                    model_name = "gemini-2.0-flash-lite"  # Upgrade to newer model
+
+                response = await asyncio.to_thread(
+                    client.models.generate_content,
+                    model=model_name,
+                    contents=prompt,
+                    config={
+                        "max_output_tokens": max_tokens,
+                        "temperature": temperature,
+                    },
+                )
+                content = response.text
+            else:
+                # Deprecated SDK (backwards compatibility)
+                genai_old.configure(api_key=self.config.gemini_api_key)
+                model = genai_old.GenerativeModel(self.config.gemini_model)
+                response = await asyncio.to_thread(
+                    model.generate_content,
+                    prompt,
+                    generation_config=genai_old.types.GenerationConfig(
+                        max_output_tokens=max_tokens,
+                        temperature=temperature,
+                    ),
+                )
+                content = response.text
+
             latency = (time.time() - start) * 1000
 
-            content = response.text
-
-            # Estimate Gemini cost (~$0.0001 per 1K tokens for Flash)
-            tokens = len(prompt.split()) + len(content.split())
-            cost = (tokens / 1000) * 0.0001
+            # Estimate Gemini cost (~$0.075/1M input, ~$0.30/1M output for Flash)
+            input_tokens = len(prompt.split())
+            output_tokens = len(content.split())
+            cost = (input_tokens * 0.000000075) + (output_tokens * 0.0000003)
 
             return CompletionResponse(
                 success=True,
                 content=content,
                 latency_ms=latency,
                 backend="gemini",
-                tokens_used=tokens,
+                tokens_used=input_tokens + output_tokens,
                 cost_estimate=cost,
             )
         except Exception as e:

@@ -114,6 +114,30 @@ from .autonomous_agent import (
     chat
 )
 
+# Reactor-Core Watcher (Auto-deploy trained models)
+from .reactor_core_watcher import (
+    ReactorCoreWatcher,
+    ReactorCoreConfig,
+    DeploymentResult,
+    ModelValidator,
+    get_reactor_core_watcher,
+    start_reactor_core_watcher,
+    stop_reactor_core_watcher,
+)
+
+# Unified Data Flywheel (Self-improving learning loop)
+from .unified_data_flywheel import (
+    UnifiedDataFlywheel,
+    FlywheelConfig,
+    FlywheelProgress,
+    FlywheelResult,
+    FlywheelStage,
+    DataSourceType,
+    get_data_flywheel,
+    run_flywheel_cycle,
+    get_flywheel_status,
+)
+
 __all__ = [
     # Original Decision Engine
     'AutonomousDecisionEngine',
@@ -213,5 +237,25 @@ __all__ = [
     'create_and_initialize_agent',
     'get_default_agent',
     'run_autonomous',
-    'chat'
+    'chat',
+
+    # Reactor-Core Watcher
+    'ReactorCoreWatcher',
+    'ReactorCoreConfig',
+    'DeploymentResult',
+    'ModelValidator',
+    'get_reactor_core_watcher',
+    'start_reactor_core_watcher',
+    'stop_reactor_core_watcher',
+
+    # Unified Data Flywheel
+    'UnifiedDataFlywheel',
+    'FlywheelConfig',
+    'FlywheelProgress',
+    'FlywheelResult',
+    'FlywheelStage',
+    'DataSourceType',
+    'get_data_flywheel',
+    'run_flywheel_cycle',
+    'get_flywheel_status',
 ]
