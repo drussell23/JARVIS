@@ -444,12 +444,16 @@ class CloudMLRouter:
                     f"cost saved by early shutdown: ${cost_saved_this_session:.4f}"
                 )
 
-            # Delete VM via GCP VM Manager
+            # Terminate VM via GCP VM Manager (using correct method name)
             if self._gcp_vm_manager:
                 for vm_name, vm in list(self._gcp_vm_manager.managed_vms.items()):
                     if vm.ip_address == vm_ip:
                         logger.info(f"🗑️  Shutting down idle VM: {vm_name}")
-                        await self._gcp_vm_manager.delete_vm(vm_name)
+                        # Fix: Use terminate_vm() instead of non-existent delete_vm()
+                        await self._gcp_vm_manager.terminate_vm(
+                            vm_name,
+                            reason=f"Scale-to-zero: idle for {(time.time() - (self._last_request_time or 0)) / 60:.1f}min"
+                        )
                         self._stats["vm_shutdowns_idle"] += 1
                         break
 

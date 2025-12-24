@@ -741,6 +741,17 @@ except ImportError:
     pass  # Will be registered later during shutdown sequence
 
 # =============================================================================
+# v2.0: Register Infrastructure Orchestrator shutdown hooks
+# This ensures Terraform-managed resources (Cloud Run, Redis) are cleaned up.
+# Also prepares orphan detection for crashed session resources.
+# =============================================================================
+try:
+    from backend.core.infrastructure_orchestrator import register_shutdown_hook as _register_infra_shutdown
+    _register_infra_shutdown()
+except ImportError:
+    pass  # Infrastructure orchestrator not available
+
+# =============================================================================
 # CRITICAL: Global Session Manager - Initialize FIRST for cleanup reliability
 # This ensures session tracking is always available, even during early failures
 # =============================================================================
@@ -13878,6 +13889,34 @@ except Exception as e:
                 elif "frontend" in name.lower():
                     self.ports["frontend"] = service.port
                     self.frontend_port = service.port  # Keep alias in sync
+
+        # =================================================================
+        # v2.0: Start Infrastructure Orchestrator Orphan Detection
+        # =================================================================
+        # This detects and cleans up orphaned GCP resources from crashed sessions.
+        # Runs every 5 minutes (configurable via ORPHAN_CHECK_INTERVAL_MINUTES).
+        # =================================================================
+        try:
+            from backend.core.infrastructure_orchestrator import (
+                get_infrastructure_orchestrator,
+                start_orphan_detection,
+            )
+
+            # Initialize orchestrator (creates session lock)
+            infra_orchestrator = await get_infrastructure_orchestrator()
+            logger.info("🔧 Infrastructure Orchestrator initialized")
+
+            # Start orphan detection loop (background task)
+            orphan_loop = await start_orphan_detection(auto_cleanup=True)
+            logger.info("🔍 Orphan detection loop started (5-minute interval)")
+
+            print(f"   • {Colors.GREEN}✓ Infrastructure Orchestrator:{Colors.ENDC} Session tracking active")
+            print(f"   • {Colors.GREEN}✓ Orphan Detection:{Colors.ENDC} Background cleanup enabled")
+        except ImportError:
+            logger.debug("Infrastructure orchestrator not available")
+        except Exception as e:
+            logger.warning(f"Infrastructure orchestrator init failed: {e}")
+            print(f"   • {Colors.YELLOW}○ Infrastructure Orchestrator:{Colors.ENDC} {e}")
 
         # Start pre-warming imports early
         await broadcast_progress(

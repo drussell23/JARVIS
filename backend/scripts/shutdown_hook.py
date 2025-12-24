@@ -80,84 +80,161 @@ async def cleanup_remote_resources(
     reason: str = "JARVIS shutdown",
 ) -> Dict[str, Any]:
     """
-    Force cleanup of all GCP Spot VMs (async version).
-    
+    Force cleanup of all GCP resources (async version).
+
     This is the primary cleanup function that should be called on shutdown.
     It's designed to be robust and work even if some components are unavailable.
-    
+
+    v3.0: Enhanced with infrastructure orchestrator integration for:
+    - Terraform-managed resources (Cloud Run, Redis, etc.)
+    - Session lock release
+    - Orphan detection loop stop
+
     Args:
         timeout: Maximum time to wait for cleanup (seconds)
         reason: Reason for cleanup (for logging)
-        
+
     Returns:
         Dict with cleanup results: {
             "success": bool,
             "vms_cleaned": int,
+            "terraform_destroyed": int,
             "errors": List[str],
-            "method": str  # "vm_manager" | "gcloud_cli" | "none"
+            "method": str
         }
     """
     global _cleanup_started, _cleanup_completed
-    
+
     # Idempotency check
     with _cleanup_lock:
         if _cleanup_completed:
             logger.info("🔄 Cleanup already completed, skipping")
-            return {"success": True, "vms_cleaned": 0, "errors": [], "method": "cached"}
-        
+            return {"success": True, "vms_cleaned": 0, "terraform_destroyed": 0, "errors": [], "method": "cached"}
+
         if _cleanup_started:
             logger.info("⏳ Cleanup already in progress, waiting...")
             # Wait for existing cleanup to complete
             for _ in range(int(timeout)):
                 if _cleanup_completed:
-                    return {"success": True, "vms_cleaned": 0, "errors": [], "method": "cached"}
+                    return {"success": True, "vms_cleaned": 0, "terraform_destroyed": 0, "errors": [], "method": "cached"}
                 await asyncio.sleep(1)
-            return {"success": False, "vms_cleaned": 0, "errors": ["Timeout waiting for existing cleanup"], "method": "timeout"}
-        
+            return {"success": False, "vms_cleaned": 0, "terraform_destroyed": 0, "errors": ["Timeout waiting for existing cleanup"], "method": "timeout"}
+
         _cleanup_started = True
-    
-    logger.info(f"🪝 Shutdown Hook: Cleaning remote resources (reason: {reason})...")
-    
+
+    logger.info(f"🪝 Shutdown Hook v3.0: Cleaning remote resources (reason: {reason})...")
+
     results = {
         "success": False,
         "vms_cleaned": 0,
+        "terraform_destroyed": 0,
         "errors": [],
         "method": "none",
     }
-    
+
     try:
-        # Method 1: Try using the VM Manager (preferred)
-        cleaned = await _cleanup_via_vm_manager(timeout)
+        # Step 0: Cleanup Infrastructure Orchestrator (Terraform-managed resources)
+        # This MUST run first to destroy Cloud Run/Redis before VM cleanup
+        terraform_count = await _cleanup_via_infrastructure_orchestrator(timeout / 3)
+        if terraform_count >= 0:
+            results["terraform_destroyed"] = terraform_count
+            logger.info(f"   Terraform cleanup: {terraform_count} resource(s)")
+
+        # Step 1: Try using the VM Manager (preferred for VMs)
+        cleaned = await _cleanup_via_vm_manager(timeout / 3)
         if cleaned >= 0:
             results["vms_cleaned"] = cleaned
             results["method"] = "vm_manager"
             results["success"] = True
-            
-        # Method 2: If VM Manager failed/unavailable, try gcloud CLI
+
+        # Step 2: If VM Manager failed/unavailable, try gcloud CLI
         if not results["success"]:
-            cleaned, errors = await _cleanup_via_gcloud(timeout)
+            cleaned, errors = await _cleanup_via_gcloud(timeout / 3)
             results["vms_cleaned"] = cleaned
             results["errors"].extend(errors)
             results["method"] = "gcloud_cli" if cleaned > 0 else "none"
             results["success"] = cleaned >= 0
-            
+
+        # If we cleaned any Terraform resources, consider it a success
+        if results["terraform_destroyed"] > 0:
+            results["success"] = True
+            results["method"] = f"terraform+{results['method']}" if results["method"] != "none" else "terraform"
+
     except Exception as e:
         logger.error(f"❌ Cleanup failed: {e}")
         results["errors"].append(str(e))
-    
+
     finally:
         with _cleanup_lock:
             _cleanup_completed = True
-    
+
     if results["success"]:
-        logger.info(f"✅ Shutdown hook complete: {results['vms_cleaned']} VM(s) cleaned ({results['method']})")
+        total_cleaned = results["vms_cleaned"] + results["terraform_destroyed"]
+        logger.info(f"✅ Shutdown hook complete: {total_cleaned} resource(s) cleaned ({results['method']})")
     else:
         logger.warning(f"⚠️ Shutdown hook completed with issues: {results}")
-    
+
     # v2.0: Notify cost tracker of cleanup for accurate cost tracking
     await _notify_cost_tracker(results, reason)
-    
+
     return results
+
+
+async def _cleanup_via_infrastructure_orchestrator(timeout: float) -> int:
+    """
+    Cleanup using the Infrastructure Orchestrator (Terraform-managed resources).
+
+    This handles:
+    - Cloud Run services (JARVIS Prime, Backend)
+    - Redis/Memorystore
+    - Any other Terraform-managed resources
+
+    Returns:
+        Number of resources cleaned, or -1 if unavailable
+    """
+    try:
+        backend_path = Path(__file__).parent.parent
+        if str(backend_path) not in sys.path:
+            sys.path.insert(0, str(backend_path))
+
+        # Try to import the orchestrator
+        for module_path in ["core.infrastructure_orchestrator", "backend.core.infrastructure_orchestrator"]:
+            try:
+                import importlib
+                module = importlib.import_module(module_path)
+                cleanup_func = getattr(module, "cleanup_infrastructure_on_shutdown", None)
+                get_orchestrator = getattr(module, "get_infrastructure_orchestrator", None)
+                if cleanup_func:
+                    break
+            except ImportError:
+                continue
+        else:
+            logger.debug("   Infrastructure Orchestrator not available")
+            return -1
+
+        logger.info("   Running Infrastructure Orchestrator cleanup...")
+
+        # Run cleanup with timeout
+        await asyncio.wait_for(cleanup_func(), timeout=timeout)
+
+        # Try to get stats on what was cleaned
+        try:
+            # Get the orchestrator to check stats (if available)
+            _orchestrator_instance = getattr(module, "_orchestrator_instance", None)
+            if _orchestrator_instance:
+                status = _orchestrator_instance.get_status()
+                return status.get("terraform_operations", {}).get("destroy_count", 0)
+        except Exception:
+            pass
+
+        return 0  # Cleanup ran but can't get count
+
+    except asyncio.TimeoutError:
+        logger.warning("   Infrastructure Orchestrator cleanup timed out")
+        return -1
+    except Exception as e:
+        logger.debug(f"   Infrastructure Orchestrator cleanup error: {e}")
+        return -1
 
 
 async def _notify_cost_tracker(

@@ -4928,6 +4928,10 @@ class ProcessCleanupManager:
             ipc_cleaned = self._cleanup_ipc_resources()
             cleanup_report["ipc_resources_cleaned"] = ipc_cleaned
 
+            # v2.0: Cleanup orphaned GCP infrastructure via orchestrator
+            infra_cleaned = await self._cleanup_orphaned_infrastructure()
+            cleanup_report["infrastructure_cleaned"] = infra_cleaned
+
         # Save cleanup history for learning
         self.cleanup_history.append(cleanup_report)
         self._save_cleanup_history()
@@ -5117,6 +5121,79 @@ class ProcessCleanupManager:
             logger.error(f"Error cleaning up IPC resources: {e}")
 
         return cleaned
+
+    async def _cleanup_orphaned_infrastructure(self) -> Dict[str, Any]:
+        """
+        v2.0: Cleanup orphaned GCP infrastructure via Infrastructure Orchestrator.
+
+        This integrates with the GCPReconciler to:
+        - Detect orphaned VMs from crashed sessions
+        - Detect orphaned Cloud Run services
+        - Clean them up automatically
+
+        Returns:
+            Dict with cleanup results:
+            - vms_cleaned: Number of orphaned VMs deleted
+            - cloud_run_cleaned: Number of orphaned Cloud Run services deleted
+            - errors: List of any errors encountered
+        """
+        results = {
+            "vms_cleaned": 0,
+            "cloud_run_cleaned": 0,
+            "errors": [],
+            "checked": False,
+        }
+
+        try:
+            # Import the orchestrator
+            from core.infrastructure_orchestrator import get_reconciler
+
+            reconciler = get_reconciler()
+            if reconciler is None:
+                logger.debug("GCP Reconciler not initialized - skipping infrastructure cleanup")
+                return results
+
+            results["checked"] = True
+
+            # Reconcile with GCP to find orphans
+            logger.info("🔍 Checking for orphaned GCP infrastructure...")
+            reconcile_result = await reconciler.reconcile_with_gcp()
+
+            if reconcile_result.get("error"):
+                results["errors"].append(reconcile_result["error"])
+                return results
+
+            orphan_count = (
+                len(reconcile_result.get("orphaned_vms", [])) +
+                len(reconcile_result.get("orphaned_cloud_run", []))
+            )
+
+            if orphan_count == 0:
+                logger.debug("No orphaned GCP infrastructure found")
+                return results
+
+            logger.warning(f"🗑️  Found {orphan_count} orphaned GCP resources - cleaning up...")
+
+            # Clean up orphans
+            cleanup_result = await reconciler.cleanup_orphans(reconcile_result)
+
+            results["vms_cleaned"] = len(cleanup_result.get("vms_deleted", []))
+            results["cloud_run_cleaned"] = len(cleanup_result.get("cloud_run_deleted", []))
+            results["errors"].extend(cleanup_result.get("errors", []))
+
+            if results["vms_cleaned"] > 0 or results["cloud_run_cleaned"] > 0:
+                logger.info(
+                    f"✅ Cleaned {results['vms_cleaned']} orphaned VMs, "
+                    f"{results['cloud_run_cleaned']} orphaned Cloud Run services"
+                )
+
+        except ImportError:
+            logger.debug("Infrastructure orchestrator not available")
+        except Exception as e:
+            logger.warning(f"Infrastructure cleanup error: {e}")
+            results["errors"].append(str(e))
+
+        return results
 
     def _update_problem_patterns(self, process_name: str, was_problematic: bool):
         """Learn from cleanup actions"""
