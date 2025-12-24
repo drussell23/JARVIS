@@ -6389,106 +6389,150 @@ class SupervisorBootstrapper:
 
     async def _run_continuous_scraping(self) -> None:
         """
-        Background task for continuous web scraping.
+        v9.4: Enhanced background task for intelligent continuous web scraping.
 
-        Runs at configurable intervals (default: every 4 hours) to:
-        - Discover new documentation and learning content
-        - Scrape and process web pages via Safe Scout
-        - Feed new data into the training pipeline
+        Uses IntelligentContinuousScraper for:
+        - Adaptive scheduling based on system load and time of day
+        - Topic priority queue with automatic discovery
+        - Integration with JARVIS learning goals
+        - Rate limiting and quality filtering
+        - Safe Scout integration from reactor-core
         """
+        self.logger.info("📅 v9.4 Intelligent Continuous Scraping starting...")
+
+        try:
+            # Try to use the new IntelligentContinuousScraper
+            from backend.autonomy.intelligent_continuous_scraper import (
+                get_continuous_scraper,
+                ScrapingMode,
+                TopicSource,
+            )
+
+            self._intelligent_scraper = get_continuous_scraper()
+
+            # Register progress callback
+            def on_scraping_progress(progress):
+                if progress.pages_scraped_this_cycle > 0:
+                    self.logger.debug(
+                        f"📊 Scraping: {progress.pages_scraped_this_cycle} pages, "
+                        f"topic: {progress.current_topic}"
+                    )
+
+            self._intelligent_scraper.register_progress_callback(on_scraping_progress)
+
+            # Add initial topics from config
+            if self.config.continuous_scraping_topics:
+                topics = [t.strip() for t in self.config.continuous_scraping_topics.split(",") if t.strip()]
+                for topic in topics:
+                    await self._intelligent_scraper.add_topic(
+                        topic=topic,
+                        priority=8,  # High priority for user-configured topics
+                        source=TopicSource.MANUAL
+                    )
+                self.logger.info(f"📚 Added {len(topics)} configured topics")
+
+            # Add topics from learning goals
+            if hasattr(self, '_learning_goals_manager') and self._learning_goals_manager:
+                pending_goals = self._learning_goals_manager.get_pending_goals()
+                for goal in pending_goals[:10]:
+                    await self._intelligent_scraper.add_topic(
+                        topic=goal.topic,
+                        priority=goal.priority if hasattr(goal, 'priority') else 5,
+                        source=TopicSource.AUTO_DISCOVERED
+                    )
+
+            # Start the intelligent scraper
+            await self._intelligent_scraper.start(mode=ScrapingMode.CONTINUOUS)
+
+            # Announce startup
+            if hasattr(self, 'narrator') and self.narrator:
+                await self.narrator.speak(
+                    "Intelligent continuous web research is now active.",
+                    wait=False
+                )
+
+            # Wait until cancelled
+            while True:
+                await asyncio.sleep(60)
+
+                # Periodically log stats
+                stats = self._intelligent_scraper.get_stats()
+                if stats["progress"]["cycles_completed"] > 0:
+                    self.logger.debug(
+                        f"📈 Scraping stats: {stats['progress']['pages_scraped_total']} total pages, "
+                        f"{stats['progress']['topics_completed']} topics completed"
+                    )
+
+        except ImportError:
+            # Fall back to the legacy scraping mode
+            self.logger.warning("IntelligentContinuousScraper not available, using legacy mode")
+            await self._run_legacy_continuous_scraping()
+
+        except asyncio.CancelledError:
+            self.logger.info("Intelligent continuous scraping stopped")
+            if hasattr(self, '_intelligent_scraper') and self._intelligent_scraper:
+                await self._intelligent_scraper.stop()
+            raise
+
+        except Exception as e:
+            self.logger.error(f"Intelligent continuous scraping error: {e}")
+            # Fall back to legacy mode
+            await self._run_legacy_continuous_scraping()
+
+    async def _run_legacy_continuous_scraping(self) -> None:
+        """Legacy continuous scraping fallback for compatibility."""
         interval_seconds = self.config.continuous_scraping_interval_hours * 3600
-        self.logger.info(f"📅 Continuous scraping started (interval: {self.config.continuous_scraping_interval_hours}h)")
+        self.logger.info(f"📅 Legacy scraping mode (interval: {self.config.continuous_scraping_interval_hours}h)")
 
         while True:
             try:
-                # Wait for the configured interval
                 await asyncio.sleep(interval_seconds)
 
-                self.logger.info("🌐 Starting continuous web scraping cycle...")
+                self.logger.info("🌐 Starting legacy web scraping cycle...")
 
-                # Check if flywheel is available and not busy
                 if hasattr(self, '_data_flywheel') and self._data_flywheel:
                     if self._data_flywheel.is_running:
                         self.logger.debug("Flywheel busy, skipping scraping cycle")
                         continue
 
-                    # Parse topics from config (comma-separated)
                     topics = []
                     if self.config.continuous_scraping_topics:
                         topics = [t.strip() for t in self.config.continuous_scraping_topics.split(",") if t.strip()]
 
-                    # If no explicit topics, use learning goals
                     if not topics and hasattr(self, '_learning_goals_manager') and self._learning_goals_manager:
                         pending_goals = self._learning_goals_manager.get_pending_goals()
-                        topics = [g.topic for g in pending_goals[:5]]  # Top 5 priority topics
+                        topics = [g.topic for g in pending_goals[:5]]
 
                     if topics:
                         self.logger.info(f"📚 Scraping topics: {topics}")
-
-                        # Announce scraping start
-                        if hasattr(self, 'narrator') and self.narrator:
-                            await self.narrator.speak(
-                                f"Starting background web research on {len(topics)} topics.",
-                                wait=False
-                            )
-
-                        # Run flywheel with web scraping only (no training)
-                        try:
-                            result = await self._data_flywheel.run_web_scraping_only(
-                                topics=topics,
-                                max_pages=self.config.continuous_scraping_max_pages,
-                            )
-
-                            if result.success:
-                                self.logger.info(
-                                    f"✅ Scraping complete: {result.progress.web_pages_scraped} pages, "
-                                    f"{result.progress.experiences_collected} experiences"
-                                )
-
-                                # Update CAI with scraping insights
-                                if hasattr(self, '_cai') and self._cai:
-                                    from dataclasses import dataclass, field
-                                    self._cai.add_insight_source(
-                                        topic="web_scraping",
-                                        source=InsightSource(
-                                            system="scraper",
-                                            confidence=0.7,
-                                            timestamp=time.time(),
-                                            data={
-                                                "pages_scraped": result.progress.web_pages_scraped,
-                                                "topics": topics,
-                                            }
-                                        )
-                                    )
-                            else:
-                                self.logger.warning(f"⚠️ Scraping failed: {result.error}")
-
-                        except AttributeError:
-                            # Flywheel might not have run_web_scraping_only method
-                            # Fall back to full cycle without training
-                            result = await self._data_flywheel.run_full_cycle(
-                                include_web_scraping=True,
-                                include_training=False,
-                            )
-                    else:
-                        self.logger.debug("No topics configured for scraping")
-
-                else:
-                    self.logger.debug("Data Flywheel not available for scraping")
+                        result = await self._data_flywheel.run_full_cycle(
+                            include_web_scraping=True,
+                            include_training=False,
+                        )
+                        if result.success:
+                            self.logger.info(f"✅ Scraping complete: {result.progress.web_pages_scraped} pages")
 
             except asyncio.CancelledError:
-                self.logger.info("Continuous scraping stopped")
+                self.logger.info("Legacy scraping stopped")
                 break
             except Exception as e:
-                self.logger.error(f"Continuous scraping error: {e}")
-                # Wait 30 minutes before retrying on error
+                self.logger.error(f"Legacy scraping error: {e}")
                 await asyncio.sleep(1800)
 
     async def _stop_intelligence_systems(self) -> None:
         """Stop all intelligence systems gracefully."""
         self.logger.info("🛑 Stopping Intelligence Systems...")
 
-        # Stop continuous scraping
+        # v9.4: Stop intelligent continuous scraper
+        if hasattr(self, '_intelligent_scraper') and self._intelligent_scraper:
+            try:
+                await self._intelligent_scraper.stop()
+                self.logger.info("✅ Intelligent Scraper stopped")
+            except Exception as e:
+                self.logger.warning(f"Intelligent Scraper shutdown error: {e}")
+            self._intelligent_scraper = None
+
+        # Stop continuous scraping task
         if hasattr(self, '_continuous_scraping_task') and self._continuous_scraping_task:
             self._continuous_scraping_task.cancel()
             try:

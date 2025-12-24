@@ -1,0 +1,109 @@
+# JARVIS AI Agent Backend - Production Container
+# ==============================================
+#
+# Multi-stage build for the JARVIS backend with:
+# - Python 3.11 with all ML dependencies
+# - Voice biometric support (ECAPA-TDNN)
+# - Neural Mesh multi-agent system
+# - Unified Data Flywheel
+# - Full observability stack
+#
+# Usage:
+#   docker build -f docker/Dockerfile.backend -t jarvis-backend .
+#   docker run -p 8010:8010 jarvis-backend
+#
+# Version: 9.4.0
+
+# =============================================================================
+# Stage 1: Base Python with ML dependencies
+# =============================================================================
+FROM python:3.11-slim-bookworm AS base
+
+LABEL maintainer="JARVIS AI Agent Team"
+LABEL description="JARVIS AI Agent Backend Server"
+LABEL version="9.4.0"
+
+# System dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    git \
+    curl \
+    ffmpeg \
+    libsndfile1 \
+    libportaudio2 \
+    sqlite3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user for security
+RUN groupadd -r jarvis && useradd -r -g jarvis -d /app -s /sbin/nologin jarvis
+
+WORKDIR /app
+
+# =============================================================================
+# Stage 2: Python dependencies
+# =============================================================================
+FROM base AS dependencies
+
+# Copy requirements first for better caching
+COPY requirements.txt /app/
+COPY pyproject.toml /app/
+
+# Install Python dependencies
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
+
+# Install ML dependencies separately (larger packages)
+RUN pip install --no-cache-dir \
+    torch>=2.0.0 \
+    torchaudio>=2.0.0 \
+    transformers>=4.35.0 \
+    speechbrain>=0.5.15 \
+    chromadb>=0.4.0 \
+    langchain>=0.1.0 \
+    langgraph>=0.0.25 \
+    langfuse>=2.0.0 \
+    anthropic>=0.18.0
+
+# =============================================================================
+# Stage 3: Production image
+# =============================================================================
+FROM dependencies AS production
+
+# Copy application code
+COPY backend/ /app/backend/
+COPY run_supervisor.py /app/
+COPY start_system.py /app/
+COPY loading_server.py /app/
+
+# Copy docker entrypoint
+COPY docker/entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
+
+# Create required directories
+RUN mkdir -p /app/data/training_db /app/data/logs /app/models /app/cache && \
+    chown -R jarvis:jarvis /app
+
+# Environment variables
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONPATH=/app
+ENV JARVIS_DOCKER=true
+ENV JARVIS_DATA_DIR=/app/data
+ENV JARVIS_MODELS_DIR=/app/models
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:8010/health || exit 1
+
+# Switch to non-root user
+USER jarvis
+
+# Expose ports
+EXPOSE 8010
+
+# Volumes for persistent data
+VOLUME ["/app/data", "/app/models"]
+
+# Default command
+ENTRYPOINT ["/app/entrypoint.sh"]
+CMD ["python", "-m", "uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8010"]

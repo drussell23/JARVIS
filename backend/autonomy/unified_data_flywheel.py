@@ -64,13 +64,22 @@ import json
 import logging
 import os
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Awaitable
+from typing import Any, Callable, Dict, List, Optional, Awaitable, Tuple
 
 logger = logging.getLogger(__name__)
+
+# v9.4: Try to import aiosqlite for async database operations
+try:
+    import aiosqlite
+    AIOSQLITE_AVAILABLE = True
+except ImportError:
+    AIOSQLITE_AVAILABLE = False
+    logger.info("[Flywheel] aiosqlite not available, using sync sqlite3")
 
 
 # =============================================================================
@@ -272,6 +281,10 @@ class UnifiedDataFlywheel:
         # v9.0: SQLite Training Database
         self._training_db = None
         self._training_db_conn = None
+
+        # v9.4: Async SQLite connection pool
+        self._async_db_conn: Optional[aiosqlite.Connection] = None if AIOSQLITE_AVAILABLE else None
+        self._db_lock = asyncio.Lock()
 
         # Last training timestamp
         self._last_training: Optional[datetime] = None
@@ -644,6 +657,624 @@ class UnifiedDataFlywheel:
         except Exception as e:
             logger.error(f"[Flywheel] Failed to get training DB stats: {e}")
             return {"error": str(e)}
+
+    # =========================================================================
+    # v9.4: Async SQLite Methods for Enhanced Performance
+    # =========================================================================
+
+    async def _get_async_db(self) -> Optional["aiosqlite.Connection"]:
+        """Get or create async database connection."""
+        if not AIOSQLITE_AVAILABLE:
+            return None
+
+        async with self._db_lock:
+            if self._async_db_conn is None:
+                db_path = Path(self.config.training_db_path)
+                db_path.parent.mkdir(parents=True, exist_ok=True)
+
+                self._async_db_conn = await aiosqlite.connect(str(db_path))
+                self._async_db_conn.row_factory = aiosqlite.Row
+
+                # Initialize schema if needed
+                await self._async_db_conn.executescript("""
+                    CREATE TABLE IF NOT EXISTS experiences (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        timestamp REAL NOT NULL,
+                        source TEXT NOT NULL,
+                        input_text TEXT NOT NULL,
+                        output_text TEXT NOT NULL,
+                        context TEXT,
+                        quality_score REAL DEFAULT 0.5,
+                        feedback TEXT,
+                        correction TEXT,
+                        used_in_training INTEGER DEFAULT 0,
+                        training_run_id INTEGER,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                    );
+
+                    CREATE TABLE IF NOT EXISTS scraped_content (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        url TEXT UNIQUE NOT NULL,
+                        title TEXT,
+                        content TEXT NOT NULL,
+                        content_type TEXT DEFAULT 'documentation',
+                        topic TEXT,
+                        language TEXT DEFAULT 'en',
+                        quality_score REAL DEFAULT 0.5,
+                        word_count INTEGER,
+                        code_blocks INTEGER DEFAULT 0,
+                        scraped_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        used_in_training INTEGER DEFAULT 0,
+                        training_run_id INTEGER
+                    );
+
+                    CREATE TABLE IF NOT EXISTS learning_goals (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        topic TEXT UNIQUE NOT NULL,
+                        description TEXT,
+                        priority INTEGER DEFAULT 5,
+                        source TEXT DEFAULT 'auto',
+                        urls TEXT,
+                        keywords TEXT,
+                        discovered_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        started_at DATETIME,
+                        completed INTEGER DEFAULT 0,
+                        completed_at DATETIME,
+                        experiences_count INTEGER DEFAULT 0,
+                        pages_scraped INTEGER DEFAULT 0
+                    );
+
+                    CREATE TABLE IF NOT EXISTS training_runs (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        started_at DATETIME NOT NULL,
+                        completed_at DATETIME,
+                        status TEXT DEFAULT 'running',
+                        experiences_used INTEGER DEFAULT 0,
+                        pages_used INTEGER DEFAULT 0,
+                        training_steps INTEGER DEFAULT 0,
+                        training_epochs INTEGER DEFAULT 0,
+                        learning_rate REAL,
+                        batch_size INTEGER,
+                        final_loss REAL,
+                        final_eval_loss REAL,
+                        model_path TEXT,
+                        gguf_path TEXT,
+                        gguf_size_mb REAL,
+                        gguf_checksum TEXT,
+                        gcs_path TEXT,
+                        deployed_to_local INTEGER DEFAULT 0,
+                        deployed_to_cloud INTEGER DEFAULT 0,
+                        error TEXT,
+                        error_traceback TEXT,
+                        config_json TEXT
+                    );
+
+                    CREATE TABLE IF NOT EXISTS model_deployments (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        training_run_id INTEGER,
+                        model_name TEXT NOT NULL,
+                        model_version TEXT,
+                        model_path TEXT NOT NULL,
+                        gguf_path TEXT,
+                        checksum TEXT,
+                        model_size_mb REAL,
+                        deployed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        deployed_to TEXT,
+                        gcs_path TEXT,
+                        active INTEGER DEFAULT 1,
+                        performance_score REAL,
+                        rollback_reason TEXT
+                    );
+
+                    CREATE TABLE IF NOT EXISTS intelligence_insights (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        insight_type TEXT NOT NULL,
+                        topic TEXT NOT NULL,
+                        source_systems TEXT,
+                        confidence REAL DEFAULT 0.5,
+                        description TEXT NOT NULL,
+                        data_json TEXT,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        acted_upon INTEGER DEFAULT 0,
+                        outcome TEXT
+                    );
+
+                    CREATE INDEX IF NOT EXISTS idx_experiences_timestamp ON experiences(timestamp);
+                    CREATE INDEX IF NOT EXISTS idx_experiences_used ON experiences(used_in_training);
+                    CREATE INDEX IF NOT EXISTS idx_experiences_quality ON experiences(quality_score DESC);
+                    CREATE INDEX IF NOT EXISTS idx_scraped_url ON scraped_content(url);
+                    CREATE INDEX IF NOT EXISTS idx_scraped_topic ON scraped_content(topic);
+                    CREATE INDEX IF NOT EXISTS idx_scraped_quality ON scraped_content(quality_score DESC);
+                    CREATE INDEX IF NOT EXISTS idx_goals_priority ON learning_goals(priority DESC);
+                    CREATE INDEX IF NOT EXISTS idx_goals_completed ON learning_goals(completed);
+                    CREATE INDEX IF NOT EXISTS idx_runs_status ON training_runs(status);
+                    CREATE INDEX IF NOT EXISTS idx_deployments_active ON model_deployments(active);
+                """)
+                await self._async_db_conn.commit()
+
+                logger.info(f"[Flywheel] Async SQLite connection established: {db_path}")
+
+            return self._async_db_conn
+
+    async def add_experience_async(
+        self,
+        source: str,
+        input_text: str,
+        output_text: str,
+        context: Optional[Dict[str, Any]] = None,
+        quality_score: float = 0.5,
+        feedback: Optional[str] = None,
+        correction: Optional[str] = None
+    ) -> Optional[int]:
+        """
+        v9.4: Add an experience to the training database asynchronously.
+
+        Args:
+            source: Source of the experience (voice, text, api, automation)
+            input_text: User's input
+            output_text: JARVIS's response
+            context: Additional context (JSON serializable)
+            quality_score: Quality score (0.0 to 1.0)
+            feedback: User feedback (positive, negative, corrected)
+            correction: If feedback is 'corrected', the correct response
+
+        Returns:
+            Experience ID if successful, None otherwise
+        """
+        conn = await self._get_async_db()
+        if not conn:
+            # Fallback to sync method
+            return self.add_experience(source, input_text, output_text, context, quality_score)
+
+        try:
+            context_json = json.dumps(context) if context else None
+
+            async with conn.execute("""
+                INSERT INTO experiences (timestamp, source, input_text, output_text, context, quality_score, feedback, correction)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (time.time(), source, input_text, output_text, context_json, quality_score, feedback, correction)) as cursor:
+                experience_id = cursor.lastrowid
+
+            await conn.commit()
+            logger.debug(f"[Flywheel] Added async experience {experience_id} from {source}")
+            return experience_id
+
+        except Exception as e:
+            logger.error(f"[Flywheel] Failed to add async experience: {e}")
+            return None
+
+    async def get_unused_experiences_async(
+        self,
+        limit: int = 1000,
+        min_quality: float = 0.3,
+        sources: Optional[List[str]] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        v9.4: Get experiences not yet used in training (async).
+
+        Args:
+            limit: Maximum number of experiences to return
+            min_quality: Minimum quality score
+            sources: Filter by source types (optional)
+
+        Returns:
+            List of experience dictionaries
+        """
+        conn = await self._get_async_db()
+        if not conn:
+            return []
+
+        try:
+            query = """
+                SELECT id, timestamp, source, input_text, output_text, context, quality_score, feedback, correction
+                FROM experiences
+                WHERE used_in_training = 0 AND quality_score >= ?
+            """
+            params: List[Any] = [min_quality]
+
+            if sources:
+                placeholders = ",".join("?" * len(sources))
+                query += f" AND source IN ({placeholders})"
+                params.extend(sources)
+
+            query += " ORDER BY quality_score DESC, timestamp DESC LIMIT ?"
+            params.append(limit)
+
+            experiences = []
+            async with conn.execute(query, params) as cursor:
+                async for row in cursor:
+                    experiences.append({
+                        "id": row[0],
+                        "timestamp": row[1],
+                        "source": row[2],
+                        "input": row[3],
+                        "output": row[4],
+                        "context": json.loads(row[5]) if row[5] else None,
+                        "quality": row[6],
+                        "feedback": row[7],
+                        "correction": row[8],
+                    })
+
+            return experiences
+
+        except Exception as e:
+            logger.error(f"[Flywheel] Failed to get unused experiences: {e}")
+            return []
+
+    async def mark_experiences_used_async(
+        self,
+        experience_ids: List[int],
+        training_run_id: Optional[int] = None
+    ) -> bool:
+        """
+        v9.4: Mark experiences as used in training (async).
+
+        Args:
+            experience_ids: List of experience IDs to mark
+            training_run_id: Optional training run ID to associate
+
+        Returns:
+            True if successful
+        """
+        if not experience_ids:
+            return True
+
+        conn = await self._get_async_db()
+        if not conn:
+            return False
+
+        try:
+            placeholders = ",".join("?" * len(experience_ids))
+            if training_run_id:
+                await conn.execute(f"""
+                    UPDATE experiences SET used_in_training = 1, training_run_id = ?
+                    WHERE id IN ({placeholders})
+                """, [training_run_id] + experience_ids)
+            else:
+                await conn.execute(f"""
+                    UPDATE experiences SET used_in_training = 1
+                    WHERE id IN ({placeholders})
+                """, experience_ids)
+
+            await conn.commit()
+            logger.debug(f"[Flywheel] Marked {len(experience_ids)} experiences as used")
+            return True
+
+        except Exception as e:
+            logger.error(f"[Flywheel] Failed to mark experiences used: {e}")
+            return False
+
+    async def get_pending_learning_goals_async(
+        self,
+        limit: int = 10,
+        min_priority: int = 1
+    ) -> List[Dict[str, Any]]:
+        """
+        v9.4: Get pending learning goals sorted by priority (async).
+
+        Args:
+            limit: Maximum number of goals to return
+            min_priority: Minimum priority (1-10)
+
+        Returns:
+            List of learning goal dictionaries
+        """
+        conn = await self._get_async_db()
+        if not conn:
+            return []
+
+        try:
+            goals = []
+            async with conn.execute("""
+                SELECT id, topic, description, priority, source, urls, keywords, discovered_at, experiences_count, pages_scraped
+                FROM learning_goals
+                WHERE completed = 0 AND priority >= ?
+                ORDER BY priority DESC, discovered_at DESC
+                LIMIT ?
+            """, (min_priority, limit)) as cursor:
+                async for row in cursor:
+                    goals.append({
+                        "id": row[0],
+                        "topic": row[1],
+                        "description": row[2],
+                        "priority": row[3],
+                        "source": row[4],
+                        "urls": row[5].split(",") if row[5] else [],
+                        "keywords": row[6].split(",") if row[6] else [],
+                        "discovered_at": row[7],
+                        "experiences_count": row[8],
+                        "pages_scraped": row[9],
+                    })
+
+            return goals
+
+        except Exception as e:
+            logger.error(f"[Flywheel] Failed to get pending goals: {e}")
+            return []
+
+    async def start_training_run_async(
+        self,
+        config: Optional[Dict[str, Any]] = None
+    ) -> Optional[int]:
+        """
+        v9.4: Record the start of a training run (async).
+
+        Args:
+            config: Training configuration to store
+
+        Returns:
+            Training run ID if successful
+        """
+        conn = await self._get_async_db()
+        if not conn:
+            return None
+
+        try:
+            config_json = json.dumps(config) if config else None
+
+            async with conn.execute("""
+                INSERT INTO training_runs (started_at, status, config_json)
+                VALUES (CURRENT_TIMESTAMP, 'running', ?)
+            """, (config_json,)) as cursor:
+                run_id = cursor.lastrowid
+
+            await conn.commit()
+            logger.info(f"[Flywheel] Started training run {run_id}")
+            return run_id
+
+        except Exception as e:
+            logger.error(f"[Flywheel] Failed to start training run: {e}")
+            return None
+
+    async def complete_training_run_async(
+        self,
+        run_id: int,
+        status: str,
+        experiences_used: int = 0,
+        pages_used: int = 0,
+        training_steps: int = 0,
+        training_epochs: int = 0,
+        final_loss: Optional[float] = None,
+        model_path: Optional[str] = None,
+        gguf_path: Optional[str] = None,
+        gguf_size_mb: Optional[float] = None,
+        gcs_path: Optional[str] = None,
+        deployed_local: bool = False,
+        deployed_cloud: bool = False,
+        error: Optional[str] = None
+    ) -> bool:
+        """
+        v9.4: Record the completion of a training run (async).
+
+        Args:
+            run_id: Training run ID
+            status: Final status (completed, failed, cancelled)
+            experiences_used: Number of experiences used
+            pages_used: Number of scraped pages used
+            training_steps: Total training steps
+            training_epochs: Total training epochs
+            final_loss: Final training loss
+            model_path: Path to trained model
+            gguf_path: Path to GGUF export
+            gguf_size_mb: GGUF file size in MB
+            gcs_path: GCS upload path
+            deployed_local: Whether deployed locally
+            deployed_cloud: Whether deployed to cloud
+            error: Error message if failed
+
+        Returns:
+            True if successful
+        """
+        conn = await self._get_async_db()
+        if not conn:
+            return False
+
+        try:
+            await conn.execute("""
+                UPDATE training_runs SET
+                    completed_at = CURRENT_TIMESTAMP,
+                    status = ?,
+                    experiences_used = ?,
+                    pages_used = ?,
+                    training_steps = ?,
+                    training_epochs = ?,
+                    final_loss = ?,
+                    model_path = ?,
+                    gguf_path = ?,
+                    gguf_size_mb = ?,
+                    gcs_path = ?,
+                    deployed_to_local = ?,
+                    deployed_to_cloud = ?,
+                    error = ?
+                WHERE id = ?
+            """, (
+                status, experiences_used, pages_used, training_steps, training_epochs,
+                final_loss, model_path, gguf_path, gguf_size_mb, gcs_path,
+                1 if deployed_local else 0, 1 if deployed_cloud else 0, error, run_id
+            ))
+
+            await conn.commit()
+            logger.info(f"[Flywheel] Completed training run {run_id}: {status}")
+            return True
+
+        except Exception as e:
+            logger.error(f"[Flywheel] Failed to complete training run: {e}")
+            return False
+
+    async def get_training_stats_async(self) -> Dict[str, Any]:
+        """
+        v9.4: Get comprehensive training database statistics (async).
+
+        Returns:
+            Dictionary of statistics
+        """
+        conn = await self._get_async_db()
+        if not conn:
+            return self.get_training_db_stats()
+
+        try:
+            stats = {}
+
+            # Experience stats
+            async with conn.execute("SELECT COUNT(*) FROM experiences") as cursor:
+                stats["total_experiences"] = (await cursor.fetchone())[0]
+
+            async with conn.execute("SELECT COUNT(*) FROM experiences WHERE used_in_training = 0") as cursor:
+                stats["unused_experiences"] = (await cursor.fetchone())[0]
+
+            async with conn.execute("SELECT AVG(quality_score) FROM experiences") as cursor:
+                result = await cursor.fetchone()
+                stats["avg_experience_quality"] = round(result[0] or 0, 3)
+
+            # Scraped content stats
+            async with conn.execute("SELECT COUNT(*) FROM scraped_content") as cursor:
+                stats["total_scraped_pages"] = (await cursor.fetchone())[0]
+
+            async with conn.execute("SELECT COUNT(*) FROM scraped_content WHERE used_in_training = 0") as cursor:
+                stats["unused_scraped_pages"] = (await cursor.fetchone())[0]
+
+            async with conn.execute("SELECT SUM(word_count) FROM scraped_content") as cursor:
+                result = await cursor.fetchone()
+                stats["total_scraped_words"] = result[0] or 0
+
+            # Learning goals stats
+            async with conn.execute("SELECT COUNT(*) FROM learning_goals") as cursor:
+                stats["total_learning_goals"] = (await cursor.fetchone())[0]
+
+            async with conn.execute("SELECT COUNT(*) FROM learning_goals WHERE completed = 0") as cursor:
+                stats["pending_learning_goals"] = (await cursor.fetchone())[0]
+
+            async with conn.execute("SELECT COUNT(*) FROM learning_goals WHERE completed = 1") as cursor:
+                stats["completed_learning_goals"] = (await cursor.fetchone())[0]
+
+            # Training runs stats
+            async with conn.execute("SELECT COUNT(*) FROM training_runs") as cursor:
+                stats["total_training_runs"] = (await cursor.fetchone())[0]
+
+            async with conn.execute("SELECT COUNT(*) FROM training_runs WHERE status = 'completed'") as cursor:
+                stats["successful_training_runs"] = (await cursor.fetchone())[0]
+
+            async with conn.execute("SELECT MIN(final_loss) FROM training_runs WHERE final_loss IS NOT NULL") as cursor:
+                result = await cursor.fetchone()
+                stats["best_training_loss"] = round(result[0] or 0, 4) if result[0] else None
+
+            # Model deployment stats
+            async with conn.execute("SELECT COUNT(*) FROM model_deployments") as cursor:
+                stats["total_deployments"] = (await cursor.fetchone())[0]
+
+            async with conn.execute("SELECT COUNT(*) FROM model_deployments WHERE active = 1") as cursor:
+                stats["active_deployments"] = (await cursor.fetchone())[0]
+
+            # Recent activity
+            async with conn.execute("""
+                SELECT COUNT(*) FROM experiences
+                WHERE timestamp > ?
+            """, (time.time() - 86400,)) as cursor:
+                stats["experiences_last_24h"] = (await cursor.fetchone())[0]
+
+            async with conn.execute("""
+                SELECT COUNT(*) FROM scraped_content
+                WHERE scraped_at > datetime('now', '-24 hours')
+            """) as cursor:
+                stats["pages_scraped_last_24h"] = (await cursor.fetchone())[0]
+
+            stats["db_path"] = str(self.config.training_db_path)
+            stats["async_enabled"] = True
+
+            return stats
+
+        except Exception as e:
+            logger.error(f"[Flywheel] Failed to get async training stats: {e}")
+            return {"error": str(e)}
+
+    async def query_experiences_async(
+        self,
+        query: str,
+        params: Optional[Tuple] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        v9.4: Execute a custom query on the experiences table (async).
+
+        Args:
+            query: SQL query (SELECT only)
+            params: Query parameters
+
+        Returns:
+            List of result rows as dictionaries
+        """
+        if not query.strip().upper().startswith("SELECT"):
+            logger.error("[Flywheel] Only SELECT queries are allowed")
+            return []
+
+        conn = await self._get_async_db()
+        if not conn:
+            return []
+
+        try:
+            results = []
+            async with conn.execute(query, params or ()) as cursor:
+                columns = [desc[0] for desc in cursor.description]
+                async for row in cursor:
+                    results.append(dict(zip(columns, row)))
+
+            return results
+
+        except Exception as e:
+            logger.error(f"[Flywheel] Query failed: {e}")
+            return []
+
+    async def add_intelligence_insight_async(
+        self,
+        insight_type: str,
+        topic: str,
+        description: str,
+        source_systems: Optional[List[str]] = None,
+        confidence: float = 0.5,
+        data: Optional[Dict[str, Any]] = None
+    ) -> Optional[int]:
+        """
+        v9.4: Add an intelligence insight from CAI system (async).
+
+        Args:
+            insight_type: Type of insight (pattern, recommendation, anomaly)
+            topic: Related topic
+            description: Insight description
+            source_systems: Contributing systems (uae, sai, mas, cai)
+            confidence: Confidence score (0.0 to 1.0)
+            data: Additional data
+
+        Returns:
+            Insight ID if successful
+        """
+        conn = await self._get_async_db()
+        if not conn:
+            return None
+
+        try:
+            sources_str = ",".join(source_systems) if source_systems else None
+            data_json = json.dumps(data) if data else None
+
+            async with conn.execute("""
+                INSERT INTO intelligence_insights (insight_type, topic, source_systems, confidence, description, data_json)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (insight_type, topic, sources_str, confidence, description, data_json)) as cursor:
+                insight_id = cursor.lastrowid
+
+            await conn.commit()
+            logger.debug(f"[Flywheel] Added intelligence insight {insight_id}")
+            return insight_id
+
+        except Exception as e:
+            logger.error(f"[Flywheel] Failed to add intelligence insight: {e}")
+            return None
+
+    async def close_async_db(self) -> None:
+        """v9.4: Close the async database connection."""
+        async with self._db_lock:
+            if self._async_db_conn:
+                await self._async_db_conn.close()
+                self._async_db_conn = None
+                logger.info("[Flywheel] Async SQLite connection closed")
 
     async def _cleanup_components(self) -> None:
         """Cleanup all components."""

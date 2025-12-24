@@ -1,0 +1,396 @@
+# =============================================================================
+# JARVIS AI Agent - Unified Docker Compose Configuration v9.4
+# =============================================================================
+#
+# Multi-Repo Integration Stack connecting:
+# - JARVIS-AI-Agent: Main FastAPI server with Neural Mesh
+# - JARVIS-Prime: Local LLM inference (from jarvis-prime repo)
+# - Reactor-Core: Training pipeline (from reactor-core repo)
+#
+# Services:
+# - jarvis-backend: Main API with 60+ agent Neural Mesh
+# - jarvis-frontend: React frontend via nginx
+# - jarvis-training: Continuous learning + Safe Scout
+# - jarvis-prime: Custom GGUF model inference (optional)
+# - jarvis-prime-cloud: Cloud Run inference proxy (optional)
+# - reactor-core: Training pipeline orchestrator (optional)
+# - redis: Distributed caching and session storage
+# - chromadb: Vector database for embeddings
+#
+# Profiles:
+#   default       - Backend, Frontend, Training, Redis, ChromaDB
+#   local-llm     - Add local JARVIS-Prime inference
+#   cloud-llm     - Add Cloud Run inference proxy
+#   full-training - Add Reactor-Core training pipeline
+#   all           - Everything enabled
+#
+# Usage:
+#   docker compose up -d                           # Default stack
+#   docker compose --profile local-llm up -d       # With local inference
+#   docker compose --profile all up -d             # Everything
+#   docker compose logs -f jarvis-backend          # View logs
+#   docker compose down -v                         # Stop and remove volumes
+#
+# Version: 9.4.0
+# =============================================================================
+
+# =============================================================================
+# Networks
+# =============================================================================
+networks:
+  jarvis-network:
+    name: jarvis-unified-network
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.28.0.0/16
+          gateway: 172.28.0.1
+
+# =============================================================================
+# Volumes - Shared across all repos
+# =============================================================================
+volumes:
+  # Core data
+  jarvis-data:
+    name: jarvis-unified-data
+    driver: local
+
+  # Shared models (accessible by all services)
+  jarvis-models:
+    name: jarvis-unified-models
+    driver: local
+
+  # Logs
+  jarvis-logs:
+    name: jarvis-unified-logs
+    driver: local
+
+  # Training database
+  jarvis-training-db:
+    name: jarvis-training-db
+    driver: local
+
+  # ChromaDB persistence
+  chromadb-data:
+    name: jarvis-chromadb-data
+    driver: local
+
+  # Redis persistence
+  redis-data:
+    name: jarvis-redis-data
+    driver: local
+
+  # Reactor-Core work directory
+  reactor-work:
+    name: jarvis-reactor-work
+    driver: local
+
+# =============================================================================
+# Services
+# =============================================================================
+services:
+  # ---------------------------------------------------------------------------
+  # JARVIS Backend - Main API Server
+  # ---------------------------------------------------------------------------
+  jarvis-backend:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.backend
+    image: jarvis-backend:${JARVIS_VERSION:-9.4.0}
+    container_name: jarvis-backend
+    hostname: jarvis-backend
+    restart: unless-stopped
+
+    # Entrypoint
+    entrypoint: ["/app/entrypoint.sh"]
+    command: ["supervisor"]
+
+    # Ports
+    ports:
+      - "${JARVIS_API_PORT:-8010}:8010"
+      - "${JARVIS_LOADING_PORT:-8011}:8011"
+
+    # Environment
+    environment:
+      # Core
+      - PYTHONUNBUFFERED=1
+      - PYTHONPATH=/app:/app/backend
+      - JARVIS_DOCKER=true
+      - JARVIS_ENV=${JARVIS_ENV:-production}
+
+      # Paths
+      - JARVIS_DATA_DIR=/app/data
+      - JARVIS_MODELS_DIR=/app/models
+      - JARVIS_LOGS_DIR=/app/data/logs
+      - JARVIS_TRAINING_DB=/app/data/training_db/jarvis_training.db
+
+      # API Keys (from .env)
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
+
+      # JARVIS Prime
+      - JARVIS_PRIME_URL=http://jarvis-prime:8012
+      - JARVIS_PRIME_CLOUD_RUN_URL=${JARVIS_PRIME_CLOUD_RUN_URL:-}
+
+      # Redis
+      - REDIS_URL=redis://redis:6379/0
+
+      # Neural Mesh
+      - NEURAL_MESH_ENABLED=${NEURAL_MESH_ENABLED:-true}
+      - NEURAL_MESH_PRODUCTION=${NEURAL_MESH_PRODUCTION:-true}
+      - NEURAL_MESH_MAX_AGENTS=${NEURAL_MESH_MAX_AGENTS:-60}
+
+      # Data Flywheel
+      - DATA_FLYWHEEL_ENABLED=${DATA_FLYWHEEL_ENABLED:-true}
+      - TRAINING_SCHEDULE=${TRAINING_SCHEDULE:-03:00}
+
+      # GCS (for model uploads)
+      - GCS_BUCKET=${GCS_BUCKET:-}
+      - GOOGLE_APPLICATION_CREDENTIALS=/app/credentials/gcp-key.json
+
+    # Volumes
+    volumes:
+      - jarvis-data:/app/data
+      - jarvis-models:/app/models
+      - jarvis-logs:/app/data/logs
+      - ${GCP_CREDENTIALS_PATH:-./credentials}:/app/credentials:ro
+
+    # Dependencies
+    depends_on:
+      redis:
+        condition: service_healthy
+
+    # Health check
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8010/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+    # Network
+    networks:
+      jarvis-network:
+        ipv4_address: 172.28.0.10
+
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: "${BACKEND_CPU_LIMIT:-4}"
+          memory: ${BACKEND_MEMORY_LIMIT:-8G}
+        reservations:
+          cpus: "1"
+          memory: 2G
+
+  # ---------------------------------------------------------------------------
+  # JARVIS Frontend - React Web Interface
+  # ---------------------------------------------------------------------------
+  jarvis-frontend:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.frontend
+    image: jarvis-frontend:${JARVIS_VERSION:-9.4.0}
+    container_name: jarvis-frontend
+    hostname: jarvis-frontend
+    restart: unless-stopped
+
+    # Ports
+    ports:
+      - "${JARVIS_FRONTEND_PORT:-3000}:80"
+
+    # Dependencies
+    depends_on:
+      jarvis-backend:
+        condition: service_healthy
+
+    # Health check
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+    # Network
+    networks:
+      jarvis-network:
+        ipv4_address: 172.28.0.11
+
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 512M
+
+  # ---------------------------------------------------------------------------
+  # JARVIS Training Engine - Continuous Learning
+  # ---------------------------------------------------------------------------
+  jarvis-training:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.training
+    image: jarvis-training:${JARVIS_VERSION:-9.4.0}
+    container_name: jarvis-training
+    hostname: jarvis-training
+    restart: unless-stopped
+
+    # Entrypoint
+    entrypoint: ["python3", "docker/training_entrypoint.py"]
+    command: ["--mode", "continuous"]
+
+    # Environment
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTHONPATH=/app:/app/backend
+      - JARVIS_DOCKER=true
+
+      # Database
+      - JARVIS_TRAINING_DB=/app/data/training_db/jarvis_training.db
+
+      # Training
+      - JARVIS_TRAINING_ENABLED=${TRAINING_ENABLED:-true}
+      - JARVIS_TRAINING_SCHEDULE=${TRAINING_SCHEDULE:-03:00}
+      - JARVIS_TRAINING_MIN_EXPERIENCES=${TRAINING_MIN_EXPERIENCES:-100}
+      - JARVIS_TRAINING_COOLDOWN_HOURS=${TRAINING_COOLDOWN_HOURS:-24}
+
+      # Scraping
+      - CONTINUOUS_SCRAPING_ENABLED=${CONTINUOUS_SCRAPING_ENABLED:-true}
+      - CONTINUOUS_SCRAPING_INTERVAL_HOURS=${SCRAPING_INTERVAL_HOURS:-4}
+      - CONTINUOUS_SCRAPING_MAX_PAGES=${SCRAPING_MAX_PAGES:-50}
+
+      # Models
+      - JARVIS_MODELS_DIR=/app/models
+      - GGUF_EXPORT_ENABLED=${GGUF_EXPORT_ENABLED:-true}
+      - GGUF_QUANTIZATION=${GGUF_QUANTIZATION:-q4_k_m}
+
+      # GCS
+      - GCS_UPLOAD_ENABLED=${GCS_UPLOAD_ENABLED:-false}
+      - GCS_MODELS_BUCKET=${GCS_BUCKET:-}
+
+    # Volumes
+    volumes:
+      - jarvis-data:/app/data
+      - jarvis-models:/app/models
+      - jarvis-logs:/app/data/logs
+
+    # Dependencies
+    depends_on:
+      jarvis-backend:
+        condition: service_healthy
+
+    # Network
+    networks:
+      jarvis-network:
+        ipv4_address: 172.28.0.12
+
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: "${TRAINING_CPU_LIMIT:-2}"
+          memory: ${TRAINING_MEMORY_LIMIT:-4G}
+
+  # ---------------------------------------------------------------------------
+  # JARVIS Prime - Local LLM Inference (Optional)
+  # ---------------------------------------------------------------------------
+  jarvis-prime:
+    image: ghcr.io/ggml-org/llama.cpp:server
+    container_name: jarvis-prime
+    hostname: jarvis-prime
+    restart: unless-stopped
+    profiles:
+      - local-inference
+
+    # Ports
+    ports:
+      - "${JARVIS_PRIME_PORT:-8012}:8080"
+
+    # Command
+    command: >
+      --host 0.0.0.0
+      --port 8080
+      --model /models/current/jarvis-prime-latest.gguf
+      --ctx-size ${PRIME_CONTEXT_SIZE:-4096}
+      --threads ${PRIME_THREADS:-4}
+      --n-gpu-layers ${PRIME_GPU_LAYERS:-0}
+
+    # Volumes
+    volumes:
+      - jarvis-models:/models:ro
+
+    # Health check
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+
+    # Network
+    networks:
+      jarvis-network:
+        ipv4_address: 172.28.0.13
+
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: "${PRIME_CPU_LIMIT:-4}"
+          memory: ${PRIME_MEMORY_LIMIT:-16G}
+
+  # ---------------------------------------------------------------------------
+  # Redis - Caching and Session Storage
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: jarvis-redis
+    hostname: redis
+    restart: unless-stopped
+
+    # Ports
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+
+    # Command with persistence
+    command: redis-server --save 60 1 --loglevel warning
+
+    # Volumes
+    volumes:
+      - redis-data:/data
+
+    # Health check
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+    # Network
+    networks:
+      jarvis-network:
+        ipv4_address: 172.28.0.20
+
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+
+# =============================================================================
+# Profiles for Optional Services
+# =============================================================================
+#
+# Default: jarvis-backend, jarvis-frontend, jarvis-training, redis
+#
+# To include local inference:
+#   docker-compose --profile local-inference up -d
+#
+# To run training only:
+#   docker-compose up -d jarvis-training redis
+# =============================================================================
