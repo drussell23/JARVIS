@@ -1,0 +1,96 @@
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Data and models (mounted as volumes)
+data/
+models/
+*.gguf
+*.bin
+*.safetensors
+
+# Logs
+logs/
+*.log
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# Node modules (frontend)
+node_modules/
+frontend/node_modules/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Docker files (avoid recursion)
+docker/Dockerfile.*
+
+# Documentation
+docs/
+*.md
+LICENSE
+
+# Tests
+tests/
+test_*/
+*_test.py
+test_*.py
+pytest.ini
+.pytest_cache/
+
+# Config files not needed in container
+terraform/
+scripts/
+.claude/
+*.tfvars
+*.tfstate*
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Credentials (should use secrets)
+credentials/
+*.json
+!package.json
+!tsconfig.json
+
+# Large model files
+*.pt
+*.pth
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+
+# Cache directories
+.cache/
+.huggingface/

@@ -420,6 +420,18 @@ class BootstrapConfig:
     training_auto_deploy_to_prime: bool = field(default_factory=lambda: os.getenv("TRAINING_AUTO_DEPLOY_PRIME", "true").lower() == "true")
     training_auto_upload_to_gcs: bool = field(default_factory=lambda: os.getenv("TRAINING_AUTO_UPLOAD_GCS", "true").lower() == "true")
 
+    # =========================================================================
+    # v9.5: Infrastructure Orchestrator (On-Demand GCP Resources)
+    # =========================================================================
+    # Fixes the root issue: GCP resources staying deployed when JARVIS is off.
+    # When enabled, infrastructure is provisioned on startup and destroyed on shutdown.
+    # =========================================================================
+    infra_on_demand_enabled: bool = field(default_factory=lambda: os.getenv("JARVIS_INFRA_ON_DEMAND", "true").lower() == "true")
+    infra_auto_destroy_on_shutdown: bool = field(default_factory=lambda: os.getenv("JARVIS_INFRA_AUTO_DESTROY", "true").lower() == "true")
+    infra_terraform_timeout_seconds: int = field(default_factory=lambda: int(os.getenv("JARVIS_TERRAFORM_TIMEOUT", "300")))
+    infra_memory_threshold_gb: float = field(default_factory=lambda: float(os.getenv("JARVIS_INFRA_MEMORY_THRESHOLD_GB", "4.0")))
+    infra_daily_cost_limit_usd: float = field(default_factory=lambda: float(os.getenv("JARVIS_DAILY_COST_LIMIT", "1.0")))
+
 
 class StartupPhase(Enum):
     """Phases of supervisor startup."""
@@ -2025,6 +2037,10 @@ class SupervisorBootstrapper:
             "workflows_completed": 0,
         }
 
+        # v9.5: Infrastructure Orchestrator (On-Demand GCP Resources)
+        self._infra_orchestrator = None
+        self._infra_orchestrator_enabled = self.config.infra_on_demand_enabled
+
         # CRITICAL: Set CI=true to prevent npm start from hanging interactively
         # if port 3000 is taken. This ensures we fail fast or handle it automatically.
         os.environ["CI"] = "true"
@@ -2212,6 +2228,19 @@ class SupervisorBootstrapper:
             # - Continuous background web scraping for self-improvement
             # ═══════════════════════════════════════════════════════════════════
             await self._initialize_intelligence_systems()
+
+            # ═══════════════════════════════════════════════════════════════════
+            # v9.5: Initialize Infrastructure Orchestrator (On-Demand GCP)
+            # ═══════════════════════════════════════════════════════════════════
+            # This fixes the root issue: GCP resources staying deployed when JARVIS is off.
+            # The orchestrator:
+            # - Provisions Cloud Run/Redis only when needed (memory pressure, explicit config)
+            # - Tracks what WE created vs pre-existing resources
+            # - Automatically destroys OUR resources on shutdown
+            # - Leaves pre-existing infrastructure alone
+            # ═══════════════════════════════════════════════════════════════════
+            if self._infra_orchestrator_enabled:
+                await self._initialize_infrastructure_orchestrator()
 
             self.perf.end("validation")
 
@@ -3516,13 +3545,32 @@ class SupervisorBootstrapper:
         
     async def cleanup_resources(self):
         """
-        Cleanup remote resources (GCP VMs) and local services on shutdown.
+        Cleanup remote resources (GCP VMs, Cloud Run, etc.) and local services on shutdown.
 
         Uses the enhanced shutdown_hook module which provides:
         - Async-safe cleanup with timeouts
         - Multiple fallback approaches (VM Manager, gcloud CLI)
         - Idempotent execution (safe to call multiple times)
+
+        v9.5: Also destroys infrastructure that WE provisioned via InfrastructureOrchestrator.
+        This ensures GCP resources don't stay deployed when JARVIS shuts down.
         """
+        # v9.5: Cleanup Infrastructure Orchestrator (destroys Cloud Run we created)
+        # This MUST run first to ensure resources are destroyed before VM cleanup
+        if self._infra_orchestrator:
+            try:
+                self.logger.info("🔧 Destroying on-demand infrastructure...")
+                success = await self._infra_orchestrator.cleanup_infrastructure()
+                if success:
+                    status = self._infra_orchestrator.get_status()
+                    self.logger.info(
+                        f"✅ Infrastructure cleanup: destroyed {status['terraform_operations']['destroy_count']} resource(s)"
+                    )
+                else:
+                    self.logger.warning("⚠️ Some infrastructure may not have been cleaned up")
+            except Exception as e:
+                self.logger.warning(f"⚠️ Infrastructure cleanup error: {e}")
+
         # Cleanup JARVIS-Prime
         try:
             await self._stop_jarvis_prime()
@@ -6386,6 +6434,113 @@ class SupervisorBootstrapper:
                 "status": "ready" if initialized_systems["cai"] else "unavailable",
             },
         )
+
+    async def _initialize_infrastructure_orchestrator(self) -> None:
+        """
+        v9.5: Initialize the Infrastructure Orchestrator for on-demand GCP resources.
+
+        This fixes the root issue of GCP resources staying deployed when JARVIS is off:
+        - Provisions Cloud Run/Redis only when needed (memory pressure, explicit config)
+        - Tracks what WE created vs pre-existing resources
+        - Automatically destroys OUR resources on shutdown
+        - Leaves pre-existing infrastructure alone
+        - Supports multi-repo integration (JARVIS, Prime, Reactor Core)
+
+        Architecture:
+        ┌─────────────────────────────────────────────────────────────────────┐
+        │              Infrastructure Orchestrator (v9.5)                      │
+        ├─────────────────────────────────────────────────────────────────────┤
+        │  ┌──────────────────┐    ┌──────────────────┐    ┌───────────────┐ │
+        │  │  JARVIS Backend  │    │   JARVIS-Prime   │    │  Reactor-Core │ │
+        │  │   (Cloud Run)    │    │   (Cloud Run)    │    │  (Training)   │ │
+        │  └────────┬─────────┘    └────────┬─────────┘    └───────┬───────┘ │
+        │           │                       │                       │         │
+        │           └───────────────────────┼───────────────────────┘         │
+        │                                   ▼                                 │
+        │                    ┌──────────────────────────┐                     │
+        │                    │  InfrastructureOrchestrator  │                 │
+        │                    │  • Terraform orchestration   │                 │
+        │                    │  • Resource state tracking   │                 │
+        │                    │  • Cost-aware decisions      │                 │
+        │                    │  • Circuit breaker           │                 │
+        │                    └────────────────┬─────────────┘                 │
+        │                                     ▼                               │
+        │                    ┌──────────────────────────┐                     │
+        │                    │     GCP Cloud Platform   │                     │
+        │                    │  Cloud Run | Redis | VMs │                     │
+        │                    └──────────────────────────┘                     │
+        └─────────────────────────────────────────────────────────────────────┘
+        """
+        self.logger.info("═" * 60)
+        self.logger.info("🔧 v9.5: Initializing Infrastructure Orchestrator...")
+        self.logger.info("═" * 60)
+
+        try:
+            from backend.core.infrastructure_orchestrator import (
+                InfrastructureOrchestrator,
+                InfrastructureConfig,
+            )
+
+            # Create config from supervisor settings
+            config = InfrastructureConfig(
+                on_demand_enabled=self.config.infra_on_demand_enabled,
+                auto_destroy_on_shutdown=self.config.infra_auto_destroy_on_shutdown,
+                terraform_timeout_seconds=self.config.infra_terraform_timeout_seconds,
+                memory_pressure_threshold_gb=self.config.infra_memory_threshold_gb,
+                daily_cost_limit_usd=self.config.infra_daily_cost_limit_usd,
+            )
+
+            self._infra_orchestrator = InfrastructureOrchestrator(config)
+            await self._infra_orchestrator.initialize()
+
+            # Log configuration
+            self.logger.info(f"   • On-demand provisioning: {config.on_demand_enabled}")
+            self.logger.info(f"   • Auto-destroy on shutdown: {config.auto_destroy_on_shutdown}")
+            self.logger.info(f"   • Memory pressure threshold: {config.memory_pressure_threshold_gb:.1f} GB")
+            self.logger.info(f"   • Daily cost limit: ${config.daily_cost_limit_usd:.2f}")
+            self.logger.info(f"   • Terraform timeout: {config.terraform_timeout_seconds}s")
+
+            # Check if we need to provision infrastructure now
+            # This is intelligent - only provisions if:
+            # 1. Memory is under pressure, OR
+            # 2. Explicit environment variable requests it
+            should_provision = (
+                os.getenv("JARVIS_PROVISION_CLOUD_RUN", "false").lower() == "true" or
+                os.getenv("JARVIS_PROVISION_REDIS", "false").lower() == "true"
+            )
+
+            if should_provision:
+                self.logger.info("🚀 Provisioning requested - starting infrastructure...")
+                success = await self._infra_orchestrator.ensure_infrastructure()
+                if success:
+                    status = self._infra_orchestrator.get_status()
+                    self.logger.info(
+                        f"✅ Infrastructure provisioned: "
+                        f"{status['terraform_operations']['apply_count']} resource(s)"
+                    )
+                else:
+                    self.logger.warning("⚠️ Infrastructure provisioning had issues")
+            else:
+                self.logger.info("📦 Infrastructure on-demand - will provision when needed")
+
+            # Propagate orchestrator availability to child processes
+            os.environ["JARVIS_INFRA_ORCHESTRATOR_ENABLED"] = "true"
+
+            print(f"  {TerminalUI.GREEN}✓ Infrastructure Orchestrator: Ready (on-demand GCP){TerminalUI.RESET}")
+            self.logger.info("✅ Infrastructure Orchestrator initialized")
+
+        except ImportError as e:
+            self.logger.warning(f"⚠️ Infrastructure Orchestrator not available: {e}")
+            self.logger.info("   → Will use existing infrastructure (no on-demand provisioning)")
+            os.environ["JARVIS_INFRA_ORCHESTRATOR_ENABLED"] = "false"
+            print(f"  {TerminalUI.YELLOW}⚠️ Infrastructure: Using existing resources{TerminalUI.RESET}")
+
+        except Exception as e:
+            self.logger.error(f"❌ Infrastructure Orchestrator init failed: {e}")
+            import traceback
+            self.logger.debug(traceback.format_exc())
+            os.environ["JARVIS_INFRA_ORCHESTRATOR_ENABLED"] = "false"
+            print(f"  {TerminalUI.RED}✗ Infrastructure: Failed ({e}){TerminalUI.RESET}")
 
     async def _run_continuous_scraping(self) -> None:
         """

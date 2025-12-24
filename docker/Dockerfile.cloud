@@ -1,0 +1,53 @@
+# JARVIS AI Agent Backend - Cloud Run Minimal
+# ============================================
+#
+# Ultra-lightweight for fast Cloud Run deploys.
+# Uses external services for heavy lifting:
+# - Anthropic API for intelligence
+# - JARVIS-Prime Cloud Run for LLM
+# - Cloud Memorystore for Redis
+#
+# Version: 9.4.0
+
+FROM python:3.11-slim-bookworm
+
+LABEL version="9.4.0-cloud"
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl sqlite3 build-essential && rm -rf /var/lib/apt/lists/*
+
+RUN groupadd -r jarvis && useradd -r -g jarvis -d /app -s /sbin/nologin jarvis
+
+WORKDIR /app
+
+# Core dependencies only (no ML packages)
+RUN pip install --no-cache-dir \
+    fastapi==0.110.0 \
+    uvicorn[standard]==0.27.0 \
+    pydantic==2.5.0 \
+    aiohttp==3.9.0 \
+    aiosqlite==0.19.0 \
+    httpx==0.26.0 \
+    anthropic==0.18.0 \
+    redis==5.0.0 \
+    python-dotenv==1.0.0 \
+    pyyaml==6.0 \
+    psutil==5.9.0
+
+COPY backend/ /app/backend/
+COPY run_supervisor.py start_system.py loading_server.py /app/
+COPY docker/entrypoint.sh /app/
+RUN chmod +x /app/entrypoint.sh
+
+RUN mkdir -p /app/data /app/logs && chown -R jarvis:jarvis /app
+
+ENV PYTHONUNBUFFERED=1 PYTHONPATH=/app:/app/backend JARVIS_DOCKER=true
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
+    CMD curl -f http://localhost:8010/health || exit 1
+
+USER jarvis
+EXPOSE 8010
+
+ENTRYPOINT ["/app/entrypoint.sh"]
+CMD ["python", "-m", "uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8010"]
