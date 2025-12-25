@@ -5736,23 +5736,27 @@ class SupervisorBootstrapper:
                     self.logger.info(f"✅ Neural Mesh v9.4 Production initialized ({total_agents} agents, bridge: {bridge_status})")
                     print(f"  {TerminalUI.GREEN}✓ Neural Mesh v9.4: Production multi-agent system active ({total_agents} agents){TerminalUI.RESET}")
 
-                else:
+                # Define NeuralMeshNode at this scope so it's available for all paths
+                from dataclasses import dataclass, field
+                from typing import Dict, Any, List, Callable, Optional
+                from collections import defaultdict
+
+                @dataclass
+                class NeuralMeshNode:
+                    """A node in the Neural Mesh network (v10.3 unified)."""
+                    node_id: str
+                    node_type: str
+                    capabilities: List[str] = field(default_factory=list)
+                    status: str = "active"
+                    last_heartbeat: float = field(default_factory=time.time)
+                    metadata: Dict[str, Any] = field(default_factory=dict)
+
+                # Store in instance for later use
+                self._NeuralMeshNode = NeuralMeshNode
+
+                if not initialized_systems["neural_mesh"]:
                     # Fallback: Basic Neural Mesh (for compatibility)
                     self.logger.info("   → Using basic Neural Mesh (fallback mode)...")
-
-                    from dataclasses import dataclass, field
-                    from typing import Dict, Any, List, Callable, Optional
-                    from collections import defaultdict
-
-                    @dataclass
-                    class NeuralMeshNode:
-                        """A node in the Neural Mesh network."""
-                        node_id: str
-                        node_type: str
-                        capabilities: List[str] = field(default_factory=list)
-                        status: str = "active"
-                        last_heartbeat: float = field(default_factory=time.time)
-                        metadata: Dict[str, Any] = field(default_factory=dict)
 
                     class BasicNeuralMesh:
                         """Basic Neural Mesh for fallback compatibility."""
@@ -6088,12 +6092,25 @@ class SupervisorBootstrapper:
 
                 # Register MAS with Neural Mesh if available
                 if hasattr(self, '_neural_mesh') and self._neural_mesh:
-                    from dataclasses import dataclass, field
-                    self._neural_mesh.register_node(NeuralMeshNode(
-                        node_id="mas-coordinator",
-                        node_type="mas",
-                        capabilities=["task_decomposition", "agent_spawning", "parallel_execution"],
-                    ))
+                    # Use stored NeuralMeshNode class or call register_node method
+                    if hasattr(self, '_NeuralMeshNode'):
+                        NeuralMeshNode = self._NeuralMeshNode
+                        if hasattr(self._neural_mesh, 'register_node'):
+                            # Check if it's the BasicNeuralMesh (takes NeuralMeshNode) or NeuralMeshCoordinator (takes params)
+                            if hasattr(self._neural_mesh, '_nodes'):
+                                # BasicNeuralMesh - uses NeuralMeshNode dataclass
+                                self._neural_mesh.register_node(NeuralMeshNode(
+                                    node_id="mas-coordinator",
+                                    node_type="mas",
+                                    capabilities=["task_decomposition", "agent_spawning", "parallel_execution"],
+                                ))
+                            else:
+                                # NeuralMeshCoordinator - uses parameters directly
+                                await self._neural_mesh.register_node(
+                                    node_name="mas-coordinator",
+                                    node_type="mas",
+                                    capabilities=["task_decomposition", "agent_spawning", "parallel_execution"],
+                                )
 
                 initialized_systems["mas"] = True
                 os.environ["MAS_ENABLED"] = "true"
@@ -6319,12 +6336,23 @@ class SupervisorBootstrapper:
                     # Connect to Neural Mesh if available
                     if hasattr(self, '_neural_mesh') and self._neural_mesh:
                         # Register reactor-core as a Neural Mesh node
-                        self._neural_mesh.register_node(NeuralMeshNode(
-                            node_id="reactor_core",
-                            node_type="reactor_core",
-                            capabilities=["training", "scraping", "model_deployment", "experience_collection"],
-                            status="active",
-                        ))
+                        if hasattr(self, '_NeuralMeshNode'):
+                            NeuralMeshNode = self._NeuralMeshNode
+                            if hasattr(self._neural_mesh, '_nodes'):
+                                # BasicNeuralMesh - uses NeuralMeshNode dataclass
+                                self._neural_mesh.register_node(NeuralMeshNode(
+                                    node_id="reactor_core",
+                                    node_type="reactor_core",
+                                    capabilities=["training", "scraping", "model_deployment", "experience_collection"],
+                                    status="active",
+                                ))
+                            else:
+                                # NeuralMeshCoordinator - uses parameters directly
+                                await self._neural_mesh.register_node(
+                                    node_name="reactor_core",
+                                    node_type="reactor_core",
+                                    capabilities=["training", "scraping", "model_deployment", "experience_collection"],
+                                )
                         self.logger.info("✅ Reactor-Core connected to Neural Mesh")
 
                     # Connect to CAI if available for insight aggregation
