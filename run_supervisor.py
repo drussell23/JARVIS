@@ -2046,6 +2046,9 @@ class SupervisorBootstrapper:
         self._reactor_core_enabled = os.getenv("JARVIS_REACTOR_CORE_ENABLED", "true").lower() == "true"
         self._reactor_core_port = int(os.getenv("REACTOR_CORE_PORT", "8003"))
 
+        # v10.3: Unified Progress Hub (Cross-component progress synchronization)
+        self._progress_hub = None
+
         # CRITICAL: Set CI=true to prevent npm start from hanging interactively
         # if port 3000 is taken. This ensures we fail fast or handle it automatically.
         os.environ["CI"] = "true"

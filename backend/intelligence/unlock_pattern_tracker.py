@@ -509,3 +509,7 @@ async def get_unlock_pattern_tracker() -> UnlockPatternTracker:
                 await _tracker.initialize()
 
     return _tracker
+
+
+# Alias for backwards compatibility
+get_pattern_tracker = get_unlock_pattern_tracker

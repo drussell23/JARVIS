@@ -32,6 +32,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import (
     Any,
+    Callable,
     Dict,
     List,
     Optional,
@@ -467,6 +468,160 @@ class NeuralMeshCoordinator:
             except Exception as e:
                 logger.exception("Health monitor error: %s", e)
                 self._system_health = HealthStatus.UNHEALTHY
+
+    # ========================================================================
+    # CROSS-SYSTEM INTEGRATION METHODS (v10.3)
+    # ========================================================================
+
+    async def register_node(
+        self,
+        node_name: str,
+        node_type: str = "system",
+        capabilities: Optional[List[str]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """
+        Register an external system node with the Neural Mesh.
+
+        This allows MAS, CAI, Reactor-Core and other systems to integrate
+        with the Neural Mesh for cross-system communication.
+
+        Args:
+            node_name: Unique identifier for the node
+            node_type: Type of node (system, agent, service)
+            capabilities: List of capabilities this node provides
+            metadata: Additional metadata about the node
+
+        Returns:
+            True if registration successful
+        """
+        if not self._initialized:
+            logger.warning(f"Cannot register node '{node_name}' - coordinator not initialized")
+            return False
+
+        try:
+            # Create an agent info for the external node
+            from .data_models import AgentInfo, AgentType, AgentCapability
+
+            # Map capabilities to AgentCapability enum
+            agent_capabilities = []
+            for cap in (capabilities or []):
+                try:
+                    agent_capabilities.append(AgentCapability(cap))
+                except ValueError:
+                    # Unknown capability, add as metadata
+                    pass
+
+            agent_info = AgentInfo(
+                agent_id=node_name,
+                agent_name=node_name,
+                agent_type=AgentType.COORDINATOR if node_type == "coordinator" else AgentType.SPECIALIZED,
+                capabilities=agent_capabilities or [AgentCapability.ANALYSIS],
+                version="1.0.0",
+                metadata=metadata or {},
+            )
+
+            # Register with the registry
+            await self._registry.register(agent_info)
+
+            logger.info(f"[NEURAL-MESH] Registered external node: {node_name} (type={node_type})")
+            return True
+
+        except Exception as e:
+            logger.error(f"[NEURAL-MESH] Failed to register node '{node_name}': {e}")
+            return False
+
+    async def subscribe(
+        self,
+        topic: str,
+        callback: Callable,
+        subscriber_id: Optional[str] = None,
+    ) -> bool:
+        """
+        Subscribe to messages on a topic.
+
+        This allows external systems to receive messages from the Neural Mesh.
+
+        Args:
+            topic: Topic to subscribe to (e.g., "safety_events", "training_events")
+            callback: Async callback function to call when message received
+            subscriber_id: Optional unique ID for the subscriber
+
+        Returns:
+            True if subscription successful
+        """
+        if not self._initialized:
+            logger.warning(f"Cannot subscribe to '{topic}' - coordinator not initialized")
+            return False
+
+        try:
+            from .data_models import MessageType
+
+            # Map topic to message type
+            topic_map = {
+                "safety_events": MessageType.BROADCAST,
+                "training_events": MessageType.BROADCAST,
+                "agent_events": MessageType.NOTIFICATION,
+                "system_events": MessageType.BROADCAST,
+            }
+
+            message_type = topic_map.get(topic, MessageType.BROADCAST)
+
+            # Subscribe via the bus
+            await self._bus.subscribe(
+                subscriber_id=subscriber_id or f"external_{topic}",
+                message_types=[message_type],
+                callback=callback,
+            )
+
+            logger.info(f"[NEURAL-MESH] Subscribed to topic: {topic}")
+            return True
+
+        except Exception as e:
+            logger.error(f"[NEURAL-MESH] Failed to subscribe to '{topic}': {e}")
+            return False
+
+    async def publish_event(
+        self,
+        event_type: str,
+        payload: Dict[str, Any],
+        target_nodes: Optional[List[str]] = None,
+    ) -> bool:
+        """
+        Publish an event to the Neural Mesh.
+
+        Args:
+            event_type: Type of event (e.g., "safety_audit", "training_complete")
+            payload: Event payload data
+            target_nodes: Optional list of specific nodes to send to
+
+        Returns:
+            True if publish successful
+        """
+        if not self._initialized:
+            logger.warning(f"Cannot publish event '{event_type}' - coordinator not initialized")
+            return False
+
+        try:
+            from .data_models import Message, MessageType
+            import uuid
+
+            message = Message(
+                message_id=str(uuid.uuid4())[:8],
+                sender_id="neural_mesh_coordinator",
+                message_type=MessageType.BROADCAST,
+                topic=event_type,
+                payload=payload,
+                recipients=target_nodes,
+            )
+
+            await self._bus.publish(message)
+            logger.debug(f"[NEURAL-MESH] Published event: {event_type}")
+            return True
+
+        except Exception as e:
+            logger.error(f"[NEURAL-MESH] Failed to publish event '{event_type}': {e}")
+            return False
 
     def __repr__(self) -> str:
         """String representation."""

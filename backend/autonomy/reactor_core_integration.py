@@ -233,7 +233,7 @@ class ReactorCoreIntegration:
                     max_topics=self.config.scout_max_topics,
                     max_pages_per_topic=self.config.scout_max_pages_per_topic,
                     url_concurrency=self.config.scout_concurrency,
-                    use_docker_sandbox=self.config.scout_use_docker,
+                    use_docker=self.config.scout_use_docker,
                 )
             )
             logger.info("[ReactorCore] ✓ SafeScoutOrchestrator initialized")

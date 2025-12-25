@@ -394,14 +394,16 @@ class JARVISSupervisor:
 
                 # Detailed health status
                 for component_name, health in health_status.items():
+                    # health is a ComponentHealth object, access via attributes
+                    status_value = health.status.value if hasattr(health.status, 'value') else str(health.status)
                     status_emoji = {
                         'ready': '✅',
                         'degraded': '⚠️',
                         'failed': '❌',
                         'initializing': '⏳'
-                    }.get(health['status'], '❓')
+                    }.get(status_value, '❓')
 
-                    logger.info(f"  {status_emoji} {component_name}: {health['status']}")
+                    logger.info(f"  {status_emoji} {component_name}: {status_value}")
 
             except Exception as e:
                 logger.warning(f"⚠️ Intelligence Component Manager initialization failed: {e}")
