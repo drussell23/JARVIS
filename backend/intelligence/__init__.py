@@ -97,6 +97,98 @@ _LAZY_MODULES = {
             'IntelligenceResult', 'RepoMapResult', 'CrossRepoAnalysis',
         ]
     ),
+    # =========================================================================
+    # NEW MODULES: Cross-Repo Integration (Heist Patterns)
+    # =========================================================================
+    'unified_memory_system': (
+        '.unified_memory_system',
+        [
+            # Configuration
+            'UnifiedMemoryConfig',
+            # Enums
+            'MemoryBlockType', 'MemoryPriority', 'MemoryEventType',
+            # Data Classes
+            'MemoryBlock', 'MemoryEntry', 'MemorySearchResult',
+            # Core Classes
+            'CoreMemory', 'WorkingMemory', 'ArchivalMemory', 'UnifiedMemorySystem',
+            # Convenience Functions
+            'get_memory_system', 'store_memory', 'retrieve_memory', 'search_memory',
+        ]
+    ),
+    'wisdom_patterns': (
+        '.wisdom_patterns',
+        [
+            # Configuration
+            'WisdomPatternsConfig',
+            # Enums
+            'PatternCategory',
+            # Data Classes
+            'WisdomPattern', 'PatternMatch',
+            # Core Classes
+            'WisdomPatternRegistry', 'WisdomAgent',
+            # Convenience Functions
+            'get_pattern_registry', 'get_wisdom_agent',
+            'enhance_with_wisdom', 'get_pattern', 'suggest_pattern',
+        ]
+    ),
+    'computer_use_refinements': (
+        '.computer_use_refinements',
+        [
+            # Configuration
+            'ComputerUseConfig',
+            # Tool Results
+            'ToolResult', 'CLIResult', 'ToolFailure', 'ToolError',
+            # Tool Protocol and Base
+            'ComputerTool', 'BaseComputerTool', 'ToolCollection',
+            # Concrete Tools
+            'ScreenshotTool', 'MouseTool', 'KeyboardTool', 'BashTool',
+            # Safety
+            'SafetyMonitor',
+            # Execution Loop
+            'StreamChunk', 'ComputerUseLoop',
+            # System Prompts
+            'get_system_prompt',
+            # Factory Functions
+            'create_default_tool_collection', 'create_computer_use_loop',
+            'get_computer_use_loop',
+        ]
+    ),
+    'sop_enforcement': (
+        '.sop_enforcement',
+        [
+            # Configuration
+            'SOPConfig',
+            # Enums
+            'ExecutionMode', 'ReviewMode', 'ReviseMode', 'FillMode',
+            'ActionStatus', 'MessageType',
+            # Data Classes
+            'ActionResult', 'ActionContext', 'SOPStep',
+            # Core Classes
+            'ActionNode', 'StandardOperatingProcedure', 'MessageGate',
+            # Pre-built SOPs
+            'create_code_review_sop', 'create_feature_implementation_sop',
+            # Convenience Functions
+            'get_message_gate',
+        ]
+    ),
+    'cross_repo_hub': (
+        '.cross_repo_hub',
+        [
+            # Configuration
+            'CrossRepoHubConfig',
+            # Enums
+            'IntelligenceSystem', 'EventType', 'TaskPriority',
+            # Data Classes
+            'HubEvent', 'IntelligenceTask', 'TaskResult', 'HubState',
+            # Core Class
+            'CrossRepoIntelligenceHub',
+            # Adapters
+            'RepositoryIntelligenceAdapter', 'ComputerUseAdapter',
+            'SOPAdapter', 'MemoryAdapter', 'WisdomAdapter',
+            # Convenience Functions
+            'get_intelligence_hub', 'enrich_task_context', 'execute_sop',
+        ]
+    ),
 }
 
 # Build reverse lookup: export name -> module info
@@ -300,13 +392,13 @@ __all__ = [
     'UnifiedIntelligenceOrchestrator',
     'create_unified_orchestrator',
     'get_unified_orchestrator',
-    
+
     # Learning Database
     'JARVISLearningDatabase',
     'get_learning_database',
     'get_learning_database_sync',
 
-    # Repository Intelligence
+    # Repository Intelligence (Aider-inspired)
     'RepositoryMapper',
     'RepositoryGraph',
     'CodeParser',
@@ -328,6 +420,98 @@ __all__ = [
     'IntelligenceResult',
     'RepoMapResult',
     'CrossRepoAnalysis',
+
+    # =========================================================================
+    # NEW EXPORTS: Cross-Repo Integration (Heist Patterns)
+    # =========================================================================
+
+    # Unified Memory System (MemGPT-inspired)
+    'UnifiedMemoryConfig',
+    'MemoryBlockType',
+    'MemoryPriority',
+    'MemoryEventType',
+    'MemoryBlock',
+    'MemoryEntry',
+    'MemorySearchResult',
+    'CoreMemory',
+    'WorkingMemory',
+    'ArchivalMemory',
+    'UnifiedMemorySystem',
+    'get_memory_system',
+    'store_memory',
+    'retrieve_memory',
+    'search_memory',
+
+    # Wisdom Patterns (Fabric-inspired)
+    'WisdomPatternsConfig',
+    'PatternCategory',
+    'WisdomPattern',
+    'PatternMatch',
+    'WisdomPatternRegistry',
+    'WisdomAgent',
+    'get_pattern_registry',
+    'get_wisdom_agent',
+    'enhance_with_wisdom',
+    'get_pattern',
+    'suggest_pattern',
+
+    # Computer Use Refinements (Open Interpreter-inspired)
+    'ComputerUseConfig',
+    'ToolResult',
+    'CLIResult',
+    'ToolFailure',
+    'ToolError',
+    'ComputerTool',
+    'BaseComputerTool',
+    'ToolCollection',
+    'ScreenshotTool',
+    'MouseTool',
+    'KeyboardTool',
+    'BashTool',
+    'SafetyMonitor',
+    'StreamChunk',
+    'ComputerUseLoop',
+    'get_system_prompt',
+    'create_default_tool_collection',
+    'create_computer_use_loop',
+    'get_computer_use_loop',
+
+    # SOP Enforcement (MetaGPT-inspired)
+    'SOPConfig',
+    'ExecutionMode',
+    'ReviewMode',
+    'ReviseMode',
+    'FillMode',
+    'ActionStatus',
+    'MessageType',
+    'ActionResult',
+    'ActionContext',
+    'SOPStep',
+    'ActionNode',
+    'StandardOperatingProcedure',
+    'MessageGate',
+    'create_code_review_sop',
+    'create_feature_implementation_sop',
+    'get_message_gate',
+
+    # Cross-Repo Intelligence Hub (Unified Orchestrator)
+    'CrossRepoHubConfig',
+    'IntelligenceSystem',
+    'EventType',
+    'TaskPriority',
+    'HubEvent',
+    'IntelligenceTask',
+    'TaskResult',
+    'HubState',
+    'CrossRepoIntelligenceHub',
+    'RepositoryIntelligenceAdapter',
+    'ComputerUseAdapter',
+    'SOPAdapter',
+    'MemoryAdapter',
+    'WisdomAdapter',
+    'get_intelligence_hub',
+    'enrich_task_context',
+    'execute_sop',
 ]
 
 

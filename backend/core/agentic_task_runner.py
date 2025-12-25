@@ -261,6 +261,20 @@ class AgenticRunnerConfig:
         default_factory=lambda: os.getenv("JARVIS_REPO_INTEL_CROSS_REPO", "true").lower() == "true"
     )
 
+    # Memory System (v6.0 - "MemGPT-Inspired Archival Memory")
+    memory_system_enabled: bool = field(
+        default_factory=lambda: os.getenv("JARVIS_MEMORY_SYSTEM_ENABLED", "true").lower() == "true"
+    )
+    memory_auto_retrieve: bool = field(
+        default_factory=lambda: os.getenv("JARVIS_MEMORY_AUTO_RETRIEVE", "true").lower() == "true"
+    )
+    memory_max_results: int = field(
+        default_factory=lambda: int(os.getenv("JARVIS_MEMORY_MAX_RESULTS", "5"))
+    )
+    memory_store_outcomes: bool = field(
+        default_factory=lambda: os.getenv("JARVIS_MEMORY_STORE_OUTCOMES", "true").lower() == "true"
+    )
+
 
 # =============================================================================
 # Enums
@@ -1700,6 +1714,99 @@ class AgenticTaskRunner:
 
         return submitted
 
+    # =========================================================================
+    # Memory System Integration (v6.0 - "MemGPT-Inspired Archival Memory")
+    # =========================================================================
+
+    async def _store_task_outcome_in_memory(
+        self,
+        goal: str,
+        result: "AgenticTaskResult",
+    ) -> None:
+        """
+        Store task outcome in the Unified Memory System for future reference.
+
+        This enables JARVIS to:
+        1. Remember past successful approaches for similar tasks
+        2. Recall failed attempts to avoid repeating mistakes
+        3. Build up expertise over time through experience accumulation
+        4. Provide context-aware assistance based on historical patterns
+
+        Args:
+            goal: The task goal that was executed
+            result: The task execution result with details
+        """
+        try:
+            from backend.intelligence.unified_memory_system import (
+                get_memory_system,
+                MemoryPriority,
+            )
+
+            memory_system = await get_memory_system()
+            if not memory_system:
+                return
+
+            # Determine memory priority based on outcome
+            if result.success:
+                priority = MemoryPriority.HIGH if result.learning_insights else MemoryPriority.NORMAL
+                outcome_type = "successful_task"
+            else:
+                # Failed tasks with clear errors are valuable learnings
+                priority = MemoryPriority.HIGH
+                outcome_type = "failed_task"
+
+            # Construct memory content
+            memory_content_parts = [
+                f"Task Goal: {goal}",
+                f"Outcome: {'SUCCESS' if result.success else 'FAILED'}",
+                f"Mode: {result.mode}",
+                f"Execution Time: {result.execution_time_ms:.0f}ms",
+                f"Actions Taken: {result.actions_count}",
+            ]
+
+            if result.final_message:
+                memory_content_parts.append(f"Final Message: {result.final_message[:500]}")
+
+            if result.error:
+                memory_content_parts.append(f"Error: {result.error[:300]}")
+
+            if result.learning_insights:
+                memory_content_parts.append(f"Learning Insights: {', '.join(result.learning_insights[:5])}")
+
+            if result.reasoning_steps > 0:
+                memory_content_parts.append(f"Reasoning Depth: {result.reasoning_steps} steps")
+
+            memory_content = "\n".join(memory_content_parts)
+
+            # Store in archival memory for long-term retention
+            metadata = {
+                "type": outcome_type,
+                "success": result.success,
+                "mode": result.mode,
+                "execution_time_ms": result.execution_time_ms,
+                "actions_count": result.actions_count,
+                "reasoning_steps": result.reasoning_steps,
+                "has_error": bool(result.error),
+                "has_insights": bool(result.learning_insights),
+                "timestamp": datetime.now().isoformat(),
+            }
+
+            await memory_system.archival.store(
+                content=memory_content,
+                metadata=metadata,
+            )
+
+            self.logger.debug(
+                f"[Memory] Stored {outcome_type} in archival memory: "
+                f"goal='{goal[:50]}...', success={result.success}"
+            )
+
+        except ImportError:
+            self.logger.debug("[Memory] Unified Memory System not available")
+        except Exception as e:
+            # Never crash JARVIS for memory storage issues
+            self.logger.debug(f"[Memory] Failed to store task outcome: {e}")
+
     async def trigger_training_manual(
         self,
         priority: str = "normal",
@@ -2055,6 +2162,10 @@ class AgenticTaskRunner:
             # Learning Goal Auto-Discovery: Extract learning topics from failures (v10.1)
             if not result.success and result.error:
                 await self._extract_and_submit_learning_goals(goal, result)
+
+            # Memory System Integration: Store task outcome for future reference (v6.0)
+            if self.config.memory_system_enabled and self.config.memory_store_outcomes:
+                await self._store_task_outcome_in_memory(goal, result)
 
             self.logger.info(f"[AgenticRunner] Complete: success={result.success}, time={execution_time:.0f}ms")
             return result
@@ -3227,6 +3338,36 @@ class AgenticTaskRunner:
 
             except Exception as e:
                 self.logger.debug(f"[Context] Repository Intelligence enrichment failed: {e}")
+
+        # Memory System enrichment (v6.0 - MemGPT-inspired)
+        if self.config.memory_system_enabled and self.config.memory_auto_retrieve:
+            try:
+                # Lazy import to avoid circular dependencies
+                from backend.intelligence.unified_memory_system import get_memory_system
+
+                memory_system = await get_memory_system()
+                if memory_system:
+                    # Search archival memory for relevant past experiences
+                    memories = await memory_system.archival.search(
+                        query=goal,
+                        limit=self.config.memory_max_results,
+                    )
+
+                    if memories:
+                        enriched["archival_memories"] = memories
+                        enriched["archival_memory_count"] = len(memories)
+                        self.logger.debug(f"[Context] Added {len(memories)} archival memories")
+
+                        # Extract key insights from memories
+                        insights = []
+                        for mem in memories[:3]:  # Top 3 most relevant
+                            if isinstance(mem, dict) and "content" in mem:
+                                insights.append(mem["content"][:200])
+                        if insights:
+                            enriched["memory_insights"] = insights
+
+            except Exception as e:
+                self.logger.debug(f"[Context] Memory System enrichment failed: {e}")
 
         return enriched
 

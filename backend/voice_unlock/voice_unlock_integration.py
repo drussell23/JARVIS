@@ -166,6 +166,36 @@ PHYSICS_THRESHOLD = float(os.getenv("PHYSICS_CONFIDENCE_THRESHOLD", "0.70"))
 BAYESIAN_FUSION_ENABLED = os.getenv("BAYESIAN_FUSION_ENABLED", "true").lower() == "true"
 
 # =============================================================================
+# WISDOM PATTERNS INTEGRATION (v6.0 - Fabric-Inspired)
+# =============================================================================
+# Enhances voice authentication reasoning with structured prompts from Fabric patterns
+try:
+    from backend.intelligence.wisdom_patterns import (
+        get_wisdom_agent,
+        WisdomAgent,
+        WisdomPattern,
+    )
+    WISDOM_PATTERNS_AVAILABLE = True
+except ImportError:
+    WISDOM_PATTERNS_AVAILABLE = False
+
+# =============================================================================
+# UNIFIED MEMORY SYSTEM INTEGRATION (v6.0 - MemGPT-Inspired)
+# =============================================================================
+# Provides archival storage for authentication history and voice evolution
+try:
+    from backend.intelligence.unified_memory_system import (
+        get_memory_system,
+        UnifiedMemorySystem,
+    )
+    MEMORY_SYSTEM_AVAILABLE = True
+except ImportError:
+    MEMORY_SYSTEM_AVAILABLE = False
+
+WISDOM_ENABLED = os.getenv("JARVIS_WISDOM_PATTERNS_ENABLED", "true").lower() == "true"
+MEMORY_ARCHIVAL_ENABLED = os.getenv("JARVIS_MEMORY_ARCHIVAL_ENABLED", "true").lower() == "true"
+
+# =============================================================================
 # ML ENGINE REGISTRY - Ensures models are loaded before processing
 # =============================================================================
 try:
@@ -616,6 +646,8 @@ class AdaptiveAuthenticationEngine:
     - Environmental issue detection and mitigation
     - Adaptive retry strategies
     - Progressive feedback
+    - v6.0: Wisdom Patterns integration for enhanced reasoning
+    - v6.0: Memory System integration for voice evolution tracking
     """
 
     def __init__(self, speaker_service: Optional['SpeakerVerificationService'] = None):
@@ -623,8 +655,145 @@ class AdaptiveAuthenticationEngine:
         self.speaker_service = speaker_service
         self._graph = None
 
+        # v6.0: Wisdom Patterns for enhanced authentication reasoning
+        self._wisdom_agent: Optional['WisdomAgent'] = None
+        self._wisdom_initialized = False
+
+        # v6.0: Memory System for voice evolution tracking
+        self._memory_system: Optional['UnifiedMemorySystem'] = None
+        self._memory_initialized = False
+
         if LANGGRAPH_AVAILABLE and speaker_service:
             self._build_graph()
+
+    async def _ensure_wisdom_initialized(self) -> bool:
+        """Lazily initialize wisdom patterns agent."""
+        if self._wisdom_initialized:
+            return self._wisdom_agent is not None
+
+        if WISDOM_PATTERNS_AVAILABLE and WISDOM_ENABLED:
+            try:
+                self._wisdom_agent = await get_wisdom_agent()
+                self._wisdom_initialized = True
+                self.logger.info("✅ Wisdom Patterns initialized for voice auth reasoning")
+                return True
+            except Exception as e:
+                self.logger.debug(f"Wisdom Patterns initialization failed: {e}")
+                self._wisdom_initialized = True  # Don't retry
+                return False
+        return False
+
+    async def _ensure_memory_initialized(self) -> bool:
+        """Lazily initialize memory system."""
+        if self._memory_initialized:
+            return self._memory_system is not None
+
+        if MEMORY_SYSTEM_AVAILABLE and MEMORY_ARCHIVAL_ENABLED:
+            try:
+                self._memory_system = await get_memory_system()
+                self._memory_initialized = True
+                self.logger.info("✅ Memory System initialized for voice evolution tracking")
+                return True
+            except Exception as e:
+                self.logger.debug(f"Memory System initialization failed: {e}")
+                self._memory_initialized = True  # Don't retry
+                return False
+        return False
+
+    async def _get_wisdom_enhanced_reasoning(
+        self,
+        voice_confidence: float,
+        behavioral_confidence: float,
+        context_confidence: float,
+        physics_confidence: float = 0.0,
+        environmental_issues: Optional[List[str]] = None,
+        threat_detected: Optional[str] = None,
+    ) -> Optional[str]:
+        """
+        Use Wisdom Patterns to get enhanced reasoning for authentication decision.
+
+        Uses the jarvis_voice_auth_reasoning pattern which provides structured
+        analysis of voice biometric authentication decisions.
+        """
+        if not await self._ensure_wisdom_initialized():
+            return None
+
+        if not self._wisdom_agent:
+            return None
+
+        try:
+            # Build context for wisdom pattern
+            input_context = f"""
+VOICE ANALYSIS:
+- Voice biometric confidence: {voice_confidence * 100:.1f}%
+- Behavioral pattern match: {behavioral_confidence * 100:.1f}%
+- Contextual intelligence: {context_confidence * 100:.1f}%
+- Physics verification: {physics_confidence * 100:.1f}%
+
+ENVIRONMENTAL FACTORS:
+{chr(10).join(f'- {issue}' for issue in (environmental_issues or [])) or '- None detected'}
+
+SECURITY CHECK:
+- Threat detected: {threat_detected or 'None'}
+- Threshold: 85% for voice, 80% for fused
+
+DECISION REQUIRED:
+Based on the above analysis, determine:
+1. Should we authenticate, challenge, or deny?
+2. What feedback should we provide to the user?
+3. What is the reasoning behind this decision?
+"""
+
+            # Use the jarvis_voice_auth_reasoning pattern
+            enhanced = await self._wisdom_agent.enhance_prompt(
+                task="voice authentication decision",
+                pattern_name="jarvis_voice_auth_reasoning",
+                input_text=input_context,
+            )
+
+            return enhanced
+
+        except Exception as e:
+            self.logger.debug(f"Wisdom reasoning failed: {e}")
+            return None
+
+    async def _store_auth_in_memory(
+        self,
+        speaker_name: str,
+        authenticated: bool,
+        voice_confidence: float,
+        decision: str,
+        feedback: str,
+    ):
+        """Store authentication event in archival memory for voice evolution tracking."""
+        if not await self._ensure_memory_initialized():
+            return
+
+        if not self._memory_system:
+            return
+
+        try:
+            content = f"""
+Authentication Event for {speaker_name}:
+- Time: {datetime.now().isoformat()}
+- Result: {'AUTHENTICATED' if authenticated else 'DENIED'}
+- Voice Confidence: {voice_confidence * 100:.1f}%
+- Decision: {decision}
+- Feedback: {feedback}
+"""
+            metadata = {
+                "type": "voice_auth_event",
+                "speaker": speaker_name,
+                "authenticated": authenticated,
+                "confidence": voice_confidence,
+                "decision": decision,
+            }
+
+            await self._memory_system.archival.insert(content, metadata)
+            self.logger.debug(f"Stored auth event in memory: {speaker_name} - {decision}")
+
+        except Exception as e:
+            self.logger.debug(f"Memory storage failed: {e}")
 
     def _build_graph(self):
         """
@@ -1192,6 +1361,18 @@ class AdaptiveAuthenticationEngine:
                         duration_ms=0.0
                     )
 
+            # v6.0: Store authentication event in archival memory for voice evolution tracking
+            try:
+                await self._store_auth_in_memory(
+                    speaker_name=speaker_name or "unknown",
+                    authenticated=is_verified,
+                    voice_confidence=voice_conf,
+                    decision=decision,
+                    feedback=final_state.get("feedback_message", ""),
+                )
+            except Exception as mem_err:
+                self.logger.debug(f"Memory storage skipped: {mem_err}")
+
             return {
                 "verified": is_verified,
                 "confidence": fused_confidence,
@@ -1202,7 +1383,9 @@ class AdaptiveAuthenticationEngine:
                 "retry_strategy": final_state.get("retry_strategy"),
                 "attempts": final_state.get("attempt_count", 1),
                 "threat_detected": final_state.get("threat_detected"),
-                "trace_id": final_state.get("trace_id")
+                "trace_id": final_state.get("trace_id"),
+                "wisdom_enhanced": WISDOM_PATTERNS_AVAILABLE and WISDOM_ENABLED,
+                "memory_tracked": MEMORY_SYSTEM_AVAILABLE and MEMORY_ARCHIVAL_ENABLED,
             }
         except asyncio.TimeoutError:
             self.logger.error(f"⏱️ LangGraph adaptive auth timed out after {LANGGRAPH_TIMEOUT}s")

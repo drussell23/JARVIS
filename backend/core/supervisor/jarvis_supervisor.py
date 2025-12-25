@@ -72,6 +72,18 @@ from .restart_coordinator import (
     RestartSource,
 )
 
+# v6.0: Cross-Repo Intelligence Hub (Heist Integration)
+# Connects: Repository Intelligence (Aider), Memory System (MemGPT),
+#           Wisdom Patterns (Fabric), SOP Enforcement (MetaGPT),
+#           Computer Use Refinements (Open Interpreter)
+def _get_intelligence_hub():
+    """Lazy import of cross-repo intelligence hub."""
+    try:
+        from backend.intelligence.cross_repo_hub import get_intelligence_hub
+        return get_intelligence_hub
+    except ImportError:
+        return None
+
 # Import loading server functionality (lazy import to avoid circular deps)
 def _get_loading_server():
     """Lazy import of loading_server module."""
@@ -259,6 +271,15 @@ class JARVISSupervisor:
         # Manages JARVIS-Prime as a critical microservice for instant local responses
         self._jarvis_prime_orchestrator: Optional[Any] = None
 
+        # v6.0: Cross-Repo Intelligence Hub (Heist Integration)
+        # Unified orchestration of all integrated systems from reference repos:
+        # - Aider: Repository Intelligence (tree-sitter, PageRank)
+        # - MemGPT: Unified Memory System (paging, archival)
+        # - Fabric: Wisdom Patterns (optimized prompts)
+        # - MetaGPT: SOP Enforcement (ActionNode, BY_ORDER)
+        # - Open Interpreter: Computer Use Refinements (streaming, safety)
+        self._cross_repo_hub: Optional[Any] = None
+
         logger.info(f"🔧 Supervisor initialized (mode: {self.config.mode.value})")
     
     def _find_entry_point(self) -> str:
@@ -445,6 +466,55 @@ class JARVISSupervisor:
                 logger.warning(f"⚠️ JARVIS-Prime Orchestrator initialization failed: {e}")
                 # Continue without JARVIS-Prime - commands will fall back to Tier 1
                 self._jarvis_prime_orchestrator = None
+
+        # v6.0: Initialize Cross-Repo Intelligence Hub (Heist Integration)
+        # This connects all reference repo patterns into a unified system
+        if self._cross_repo_hub is None:
+            try:
+                get_hub = _get_intelligence_hub()
+                if get_hub:
+                    self._cross_repo_hub = await get_hub()
+                    await self._cross_repo_hub.start()
+
+                    # Get hub state
+                    hub_state = self._cross_repo_hub.get_state()
+                    active_systems = [s.value for s in hub_state.active_systems]
+
+                    logger.info(
+                        f"🔗 Cross-Repo Intelligence Hub initialized: "
+                        f"{len(active_systems)} systems active"
+                    )
+
+                    # Log which systems are available
+                    system_emojis = {
+                        'repository': '📂',
+                        'memory': '🧠',
+                        'wisdom': '📚',
+                        'sop': '📋',
+                        'computer_use': '🖥️',
+                    }
+                    for system in active_systems:
+                        emoji = system_emojis.get(system, '✓')
+                        logger.info(f"  {emoji} {system.title().replace('_', ' ')}")
+
+                    # Report to progress hub if available
+                    if self._progress_hub:
+                        try:
+                            asyncio.create_task(
+                                self._progress_hub.component_complete(
+                                    "cross_repo_hub",
+                                    f"Cross-Repo Hub ({len(active_systems)} systems)"
+                                )
+                            )
+                        except Exception:
+                            pass
+                else:
+                    logger.info("⏭️ Cross-Repo Intelligence Hub not available (optional)")
+
+            except Exception as e:
+                logger.warning(f"⚠️ Cross-Repo Intelligence Hub initialization failed: {e}")
+                # Graceful degradation - continue without hub
+                self._cross_repo_hub = None
 
     # Browser lock file - shared with run_supervisor.py
     BROWSER_LOCK_FILE = Path("/tmp/jarvis_browser.lock")

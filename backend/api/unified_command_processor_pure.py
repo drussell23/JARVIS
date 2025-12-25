@@ -4,14 +4,52 @@ Simplified to use Claude's natural understanding instead of pattern matching
 
 The old way: Complex routing logic, pattern matching, multiple handlers
 The new way: Claude understands everything naturally
+
+v6.0 Enhancements (Cross-Repo Integration):
+- SOP Enforcement (MetaGPT-inspired) for structured task execution
+- Wisdom Patterns (Fabric-inspired) for enhanced prompts
+- Context enrichment via Cross-Repo Intelligence Hub
 """
 
 import logging
-from typing import Dict, Any, Optional, Tuple
-from dataclasses import dataclass
+import os
+from typing import Dict, Any, Optional, Tuple, List
+from dataclasses import dataclass, field
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
+
+# =============================================================================
+# SOP ENFORCEMENT INTEGRATION (v6.0 - MetaGPT-Inspired)
+# =============================================================================
+try:
+    from backend.intelligence.sop_enforcement import (
+        StandardOperatingProcedure,
+        ActionNode,
+        ExecutionMode,
+        create_code_review_sop,
+        create_feature_implementation_sop,
+        SOPConfig,
+    )
+    SOP_AVAILABLE = True
+except ImportError:
+    SOP_AVAILABLE = False
+
+# =============================================================================
+# CROSS-REPO HUB INTEGRATION (v6.0)
+# =============================================================================
+try:
+    from backend.intelligence.cross_repo_hub import (
+        get_intelligence_hub,
+        CrossRepoIntelligenceHub,
+    )
+    HUB_AVAILABLE = True
+except ImportError:
+    HUB_AVAILABLE = False
+
+# Environment-driven configuration
+SOP_ENABLED = os.getenv("JARVIS_SOP_ENABLED", "true").lower() == "true"
+HUB_ENRICHMENT_ENABLED = os.getenv("JARVIS_HUB_ENRICHMENT_ENABLED", "true").lower() == "true"
 
 
 @dataclass
@@ -31,13 +69,74 @@ class PureUnifiedCommandProcessor:
     """
     Unified processor using pure Claude intelligence.
     No routing tables, no pattern matching - Claude understands intent naturally.
+
+    v6.0 Enhancements:
+    - SOP Enforcement for structured multi-step tasks
+    - Cross-Repo Hub for context enrichment
+    - Available SOPs: code_review, feature_implementation
     """
-    
+
+    # Keywords that trigger SOP-based processing
+    SOP_TRIGGERS = {
+        "review": "code_review",
+        "code review": "code_review",
+        "review this code": "code_review",
+        "review my code": "code_review",
+        "implement": "feature_implementation",
+        "add feature": "feature_implementation",
+        "create feature": "feature_implementation",
+        "build feature": "feature_implementation",
+    }
+
     def __init__(self, api_key: Optional[str] = None):
         self.api_key = api_key
         self.context = PureUnifiedContext()
         self.vision_handler = None
         self._initialized = False
+
+        # v6.0: SOP Enforcement
+        self._sop_registry: Dict[str, StandardOperatingProcedure] = {}
+        self._hub: Optional[CrossRepoIntelligenceHub] = None
+        self._hub_initialized = False
+
+    async def _ensure_sop_initialized(self):
+        """Lazily initialize available SOPs."""
+        if self._sop_registry:
+            return
+
+        if SOP_AVAILABLE and SOP_ENABLED:
+            try:
+                config = SOPConfig()
+                self._sop_registry["code_review"] = create_code_review_sop(config)
+                self._sop_registry["feature_implementation"] = create_feature_implementation_sop(config)
+                logger.info(f"✅ SOP Enforcement initialized: {list(self._sop_registry.keys())}")
+            except Exception as e:
+                logger.debug(f"SOP initialization failed: {e}")
+
+    async def _ensure_hub_initialized(self):
+        """Lazily initialize Cross-Repo Hub."""
+        if self._hub_initialized:
+            return self._hub is not None
+
+        if HUB_AVAILABLE and HUB_ENRICHMENT_ENABLED:
+            try:
+                self._hub = await get_intelligence_hub()
+                self._hub_initialized = True
+                logger.info("✅ Cross-Repo Hub connected for context enrichment")
+                return True
+            except Exception as e:
+                logger.debug(f"Hub initialization failed: {e}")
+                self._hub_initialized = True
+                return False
+        return False
+
+    def _detect_sop_trigger(self, command: str) -> Optional[str]:
+        """Detect if command should trigger an SOP."""
+        command_lower = command.lower()
+        for trigger, sop_name in self.SOP_TRIGGERS.items():
+            if trigger in command_lower:
+                return sop_name
+        return None
         
     async def _ensure_initialized(self):
         """Lazy initialization of handlers"""
@@ -57,29 +156,80 @@ class PureUnifiedCommandProcessor:
             except Exception as e:
                 logger.error(f"Failed to initialize pure processor: {e}")
                 
-    async def process_command(self, command_text: str, websocket=None) -> Dict[str, Any]:
+    async def process_command(self, command_text: str, websocket=None, llm=None) -> Dict[str, Any]:
         """
         Process any command using pure Claude intelligence.
         Claude figures out what the user wants - no pattern matching needed.
+
+        v6.0: Now supports SOP-based execution for complex tasks like:
+        - Code review (structured analysis with security, performance, quality checks)
+        - Feature implementation (requirements -> design -> code -> tests)
         """
         logger.info(f"[PURE] Processing: '{command_text}'")
-        
+
         # Ensure initialized
         await self._ensure_initialized()
-        
+        await self._ensure_sop_initialized()
+
         # Update context
         self.context.last_command = command_text
         self.context.last_command_time = datetime.now()
-        
+
         try:
+            # v6.0: Check if this command should trigger an SOP
+            sop_name = self._detect_sop_trigger(command_text)
+            if sop_name and sop_name in self._sop_registry and llm:
+                logger.info(f"[SOP] Triggering '{sop_name}' SOP for: '{command_text}'")
+
+                # Get enriched context from hub if available
+                enriched_context = command_text
+                if await self._ensure_hub_initialized() and self._hub:
+                    try:
+                        enrichment = await self._hub.enrich_context(command_text)
+                        if enrichment.get("enrichments"):
+                            enriched_context = f"{command_text}\n\n## Intelligence Context\n{enrichment['enrichments']}"
+                    except Exception as enrich_err:
+                        logger.debug(f"Context enrichment skipped: {enrich_err}")
+
+                # Execute the SOP
+                sop = self._sop_registry[sop_name]
+                sop_result = await sop.execute(llm, enriched_context, ExecutionMode.BY_ORDER)
+
+                # Format the response
+                steps_completed = sum(1 for r in sop_result.values() if r.is_success())
+                total_steps = len(sop_result)
+
+                response_parts = [f"Completed {steps_completed}/{total_steps} steps of {sop_name}:"]
+                for step_name, result in sop_result.items():
+                    status_emoji = "✅" if result.is_success() else "❌"
+                    response_parts.append(f"  {status_emoji} {step_name}")
+                    if result.output:
+                        # Include key parts of output
+                        if isinstance(result.output, dict):
+                            for key, value in list(result.output.items())[:3]:
+                                response_parts.append(f"      • {key}: {str(value)[:100]}")
+
+                self.context.last_response = "\n".join(response_parts)
+
+                return {
+                    'success': steps_completed == total_steps,
+                    'response': "\n".join(response_parts),
+                    'command_type': f'sop_{sop_name}',
+                    'sop_results': {k: v.to_dict() if hasattr(v, 'to_dict') else str(v) for k, v in sop_result.items()},
+                    'steps_completed': steps_completed,
+                    'total_steps': total_steps,
+                    'pure_intelligence': True,
+                    'sop_enhanced': True,
+                }
+
             # For vision-related queries, use vision intelligence
             # But we don't need to detect this - Claude will understand
             if self._might_be_vision_related(command_text) and self.vision_handler:
                 result = await self.vision_handler.handle_command(command_text)
-                
+
                 # Update context
                 self.context.last_response = result.get('response', '')
-                
+
                 return {
                     'success': True,
                     'response': result.get('response', ''),
@@ -94,9 +244,10 @@ class PureUnifiedCommandProcessor:
                     'success': False,
                     'response': await self._get_natural_fallback_response(command_text),
                     'command_type': 'not_implemented',
-                    'pure_intelligence': True
+                    'pure_intelligence': True,
+                    'available_sops': list(self._sop_registry.keys()) if self._sop_registry else [],
                 }
-                
+
         except Exception as e:
             logger.error(f"Pure processor error: {e}", exc_info=True)
             return {
