@@ -25210,7 +25210,1498 @@ The runner is a **"Producer"** (writes data) but not a **"Consumer"** (reads sta
 
 ---
 
+## 🚀 MAS Integration Roadmap: Google APIs, Coding Agents & Computer Use
+
+This section provides a **comprehensive, in-depth roadmap** for integrating Google APIs into the MAS (Multi-Agent System), implementing coding agents, connecting MAS to Claude Computer Use, and establishing a complete testing framework. This is the definitive guide to achieving full "Agentic OS" capabilities with 60+ specialized agents.
+
+### 📊 Current MAS Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│              JARVIS Multi-Agent System (60+ Agents)                 │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  ┌──────────────────────────────────────────────────────────────┐  │
+│  │         Tier 1: Master Intelligence Agents (2)                 │  │
+│  │  • Unified Awareness Engine (UAE) - Master Coordinator       │  │
+│  │  • Situational Awareness Intelligence (SAI) - Real-time       │  │
+│  └──────────────────────────────────────────────────────────────┘  │
+│                           │                                          │
+│                           ▼                                          │
+│  ┌──────────────────────────────────────────────────────────────┐  │
+│  │      Tier 2: Core Domain Agents (37 Agents)                   │  │
+│  │  • Vision Intelligence (9)                               │  │
+│  │  • Autonomy & Control (8)                                    │  │
+│  │  • Memory & Context (6)                                      │  │
+│  │  • Communication (5)                                          │  │
+│  │  • Security & Privacy (4)                                    │  │
+│  │  • System Intelligence (5)                                    │  │
+│  └──────────────────────────────────────────────────────────────┘  │
+│                           │                                          │
+│                           ▼                                          │
+│  ┌──────────────────────────────────────────────────────────────┐  │
+│  │      Tier 3: Specialized Task Agents (21+)                    │  │
+│  │  • Google API Agents (0) ❌ MISSING                          │  │
+│  │  • Coding Agents (0) ❌ MISSING                               │  │
+│  │  • Computer Use Agents (1) ✅ Partial                         │  │
+│  └──────────────────────────────────────────────────────────────┘  │
+│                                                                      │
+│  ⚠️  MISSING: Google API Agents, Coding Agents, MAS-Computer Use   │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 1. Google APIs Integration into MAS
+
+### 1.1 Current State Analysis
+
+**Status:** ❌ **NOT IMPLEMENTED** - No Google API agents exist in the MAS
+
+**What Exists:**
+- ✅ GCP Infrastructure (Cloud Run, Cloud SQL, VMs) - Managed via Terraform
+- ✅ GCP Service Account Authentication - For infrastructure management
+- ❌ **No Google Workspace API Integration** (Gmail, Calendar, Drive, Sheets, Docs)
+- ❌ **No Google Cloud APIs Integration** (Vision, Translation, Speech-to-Text, etc.)
+- ❌ **No Google Search API Integration** (Custom Search, Knowledge Graph)
+
+**Impact:**
+- ❌ Cannot read/send emails via Gmail API
+- ❌ Cannot manage calendar events
+- ❌ Cannot access Google Drive files
+- ❌ Cannot edit Google Sheets/Docs
+- ❌ Cannot use Google Cloud AI services (Vision, Translation, etc.)
+- ❌ Cannot perform Google searches programmatically
+
+### 1.2 Recommended Architecture: Google API Agents as Tier 2 Specialized Agents
+
+**Design Philosophy:**
+Google APIs should be integrated as **specialized Tier 2 agents** within the MAS, not as direct API calls. Each Google service becomes a dedicated agent with its own capabilities, tools, and decision-making logic.
+
+**Proposed Agent Structure:**
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│              Google API Agents (Tier 2 - Specialized)                │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  ┌──────────────────────────────────────────────────────────────┐  │
+│  │         Google Workspace Agents (5 Agents)                    │  │
+│  │  • Gmail Agent - Email reading, sending, filtering          │  │
+│  │  • Calendar Agent - Event management, scheduling             │  │
+│  │  • Drive Agent - File access, sharing, organization          │  │
+│  │  • Sheets Agent - Spreadsheet manipulation, formulas         │  │
+│  │  • Docs Agent - Document editing, collaboration              │  │
+│  └──────────────────────────────────────────────────────────────┘  │
+│                                                                      │
+│  ┌──────────────────────────────────────────────────────────────┐  │
+│  │         Google Cloud AI Agents (6 Agents)                      │  │
+│  │  • Vision Agent - Image analysis, OCR, object detection      │  │
+│  │  • Translation Agent - Multi-language translation             │  │
+│  │  • Speech-to-Text Agent - Audio transcription               │  │
+│  │  • Text-to-Speech Agent - Voice synthesis                    │  │
+│  │  • Natural Language Agent - Sentiment, entity extraction      │  │
+│  │  • Knowledge Graph Agent - Entity search, relationships       │  │
+│  └──────────────────────────────────────────────────────────────┘  │
+│                                                                      │
+│  ┌──────────────────────────────────────────────────────────────┐  │
+│  │         Google Search Agents (2 Agents)                       │  │
+│  │  • Custom Search Agent - Programmatic web search             │  │
+│  │  • Knowledge Graph Agent - Structured data queries          │  │
+│  └──────────────────────────────────────────────────────────────┘  │
+│                                                                      │
+│  Total: 13 New Google API Agents                                    │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 1.3 Implementation Roadmap
+
+#### Phase 1: Google Workspace Agents (Priority: HIGH)
+
+**Timeline:** 2-3 weeks
+
+**1.1 Gmail Agent** (`backend/neural_mesh/agents/google/gmail_agent.py`)
+
+**Capabilities:**
+- Read emails (inbox, labels, filters)
+- Send emails (compose, reply, forward)
+- Search emails (by subject, sender, date, content)
+- Manage labels and filters
+- Extract attachments
+- Auto-categorize emails
+
+**Tools:**
+- `gmail_read_inbox()` - Read inbox emails
+- `gmail_send_email()` - Send email
+- `gmail_search()` - Search emails
+- `gmail_get_labels()` - Get email labels
+- `gmail_apply_label()` - Apply label to email
+- `gmail_get_attachment()` - Download attachment
+
+**Integration Points:**
+- MAS Orchestrator: `google.gmail` agent category
+- ATR: Can be called for email-related tasks
+- UAE: Email context awareness
+- SAI: Real-time email notifications
+
+**Example Usage:**
+```python
+# User: "JARVIS, check my emails and summarize the important ones"
+# ATR decomposes: 
+#   1. Gmail Agent → Read inbox
+#   2. Natural Language Agent → Summarize emails
+#   3. UAE → Store email context
+```
+
+**1.2 Calendar Agent** (`backend/neural_mesh/agents/google/calendar_agent.py`)
+
+**Capabilities:**
+- Read calendar events
+- Create/update/delete events
+- Find free time slots
+- Schedule meetings
+- Send meeting invitations
+- Handle timezone conversions
+
+**Tools:**
+- `calendar_list_events()` - List events
+- `calendar_create_event()` - Create event
+- `calendar_update_event()` - Update event
+- `calendar_delete_event()` - Delete event
+- `calendar_find_free_time()` - Find available slots
+- `calendar_send_invite()` - Send invitation
+
+**1.3 Drive Agent** (`backend/neural_mesh/agents/google/drive_agent.py`)
+
+**Capabilities:**
+- List files and folders
+- Upload/download files
+- Share files/folders
+- Search files
+- Organize files (move, copy, delete)
+- Get file metadata
+
+**Tools:**
+- `drive_list_files()` - List files
+- `drive_upload_file()` - Upload file
+- `drive_download_file()` - Download file
+- `drive_share_file()` - Share file
+- `drive_search_files()` - Search files
+- `drive_move_file()` - Move file
+
+**1.4 Sheets Agent** (`backend/neural_mesh/agents/google/sheets_agent.py`)
+
+**Capabilities:**
+- Read/write spreadsheet data
+- Execute formulas
+- Format cells
+- Create charts
+- Manage sheets (tabs)
+- Batch operations
+
+**Tools:**
+- `sheets_read_range()` - Read cell range
+- `sheets_write_range()` - Write cell range
+- `sheets_execute_formula()` - Execute formula
+- `sheets_format_cells()` - Format cells
+- `sheets_create_chart()` - Create chart
+- `sheets_batch_update()` - Batch operations
+
+**1.5 Docs Agent** (`backend/neural_mesh/agents/google/docs_agent.py`)
+
+**Capabilities:**
+- Read document content
+- Insert text/images
+- Format text
+- Create documents
+- Manage comments
+- Track changes
+
+**Tools:**
+- `docs_read_document()` - Read document
+- `docs_insert_text()` - Insert text
+- `docs_format_text()` - Format text
+- `docs_create_document()` - Create document
+- `docs_add_comment()` - Add comment
+- `docs_track_changes()` - Track changes
+
+#### Phase 2: Google Cloud AI Agents (Priority: MEDIUM)
+
+**Timeline:** 3-4 weeks
+
+**2.1 Vision Agent** (`backend/neural_mesh/agents/google/vision_agent.py`)
+
+**Capabilities:**
+- Image classification
+- Object detection
+- OCR (text extraction)
+- Face detection
+- Label detection
+- Safe search detection
+
+**Tools:**
+- `vision_analyze_image()` - Full image analysis
+- `vision_detect_objects()` - Object detection
+- `vision_extract_text()` - OCR
+- `vision_detect_faces()` - Face detection
+- `vision_detect_labels()` - Label detection
+- `vision_safe_search()` - Safe search check
+
+**2.2 Translation Agent** (`backend/neural_mesh/agents/google/translation_agent.py`)
+
+**Capabilities:**
+- Translate text between languages
+- Detect language
+- Batch translation
+- Custom glossary support
+
+**Tools:**
+- `translation_translate()` - Translate text
+- `translation_detect_language()` - Detect language
+- `translation_batch_translate()` - Batch translation
+- `translation_use_glossary()` - Use custom glossary
+
+**2.3 Speech-to-Text Agent** (`backend/neural_mesh/agents/google/speech_agent.py`)
+
+**Capabilities:**
+- Transcribe audio to text
+- Real-time streaming transcription
+- Speaker diarization
+- Multiple language support
+
+**Tools:**
+- `speech_transcribe()` - Transcribe audio
+- `speech_stream_transcribe()` - Real-time transcription
+- `speech_diarize()` - Speaker diarization
+- `speech_detect_language()` - Detect language
+
+**2.4 Text-to-Speech Agent** (`backend/neural_mesh/agents/google/tts_agent.py`)
+
+**Capabilities:**
+- Convert text to speech
+- Multiple voice options
+- SSML support
+- Audio format selection
+
+**Tools:**
+- `tts_synthesize()` - Synthesize speech
+- `tts_list_voices()` - List available voices
+- `tts_use_ssml()` - Use SSML markup
+- `tts_select_format()` - Select audio format
+
+**2.5 Natural Language Agent** (`backend/neural_mesh/agents/google/nlp_agent.py`)
+
+**Capabilities:**
+- Sentiment analysis
+- Entity extraction
+- Syntax analysis
+- Content classification
+
+**Tools:**
+- `nlp_analyze_sentiment()` - Sentiment analysis
+- `nlp_extract_entities()` - Entity extraction
+- `nlp_analyze_syntax()` - Syntax analysis
+- `nlp_classify_content()` - Content classification
+
+**2.6 Knowledge Graph Agent** (`backend/neural_mesh/agents/google/kg_agent.py`)
+
+**Capabilities:**
+- Entity search
+- Relationship discovery
+- Fact extraction
+- Knowledge graph queries
+
+**Tools:**
+- `kg_search_entity()` - Search entity
+- `kg_get_relationships()` - Get relationships
+- `kg_extract_facts()` - Extract facts
+- `kg_query_graph()` - Query knowledge graph
+
+#### Phase 3: Google Search Agents (Priority: LOW)
+
+**Timeline:** 1-2 weeks
+
+**3.1 Custom Search Agent** (`backend/neural_mesh/agents/google/search_agent.py`)
+
+**Capabilities:**
+- Programmatic web search
+- Custom search engine configuration
+- Search result filtering
+- Image search
+
+**Tools:**
+- `search_web()` - Web search
+- `search_images()` - Image search
+- `search_filter()` - Filter results
+- `search_custom_engine()` - Use custom engine
+
+**3.2 Knowledge Graph Search Agent** (`backend/neural_mesh/agents/google/kg_search_agent.py`)
+
+**Capabilities:**
+- Structured data queries
+- Entity information retrieval
+- Relationship queries
+
+**Tools:**
+- `kg_search()` - Knowledge graph search
+- `kg_get_entity()` - Get entity info
+- `kg_get_relationships()` - Get relationships
+
+### 1.4 Authentication & Security
+
+**OAuth 2.0 Flow:**
+1. User grants permissions via OAuth consent screen
+2. Access tokens stored securely in `~/.jarvis/google_credentials.json`
+3. Token refresh handled automatically
+4. Scoped permissions (only requested APIs)
+
+**Security Considerations:**
+- ✅ Credentials encrypted at rest
+- ✅ Token refresh automatic
+- ✅ Scope-limited permissions
+- ✅ Audit logging for all API calls
+- ✅ Rate limiting per agent
+- ✅ Error handling and retry logic
+
+**Configuration:**
+```yaml
+# backend/core/google_apis_config.yaml
+google_apis:
+  enabled: true
+  oauth:
+    client_id: "${GOOGLE_CLIENT_ID}"
+    client_secret: "${GOOGLE_CLIENT_SECRET}"
+    scopes:
+      - https://www.googleapis.com/auth/gmail.readonly
+      - https://www.googleapis.com/auth/calendar
+      - https://www.googleapis.com/auth/drive.readonly
+      - https://www.googleapis.com/auth/spreadsheets
+      - https://www.googleapis.com/auth/documents
+  rate_limiting:
+    requests_per_minute: 100
+    requests_per_day: 10000
+  retry:
+    max_retries: 3
+    backoff_factor: 2
+```
+
+---
+
+## 2. Coding Agents Implementation
+
+### 2.1 Current State Analysis
+
+**Status:** ❌ **NOT IMPLEMENTED** - No dedicated coding agents exist
+
+**What Exists:**
+- ✅ LangChain tools for code execution
+- ✅ Terminal/command execution capabilities
+- ✅ File system access
+- ❌ **No specialized coding agents** (Code Generation, Code Review, Code Testing, etc.)
+- ❌ **No code understanding agents** (Code Analysis, Documentation Generation, etc.)
+- ❌ **No IDE integration agents** (VSCode, IntelliJ, etc.)
+
+**Impact:**
+- ❌ Cannot generate code from natural language descriptions
+- ❌ Cannot review code for bugs/security issues
+- ❌ Cannot write unit tests automatically
+- ❌ Cannot refactor code intelligently
+- ❌ Cannot generate documentation from code
+- ❌ Cannot understand codebase structure
+
+### 2.2 Recommended Architecture: Coding Agents as Tier 2 Specialized Agents
+
+**Proposed Agent Structure:**
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│              Coding Agents (Tier 2 - Specialized)                    │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  ┌──────────────────────────────────────────────────────────────┐  │
+│  │         Code Generation Agents (4 Agents)                     │  │
+│  │  • Code Generator Agent - Generate code from descriptions    │  │
+│  │  • Function Generator Agent - Generate functions/classes     │  │
+│  │  • Test Generator Agent - Generate unit/integration tests   │  │
+│  │  • Documentation Generator Agent - Generate docs from code │  │
+│  └──────────────────────────────────────────────────────────────┘  │
+│                                                                      │
+│  ┌──────────────────────────────────────────────────────────────┐  │
+│  │         Code Analysis Agents (5 Agents)                       │  │
+│  │  • Code Reviewer Agent - Review code for bugs/issues         │  │
+│  │  • Security Scanner Agent - Find security vulnerabilities    │  │
+│  │  • Performance Analyzer Agent - Analyze performance         │  │
+│  │  • Code Structure Analyzer Agent - Understand codebase       │  │
+│  │  • Dependency Analyzer Agent - Analyze dependencies         │  │
+│  └──────────────────────────────────────────────────────────────┘  │
+│                                                                      │
+│  ┌──────────────────────────────────────────────────────────────┐  │
+│  │         Code Transformation Agents (3 Agents)                 │  │
+│  │  • Code Refactorer Agent - Refactor code intelligently       │  │
+│  │  • Code Migrator Agent - Migrate between frameworks         │  │
+│  │  • Code Formatter Agent - Format code to standards          │  │
+│  └──────────────────────────────────────────────────────────────┘  │
+│                                                                      │
+│  ┌──────────────────────────────────────────────────────────────┐  │
+│  │         IDE Integration Agents (2 Agents)                      │  │
+│  │  • VSCode Agent - VSCode integration                        │  │
+│  │  • IntelliJ Agent - IntelliJ integration                    │  │
+│  └──────────────────────────────────────────────────────────────┘  │
+│                                                                      │
+│  Total: 14 New Coding Agents                                         │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 2.3 Implementation Roadmap
+
+#### Phase 1: Code Generation Agents (Priority: HIGH)
+
+**Timeline:** 2-3 weeks
+
+**1.1 Code Generator Agent** (`backend/neural_mesh/agents/coding/code_generator_agent.py`)
+
+**Capabilities:**
+- Generate code from natural language descriptions
+- Support multiple programming languages (Python, JavaScript, TypeScript, Go, Rust, etc.)
+- Generate complete files or code snippets
+- Understand context and requirements
+- Generate idiomatic code
+
+**Tools:**
+- `generate_code()` - Generate code from description
+- `generate_file()` - Generate complete file
+- `generate_snippet()` - Generate code snippet
+- `generate_class()` - Generate class
+- `generate_function()` - Generate function
+- `generate_module()` - Generate module
+
+**Example Usage:**
+```python
+# User: "JARVIS, create a Python function that calculates fibonacci numbers"
+# Code Generator Agent generates:
+def fibonacci(n: int) -> int:
+    """Calculate the nth Fibonacci number."""
+    if n <= 1:
+        return n
+    return fibonacci(n - 1) + fibonacci(n - 2)
+```
+
+**1.2 Function Generator Agent** (`backend/neural_mesh/agents/coding/function_generator_agent.py`)
+
+**Capabilities:**
+- Generate functions with proper signatures
+- Generate docstrings
+- Generate type hints
+- Generate error handling
+- Generate unit tests
+
+**Tools:**
+- `generate_function()` - Generate function
+- `generate_method()` - Generate method
+- `generate_docstring()` - Generate docstring
+- `generate_type_hints()` - Generate type hints
+- `generate_error_handling()` - Generate error handling
+
+**1.3 Test Generator Agent** (`backend/neural_mesh/agents/coding/test_generator_agent.py`)
+
+**Capabilities:**
+- Generate unit tests
+- Generate integration tests
+- Generate test fixtures
+- Generate test mocks
+- Generate test coverage reports
+
+**Tools:**
+- `generate_unit_tests()` - Generate unit tests
+- `generate_integration_tests()` - Generate integration tests
+- `generate_test_fixtures()` - Generate test fixtures
+- `generate_mocks()` - Generate mocks
+- `generate_coverage_report()` - Generate coverage report
+
+**1.4 Documentation Generator Agent** (`backend/neural_mesh/agents/coding/doc_generator_agent.py`)
+
+**Capabilities:**
+- Generate API documentation
+- Generate README files
+- Generate code comments
+- Generate architecture diagrams
+- Generate usage examples
+
+**Tools:**
+- `generate_api_docs()` - Generate API documentation
+- `generate_readme()` - Generate README
+- `generate_comments()` - Generate code comments
+- `generate_architecture_diagram()` - Generate architecture diagram
+- `generate_examples()` - Generate usage examples
+
+#### Phase 2: Code Analysis Agents (Priority: HIGH)
+
+**Timeline:** 3-4 weeks
+
+**2.1 Code Reviewer Agent** (`backend/neural_mesh/agents/coding/code_reviewer_agent.py`)
+
+**Capabilities:**
+- Review code for bugs
+- Review code for best practices
+- Review code for performance issues
+- Review code for maintainability
+- Generate review comments
+
+**Tools:**
+- `review_code()` - Review code
+- `find_bugs()` - Find bugs
+- `check_best_practices()` - Check best practices
+- `analyze_performance()` - Analyze performance
+- `generate_review_comments()` - Generate review comments
+
+**2.2 Security Scanner Agent** (`backend/neural_mesh/agents/coding/security_scanner_agent.py`)
+
+**Capabilities:**
+- Find security vulnerabilities
+- Check for SQL injection
+- Check for XSS vulnerabilities
+- Check for authentication issues
+- Generate security report
+
+**Tools:**
+- `scan_security()` - Scan for vulnerabilities
+- `check_sql_injection()` - Check SQL injection
+- `check_xss()` - Check XSS vulnerabilities
+- `check_authentication()` - Check authentication
+- `generate_security_report()` - Generate security report
+
+**2.3 Performance Analyzer Agent** (`backend/neural_mesh/agents/coding/performance_analyzer_agent.py`)
+
+**Capabilities:**
+- Analyze code performance
+- Find performance bottlenecks
+- Suggest optimizations
+- Generate performance reports
+- Profile code execution
+
+**Tools:**
+- `analyze_performance()` - Analyze performance
+- `find_bottlenecks()` - Find bottlenecks
+- `suggest_optimizations()` - Suggest optimizations
+- `generate_performance_report()` - Generate performance report
+- `profile_code()` - Profile code execution
+
+**2.4 Code Structure Analyzer Agent** (`backend/neural_mesh/agents/coding/structure_analyzer_agent.py`)
+
+**Capabilities:**
+- Understand codebase structure
+- Map dependencies
+- Identify patterns
+- Generate architecture diagrams
+- Analyze code complexity
+
+**Tools:**
+- `analyze_structure()` - Analyze codebase structure
+- `map_dependencies()` - Map dependencies
+- `identify_patterns()` - Identify patterns
+- `generate_architecture_diagram()` - Generate architecture diagram
+- `analyze_complexity()` - Analyze code complexity
+
+**2.5 Dependency Analyzer Agent** (`backend/neural_mesh/agents/coding/dependency_analyzer_agent.py`)
+
+**Capabilities:**
+- Analyze dependencies
+- Check for outdated packages
+- Check for security vulnerabilities in dependencies
+- Suggest dependency updates
+- Generate dependency report
+
+**Tools:**
+- `analyze_dependencies()` - Analyze dependencies
+- `check_outdated()` - Check for outdated packages
+- `check_vulnerabilities()` - Check for vulnerabilities
+- `suggest_updates()` - Suggest updates
+- `generate_dependency_report()` - Generate dependency report
+
+#### Phase 3: Code Transformation Agents (Priority: MEDIUM)
+
+**Timeline:** 2-3 weeks
+
+**3.1 Code Refactorer Agent** (`backend/neural_mesh/agents/coding/refactorer_agent.py`)
+
+**Capabilities:**
+- Refactor code intelligently
+- Extract methods
+- Rename variables
+- Simplify complex code
+- Apply design patterns
+
+**Tools:**
+- `refactor_code()` - Refactor code
+- `extract_method()` - Extract method
+- `rename_variable()` - Rename variable
+- `simplify_code()` - Simplify code
+- `apply_design_pattern()` - Apply design pattern
+
+**3.2 Code Migrator Agent** (`backend/neural_mesh/agents/coding/migrator_agent.py`)
+
+**Capabilities:**
+- Migrate between frameworks
+- Migrate between languages
+- Update API versions
+- Migrate database schemas
+- Generate migration scripts
+
+**Tools:**
+- `migrate_framework()` - Migrate framework
+- `migrate_language()` - Migrate language
+- `update_api_version()` - Update API version
+- `migrate_database()` - Migrate database
+- `generate_migration_script()` - Generate migration script
+
+**3.3 Code Formatter Agent** (`backend/neural_mesh/agents/coding/formatter_agent.py`)
+
+**Capabilities:**
+- Format code to standards
+- Apply linting rules
+- Fix formatting issues
+- Enforce code style
+- Generate formatting report
+
+**Tools:**
+- `format_code()` - Format code
+- `apply_linting()` - Apply linting
+- `fix_formatting()` - Fix formatting
+- `enforce_style()` - Enforce code style
+- `generate_formatting_report()` - Generate formatting report
+
+#### Phase 4: IDE Integration Agents (Priority: LOW)
+
+**Timeline:** 2-3 weeks
+
+**4.1 VSCode Agent** (`backend/neural_mesh/agents/coding/vscode_agent.py`)
+
+**Capabilities:**
+- Integrate with VSCode
+- Execute VSCode commands
+- Manage VSCode extensions
+- Configure VSCode settings
+- Access VSCode workspace
+
+**Tools:**
+- `vscode_execute_command()` - Execute VSCode command
+- `vscode_manage_extensions()` - Manage extensions
+- `vscode_configure_settings()` - Configure settings
+- `vscode_access_workspace()` - Access workspace
+
+**4.2 IntelliJ Agent** (`backend/neural_mesh/agents/coding/intellij_agent.py`)
+
+**Capabilities:**
+- Integrate with IntelliJ
+- Execute IntelliJ actions
+- Manage IntelliJ plugins
+- Configure IntelliJ settings
+- Access IntelliJ project
+
+**Tools:**
+- `intellij_execute_action()` - Execute IntelliJ action
+- `intellij_manage_plugins()` - Manage plugins
+- `intellij_configure_settings()` - Configure settings
+- `intellij_access_project()` - Access project
+
+---
+
+## 3. MAS Connection to Claude Computer Use
+
+### 3.1 Current State Analysis
+
+**Status:** ⚠️ **PARTIALLY IMPLEMENTED** - Computer Use exists but not fully integrated with MAS
+
+**What Exists:**
+- ✅ `ClaudeComputerUseConnector` - Direct Computer Use API integration
+- ✅ `ComputerUseTool` - Tool wrapper for Autonomous Agent
+- ✅ Computer Use capabilities (mouse, keyboard, screen capture)
+- ❌ **Not integrated with MAS orchestrator** - Only available to single Autonomous Agent
+- ❌ **Not available to 60+ MAS agents** - Agents cannot use Computer Use tools
+- ❌ **No MAS workflow execution via Computer Use** - Complex tasks cannot use Computer Use
+
+**Impact:**
+- ❌ MAS agents cannot control macOS directly
+- ❌ Complex multi-agent workflows cannot use Computer Use
+- ❌ Only single-agent tasks can use Computer Use
+- ❌ No coordination between MAS agents and Computer Use
+
+### 3.2 Recommended Architecture: Computer Use as MAS Tool Provider
+
+**Design Philosophy:**
+Computer Use should be a **shared tool provider** accessible to all MAS agents through the orchestrator. The orchestrator coordinates which agents use Computer Use tools and when.
+
+**Proposed Integration:**
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│              MAS-Computer Use Integration Architecture               │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  ┌──────────────────────────────────────────────────────────────┐  │
+│  │         MAS Orchestrator                                      │  │
+│  │  • Decomposes complex tasks                                  │  │
+│  │  • Assigns agents to subtasks                                │  │
+│  │  • Coordinates Computer Use tool access                      │  │
+│  └──────────────────────┬───────────────────────────────────────┘  │
+│                         │                                            │
+│         ┌───────────────┼───────────────┐                          │
+│         │               │               │                            │
+│         ▼               ▼               ▼                            │
+│  ┌──────────┐   ┌──────────┐   ┌──────────┐                        │
+│  │ Agent 1   │   │ Agent 2 │   │ Agent 3 │                        │
+│  │ (Vision) │   │ (Code)  │   │ (UI)    │                        │
+│  └────┬─────┘   └────┬─────┘   └────┬─────┘                        │
+│       │              │              │                                │
+│       └──────────────┼──────────────┘                                │
+│                      │                                                │
+│                      ▼                                                │
+│  ┌──────────────────────────────────────────────────────────────┐  │
+│  │         Computer Use Tool Provider                            │  │
+│  │  • Mouse control                                              │  │
+│  │  • Keyboard input                                            │  │
+│  │  • Screen capture                                            │  │
+│  │  • UI element interaction                                    │  │
+│  └──────────────────────────────────────────────────────────────┘  │
+│                                                                      │
+│  ⚠️  MISSING: Orchestrator coordination, agent tool access          │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 3.3 Implementation Roadmap
+
+#### Phase 1: Computer Use Tool Registration in MAS (Priority: CRITICAL)
+
+**Timeline:** 1 week
+
+**1.1 Register Computer Use Tools with MAS Orchestrator**
+
+**File:** `backend/neural_mesh/orchestration/multi_agent_orchestrator.py`
+
+**Changes:**
+```python
+# Add Computer Use tools to MAS tool registry
+async def _register_computer_use_tools(self):
+    """Register Computer Use tools with MAS orchestrator."""
+    from backend.autonomy.computer_use_tool import ComputerUseTool
+    
+    computer_use_tool = ComputerUseTool()
+    
+    # Register tools
+    self.tool_registry.register_tool(
+        name="computer_use_mouse",
+        tool=computer_use_tool.mouse_control,
+        description="Control mouse (click, move, drag)",
+        category="computer_use",
+        available_to=["all_agents"]  # All agents can use
+    )
+    
+    self.tool_registry.register_tool(
+        name="computer_use_keyboard",
+        tool=computer_use_tool.keyboard_input,
+        description="Send keyboard input",
+        category="computer_use",
+        available_to=["all_agents"]
+    )
+    
+    self.tool_registry.register_tool(
+        name="computer_use_screen_capture",
+        tool=computer_use_tool.screen_capture,
+        description="Capture screen or UI elements",
+        category="computer_use",
+        available_to=["all_agents"]
+    )
+    
+    self.tool_registry.register_tool(
+        name="computer_use_ui_interaction",
+        tool=computer_use_tool.ui_interaction,
+        description="Interact with UI elements",
+        category="computer_use",
+        available_to=["all_agents"]
+    )
+```
+
+**1.2 Agent Tool Access Control**
+
+**File:** `backend/neural_mesh/orchestration/multi_agent_orchestrator.py`
+
+**Changes:**
+```python
+async def _check_tool_access(self, agent_id: str, tool_name: str) -> bool:
+    """Check if agent can access tool."""
+    tool = self.tool_registry.get_tool(tool_name)
+    
+    if not tool:
+        return False
+    
+    # Check if tool is available to agent
+    if "all_agents" in tool.available_to:
+        return True
+    
+    if agent_id in tool.available_to:
+        return True
+    
+    # Check agent category
+    agent = self.agent_registry.get_agent(agent_id)
+    if agent and agent.category in tool.available_to:
+        return True
+    
+    return False
+```
+
+#### Phase 2: MAS Workflow Execution with Computer Use (Priority: HIGH)
+
+**Timeline:** 2-3 weeks
+
+**2.1 Complex Task Decomposition with Computer Use**
+
+**File:** `backend/core/agentic_task_runner.py`
+
+**Changes:**
+```python
+async def _phase_plan(
+    self,
+    goal: str,
+    context: Dict[str, Any],
+    execution_mode: str = "direct"
+) -> Dict[str, Any]:
+    """Plan task execution with MAS and Computer Use."""
+    
+    # Check if task requires Computer Use
+    requires_computer_use = await self._check_computer_use_requirement(goal)
+    
+    if requires_computer_use and execution_mode == "multi_agent":
+        # Decompose via MAS with Computer Use
+        workflow = await self._neural_mesh_coordinator.create_workflow(
+            goal=goal,
+            process_type="dynamic",
+            delegation_strategy="capability_based",
+            tools_required=["computer_use"]  # Request Computer Use tools
+        )
+        
+        # Execute workflow with Computer Use coordination
+        result = await workflow.execute(
+            tool_provider=self._computer_use_tool_provider
+        )
+        
+        return {
+            "sub_tasks": result.steps,
+            "execution_mode": "multi_agent_computer_use",
+            "computer_use_enabled": True
+        }
+    
+    # Fallback to existing planning
+    return await self._existing_phase_plan(goal, context, execution_mode)
+```
+
+**2.2 Agent-Computer Use Coordination**
+
+**File:** `backend/neural_mesh/orchestration/multi_agent_orchestrator.py`
+
+**Changes:**
+```python
+async def execute_workflow_with_computer_use(
+    self,
+    workflow: Workflow,
+    tool_provider: ComputerUseToolProvider
+) -> WorkflowResult:
+    """Execute workflow with Computer Use tool coordination."""
+    
+    results = []
+    
+    for step in workflow.steps:
+        agent = self.agent_registry.get_agent(step.assigned_agent)
+        
+        # Check if step requires Computer Use
+        if step.requires_computer_use:
+            # Acquire Computer Use tool lock
+            tool_lock = await tool_provider.acquire_lock(agent.id)
+            
+            try:
+                # Execute step with Computer Use
+                result = await agent.execute(
+                    goal=step.description,
+                    tools=[tool_provider.get_tools()],
+                    context=step.context
+                )
+                results.append(result)
+            finally:
+                # Release Computer Use tool lock
+                await tool_provider.release_lock(tool_lock)
+        else:
+            # Execute step without Computer Use
+            result = await agent.execute(
+                goal=step.description,
+                tools=step.required_tools,
+                context=step.context
+            )
+            results.append(result)
+    
+    return WorkflowResult(steps=results)
+```
+
+#### Phase 3: Testing & Validation (Priority: HIGH)
+
+**Timeline:** 1-2 weeks
+
+**3.1 Test Scenarios**
+
+**Scenario 1: Simple Computer Use Task**
+```
+User: "JARVIS, click the button in the top right corner"
+Expected: Single agent (UI Agent) uses Computer Use to click button
+```
+
+**Scenario 2: Complex Multi-Agent Computer Use Task**
+```
+User: "JARVIS, take a screenshot, analyze it, and click the red button"
+Expected: 
+  1. Vision Agent → Uses Computer Use to capture screen
+  2. Vision Analyzer Agent → Analyzes screenshot
+  3. UI Agent → Uses Computer Use to click red button
+```
+
+**Scenario 3: MAS Workflow with Computer Use**
+```
+User: "JARVIS, open Gmail, read my emails, and summarize them"
+Expected:
+  1. Computer Use Agent → Opens Gmail
+  2. Gmail Agent → Reads emails (via Google API)
+  3. Natural Language Agent → Summarizes emails
+  4. UAE → Stores email context
+```
+
+---
+
+## 4. Testing JARVIS: Complete Testing Framework
+
+### 4.1 Current Testing State
+
+**Status:** ⚠️ **PARTIAL** - Some testing exists but not comprehensive
+
+**What Exists:**
+- ✅ Unit tests for some components
+- ✅ Integration tests for some APIs
+- ❌ **No end-to-end testing framework** for MAS workflows
+- ❌ **No Computer Use testing framework**
+- ❌ **No Google API testing framework**
+- ❌ **No coding agent testing framework**
+
+### 4.2 Recommended Testing Architecture
+
+**Testing Pyramid:**
+```
+                    ┌─────────────┐
+                    │   E2E Tests │  (10%) - Full user workflows
+                    └─────────────┘
+                  ┌─────────────────┐
+                  │ Integration     │  (30%) - Component integration
+                  │ Tests           │
+                  └─────────────────┘
+                ┌─────────────────────┐
+                │   Unit Tests        │  (60%) - Individual components
+                └─────────────────────┘
+```
+
+### 4.3 Testing Roadmap
+
+#### Phase 1: MAS Workflow Testing (Priority: HIGH)
+
+**Timeline:** 2 weeks
+
+**1.1 MAS Workflow Test Framework**
+
+**File:** `backend/tests/mas/test_mas_workflows.py`
+
+**Test Cases:**
+- Test simple MAS workflow (2-3 agents)
+- Test complex MAS workflow (5+ agents)
+- Test MAS workflow with Computer Use
+- Test MAS workflow with Google APIs
+- Test MAS workflow error handling
+- Test MAS workflow coordination
+
+**Example Test:**
+```python
+async def test_mas_workflow_email_summary():
+    """Test MAS workflow: Read emails and summarize."""
+    # Setup
+    orchestrator = MultiAgentOrchestrator()
+    workflow = await orchestrator.create_workflow(
+        goal="Read my emails and summarize the important ones",
+        process_type="dynamic"
+    )
+    
+    # Execute
+    result = await workflow.execute()
+    
+    # Assert
+    assert result.success
+    assert len(result.steps) >= 2  # Gmail Agent + NLP Agent
+    assert "summary" in result.final_output.lower()
+```
+
+#### Phase 2: Computer Use Testing (Priority: HIGH)
+
+**Timeline:** 2 weeks
+
+**2.1 Computer Use Test Framework**
+
+**File:** `backend/tests/computer_use/test_computer_use.py`
+
+**Test Cases:**
+- Test mouse control
+- Test keyboard input
+- Test screen capture
+- Test UI element interaction
+- Test Computer Use with MAS
+- Test Computer Use error handling
+
+**Example Test:**
+```python
+async def test_computer_use_click_button():
+    """Test Computer Use: Click button."""
+    # Setup
+    computer_use = ComputerUseTool()
+    
+    # Execute
+    result = await computer_use.mouse_control(
+        action="click",
+        coordinates=(100, 200)
+    )
+    
+    # Assert
+    assert result.success
+    assert result.action == "click"
+```
+
+#### Phase 3: Google API Testing (Priority: MEDIUM)
+
+**Timeline:** 2 weeks
+
+**3.1 Google API Test Framework**
+
+**File:** `backend/tests/google/test_google_apis.py`
+
+**Test Cases:**
+- Test Gmail API agent
+- Test Calendar API agent
+- Test Drive API agent
+- Test Sheets API agent
+- Test Docs API agent
+- Test Google Cloud AI agents
+
+**Example Test:**
+```python
+async def test_gmail_agent_read_emails():
+    """Test Gmail Agent: Read emails."""
+    # Setup
+    gmail_agent = GmailAgent()
+    
+    # Execute
+    result = await gmail_agent.read_inbox(limit=10)
+    
+    # Assert
+    assert result.success
+    assert len(result.emails) <= 10
+    assert all("subject" in email for email in result.emails)
+```
+
+#### Phase 4: Coding Agent Testing (Priority: MEDIUM)
+
+**Timeline:** 2 weeks
+
+**4.1 Coding Agent Test Framework**
+
+**File:** `backend/tests/coding/test_coding_agents.py`
+
+**Test Cases:**
+- Test code generator agent
+- Test code reviewer agent
+- Test test generator agent
+- Test documentation generator agent
+- Test code refactorer agent
+
+**Example Test:**
+```python
+async def test_code_generator_agent():
+    """Test Code Generator Agent: Generate function."""
+    # Setup
+    code_agent = CodeGeneratorAgent()
+    
+    # Execute
+    result = await code_agent.generate_function(
+        description="Calculate fibonacci numbers",
+        language="python"
+    )
+    
+    # Assert
+    assert result.success
+    assert "def fibonacci" in result.code
+    assert "return" in result.code
+```
+
+#### Phase 5: End-to-End Testing (Priority: HIGH)
+
+**Timeline:** 3 weeks
+
+**5.1 E2E Test Framework**
+
+**File:** `backend/tests/e2e/test_e2e_workflows.py`
+
+**Test Scenarios:**
+1. **Email Management Workflow**
+   - User: "JARVIS, check my emails and summarize"
+   - Expected: Gmail Agent → NLP Agent → UAE
+
+2. **Code Generation Workflow**
+   - User: "JARVIS, create a Python function to calculate primes"
+   - Expected: Code Generator Agent → Test Generator Agent
+
+3. **Computer Use Workflow**
+   - User: "JARVIS, take a screenshot and analyze it"
+   - Expected: Computer Use Agent → Vision Agent → UAE
+
+4. **Complex Multi-Agent Workflow**
+   - User: "JARVIS, read my calendar, check emails, and prepare a summary"
+   - Expected: Calendar Agent → Gmail Agent → NLP Agent → UAE
+
+**Example E2E Test:**
+```python
+async def test_e2e_email_summary_workflow():
+    """E2E Test: Email summary workflow."""
+    # Setup
+    jarvis = JARVIS()
+    await jarvis.initialize()
+    
+    # Execute
+    result = await jarvis.execute_command(
+        "JARVIS EXECUTE: Check my emails and summarize the important ones"
+    )
+    
+    # Assert
+    assert result.success
+    assert "email" in result.output.lower()
+    assert "summary" in result.output.lower()
+    assert result.agents_used >= 2  # Gmail + NLP
+```
+
+---
+
+## 5. Complete Implementation Roadmap
+
+### 5.1 Priority Matrix
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    Priority Matrix                                │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  🔴 CRITICAL (Do First)                                             │
+│  • MAS-Computer Use Integration (Phase 1) - 1 week                 │
+│  • MAS Workflow Execution in ATR - 2 weeks                        │
+│  • Computer Use Testing Framework - 2 weeks                       │
+│                                                                      │
+│  🟡 HIGH (Do Next)                                                  │
+│  • Google Workspace Agents (Gmail, Calendar, Drive) - 2-3 weeks   │
+│  • Code Generation Agents - 2-3 weeks                             │
+│  • MAS Workflow Testing - 2 weeks                                 │
+│  • E2E Testing Framework - 3 weeks                                 │
+│                                                                      │
+│  🟢 MEDIUM (Do Later)                                               │
+│  • Google Cloud AI Agents - 3-4 weeks                              │
+│  • Code Analysis Agents - 3-4 weeks                                │
+│  • Google API Testing - 2 weeks                                    │
+│  • Coding Agent Testing - 2 weeks                                  │
+│                                                                      │
+│  ⚪ LOW (Nice to Have)                                              │
+│  • Google Search Agents - 1-2 weeks                                 │
+│  • Code Transformation Agents - 2-3 weeks                          │
+│  • IDE Integration Agents - 2-3 weeks                                │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 5.2 Timeline Summary
+
+**Total Timeline: 16-24 weeks (4-6 months)**
+
+**Phase 1: Foundation (Weeks 1-3)**
+- ✅ MAS-Computer Use Integration
+- ✅ MAS Workflow Execution in ATR
+- ✅ Computer Use Testing Framework
+
+**Phase 2: Core Agents (Weeks 4-9)**
+- ✅ Google Workspace Agents (Gmail, Calendar, Drive, Sheets, Docs)
+- ✅ Code Generation Agents (Code Generator, Function Generator, Test Generator, Doc Generator)
+
+**Phase 3: Advanced Agents (Weeks 10-16)**
+- ✅ Google Cloud AI Agents (Vision, Translation, Speech, NLP, Knowledge Graph)
+- ✅ Code Analysis Agents (Code Reviewer, Security Scanner, Performance Analyzer, Structure Analyzer, Dependency Analyzer)
+
+**Phase 4: Testing & Polish (Weeks 17-20)**
+- ✅ MAS Workflow Testing
+- ✅ Google API Testing
+- ✅ Coding Agent Testing
+- ✅ E2E Testing Framework
+
+**Phase 5: Extended Features (Weeks 21-24)**
+- ✅ Google Search Agents
+- ✅ Code Transformation Agents
+- ✅ IDE Integration Agents
+
+### 5.3 Success Metrics
+
+**Technical Metrics:**
+- ✅ 60+ agents fully integrated in MAS
+- ✅ 13 Google API agents operational
+- ✅ 14 Coding agents operational
+- ✅ MAS-Computer Use integration complete
+- ✅ 100+ E2E test scenarios passing
+
+**User Experience Metrics:**
+- ✅ Complex multi-agent workflows execute successfully
+- ✅ Google API tasks complete in < 5 seconds
+- ✅ Code generation tasks complete in < 10 seconds
+- ✅ Computer Use tasks execute reliably (> 95% success rate)
+
+**Quality Metrics:**
+- ✅ Test coverage > 80%
+- ✅ E2E test pass rate > 95%
+- ✅ Agent coordination success rate > 90%
+- ✅ Error handling coverage > 90%
+
+---
+
+## 6. What Testing JARVIS Looks Like
+
+### 6.1 Simple Test Scenarios
+
+**Scenario 1: Single Agent Task**
+```bash
+# User Command
+"JARVIS EXECUTE: Check my emails"
+
+# Expected Flow
+1. ATR receives command
+2. ATR routes to Gmail Agent
+3. Gmail Agent reads inbox via Google API
+4. Gmail Agent returns email list
+5. ATR displays results to user
+
+# Test Command
+python3 -m pytest backend/tests/e2e/test_e2e_workflows.py::test_gmail_read_emails -v
+```
+
+**Scenario 2: Multi-Agent Task**
+```bash
+# User Command
+"JARVIS EXECUTE: Read my emails and summarize the important ones"
+
+# Expected Flow
+1. ATR receives command
+2. ATR decomposes via MAS:
+   - Gmail Agent → Read emails
+   - NLP Agent → Summarize emails
+   - UAE → Store context
+3. MAS orchestrator coordinates execution
+4. Results combined and returned
+
+# Test Command
+python3 -m pytest backend/tests/e2e/test_e2e_workflows.py::test_email_summary_workflow -v
+```
+
+**Scenario 3: Computer Use Task**
+```bash
+# User Command
+"JARVIS EXECUTE: Take a screenshot and analyze it"
+
+# Expected Flow
+1. ATR receives command
+2. ATR decomposes via MAS:
+   - Computer Use Agent → Capture screen
+   - Vision Agent → Analyze screenshot
+   - UAE → Store analysis
+3. MAS orchestrator coordinates Computer Use tool access
+4. Results returned
+
+# Test Command
+python3 -m pytest backend/tests/e2e/test_e2e_workflows.py::test_screenshot_analysis -v
+```
+
+### 6.2 Complex Test Scenarios
+
+**Scenario 4: Full Workflow with Google APIs + Computer Use**
+```bash
+# User Command
+"JARVIS EXECUTE: Open Gmail, read my emails, create a summary document in Google Docs, and share it with me"
+
+# Expected Flow
+1. ATR receives command
+2. ATR decomposes via MAS:
+   - Computer Use Agent → Open Gmail (browser)
+   - Gmail Agent → Read emails (Google API)
+   - NLP Agent → Summarize emails
+   - Docs Agent → Create document (Google API)
+   - Docs Agent → Share document (Google API)
+   - UAE → Store workflow context
+3. MAS orchestrator coordinates:
+   - Computer Use tool access (locked during browser interaction)
+   - Google API calls (parallel where possible)
+   - Sequential document creation/sharing
+4. Results returned
+
+# Test Command
+python3 -m pytest backend/tests/e2e/test_e2e_workflows.py::test_full_gmail_docs_workflow -v
+```
+
+**Scenario 5: Code Generation Workflow**
+```bash
+# User Command
+"JARVIS EXECUTE: Create a Python function to calculate prime numbers, write unit tests for it, and generate documentation"
+
+# Expected Flow
+1. ATR receives command
+2. ATR decomposes via MAS:
+   - Code Generator Agent → Generate function
+   - Test Generator Agent → Generate unit tests
+   - Documentation Generator Agent → Generate docs
+   - Code Reviewer Agent → Review code quality
+   - UAE → Store code context
+3. MAS orchestrator coordinates:
+   - Sequential code generation (function → tests → docs)
+   - Parallel code review
+4. Results returned
+
+# Test Command
+python3 -m pytest backend/tests/e2e/test_e2e_workflows.py::test_code_generation_workflow -v
+```
+
+### 6.3 Running Tests
+
+**Run All Tests:**
+```bash
+# Run all tests
+python3 -m pytest backend/tests/ -v
+
+# Run MAS tests only
+python3 -m pytest backend/tests/mas/ -v
+
+# Run Computer Use tests only
+python3 -m pytest backend/tests/computer_use/ -v
+
+# Run Google API tests only
+python3 -m pytest backend/tests/google/ -v
+
+# Run Coding Agent tests only
+python3 -m pytest backend/tests/coding/ -v
+
+# Run E2E tests only
+python3 -m pytest backend/tests/e2e/ -v
+```
+
+**Run Specific Test:**
+```bash
+# Run specific test
+python3 -m pytest backend/tests/e2e/test_e2e_workflows.py::test_email_summary_workflow -v
+
+# Run with coverage
+python3 -m pytest backend/tests/ --cov=backend --cov-report=html
+
+# Run with verbose output
+python3 -m pytest backend/tests/ -v -s
+```
+
+---
+
+## 7. Next Steps: Immediate Action Items
+
+### 7.1 Week 1: MAS-Computer Use Integration (CRITICAL)
+
+**Day 1-2: Tool Registration**
+- [ ] Register Computer Use tools with MAS orchestrator
+- [ ] Implement tool access control
+- [ ] Add tool locking mechanism
+
+**Day 3-4: ATR Integration**
+- [ ] Update `_phase_plan()` to detect Computer Use requirements
+- [ ] Integrate MAS workflow execution with Computer Use
+- [ ] Add Computer Use coordination logic
+
+**Day 5: Testing**
+- [ ] Write unit tests for tool registration
+- [ ] Write integration tests for MAS-Computer Use
+- [ ] Test simple Computer Use workflow
+
+### 7.2 Week 2-3: MAS Workflow Execution in ATR
+
+**Week 2: Complexity Detection**
+- [ ] Implement task complexity detection
+- [ ] Add MAS decomposition logic
+- [ ] Integrate with existing Phase Manager
+
+**Week 3: Workflow Execution**
+- [ ] Implement MAS workflow execution in ATR
+- [ ] Add error handling and retry logic
+- [ ] Test complex multi-agent workflows
+
+### 7.3 Week 4-6: Google Workspace Agents
+
+**Week 4: Gmail Agent**
+- [ ] Implement Gmail API client
+- [ ] Create Gmail Agent
+- [ ] Register with MAS
+- [ ] Write tests
+
+**Week 5: Calendar & Drive Agents**
+- [ ] Implement Calendar Agent
+- [ ] Implement Drive Agent
+- [ ] Register with MAS
+- [ ] Write tests
+
+**Week 6: Sheets & Docs Agents**
+- [ ] Implement Sheets Agent
+- [ ] Implement Docs Agent
+- [ ] Register with MAS
+- [ ] Write tests
+
+### 7.4 Week 7-9: Code Generation Agents
+
+**Week 7: Code Generator Agent**
+- [ ] Implement Code Generator Agent
+- [ ] Support multiple languages
+- [ ] Register with MAS
+- [ ] Write tests
+
+**Week 8: Function & Test Generator Agents**
+- [ ] Implement Function Generator Agent
+- [ ] Implement Test Generator Agent
+- [ ] Register with MAS
+- [ ] Write tests
+
+**Week 9: Documentation Generator Agent**
+- [ ] Implement Documentation Generator Agent
+- [ ] Register with MAS
+- [ ] Write tests
+
+### 7.5 Week 10+: Testing & Polish
+
+**Week 10-12: Testing Framework**
+- [ ] Implement MAS workflow testing
+- [ ] Implement Computer Use testing
+- [ ] Implement Google API testing
+- [ ] Implement Coding Agent testing
+- [ ] Implement E2E testing framework
+
+**Week 13-16: Advanced Agents**
+- [ ] Implement Google Cloud AI Agents
+- [ ] Implement Code Analysis Agents
+- [ ] Register with MAS
+- [ ] Write tests
+
+---
+
 ## 📚 Documentation
+
 
 **Architecture Documentation:**
 - [HYBRID_ARCHITECTURE.md](HYBRID_ARCHITECTURE.md) - Complete hybrid architecture guide

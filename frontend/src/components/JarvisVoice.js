@@ -21,6 +21,7 @@ import EnvironmentalStatsDisplay from './EnvironmentalStatsDisplay'; // Environm
 import AudioQualityStatsDisplay from './AudioQualityStatsDisplay'; // Audio quality stats display
 import CommandDetectionBanner from './CommandDetectionBanner'; // 🆕 Command detection banner for streaming safeguard
 import { getJarvisConnectionService, ConnectionState, connectionStateToJarvisStatus } from '../services/JarvisConnectionService'; // 🆕 Unified connection service
+import TrainingStatus from './TrainingStatus'; // 🆕 Real-time training progress display (Feedback Loop)
 import { getContinuousAudioBuffer } from '../utils/ContinuousAudioBuffer'; // 🆕 Continuous audio pre-buffer for first-attempt recognition
 import { initDynamicFavicon, setFaviconState } from '../utils/DynamicFavicon'; // 🆕 Dynamic JARVIS favicon
 
@@ -5443,6 +5444,9 @@ const JarvisVoice = () => {
           }}
         />
       )}
+
+      {/* Training Status - Real-time training progress from Reactor-Core (Feedback Loop) */}
+      <TrainingStatus />
 
       {/* Vision Status - REMOVED */}
 

@@ -1206,6 +1206,314 @@ class AgenticTaskRunner:
         except Exception as e:
             self.logger.debug(f"[HotSwap] Bridge event write error: {e}")
 
+    # =========================================================================
+    # Learning Goal Auto-Discovery (v10.1 - Proactive Learning from Failures)
+    # =========================================================================
+
+    async def _extract_and_submit_learning_goals(
+        self,
+        goal: str,
+        result: "AgenticTaskResult",
+    ) -> None:
+        """
+        Extract learning topics from failed task and submit to Safe Scout.
+
+        This enables JARVIS to proactively learn from failures by:
+        1. Analyzing the failed goal and error message
+        2. Extracting relevant learning topics
+        3. Submitting them to the learning goals manager
+        4. Eventually triggering Safe Scout scraping and training
+
+        Args:
+            goal: The failed task goal
+            result: The task result with error details
+        """
+        import os
+
+        # Check if learning goal auto-discovery is enabled
+        if not os.getenv("JARVIS_AUTO_LEARN_FROM_FAILURES", "true").lower() == "true":
+            return
+
+        try:
+            error_text = result.error or ""
+            final_message = result.final_message or ""
+
+            # Extract learning topics from the failure
+            learning_topics = self._extract_learning_topics_from_failure(
+                goal=goal,
+                error=error_text,
+                final_message=final_message,
+            )
+
+            if not learning_topics:
+                self.logger.debug("[LearningGoals] No learning topics extracted from failure")
+                return
+
+            # Try to submit to learning goals manager
+            submitted = await self._submit_learning_goals(learning_topics, goal, error_text)
+
+            if submitted > 0:
+                self.logger.info(
+                    f"[LearningGoals] Auto-discovered {submitted} learning topic(s) from failure: "
+                    f"{[t['topic'] for t in learning_topics[:3]]}"
+                )
+
+                # Announce if TTS is available
+                if self.tts_callback and self.config.narrate_by_default:
+                    await self.tts_callback(
+                        f"I've identified {submitted} learning topic{'s' if submitted > 1 else ''} "
+                        f"from this failure. Adding to my study queue."
+                    )
+
+        except Exception as e:
+            self.logger.debug(f"[LearningGoals] Learning goal extraction failed: {e}")
+
+    def _extract_learning_topics_from_failure(
+        self,
+        goal: str,
+        error: str,
+        final_message: str,
+    ) -> List[Dict[str, Any]]:
+        """
+        Extract learning topics from failure context using intelligent keyword analysis.
+
+        Uses multiple strategies:
+        1. Technology keyword matching (React, Python, Docker, etc.)
+        2. Error pattern recognition
+        3. Goal phrase extraction
+        4. Context-aware topic generation
+
+        Args:
+            goal: The failed task goal
+            error: The error message
+            final_message: The final result message
+
+        Returns:
+            List of learning topic dictionaries with topic, category, priority
+        """
+        topics = []
+        combined_text = f"{goal} {error} {final_message}".lower()
+
+        # Technology keywords with their learning topics and categories
+        tech_keywords = {
+            # Programming Languages
+            "python": {"topic": "Python programming", "category": "programming", "priority": 8},
+            "javascript": {"topic": "JavaScript", "category": "programming", "priority": 8},
+            "typescript": {"topic": "TypeScript", "category": "programming", "priority": 8},
+            "rust": {"topic": "Rust programming", "category": "programming", "priority": 7},
+            "go": {"topic": "Go programming", "category": "programming", "priority": 7},
+
+            # Frameworks
+            "react": {"topic": "React.js", "category": "frontend", "priority": 8},
+            "vue": {"topic": "Vue.js", "category": "frontend", "priority": 7},
+            "angular": {"topic": "Angular", "category": "frontend", "priority": 7},
+            "fastapi": {"topic": "FastAPI", "category": "backend", "priority": 8},
+            "django": {"topic": "Django", "category": "backend", "priority": 7},
+            "flask": {"topic": "Flask", "category": "backend", "priority": 7},
+            "nextjs": {"topic": "Next.js", "category": "frontend", "priority": 8},
+
+            # Infrastructure
+            "docker": {"topic": "Docker containerization", "category": "devops", "priority": 8},
+            "kubernetes": {"topic": "Kubernetes orchestration", "category": "devops", "priority": 7},
+            "terraform": {"topic": "Terraform infrastructure", "category": "devops", "priority": 7},
+            "gcp": {"topic": "Google Cloud Platform", "category": "cloud", "priority": 8},
+            "aws": {"topic": "Amazon Web Services", "category": "cloud", "priority": 7},
+            "azure": {"topic": "Microsoft Azure", "category": "cloud", "priority": 7},
+
+            # Databases
+            "sql": {"topic": "SQL databases", "category": "database", "priority": 8},
+            "postgresql": {"topic": "PostgreSQL", "category": "database", "priority": 8},
+            "mysql": {"topic": "MySQL", "category": "database", "priority": 7},
+            "mongodb": {"topic": "MongoDB", "category": "database", "priority": 7},
+            "redis": {"topic": "Redis caching", "category": "database", "priority": 7},
+            "chromadb": {"topic": "ChromaDB vector database", "category": "database", "priority": 8},
+
+            # AI/ML
+            "llm": {"topic": "Large Language Models", "category": "ai", "priority": 9},
+            "machine learning": {"topic": "Machine Learning", "category": "ai", "priority": 8},
+            "neural network": {"topic": "Neural Networks", "category": "ai", "priority": 8},
+            "transformer": {"topic": "Transformer models", "category": "ai", "priority": 8},
+            "fine-tuning": {"topic": "LLM fine-tuning", "category": "ai", "priority": 9},
+            "embeddings": {"topic": "Vector embeddings", "category": "ai", "priority": 8},
+
+            # APIs
+            "api": {"topic": "API design", "category": "backend", "priority": 7},
+            "rest": {"topic": "REST API design", "category": "backend", "priority": 7},
+            "graphql": {"topic": "GraphQL", "category": "backend", "priority": 7},
+            "websocket": {"topic": "WebSocket programming", "category": "backend", "priority": 7},
+
+            # Other
+            "git": {"topic": "Git version control", "category": "tools", "priority": 6},
+            "testing": {"topic": "Software testing", "category": "quality", "priority": 7},
+            "debugging": {"topic": "Debugging techniques", "category": "quality", "priority": 7},
+            "security": {"topic": "Application security", "category": "security", "priority": 8},
+            "authentication": {"topic": "Authentication systems", "category": "security", "priority": 8},
+        }
+
+        # Check for technology keywords
+        for keyword, topic_info in tech_keywords.items():
+            if keyword in combined_text:
+                # Avoid duplicates
+                if not any(t["topic"] == topic_info["topic"] for t in topics):
+                    topics.append({
+                        "topic": topic_info["topic"],
+                        "category": topic_info["category"],
+                        "priority": topic_info["priority"],
+                        "source": "keyword_match",
+                        "matched_keyword": keyword,
+                    })
+
+        # Error pattern recognition
+        error_patterns = {
+            "permission denied": {"topic": "File permissions and access control", "category": "systems", "priority": 6},
+            "connection refused": {"topic": "Network troubleshooting", "category": "networking", "priority": 7},
+            "timeout": {"topic": "Timeout handling and async programming", "category": "programming", "priority": 7},
+            "memory": {"topic": "Memory management", "category": "systems", "priority": 7},
+            "import error": {"topic": "Python module management", "category": "programming", "priority": 6},
+            "module not found": {"topic": "Python dependency management", "category": "programming", "priority": 6},
+            "syntax error": {"topic": "Code syntax and linting", "category": "programming", "priority": 5},
+            "type error": {"topic": "Type systems and type checking", "category": "programming", "priority": 6},
+            "null pointer": {"topic": "Null safety and error handling", "category": "programming", "priority": 7},
+            "rate limit": {"topic": "API rate limiting", "category": "backend", "priority": 7},
+        }
+
+        error_lower = error.lower()
+        for pattern, topic_info in error_patterns.items():
+            if pattern in error_lower:
+                if not any(t["topic"] == topic_info["topic"] for t in topics):
+                    topics.append({
+                        "topic": topic_info["topic"],
+                        "category": topic_info["category"],
+                        "priority": topic_info["priority"],
+                        "source": "error_pattern",
+                        "matched_pattern": pattern,
+                    })
+
+        # Fallback: Extract key phrases from goal if no specific topics found
+        if not topics and len(goal.split()) >= 2:
+            # Extract first meaningful phrase from goal
+            words = [w for w in goal.split() if len(w) > 3]
+            if words:
+                fallback_topic = " ".join(words[:3])
+                topics.append({
+                    "topic": fallback_topic.capitalize(),
+                    "category": "general",
+                    "priority": 5,
+                    "source": "goal_phrase",
+                })
+
+        # Limit to top 3 topics by priority
+        topics.sort(key=lambda t: t.get("priority", 5), reverse=True)
+        return topics[:3]
+
+    async def _submit_learning_goals(
+        self,
+        topics: List[Dict[str, Any]],
+        failed_goal: str,
+        error: str,
+    ) -> int:
+        """
+        Submit extracted learning topics to the learning goals system.
+
+        Attempts multiple submission methods:
+        1. Learning Goals Manager (if available)
+        2. Reactor-Core Scout API (if available)
+        3. Cross-repo bridge file (fallback)
+
+        Args:
+            topics: List of learning topic dictionaries
+            failed_goal: The original failed goal
+            error: The error message
+
+        Returns:
+            Number of topics successfully submitted
+        """
+        submitted = 0
+
+        # Method 1: Try Learning Goals Manager
+        try:
+            from autonomy.learning_goals_discovery import get_learning_goals_manager
+
+            manager = get_learning_goals_manager()
+            if manager:
+                for topic in topics:
+                    success = await manager.add_learning_goal(
+                        topic=topic["topic"],
+                        source="task_failure_auto",
+                        priority=topic.get("priority", 5),
+                        context={
+                            "failed_goal": failed_goal,
+                            "error": error[:500],
+                            "category": topic.get("category", "general"),
+                            "timestamp": datetime.now().isoformat(),
+                        }
+                    )
+                    if success:
+                        submitted += 1
+
+                if submitted > 0:
+                    return submitted
+
+        except ImportError:
+            pass
+        except Exception as e:
+            self.logger.debug(f"[LearningGoals] Manager submission failed: {e}")
+
+        # Method 2: Try Reactor-Core Scout API
+        try:
+            if self._reactor_core_client and self._reactor_core_client.is_online:
+                for topic in topics:
+                    success = await self._reactor_core_client.add_learning_topic(
+                        topic=topic["topic"],
+                        category=topic.get("category", "general"),
+                        priority=topic.get("priority", 5),
+                        added_by="jarvis_auto_learn",
+                    )
+                    if success:
+                        submitted += 1
+
+                if submitted > 0:
+                    return submitted
+
+        except Exception as e:
+            self.logger.debug(f"[LearningGoals] Reactor-Core submission failed: {e}")
+
+        # Method 3: Fallback to cross-repo bridge
+        try:
+            import json
+            from pathlib import Path
+
+            bridge_dir = Path.home() / ".jarvis" / "cross_repo" / "learning_goals"
+            bridge_dir.mkdir(parents=True, exist_ok=True)
+
+            for topic in topics:
+                event = {
+                    "event_id": str(uuid.uuid4())[:8],
+                    "event_type": "learning_goal_discovered",
+                    "source": "jarvis_auto_learn",
+                    "timestamp": datetime.now().isoformat(),
+                    "payload": {
+                        "topic": topic["topic"],
+                        "category": topic.get("category", "general"),
+                        "priority": topic.get("priority", 5),
+                        "failed_goal": failed_goal,
+                        "error_snippet": error[:200],
+                    },
+                }
+
+                filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{event['event_id']}.json"
+                filepath = bridge_dir / filename
+
+                with open(filepath, "w") as f:
+                    json.dump(event, f, indent=2)
+
+                submitted += 1
+
+        except Exception as e:
+            self.logger.debug(f"[LearningGoals] Bridge write failed: {e}")
+
+        return submitted
+
     async def trigger_training_manual(
         self,
         priority: str = "normal",
@@ -1557,6 +1865,10 @@ class AgenticTaskRunner:
             # Reactor-Core Integration: Track experience and check training trigger (v10.0)
             if result.success and self.config.reactor_core_enabled:
                 await self._record_experience_and_check_training(goal, result)
+
+            # Learning Goal Auto-Discovery: Extract learning topics from failures (v10.1)
+            if not result.success and result.error:
+                await self._extract_and_submit_learning_goals(goal, result)
 
             self.logger.info(f"[AgenticRunner] Complete: success={result.success}, time={execution_time:.0f}ms")
             return result
