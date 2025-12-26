@@ -200,6 +200,17 @@ class AgenticRunnerConfig:
         default_factory=lambda: os.getenv("REACTOR_CORE_AUTO_TRIGGER", "true").lower() == "true"
     )
 
+    # SOP Enforcer Integration (v11.0 - "Clinical-Grade Discipline")
+    sop_enforcer_enabled: bool = field(
+        default_factory=lambda: os.getenv("JARVIS_SOP_ENFORCER_ENABLED", "true").lower() == "true"
+    )
+    sop_strict_mode: bool = field(
+        default_factory=lambda: os.getenv("JARVIS_SOP_STRICT_MODE", "true").lower() == "true"
+    )
+    sop_complexity_threshold: float = field(
+        default_factory=lambda: float(os.getenv("JARVIS_SOP_COMPLEXITY_THRESHOLD", "0.5"))
+    )
+
     # Vision Cognitive Loop Integration (v10.2 - "Eyes of JARVIS")
     vision_cognitive_loop_enabled: bool = field(
         default_factory=lambda: os.getenv("JARVIS_VISION_LOOP_ENABLED", "true").lower() == "true"
@@ -593,6 +604,12 @@ class AgenticTaskRunner:
         self._safe_code_executor = None
         self._safe_code_initialized = False
 
+        # SOP Enforcer (v11.0 - "Clinical-Grade Discipline")
+        self._sop_enforcer = None
+        self._sop_enforcer_initialized = False
+        self._design_plans_generated = 0
+        self._tasks_blocked_by_sop = 0
+
         self.logger.info("[AgenticRunner] Created")
         self._log_availability()
 
@@ -979,6 +996,31 @@ class AgenticTaskRunner:
             if not self._computer_use_tool and not self._computer_use_connector:
                 self.logger.error("[AgenticRunner] No execution capability available!")
                 return False
+
+            # Initialize SOP Enforcer (v11.0 - Clinical-Grade Discipline)
+            if self.config.sop_enforcer_enabled:
+                try:
+                    from backend.core.governance.sop_enforcer import (
+                        SOPEnforcer,
+                        SOPEnforcerConfig,
+                    )
+
+                    sop_config = SOPEnforcerConfig(
+                        enabled=self.config.sop_enforcer_enabled,
+                        strict_mode=self.config.sop_strict_mode,
+                        complexity_threshold=self.config.sop_complexity_threshold,
+                    )
+                    self._sop_enforcer = SOPEnforcer(sop_config)
+                    self._sop_enforcer_initialized = True
+                    self.logger.info(
+                        f"[AgenticRunner] ✓ SOP Enforcer "
+                        f"(strict={self.config.sop_strict_mode}, "
+                        f"threshold={self.config.sop_complexity_threshold})"
+                    )
+                except ImportError:
+                    self.logger.debug("[AgenticRunner] ✗ SOP Enforcer: module not available")
+                except Exception as e:
+                    self.logger.debug(f"[AgenticRunner] ✗ SOP Enforcer: {e}")
 
             self._initialized = True
             self.logger.info("[AgenticRunner] Initialization complete")
@@ -2222,6 +2264,93 @@ class AgenticTaskRunner:
                 error="Watchdog kill switch active or in cooldown",
                 watchdog_status="blocked",
             )
+
+        # SOP Enforcer Check (v11.0 - "Measure Twice, Cut Once")
+        design_plan = None
+        if self._sop_enforcer and self.config.sop_enforcer_enabled:
+            try:
+                from backend.core.governance.sop_enforcer import (
+                    enforce_sop_before_execution,
+                    EnforcementAction,
+                )
+
+                task_id = str(uuid.uuid4())
+                sop_context = context.copy() if context else {}
+
+                # Add repo map to context if available
+                if self._jarvis_prime_client:
+                    try:
+                        repo_map = await self._jarvis_prime_client.get_repo_map()
+                        if repo_map:
+                            sop_context["repo_map"] = repo_map
+                    except Exception:
+                        pass
+
+                # Get LLM for plan generation (use JARVIS Prime if available)
+                llm = None
+                if self._jarvis_prime_client:
+                    # Create a simple adapter for the thinking protocol
+                    class LLMAdapter:
+                        def __init__(self, client):
+                            self.client = client
+
+                        async def aask(self, prompt: str, timeout: int = 120, **kwargs) -> str:
+                            response = await self.client.complete(
+                                prompt=prompt,
+                                max_tokens=2000,
+                                enrich_with_repo_map=False,  # Already have context
+                            )
+                            return response.text if response.success else ""
+
+                    llm = LLMAdapter(self._jarvis_prime_client)
+
+                can_proceed, design_plan, block_reason = await enforce_sop_before_execution(
+                    self._sop_enforcer,
+                    task_id,
+                    goal,
+                    sop_context,
+                    llm,
+                )
+
+                if not can_proceed:
+                    self._tasks_blocked_by_sop += 1
+                    return AgenticTaskResult(
+                        success=False,
+                        goal=goal,
+                        mode=mode.value,
+                        execution_time_ms=0,
+                        actions_count=0,
+                        reasoning_steps=0,
+                        final_message=block_reason or "Safety Block: Design Plan required",
+                        error="SOP enforcement blocked execution",
+                        watchdog_status="sop_blocked",
+                    )
+
+                if design_plan:
+                    self._design_plans_generated += 1
+                    self.logger.info(f"[AgenticRunner] SOP: Using design plan {design_plan.plan_id}")
+                    # Add plan to context for execution
+                    if context is None:
+                        context = {}
+                    context["design_plan"] = design_plan.model_dump()
+
+            except ImportError:
+                self.logger.debug("[AgenticRunner] SOP Enforcer not available, skipping check")
+            except Exception as e:
+                self.logger.warning(f"[AgenticRunner] SOP check failed: {e}")
+                # In non-strict mode, continue anyway
+                if self.config.sop_strict_mode:
+                    return AgenticTaskResult(
+                        success=False,
+                        goal=goal,
+                        mode=mode.value,
+                        execution_time_ms=0,
+                        actions_count=0,
+                        reasoning_steps=0,
+                        final_message=f"SOP enforcement error: {e}",
+                        error="SOP check failed in strict mode",
+                        watchdog_status="sop_error",
+                    )
 
         self._tasks_executed += 1
         start_time = time.time()
