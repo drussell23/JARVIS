@@ -527,8 +527,10 @@ class MultiAgentOrchestrator:
         """
         Create workflow tasks from a natural language query.
 
-        This is a simplified implementation. A full implementation would use
-        LLM to decompose complex queries into tasks.
+        This implementation uses intelligent routing based on query intent:
+        - Workspace queries → GoogleWorkspaceAgent
+        - Debug queries → Error detection workflow
+        - Analysis queries → Context + code analysis workflow
 
         Args:
             query: Natural language query
@@ -540,9 +542,40 @@ class MultiAgentOrchestrator:
         tasks: List[WorkflowTask] = []
         query_lower = query.lower()
 
-        # Simple keyword-based task generation
+        # =================================================================
+        # WORKSPACE ROUTING (Calendar, Email, Contacts)
+        # =================================================================
+        workspace_keywords = [
+            # Calendar
+            "calendar", "schedule", "meetings", "events", "agenda",
+            "what's on my calendar", "what meetings", "my schedule",
+            "busy", "free time", "availability", "appointments",
+            # Email
+            "email", "inbox", "mail", "unread", "messages", "draft",
+            "send email", "check email", "reply to",
+            # Contacts
+            "contact", "phone number", "email address for",
+            # Briefing
+            "briefing", "summary", "catch me up", "what's happening",
+        ]
+
+        is_workspace_query = any(kw in query_lower for kw in workspace_keywords)
+
+        if is_workspace_query:
+            # Route to Google Workspace Agent
+            tasks.append(WorkflowTask(
+                name="Handle workspace query",
+                description=f"Process workspace request: {query[:50]}...",
+                required_capability="handle_workspace_query",
+                input_data={"query": query},
+                priority=MessagePriority.HIGH,  # User-facing, prioritize
+            ))
+            return tasks
+
+        # =================================================================
+        # DEBUG / ERROR WORKFLOW
+        # =================================================================
         if "debug" in query_lower or "error" in query_lower:
-            # Debug workflow
             tasks.append(WorkflowTask(
                 name="Capture current state",
                 description="Capture screen or relevant context",
@@ -561,8 +594,10 @@ class MultiAgentOrchestrator:
                 dependencies=[tasks[1].task_id] if len(tasks) > 1 else [],
             ))
 
+        # =================================================================
+        # ANALYSIS WORKFLOW
+        # =================================================================
         elif "analyze" in query_lower or "review" in query_lower:
-            # Analysis workflow
             tasks.append(WorkflowTask(
                 name="Gather context",
                 description="Collect relevant information",
@@ -575,16 +610,20 @@ class MultiAgentOrchestrator:
                 dependencies=[tasks[0].task_id] if tasks else [],
             ))
 
+        # =================================================================
+        # SCREEN CAPTURE
+        # =================================================================
         elif "capture" in query_lower or "screenshot" in query_lower:
-            # Simple capture
             tasks.append(WorkflowTask(
                 name="Capture screen",
                 description="Capture screen content",
                 required_capability="screen_capture",
             ))
 
+        # =================================================================
+        # GENERIC FALLBACK
+        # =================================================================
         else:
-            # Generic task
             tasks.append(WorkflowTask(
                 name="Process query",
                 description=query,
@@ -592,6 +631,83 @@ class MultiAgentOrchestrator:
             ))
 
         return tasks
+
+    async def route_natural_query(
+        self,
+        query: str,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Intelligently route a natural language query to the right agent.
+
+        This is a convenience method that:
+        1. Detects the query intent
+        2. Creates appropriate workflow tasks
+        3. Executes the workflow
+        4. Returns the result
+
+        Args:
+            query: Natural language query from user
+            context: Optional additional context
+
+        Returns:
+            Result from the appropriate agent
+        """
+        # Create workflow from query
+        tasks = await self.create_workflow_from_query(query, context)
+
+        if not tasks:
+            return {
+                "status": "error",
+                "error": "Could not determine how to handle this query",
+            }
+
+        # Execute as single-step or multi-step workflow
+        if len(tasks) == 1:
+            # Single task - execute directly
+            task = tasks[0]
+            agent = await self.registry.get_best_agent(task.required_capability)
+
+            if not agent:
+                return {
+                    "status": "error",
+                    "error": f"No agent found with capability: {task.required_capability}",
+                }
+
+            # Send task
+            message = AgentMessage(
+                from_agent="orchestrator",
+                to_agent=agent.agent_name,
+                message_type=MessageType.TASK_ASSIGNED,
+                payload={
+                    "action": task.required_capability,
+                    **task.input_data,
+                },
+                priority=task.priority,
+            )
+
+            try:
+                result = await self.bus.request(message, timeout=task.timeout_seconds)
+                return {
+                    "status": "success",
+                    "agent": agent.agent_name,
+                    "result": result,
+                }
+            except Exception as e:
+                return {
+                    "status": "error",
+                    "agent": agent.agent_name,
+                    "error": str(e),
+                }
+        else:
+            # Multi-step workflow
+            result = await self.execute_workflow(
+                name=f"Query: {query[:30]}...",
+                tasks=tasks,
+                strategy=ExecutionStrategy.HYBRID,
+                context=context,
+            )
+            return result.to_dict()
 
     def get_metrics(self) -> OrchestratorMetrics:
         """Get current orchestrator metrics."""
