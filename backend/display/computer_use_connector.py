@@ -1008,22 +1008,59 @@ Always provide your reasoning before taking action, including grid position esti
             "blocked_reason": result.blocked_reason,
         }
 
-    def get_enhanced_system_prompt(self) -> str:
+    def get_enhanced_system_prompt(self, spatial_context: Optional[str] = None) -> str:
         """
-        Get system prompt enhanced with dynamic grid information.
+        Get system prompt enhanced with dynamic grid information and spatial context.
 
-        This provides the LLM with accurate screen-specific grid calculations
-        for improved coordinate extraction.
+        This provides the LLM with:
+        1. Accurate screen-specific grid calculations
+        2. 3D OS Awareness (which Space, which Window, where apps are)
+
+        Args:
+            spatial_context: Optional pre-computed spatial context string
+
+        Returns:
+            Enhanced system prompt with all context injected
         """
         base_prompt = self.SYSTEM_PROMPT
 
         # Add dynamic grid information if coordinate extractor is available
         if self._coordinate_extractor and self._coordinate_extractor._calibrated:
             grid_section = self._coordinate_extractor.get_grid_prompt_section()
-            # Insert after the static grid section for reinforcement
-            return f"{base_prompt}\n\n*** DYNAMIC SCREEN CALIBRATION ***\n{grid_section}"
+            base_prompt = f"{base_prompt}\n\n*** DYNAMIC SCREEN CALIBRATION ***\n{grid_section}"
+
+        # v6.2: Add 3D OS Awareness (Spatial Context / Proprioception)
+        if spatial_context:
+            spatial_section = f"""
+*** 3D OS AWARENESS (Proprioception) ***
+You have spatial awareness of the entire macOS desktop. Current context:
+{spatial_context}
+
+SPATIAL RULES:
+- Before clicking on any app, verify it's on the CURRENT space
+- If the target app is on a different space, I will switch to it automatically
+- Use this context to understand what's visible vs hidden
+- Never try to click on windows that aren't on the current space
+"""
+            base_prompt = f"{base_prompt}\n{spatial_section}"
 
         return base_prompt
+
+    async def get_current_spatial_context(self) -> Optional[str]:
+        """
+        Get current spatial context for prompt injection.
+
+        Returns:
+            Formatted spatial context string or None if unavailable
+        """
+        try:
+            from core.computer_use_bridge import get_current_context
+            context = await get_current_context()
+            if context:
+                return context.get_context_prompt()
+        except Exception as e:
+            logger.debug(f"[COMPUTER USE] Could not get spatial context: {e}")
+        return None
 
     def _load_learned_positions(self) -> None:
         """Load previously learned UI element positions."""
@@ -1430,6 +1467,9 @@ Always provide your reasoning before taking action, including grid position esti
         if context:
             context_text = f"\n\nAdditional context: {json.dumps(context)}"
 
+        # v6.2: Get spatial context for 3D OS Awareness
+        spatial_context = await self.get_current_spatial_context()
+
         # Build the prompt
         user_prompt = f"""Goal: {goal}
 {history_text}{context_text}
@@ -1477,12 +1517,15 @@ OPTION B - SINGLE ACTION (Use for dynamic interfaces or uncertain outcomes):
 Respond with your analysis followed by the action JSON."""
 
         try:
+            # v6.2: Use enhanced system prompt with 3D OS Awareness
+            system_prompt = self.get_enhanced_system_prompt(spatial_context=spatial_context)
+
             # Call Claude with computer use capability - with timeout
             response = await asyncio.wait_for(
                 self.client.messages.create(
                     model=self.COMPUTER_USE_MODEL,
                     max_tokens=1024,
-                    system=self.SYSTEM_PROMPT,
+                    system=system_prompt,
                     messages=[
                         {
                             "role": "user",
