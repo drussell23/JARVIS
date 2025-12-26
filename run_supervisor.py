@@ -3844,6 +3844,45 @@ class SupervisorBootstrapper:
                     self.logger.warning(f"⚠️ Tiered VBIA Adapter not available: {e}")
                     print(f"  {TerminalUI.YELLOW}⚠️ VBIA Adapter: Not available (will use fallback){TerminalUI.RESET}")
 
+            # v6.2 NEW: Initialize Cross-Repo State System
+            try:
+                from core.cross_repo_state_initializer import (
+                    initialize_cross_repo_state,
+                    CrossRepoStateConfig,
+                )
+
+                # Initialize cross-repo communication infrastructure
+                cross_repo_success = await initialize_cross_repo_state()
+
+                if cross_repo_success:
+                    self.logger.info("🌐 Cross-Repo State System initialized")
+                    self.logger.info("   • JARVIS ↔ JARVIS Prime ↔ Reactor Core connected")
+                    self.logger.info("   • VBIA events: Real-time sharing enabled")
+                    self.logger.info("   • Visual security: Event emission ready")
+                    print(f"  {TerminalUI.GREEN}✓ Cross-Repo: VBIA v6.2 event sharing active{TerminalUI.RESET}")
+
+                    # Broadcast cross-repo status to loading page
+                    await self._broadcast_startup_progress(
+                        stage="cross_repo_init",
+                        message="Cross-repository communication established",
+                        progress=86,
+                        metadata={
+                            "cross_repo": {
+                                "initialized": True,
+                                "visual_security_enabled": True,
+                                "event_sharing_ready": True,
+                                "message": "VBIA v6.2 cross-repo events active",
+                            }
+                        }
+                    )
+                else:
+                    self.logger.warning("⚠️ Cross-Repo State System initialization failed")
+                    print(f"  {TerminalUI.YELLOW}⚠️ Cross-Repo: Initialization failed (VBIA events disabled){TerminalUI.RESET}")
+
+            except ImportError as e:
+                self.logger.debug(f"Cross-Repo State System not available: {e}")
+                print(f"  {TerminalUI.YELLOW}⚠️ Cross-Repo: Not available (VBIA events disabled){TerminalUI.RESET}")
+
             # Initialize Tiered Router
             if self._tiered_routing_enabled:
                 try:

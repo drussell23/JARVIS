@@ -143,6 +143,7 @@ class IntelligenceSystem(str, Enum):
     MEMORY = "memory"
     WISDOM = "wisdom"
     REASONING = "reasoning"
+    VBIA = "vbia"  # v6.2 NEW: Voice Biometric Intelligent Authentication
 
 
 class EventType(str, Enum):
@@ -171,6 +172,23 @@ class EventType(str, Enum):
     # Wisdom
     PATTERN_SELECTED = "pattern_selected"
     PROMPT_ENHANCED = "prompt_enhanced"
+
+    # VBIA (Voice Biometric Intelligent Authentication) - v6.2 NEW
+    VBIA_VISUAL_SECURITY = "vbia_visual_security"
+    VBIA_VISUAL_THREAT = "vbia_visual_threat"
+    VBIA_VISUAL_SAFE = "vbia_visual_safe"
+    VBIA_AUTH_STARTED = "vbia_auth_started"
+    VBIA_AUTH_SUCCESS = "vbia_auth_success"
+    VBIA_AUTH_FAILED = "vbia_auth_failed"
+    VBIA_EVIDENCE_COLLECTED = "vbia_evidence_collected"
+    VBIA_MULTI_FACTOR_FUSION = "vbia_multi_factor_fusion"
+    VBIA_REASONING_STARTED = "vbia_reasoning_started"
+    VBIA_REASONING_THOUGHT = "vbia_reasoning_thought"
+    VBIA_REASONING_COMPLETED = "vbia_reasoning_completed"
+    VBIA_COST_TRACKED = "vbia_cost_tracked"
+    VBIA_PATTERN_LEARNED = "vbia_pattern_learned"
+    VBIA_SYSTEM_READY = "vbia_system_ready"
+    VBIA_SYSTEM_ERROR = "vbia_system_error"
 
     # Cross-System
     CONTEXT_ENRICHED = "context_enriched"

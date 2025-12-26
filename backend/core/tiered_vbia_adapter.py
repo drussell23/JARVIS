@@ -133,6 +133,14 @@ class VBIAResult:
     verification_time_ms: float
     details: Dict[str, Any] = field(default_factory=dict)
 
+    # Visual Security (v6.2 NEW)
+    visual_confidence: float = 0.0
+    visual_threat_detected: bool = False
+    visual_security_status: Optional[str] = None
+    visual_should_proceed: bool = True
+    visual_warning_message: str = ""
+    visual_analysis_time_ms: float = 0.0
+
 
 # =============================================================================
 # Tiered VBIA Adapter
@@ -157,6 +165,8 @@ class TieredVBIAAdapter:
         # Lazy-loaded services
         self._speaker_service = None
         self._voice_unlock_service = None
+        self._visual_security_analyzer = None  # v6.2 NEW
+        self._cross_repo_initializer = None  # v6.2 NEW
 
         # State
         self._initialized = False
@@ -168,13 +178,19 @@ class TieredVBIAAdapter:
         self._cached_verification_time: float = 0.0
         self._verification_cache_ttl: float = float(os.getenv("JARVIS_VBIA_CACHE_TTL", "30.0"))
 
+        # Visual security settings (v6.2 NEW)
+        self._visual_security_enabled = os.getenv("JARVIS_VISUAL_SECURITY_ENABLED", "true").lower() == "true"
+        self._visual_security_tier2_only = os.getenv("JARVIS_VISUAL_SECURITY_TIER2_ONLY", "true").lower() == "true"
+
         # Stats
         self._tier1_attempts = 0
         self._tier1_passes = 0
         self._tier2_attempts = 0
         self._tier2_passes = 0
+        self._visual_security_checks = 0  # v6.2 NEW
+        self._visual_threats_detected = 0  # v6.2 NEW
 
-        logger.info("[TieredVBIA] Adapter created")
+        logger.info("[TieredVBIA] Adapter created (visual_security={})".format(self._visual_security_enabled))
 
     async def initialize(self) -> bool:
         """Initialize the VBIA adapter."""
@@ -202,6 +218,30 @@ class TieredVBIAAdapter:
                 logger.info("[TieredVBIA] Voice unlock service loaded")
             except ImportError as e:
                 logger.debug(f"[TieredVBIA] Voice unlock service not available: {e}")
+
+            # v6.2 NEW: Try to load visual security analyzer
+            if self._visual_security_enabled:
+                try:
+                    from voice_unlock.security.visual_context_integration import (
+                        VisualSecurityAnalyzer,
+                    )
+                    self._visual_security_analyzer = VisualSecurityAnalyzer(
+                        enabled=True,
+                        preferred_mode=os.getenv("JARVIS_VISUAL_SECURITY_MODE", "auto"),
+                        screenshot_method=os.getenv("JARVIS_SCREENSHOT_METHOD", "screencapture"),
+                    )
+                    logger.info("[TieredVBIA] ✅ Visual Security Analyzer loaded")
+                except ImportError as e:
+                    logger.warning(f"[TieredVBIA] Visual security not available: {e}")
+                    self._visual_security_enabled = False
+
+            # v6.2 NEW: Try to load cross-repo initializer for event emission
+            try:
+                from core.cross_repo_state_initializer import get_cross_repo_initializer
+                self._cross_repo_initializer = await get_cross_repo_initializer()
+                logger.info("[TieredVBIA] ✅ Cross-repo event system connected")
+            except ImportError as e:
+                logger.debug(f"[TieredVBIA] Cross-repo events not available: {e}")
 
             self._initialized = True
             return True
@@ -438,6 +478,126 @@ class TieredVBIAAdapter:
         return LivenessResult.LIVE
 
     # =========================================================================
+    # Visual Security Integration (v6.2 NEW)
+    # =========================================================================
+
+    async def _perform_visual_security_check(
+        self,
+        session_id: str = "",
+        user_id: str = "",
+        tier: AuthTier = AuthTier.TIER2,
+    ) -> Dict[str, Any]:
+        """
+        Perform visual security analysis during authentication.
+
+        Args:
+            session_id: Authentication session ID
+            user_id: User identifier
+            tier: Authentication tier
+
+        Returns:
+            Dictionary with visual security results
+        """
+        if not self._visual_security_enabled or not self._visual_security_analyzer:
+            return {
+                "visual_confidence": 0.0,
+                "visual_threat_detected": False,
+                "visual_security_status": "disabled",
+                "visual_should_proceed": True,
+                "visual_warning_message": "",
+                "visual_analysis_time_ms": 0.0,
+            }
+
+        # Skip visual security for Tier 1 if configured
+        if tier == AuthTier.TIER1 and self._visual_security_tier2_only:
+            return {
+                "visual_confidence": 0.0,
+                "visual_threat_detected": False,
+                "visual_security_status": "skipped_tier1",
+                "visual_should_proceed": True,
+                "visual_warning_message": "",
+                "visual_analysis_time_ms": 0.0,
+            }
+
+        try:
+            start_time = time.time()
+
+            # Perform visual security analysis
+            evidence = await self._visual_security_analyzer.analyze_screen_security(
+                session_id=session_id or f"vbia_{int(time.time())}",
+                user_id=user_id or "unknown",
+                context={"tier": tier.value, "source": "tiered_vbia_adapter"},
+            )
+
+            # Update statistics
+            self._visual_security_checks += 1
+            if evidence.threat_detected:
+                self._visual_threats_detected += 1
+
+            # Emit event to cross-repo system
+            if self._cross_repo_initializer:
+                try:
+                    from core.cross_repo_state_initializer import VBIAEvent, EventType, RepoType
+
+                    event_type = (
+                        EventType.VISUAL_THREAT_DETECTED
+                        if evidence.threat_detected
+                        else EventType.VISUAL_SAFE_CONFIRMED
+                    )
+
+                    await self._cross_repo_initializer.emit_event(VBIAEvent(
+                        event_type=event_type,
+                        source_repo=RepoType.JARVIS,
+                        session_id=session_id,
+                        user_id=user_id,
+                        payload={
+                            "security_status": evidence.security_status.value,
+                            "threat_detected": evidence.threat_detected,
+                            "threat_types": [t.value for t in evidence.threat_types],
+                            "visual_confidence": evidence.visual_confidence,
+                            "analysis_mode": evidence.analysis_mode.value,
+                            "analysis_time_ms": evidence.analysis_time_ms,
+                            "should_proceed": evidence.should_proceed,
+                            "tier": tier.value,
+                        }
+                    ))
+                except Exception as e:
+                    logger.debug(f"[TieredVBIA] Event emission failed: {e}")
+
+            analysis_time_ms = (time.time() - start_time) * 1000
+
+            return {
+                "visual_confidence": evidence.visual_confidence,
+                "visual_threat_detected": evidence.threat_detected,
+                "visual_security_status": evidence.security_status.value,
+                "visual_should_proceed": evidence.should_proceed,
+                "visual_warning_message": evidence.warning_message,
+                "visual_analysis_time_ms": analysis_time_ms,
+            }
+
+        except asyncio.TimeoutError:
+            logger.warning("[TieredVBIA] Visual security check timed out")
+            return {
+                "visual_confidence": 0.0,
+                "visual_threat_detected": False,
+                "visual_security_status": "timeout",
+                "visual_should_proceed": True,
+                "visual_warning_message": "Visual security analysis timed out",
+                "visual_analysis_time_ms": 0.0,
+            }
+
+        except Exception as e:
+            logger.error(f"[TieredVBIA] Visual security check failed: {e}")
+            return {
+                "visual_confidence": 0.0,
+                "visual_threat_detected": False,
+                "visual_security_status": "error",
+                "visual_should_proceed": True,
+                "visual_warning_message": f"Visual security error: {str(e)}",
+                "visual_analysis_time_ms": 0.0,
+            }
+
+    # =========================================================================
     # Full Verification (Both Tiers)
     # =========================================================================
 
@@ -469,11 +629,19 @@ class TieredVBIAAdapter:
             AuthTier.TIER1
         )
 
-    async def verify_tier2(self) -> VBIAResult:
+    async def verify_tier2(
+        self,
+        session_id: str = "",
+        user_id: str = ""
+    ) -> VBIAResult:
         """
         Perform Tier 2 verification (agentic commands).
 
-        Requires both speaker verification and liveness check.
+        Requires speaker verification, liveness check, and visual security (v6.2 NEW).
+
+        Args:
+            session_id: Authentication session ID (v6.2 NEW)
+            user_id: User identifier (v6.2 NEW)
 
         Returns:
             VBIAResult with verification details
@@ -511,7 +679,35 @@ class TieredVBIAAdapter:
 
             speaker_result.liveness = liveness
 
+        # Step 3: Visual security check (v6.2 NEW)
+        visual_results = await self._perform_visual_security_check(
+            session_id=session_id,
+            user_id=user_id,
+            tier=AuthTier.TIER2
+        )
+
+        # Integrate visual security results into speaker_result
+        speaker_result.visual_confidence = visual_results["visual_confidence"]
+        speaker_result.visual_threat_detected = visual_results["visual_threat_detected"]
+        speaker_result.visual_security_status = visual_results["visual_security_status"]
+        speaker_result.visual_should_proceed = visual_results["visual_should_proceed"]
+        speaker_result.visual_warning_message = visual_results["visual_warning_message"]
+        speaker_result.visual_analysis_time_ms = visual_results["visual_analysis_time_ms"]
+
+        # If visual threat detected, deny access regardless of voice confidence
+        if visual_results["visual_threat_detected"] and not visual_results["visual_should_proceed"]:
+            speaker_result.passed = False
+            speaker_result.details["visual_security_blocked"] = True
+            speaker_result.details["visual_threat_reason"] = visual_results["visual_warning_message"]
+            logger.warning(
+                f"[TieredVBIA] ⚠️ Visual threat detected - blocking Tier 2 access: "
+                f"{visual_results['visual_warning_message']}"
+            )
+
         speaker_result.verification_time_ms = (time.time() - start_time) * 1000
+        speaker_result.details["total_time_ms"] = speaker_result.verification_time_ms
+        speaker_result.details["visual_analysis_time_ms"] = visual_results["visual_analysis_time_ms"]
+
         return speaker_result
 
     # =========================================================================
@@ -533,11 +729,21 @@ class TieredVBIAAdapter:
                 self._tier2_passes / self._tier2_attempts
                 if self._tier2_attempts > 0 else 0.0
             ),
+            # v6.2 NEW: Visual security statistics
+            "visual_security_checks": self._visual_security_checks,
+            "visual_threats_detected": self._visual_threats_detected,
+            "visual_threat_rate": (
+                self._visual_threats_detected / self._visual_security_checks
+                if self._visual_security_checks > 0 else 0.0
+            ),
             "config": {
                 "tier1_threshold": self.config.tier1_threshold,
                 "tier2_threshold": self.config.tier2_threshold,
                 "anti_spoofing": self.config.anti_spoofing_enabled,
                 "liveness_required": self.config.tier2_require_liveness,
+                # v6.2 NEW: Visual security config
+                "visual_security_enabled": self._visual_security_enabled,
+                "visual_security_tier2_only": self._visual_security_tier2_only,
             }
         }
 
