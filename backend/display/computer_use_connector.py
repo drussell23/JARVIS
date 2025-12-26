@@ -299,11 +299,13 @@ class VisionAnalysis:
     description: str
     detected_elements: List[Dict[str, Any]]
     suggested_action: Optional[ComputerAction]
-    goal_progress: float  # 0.0 to 1.0
-    is_goal_achieved: bool
-    reasoning_chain: List[str]
-    confidence: float
+    suggested_actions: List[ComputerAction] = field(default_factory=list)  # NEW: Batch support
+    goal_progress: float = 0.0  # 0.0 to 1.0
+    is_goal_achieved: bool = False
+    reasoning_chain: List[str] = field(default_factory=list)
+    confidence: float = 0.0
     is_auth_error: bool = False  # True if API authentication failed
+    is_static_interface: bool = False  # NEW: Indicates if interface is static (can batch)
 
 
 # ============================================================================
@@ -705,6 +707,43 @@ class ClaudeComputerUseConnector:
     SYSTEM_PROMPT = """You are JARVIS, an AI assistant helping to control a macOS computer.
 You can see the screen through screenshots and execute actions to help the user.
 
+*** ACTION CHAINING OPTIMIZATION (Clinical-Grade Speed) ***
+CRITICAL: You can and SHOULD chain multiple actions in a single response for static interfaces.
+
+STATIC INTERFACE DETECTION:
+- Calculators, Forms, Dialogs, Menus, Keypads - These do NOT change between actions
+- Example: A calculator keypad stays static whether you click '2', '+', or '='
+- If the interface is STATIC, send ALL actions as a JSON array in ONE response
+
+EFFICIENCY RULE:
+- If you see a calculator and need to compute "2+2", do NOT send one action at a time
+- INSTEAD: Send all 4 clicks as a batch: [click(2), click(+), click(2), click(=)]
+- This reduces task time from ~10s to ~2s (5x speedup)
+
+WHEN TO BATCH:
+✅ Static UI: Calculators, forms, dialogs, control panels, settings screens
+✅ Predictable sequences: Type text, navigate menus, fill forms
+✅ Same app/window: Actions within one stable interface
+❌ Dynamic UI: Web pages that reload, animated transitions, async loading states
+❌ Cross-app: Switching between applications
+❌ Uncertain outcomes: Actions where next step depends on unknown result
+
+BATCH FORMAT:
+- Single action: Return one JSON object as usual
+- Multiple actions: Return JSON array with "batch": true flag:
+```json
+{
+    "batch": true,
+    "actions": [
+        {"action_type": "click", "coordinates": [x1, y1], "reasoning": "..."},
+        {"action_type": "click", "coordinates": [x2, y2], "reasoning": "..."},
+        {"action_type": "click", "coordinates": [x3, y3], "reasoning": "..."}
+    ],
+    "interface_type": "static",
+    "expected_duration_ms": 500
+}
+```
+
 *** COORDINATE EXTRACTION (Open Interpreter Grid Pattern) ***
 When identifying click targets, use a mental grid overlay for improved accuracy:
 
@@ -857,6 +896,36 @@ Always provide your reasoning before taking action, including grid position esti
         self._load_learned_positions()
 
         # v6.0: Open Interpreter pattern integrations
+
+        # v6.2: OmniParser integration with intelligent fallback (enabled by default)
+        self._omniparser_engine: Optional[Any] = None
+        self._omniparser_enabled = os.getenv("OMNIPARSER_ENABLED", "true").lower() == "true"
+
+        if self._omniparser_enabled:
+            try:
+                from backend.vision.omniparser_integration import get_omniparser_engine
+                logger.info("[OMNIPARSER] ✅ OmniParser enabled with intelligent fallback modes")
+                logger.info("[OMNIPARSER] Modes: OmniParser → Claude Vision → OCR (auto-select)")
+                # Initialize in background (don't block startup)
+                asyncio.create_task(self._initialize_omniparser())
+            except ImportError:
+                logger.info("[OMNIPARSER] Import failed - using standard vision")
+                self._omniparser_enabled = False
+
+        # v6.1: Cross-repo Computer Use bridge for action tracking and optimization
+        self._computer_use_bridge: Optional[Any] = None
+        self._bridge_enabled = os.getenv("COMPUTER_USE_BRIDGE_ENABLED", "true").lower() == "true"
+
+        if self._bridge_enabled:
+            try:
+                from backend.core.computer_use_bridge import get_computer_use_bridge
+                logger.info("[COMPUTER USE BRIDGE] Initializing cross-repo bridge...")
+                # Initialize in background
+                asyncio.create_task(self._initialize_bridge())
+            except ImportError:
+                logger.info("[COMPUTER USE BRIDGE] Bridge not available")
+                self._bridge_enabled = False
+
         self._safe_code_executor = None
         self._coordinate_extractor = None
         self._safety_monitor = None
@@ -978,6 +1047,58 @@ Always provide your reasoning before taking action, including grid position esti
         except Exception as e:
             logger.warning(f"Could not save learned position: {e}")
 
+    async def _initialize_omniparser(self) -> None:
+        """Initialize OmniParser engine in background."""
+        try:
+            from backend.vision.omniparser_integration import get_omniparser_engine
+            from backend.vision.omniparser_core import ParserMode
+
+            self._omniparser_engine = await get_omniparser_engine()
+            if self._omniparser_engine and self._omniparser_engine._model:
+                mode = self._omniparser_engine._model.get_current_mode()
+                stats = self._omniparser_engine._model.get_statistics()
+
+                logger.info(f"[OMNIPARSER] ✅ Engine initialized successfully")
+                logger.info(f"[OMNIPARSER] Active Mode: {mode.value}")
+                logger.info(f"[OMNIPARSER] Cache: {stats['cache_size']} entries")
+
+                if mode == ParserMode.OMNIPARSER:
+                    logger.info("[OMNIPARSER] 🚀 Using OmniParser (fastest, most accurate)")
+                elif mode == ParserMode.CLAUDE_VISION:
+                    logger.info("[OMNIPARSER] 🔄 Using Claude Vision fallback (good accuracy)")
+                elif mode == ParserMode.OCR_TEMPLATE:
+                    logger.info("[OMNIPARSER] 📝 Using OCR fallback (basic)")
+                else:
+                    logger.info("[OMNIPARSER] ⚠️  No parsers available (disabled)")
+
+            else:
+                logger.warning("[OMNIPARSER] Engine initialization returned None")
+                self._omniparser_enabled = False
+        except Exception as e:
+            logger.error(f"[OMNIPARSER] Failed to initialize: {e}")
+            import traceback
+            traceback.print_exc()
+            self._omniparser_enabled = False
+
+    async def _initialize_bridge(self) -> None:
+        """Initialize Computer Use bridge in background."""
+        try:
+            from backend.core.computer_use_bridge import get_computer_use_bridge
+            self._computer_use_bridge = await get_computer_use_bridge(
+                enable_action_chaining=True,
+                enable_omniparser=self._omniparser_enabled,
+            )
+            if self._computer_use_bridge:
+                logger.info("[COMPUTER USE BRIDGE] ✅ Cross-repo bridge initialized successfully")
+                stats = self._computer_use_bridge.get_statistics()
+                logger.info(f"[COMPUTER USE BRIDGE] Statistics: {stats}")
+            else:
+                logger.warning("[COMPUTER USE BRIDGE] Bridge initialization returned None")
+                self._bridge_enabled = False
+        except Exception as e:
+            logger.error(f"[COMPUTER USE BRIDGE] Failed to initialize: {e}")
+            self._bridge_enabled = False
+
     async def execute_task(
         self,
         goal: str,
@@ -1076,8 +1197,101 @@ Always provide your reasoning before taking action, including grid position esti
                     )
                     break
 
-                # Execute suggested action
-                if analysis.suggested_action:
+                # Execute suggested action(s) - NOW WITH BATCH SUPPORT
+                if analysis.suggested_actions:
+                    # BATCH MODE: Execute all actions in rapid succession
+                    actions_to_execute = analysis.suggested_actions
+                    batch_size = len(actions_to_execute)
+
+                    if batch_size > 1:
+                        logger.info(f"[ACTION CHAINING] Executing batch of {batch_size} actions")
+                        await self.narrator.narrate(
+                            NarrationEvent.ANALYZING,
+                            {"target": f"batch of {batch_size} actions for {goal}"}
+                        )
+
+                    # Reset no-action counter since we have actions
+                    self._no_action_count = 0
+
+                    # Execute all actions in the batch
+                    batch_start_time = time.time()
+                    for i, action in enumerate(actions_to_execute):
+                        # Narrate the action (but suppress for batches > 3 to avoid spam)
+                        if batch_size <= 3 or i == 0 or i == batch_size - 1:
+                            await self._narrate_action(action)
+                        elif i == 1:
+                            logger.info(f"[ACTION CHAINING] Executing actions 2-{batch_size-1} silently...")
+
+                        # Execute
+                        result = await self.action_executor.execute(action)
+                        actions_executed.append(result)
+                        self._action_history.append(action)
+
+                        if result.success:
+                            # Learn from successful action
+                            if action.coordinates and action.reasoning:
+                                element_hint = self._extract_element_name(action.reasoning)
+                                if element_hint:
+                                    self._save_learned_position(element_hint, action.coordinates)
+                                    learning_insights.append(
+                                        f"Learned position for '{element_hint}': {action.coordinates}"
+                                    )
+
+                            # OPTIMIZATION: Only wait between actions, not after last one
+                            if i < batch_size - 1:
+                                # Small delay between batch actions for UI responsiveness
+                                await asyncio.sleep(0.1)  # 100ms vs 500ms - 5x faster!
+                        else:
+                            await self.narrator.narrate(
+                                NarrationEvent.FAILED,
+                                {"reason": result.error or "Unknown error"}
+                            )
+                            # Don't break batch on single failure - try remaining actions
+                            logger.warning(f"[ACTION CHAINING] Action {i+1}/{batch_size} failed, continuing batch")
+
+                    batch_duration_ms = (time.time() - batch_start_time) * 1000
+
+                    if batch_size > 1:
+                        logger.info(
+                            f"[ACTION CHAINING] ✅ Completed batch of {batch_size} actions in {batch_duration_ms:.0f}ms "
+                            f"(~{batch_duration_ms/batch_size:.0f}ms per action)"
+                        )
+
+                        # v6.1: Emit batch event to cross-repo bridge
+                        if self._bridge_enabled and self._computer_use_bridge:
+                            try:
+                                from backend.core.computer_use_bridge import ActionBatch, InterfaceType, ExecutionStatus
+
+                                # Calculate savings (assume 2s per Stop-and-Look cycle)
+                                stop_and_look_time_ms = batch_size * 2000  # 2s per action
+                                time_saved_ms = stop_and_look_time_ms - batch_duration_ms
+
+                                # Token savings: batching reduces tokens by ~70% (single screenshot vs N screenshots)
+                                avg_tokens_per_screenshot = 1500  # Approximate
+                                tokens_saved = int((batch_size - 1) * avg_tokens_per_screenshot * 0.7)
+
+                                batch = ActionBatch(
+                                    batch_id=f"{analysis.analysis_id}-batch",
+                                    actions=actions_to_execute,
+                                    interface_type=InterfaceType.STATIC if analysis.is_static_interface else InterfaceType.DYNAMIC,
+                                    goal=goal,
+                                )
+
+                                await self._computer_use_bridge.emit_batch_event(
+                                    batch=batch,
+                                    status=ExecutionStatus.COMPLETED,
+                                    execution_time_ms=batch_duration_ms,
+                                    time_saved_ms=time_saved_ms,
+                                    tokens_saved=tokens_saved,
+                                )
+                            except Exception as e:
+                                logger.warning(f"[COMPUTER USE BRIDGE] Failed to emit batch event: {e}")
+
+                    # Wait for UI to update ONCE after entire batch
+                    await asyncio.sleep(0.3)  # Shorter wait since actions were fast
+
+                elif analysis.suggested_action:
+                    # LEGACY: Single action mode (backward compatibility)
                     action = analysis.suggested_action
 
                     # Reset no-action counter since we have an action
@@ -1108,6 +1322,7 @@ Always provide your reasoning before taking action, including grid position esti
                             NarrationEvent.FAILED,
                             {"reason": result.error or "Unknown error"}
                         )
+
                 else:
                     # No action suggested - task might be complete or Claude is stuck
                     logger.warning("[COMPUTER USE] No action suggested by Claude")
@@ -1221,11 +1436,30 @@ Always provide your reasoning before taking action, including grid position esti
 
 Please analyze the current screenshot and determine:
 1. What do you see on the screen?
-2. How close are we to achieving the goal? (0-100%)
-3. Is the goal already achieved?
-4. What action should we take next?
+2. Is this a STATIC interface (calculator, form, dialog) or DYNAMIC (web page, app that changes)?
+3. How close are we to achieving the goal? (0-100%)
+4. Is the goal already achieved?
+5. What action(s) should we take next?
 
-If an action is needed, provide it in this JSON format:
+*** ACTION RESPONSE FORMAT ***
+
+OPTION A - STATIC INTERFACE (Use this when possible for 5x speedup):
+If the interface is STATIC and you can see all the buttons/elements needed, send a BATCH of actions:
+```json
+{{
+    "batch": true,
+    "interface_type": "static",
+    "actions": [
+        {{"action_type": "click", "coordinates": [x1, y1], "reasoning": "Click button 2"}},
+        {{"action_type": "click", "coordinates": [x2, y2], "reasoning": "Click + operator"}},
+        {{"action_type": "click", "coordinates": [x3, y3], "reasoning": "Click button 2"}},
+        {{"action_type": "click", "coordinates": [x4, y4], "reasoning": "Click = to get result"}}
+    ],
+    "expected_duration_ms": 500
+}}
+```
+
+OPTION B - SINGLE ACTION (Use for dynamic interfaces or uncertain outcomes):
 ```json
 {{
     "action_type": "click|double_click|right_click|type|key|scroll|wait",
@@ -1238,7 +1472,9 @@ If an action is needed, provide it in this JSON format:
 }}
 ```
 
-Respond with your analysis followed by the action JSON if needed."""
+**PREFER OPTION A (batch) whenever the interface is static!**
+
+Respond with your analysis followed by the action JSON."""
 
         try:
             # Call Claude with computer use capability - with timeout
@@ -1326,11 +1562,16 @@ Respond with your analysis followed by the action JSON if needed."""
             )
 
     def _parse_analysis_response(self, response_text: str, goal: str) -> VisionAnalysis:
-        """Parse Claude's response into a VisionAnalysis."""
+        """
+        Parse Claude's response into a VisionAnalysis.
+        Now supports BATCH ACTIONS for action chaining optimization.
+        """
         analysis_id = str(uuid4())
         suggested_action = None
+        suggested_actions: List[ComputerAction] = []
         goal_progress = 0.0
         is_goal_achieved = False
+        is_static_interface = False
         reasoning_chain = []
 
         # Extract reasoning
@@ -1357,30 +1598,69 @@ Respond with your analysis followed by the action JSON if needed."""
         if is_goal_achieved:
             goal_progress = 1.0
 
-        # Extract JSON action if present
+        # Extract JSON action(s) if present
         json_match = re.search(r'```json\s*(.*?)\s*```', response_text, re.DOTALL)
         if json_match:
             try:
                 action_data = json.loads(json_match.group(1))
 
-                action_type = ActionType(action_data.get("action_type", "click"))
-                coords = action_data.get("coordinates")
-                if coords and isinstance(coords, list) and len(coords) == 2:
-                    coords = tuple(coords)
-                else:
-                    coords = None
+                # Check if this is a BATCH response
+                if isinstance(action_data, dict) and action_data.get("batch") is True:
+                    # BATCH MODE: Multiple actions
+                    is_static_interface = action_data.get("interface_type") == "static"
+                    actions_list = action_data.get("actions", [])
 
-                suggested_action = ComputerAction(
-                    action_id=str(uuid4()),
-                    action_type=action_type,
-                    coordinates=coords,
-                    text=action_data.get("text"),
-                    key=action_data.get("key"),
-                    scroll_amount=action_data.get("scroll_amount"),
-                    duration=action_data.get("duration", 0.5),
-                    reasoning=action_data.get("reasoning", ""),
-                    confidence=0.8
-                )
+                    logger.info(f"[ACTION CHAINING] Detected batch of {len(actions_list)} actions")
+
+                    for i, act_data in enumerate(actions_list):
+                        action_type = ActionType(act_data.get("action_type", "click"))
+                        coords = act_data.get("coordinates")
+                        if coords and isinstance(coords, list) and len(coords) == 2:
+                            coords = tuple(coords)
+                        else:
+                            coords = None
+
+                        action = ComputerAction(
+                            action_id=str(uuid4()),
+                            action_type=action_type,
+                            coordinates=coords,
+                            text=act_data.get("text"),
+                            key=act_data.get("key"),
+                            scroll_amount=act_data.get("scroll_amount"),
+                            duration=act_data.get("duration", 0.1),  # Faster for batches
+                            reasoning=act_data.get("reasoning", f"Batch action {i+1}"),
+                            confidence=0.8
+                        )
+                        suggested_actions.append(action)
+
+                    # Set first action as suggested_action for backward compatibility
+                    if suggested_actions:
+                        suggested_action = suggested_actions[0]
+
+                    logger.info(f"[ACTION CHAINING] Parsed {len(suggested_actions)} actions successfully")
+
+                else:
+                    # SINGLE ACTION MODE (original behavior)
+                    action_type = ActionType(action_data.get("action_type", "click"))
+                    coords = action_data.get("coordinates")
+                    if coords and isinstance(coords, list) and len(coords) == 2:
+                        coords = tuple(coords)
+                    else:
+                        coords = None
+
+                    suggested_action = ComputerAction(
+                        action_id=str(uuid4()),
+                        action_type=action_type,
+                        coordinates=coords,
+                        text=action_data.get("text"),
+                        key=action_data.get("key"),
+                        scroll_amount=action_data.get("scroll_amount"),
+                        duration=action_data.get("duration", 0.5),
+                        reasoning=action_data.get("reasoning", ""),
+                        confidence=0.8
+                    )
+                    suggested_actions = [suggested_action] if suggested_action else []
+
             except (json.JSONDecodeError, ValueError) as e:
                 logger.warning(f"Could not parse action JSON: {e}")
 
@@ -1389,10 +1669,12 @@ Respond with your analysis followed by the action JSON if needed."""
             description=reasoning_chain[0][:200] if reasoning_chain else "Analysis complete",
             detected_elements=[],
             suggested_action=suggested_action,
+            suggested_actions=suggested_actions,
             goal_progress=goal_progress,
             is_goal_achieved=is_goal_achieved,
             reasoning_chain=reasoning_chain,
-            confidence=0.8 if suggested_action else 0.5
+            confidence=0.8 if suggested_action else 0.5,
+            is_static_interface=is_static_interface
         )
 
     async def _narrate_action(self, action: ComputerAction) -> None:
