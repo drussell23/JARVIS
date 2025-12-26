@@ -96,12 +96,9 @@ impl MetalAccelerator {
         
         // Copy data to shared buffer (this would be done through shared memory)
         if let Some(mut buffer) = self.bridge.get_buffer(buffer_id) {
-            // Safety: We just allocated this buffer with the correct size
-            unsafe {
-                let buffer_mut = Arc::get_mut(&mut buffer)
-                    .ok_or_else(|| JarvisError::VisionError("Cannot get mutable buffer".to_string()))?;
-                buffer_mut.as_mut_slice().copy_from_slice(input_data);
-            }
+            let buffer_mut = Arc::get_mut(&mut buffer)
+                .ok_or_else(|| JarvisError::VisionError("Cannot get mutable buffer".to_string()))?;
+            buffer_mut.as_mut_slice().copy_from_slice(input_data);
         }
         
         // Send Metal processing command

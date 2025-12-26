@@ -433,8 +433,8 @@ impl SlidingWindowCapture {
         for window in windows {
             // Check cache first
             if config.enable_caching {
-                let mut cache = self.region_cache.write();
-                
+                let cache = self.region_cache.write();
+
                 if let Some(cached) = cache.get(&window.hash) {
                     if cached.timestamp.elapsed() < Duration::from_secs(config.cache_ttl_seconds) {
                         self.stats.cache_hits += 1;

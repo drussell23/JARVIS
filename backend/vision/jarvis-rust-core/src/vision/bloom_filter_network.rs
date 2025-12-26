@@ -521,17 +521,14 @@ fn rust_bloom_bindings(_py: Python, m: &PyModule) -> PyResult<()> {
 }
 
 // Global singleton for C-style interface
-use std::sync::Once;
-static INIT: Once = Once::new();
-static mut NETWORK: Option<Arc<BloomFilterNetwork>> = None;
+use std::sync::OnceLock;
+
+static NETWORK: OnceLock<Arc<BloomFilterNetwork>> = OnceLock::new();
 
 pub fn get_global_bloom_network() -> Arc<BloomFilterNetwork> {
-    unsafe {
-        INIT.call_once(|| {
-            NETWORK = Some(Arc::new(BloomFilterNetwork::new(4.0, 1.0, 2.0)));
-        });
-        NETWORK.as_ref().unwrap().clone()
-    }
+    NETWORK.get_or_init(|| {
+        Arc::new(BloomFilterNetwork::new(4.0, 1.0, 2.0))
+    }).clone()
 }
 
 #[cfg(test)]

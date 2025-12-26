@@ -891,7 +891,7 @@ impl ImageProcessor {
             max_val = max_val.max(val);
         }
         
-        brightness /= (image.data.len() as f32 * 255.0);
+        brightness /= image.data.len() as f32 * 255.0;
         let contrast = (max_val - min_val) / 255.0;
         
         // Estimate color cast for color images

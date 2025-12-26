@@ -280,7 +280,7 @@ impl AnomalyDetector {
                 for (severity, &threshold) in &self.detection_thresholds {
                     if deviation >= threshold {
                         let anomaly = DetectedAnomaly {
-                            id: format!("anomaly_{}", Utc::now().timestamp_nanos()),
+                            id: format!("anomaly_{}", Utc::now().timestamp_nanos_opt().unwrap_or(0)),
                             anomaly_type: self.infer_anomaly_type(&feature, category),
                             severity: *severity,
                             timestamp: Utc::now(),
@@ -315,7 +315,7 @@ impl AnomalyDetector {
         // Check for stuck patterns
         if let Some(stuck_action) = detector.detect_stuck_patterns(5) {
             anomalies.push(DetectedAnomaly {
-                id: format!("stuck_{}", Utc::now().timestamp_nanos()),
+                id: format!("stuck_{}", Utc::now().timestamp_nanos_opt().unwrap_or(0)),
                 anomaly_type: AnomalyType::StuckState,
                 severity: Severity::Medium,
                 timestamp: Utc::now(),
@@ -329,7 +329,7 @@ impl AnomalyDetector {
         let circular = detector.detect_circular_patterns(3);
         if !circular.is_empty() {
             anomalies.push(DetectedAnomaly {
-                id: format!("circular_{}", Utc::now().timestamp_nanos()),
+                id: format!("circular_{}", Utc::now().timestamp_nanos_opt().unwrap_or(0)),
                 anomaly_type: AnomalyType::CircularPattern,
                 severity: Severity::Low,
                 timestamp: Utc::now(),

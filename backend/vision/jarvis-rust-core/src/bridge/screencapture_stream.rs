@@ -405,17 +405,15 @@ impl ScreenCaptureStream {
     async fn get_shareable_content(&self) -> Result<id> {
         // In production, this would use proper async/await with completion handlers
         // For now, we'll use a simplified synchronous approach
-        unsafe {
-            autoreleasepool(|| {
-                let content_class = Class::get("SCShareableContent")
-                    .ok_or_else(|| JarvisError::BridgeError("SCShareableContent not found".to_string()))?;
-                
-                // Get current content synchronously (simplified)
-                // In production, use getShareableContentWithCompletionHandler
-                
-                Ok(nil) // Placeholder
-            })
-        }
+        autoreleasepool(|| {
+            let _content_class = Class::get("SCShareableContent")
+                .ok_or_else(|| JarvisError::BridgeError("SCShareableContent not found".to_string()))?;
+
+            // Get current content synchronously (simplified)
+            // In production, use getShareableContentWithCompletionHandler
+
+            Ok(nil) // Placeholder
+        })
     }
     
     /// Create content filter based on configuration
@@ -547,34 +545,26 @@ impl ScreenCaptureStream {
     
     /// Get main display
     fn get_main_display(&self) -> Result<id> {
-        unsafe {
-            // Simplified - would query SCShareableContent in production
-            Ok(nil)
-        }
+        // Simplified - would query SCShareableContent in production
+        Ok(nil)
     }
-    
+
     /// Get displays by IDs
-    fn get_displays_by_ids(&self, ids: &[u32]) -> Result<id> {
-        unsafe {
-            // Simplified - would filter SCShareableContent displays
-            Ok(nil)
-        }
+    fn get_displays_by_ids(&self, _ids: &[u32]) -> Result<id> {
+        // Simplified - would filter SCShareableContent displays
+        Ok(nil)
     }
-    
+
     /// Get physical displays only
     fn get_physical_displays(&self) -> Result<id> {
-        unsafe {
-            // Simplified - would filter virtual displays
-            Ok(nil)
-        }
+        // Simplified - would filter virtual displays
+        Ok(nil)
     }
-    
+
     /// Apply window filtering rules
-    fn apply_window_filters(&self, filter: id, exclude_apps: &[String]) -> Result<()> {
-        unsafe {
-            // Simplified - would set excludedApplications on filter
-            Ok(())
-        }
+    fn apply_window_filters(&self, _filter: id, _exclude_apps: &[String]) -> Result<()> {
+        // Simplified - would set excludedApplications on filter
+        Ok(())
     }
     
     /// Get current metrics
@@ -629,7 +619,7 @@ impl StreamDelegate {
     fn create_objc_delegate(&self) -> Result<id> {
         // This would create a proper Objective-C delegate conforming to SCStreamDelegate
         // For now, returning nil as placeholder
-        unsafe { Ok(nil) }
+        Ok(nil)
     }
     
     /// Handle incoming frame

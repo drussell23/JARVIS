@@ -67,7 +67,7 @@ impl RustBloomFilter {
         #[cfg(target_arch = "aarch64")]
         unsafe {
             // Use ARM NEON for M1 Mac
-            use std::intrinsics::transmute;
+            use std::mem::transmute;
             
             let mut hash = seed as u64;
             let chunks = data.chunks_exact(16);

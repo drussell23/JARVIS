@@ -1,5 +1,5 @@
 //! JARVIS Rust Core - High-performance vision and ML operations
-//! 
+//!
 //! This crate provides optimized implementations of:
 //! - Quantized ML inference (INT4/INT8/FP16)
 //! - Memory-efficient buffer management
@@ -10,6 +10,19 @@
 
 // Note: portable SIMD requires nightly Rust
 // #![feature(portable_simd)]
+
+// Allow dead code for library APIs that may not be used yet
+#![allow(dead_code)]
+// Allow unused variables in placeholder implementations
+#![allow(unused_variables)]
+// Allow unused imports during development
+#![allow(unused_imports)]
+// Allow non-local impl definitions (PyO3 macro warning)
+#![allow(non_local_definitions)]
+// Allow non-upper-case globals for CGConstants compatibility
+#![allow(non_upper_case_globals)]
+// Allow private types in public interfaces (intentional for internal APIs)
+#![allow(private_interfaces)]
 
 use std::sync::Once;
 use anyhow;

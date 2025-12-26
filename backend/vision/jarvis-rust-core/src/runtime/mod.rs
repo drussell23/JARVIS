@@ -221,7 +221,7 @@ impl RuntimeManager {
         
         // Pin to high-performance core if available
         if let Ok(core_id) = self.affinity_manager.get_performance_core() {
-            self.affinity_manager.pin_thread_to_core(core_id);
+            let _ = self.affinity_manager.pin_thread_to_core(core_id);
         }
         
         self.spawn_cpu(name, task)

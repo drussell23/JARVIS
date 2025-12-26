@@ -126,6 +126,8 @@ lto = true
 codegen-units = 1
 strip = true
 
-# M1-specific optimizations
-[target.'cfg(target_arch = "aarch64")']
-rustflags = ["-C", "target-cpu=native"]
+# Lint configuration
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(feature, values(\"cargo-clippy\", \"python\", \"gpu\"))"] }
+
+# Note: M1-specific rustflags should be in .cargo/config.toml, not Cargo.toml

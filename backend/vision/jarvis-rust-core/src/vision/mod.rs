@@ -273,13 +273,11 @@ impl ImageData {
         let channels = format.channels();
         let expected_size = (width * height * channels as u32) as usize;
         
-        unsafe {
-            if buffer.as_slice().len() < expected_size {
-                return Err(JarvisError::VisionError(
-                    format!("Buffer too small: expected {}, got {}", 
-                        expected_size, buffer.as_slice().len())
-                ));
-            }
+        if buffer.as_slice().len() < expected_size {
+            return Err(JarvisError::VisionError(
+                format!("Buffer too small: expected {}, got {}",
+                    expected_size, buffer.as_slice().len())
+            ));
         }
         
         Ok(Self {
@@ -296,7 +294,7 @@ impl ImageData {
     /// Get data as slice (handles both owned and zero-copy)
     pub fn as_slice(&self) -> &[u8] {
         if let Some(ref buffer) = self.zero_copy_buffer {
-            unsafe { buffer.as_slice() }
+            buffer.as_slice()
         } else {
             &self.data
         }

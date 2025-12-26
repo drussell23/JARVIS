@@ -738,37 +738,35 @@ impl ObjCActor {
 
     /// Handle incoming command
     fn handle_command(&self, command: ObjCCommand, shared_memory: &SharedMemoryManager) -> ObjCResponse {
-        unsafe {
-            autoreleasepool(|| {
-                match command {
-                    ObjCCommand::CaptureScreen { quality, region } => {
-                        self.capture_screen(quality, region, shared_memory)
-                    }
-                    ObjCCommand::GetRunningApps => {
-                        self.get_running_apps()
-                    }
-                    ObjCCommand::GetWindowList { use_cache } => {
-                        self.get_window_list(use_cache)
-                    }
-                    ObjCCommand::MonitorNotification { name } => {
-                        self.monitor_notification(name)
-                    }
-                    ObjCCommand::StopMonitoring { name } => {
-                        self.stop_monitoring_notification(name)
-                    }
-                    ObjCCommand::DetectText { buffer_id, region } => {
-                        self.detect_text(buffer_id, region, shared_memory)
-                    }
-                    ObjCCommand::ProcessWithMetal { buffer_id, shader_name } => {
-                        self.process_with_metal(buffer_id, shader_name, shared_memory)
-                    }
-                    ObjCCommand::Shutdown => {
-                        tracing::info!("Received shutdown command");
-                        ObjCResponse::Ok
-                    }
+        autoreleasepool(|| {
+            match command {
+                ObjCCommand::CaptureScreen { quality, region } => {
+                    self.capture_screen(quality, region, shared_memory)
                 }
-            })
-        }
+                ObjCCommand::GetRunningApps => {
+                    self.get_running_apps()
+                }
+                ObjCCommand::GetWindowList { use_cache } => {
+                    self.get_window_list(use_cache)
+                }
+                ObjCCommand::MonitorNotification { name } => {
+                    self.monitor_notification(name)
+                }
+                ObjCCommand::StopMonitoring { name } => {
+                    self.stop_monitoring_notification(name)
+                }
+                ObjCCommand::DetectText { buffer_id, region } => {
+                    self.detect_text(buffer_id, region, shared_memory)
+                }
+                ObjCCommand::ProcessWithMetal { buffer_id, shader_name } => {
+                    self.process_with_metal(buffer_id, shader_name, shared_memory)
+                }
+                ObjCCommand::Shutdown => {
+                    tracing::info!("Received shutdown command");
+                    ObjCResponse::Ok
+                }
+            }
+        })
     }
 
     /// Capture screen using best available API

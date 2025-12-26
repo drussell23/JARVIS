@@ -413,34 +413,32 @@ impl NotificationMonitor {
     
     /// Register a notification filter
     fn register_filter(&self, filter: NotificationFilter) -> Result<()> {
-        unsafe {
-            autoreleasepool(|| {
-                for pattern in &filter.include_patterns {
-                    // Create observer for this pattern
-                    let observer = self.create_observer(pattern, filter.clone())?;
-                    
-                    // Store observer
-                    let observer_info = ObserverInfo {
-                        observer,
-                        filter: filter.clone(),
-                        created_at: SystemTime::now(),
-                        event_count: AtomicU64::new(0),
-                    };
-                    
-                    self.observers.insert(pattern.clone(), observer_info);
-                    
-                    // Set up rate limiter if configured
-                    if let Some(ref rate_config) = filter.rate_limit {
-                        self.rate_limiters.insert(
-                            pattern.clone(),
-                            RateLimiter::new(rate_config.clone())
-                        );
-                    }
+        autoreleasepool(|| {
+            for pattern in &filter.include_patterns {
+                // Create observer for this pattern
+                let observer = self.create_observer(pattern, filter.clone())?;
+
+                // Store observer
+                let observer_info = ObserverInfo {
+                    observer,
+                    filter: filter.clone(),
+                    created_at: SystemTime::now(),
+                    event_count: AtomicU64::new(0),
+                };
+
+                self.observers.insert(pattern.clone(), observer_info);
+
+                // Set up rate limiter if configured
+                if let Some(ref rate_config) = filter.rate_limit {
+                    self.rate_limiters.insert(
+                        pattern.clone(),
+                        RateLimiter::new(rate_config.clone())
+                    );
                 }
-                
-                Ok(())
-            })
-        }
+            }
+
+            Ok(())
+        })
     }
     
     /// Create observer for a notification pattern
