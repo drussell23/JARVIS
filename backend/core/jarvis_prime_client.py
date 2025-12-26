@@ -37,13 +37,374 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple, Callable, Awaitable
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple, Callable, Awaitable
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Repo Map Enricher - Intelligent Context Injection for Coding Questions
+# =============================================================================
+
+class CodingQuestionDetector:
+    """
+    Intelligently detects if a prompt is a coding-related question.
+
+    Uses multiple signals:
+    - Keyword patterns (implement, fix, refactor, debug, etc.)
+    - File references (.py, .ts, .js mentions)
+    - Code symbol mentions (class names, function names)
+    - Question structure analysis
+    """
+
+    # Coding-related keywords (weighted by relevance)
+    CODING_KEYWORDS: Dict[str, float] = {
+        # High relevance (0.8+)
+        "implement": 0.9, "code": 0.85, "function": 0.85, "class": 0.85,
+        "method": 0.85, "debug": 0.9, "fix": 0.8, "bug": 0.85, "error": 0.8,
+        "refactor": 0.9, "optimize": 0.8, "test": 0.75, "api": 0.8,
+
+        # Medium relevance (0.5-0.8)
+        "variable": 0.7, "import": 0.7, "module": 0.7, "package": 0.65,
+        "type": 0.6, "return": 0.7, "async": 0.8, "await": 0.75,
+        "database": 0.6, "query": 0.55, "endpoint": 0.7, "route": 0.65,
+
+        # Lower relevance (0.3-0.5)
+        "file": 0.5, "folder": 0.4, "directory": 0.4, "project": 0.45,
+        "architecture": 0.55, "pattern": 0.5, "structure": 0.45,
+    }
+
+    # File extension patterns
+    FILE_PATTERNS = re.compile(
+        r'\b[\w/-]+\.(py|ts|tsx|js|jsx|go|rs|java|cpp|c|h|hpp|rb|swift|kt|json|yaml|yml|toml|sql)\b',
+        re.IGNORECASE
+    )
+
+    # Code symbol patterns (CamelCase, snake_case, SCREAMING_SNAKE)
+    SYMBOL_PATTERNS = [
+        re.compile(r'\b[A-Z][a-z]+(?:[A-Z][a-z]+)+\b'),  # CamelCase
+        re.compile(r'\b[a-z]+(?:_[a-z]+)+\b'),  # snake_case
+        re.compile(r'\b[A-Z]+(?:_[A-Z]+)+\b'),  # SCREAMING_SNAKE
+        re.compile(r'\b(?:get|set|is|has|can|should|will|on|handle)_?\w+\b', re.IGNORECASE),  # Common function prefixes
+    ]
+
+    # Repo-specific patterns (detect which repos are relevant)
+    REPO_PATTERNS: Dict[str, List[str]] = {
+        "jarvis": [
+            "jarvis", "voice", "unlock", "screen", "assistant", "backend",
+            "computer_use", "vision", "audio", "supervisor", "transport",
+        ],
+        "jarvis_prime": [
+            "prime", "orchestrat", "workflow", "llm", "gemini", "inference",
+            "routing", "cloud_run", "tier-0", "brain",
+        ],
+        "reactor_core": [
+            "reactor", "training", "learning", "experience", "dataset",
+            "fine-tune", "lora", "scraping", "safe_scout",
+        ],
+    }
+
+    def __init__(self):
+        self._symbol_cache: Dict[str, Set[str]] = {}
+
+    def detect(self, prompt: str) -> Tuple[bool, float, Dict[str, Any]]:
+        """
+        Detect if the prompt is a coding question.
+
+        Returns:
+            Tuple of (is_coding_question, confidence, metadata)
+        """
+        prompt_lower = prompt.lower()
+        signals = []
+        metadata: Dict[str, Any] = {
+            "mentioned_files": [],
+            "mentioned_symbols": [],
+            "relevant_repos": [],
+            "detected_keywords": [],
+        }
+
+        # 1. Keyword detection
+        keyword_score = 0.0
+        detected_keywords = []
+        for keyword, weight in self.CODING_KEYWORDS.items():
+            if keyword in prompt_lower:
+                keyword_score += weight
+                detected_keywords.append(keyword)
+
+        if keyword_score > 0:
+            signals.append(min(keyword_score / 3.0, 1.0))  # Normalize
+            metadata["detected_keywords"] = detected_keywords
+
+        # 2. File reference detection
+        file_matches = self.FILE_PATTERNS.findall(prompt)
+        if file_matches:
+            signals.append(0.9)  # High confidence if files mentioned
+            # Extract full file paths
+            file_paths = re.findall(r'[\w/-]+\.(?:py|ts|tsx|js|jsx|go|rs|java)', prompt, re.IGNORECASE)
+            metadata["mentioned_files"] = list(set(file_paths))
+
+        # 3. Symbol detection
+        symbols = set()
+        for pattern in self.SYMBOL_PATTERNS:
+            matches = pattern.findall(prompt)
+            symbols.update(m for m in matches if len(m) > 2 and m.lower() not in ["the", "and", "for"])
+
+        if symbols:
+            signals.append(0.7 * min(len(symbols) / 5.0, 1.0))  # More symbols = higher confidence
+            metadata["mentioned_symbols"] = list(symbols)[:20]  # Limit to 20
+
+        # 4. Repo relevance detection
+        for repo_name, patterns in self.REPO_PATTERNS.items():
+            if any(p in prompt_lower for p in patterns):
+                metadata["relevant_repos"].append(repo_name)
+
+        if metadata["relevant_repos"]:
+            signals.append(0.6)
+
+        # 5. Question structure (asking "how to", "where is", "why does", etc.)
+        question_patterns = [
+            r'\bhow\s+(?:do|can|should|to)\b',
+            r'\bwhere\s+(?:is|are|does|do)\b',
+            r'\bwhy\s+(?:is|does|do|doesn\'t)\b',
+            r'\bwhat\s+(?:is|does|are)\b',
+            r'\bcan\s+you\s+(?:show|explain|implement|fix|add)\b',
+        ]
+        for pattern in question_patterns:
+            if re.search(pattern, prompt_lower):
+                signals.append(0.5)
+                break
+
+        # Calculate final confidence
+        if not signals:
+            return False, 0.0, metadata
+
+        confidence = min(sum(signals) / len(signals) + (len(signals) * 0.1), 1.0)
+        is_coding = confidence >= 0.4  # Threshold
+
+        return is_coding, confidence, metadata
+
+
+class RepoMapEnricher:
+    """
+    Enriches prompts with repository context for coding questions.
+
+    Features:
+    - Intelligent coding question detection
+    - Dynamic repo map generation with PageRank prioritization
+    - Cross-repo context for multi-repo questions
+    - Caching for performance
+    - Token-aware truncation
+    """
+
+    def __init__(
+        self,
+        max_context_tokens: int = 2000,
+        cache_ttl_seconds: int = 300,
+        enable_cross_repo: bool = True,
+    ):
+        self.max_context_tokens = max_context_tokens
+        self.cache_ttl_seconds = cache_ttl_seconds
+        self.enable_cross_repo = enable_cross_repo
+
+        self._detector = CodingQuestionDetector()
+        self._mapper = None
+        self._mapper_lock = asyncio.Lock()
+        self._cache: Dict[str, Tuple[str, float]] = {}  # key -> (content, timestamp)
+        self._initialized = False
+
+    async def _get_mapper(self):
+        """Lazy-load the repository mapper."""
+        async with self._mapper_lock:
+            if self._mapper is None:
+                try:
+                    from backend.intelligence.repository_intelligence import get_repository_mapper
+                    self._mapper = await get_repository_mapper()
+                    self._initialized = True
+                    logger.info("[RepoMapEnricher] Repository mapper initialized")
+                except ImportError as e:
+                    logger.warning(f"[RepoMapEnricher] Repository intelligence not available: {e}")
+                except Exception as e:
+                    logger.error(f"[RepoMapEnricher] Failed to initialize mapper: {e}")
+        return self._mapper
+
+    def _get_cache_key(
+        self,
+        repos: List[str],
+        files: List[str],
+        symbols: List[str],
+    ) -> str:
+        """Generate a cache key for repo map queries."""
+        import hashlib
+        key_data = f"{sorted(repos)}:{sorted(files)}:{sorted(symbols)}"
+        return hashlib.sha256(key_data.encode()).hexdigest()[:16]
+
+    def _check_cache(self, cache_key: str) -> Optional[str]:
+        """Check cache for existing repo map."""
+        if cache_key in self._cache:
+            content, timestamp = self._cache[cache_key]
+            if time.time() - timestamp < self.cache_ttl_seconds:
+                return content
+            else:
+                del self._cache[cache_key]
+        return None
+
+    async def enrich_prompt(
+        self,
+        prompt: str,
+        system_prompt: Optional[str] = None,
+        force_enrich: bool = False,
+    ) -> Tuple[Optional[str], str, Dict[str, Any]]:
+        """
+        Enrich a prompt with repository context if it's a coding question.
+
+        Args:
+            prompt: The user's prompt
+            system_prompt: Existing system prompt (if any)
+            force_enrich: Force enrichment even if not detected as coding question
+
+        Returns:
+            Tuple of (enriched_system_prompt, original_prompt, metadata)
+        """
+        # Detect if this is a coding question
+        is_coding, confidence, metadata = self._detector.detect(prompt)
+        metadata["is_coding_question"] = is_coding
+        metadata["coding_confidence"] = confidence
+
+        if not is_coding and not force_enrich:
+            return system_prompt, prompt, metadata
+
+        # Get the mapper
+        mapper = await self._get_mapper()
+        if not mapper:
+            metadata["repo_map_error"] = "Mapper not available"
+            return system_prompt, prompt, metadata
+
+        # Determine which repos to query
+        relevant_repos = metadata.get("relevant_repos", [])
+        if not relevant_repos:
+            relevant_repos = ["jarvis"]  # Default to JARVIS
+
+        if self.enable_cross_repo and len(relevant_repos) < 3:
+            # Add adjacent repos for cross-repo context
+            if "jarvis_prime" not in relevant_repos:
+                relevant_repos.append("jarvis_prime")
+
+        # Check cache
+        cache_key = self._get_cache_key(
+            relevant_repos,
+            metadata.get("mentioned_files", []),
+            metadata.get("mentioned_symbols", []),
+        )
+        cached_map = self._check_cache(cache_key)
+
+        if cached_map:
+            metadata["cache_hit"] = True
+            repo_context = cached_map
+        else:
+            # Generate repo map
+            try:
+                repo_context = await self._generate_repo_context(
+                    repos=relevant_repos,
+                    mentioned_files=set(metadata.get("mentioned_files", [])),
+                    mentioned_symbols=set(metadata.get("mentioned_symbols", [])),
+                )
+                # Cache the result
+                self._cache[cache_key] = (repo_context, time.time())
+                metadata["cache_hit"] = False
+            except Exception as e:
+                logger.error(f"[RepoMapEnricher] Failed to generate context: {e}")
+                metadata["repo_map_error"] = str(e)
+                return system_prompt, prompt, metadata
+
+        # Build enriched system prompt
+        enriched_system = self._build_enriched_system_prompt(
+            system_prompt,
+            repo_context,
+            metadata,
+        )
+
+        metadata["enriched"] = True
+        metadata["context_tokens_estimated"] = len(repo_context) // 4
+
+        return enriched_system, prompt, metadata
+
+    async def _generate_repo_context(
+        self,
+        repos: List[str],
+        mentioned_files: Set[str],
+        mentioned_symbols: Set[str],
+    ) -> str:
+        """Generate repository context from repo maps."""
+        if not self._mapper:
+            return ""
+
+        tokens_per_repo = self.max_context_tokens // len(repos) if repos else self.max_context_tokens
+        context_parts = []
+
+        for repo in repos:
+            try:
+                result = await self._mapper.get_repo_map(
+                    repository=repo,
+                    max_tokens=tokens_per_repo,
+                    mentioned_files=mentioned_files,
+                    mentioned_symbols=mentioned_symbols,
+                )
+
+                if result and result.map_content:
+                    header = f"## {repo.replace('_', ' ').title()} Codebase"
+                    context_parts.append(f"{header}\n```\n{result.map_content}\n```")
+            except Exception as e:
+                logger.debug(f"[RepoMapEnricher] Failed to get map for {repo}: {e}")
+
+        return "\n\n".join(context_parts)
+
+    def _build_enriched_system_prompt(
+        self,
+        original_system: Optional[str],
+        repo_context: str,
+        metadata: Dict[str, Any],
+    ) -> str:
+        """Build the enriched system prompt with repo context."""
+        parts = []
+
+        # Add original system prompt if present
+        if original_system:
+            parts.append(original_system)
+
+        # Add repository context section
+        if repo_context:
+            context_intro = """
+# Codebase Context
+
+You have access to the following codebase structure. Use this to understand:
+- Where relevant code lives
+- Important symbols (classes, functions) and their locations
+- File organization and architecture
+
+"""
+            parts.append(context_intro + repo_context)
+
+        # Add detected context hints
+        if metadata.get("mentioned_symbols"):
+            symbols_hint = f"\n**Mentioned symbols to focus on:** {', '.join(metadata['mentioned_symbols'][:10])}"
+            parts.append(symbols_hint)
+
+        if metadata.get("mentioned_files"):
+            files_hint = f"\n**Files referenced:** {', '.join(metadata['mentioned_files'][:5])}"
+            parts.append(files_hint)
+
+        return "\n\n".join(parts)
+
+    @property
+    def is_available(self) -> bool:
+        """Check if the enricher is available."""
+        return self._initialized and self._mapper is not None
 
 
 # =============================================================================
@@ -122,6 +483,20 @@ class JarvisPrimeConfig:
     # Force mode (for testing/override)
     force_mode: Optional[str] = field(
         default_factory=lambda: os.getenv("JARVIS_PRIME_FORCE_MODE", None)
+    )
+
+    # Repo Map Enrichment settings
+    enable_repo_map_enrichment: bool = field(
+        default_factory=lambda: os.getenv("JARVIS_PRIME_ENABLE_REPO_MAP", "true").lower() == "true"
+    )
+    repo_map_max_tokens: int = field(
+        default_factory=lambda: int(os.getenv("JARVIS_PRIME_REPO_MAP_MAX_TOKENS", "2000"))
+    )
+    repo_map_cache_ttl_seconds: int = field(
+        default_factory=lambda: int(os.getenv("JARVIS_PRIME_REPO_MAP_CACHE_TTL", "300"))
+    )
+    enable_cross_repo_context: bool = field(
+        default_factory=lambda: os.getenv("JARVIS_PRIME_CROSS_REPO_CONTEXT", "true").lower() == "true"
     )
 
 
@@ -372,10 +747,20 @@ class JarvisPrimeClient:
         self._monitoring_interval_seconds = float(os.getenv("JARVIS_PRIME_MONITOR_INTERVAL", "30"))
         self._shutdown_event = asyncio.Event()
 
+        # Repo Map Enricher for coding questions
+        self._repo_enricher: Optional[RepoMapEnricher] = None
+        if self.config.enable_repo_map_enrichment:
+            self._repo_enricher = RepoMapEnricher(
+                max_context_tokens=self.config.repo_map_max_tokens,
+                cache_ttl_seconds=self.config.repo_map_cache_ttl_seconds,
+                enable_cross_repo=self.config.enable_cross_repo_context,
+            )
+
         logger.info(
             f"[JarvisPrimeClient] Initialized with thresholds: "
             f"local>{self.config.memory_threshold_local_gb}GB, "
-            f"cloud>{self.config.memory_threshold_cloud_gb}GB"
+            f"cloud>{self.config.memory_threshold_cloud_gb}GB, "
+            f"repo_map={'enabled' if self._repo_enricher else 'disabled'}"
         )
 
     async def _get_http_client(self):
@@ -566,6 +951,7 @@ class JarvisPrimeClient:
         max_tokens: int = 512,
         temperature: float = 0.7,
         messages: Optional[List[ChatMessage]] = None,
+        enrich_with_repo_map: bool = True,
     ) -> CompletionResponse:
         """
         Complete a prompt with automatic routing and fallback.
@@ -576,11 +962,31 @@ class JarvisPrimeClient:
             max_tokens: Max tokens to generate
             temperature: Sampling temperature
             messages: Optional list of messages (overrides prompt)
+            enrich_with_repo_map: Whether to enrich coding questions with repo context
 
         Returns:
             CompletionResponse with result
         """
         self._request_count += 1
+        enrichment_metadata: Dict[str, Any] = {}
+
+        # Enrich with repo map context for coding questions
+        if enrich_with_repo_map and self._repo_enricher and messages is None:
+            try:
+                enriched_system, prompt, enrichment_metadata = await self._repo_enricher.enrich_prompt(
+                    prompt=prompt,
+                    system_prompt=system_prompt,
+                )
+                if enrichment_metadata.get("enriched"):
+                    system_prompt = enriched_system
+                    logger.info(
+                        f"[JarvisPrimeClient] Enriched with repo context: "
+                        f"confidence={enrichment_metadata.get('coding_confidence', 0):.2f}, "
+                        f"repos={enrichment_metadata.get('relevant_repos', [])}, "
+                        f"cache_hit={enrichment_metadata.get('cache_hit', False)}"
+                    )
+            except Exception as e:
+                logger.warning(f"[JarvisPrimeClient] Repo enrichment failed: {e}")
 
         # Decide initial mode
         mode, reason = self.decide_mode()
@@ -620,6 +1026,9 @@ class JarvisPrimeClient:
 
                 if response.success:
                     cb.record_success()
+                    # Add enrichment metadata to response
+                    if enrichment_metadata:
+                        response.metadata["enrichment"] = enrichment_metadata
                     self._update_stats(try_mode, response)
                     return response
                 else:
@@ -875,6 +1284,100 @@ class JarvisPrimeClient:
             return CompletionResponse(success=False, error=str(e), backend="gemini")
 
     # =========================================================================
+    # Repo Map Access
+    # =========================================================================
+
+    async def get_repo_map(
+        self,
+        repository: str = "jarvis",
+        max_tokens: Optional[int] = None,
+        mentioned_files: Optional[Set[str]] = None,
+        mentioned_symbols: Optional[Set[str]] = None,
+    ) -> Optional[str]:
+        """
+        Get a repository map directly.
+
+        Args:
+            repository: Repository name ("jarvis", "jarvis_prime", "reactor_core")
+            max_tokens: Max tokens for the map (default from config)
+            mentioned_files: Files to prioritize in the map
+            mentioned_symbols: Symbols to prioritize
+
+        Returns:
+            Repository map content as string, or None if unavailable
+        """
+        if not self._repo_enricher:
+            logger.warning("[JarvisPrimeClient] Repo enricher not enabled")
+            return None
+
+        mapper = await self._repo_enricher._get_mapper()
+        if not mapper:
+            return None
+
+        try:
+            result = await mapper.get_repo_map(
+                repository=repository,
+                max_tokens=max_tokens or self.config.repo_map_max_tokens,
+                mentioned_files=mentioned_files or set(),
+                mentioned_symbols=mentioned_symbols or set(),
+            )
+            return result.map_content if result else None
+        except Exception as e:
+            logger.error(f"[JarvisPrimeClient] Failed to get repo map: {e}")
+            return None
+
+    async def get_cross_repo_map(
+        self,
+        repositories: Optional[List[str]] = None,
+        max_tokens: Optional[int] = None,
+        focus_area: Optional[str] = None,
+    ) -> Optional[str]:
+        """
+        Get a map spanning multiple repositories.
+
+        Args:
+            repositories: List of repository names (default: all)
+            max_tokens: Maximum total tokens
+            focus_area: Area to focus on (e.g., "voice_auth", "training")
+
+        Returns:
+            Combined repository map content
+        """
+        if not self._repo_enricher:
+            return None
+
+        mapper = await self._repo_enricher._get_mapper()
+        if not mapper:
+            return None
+
+        try:
+            return await mapper.get_cross_repo_map(
+                repositories=repositories,
+                max_tokens=max_tokens or self.config.repo_map_max_tokens * 2,
+                focus_area=focus_area,
+            )
+        except Exception as e:
+            logger.error(f"[JarvisPrimeClient] Failed to get cross-repo map: {e}")
+            return None
+
+    def detect_coding_question(
+        self,
+        prompt: str,
+    ) -> Tuple[bool, float, Dict[str, Any]]:
+        """
+        Detect if a prompt is a coding question.
+
+        Args:
+            prompt: The prompt to analyze
+
+        Returns:
+            Tuple of (is_coding_question, confidence, metadata)
+        """
+        if not self._repo_enricher:
+            return False, 0.0, {}
+        return self._repo_enricher._detector.detect(prompt)
+
+    # =========================================================================
     # Stats and Cleanup
     # =========================================================================
 
@@ -925,7 +1428,7 @@ class JarvisPrimeClient:
     def get_stats(self) -> Dict[str, Any]:
         """Get usage statistics."""
         total = self._request_count or 1
-        return {
+        stats = {
             "total_requests": self._request_count,
             "local_count": self._local_count,
             "cloud_count": self._cloud_count,
@@ -943,6 +1446,20 @@ class JarvisPrimeClient:
                 for mode, cb in self._circuit_breakers.items()
             },
         }
+
+        # Add repo map enrichment stats
+        if self._repo_enricher:
+            stats["repo_map_enricher"] = {
+                "enabled": True,
+                "is_available": self._repo_enricher.is_available,
+                "cache_size": len(self._repo_enricher._cache),
+                "max_context_tokens": self._repo_enricher.max_context_tokens,
+                "cross_repo_enabled": self._repo_enricher.enable_cross_repo,
+            }
+        else:
+            stats["repo_map_enricher"] = {"enabled": False}
+
+        return stats
 
     # =========================================================================
     # Dynamic Memory Monitoring
