@@ -4,7 +4,7 @@
 
 use super::{ImageData, ImageFormat, CaptureRegion};
 use crate::{Result, JarvisError};
-use crate::memory::{MemoryManager, ZeroCopyBuffer};
+use crate::memory::MemoryManager;
 use std::sync::Arc;
 use std::collections::{VecDeque, HashMap};
 use parking_lot::RwLock;
@@ -149,7 +149,7 @@ impl SlidingWindowConfig {
 #[derive(Debug, Clone)]
 pub struct WindowRegion {
     pub bounds: CaptureRegion,
-    pub data: Option<ZeroCopyBuffer>,
+    pub data: Option<Vec<u8>>,
     pub hash: u64,
     pub priority: f32,
     pub is_static: bool,
@@ -170,11 +170,44 @@ pub struct SlidingWindowCapture {
     stats: SlidingWindowStats,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct CachedAnalysis {
     pub result: String,
     pub timestamp: Instant,
     pub confidence: f32,
+}
+
+// Serde implementations that skip Instant (which can't be serialized)
+impl serde::Serialize for CachedAnalysis {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("CachedAnalysis", 2)?;
+        state.serialize_field("result", &self.result)?;
+        state.serialize_field("confidence", &self.confidence)?;
+        state.end()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for CachedAnalysis {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct CachedAnalysisHelper {
+            result: String,
+            confidence: f32,
+        }
+        let helper = CachedAnalysisHelper::deserialize(deserializer)?;
+        Ok(CachedAnalysis {
+            result: helper.result,
+            timestamp: Instant::now(),
+            confidence: helper.confidence,
+        })
+    }
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -185,16 +218,18 @@ pub struct SlidingWindowStats {
     pub static_regions_skipped: u64,
     pub avg_window_size_bytes: f32,
     pub total_memory_saved_mb: f32,
+    pub memory_pressure_events: u64,
 }
 
 impl SlidingWindowCapture {
     pub fn new(config: SlidingWindowConfig) -> Self {
         let memory_manager = MemoryManager::global();
-        
+        let max_windows = config.max_windows_in_memory;
+
         Self {
             config: Arc::new(RwLock::new(config)),
             memory_manager,
-            window_buffer: VecDeque::with_capacity(config.max_windows_in_memory),
+            window_buffer: VecDeque::with_capacity(max_windows),
             region_cache: Arc::new(RwLock::new(HashMap::new())),
             previous_hashes: HashMap::new(),
             stats: SlidingWindowStats::default(),
@@ -203,18 +238,19 @@ impl SlidingWindowCapture {
 
     /// Generate sliding windows for an image
     pub fn generate_windows(&mut self, image: &ImageData) -> Result<Vec<WindowRegion>> {
-        let config = self.config.read();
         let available_memory_mb = self.get_available_memory_mb();
-        
-        // Get adaptive window size based on memory
-        let (window_width, window_height) = config.get_adaptive_window_size(available_memory_mb);
-        
-        // Calculate steps with overlap
-        let step_x = ((window_width as f32) * (1.0 - config.overlap_percentage)) as u32;
-        let step_y = ((window_height as f32) * (1.0 - config.overlap_percentage)) as u32;
-        
+
+        // Extract config values to release the lock
+        let (window_width, window_height, step_x, step_y, prioritize_center, skip_static_regions, static_threshold, memory_threshold_mb, max_concurrent_regions) = {
+            let config = self.config.read();
+            let (ww, wh) = config.get_adaptive_window_size(available_memory_mb);
+            let sx = ((ww as f32) * (1.0 - config.overlap_percentage)) as u32;
+            let sy = ((wh as f32) * (1.0 - config.overlap_percentage)) as u32;
+            (ww, wh, sx, sy, config.prioritize_center, config.skip_static_regions, config.static_threshold, config.memory_threshold_mb, config.max_concurrent_regions)
+        };
+
         let mut windows = Vec::new();
-        
+
         // Generate windows with configurable stepping
         for y in (0..image.height.saturating_sub(window_height)).step_by(step_y as usize) {
             for x in (0..image.width.saturating_sub(window_width)).step_by(step_x as usize) {
@@ -224,23 +260,23 @@ impl SlidingWindowCapture {
                     width: window_width.min(image.width - x),
                     height: window_height.min(image.height - y),
                 };
-                
+
                 // Calculate priority (center regions get higher priority)
-                let priority = if config.prioritize_center {
+                let priority = if prioritize_center {
                     self.calculate_region_priority(x, y, window_width, window_height, image.width, image.height)
                 } else {
                     1.0
                 };
-                
+
                 // Extract region data without copying
                 let region_data = self.extract_region_zero_copy(image, &bounds)?;
-                
+
                 // Calculate hash for change detection
                 let hash = self.calculate_region_hash(&region_data);
-                
+
                 // Check if region is static
-                let is_static = if config.skip_static_regions {
-                    self.is_region_static(x, y, hash, config.static_threshold)
+                let is_static = if skip_static_regions {
+                    self.is_region_static(x, y, hash, static_threshold)
                 } else {
                     false
                 };
@@ -265,10 +301,10 @@ impl SlidingWindowCapture {
         windows.sort_by(|a, b| b.priority.partial_cmp(&a.priority).unwrap());
         
         // Keep only top N windows based on memory constraints
-        let max_windows = if available_memory_mb < config.memory_threshold_mb {
-            config.max_concurrent_regions / 2  // Reduce when memory is low
+        let max_windows = if available_memory_mb < memory_threshold_mb {
+            max_concurrent_regions / 2  // Reduce when memory is low
         } else {
-            config.max_concurrent_regions
+            max_concurrent_regions
         };
         
         windows.truncate(max_windows);
@@ -279,37 +315,38 @@ impl SlidingWindowCapture {
         Ok(windows)
     }
 
-    /// Extract region with zero-copy when possible
-    fn extract_region_zero_copy(&self, image: &ImageData, bounds: &CaptureRegion) -> Result<ZeroCopyBuffer> {
+    /// Extract region with efficient memory allocation
+    fn extract_region_zero_copy(&mut self, image: &ImageData, bounds: &CaptureRegion) -> Result<Vec<u8>> {
         let bytes_per_pixel = image.format.bytes_per_pixel() as usize;
         let region_size = (bounds.width * bounds.height) as usize * bytes_per_pixel;
-        
-        // Allocate buffer from memory pool
-        let buffer = self.memory_manager.allocate(region_size)?;
-        let mut zero_copy_buffer = ZeroCopyBuffer::from_rust(buffer);
-        
+
+        // Allocate buffer from memory pool and convert to Vec
+        let mut buffer = self.memory_manager.allocate(region_size)?;
+
         // Copy region data (optimized for cache efficiency)
-        unsafe {
+        {
             let src_data = image.as_slice();
-            let dst_data = zero_copy_buffer.as_mut_slice();
-            let src_stride = (image.width as usize) * bytes_per_pixel;
+            let dst_data = buffer.as_mut_slice();
             let dst_stride = (bounds.width as usize) * bytes_per_pixel;
-            
+
             for y in 0..bounds.height as usize {
                 let src_offset = ((bounds.y as usize + y) * image.width as usize + bounds.x as usize) * bytes_per_pixel;
                 let dst_offset = y * dst_stride;
-                
+
                 dst_data[dst_offset..dst_offset + dst_stride]
                     .copy_from_slice(&src_data[src_offset..src_offset + dst_stride]);
             }
         }
-        
+
         // Update stats
-        self.stats.avg_window_size_bytes = 
-            (self.stats.avg_window_size_bytes * (self.stats.total_windows_processed - 1) as f32 + region_size as f32) 
-            / self.stats.total_windows_processed as f32;
-        
-        Ok(zero_copy_buffer)
+        if self.stats.total_windows_processed > 0 {
+            self.stats.avg_window_size_bytes =
+                (self.stats.avg_window_size_bytes * (self.stats.total_windows_processed - 1) as f32 + region_size as f32)
+                / self.stats.total_windows_processed as f32;
+        }
+
+        // Convert PooledBuffer to Vec<u8>
+        Ok(buffer.into_vec())
     }
 
     /// Calculate region priority based on position
@@ -333,21 +370,18 @@ impl SlidingWindowCapture {
     }
 
     /// Calculate hash for region (for change detection)
-    fn calculate_region_hash(&self, buffer: &ZeroCopyBuffer) -> u64 {
+    fn calculate_region_hash(&self, data: &[u8]) -> u64 {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
-        
-        unsafe {
-            let data = buffer.as_slice();
-            let mut hasher = DefaultHasher::new();
-            
-            // Sample the data for faster hashing (every 16th byte)
-            for i in (0..data.len()).step_by(16) {
-                data[i].hash(&mut hasher);
-            }
-            
-            hasher.finish()
+
+        let mut hasher = DefaultHasher::new();
+
+        // Sample the data for faster hashing (every 16th byte)
+        for i in (0..data.len()).step_by(16) {
+            data[i].hash(&mut hasher);
         }
+
+        hasher.finish()
     }
 
     /// Check if region is static (unchanged)
@@ -394,7 +428,8 @@ impl SlidingWindowCapture {
     {
         let config = self.config.read();
         let mut results = Vec::new();
-        
+        let windows_count = windows.len();
+
         for window in windows {
             // Check cache first
             if config.enable_caching {
@@ -438,14 +473,14 @@ impl SlidingWindowCapture {
         
         // Calculate memory saved
         let full_image_size_mb = 1920.0 * 1080.0 * 3.0 / 1024.0 / 1024.0; // Assume full HD
-        let windows_size_mb = (self.stats.avg_window_size_bytes * windows.len() as f32) / 1024.0 / 1024.0;
+        let windows_size_mb = (self.stats.avg_window_size_bytes * windows_count as f32) / 1024.0 / 1024.0;
         self.stats.total_memory_saved_mb += full_image_size_mb - windows_size_mb;
         
         Ok(results)
     }
 
     /// Clear cache
-    pub fn clear_cache(&self) {
+    pub fn clear_cache(&mut self) {
         self.region_cache.write().clear();
         self.previous_hashes.clear();
     }
@@ -472,7 +507,7 @@ pub struct AnalysisResult {
 
 /// Memory-aware sliding window coordinator
 pub struct MemoryAwareSlidingWindow {
-    capture: Arc<SlidingWindowCapture>,
+    capture: Arc<RwLock<SlidingWindowCapture>>,
     memory_monitor: MemoryMonitor,
     quality_adjuster: QualityAdjuster,
 }
@@ -587,7 +622,7 @@ impl QualityAdjuster {
 impl MemoryAwareSlidingWindow {
     pub fn new(config: SlidingWindowConfig) -> Self {
         Self {
-            capture: Arc::new(SlidingWindowCapture::new(config)),
+            capture: Arc::new(RwLock::new(SlidingWindowCapture::new(config))),
             memory_monitor: MemoryMonitor::new(
                 std::env::var("MEMORY_MONITOR_THRESHOLD_MB")
                     .unwrap_or_else(|_| "2000".to_string())
@@ -615,31 +650,31 @@ impl MemoryAwareSlidingWindow {
         }
 
         // Generate windows with current quality settings
-        let mut windows = self.capture.generate_windows(image)?;
-        
+        let mut windows = self.capture.write().generate_windows(image)?;
+
         // Limit windows based on current quality
         let current_quality = self.quality_adjuster.current_quality();
         windows.truncate(current_quality.max_regions);
-        
+
         // Analyze windows
         let analyzer = |window: &WindowRegion| -> Result<String> {
             // This would call Claude Vision API or other analyzer
             Ok(format!("Analysis of region at ({}, {})", window.bounds.x, window.bounds.y))
         };
-        
-        self.capture.analyze_windows(windows, analyzer).await
+
+        self.capture.write().analyze_windows(windows, analyzer).await
     }
 
     fn apply_quality_level(&self, level: &QualityLevel) -> Result<()> {
-        self.capture.update_config("window_width", &level.window_size.0.to_string())?;
-        self.capture.update_config("window_height", &level.window_size.1.to_string())?;
-        self.capture.update_config("max_concurrent_regions", &level.max_regions.to_string())?;
+        self.capture.read().update_config("window_width", &level.window_size.0.to_string())?;
+        self.capture.read().update_config("window_height", &level.window_size.1.to_string())?;
+        self.capture.read().update_config("max_concurrent_regions", &level.max_regions.to_string())?;
         Ok(())
     }
 
     /// Get sliding window statistics
     pub fn get_stats(&self) -> SlidingWindowStats {
-        self.capture.get_stats()
+        self.capture.read().get_stats()
     }
 }
 

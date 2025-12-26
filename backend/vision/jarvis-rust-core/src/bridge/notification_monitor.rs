@@ -259,7 +259,7 @@ impl RateLimiter {
         }
         
         let current_count = self.count.fetch_add(1, Ordering::SeqCst);
-        current_count < self.config.max_per_window
+        current_count < self.config.max_per_window as u64
     }
     
     fn handle_overflow(&self, event: NotificationEvent) -> Option<NotificationEvent> {
@@ -395,7 +395,7 @@ impl NotificationMonitor {
                     let observer_info = entry.value();
                     let _: () = msg_send![
                         self.notification_center,
-                        removeObserver:observer_info.observer.as_ptr()
+                        removeObserver:*observer_info.observer
                     ];
                 }
                 

@@ -3766,6 +3766,10 @@ class SupervisorBootstrapper:
                 }
             )
 
+            # v6.2: Announce two-tier security initialization
+            if self.config.voice_enabled:
+                await self.narrator.speak("Initializing two-tier security architecture.", wait=False)
+
             # Initialize Watchdog
             if self._watchdog_enabled:
                 try:
@@ -3789,6 +3793,10 @@ class SupervisorBootstrapper:
 
                     os.environ["JARVIS_WATCHDOG_ENABLED"] = "true"
                     print(f"  {TerminalUI.GREEN}✓ Watchdog: Active safety monitoring{TerminalUI.RESET}")
+
+                    # v6.2: Announce watchdog ready
+                    if self.config.voice_enabled:
+                        await self.narrator.speak("Agentic watchdog armed. Kill switch ready.", wait=False)
 
                     # Broadcast Two-Tier Watchdog status to loading page
                     await self._broadcast_startup_progress(
@@ -3823,6 +3831,15 @@ class SupervisorBootstrapper:
                     vbia_adapter = await get_tiered_vbia_adapter()
                     self.logger.info("🔐 Tiered VBIA Adapter initialized")
                     print(f"  {TerminalUI.GREEN}✓ VBIA Adapter: Tiered authentication ready{TerminalUI.RESET}")
+
+                    # v6.2: Announce VBIA ready with visual security
+                    if self.config.voice_enabled:
+                        # Check if visual security is enabled
+                        visual_enabled = os.getenv("JARVIS_VISUAL_SECURITY_ENABLED", "true").lower() == "true"
+                        if visual_enabled:
+                            await self.narrator.speak("Voice biometric authentication ready. Visual threat detection enabled.", wait=False)
+                        else:
+                            await self.narrator.speak("Voice biometric authentication ready. Tiered thresholds configured.", wait=False)
 
                     # Broadcast Two-Tier VBIA status to loading page
                     await self._broadcast_startup_progress(
@@ -3860,6 +3877,10 @@ class SupervisorBootstrapper:
                     self.logger.info("   • VBIA events: Real-time sharing enabled")
                     self.logger.info("   • Visual security: Event emission ready")
                     print(f"  {TerminalUI.GREEN}✓ Cross-Repo: VBIA v6.2 event sharing active{TerminalUI.RESET}")
+
+                    # v6.2: Announce cross-repo connection
+                    if self.config.voice_enabled:
+                        await self.narrator.speak("Cross-repository integration complete. Intelligence shared across all platforms.", wait=False)
 
                     # Broadcast cross-repo status to loading page
                     await self._broadcast_startup_progress(
@@ -3962,6 +3983,14 @@ class SupervisorBootstrapper:
                             }
                         }
                     )
+
+                    # v6.2: Announce complete two-tier security with visual protection
+                    if self.config.voice_enabled:
+                        visual_enabled = os.getenv("JARVIS_VISUAL_SECURITY_ENABLED", "true").lower() == "true"
+                        if visual_enabled:
+                            await self.narrator.speak("Two-tier security fully operational. I'm protected by voice biometrics and visual threat detection.", wait=False)
+                        else:
+                            await self.narrator.speak("Two-tier security fully operational. Safe mode and agentic mode ready.", wait=False)
 
                 except ImportError as e:
                     self.logger.warning(f"⚠️ Tiered Router not available: {e}")
@@ -5602,6 +5631,10 @@ class SupervisorBootstrapper:
                 self.logger.info("🕸️ Step 3/7: Initializing Neural Mesh v9.4 (Production Multi-Agent System)...")
                 self.logger.info("   • Production mode: " + str(self.config.neural_mesh_production))
                 self.logger.info("   • Agents enabled: " + str(self.config.neural_mesh_agents_enabled))
+
+                # v6.0+: Narrator announcement - Neural Mesh initialization
+                if self.config.voice_enabled:
+                    await self.narrator.speak("Initializing Neural Mesh multi-agent system.", wait=False)
                 self.logger.info("   • Knowledge graph: " + str(self.config.neural_mesh_knowledge_graph))
                 self.logger.info("   • JARVIS bridge: " + str(self.config.neural_mesh_jarvis_bridge))
                 self.logger.info("   • Health interval: " + str(self.config.neural_mesh_health_interval) + "s")
@@ -5656,6 +5689,10 @@ class SupervisorBootstrapper:
                     await self._neural_mesh_coordinator.start()
                     self.logger.info("   ✓ Neural Mesh Coordinator started")
 
+                    # v6.0+: Narrator announcement - Coordinator online
+                    if self.config.voice_enabled:
+                        await self.narrator.speak("Neural Mesh coordinator online.", wait=False)
+
                     # Store coordinator reference for system access
                     self._neural_mesh = self._neural_mesh_coordinator
 
@@ -5674,6 +5711,25 @@ class SupervisorBootstrapper:
                         for agent_name, agent in self._neural_mesh_agents.items():
                             self._neural_mesh_stats["agents_registered"] += 1
                             self.logger.debug(f"      • {agent_name} ({agent.agent_type})")
+
+                        # v6.0+: Narrator announcement - Check for Google Workspace Agent
+                        if self.config.voice_enabled:
+                            # Detect if GoogleWorkspaceAgent was registered
+                            google_workspace_registered = any(
+                                "GoogleWorkspace" in agent.agent_type or "GoogleWorkspace" in agent_name
+                                for agent_name, agent in self._neural_mesh_agents.items()
+                            )
+
+                            if google_workspace_registered:
+                                await self.narrator.speak(
+                                    "Google Workspace Agent registered. Gmail, Calendar, and Drive ready.",
+                                    wait=False
+                                )
+                            else:
+                                await self.narrator.speak(
+                                    f"{agent_count} production agents registered and coordinated.",
+                                    wait=False
+                                )
 
                     # Initialize JARVIS Bridge if enabled (connects all JARVIS systems)
                     if self.config.neural_mesh_jarvis_bridge:
@@ -5774,6 +5830,13 @@ class SupervisorBootstrapper:
                     bridge_status = "active" if self._neural_mesh_bridge else "disabled"
                     self.logger.info(f"✅ Neural Mesh v9.4 Production initialized ({total_agents} agents, bridge: {bridge_status})")
                     print(f"  {TerminalUI.GREEN}✓ Neural Mesh v9.4: Production multi-agent system active ({total_agents} agents){TerminalUI.RESET}")
+
+                    # v6.0+: Narrator announcement - Neural Mesh fully operational
+                    if self.config.voice_enabled:
+                        await self.narrator.speak(
+                            f"Neural Mesh fully operational. {total_agents} agents coordinated.",
+                            wait=False
+                        )
 
                 # Define NeuralMeshNode at this scope so it's available for all paths
                 from dataclasses import dataclass, field

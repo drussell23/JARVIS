@@ -132,6 +132,12 @@ pub struct CaptureRegion {
     pub height: u32,
 }
 
+impl CaptureRegion {
+    pub fn area(&self) -> u32 {
+        self.width * self.height
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppState {
     pub bundle_id: String,
@@ -416,12 +422,12 @@ impl SharedBuffer {
     }
     
     /// Get mutable slice to buffer data
-    pub fn as_mut_slice(&self) -> parking_lot::RwLockWriteGuard<'_, [u8]> {
+    pub fn as_mut_slice(&self) -> parking_lot::MappedRwLockWriteGuard<'_, [u8]> {
         parking_lot::RwLockWriteGuard::map(self.inner.write(), |inner| &mut inner.mmap[..])
     }
-    
+
     /// Get immutable slice to buffer data
-    pub fn as_slice(&self) -> parking_lot::RwLockReadGuard<'_, [u8]> {
+    pub fn as_slice(&self) -> parking_lot::MappedRwLockReadGuard<'_, [u8]> {
         parking_lot::RwLockReadGuard::map(self.inner.read(), |inner| &inner.mmap[..])
     }
 }

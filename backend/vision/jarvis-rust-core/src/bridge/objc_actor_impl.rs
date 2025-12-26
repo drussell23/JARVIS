@@ -1116,7 +1116,7 @@ impl ObjCActor {
 
                 // Create data provider from buffer
                 use core_foundation::data::CFData;
-                let cf_data = CFData::from_buffer(buffer_data);
+                let cf_data = CFData::from_buffer(&*buffer_data);
 
                 let data_provider = CGDataProviderCreateWithCFData(cf_data.as_concrete_TypeRef() as *const std::ffi::c_void);
                 if data_provider.is_null() {

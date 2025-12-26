@@ -88,6 +88,16 @@ class StartupPhase(str, Enum):
     LEARNING_GOALS = "learning_goals"
     JARVIS_PRIME = "jarvis_prime"
     REACTOR_CORE = "reactor_core"
+    # v6.2: Enhanced VBIA Visual Security phases
+    VBIA_INIT = "vbia_init"
+    VISUAL_SECURITY = "visual_security"
+    CROSS_REPO_INIT = "cross_repo_init"
+    TWO_TIER_SECURITY = "two_tier_security"
+    # v6.0+: Google Workspace Integration
+    GOOGLE_WORKSPACE = "google_workspace"
+    GMAIL_INIT = "gmail_init"
+    CALENDAR_INIT = "calendar_init"
+    NEURAL_MESH = "neural_mesh"
 
 
 class NarrationPriority(Enum):
@@ -451,6 +461,191 @@ PHASE_NARRATION_TEMPLATES: Dict[StartupPhase, Dict[str, List[str]]] = {
         "complete": [
             "Reactor Core initialized. Ready for model training.",
             "Training pipeline operational.",
+        ],
+    },
+    # v6.2: Enhanced VBIA Visual Security phases
+    StartupPhase.VBIA_INIT: {
+        "start": [
+            "Initializing voice biometric authentication.",
+            "Voice authentication systems coming online.",
+            "Preparing biometric security layer.",
+        ],
+        "tier1": [
+            "Tier one voice authentication ready. Basic security active.",
+            "Standard voice authentication initialized.",
+        ],
+        "tier2": [
+            "Tier two voice authentication ready. Advanced security enabled.",
+            "Strict voice biometric verification online.",
+        ],
+        "complete": [
+            "Voice biometric authentication fully operational.",
+            "VBIA ready. Multi-factor security enabled.",
+            "Biometric authentication systems initialized.",
+        ],
+    },
+    StartupPhase.VISUAL_SECURITY: {
+        "start": [
+            "Enabling visual security analysis.",
+            "Initializing computer vision for threat detection.",
+            "Visual security systems coming online.",
+        ],
+        "omniparser": [
+            "OmniParser visual analyzer ready.",
+            "Screen analysis capabilities enabled.",
+        ],
+        "claude_vision": [
+            "Claude Vision integration active.",
+            "Advanced visual threat detection online.",
+        ],
+        "complete": [
+            "Visual security operational. I can now see potential threats.",
+            "Screen monitoring active. Visual threats will be detected.",
+            "Visual security fully initialized. Enhanced protection enabled.",
+        ],
+        "threat_detection": [
+            "Visual threat detection is now active. I'll watch for ransomware and suspicious screens.",
+            "Screen security monitoring enabled. Fake lock screens will be detected.",
+        ],
+    },
+    StartupPhase.CROSS_REPO_INIT: {
+        "start": [
+            "Establishing cross-repository connections.",
+            "Connecting to JARVIS Prime and Reactor Core.",
+            "Initializing multi-system integration.",
+        ],
+        "prime_connected": [
+            "JARVIS Prime connection established.",
+            "Connected to tier-zero intelligence.",
+        ],
+        "reactor_connected": [
+            "Reactor Core analytics online.",
+            "Event monitoring and threat analysis active.",
+        ],
+        "events_ready": [
+            "Cross-repo event sharing enabled.",
+            "Real-time security events flowing between systems.",
+        ],
+        "complete": [
+            "Cross-repository integration complete. All systems connected.",
+            "JARVIS, JARVIS Prime, and Reactor Core now operating in harmony.",
+            "Multi-system coordination active. Intelligence shared across all platforms.",
+        ],
+    },
+    StartupPhase.TWO_TIER_SECURITY: {
+        "start": [
+            "Initializing two-tier security architecture.",
+            "Preparing dual-mode authentication system.",
+        ],
+        "watchdog": [
+            "Agentic watchdog armed. Kill switch ready.",
+            "Safety monitoring active. Heartbeat tracking enabled.",
+        ],
+        "vbia": [
+            "Voice biometric adapter connected.",
+            "Tiered authentication thresholds configured.",
+        ],
+        "router": [
+            "Two-tier command router online.",
+            "Tier one Gemini and tier two Claude routing ready.",
+        ],
+        "complete": [
+            "Two-tier security fully operational. Safe mode and agentic mode ready.",
+            "Dual security architecture initialized. Basic commands use Gemini, advanced use Claude with strict voice auth.",
+            "Security tiers active. I'm protected by voice biometrics and visual threat detection.",
+        ],
+        "visual_enhanced": [
+            "Two-tier security enhanced with visual threat detection. Maximum security enabled.",
+            "Advanced protection active: voice authentication plus visual screening for tier two commands.",
+        ],
+    },
+    # v6.0+: Google Workspace Integration phases
+    StartupPhase.GOOGLE_WORKSPACE: {
+        "start": [
+            "Initializing Google Workspace integration.",
+            "Connecting to your Google account.",
+            "Preparing Gmail, Calendar, and Drive connections.",
+        ],
+        "tier1_ready": [
+            "Google Workspace tier one ready. Cloud APIs initialized.",
+            "Gmail API and Calendar API online.",
+        ],
+        "tier2_ready": [
+            "Google Workspace tier two ready. Local macOS fallback enabled.",
+            "CalendarBridge and macOS integrations active.",
+        ],
+        "tier3_ready": [
+            "Google Workspace tier three ready. Visual automation available.",
+            "Computer Use fallback initialized for workspace tasks.",
+        ],
+        "complete": [
+            "Google Workspace fully operational. Three-tier waterfall active.",
+            "I can now handle your emails, calendar, and documents.",
+            "Gmail, Calendar, and Drive ready. Chief of Staff mode enabled.",
+        ],
+        "admin_ready": [
+            "I'm ready to be your Chief of Staff. Ask me to check emails or schedule meetings.",
+            "Admin capabilities online. I can manage your Google Workspace.",
+        ],
+    },
+    StartupPhase.GMAIL_INIT: {
+        "start": [
+            "Connecting to Gmail.",
+            "Initializing email management.",
+        ],
+        "api_ready": [
+            "Gmail API ready. I can fetch and send emails.",
+            "Email access granted.",
+        ],
+        "complete": [
+            "Gmail integration complete.",
+            "I can now read and write your emails.",
+        ],
+    },
+    StartupPhase.CALENDAR_INIT: {
+        "start": [
+            "Connecting to Google Calendar.",
+            "Initializing schedule management.",
+        ],
+        "api_ready": [
+            "Calendar API ready. I can check your schedule.",
+            "Calendar access granted.",
+        ],
+        "local_ready": [
+            "macOS Calendar bridge ready. Local schedule access enabled.",
+            "CalendarBridge initialized.",
+        ],
+        "complete": [
+            "Calendar integration complete.",
+            "I can now manage your meetings and events.",
+        ],
+    },
+    StartupPhase.NEURAL_MESH: {
+        "start": [
+            "Initializing Neural Mesh multi-agent system.",
+            "Preparing distributed agent coordination.",
+            "Activating agent swarm.",
+        ],
+        "coordinator_ready": [
+            "Neural Mesh coordinator online.",
+            "Agent orchestration ready.",
+        ],
+        "agents_registering": [
+            "Registering production agents.",
+            "Agents joining the mesh.",
+        ],
+        "workspace_agent": [
+            "Google Workspace Agent registered.",
+            "Chief of Staff agent online.",
+        ],
+        "memory_agent": [
+            "Memory Agent registered.",
+            "Distributed memory management active.",
+        ],
+        "complete": [
+            "Neural Mesh fully operational. All agents coordinated.",
+            "Multi-agent swarm ready. Distributed intelligence enabled.",
+            "Agent mesh initialized. Collaborative problem-solving active.",
         ],
     },
 }

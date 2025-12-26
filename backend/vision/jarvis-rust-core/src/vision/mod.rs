@@ -31,11 +31,11 @@ use serde::{Deserialize, Serialize};
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
 
-// Re-export capture types  
+// Re-export capture types
 pub use capture::{
     ScreenCapture, CaptureConfig, CaptureRegion, ColorSpace,
     PixelFormat, CompressionHint, CaptureQuality, CaptureStats,
-    SharedMemoryHandle, WindowInfo, AppInfo, TextDetection
+    SharedMemoryHandle, WindowInfo, AppInfo, TextDetection, BridgeMetrics
 };
 pub use processing::{
     ImageProcessor, ProcessingPipeline, ProcessingConfig,
@@ -426,9 +426,10 @@ impl ImageData {
             ));
         }
         
+        let channels = self.channels as usize;
         let offset = ((y * self.width + x) * self.channels as u32) as usize;
         let data = self.as_mut_slice();
-        data[offset..offset + self.channels as usize].copy_from_slice(pixel);
+        data[offset..offset + channels].copy_from_slice(pixel);
         Ok(())
     }
     
@@ -568,8 +569,8 @@ pub struct VisionStats {
 impl VisionContext {
     /// Create new vision context with default configuration
     pub fn new() -> Result<Self> {
-        let config = Arc::new(RwLock::new(VisionGlobalConfig::from_env()));
-        Self::with_config(config.read().clone())
+        let config = VisionGlobalConfig::from_env();
+        Self::with_config(config)
     }
     
     /// Create with custom configuration

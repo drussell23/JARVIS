@@ -42,7 +42,8 @@ from uuid import uuid4
 try:
     from langchain_core.tools import BaseTool, StructuredTool, tool
     from langchain_core.callbacks import CallbackManagerForToolRun, AsyncCallbackManagerForToolRun
-    from langchain_core.pydantic_v1 import BaseModel, Field
+    # Fix for pydantic v2 - use pydantic directly instead of compatibility shim
+    from pydantic import BaseModel, Field
     LANGCHAIN_AVAILABLE = True
 except ImportError:
     try:

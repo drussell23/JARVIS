@@ -27,6 +27,11 @@ pub struct MemoryStats {
     pub pool_hits: usize,
     pub pool_misses: usize,
     pub recycled_buffers: usize,
+    pub peak_usage_bytes: usize,
+    pub allocation_count: usize,
+    pub deallocation_count: usize,
+    pub allocated_bytes: usize,
+    pub deallocated_bytes: usize,
 }
 
 /// Central memory manager

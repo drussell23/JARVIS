@@ -261,8 +261,8 @@ impl UserStateDetector {
             return 1.0;
         }
         
-        let mut best_match = 0.0;
-        
+        let mut best_match: f64 = 0.0;
+
         for pattern in patterns {
             let recent_window = Utc::now() - pattern.time_window;
             let window_signals: Vec<&UserSignal> = signals.iter()

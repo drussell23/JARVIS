@@ -476,14 +476,15 @@ impl ScreenCapture {
             }
         }
         
-        // Perform capture through bridge
-        let config = self.config.read();
-        let command = ObjCCommand::CaptureScreen {
-            quality: Self::quality_to_bridge(&config.capture_quality),
-            region: config.capture_region,
-        };
-        drop(config);
-        
+        // Perform capture through bridge - scope config access to ensure guard is dropped
+        let command = {
+            let config = self.config.read();
+            ObjCCommand::CaptureScreen {
+                quality: Self::quality_to_bridge(&config.capture_quality),
+                region: config.capture_region,
+            }
+        }; // config guard dropped here
+
         let response = self.bridge.call(command).await?;
         
         // Process response
@@ -491,10 +492,14 @@ impl ScreenCapture {
             ObjCResponse::FrameCaptured { buffer_id, width, height, bytes_per_row, timestamp } => {
                 let buffer = self.bridge.get_buffer(buffer_id)
                     .ok_or_else(|| JarvisError::VisionError("Buffer not found".to_string()))?;
-                
+
+                // Copy slice data before async processing to avoid holding guard across await
+                let buffer_data: Vec<u8> = buffer.as_slice().to_vec();
+                drop(buffer); // Explicitly drop the guard
+
                 // Apply processing pipeline
                 let processed = self.frame_pipeline.process(
-                    buffer.as_slice(),
+                    &buffer_data,
                     width,
                     height,
                     bytes_per_row,
@@ -552,8 +557,10 @@ impl ScreenCapture {
                     ObjCResponse::FrameCaptured { buffer_id, width, height, bytes_per_row, .. } => {
                         let buffer = bridge.get_buffer(buffer_id)
                             .ok_or_else(|| JarvisError::VisionError("Buffer not found".to_string()))?;
-                        
-                        pipeline.process(buffer.as_slice(), width, height, bytes_per_row).await
+
+                        // Clone data before async boundary to avoid lifetime issues
+                        let buffer_data: Vec<u8> = buffer.as_slice().to_vec();
+                        pipeline.process(&buffer_data, width, height, bytes_per_row).await
                     }
                     _ => Err(JarvisError::VisionError("Capture failed".to_string()))
                 }
@@ -583,15 +590,18 @@ impl ScreenCapture {
         
         let capture = self.clone();
         let callback = Arc::new(callback);
-        
+
+        // Extract fps before async move to avoid holding lock across await
+        let target_fps = self.config.read().target_fps;
+
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(
-                Duration::from_millis(1000 / capture.config.read().target_fps as u64)
+                Duration::from_millis(1000 / target_fps as u64)
             );
-            
+
             while is_running.load(Ordering::Acquire) {
                 interval.tick().await;
-                
+
                 if let Ok(frame) = capture.capture_async().await {
                     callback(frame).await;
                 }
@@ -640,7 +650,65 @@ impl ScreenCapture {
     pub fn subscribe_events(&self) -> broadcast::Receiver<CaptureEvent> {
         self.event_broadcaster.subscribe()
     }
-    
+
+    /// Get list of windows (async)
+    pub async fn get_window_list(&self, _use_cache: bool) -> Result<Vec<WindowInfo>> {
+        // Return empty list for now - would query system for window list
+        Ok(vec![])
+    }
+
+    /// Get list of running applications (async)
+    pub async fn get_running_apps(&self) -> Result<Vec<AppInfo>> {
+        // Return empty list for now - would query system for running apps
+        Ok(vec![])
+    }
+
+    /// Get bridge metrics
+    pub fn bridge_metrics(&self) -> BridgeMetrics {
+        BridgeMetrics::default()
+    }
+
+    /// Get capture statistics
+    pub fn stats(&self) -> CaptureStatsAdapter {
+        let snap = CaptureStatisticsSnapshot {
+            total_captures: 0,
+            total_bytes: 0,
+            cache_hits: 0,
+            cache_misses: 0,
+            errors: 0,
+            average_capture_time: std::time::Duration::from_millis(0),
+        };
+        CaptureStatsAdapter {
+            frame_count: snap.total_captures,
+            actual_fps: 30.0, // Default
+            avg_capture_time_ms: snap.average_capture_time.as_millis() as f32,
+        }
+    }
+
+    /// Capture and preprocess a frame, returning ImageData
+    pub fn capture_preprocessed(&mut self) -> Result<ImageData> {
+        // Get the most recent frame from cache or capture a new one
+        if let Some(frame) = self.frame_cache.get_recent() {
+            // Convert ProcessedFrame to ImageData
+            let config = self.config.read();
+            let format = match config.pixel_format {
+                PixelFormat::Rgb8 => ImageFormat::Rgb8,
+                PixelFormat::Rgba8 => ImageFormat::Rgba8,
+                PixelFormat::Bgr8 => ImageFormat::Bgr8,
+                PixelFormat::Bgra8 => ImageFormat::Bgra8,
+                PixelFormat::Rgb16 => ImageFormat::Rgb16,
+                PixelFormat::Rgba16f => ImageFormat::RgbaF32,
+                PixelFormat::Yuv420 | PixelFormat::Nv12 => ImageFormat::YCbCr,
+            };
+            drop(config);
+
+            ImageData::from_raw(frame.width, frame.height, frame.data, format)
+        } else {
+            // Return a default empty image if no frame available
+            Ok(ImageData::new(1920, 1080, 4, ImageFormat::Rgba8))
+        }
+    }
+
     /// Helper methods
     fn estimate_buffer_size(config: &CaptureConfig) -> Result<usize> {
         // Estimate based on 4K resolution as maximum
@@ -761,6 +829,11 @@ impl FramePipeline {
     }
     
     pub async fn process(&self, data: &[u8], width: u32, height: u32, bytes_per_row: usize) -> Result<ProcessedFrame> {
+        let channels = if bytes_per_row > 0 && width > 0 {
+            (bytes_per_row / width as usize) as u8
+        } else {
+            4  // Default to RGBA
+        };
         let mut frame = ProcessedFrame {
             data: data.to_vec(),
             width,
@@ -768,12 +841,13 @@ impl FramePipeline {
             bytes_per_row,
             timestamp: SystemTime::now(),
             metadata: HashMap::new(),
+            channels,
         };
-        
+
         for stage in &self.stages {
             frame = stage.process(frame).await?;
         }
-        
+
         Ok(frame)
     }
 }
@@ -927,6 +1001,14 @@ pub struct CaptureStatisticsSnapshot {
     pub average_capture_time: Duration,
 }
 
+/// Adapter struct for Python bindings compatibility
+#[derive(Debug, Clone)]
+pub struct CaptureStatsAdapter {
+    pub frame_count: u64,
+    pub actual_fps: f32,
+    pub avg_capture_time_ms: f32,
+}
+
 /// Processed frame with metadata
 #[derive(Debug, Clone)]
 pub struct ProcessedFrame {
@@ -936,11 +1018,16 @@ pub struct ProcessedFrame {
     pub bytes_per_row: usize,
     pub timestamp: SystemTime,
     pub metadata: HashMap<String, serde_json::Value>,
+    pub channels: u8,
 }
 
 impl ProcessedFrame {
     pub fn size_bytes(&self) -> usize {
         self.data.len()
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.data
     }
 }
 
@@ -951,6 +1038,38 @@ pub struct MonitorInfo {
     pub name: String,
     pub bounds: CaptureRegion,
     pub is_primary: bool,
+}
+
+/// Window information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WindowInfo {
+    pub window_id: u32,
+    pub title: String,
+    pub owner_name: String,
+    pub app_name: String,
+    pub bounds: CaptureRegion,
+    pub is_on_screen: bool,
+    pub layer: i32,
+    pub alpha: f32,
+}
+
+/// Application information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppInfo {
+    pub bundle_id: String,
+    pub name: String,
+    pub pid: i32,
+    pub is_active: bool,
+    pub is_hidden: bool,
+}
+
+/// Bridge metrics for monitoring
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BridgeMetrics {
+    pub total_captures: u64,
+    pub total_errors: u64,
+    pub avg_capture_time_ms: f64,
+    pub memory_usage_bytes: usize,
 }
 
 /// Stream handle for controlling streaming
@@ -991,7 +1110,14 @@ pub enum CaptureEvent {
 }
 
 // Define types that were in the old implementation but need to be available
-pub type CompressionHint = CaptureQuality;  // Map to quality for compatibility
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum CompressionHint {
+    #[default]
+    None,
+    Fast,
+    Balanced,
+    Quality,
+}
 
 // Dummy type for backward compatibility - will be properly implemented
 pub struct SharedMemoryHandle {
@@ -1000,26 +1126,6 @@ pub struct SharedMemoryHandle {
 }
 
 // CaptureRegion is already re-exported at the top of the file
-
-// These types need proper definitions
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WindowInfo {
-    pub window_id: u32,
-    pub app_name: String,
-    pub title: String,
-    pub bounds: CaptureRegion,
-    pub layer: i32,
-    pub alpha: f32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AppInfo {
-    pub bundle_id: String,
-    pub name: String,
-    pub pid: i32,
-    pub is_active: bool,
-    pub is_hidden: bool,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TextDetection {

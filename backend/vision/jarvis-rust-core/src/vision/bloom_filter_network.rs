@@ -25,7 +25,7 @@ pub enum BloomFilterLevel {
 }
 
 /// Performance metrics for bloom filters
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug)]
 pub struct BloomFilterMetrics {
     pub total_insertions: AtomicU64,
     pub total_queries: AtomicU64,
@@ -34,6 +34,20 @@ pub struct BloomFilterMetrics {
     pub false_positives: AtomicU64,
     pub reset_count: AtomicU32,
     pub last_reset: Instant,
+}
+
+impl Clone for BloomFilterMetrics {
+    fn clone(&self) -> Self {
+        Self {
+            total_insertions: AtomicU64::new(self.total_insertions.load(Ordering::Relaxed)),
+            total_queries: AtomicU64::new(self.total_queries.load(Ordering::Relaxed)),
+            probable_hits: AtomicU64::new(self.probable_hits.load(Ordering::Relaxed)),
+            confirmed_hits: AtomicU64::new(self.confirmed_hits.load(Ordering::Relaxed)),
+            false_positives: AtomicU64::new(self.false_positives.load(Ordering::Relaxed)),
+            reset_count: AtomicU32::new(self.reset_count.load(Ordering::Relaxed)),
+            last_reset: self.last_reset,
+        }
+    }
 }
 
 impl Default for BloomFilterMetrics {
@@ -442,15 +456,15 @@ impl BloomFilterNetwork {
         }
         
         // Calculate derived metrics
-        let total_checks = stats.get("total_checks").unwrap_or(&0.0);
-        let total_hits = stats.get("global_hits").unwrap_or(&0.0) +
-                        stats.get("regional_hits").unwrap_or(&0.0) +
-                        stats.get("element_hits").unwrap_or(&0.0);
-        
-        if *total_checks > 0.0 {
+        let total_checks = *stats.get("total_checks").unwrap_or(&0.0);
+        let total_hits = *stats.get("global_hits").unwrap_or(&0.0) +
+                        *stats.get("regional_hits").unwrap_or(&0.0) +
+                        *stats.get("element_hits").unwrap_or(&0.0);
+        let hierarchical_shortcuts = *stats.get("hierarchical_shortcuts").unwrap_or(&0.0);
+
+        if total_checks > 0.0 {
             stats.insert("overall_hit_rate".to_string(), total_hits / total_checks);
-            stats.insert("hierarchical_efficiency".to_string(), 
-                        stats.get("hierarchical_shortcuts").unwrap_or(&0.0) / total_checks);
+            stats.insert("hierarchical_efficiency".to_string(), hierarchical_shortcuts / total_checks);
         }
         
         stats

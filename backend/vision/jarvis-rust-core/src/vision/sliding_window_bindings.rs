@@ -83,4 +83,5 @@ pub mod python_bindings {
     }
 }
 
+#[cfg(feature = "python-bindings")]
 pub use python_bindings::register_module;

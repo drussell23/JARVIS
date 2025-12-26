@@ -1,7 +1,9 @@
 //! Thread-safe Python bindings using refactored components
-//! 
+//!
 //! This module provides Python bindings that work with the new message-passing
 //! architecture, eliminating thread-safety compilation errors.
+
+#![cfg(feature = "python-bindings")]
 
 use crate::{Result, JarvisError};
 use crate::bridge::{ObjCBridge, ObjCCommand};
@@ -42,12 +44,12 @@ impl PyScreenCapture {
         
         // Apply Python config if provided
         if let Some(cfg) = config {
-            if let Ok(fps) = cfg.get_item("target_fps") {
+            if let Some(fps) = cfg.get_item("target_fps")? {
                 if let Ok(fps_val) = fps.extract::<u32>() {
                     cap_config.target_fps = fps_val;
                 }
             }
-            if let Ok(quality) = cfg.get_item("quality") {
+            if let Some(quality) = cfg.get_item("quality")? {
                 if let Ok(q) = quality.extract::<String>() {
                     cap_config.capture_quality = match q.as_str() {
                         "low" => CaptureQuality::Low,
@@ -152,7 +154,9 @@ impl PyScreenCapture {
     
     /// Get bridge metrics
     fn get_bridge_metrics(&self) -> PyResult<String> {
-        Ok(self.inner.bridge_metrics())
+        let metrics = self.inner.bridge_metrics();
+        serde_json::to_string(&metrics)
+            .map_err(|e| PyRuntimeError::new_err(format!("Failed to serialize metrics: {}", e)))
     }
     
     /// Update configuration
@@ -263,7 +267,7 @@ impl PyMetalAccelerator {
         }).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         
         // Convert to PyArray
-        PyArray3::from_owned_array(py, result)
+        Ok(PyArray3::from_owned_array(py, result).to_owned())
     }
     
     /// Get performance statistics

@@ -101,10 +101,25 @@ impl ZeroCopyBuffer {
     pub fn age(&self) -> Duration {
         self.inner.allocated_at.elapsed()
     }
-    
+
     /// Get size of buffer
     pub fn size(&self) -> usize {
         self.inner.size
+    }
+}
+
+impl Clone for ZeroCopyBuffer {
+    fn clone(&self) -> Self {
+        self.clone_ref()
+    }
+}
+
+impl std::fmt::Debug for ZeroCopyBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ZeroCopyBuffer")
+            .field("size", &self.inner.size)
+            .field("age", &self.inner.allocated_at.elapsed())
+            .finish()
     }
 }
 
@@ -132,8 +147,13 @@ struct MemoryBlock {
     layout: Layout,
 }
 
-// MemoryBlock is only used internally within RwLock-protected collections,
-// so we don't need explicit Send/Sync implementations
+// MemoryBlock is safe to Send/Sync because:
+// 1. The memory is owned exclusively by this block
+// 2. All access is synchronized through RwLock in ZeroCopyPool
+// 3. The raw pointer points to heap-allocated memory that won't be freed
+//    until the block is consumed
+unsafe impl Send for MemoryBlock {}
+unsafe impl Sync for MemoryBlock {}
 
 /// Zero-copy memory pool with dynamic sizing
 pub struct ZeroCopyPool {
@@ -392,16 +412,14 @@ mod python_bindings {
     
     #[pymethods]
     impl PyZeroCopyBuffer {
-        fn as_numpy(&self) -> PyResult<&PyArray1<u8>> {
-            Python::with_gil(|py| {
-                unsafe {
-                    Ok(PyArray1::from_slice(py, self.buffer.as_slice()))
-                }
-            })
+        fn as_numpy(&self, py: Python<'_>) -> PyResult<Py<PyArray1<u8>>> {
+            let slice = self.buffer.as_slice();
+            let array = PyArray1::from_slice(py, slice);
+            Ok(array.to_owned())
         }
         
         fn size(&self) -> usize {
-            self.buffer.size
+            self.buffer.size()
         }
         
         fn age_seconds(&self) -> f64 {

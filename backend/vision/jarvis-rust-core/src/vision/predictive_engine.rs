@@ -152,8 +152,10 @@ impl TransitionMatrix {
         // Update temporal weights
         {
             let mut weights = self.temporal_weights.write();
-            let current = weights.get_entry(from_idx, to_idx)
-                .map(|e| *e.into_value())
+            // Find current value by iterating through triplets
+            let current = weights.triplet_iter()
+                .find(|(r, c, _)| *r == from_idx && *c == to_idx)
+                .map(|(_, _, v)| *v)
                 .unwrap_or(0.0);
             weights.push(from_idx, to_idx, 0.9 * current + 0.1 * temporal_factor);
         }
@@ -215,8 +217,9 @@ impl TransitionMatrix {
     /// Get top-k predictions for a state
     pub fn get_predictions(&self, state: &StateVector, top_k: usize) -> Vec<(StateVector, f32, f32)> {
         let state_hash = state.hash_state();
-        
-        if let Some(&state_idx) = self.state_to_idx.get(&state_hash) {
+
+        if let Some(state_idx_ref) = self.state_to_idx.get(&state_hash) {
+            let state_idx = *state_idx_ref;
             // Ensure probabilities are calculated
             if self.transition_probs.read().is_none() {
                 drop(self.transition_probs.read());

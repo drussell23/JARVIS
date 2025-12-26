@@ -327,43 +327,44 @@ impl ScreenCaptureStream {
     
     /// Start capturing
     pub async fn start(&self) -> Result<()> {
+        if self.is_running.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+
+        // Get shareable content asynchronously (outside autoreleasepool)
+        let content = self.get_shareable_content().await?;
+
+        // Use autoreleasepool for synchronous Objective-C operations
         unsafe {
             autoreleasepool(|| {
-                if self.is_running.load(Ordering::SeqCst) {
-                    return Ok(());
-                }
-                
-                // Get shareable content
-                let content = self.get_shareable_content().await?;
-                
                 // Create content filter
                 let filter = self.create_content_filter(content)?;
                 *self.content_filter.lock() = Some(filter);
-                
+
                 // Create stream
                 let stream = self.create_stream(filter)?;
                 *self.stream.lock() = Some(stream);
-                
+
                 // Start adaptive quality controller
                 if self.config.read().adaptive_quality.enabled {
                     self.quality_controller.start();
                 }
-                
+
                 // Start stream
                 let start_error: id = nil;
-                let success: BOOL = msg_send![stream, 
-                    startCaptureWithCompletionHandler:nil 
+                let success: BOOL = msg_send![stream,
+                    startCaptureWithCompletionHandler:nil
                     error:&start_error
                 ];
-                
+
                 if success == NO || !start_error.is_null() {
                     return Err(JarvisError::BridgeError("Failed to start capture".to_string()));
                 }
-                
+
                 self.is_running.store(true, Ordering::SeqCst);
-                
+
                 tracing::info!("ScreenCaptureKit stream started successfully");
-                
+
                 Ok(())
             })
         }
@@ -426,7 +427,7 @@ impl ScreenCaptureStream {
                     .ok_or_else(|| JarvisError::BridgeError("SCContentFilter not found".to_string()))?;
                 
                 // Create filter based on display configuration
-                let filter = match &config.display_filter {
+                let filter: id = match &config.display_filter {
                     DisplayFilter::All => {
                         msg_send![filter_class, filterForAllDisplays]
                     }

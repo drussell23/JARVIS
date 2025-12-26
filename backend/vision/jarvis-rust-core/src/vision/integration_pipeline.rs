@@ -34,7 +34,7 @@ impl Priority {
 }
 
 /// Memory allocation for a component
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct MemoryAllocation {
     pub component: String,
     pub allocated_bytes: AtomicU64,
@@ -43,6 +43,20 @@ pub struct MemoryAllocation {
     pub min_bytes: u64,
     pub max_bytes: u64,
     pub can_reduce: bool,
+}
+
+impl Clone for MemoryAllocation {
+    fn clone(&self) -> Self {
+        Self {
+            component: self.component.clone(),
+            allocated_bytes: AtomicU64::new(self.allocated_bytes.load(Ordering::Relaxed)),
+            used_bytes: AtomicU64::new(self.used_bytes.load(Ordering::Relaxed)),
+            priority: self.priority,
+            min_bytes: self.min_bytes,
+            max_bytes: self.max_bytes,
+            can_reduce: self.can_reduce,
+        }
+    }
 }
 
 impl MemoryAllocation {

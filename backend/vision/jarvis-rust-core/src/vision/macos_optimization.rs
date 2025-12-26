@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::collections::HashMap;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use chrono::Timelike;
 
 #[cfg(target_os = "macos")]
 use objc::runtime::{Object, Sel};

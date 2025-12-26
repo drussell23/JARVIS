@@ -209,13 +209,13 @@ impl ImageCompressor {
             _ => format,
         };
         
-        // Get a work buffer
-        let work_buffer = &mut self.work_buffers[0];
-        
+        // Get a work buffer (use local buffer to avoid borrow conflicts)
+        let mut work_buffer = Vec::with_capacity(image.data.len());
+
         // Compress based on format
         let compressed_data = match format {
             CompressionFormat::None => image.data.clone(),
-            CompressionFormat::Lz4 => self.compress_lz4(&image.data, work_buffer, config.lz4_acceleration)?,
+            CompressionFormat::Lz4 => self.compress_lz4(&image.data, &mut work_buffer, config.lz4_acceleration)?,
             CompressionFormat::Zstd(level) => self.compress_zstd(&image.data, level)?,
             CompressionFormat::Brotli(quality) => self.compress_brotli(&image.data, quality, config.brotli_window_size)?,
             CompressionFormat::Snappy => self.compress_snappy(&image.data)?,
@@ -503,15 +503,18 @@ impl ImageCompressor {
     
     /// Parallel compression for large images
     pub fn compress_parallel(&mut self, image: &ImageData, format: CompressionFormat) -> Result<CompressedImage> {
-        let config = self.config.read();
-        
-        if !config.enable_parallel || image.data.len() < 1024 * 1024 {
+        let (enable_parallel, max_threads) = {
+            let config = self.config.read();
+            (config.enable_parallel, config.max_threads)
+        };
+
+        if !enable_parallel || image.data.len() < 1024 * 1024 {
             // Fall back to single-threaded for small images
             return self.compress(image, Some(format));
         }
-        
+
         // Split image into chunks for parallel processing
-        let chunk_size = image.data.len() / config.max_threads;
+        let chunk_size = image.data.len() / max_threads;
         let chunks: Vec<&[u8]> = image.data.chunks(chunk_size).collect();
         
         use rayon::prelude::*;

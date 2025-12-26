@@ -22,7 +22,9 @@ pub struct CacheEntry {
     pub value: Vec<u8>,
     pub embedding: Option<Vec<f32>>,
     pub context: Option<HashMap<String, String>>,
+    #[serde(skip, default = "Instant::now")]
     pub timestamp: Instant,
+    #[serde(skip, default = "Instant::now")]
     pub last_access: Instant,
     pub access_count: u32,
     pub ttl_seconds: u64,
@@ -317,7 +319,7 @@ pub struct SemanticCacheLSH {
     embedding_dim: usize,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct CacheStats {
     l1_hits: u64,
     l1_misses: u64,
@@ -460,7 +462,7 @@ impl SemanticCacheLSH {
 
     /// Get cache statistics
     pub fn get_stats(&self) -> CacheStats {
-        self.stats.read().clone()
+        (*self.stats.read()).clone()
     }
 
     /// Clear all caches
@@ -504,7 +506,8 @@ impl CachePredictor {
         
         // Maintain max size
         if history.len() > self.max_history {
-            history.drain(0..history.len() - self.max_history);
+            let drain_count = history.len() - self.max_history;
+            history.drain(0..drain_count);
         }
         
         // Update patterns

@@ -194,6 +194,7 @@ pub struct ImageProcessor {
     memory_manager: Arc<MemoryManager>,
     filter_cache: RwLock<HashMap<String, Vec<f32>>>,
     stats: RwLock<ProcessingStats>,
+    pub use_simd: bool,
     #[cfg(feature = "gpu")]
     gpu_context: Option<GpuContext>,
 }
@@ -222,11 +223,12 @@ impl ImageProcessor {
             memory_manager: MemoryManager::global(),
             filter_cache: RwLock::new(HashMap::new()),
             stats: RwLock::new(ProcessingStats::default()),
+            use_simd: cfg!(target_feature = "sse2") || cfg!(target_feature = "neon"),
             #[cfg(feature = "gpu")]
             gpu_context: None,
         }
     }
-    
+
     /// Create with custom configuration
     pub fn with_config(config: ProcessingConfig) -> Self {
         Self {
@@ -234,8 +236,23 @@ impl ImageProcessor {
             memory_manager: MemoryManager::global(),
             filter_cache: RwLock::new(HashMap::new()),
             stats: RwLock::new(ProcessingStats::default()),
+            use_simd: cfg!(target_feature = "sse2") || cfg!(target_feature = "neon"),
             #[cfg(feature = "gpu")]
             gpu_context: None,
+        }
+    }
+
+    /// Get specific channel value at coordinates from an image
+    pub fn get_pixel_at(image: &ImageData, x: u32, y: u32, channel: u8) -> u8 {
+        if x >= image.width || y >= image.height || channel >= image.channels {
+            return 0;
+        }
+        let offset = ((y * image.width + x) * image.channels as u32 + channel as u32) as usize;
+        let data = image.as_slice();
+        if offset < data.len() {
+            data[offset]
+        } else {
+            0
         }
     }
     
@@ -570,28 +587,29 @@ impl ImageProcessor {
             .build()
             .unwrap();
         
-        pool.install(|| {
-            // Process each channel in parallel
-            (0..image.channels).into_par_iter().for_each(|c| {
-                // Extract channel data
-                let channel_data: Vec<f32> = image.data.iter()
-                    .skip(c as usize)
-                    .step_by(image.channels as usize)
-                    .map(|&v| v as f32)
-                    .collect();
-                
-                let channel_2d = Array2::from_shape_vec(
-                    (image.height as usize, image.width as usize), 
-                    channel_data
-                ).unwrap();
-                
-                // Apply convolution
-                let mut result = Array2::zeros((image.height as usize, image.width as usize));
-                
+        // Process each channel sequentially (they write to interleaved positions)
+        for c in 0..image.channels {
+            // Extract channel data
+            let channel_data: Vec<f32> = image.data.iter()
+                .skip(c as usize)
+                .step_by(image.channels as usize)
+                .map(|&v| v as f32)
+                .collect();
+
+            let channel_2d = Array2::from_shape_vec(
+                (image.height as usize, image.width as usize),
+                channel_data
+            ).unwrap();
+
+            // Apply convolution
+            let mut result = Array2::zeros((image.height as usize, image.width as usize));
+
+            pool.install(|| {
+                // Parallelize within each channel's pixel processing
                 for y in half_kernel..(image.height as usize - half_kernel) {
                     for x in half_kernel..(image.width as usize - half_kernel) {
                         let mut sum = 0.0;
-                        
+
                         for ky in 0..kernel_size {
                             for kx in 0..kernel_size {
                                 let pixel_y = y + ky - half_kernel;
@@ -599,20 +617,20 @@ impl ImageProcessor {
                                 sum += channel_2d[[pixel_y, pixel_x]] * kernel[ky * kernel_size + kx];
                             }
                         }
-                        
+
                         result[[y, x]] = sum.clamp(0.0, 255.0);
                     }
                 }
-                
-                // Handle edges with reflection padding
-                self.apply_edge_padding(&channel_2d, &mut result, kernel, kernel_size);
-                
-                // Write back to output
-                for (i, &val) in result.iter().enumerate() {
-                    output.data[i * image.channels as usize + c as usize] = val as u8;
-                }
             });
-        });
+
+            // Handle edges with reflection padding
+            self.apply_edge_padding(&channel_2d, &mut result, kernel, kernel_size);
+
+            // Write back to output
+            for (i, &val) in result.iter().enumerate() {
+                output.data[i * image.channels as usize + c as usize] = val as u8;
+            }
+        }
         
         Ok(output)
     }
@@ -860,9 +878,9 @@ impl ImageProcessor {
     
     /// Analyze image statistics
     fn analyze_image_stats(&self, image: &ImageData) -> Result<ImageStats> {
-        let mut brightness = 0.0;
-        let mut min_val = 255.0;
-        let mut max_val = 0.0;
+        let mut brightness: f32 = 0.0;
+        let mut min_val: f32 = 255.0;
+        let mut max_val: f32 = 0.0;
         let pixel_count = (image.width * image.height) as f32;
         
         // Compute brightness and range

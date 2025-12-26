@@ -29,6 +29,12 @@ struct FPNode {
     parent: Option<*const FPNode>,
 }
 
+// FPNode is safe to Send/Sync because:
+// 1. The parent pointer is only used for tree traversal within synchronized contexts
+// 2. All access to the tree is protected by RwLock
+unsafe impl Send for FPNode {}
+unsafe impl Sync for FPNode {}
+
 impl FPNode {
     fn new(item: String) -> Self {
         Self {
@@ -101,9 +107,10 @@ impl PatternMiner {
     fn count_item_frequencies(&self, sequences: &[Vec<String>]) -> HashMap<String, u32> {
         sequences
             .par_iter()
-            .flat_map(|seq| seq.iter().cloned())
-            .fold(HashMap::new, |mut acc, item| {
-                *acc.entry(item).or_insert(0) += 1;
+            .fold(HashMap::new, |mut acc, seq| {
+                for item in seq.iter() {
+                    *acc.entry(item.clone()).or_insert(0) += 1;
+                }
                 acc
             })
             .reduce(HashMap::new, |mut acc, map| {
@@ -148,15 +155,18 @@ impl PatternMiner {
         
         let first = &sequence[0];
         let rest = &sequence[1..];
-        
+
+        // Get pointer to parent before mutable borrow
+        let parent_ptr: *const FPNode = node;
+
         let child = node.children.entry(first.clone()).or_insert_with(|| {
             let mut child_node = Box::new(FPNode::new(first.clone()));
-            child_node.parent = Some(node as *const _);
+            child_node.parent = Some(parent_ptr);
             child_node
         });
-        
+
         child.count += 1;
-        
+
         if !rest.is_empty() {
             self.insert_sequence(child, rest);
         }
@@ -239,18 +249,21 @@ impl PatternMiner {
         for (pattern, count) in conditional_patterns {
             *pattern_counts.entry(pattern).or_insert(0) += count;
         }
-        
+
+        // Get length before consuming the map
+        let total_patterns = pattern_counts.len().max(1);
+
         // Create patterns that meet minimum support
         for (mut sequence, count) in pattern_counts {
             if count >= min_count && sequence.len() <= self.max_pattern_length {
                 sequence.push(base_item.to_string());
-                
+
                 let pattern_id = format!("pattern_{}", sequence.join("_"));
                 patterns.push(MinedPattern {
                     pattern_id,
                     sequence,
                     frequency: count,
-                    support: count as f32 / pattern_counts.len() as f32,
+                    support: count as f32 / total_patterns as f32,
                     confidence: 0.8, // Will be updated later
                     variations: vec![],
                     metadata: HashMap::new(),

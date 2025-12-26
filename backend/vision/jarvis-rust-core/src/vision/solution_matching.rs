@@ -269,7 +269,7 @@ impl SimilarityIndex {
     }
     
     /// Add vector to index
-    pub fn add_vector(&self, id: String, vector: Vec<f32>) {
+    pub fn add_vector(&mut self, id: String, vector: Vec<f32>) {
         // Store vector
         {
             let mut solutions = self.solutions.write().unwrap();

@@ -42,7 +42,7 @@ pub struct ShaderConfig {
     pub parameters: HashMap<String, f32>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct PerformanceStats {
     pub total_frames_processed: u64,
     pub total_compute_time_ms: f64,
@@ -241,7 +241,7 @@ impl MetalAccelerator {
     
     /// Get performance statistics
     pub fn stats(&self) -> PerformanceStats {
-        self.performance_stats.read().clone()
+        (*self.performance_stats.read()).clone()
     }
     
     /// Reset performance statistics
