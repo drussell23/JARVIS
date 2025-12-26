@@ -301,6 +301,7 @@ class UnifiedWorkspaceExecutor:
     This executor tries each tier in order until one succeeds:
     1. Google API (fast, cloud-based)
     2. macOS Local (CalendarBridge, AppleScript)
+    2.5. Spatial Awareness (v6.2: Switch to app via Yabai before Computer Use)
     3. Computer Use (visual automation via Claude Vision)
 
     Features:
@@ -309,6 +310,7 @@ class UnifiedWorkspaceExecutor:
     - Parallel execution where possible
     - Detailed logging for debugging
     - Learning from failures for future optimization
+    - v6.2 Grand Unification: Spatial Awareness integration
     """
 
     def __init__(self) -> None:
@@ -317,6 +319,7 @@ class UnifiedWorkspaceExecutor:
         self._tier_stats: Dict[ExecutionTier, Dict[str, int]] = {}
         self._calendar_bridge: Optional[CalendarBridge] = None
         self._computer_use: Optional[ComputerUseTool] = None
+        self._spatial_awareness = None  # v6.2: SpatialAwarenessAgent integration
         self._initialized = False
         self._lock = asyncio.Lock()
 
@@ -368,6 +371,18 @@ class UnifiedWorkspaceExecutor:
                 if CALENDAR_BRIDGE_AVAILABLE and CalendarBridge is not None:
                     self._calendar_bridge = CalendarBridge()
                     logger.info("CalendarBridge initialized")
+
+                # v6.2: Initialize Spatial Awareness (for smart app switching)
+                try:
+                    from core.computer_use_bridge import switch_to_app_smart, get_current_context
+                    self._spatial_awareness = {
+                        "switch_to_app": switch_to_app_smart,
+                        "get_context": get_current_context,
+                    }
+                    logger.info("Spatial Awareness (Proprioception) initialized")
+                except ImportError as e:
+                    logger.info(f"Spatial Awareness not available: {e}")
+                    self._spatial_awareness = None
 
                 # Initialize Tier 3: Computer Use
                 if COMPUTER_USE_AVAILABLE and get_computer_use_tool is not None:
@@ -449,10 +464,15 @@ class UnifiedWorkspaceExecutor:
                 self._tier_stats[ExecutionTier.MACOS_LOCAL]["failures"] += 1
 
         # Tier 3: Computer Use (Visual)
+        # v6.2: First switch to Calendar using Spatial Awareness, then take screenshot
         if ExecutionTier.COMPUTER_USE in self._available_tiers and self._computer_use:
             self._tier_stats[ExecutionTier.COMPUTER_USE]["attempts"] += 1
             try:
-                goal = f"Open the Calendar app and read today's events. List all meetings and appointments for {date_str}."
+                # v6.2 Grand Unification: Switch to Calendar app first via Yabai
+                await self._switch_to_app_with_spatial_awareness("Calendar", narrate=True)
+
+                # Now run Computer Use - Calendar should already be focused
+                goal = f"Read the calendar events currently visible on screen. List all meetings and appointments for {date_str}."
                 result = await self._computer_use.run(goal=goal)
                 if result and result.success:
                     self._tier_stats[ExecutionTier.COMPUTER_USE]["successes"] += 1
@@ -514,10 +534,15 @@ class UnifiedWorkspaceExecutor:
                 self._tier_stats[ExecutionTier.GOOGLE_API]["failures"] += 1
 
         # Tier 3: Computer Use (Visual) - Skip Tier 2 for email (no macOS email bridge)
+        # v6.2: First switch to browser using Spatial Awareness, then navigate
         if ExecutionTier.COMPUTER_USE in self._available_tiers and self._computer_use:
             self._tier_stats[ExecutionTier.COMPUTER_USE]["attempts"] += 1
             try:
-                goal = f"Open Safari, go to mail.google.com, and read the {limit} most recent unread emails. List the sender and subject of each."
+                # v6.2 Grand Unification: Switch to Safari first via Yabai
+                await self._switch_to_app_with_spatial_awareness("Safari", narrate=True)
+
+                # Now run Computer Use - Safari should already be focused
+                goal = f"Navigate to mail.google.com and read the {limit} most recent unread emails. List the sender and subject of each."
                 result = await self._computer_use.run(goal=goal)
                 if result and result.success:
                     self._tier_stats[ExecutionTier.COMPUTER_USE]["successes"] += 1
@@ -590,10 +615,14 @@ class UnifiedWorkspaceExecutor:
                 logger.warning(f"DocumentWriter error: {e}")
 
         # Tier 3: Computer Use (Visual)
+        # v6.2: First switch to browser using Spatial Awareness
         if ExecutionTier.COMPUTER_USE in self._available_tiers and self._computer_use:
             try:
+                # v6.2 Grand Unification: Switch to Safari first via Yabai
+                await self._switch_to_app_with_spatial_awareness("Safari", narrate=True)
+
                 goal = (
-                    f"Open Safari, go to docs.google.com, create a new blank document, "
+                    f"Navigate to docs.google.com, create a new blank document, "
                     f"title it '{topic}', and write a {word_count or 500} word {document_type} about {topic}."
                 )
                 result = await self._computer_use.run(goal=goal)
@@ -619,12 +648,68 @@ class UnifiedWorkspaceExecutor:
             execution_time_ms=(asyncio.get_event_loop().time() - start_time) * 1000,
         )
 
+    async def _switch_to_app_with_spatial_awareness(
+        self,
+        app_name: str,
+        narrate: bool = True,
+    ) -> bool:
+        """
+        v6.2 Grand Unification: Switch to an app using Spatial Awareness.
+
+        Before Computer Use takes a screenshot, we use Yabai to teleport
+        to the correct app/window across all macOS Spaces.
+
+        Args:
+            app_name: Name of the app to switch to (e.g., "Calendar", "Safari")
+            narrate: Whether to speak the switch action
+
+        Returns:
+            True if switch succeeded, False otherwise
+        """
+        if not self._spatial_awareness:
+            logger.debug("Spatial Awareness not available, skipping app switch")
+            return False
+
+        try:
+            switch_fn = self._spatial_awareness.get("switch_to_app")
+            if not switch_fn:
+                return False
+
+            logger.info(f"[Spatial Awareness] Switching to {app_name}...")
+            result = await switch_fn(app_name, narrate=narrate)
+
+            # Check if switch was successful
+            from core.computer_use_bridge import SwitchResult
+            is_success = result.result in (
+                SwitchResult.SUCCESS,
+                SwitchResult.ALREADY_FOCUSED,
+                SwitchResult.SWITCHED_SPACE,
+                SwitchResult.LAUNCHED_APP,
+            )
+
+            if is_success:
+                logger.info(
+                    f"[Spatial Awareness] Successfully switched to {app_name} "
+                    f"(Space {result.from_space} -> {result.to_space})"
+                )
+            else:
+                logger.warning(
+                    f"[Spatial Awareness] Failed to switch to {app_name}: {result.result.value}"
+                )
+
+            return is_success
+
+        except Exception as e:
+            logger.warning(f"[Spatial Awareness] Error switching to {app_name}: {e}")
+            return False
+
     def get_stats(self) -> Dict[str, Any]:
         """Get execution statistics for all tiers."""
         return {
             "available_tiers": [t.value for t in self._available_tiers],
             "tier_stats": {t.value: stats for t, stats in self._tier_stats.items()},
             "initialized": self._initialized,
+            "spatial_awareness_available": self._spatial_awareness is not None,
         }
 
 

@@ -69,6 +69,7 @@ from .adapters.intelligence_adapter import (
     IntelligenceEngineType,
     create_uae_adapter,
     create_sai_adapter,
+    create_cai_adapter,  # v6.2: Contextual Awareness Intelligence
     create_cot_adapter,
     create_rge_adapter,
     create_pie_adapter,
@@ -358,10 +359,15 @@ class JARVISNeuralMeshBridge:
         )
 
     async def _discover_intelligence_agents(self) -> None:
-        """Discover and register intelligence agents."""
+        """Discover and register intelligence agents.
+
+        v6.2 Grand Unification: Now includes CAI (Contextual Awareness Intelligence)
+        for deep contextual understanding, emotional intelligence, and adaptive behavior.
+        """
         intelligence_agents = [
             ("intelligence_uae", create_uae_adapter, IntelligenceEngineType.UAE),
             ("intelligence_sai", create_sai_adapter, IntelligenceEngineType.SAI),
+            ("intelligence_cai", create_cai_adapter, IntelligenceEngineType.CAI),  # v6.2: CAI
             ("intelligence_cot", create_cot_adapter, IntelligenceEngineType.COT),
             ("intelligence_rge", create_rge_adapter, IntelligenceEngineType.RGE),
             ("intelligence_pie", create_pie_adapter, IntelligenceEngineType.PIE),

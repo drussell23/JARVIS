@@ -952,3 +952,46 @@ async def create_pie_adapter(
         engine_type=IntelligenceEngineType.PIE,
         agent_name=agent_name,
     )
+
+
+async def create_cai_adapter(
+    engine: Optional[Any] = None,
+    agent_name: str = "cai_adapter",
+) -> IntelligenceEngineAdapter:
+    """Create an adapter for the Contextual Awareness Intelligence.
+
+    The CAI provides deep contextual understanding including:
+    - Emotional intelligence and user mood detection
+    - Behavioral pattern analysis
+    - Context clustering and prediction
+    - Adaptive personality modeling
+
+    Args:
+        engine: Existing CAI instance (creates new if None)
+        agent_name: Name for the adapter agent
+
+    Returns:
+        Configured IntelligenceEngineAdapter
+    """
+    if engine is None:
+        try:
+            # Try to import ContextualUnderstandingEngine
+            import os
+            from autonomy.contextual_understanding import (
+                ContextualUnderstandingEngine,
+            )
+            api_key = os.getenv("ANTHROPIC_API_KEY", "")
+            if api_key:
+                engine = ContextualUnderstandingEngine(anthropic_api_key=api_key)
+            else:
+                logger.warning("ANTHROPIC_API_KEY not set for CAI")
+                raise ImportError("API key required for CAI")
+        except ImportError as e:
+            logger.warning(f"Could not import ContextualUnderstandingEngine: {e}")
+            raise
+
+    return IntelligenceEngineAdapter(
+        engine=engine,
+        engine_type=IntelligenceEngineType.CAI,
+        agent_name=agent_name,
+    )

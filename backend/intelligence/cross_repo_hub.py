@@ -143,7 +143,8 @@ class IntelligenceSystem(str, Enum):
     MEMORY = "memory"
     WISDOM = "wisdom"
     REASONING = "reasoning"
-    VBIA = "vbia"  # v6.2 NEW: Voice Biometric Intelligent Authentication
+    VBIA = "vbia"  # v6.2: Voice Biometric Intelligent Authentication
+    SPATIAL = "spatial"  # v6.2: 3D OS Awareness (Proprioception)
 
 
 class EventType(str, Enum):
@@ -189,6 +190,12 @@ class EventType(str, Enum):
     VBIA_PATTERN_LEARNED = "vbia_pattern_learned"
     VBIA_SYSTEM_READY = "vbia_system_ready"
     VBIA_SYSTEM_ERROR = "vbia_system_error"
+
+    # Spatial Awareness (3D OS Proprioception) - v6.2 Grand Unification
+    SPATIAL_CONTEXT_UPDATED = "spatial_context_updated"
+    SPATIAL_APP_SWITCH = "spatial_app_switch"
+    SPATIAL_SPACE_TELEPORT = "spatial_space_teleport"
+    SPATIAL_WINDOW_FOCUSED = "spatial_window_focused"
 
     # Cross-System
     CONTEXT_ENRICHED = "context_enriched"
@@ -732,6 +739,142 @@ class JARVISPrimeAdapter:
         return self._initialized
 
 
+class SpatialAwarenessAdapter:
+    """
+    Adapter for 3D OS Awareness (Proprioception).
+
+    v6.2 Grand Unification: Provides spatial context and smart app switching
+    via Yabai integration for the entire JARVIS ecosystem.
+
+    Capabilities:
+    - Get current spatial context (Space, Window, App)
+    - Smart app switching with Yabai teleportation
+    - Cross-repo spatial state sharing
+    """
+
+    def __init__(self, config: Optional["CrossRepoHubConfig"] = None):
+        self.config = config or CrossRepoHubConfig()
+        self._proprioception = None
+        self._initialized = False
+        self._is_available = False
+
+    async def initialize(self) -> None:
+        if self._initialized:
+            return
+        try:
+            from core.computer_use_bridge import (
+                get_current_context,
+                switch_to_app_smart,
+                get_spatial_manager,
+                SwitchResult,
+            )
+            self._proprioception = {
+                "get_context": get_current_context,
+                "switch_to_app": switch_to_app_smart,
+                "get_manager": get_spatial_manager,
+                "SwitchResult": SwitchResult,
+            }
+            # Test if spatial manager is available
+            manager = await get_spatial_manager()
+            self._is_available = manager is not None
+            self._initialized = True
+            logger.info(f"SpatialAwarenessAdapter initialized (available={self._is_available})")
+        except ImportError as e:
+            logger.info(f"Spatial Awareness (Proprioception) not available: {e}")
+            self._initialized = True
+
+    async def get_spatial_context(self) -> Optional[Dict[str, Any]]:
+        """Get current 3D OS context (proprioception)."""
+        if not self._initialized:
+            await self.initialize()
+        if not self._proprioception or not self._is_available:
+            return None
+
+        try:
+            get_context = self._proprioception["get_context"]
+            context = await get_context()
+            if context:
+                return {
+                    "current_space_id": context.current_space_id,
+                    "current_display_id": context.current_display_id,
+                    "total_spaces": context.total_spaces,
+                    "focused_app": context.focused_app,
+                    "focused_window": (
+                        {
+                            "window_id": context.focused_window.window_id,
+                            "app_name": context.focused_window.app_name,
+                            "title": context.focused_window.title,
+                        }
+                        if context.focused_window
+                        else None
+                    ),
+                    "app_locations": dict(context.app_locations),
+                    "timestamp": context.timestamp,
+                    "context_prompt": context.get_context_prompt(),
+                }
+        except Exception as e:
+            logger.debug(f"Error getting spatial context: {e}")
+        return None
+
+    async def switch_to_app(
+        self,
+        app_name: str,
+        narrate: bool = True,
+    ) -> Dict[str, Any]:
+        """Switch to an app using Yabai teleportation."""
+        if not self._initialized:
+            await self.initialize()
+        if not self._proprioception or not self._is_available:
+            return {"success": False, "error": "Spatial Awareness not available"}
+
+        try:
+            switch_fn = self._proprioception["switch_to_app"]
+            SwitchResult = self._proprioception["SwitchResult"]
+
+            result = await switch_fn(app_name, narrate=narrate)
+
+            is_success = result.result in (
+                SwitchResult.SUCCESS,
+                SwitchResult.ALREADY_FOCUSED,
+                SwitchResult.SWITCHED_SPACE,
+                SwitchResult.LAUNCHED_APP,
+            )
+
+            return {
+                "success": is_success,
+                "result": result.result.value,
+                "app_name": result.app_name,
+                "from_space": result.from_space,
+                "to_space": result.to_space,
+                "space_changed": result.from_space != result.to_space,
+                "narration": result.narration,
+            }
+        except Exception as e:
+            logger.debug(f"Error switching to {app_name}: {e}")
+            return {"success": False, "error": str(e)}
+
+    async def find_app(self, app_name: str) -> Optional[Dict[str, Any]]:
+        """Find which Space(s) an app is on."""
+        context = await self.get_spatial_context()
+        if not context:
+            return None
+
+        app_locations = context.get("app_locations", {})
+        for app, spaces in app_locations.items():
+            if app.lower() == app_name.lower():
+                return {
+                    "app_name": app,
+                    "spaces": spaces,
+                    "found": True,
+                    "is_focused": context.get("focused_app", "").lower() == app_name.lower(),
+                }
+        return {"app_name": app_name, "spaces": [], "found": False}
+
+    @property
+    def is_available(self) -> bool:
+        return self._initialized and self._is_available
+
+
 # ============================================================================
 # Cross-Repo Intelligence Hub
 # ============================================================================
@@ -762,6 +905,9 @@ class CrossRepoIntelligenceHub:
         self._safe_code_adapter = SafeCodeAdapter()
         self._reactor_core_adapter = ReactorCoreAdapter(config)
         self._jarvis_prime_adapter = JARVISPrimeAdapter(config)
+
+        # v6.2: Grand Unification - Spatial Awareness (Proprioception)
+        self._spatial_adapter = SpatialAwarenessAdapter(config)
 
         # Event handling
         self._event_handlers: Dict[EventType, List[Callable]] = {}
@@ -805,6 +951,9 @@ class CrossRepoIntelligenceHub:
 
             if self.config.enable_wisdom_patterns:
                 init_tasks.append(self._wisdom_adapter.initialize())
+
+            # v6.2: Always try to initialize spatial awareness (Proprioception)
+            init_tasks.append(self._spatial_adapter.initialize())
 
             if init_tasks:
                 await asyncio.gather(*init_tasks, return_exceptions=True)
@@ -1099,6 +1248,9 @@ class CrossRepoIntelligenceHub:
             active.add(IntelligenceSystem.MEMORY)
         if self._wisdom_adapter.is_available:
             active.add(IntelligenceSystem.WISDOM)
+        # v6.2: Spatial Awareness (Proprioception)
+        if self._spatial_adapter.is_available:
+            active.add(IntelligenceSystem.SPATIAL)
         return active
 
     def get_state(self) -> HubState:
@@ -1115,6 +1267,7 @@ class CrossRepoIntelligenceHub:
                 IntelligenceSystem.SOP: self._sop_adapter.is_available,
                 IntelligenceSystem.MEMORY: self._memory_adapter.is_available,
                 IntelligenceSystem.WISDOM: self._wisdom_adapter.is_available,
+                IntelligenceSystem.SPATIAL: self._spatial_adapter.is_available,  # v6.2
             },
         )
 
@@ -1186,6 +1339,9 @@ __all__ = [
     "SafeCodeAdapter",
     "ReactorCoreAdapter",
     "JARVISPrimeAdapter",
+
+    # v6.2: Grand Unification
+    "SpatialAwarenessAdapter",
 
     # Convenience Functions
     "get_intelligence_hub",

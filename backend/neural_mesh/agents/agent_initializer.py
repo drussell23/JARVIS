@@ -22,11 +22,13 @@ from .context_tracker_agent import ContextTrackerAgent
 from .error_analyzer_agent import ErrorAnalyzerAgent
 from .pattern_recognition_agent import PatternRecognitionAgent
 from .google_workspace_agent import GoogleWorkspaceAgent
+from .spatial_awareness_agent import SpatialAwarenessAgent  # v6.2: Grand Unification
 
 logger = logging.getLogger(__name__)
 
 
 # Registry of all available production agents
+# v6.2 Grand Unification: Added SpatialAwarenessAgent for 3D OS Awareness
 PRODUCTION_AGENTS: List[Type[BaseNeuralMeshAgent]] = [
     # Core agents (fundamental system operations)
     MemoryAgent,
@@ -37,6 +39,9 @@ PRODUCTION_AGENTS: List[Type[BaseNeuralMeshAgent]] = [
     ContextTrackerAgent,
     ErrorAnalyzerAgent,
     PatternRecognitionAgent,
+
+    # Spatial agents (3D OS Awareness - "The Body")
+    SpatialAwarenessAgent,  # v6.2: Proprioception for all agents
 
     # Admin/Communication agents (Chief of Staff role)
     GoogleWorkspaceAgent,
