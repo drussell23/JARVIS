@@ -1038,6 +1038,16 @@ class VoiceAuthReasoningState(BaseModel):
     context_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
 
     # =========================================================================
+    # Visual Security Results (v6.2 NEW)
+    # =========================================================================
+    visual_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    visual_threat_detected: bool = Field(default=False)
+    visual_security_status: Optional[str] = Field(default=None)
+    visual_should_proceed: bool = Field(default=True)
+    visual_warning_message: str = Field(default="")
+    visual_evidence: Optional[Any] = Field(default=None, exclude=True)
+
+    # =========================================================================
     # Hypotheses (for borderline cases)
     # =========================================================================
     hypotheses: List[VoiceAuthHypothesis] = Field(default_factory=list)

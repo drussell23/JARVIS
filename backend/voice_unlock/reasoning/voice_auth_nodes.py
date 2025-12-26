@@ -495,6 +495,7 @@ class EvidenceCollectionNode(BaseVoiceAuthNode):
     Responsibilities:
     - Run physics analysis (VTL, liveness, spoofing) in parallel
     - Run behavioral context analysis in parallel
+    - Run visual security analysis (screen state, threats) in parallel [v6.2 NEW]
     - Combine into unified evidence set
     - Detect spoofing attempts
     """
@@ -502,15 +503,17 @@ class EvidenceCollectionNode(BaseVoiceAuthNode):
     def __init__(self, voice_biometric_intelligence=None):
         super().__init__("evidence_collection")
         self._vbi = voice_biometric_intelligence
+        self._visual_analyzer = None  # Lazy-loaded visual security analyzer
 
     async def process(self, state: VoiceAuthReasoningState) -> VoiceAuthReasoningState:
         state.transition_to(VoiceAuthReasoningPhase.COLLECTING_EVIDENCE)
 
-        # Run evidence collection in parallel
+        # Run evidence collection in parallel (v6.2: Added visual security as 4th stream)
         tasks = [
             self._analyze_physics(state),
             self._get_behavioral_context(state),
             self._compute_context_confidence(state),
+            self._analyze_visual_security(state),  # NEW: Visual security analysis
         ]
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -536,12 +539,21 @@ class EvidenceCollectionNode(BaseVoiceAuthNode):
         if isinstance(context_result, (int, float)):
             state.context_confidence = float(context_result)
 
-        # Create evidence thought
+        # Process visual security results (v6.2 NEW)
+        visual_result = results[3]
+        if isinstance(visual_result, Exception):
+            self.logger.warning(f"Visual security analysis failed: {visual_result}")
+            state.add_warning(f"Visual security analysis failed: {visual_result}")
+        else:
+            self._apply_visual_security_results(state, visual_result)
+
+        # Create evidence thought (v6.2: Added visual security)
         thought = self._create_thought(
             ThoughtType.OBSERVATION,
             f"Evidence: physics={state.physics_confidence:.1%}, "
             f"behavioral={state.behavioral_confidence:.1%}, "
-            f"context={state.context_confidence:.1%}",
+            f"context={state.context_confidence:.1%}, "
+            f"visual={getattr(state, 'visual_confidence', 0.0):.1%}",
             confidence=0.9,
             evidence=[
                 f"physics_confidence={state.physics_confidence:.1%}",
@@ -549,6 +561,7 @@ class EvidenceCollectionNode(BaseVoiceAuthNode):
                 f"liveness_passed={state.liveness_passed}",
                 f"spoofing_detected={state.spoofing_detected}",
                 f"is_typical_time={state.is_typical_time}",
+                f"visual_threat_detected={getattr(state, 'visual_threat_detected', False)}",
             ]
         )
         state.thoughts.append(thought)
@@ -650,6 +663,73 @@ class EvidenceCollectionNode(BaseVoiceAuthNode):
         state.anomaly_score = context.anomaly_score
         state.apple_watch_connected = context.apple_watch_connected
         state.apple_watch_authenticated = context.apple_watch_authenticated
+
+    async def _analyze_visual_security(self, state: VoiceAuthReasoningState) -> Optional[Any]:
+        """
+        Run visual security analysis using Computer Use integration.
+
+        v6.2 NEW: Analyzes screen state during voice unlock for additional security.
+        Uses OmniParser → Claude Vision → OCR fallback chain.
+        """
+        try:
+            # Lazy import visual security analyzer
+            if self._visual_analyzer is None:
+                from backend.voice_unlock.security.visual_context_integration import (
+                    get_visual_security_analyzer
+                )
+                self._visual_analyzer = get_visual_security_analyzer()
+
+            # Run visual security analysis
+            session_id = state.context.get("session_id", "")
+            user_id = state.context.get("user_id", "")
+
+            evidence = await self._visual_analyzer.analyze_screen_security(
+                session_id=session_id,
+                user_id=user_id,
+                context=state.context,
+            )
+
+            return evidence
+
+        except Exception as e:
+            self.logger.warning(f"Visual security analysis failed: {e}")
+            # Return None to indicate failure - won't block authentication
+            return None
+
+    def _apply_visual_security_results(self, state: VoiceAuthReasoningState, evidence: Any) -> None:
+        """
+        Apply visual security evidence to state.
+
+        v6.2 NEW: Integrates visual security into multi-factor authentication.
+        """
+        if evidence is None:
+            return
+
+        # Extract visual security fields
+        state.visual_confidence = getattr(evidence, 'visual_confidence', 0.0)
+        state.visual_threat_detected = getattr(evidence, 'threat_detected', False)
+        state.visual_security_status = getattr(evidence, 'security_status', None)
+        state.visual_should_proceed = getattr(evidence, 'should_proceed', True)
+        state.visual_warning_message = getattr(evidence, 'warning_message', '')
+
+        # Store full evidence for later use
+        if not hasattr(state, 'visual_evidence'):
+            state.visual_evidence = evidence
+
+        # Add visual threat hypothesis if detected
+        if state.visual_threat_detected:
+            threat_types = getattr(evidence, 'threat_types', [])
+            threat_desc = ', '.join(str(t.value) if hasattr(t, 'value') else str(t) for t in threat_types)
+
+            state.add_hypothesis(
+                HypothesisCategory.REPLAY_ATTACK,  # Reuse existing category for visual threats
+                f"Visual security threat detected: {threat_desc}",
+                evidence_for=[
+                    f"visual_threat_detected=True",
+                    f"threat_types={threat_desc}",
+                    f"visual_confidence={state.visual_confidence:.1%}",
+                ],
+            )
 
 
 # =============================================================================
