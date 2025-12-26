@@ -77,6 +77,232 @@ class SpatialAwarenessConfig:
     narrate_switches: bool = True  # Speak when switching apps
     # Cross-repo sharing
     share_context_cross_repo: bool = True  # Write to ~/.jarvis/cross_repo/
+    # v6.2 Proactive Parallelism: SpaceLock settings
+    space_lock_timeout: float = 30.0  # Max time to hold the lock
+    space_lock_queue_size: int = 10  # Max concurrent lock requests
+
+
+# =============================================================================
+# SpaceLock - Critical for Proactive Parallelism
+# =============================================================================
+
+class SpaceLock:
+    """
+    Global Space Lock for safe parallel agent execution.
+
+    When multiple agents run in parallel, they may all try to switch
+    macOS Spaces simultaneously. This would cause chaos:
+    - Agent A switches to Space 1
+    - Agent B switches to Space 2 (while A is still executing)
+    - Agent A takes screenshot of Space 2 (wrong context!)
+
+    SpaceLock ensures:
+    1. Only ONE agent can switch spaces at a time
+    2. Other agents queue and wait their turn
+    3. Once on target Space, agents work in parallel (different apps)
+    4. Timeout protection prevents deadlocks
+
+    Usage:
+        async with space_lock.acquire("Calendar"):
+            # Only I control the display now
+            await switch_to_app("Calendar")
+            await do_calendar_stuff()
+        # Lock released, next agent can switch
+
+    Architecture:
+        ┌─────────────────────────────────────────────────────────────┐
+        │                    Parallel Agents                          │
+        │                                                             │
+        │  Agent A (Email) ──┐                                        │
+        │  Agent B (Code)  ──┼──▶  SpaceLock  ──▶  Yabai Switch      │
+        │  Agent C (Jira)  ──┘      (Queue)                          │
+        │                                                             │
+        │  Execution Order: A→B→C (serial switches)                   │
+        │  But once on Space: Parallel work within each Space        │
+        └─────────────────────────────────────────────────────────────┘
+    """
+
+    _instance: Optional["SpaceLock"] = None
+    _lock: asyncio.Lock = None
+
+    def __new__(cls):
+        """Singleton pattern - one global lock for all agents."""
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance._initialized = False
+        return cls._instance
+
+    def __init__(self):
+        if self._initialized:
+            return
+
+        self._switch_lock = asyncio.Lock()  # The actual lock
+        self._queue: asyncio.Queue = asyncio.Queue(maxsize=10)
+        self._current_holder: Optional[str] = None
+        self._current_app: Optional[str] = None
+        self._lock_acquired_time: float = 0.0
+        self._timeout = 30.0
+
+        # Statistics
+        self._total_acquisitions = 0
+        self._total_waits = 0
+        self._max_wait_time = 0.0
+        self._timeouts = 0
+
+        self._initialized = True
+        logger.info("SpaceLock initialized (singleton)")
+
+    @classmethod
+    def get_instance(cls) -> "SpaceLock":
+        """Get the singleton SpaceLock instance."""
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+
+    async def acquire(
+        self,
+        app_name: str,
+        holder_id: Optional[str] = None,
+        timeout: Optional[float] = None,
+    ) -> "SpaceLockContext":
+        """
+        Acquire the space lock for switching to an app.
+
+        Args:
+            app_name: Target app to switch to
+            holder_id: Identifier for the lock holder (for debugging)
+            timeout: Custom timeout (default: 30s)
+
+        Returns:
+            SpaceLockContext for use with async with
+
+        Example:
+            async with await space_lock.acquire("Calendar", holder_id="email_agent"):
+                await switch_to_calendar()
+        """
+        return SpaceLockContext(
+            lock=self,
+            app_name=app_name,
+            holder_id=holder_id or f"agent_{id(asyncio.current_task())}",
+            timeout=timeout or self._timeout,
+        )
+
+    async def _acquire_internal(
+        self,
+        app_name: str,
+        holder_id: str,
+        timeout: float,
+    ) -> bool:
+        """Internal lock acquisition with timeout."""
+        start_time = asyncio.get_event_loop().time()
+
+        try:
+            # Try to acquire lock with timeout
+            acquired = await asyncio.wait_for(
+                self._switch_lock.acquire(),
+                timeout=timeout,
+            )
+
+            if acquired:
+                wait_time = asyncio.get_event_loop().time() - start_time
+                self._total_acquisitions += 1
+                self._total_waits += 1 if wait_time > 0.1 else 0
+                self._max_wait_time = max(self._max_wait_time, wait_time)
+                self._current_holder = holder_id
+                self._current_app = app_name
+                self._lock_acquired_time = asyncio.get_event_loop().time()
+
+                logger.debug(
+                    f"SpaceLock acquired by {holder_id} for {app_name} "
+                    f"(waited {wait_time:.2f}s)"
+                )
+                return True
+
+        except asyncio.TimeoutError:
+            self._timeouts += 1
+            logger.warning(
+                f"SpaceLock timeout for {holder_id} trying to switch to {app_name} "
+                f"(current holder: {self._current_holder})"
+            )
+            return False
+
+        return False
+
+    def _release_internal(self, holder_id: str) -> None:
+        """Internal lock release."""
+        if self._current_holder == holder_id:
+            hold_time = asyncio.get_event_loop().time() - self._lock_acquired_time
+            logger.debug(
+                f"SpaceLock released by {holder_id} (held for {hold_time:.2f}s)"
+            )
+            self._current_holder = None
+            self._current_app = None
+            self._lock_acquired_time = 0.0
+
+            if self._switch_lock.locked():
+                self._switch_lock.release()
+        else:
+            logger.warning(
+                f"SpaceLock release mismatch: {holder_id} tried to release "
+                f"but {self._current_holder} holds the lock"
+            )
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Get SpaceLock statistics."""
+        return {
+            "total_acquisitions": self._total_acquisitions,
+            "total_waits": self._total_waits,
+            "max_wait_time_seconds": self._max_wait_time,
+            "timeouts": self._timeouts,
+            "is_locked": self._switch_lock.locked() if self._switch_lock else False,
+            "current_holder": self._current_holder,
+            "current_app": self._current_app,
+        }
+
+
+class SpaceLockContext:
+    """Context manager for SpaceLock acquisition."""
+
+    def __init__(
+        self,
+        lock: SpaceLock,
+        app_name: str,
+        holder_id: str,
+        timeout: float,
+    ):
+        self.lock = lock
+        self.app_name = app_name
+        self.holder_id = holder_id
+        self.timeout = timeout
+        self.acquired = False
+
+    async def __aenter__(self) -> "SpaceLockContext":
+        self.acquired = await self.lock._acquire_internal(
+            self.app_name,
+            self.holder_id,
+            self.timeout,
+        )
+        if not self.acquired:
+            raise asyncio.TimeoutError(
+                f"Failed to acquire SpaceLock for {self.app_name}"
+            )
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+        if self.acquired:
+            self.lock._release_internal(self.holder_id)
+
+
+# Global SpaceLock instance
+_space_lock: Optional[SpaceLock] = None
+
+
+def get_space_lock() -> SpaceLock:
+    """Get the global SpaceLock instance."""
+    global _space_lock
+    if _space_lock is None:
+        _space_lock = SpaceLock.get_instance()
+    return _space_lock
 
 
 class SpatialAwarenessAgent(BaseNeuralMeshAgent):

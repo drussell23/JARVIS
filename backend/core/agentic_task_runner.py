@@ -4272,6 +4272,287 @@ class AgenticTaskRunner:
             "pattern_insights": len(self._nm_pattern_insights),
         }
 
+    # =========================================================================
+    # v6.2: Proactive Parallelism - Parallel Workflow Execution
+    # =========================================================================
+
+    async def execute_parallel_workflow(
+        self,
+        goals: List[str],
+        mode: Optional["RunnerMode"] = None,
+        narrate: bool = True,
+        max_concurrent: int = 5,
+    ) -> Dict[str, Any]:
+        """
+        v6.2 Proactive Parallelism: Execute multiple goals in parallel.
+
+        This is the "Muscle" component of Proactive Parallelism.
+        Takes a list of goals from the PredictivePlanningAgent and
+        executes them concurrently using the SpaceLock for safe
+        space switching.
+
+        Architecture:
+            ┌─────────────────────────────────────────────────────────────┐
+            │               execute_parallel_workflow                      │
+            │                                                              │
+            │  Goals: ["Open VS Code", "Check Email", "Open Slack"]       │
+            │                          ↓                                   │
+            │  ┌──────────┐   ┌──────────┐   ┌──────────┐                │
+            │  │  Task 1  │   │  Task 2  │   │  Task 3  │                │
+            │  │ VS Code  │   │  Email   │   │  Slack   │                │
+            │  └────┬─────┘   └────┬─────┘   └────┬─────┘                │
+            │       │              │              │                       │
+            │       └──────────────┼──────────────┘                       │
+            │                      ↓                                      │
+            │              ┌──────────────┐                               │
+            │              │  SpaceLock   │  ← Serial space switches      │
+            │              │  (Queue)     │                               │
+            │              └──────────────┘                               │
+            │                      ↓                                      │
+            │              Parallel Execution                             │
+            └─────────────────────────────────────────────────────────────┘
+
+        Args:
+            goals: List of goals to execute in parallel
+            mode: Execution mode (defaults to config)
+            narrate: Whether to narrate progress
+            max_concurrent: Maximum concurrent tasks
+
+        Returns:
+            Dictionary with results for each goal
+        """
+        if not goals:
+            return {"success": False, "error": "No goals provided", "results": {}}
+
+        if not self._initialized:
+            await self.initialize()
+
+        start_time = time.time()
+        self.logger.info(f"[Proactive Parallelism] Starting parallel execution of {len(goals)} goals")
+
+        # Narrate start
+        if narrate and self.tts_callback:
+            await self.tts_callback(
+                f"Executing {len(goals)} tasks in parallel."
+            )
+
+        # Create semaphore to limit concurrency
+        semaphore = asyncio.Semaphore(max_concurrent)
+
+        # Import SpaceLock for safe space switching
+        try:
+            from neural_mesh.agents.spatial_awareness_agent import get_space_lock
+            space_lock = get_space_lock()
+            self.logger.debug("[Proactive Parallelism] SpaceLock acquired for safe switching")
+        except ImportError:
+            space_lock = None
+            self.logger.debug("[Proactive Parallelism] SpaceLock not available, proceeding without")
+
+        async def execute_single_goal(goal: str, goal_index: int) -> Tuple[str, AgenticTaskResult]:
+            """Execute a single goal with semaphore and space lock."""
+            async with semaphore:
+                self.logger.debug(f"[Parallel Task {goal_index + 1}] Starting: {goal}")
+
+                # Use SpaceLock for any space-switching operations
+                if space_lock:
+                    try:
+                        # Determine target app from goal
+                        target_app = self._extract_target_app(goal)
+                        if target_app:
+                            async with await space_lock.acquire(
+                                target_app,
+                                holder_id=f"parallel_task_{goal_index}",
+                            ):
+                                # Switch to app while holding lock
+                                await self._switch_to_app_for_goal(goal, target_app)
+                                # Execute the actual task
+                                result = await self.run(goal, mode=mode, narrate=False)
+                        else:
+                            # No target app, just execute
+                            result = await self.run(goal, mode=mode, narrate=False)
+                    except asyncio.TimeoutError:
+                        self.logger.warning(f"[Parallel Task {goal_index + 1}] SpaceLock timeout for: {goal}")
+                        result = AgenticTaskResult(
+                            success=False,
+                            goal=goal,
+                            mode=mode.value if mode else self.config.default_mode,
+                            execution_time_ms=0,
+                            actions_count=0,
+                            reasoning_steps=0,
+                            final_message="SpaceLock timeout - space was busy",
+                            error="SpaceLock acquisition timeout",
+                        )
+                else:
+                    # No SpaceLock, execute directly
+                    result = await self.run(goal, mode=mode, narrate=False)
+
+                self.logger.debug(
+                    f"[Parallel Task {goal_index + 1}] Completed: {goal} "
+                    f"(success={result.success})"
+                )
+                return goal, result
+
+        # Execute all goals in parallel
+        tasks = [
+            execute_single_goal(goal, i)
+            for i, goal in enumerate(goals)
+        ]
+
+        results_list = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Process results
+        results = {}
+        successful = 0
+        failed = 0
+
+        for item in results_list:
+            if isinstance(item, Exception):
+                # Handle exception
+                failed += 1
+                self.logger.error(f"[Proactive Parallelism] Task exception: {item}")
+            else:
+                goal, result = item
+                results[goal] = {
+                    "success": result.success,
+                    "execution_time_ms": result.execution_time_ms,
+                    "actions_count": result.actions_count,
+                    "final_message": result.final_message,
+                    "error": result.error,
+                }
+                if result.success:
+                    successful += 1
+                else:
+                    failed += 1
+
+        execution_time_ms = (time.time() - start_time) * 1000
+
+        # Get SpaceLock stats if available
+        space_lock_stats = space_lock.get_stats() if space_lock else {}
+
+        # Narrate completion
+        if narrate and self.tts_callback:
+            await self.tts_callback(
+                f"Completed {successful} of {len(goals)} tasks in {execution_time_ms / 1000:.1f} seconds."
+            )
+
+        self.logger.info(
+            f"[Proactive Parallelism] Completed: {successful}/{len(goals)} successful, "
+            f"{failed} failed, {execution_time_ms:.0f}ms total"
+        )
+
+        return {
+            "success": failed == 0,
+            "total_goals": len(goals),
+            "successful": successful,
+            "failed": failed,
+            "execution_time_ms": execution_time_ms,
+            "results": results,
+            "space_lock_stats": space_lock_stats,
+        }
+
+    def _extract_target_app(self, goal: str) -> Optional[str]:
+        """Extract target app from a goal string."""
+        goal_lower = goal.lower()
+
+        # App mapping (goal keywords -> app names)
+        app_mappings = {
+            ("vs code", "vscode", "code", "coding"): "Visual Studio Code",
+            ("email", "mail", "inbox", "gmail"): "Mail",
+            ("calendar", "meeting", "schedule"): "Calendar",
+            ("slack", "team message"): "Slack",
+            ("jira", "sprint", "ticket", "issue"): "Safari",  # Jira is web-based
+            ("chrome", "browser", "web"): "Google Chrome",
+            ("safari",): "Safari",
+            ("terminal", "command line", "shell"): "Terminal",
+            ("notes", "note"): "Notes",
+            ("finder", "files"): "Finder",
+        }
+
+        for keywords, app_name in app_mappings.items():
+            for keyword in keywords:
+                if keyword in goal_lower:
+                    return app_name
+
+        return None
+
+    async def _switch_to_app_for_goal(self, goal: str, target_app: str) -> bool:
+        """Switch to the target app for a goal."""
+        try:
+            from core.computer_use_bridge import switch_to_app_smart
+            result = await switch_to_app_smart(target_app, narrate=False)
+            return result.result.value in ("success", "already_focused", "switched_space")
+        except Exception as e:
+            self.logger.debug(f"App switch failed for {target_app}: {e}")
+            return False
+
+    async def expand_and_execute(
+        self,
+        query: str,
+        narrate: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        v6.2 Proactive Parallelism: Full "Psychic" workflow.
+
+        Combines PredictivePlanningAgent (expansion) with parallel execution.
+
+        Flow:
+        1. User says: "Start my day"
+        2. PredictivePlanningAgent expands to 5 tasks
+        3. execute_parallel_workflow runs them all
+        4. Workspace is ready in seconds
+
+        Args:
+            query: User's vague command
+            narrate: Whether to narrate
+
+        Returns:
+            Combined result from prediction and execution
+        """
+        start_time = time.time()
+
+        # 1. Expand intent using Predictive Planning Agent
+        try:
+            from neural_mesh.agents.predictive_planning_agent import expand_user_intent
+            prediction = await expand_user_intent(query)
+
+            self.logger.info(
+                f"[Expand & Execute] Expanded '{query}' into {len(prediction.goals)} tasks: "
+                f"{prediction.goals}"
+            )
+
+            if narrate and self.tts_callback:
+                await self.tts_callback(
+                    f"Expanding '{query}' into {len(prediction.goals)} tasks."
+                )
+
+        except Exception as e:
+            self.logger.error(f"[Expand & Execute] Prediction failed: {e}")
+            return {
+                "success": False,
+                "error": f"Prediction failed: {e}",
+                "query": query,
+            }
+
+        # 2. Execute in parallel
+        execution_result = await self.execute_parallel_workflow(
+            goals=prediction.goals,
+            narrate=narrate,
+        )
+
+        # 3. Combine results
+        total_time_ms = (time.time() - start_time) * 1000
+
+        return {
+            "success": execution_result["success"],
+            "query": query,
+            "intent": prediction.detected_intent.value,
+            "confidence": prediction.confidence,
+            "expanded_tasks": prediction.goals,
+            "execution": execution_result,
+            "total_time_ms": total_time_ms,
+            "reasoning": prediction.reasoning,
+        }
+
     async def _record_to_training_database(
         self,
         goal: str,

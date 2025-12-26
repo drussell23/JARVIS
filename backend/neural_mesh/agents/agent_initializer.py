@@ -23,12 +23,14 @@ from .error_analyzer_agent import ErrorAnalyzerAgent
 from .pattern_recognition_agent import PatternRecognitionAgent
 from .google_workspace_agent import GoogleWorkspaceAgent
 from .spatial_awareness_agent import SpatialAwarenessAgent  # v6.2: Grand Unification
+from .predictive_planning_agent import PredictivePlanningAgent  # v6.2: Proactive Parallelism
 
 logger = logging.getLogger(__name__)
 
 
 # Registry of all available production agents
 # v6.2 Grand Unification: Added SpatialAwarenessAgent for 3D OS Awareness
+# v6.2 Proactive Parallelism: Added PredictivePlanningAgent ("Psychic Brain")
 PRODUCTION_AGENTS: List[Type[BaseNeuralMeshAgent]] = [
     # Core agents (fundamental system operations)
     MemoryAgent,
@@ -39,6 +41,9 @@ PRODUCTION_AGENTS: List[Type[BaseNeuralMeshAgent]] = [
     ContextTrackerAgent,
     ErrorAnalyzerAgent,
     PatternRecognitionAgent,
+
+    # Proactive Intelligence ("The Psychic Brain")
+    PredictivePlanningAgent,  # v6.2: Expands intents into parallel tasks
 
     # Spatial agents (3D OS Awareness - "The Body")
     SpatialAwarenessAgent,  # v6.2: Proprioception for all agents
