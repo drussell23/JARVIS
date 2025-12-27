@@ -520,8 +520,10 @@ class YabaiSAIBridge:
             if not self.sai:
                 return
 
-            # Trigger SAI screen analysis
-            await self.sai.trigger_analysis()
+            # Update SAI display topology to reflect current screen state
+            # The SAI monitoring loop will pick up changes automatically
+            if hasattr(self.sai, 'display_awareness') and self.sai.display_awareness:
+                await self.sai.display_awareness.update_topology()
 
         except Exception as e:
             logger.error(f"[BRIDGE] Error requesting SAI analysis: {e}", exc_info=True)

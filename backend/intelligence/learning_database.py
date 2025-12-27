@@ -1251,20 +1251,20 @@ class DatabaseConnectionWrapper:
                 'app_usage_patterns': ['pattern_id'],
                 'user_workflows': ['workflow_id'],
                 'space_transitions': ['transition_id'],
-                'behavioral_patterns': ['pattern_id'],
-                'temporal_patterns': ['pattern_id'],
+                'behavioral_patterns': ['behavior_id'],
+                'temporal_patterns': ['temporal_id'],
                 'proactive_suggestions': ['suggestion_id'],
                 'voice_samples': ['sample_id'],
                 'speaker_profiles': ['speaker_id'],
                 'voice_transcriptions': ['transcription_id'],
-                'misheard_queries': ['query_id'],
+                'misheard_queries': ['misheard_id'],
                 'query_retries': ['retry_id'],
                 'acoustic_adaptations': ['adaptation_id'],
                 'display_patterns': ['pattern_id'],
                 'user_preferences': ['preference_id'],
                 'actions': ['action_id'],
                 'goal_action_mappings': ['mapping_id'],
-                'conversation_history': ['history_id'],
+                'conversation_history': ['interaction_id'],
                 'interaction_corrections': ['correction_id'],
                 'conversation_embeddings': ['embedding_id'],
                 'ml_training_history': ['training_id'],
@@ -6067,7 +6067,7 @@ class JARVISLearningDatabase:
                 SELECT from_space_id, to_space_id, trigger_app,
                        SUM(frequency) as total_transitions
                 FROM space_transitions
-                GROUP BY from_space_id, to_space_id
+                GROUP BY from_space_id, to_space_id, trigger_app
                 ORDER BY total_transitions DESC
                 LIMIT 15
             """

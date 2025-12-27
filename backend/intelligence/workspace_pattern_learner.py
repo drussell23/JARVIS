@@ -103,6 +103,7 @@ class WorkflowPattern:
     typical_times: List[int]                # Hours of day
     confidence: float
     triggers: List[str]                     # Common triggers
+    last_seen: float = 0.0                  # Timestamp of last observation
 
 
 @dataclass
@@ -301,6 +302,7 @@ class WorkspacePatternLearner:
 
                 elif len([w for w in self.workflow_patterns.values() if w.sequence == sequence]) == 0:
                     # New potential workflow
+                    import time
                     now = datetime.now()
                     workflow = WorkflowPattern(
                         workflow_id=seq_key,
@@ -309,7 +311,8 @@ class WorkspacePatternLearner:
                         avg_duration=0.0,
                         typical_times=[now.hour],
                         confidence=0.3,
-                        triggers=[]
+                        triggers=[],
+                        last_seen=time.time()
                     )
                     self.workflow_patterns[seq_key] = workflow
 
