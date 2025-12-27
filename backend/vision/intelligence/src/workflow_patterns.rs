@@ -3,7 +3,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use parking_lot::RwLock;
 use rayon::prelude::*;
-use serde::{Deserialize, Serialize};
 
 /// High-performance sequence similarity calculator
 #[pyclass]

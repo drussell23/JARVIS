@@ -1,7 +1,7 @@
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use serde::{Deserialize, Serialize};
-use ndarray::{Array2, Array3, ArrayView2, Axis};
+use ndarray::Array2;
 use std::collections::HashMap;
 use ahash::AHashMap;
 use rayon::prelude::*;
@@ -42,13 +42,13 @@ impl VisualPattern {
 
     fn update_from_observation(&mut self, features: &PyDict) -> PyResult<()> {
         // Extract features from Python dict
-        if let Ok(color_hist) = features.get_item("color_histogram") {
+        if let Ok(Some(color_hist)) = features.get_item("color_histogram") {
             if let Ok(hist_vec) = color_hist.extract::<Vec<f32>>() {
                 self.update_color_histogram(&hist_vec);
             }
         }
 
-        if let Ok(edges) = features.get_item("edge_features") {
+        if let Ok(Some(edges)) = features.get_item("edge_features") {
             if let Ok(edge_vec) = edges.extract::<Vec<f32>>() {
                 self.update_edge_features(&edge_vec);
             }

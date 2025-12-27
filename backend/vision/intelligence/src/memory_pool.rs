@@ -1,6 +1,5 @@
 use std::sync::{Arc, Mutex};
 use std::collections::VecDeque;
-use typed_arena::Arena;
 use bumpalo::Bump;
 use mimalloc::MiMalloc;
 
@@ -8,6 +7,7 @@ use mimalloc::MiMalloc;
 static GLOBAL: MiMalloc = MiMalloc;
 
 use pyo3::prelude::*;
+use pyo3::types::PyList;
 
 /// Global memory pool for vision processing
 static mut GLOBAL_POOL: Option<Arc<Mutex<MemoryPool>>> = None;
@@ -99,7 +99,7 @@ pub struct VisionMemoryPool {
 #[pymethods]
 impl VisionMemoryPool {
     #[new]
-    fn new(max_buffers: Option<usize>) -> Self {
+    fn new(_max_buffers: Option<usize>) -> Self {
         initialize_global_pool();
         Self {
             pool: get_global_pool(),
@@ -161,8 +161,8 @@ impl ImageBuffer {
         self.data.len()
     }
 
-    fn as_bytes(&self) -> &[u8] {
-        &self.data
+    fn as_bytes<'py>(&self, py: Python<'py>) -> &'py PyList {
+        PyList::new(py, &self.data)
     }
 
     fn fill(&mut self, value: u8) {
@@ -215,8 +215,8 @@ impl FeatureBuffer {
         self.data.len()
     }
 
-    fn as_slice(&self) -> &[f32] {
-        &self.data
+    fn as_slice<'py>(&self, py: Python<'py>) -> &'py PyList {
+        PyList::new(py, &self.data)
     }
 
     fn fill(&mut self, value: f32) {

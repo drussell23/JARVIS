@@ -62,9 +62,8 @@ metrics = "0.21"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 
-# Persistence
-rocksdb = "0.21"
-rmp-serde = "1.1"
+# Persistence - removed unused dependencies (rocksdb, rmp-serde)
+# Add back only if persistence features are implemented
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.9"

@@ -1,7 +1,6 @@
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use ndarray::{Array2, Array3, Axis};
-use image::{DynamicImage, GrayImage, Rgb, RgbImage};
+use image::{GrayImage, RgbImage};
 use imageproc::edges::canny;
 use std::collections::HashMap;
 use rayon::prelude::*;
@@ -92,7 +91,7 @@ impl StructuralFeatures {
         let grid_w = width / 3;
         let grid_h = height / 3;
 
-        for (x, y, pixel) in image.enumerate_pixels() {
+        for (x, y, _pixel) in image.enumerate_pixels() {
             let grid_x = (x / grid_w).min(2) as usize;
             let grid_y = (y / grid_h).min(2) as usize;
             let idx = grid_y * 3 + grid_x;
@@ -259,8 +258,8 @@ fn compute_image_statistics(image_data: &[u8], width: u32, height: u32) -> HashM
     stats.insert("brightness".to_string(), brightness);
     
     // Compute contrast (simplified)
-    let mut min_val = 255.0;
-    let mut max_val = 0.0;
+    let mut min_val: f32 = 255.0;
+    let mut max_val: f32 = 0.0;
     
     for chunk in image_data.chunks(3) {
         let gray = 0.299 * chunk[0] as f32 + 0.587 * chunk[1] as f32 + 0.114 * chunk[2] as f32;

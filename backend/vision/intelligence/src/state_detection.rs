@@ -1,8 +1,8 @@
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 use serde::{Deserialize, Serialize};
-use ndarray::Array2;
 use std::collections::HashMap;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 
 #[pyclass]
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -38,24 +38,18 @@ impl StateSignature {
         }
     }
 
-    fn update(&mut self, features: &HashMap<String, Vec<f32>>) {
-        // Update visual features with exponential moving average
-        for (key, new_values) in features {
-            self.visual_features
-                .entry(key.clone())
-                .and_modify(|existing| {
-                    for (i, new_val) in new_values.iter().enumerate() {
-                        if i < existing.len() {
-                            existing[i] = existing[i] * 0.9 + new_val * 0.1;
-                        }
-                    }
-                })
-                .or_insert_with(|| new_values.clone());
+    fn update(&mut self, _py: Python<'_>, features: &PyDict) -> PyResult<()> {
+        // Convert PyDict to HashMap<String, Vec<f32>>
+        let mut features_map = HashMap::new();
+        for (key, value) in features.iter() {
+            let key_str: String = key.extract()?;
+            let new_values: Vec<f32> = value.extract()?;
+            features_map.insert(key_str, new_values);
         }
-        
-        self.observation_count += 1;
-        self.confidence = (self.confidence * 0.95) + (0.05 * self.observation_count as f32).min(1.0);
-        self.last_observed = Utc::now().to_rfc3339();
+
+        // Call internal update method
+        self.update_internal(&features_map);
+        Ok(())
     }
 
     fn similarity(&self, other: &StateSignature) -> f32 {
@@ -76,6 +70,29 @@ impl StateSignature {
         } else {
             0.0
         }
+    }
+}
+
+impl StateSignature {
+    // Internal method for Rust code to update features
+    fn update_internal(&mut self, features: &HashMap<String, Vec<f32>>) {
+        // Update visual features with exponential moving average
+        for (key, new_values) in features {
+            self.visual_features
+                .entry(key.clone())
+                .and_modify(|existing| {
+                    for (i, new_val) in new_values.iter().enumerate() {
+                        if i < existing.len() {
+                            existing[i] = existing[i] * 0.9 + new_val * 0.1;
+                        }
+                    }
+                })
+                .or_insert_with(|| new_values.clone());
+        }
+
+        self.observation_count += 1;
+        self.confidence = (self.confidence * 0.95) + (0.05 * self.observation_count as f32).min(1.0);
+        self.last_observed = Utc::now().to_rfc3339();
     }
 }
 
@@ -129,14 +146,14 @@ impl StateDetector {
     fn learn(&mut self, state_id: String, features: HashMap<String, Vec<f32>>, state_type: Option<String>) {
         if let Some(signature) = self.state_signatures.get_mut(&state_id) {
             // Update existing state
-            signature.update(&features);
+            signature.update_internal(&features);
         } else if self.state_signatures.len() < self.max_states {
             // Create new state
             let mut new_signature = StateSignature::new(
                 state_id.clone(),
                 state_type.unwrap_or_else(|| "custom".to_string())
             );
-            new_signature.update(&features);
+            new_signature.update_internal(&features);
             self.state_signatures.insert(state_id, new_signature);
         } else {
             // Replace least confident state if at capacity
@@ -145,12 +162,12 @@ impl StateDetector {
                 .min_by(|(_, a), (_, b)| a.confidence.partial_cmp(&b.confidence).unwrap()) {
                 let weakest_id = weakest_id.clone();
                 self.state_signatures.remove(&weakest_id);
-                
+
                 let mut new_signature = StateSignature::new(
                     state_id.clone(),
                     state_type.unwrap_or_else(|| "custom".to_string())
                 );
-                new_signature.update(&features);
+                new_signature.update_internal(&features);
                 self.state_signatures.insert(state_id, new_signature);
             }
         }
@@ -229,9 +246,9 @@ mod tests {
         
         let mut features = HashMap::new();
         features.insert("test".to_string(), vec![1.0, 0.0, 0.0]);
-        
-        sig1.update(&features);
-        sig2.update(&features);
+
+        sig1.update_internal(&features);
+        sig2.update_internal(&features);
         
         let similarity = sig1.similarity(&sig2);
         assert!((similarity - 1.0).abs() < 0.01);
