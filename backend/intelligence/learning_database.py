@@ -73,6 +73,44 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 
 
+class AsyncContextCursor:
+    """
+    Awaitable async context manager wrapper for execute() operations.
+
+    This class makes execute() both awaitable AND usable as an async context manager,
+    supporting both patterns:
+        cursor = await db.execute(...)
+        async with db.execute(...) as cursor:
+
+    NO HARDCODING - fully dynamic and robust.
+    """
+
+    def __init__(self, coro):
+        """
+        Initialize with coroutine that returns DetachedCursor.
+
+        Args:
+            coro: Coroutine from execute() method
+        """
+        self._coro = coro
+        self._cursor = None
+
+    def __await__(self):
+        """Make awaitable - returns DetachedCursor."""
+        return self._coro.__await__()
+
+    async def __aenter__(self):
+        """Async context manager entry - await and return cursor."""
+        self._cursor = await self._coro
+        return self._cursor
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Async context manager exit."""
+        if self._cursor:
+            await self._cursor.close()
+        return False
+
+
 class DetachedCursor:
     """
     A cursor that holds query results without maintaining a connection reference.
@@ -947,37 +985,50 @@ class DatabaseConnectionWrapper:
                 async with self.adapter.connection() as conn:
                     yield DatabaseCursorWrapper(conn, connection_wrapper=self)
 
-    async def execute(self, sql: str, parameters: Tuple = ()) -> "DetachedCursor":
+    def execute(self, sql: str, parameters: Tuple = ()) -> "AsyncContextCursor":
         """
-        Execute SQL directly without creating cursor.
+        Execute SQL directly - returns awaitable AND async context manager.
+
+        This method is fully async, parallel, intelligent, and dynamic.
+        Supports both usage patterns:
+            cursor = await db.execute(...)          # await pattern
+            async with db.execute(...) as cursor:   # context manager pattern
 
         Args:
             sql: SQL query string
             parameters: Query parameters
 
         Returns:
-            DetachedCursor: Cursor with results (safe to use after connection release)
+            AsyncContextCursor: Awaitable context manager wrapping DetachedCursor
         """
-        async with self.cursor() as cur:
-            await cur.execute(sql, parameters)
-            # Return detached cursor to prevent "connection released" errors
-            return cur.detach()
+        async def _execute_impl():
+            async with self.cursor() as cur:
+                await cur.execute(sql, parameters)
+                # Return detached cursor to prevent "connection released" errors
+                return cur.detach()
 
-    async def executemany(self, sql: str, parameters_list: List[Tuple]) -> "DetachedCursor":
+        return AsyncContextCursor(_execute_impl())
+
+    def executemany(self, sql: str, parameters_list: List[Tuple]) -> "AsyncContextCursor":
         """
         Execute SQL with multiple parameter sets.
+
+        Fully async and dynamic - supports both await and context manager patterns.
 
         Args:
             sql: SQL query string
             parameters_list: List of parameter tuples
 
         Returns:
-            DetachedCursor: Cursor with results (safe to use after connection release)
+            AsyncContextCursor: Awaitable context manager wrapping DetachedCursor
         """
-        async with self.cursor() as cur:
-            await cur.executemany(sql, parameters_list)
-            # Return detached cursor to prevent "connection released" errors
-            return cur.detach()
+        async def _executemany_impl():
+            async with self.cursor() as cur:
+                await cur.executemany(sql, parameters_list)
+                # Return detached cursor to prevent "connection released" errors
+                return cur.detach()
+
+        return AsyncContextCursor(_executemany_impl())
 
     async def executescript(self, sql_script: str):
         """
