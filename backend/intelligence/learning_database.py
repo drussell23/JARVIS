@@ -24,11 +24,17 @@ import aiosqlite
 
 # Try to import Cloud Database Adapter
 try:
-    from intelligence.cloud_database_adapter import get_database_adapter
+    from intelligence.cloud_database_adapter import (
+        get_database_adapter,
+        CloudDatabaseAdapter,
+        DatabaseConfig,
+    )
 
     CLOUD_ADAPTER_AVAILABLE = True
 except ImportError:
     CLOUD_ADAPTER_AVAILABLE = False
+    CloudDatabaseAdapter = None  # Type hint compatibility
+    DatabaseConfig = None
     logging.warning("Cloud Database Adapter not available - using SQLite only")
 
 # Async and ML dependencies
@@ -1839,6 +1845,11 @@ class JARVISLearningDatabase:
         self.hybrid_sync = None
         self._sync_enabled = self.config.get("enable_hybrid_sync", True)
 
+        # Cloud Database Adapter for redundant Cloud SQL storage (v10.6)
+        # Initialized lazily in initialize() for parallel voice sample storage
+        self.cloud_adapter: Optional["CloudDatabaseAdapter"] = None
+        self._cloud_adapter_enabled = self.config.get("enable_cloud_adapter", True)
+
         logger.info(f"Advanced JARVIS Learning Database initializing at {self.db_dir}")
 
     async def initialize(self):
@@ -1850,6 +1861,11 @@ class JARVISLearningDatabase:
 
         # Initialize async SQLite
         await self._init_sqlite()
+
+        # Initialize Cloud Database Adapter for redundant Cloud SQL storage (v10.6)
+        # This enables parallel writes to both local SQLite and Cloud SQL for voice samples
+        if self._cloud_adapter_enabled and CLOUD_ADAPTER_AVAILABLE:
+            await self._init_cloud_adapter()
 
         # Initialize ChromaDB
         if CHROMADB_AVAILABLE:
@@ -2896,6 +2912,101 @@ class JARVISLearningDatabase:
         except Exception as e:
             logger.error(f"Failed to initialize ChromaDB: {e}")
             self.chroma_client = None
+
+    async def _init_cloud_adapter(self):
+        """
+        Initialize Cloud Database Adapter for redundant Cloud SQL storage (v10.6).
+
+        This enables parallel writes to both local SQLite and Cloud SQL for voice samples,
+        providing redundancy and enabling multi-device access to voice biometric data.
+
+        Features:
+        - Timeout protection (15s) to prevent hangs if Cloud SQL proxy isn't running
+        - Graceful fallback to SQLite-only if Cloud SQL unavailable
+        - Smart detection of Cloud SQL vs SQLite configuration
+        - Configuration-driven behavior (no hardcoding)
+        - Comprehensive error handling with detailed logging
+        - Async initialization for non-blocking startup
+
+        If initialization fails, self.cloud_adapter remains None and all voice sample
+        writes will fall back to local SQLite only (existing behavior).
+        """
+        try:
+            logger.info("🔧 Initializing Cloud Database Adapter for redundant voice storage...")
+
+            # STEP 1: Create CloudDatabaseAdapter instance
+            # This reads configuration from environment variables and config files
+            try:
+                cloud_config = DatabaseConfig()
+
+                # Log configuration status (for debugging)
+                logger.info(
+                    f"   Database config: type={cloud_config.db_type}, "
+                    f"cloud_sql={cloud_config.use_cloud_sql}"
+                )
+
+                # Create adapter instance
+                self.cloud_adapter = CloudDatabaseAdapter(config=cloud_config)
+
+            except Exception as config_error:
+                logger.warning(
+                    f"⚠️  Failed to create Cloud Database Adapter config: {config_error}\n"
+                    f"   → Falling back to SQLite-only storage"
+                )
+                self.cloud_adapter = None
+                return
+
+            # STEP 2: Initialize the adapter with timeout protection
+            # This prevents infinite hangs if Cloud SQL proxy isn't running
+            try:
+                logger.info("   Initializing adapter (15s timeout)...")
+                await asyncio.wait_for(
+                    self.cloud_adapter.initialize(),
+                    timeout=15.0  # 15 second timeout
+                )
+
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "⏱️  Cloud Database Adapter initialization timeout (15s exceeded)\n"
+                    "   This usually means Cloud SQL proxy isn't running.\n"
+                    "   → Falling back to SQLite-only storage"
+                )
+                self.cloud_adapter = None
+                return
+
+            except Exception as init_error:
+                logger.warning(
+                    f"⚠️  Cloud Database Adapter initialization failed: {init_error}\n"
+                    f"   → Falling back to SQLite-only storage"
+                )
+                self.cloud_adapter = None
+                return
+
+            # STEP 3: Verify the adapter is actually using Cloud SQL
+            # If it fell back to SQLite, we don't need it (we already have self.db)
+            if not self.cloud_adapter.is_cloud:
+                logger.info(
+                    "📂 Cloud Database Adapter is using SQLite (not Cloud SQL)\n"
+                    "   → Using local self.db for all storage (no redundancy needed)"
+                )
+                self.cloud_adapter = None
+                return
+
+            # STEP 4: Success! We have a working Cloud SQL adapter
+            logger.info(
+                "✅ Cloud Database Adapter initialized successfully\n"
+                "   → Voice samples will be written to BOTH:\n"
+                "      • Local SQLite (fast, always available)\n"
+                "      • Cloud SQL (redundant, multi-device accessible)"
+            )
+
+        except Exception as e:
+            # Catch-all: Any unexpected error should not crash initialization
+            logger.error(
+                f"❌ Unexpected error in Cloud Database Adapter initialization: {e}\n"
+                f"   → Falling back to SQLite-only storage"
+            )
+            self.cloud_adapter = None
 
     # ==================== Goal Management (Async + Cached) ====================
 
