@@ -1,32 +1,40 @@
 """
-JARVIS Neural Mesh - Visual Monitor Agent v10.6
+JARVIS Neural Mesh - Visual Monitor Agent v11.0
 ===============================================
 
-The "Watcher" of Video Multi-Space Intelligence (VMSI).
+The "Watcher & Actor" of Video Multi-Space Intelligence (VMSI).
 
-This agent provides background visual surveillance capabilities:
+This agent provides ACTIVE visual surveillance capabilities:
 - Watch background windows for specific events
+- AUTOMATICALLY ACT when events are detected (NEW in v11.0!)
 - Monitor multiple windows in parallel
 - Alert when visual events are detected
+- Execute Computer Use actions in response to visual triggers
+- Support conditional branching (if Error -> Retry, if Success -> Deploy)
 - Integrate with SpatialAwarenessAgent for window location
 - Share state across repos (JARVIS ↔ JARVIS Prime ↔ Reactor Core)
 
 Capabilities:
 - watch_and_alert: Monitor a window for text/event and alert
+- watch_and_act: Monitor AND execute actions when event detected (NEW!)
 - watch_multiple: Monitor multiple windows in parallel
 - stop_watching: Cancel active watchers
 - list_watchers: Get status of all active watchers
 
 Usage from voice:
+    Passive (v10.6):
     "Watch the Terminal for 'Build Successful'"
-    "Watch Chrome for 'Application Submitted' and Terminal for 'Error'"
-    "Stop watching Terminal"
 
-This is JARVIS's "second pair of eyes" - monitoring background activity
-while you focus on your main work.
+    ACTIVE (v11.0 NEW!):
+    "Watch the Terminal for 'Build Complete', then click Deploy"
+    "When you see 'Error' in Terminal, click Retry button"
+    "Watch Chrome for 'Application Submitted' and Terminal for 'Error'"
+
+This is JARVIS's "second pair of eyes AND hands" - autonomously monitoring
+and responding to background activity while you focus on your main work.
 
 Author: JARVIS AI System
-Version: 10.6 - Video Multi-Space Intelligence
+Version: 11.0 - Watch & Act (Autonomous Response)
 """
 
 from __future__ import annotations
@@ -35,10 +43,11 @@ import asyncio
 import json
 import logging
 import os
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from datetime import datetime
+from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set, Union
 
 from ..base.base_neural_mesh_agent import BaseNeuralMeshAgent
 from ..data_models import (
@@ -49,6 +58,105 @@ from ..data_models import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Action Configuration - "Watch & Act" Capabilities (v11.0)
+# =============================================================================
+
+class ActionType(str, Enum):
+    """Types of actions that can be executed in response to visual events."""
+    SIMPLE_GOAL = "simple_goal"  # Natural language goal for Computer Use
+    CONDITIONAL = "conditional"  # Conditional branching (if X -> do Y)
+    WORKFLOW = "workflow"  # Complex multi-step workflow via AgenticTaskRunner
+    NOTIFICATION = "notification"  # Just notify (passive mode)
+    VOICE_ALERT = "voice_alert"  # Voice alert only
+
+
+@dataclass
+class ActionConfig:
+    """
+    Configuration for actions to execute when visual event detected.
+
+    Supports multiple action types from simple to complex:
+    - Simple: Natural language goal executed via Computer Use
+    - Conditional: If-then-else branching based on trigger
+    - Workflow: Complex multi-step via AgenticTaskRunner
+    """
+    action_type: ActionType = ActionType.NOTIFICATION
+
+    # Simple goal (for SIMPLE_GOAL)
+    goal: Optional[str] = None  # e.g., "Click the Deploy button"
+
+    # Conditional branching (for CONDITIONAL)
+    conditions: List['ConditionalAction'] = field(default_factory=list)
+    default_action: Optional[str] = None  # Fallback if no conditions match
+
+    # Workflow (for WORKFLOW)
+    workflow_goal: Optional[str] = None  # Complex goal for AgenticTaskRunner
+    workflow_context: Dict[str, Any] = field(default_factory=dict)
+
+    # Common settings
+    switch_to_window: bool = True  # Switch to window before acting
+    narrate: bool = True  # Voice narration during execution
+    require_confirmation: bool = False  # Ask user before acting
+    timeout_seconds: float = 30.0  # Max time for action execution
+
+
+@dataclass
+class ConditionalAction:
+    """
+    Conditional action: If trigger matches pattern, execute action.
+
+    Example:
+        ConditionalAction(
+            trigger_pattern="Error",
+            action_goal="Click the Retry button",
+            description="Retry on error"
+        )
+    """
+    trigger_pattern: str  # Text pattern to match (supports regex)
+    action_goal: str  # What to do if pattern matches
+    description: str = ""  # Human-readable description
+    confidence_threshold: float = 0.75  # Min confidence to trigger
+    case_sensitive: bool = False
+    use_regex: bool = False
+
+
+@dataclass
+class WatchAndActRequest:
+    """
+    Complete request for watch-and-act operation.
+
+    Combines visual monitoring with automated response.
+    """
+    # Monitoring config
+    app_name: str
+    trigger_text: str
+    space_id: Optional[int] = None
+
+    # Action config
+    action_config: Optional[ActionConfig] = None
+
+    # Monitoring settings
+    fps: int = 5
+    timeout: float = 300.0  # 5 minutes default
+
+    # Advanced
+    multiple_triggers: List[str] = field(default_factory=list)  # Watch for any of these
+    stop_on_first: bool = True  # Stop after first trigger
+
+
+@dataclass
+class ActionExecutionResult:
+    """Result of action execution after visual event detected."""
+    success: bool
+    action_type: ActionType
+    goal_executed: Optional[str] = None
+    error: Optional[str] = None
+    duration_ms: float = 0.0
+    computer_use_result: Optional[Dict[str, Any]] = None  # Full Computer Use result
+    narration: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -79,6 +187,14 @@ class VisualMonitorConfig:
     cross_repo_dir: str = "~/.jarvis/cross_repo"
     vmsi_state_file: str = "vmsi_state.json"
     sync_interval_seconds: float = 5.0  # How often to sync state
+
+    # v11.0: Action execution ("Watch & Act")
+    enable_action_execution: bool = True  # Execute actions on events
+    enable_computer_use: bool = True  # Use Computer Use for actions
+    enable_agentic_runner: bool = True  # Use AgenticTaskRunner for workflows
+    action_timeout_seconds: float = 60.0  # Max time for action execution
+    require_confirmation: bool = False  # Ask before executing actions
+    auto_switch_to_window: bool = True  # Automatically switch to target window
 
 
 class VisualMonitorAgent(BaseNeuralMeshAgent):
@@ -111,21 +227,27 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
             agent_type="visual_monitor",
             capabilities={
                 "watch_and_alert",
+                "watch_and_act",  # NEW v11.0: Active response
                 "watch_multiple",
                 "stop_watching",
                 "list_watchers",
                 "get_watcher_stats",
                 "background_surveillance",  # Meta capability
+                "autonomous_response",  # NEW v11.0: Act on visual events
             },
-            version="10.6",
+            version="11.0",
         )
 
         self.config = config or VisualMonitorConfig()
 
-        # Lazy-loaded components
+        # Lazy-loaded components - Visual
         self._watcher_manager = None
         self._detector = None
         self._spatial_agent = None
+
+        # Lazy-loaded components - Action Execution (v11.0)
+        self._computer_use_connector = None  # For executing actions
+        self._agentic_task_runner = None  # For complex workflows
 
         # Active monitoring tasks
         self._watch_tasks: Dict[str, asyncio.Task] = {}
@@ -135,19 +257,22 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
         self._total_watches_started = 0
         self._total_events_detected = 0
         self._total_alerts_sent = 0
+        self._total_actions_executed = 0  # NEW v11.0
+        self._total_actions_succeeded = 0  # NEW v11.0
+        self._total_actions_failed = 0  # NEW v11.0
 
         # Cross-repo state
         self._state_sync_task: Optional[asyncio.Task] = None
 
     async def on_initialize(self) -> None:
         """Initialize agent resources."""
-        logger.info("Initializing VisualMonitorAgent v10.6 (VMSI Watcher)")
+        logger.info("Initializing VisualMonitorAgent v11.0 (VMSI Watcher & Actor)")
 
         # Initialize video watcher manager
         try:
             from backend.vision.macos_video_capture_advanced import get_watcher_manager
             self._watcher_manager = get_watcher_manager()
-            logger.info("VideoWatcherManager initialized")
+            logger.info("✓ VideoWatcherManager initialized")
         except Exception as e:
             logger.warning(f"VideoWatcherManager init failed: {e}")
 
@@ -155,9 +280,29 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
         try:
             from backend.vision.visual_event_detector import create_detector
             self._detector = create_detector()
-            logger.info("VisualEventDetector initialized")
+            logger.info("✓ VisualEventDetector initialized")
         except Exception as e:
             logger.warning(f"VisualEventDetector init failed: {e}")
+
+        # v11.0: Initialize Computer Use connector for action execution
+        if self.config.enable_computer_use:
+            try:
+                from backend.display.computer_use_connector import get_computer_use_connector
+                self._computer_use_connector = get_computer_use_connector()
+                logger.info("✓ ClaudeComputerUseConnector initialized (Watch & Act enabled)")
+            except Exception as e:
+                logger.warning(f"ComputerUseConnector init failed: {e}")
+                logger.warning("Watch & Act will be limited to passive mode")
+
+        # v11.0: Initialize AgenticTaskRunner for complex workflows
+        if self.config.enable_agentic_runner:
+            try:
+                from backend.core.agentic_task_runner import get_agentic_task_runner
+                self._agentic_task_runner = await get_agentic_task_runner()
+                logger.info("✓ AgenticTaskRunner initialized (Complex workflows enabled)")
+            except Exception as e:
+                logger.warning(f"AgenticTaskRunner init failed: {e}")
+                logger.warning("Complex workflows will fall back to Computer Use")
 
         # Ensure cross-repo directory exists
         if self.config.enable_cross_repo_sync:
@@ -273,21 +418,26 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
         self,
         app_name: str,
         trigger_text: str,
-        space_id: Optional[int] = None
+        space_id: Optional[int] = None,
+        action_config: Optional[ActionConfig] = None,
+        workflow_goal: Optional[str] = None
     ) -> Dict[str, Any]:
         """
-        Watch an app for specific text/event and alert when found.
+        Watch an app for specific text/event and alert (or ACT!) when found.
 
         This is the main capability - enables voice commands like:
-        "Watch the Terminal for 'Build Successful'"
+        - Passive (v10.6): "Watch the Terminal for 'Build Successful'"
+        - ACTIVE (v11.0): "Watch the Terminal for 'Build Complete', then click Deploy"
 
         Args:
             app_name: App to monitor (e.g., "Terminal", "Chrome")
             trigger_text: Text to wait for (e.g., "Build Successful")
             space_id: Optional specific space (auto-detect if None)
+            action_config: Optional action to execute when event detected (v11.0)
+            workflow_goal: Optional complex workflow goal (v11.0)
 
         Returns:
-            Result with watcher_id and monitoring status
+            Result with watcher_id, monitoring status, and action result if executed
         """
         if not app_name or not trigger_text:
             return {
@@ -332,13 +482,23 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                 timeout=self.config.default_timeout
             )
 
+            # v11.0: Auto-create action_config from workflow_goal if provided
+            if workflow_goal and not action_config:
+                action_config = ActionConfig(
+                    action_type=ActionType.WORKFLOW,
+                    workflow_goal=workflow_goal,
+                    narrate=self.config.enable_voice_alerts,
+                    switch_to_window=self.config.auto_switch_to_window
+                )
+
             # Step 3: Start monitoring task
             task = asyncio.create_task(
                 self._monitor_and_alert(
                     watcher=watcher,
                     trigger_text=trigger_text,
                     app_name=app_name,
-                    space_id=detected_space_id
+                    space_id=detected_space_id,
+                    action_config=action_config  # v11.0: Pass action config
                 )
             )
 
@@ -349,6 +509,8 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                 'trigger_text': trigger_text,
                 'space_id': detected_space_id,
                 'started_at': datetime.now().isoformat(),
+                'action_config': action_config,  # v11.0: Store action config
+                'will_act': action_config is not None  # v11.0: Flag for active monitoring
             }
 
             return {
@@ -567,17 +729,27 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
         watcher: Any,
         trigger_text: str,
         app_name: str,
-        space_id: int
+        space_id: int,
+        action_config: Optional[ActionConfig] = None
     ):
         """
-        Monitor watcher and send alert when event detected.
+        Monitor watcher and send alert (or execute action!) when event detected.
+
+        v11.0: Now supports autonomous action execution!
 
         This runs as a background task.
         """
+        action_result = None
+
         try:
             logger.info(
                 f"[{watcher.watcher_id}] Monitoring {app_name} for '{trigger_text}'"
             )
+
+            if action_config:
+                logger.info(
+                    f"[{watcher.watcher_id}] 🎯 ACTIVE MODE: Will execute action when detected!"
+                )
 
             # Wait for visual event
             result = await self._watcher_manager.wait_for_visual_event(
@@ -604,19 +776,59 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                     detection_time=result.detection_time
                 )
 
-                # Store in knowledge graph
+                # v11.0: EXECUTE ACTION if configured!
+                if action_config and self.config.enable_action_execution:
+                    logger.info(
+                        f"[{watcher.watcher_id}] 🚀 Executing action: {action_config.action_type.value}"
+                    )
+
+                    action_result = await self._execute_response(
+                        trigger_text=trigger_text,
+                        detected_text=result.trigger,  # Actual detected text
+                        action_config=action_config,
+                        app_name=app_name,
+                        space_id=space_id,
+                        confidence=result.confidence
+                    )
+
+                    if action_result and action_result.success:
+                        logger.info(
+                            f"[{watcher.watcher_id}] ✅ Action executed successfully! "
+                            f"Goal: {action_result.goal_executed}"
+                        )
+                        self._total_actions_succeeded += 1
+                    else:
+                        logger.warning(
+                            f"[{watcher.watcher_id}] ❌ Action failed: "
+                            f"{action_result.error if action_result else 'Unknown error'}"
+                        )
+                        self._total_actions_failed += 1
+
+                # Store in knowledge graph (with action result if available)
                 if self.knowledge_graph:
+                    knowledge_data = {
+                        "type": "visual_event_detected",
+                        "app_name": app_name,
+                        "trigger_text": trigger_text,
+                        "space_id": space_id,
+                        "confidence": result.confidence,
+                        "detection_time": result.detection_time,
+                        "timestamp": datetime.now().isoformat(),
+                    }
+
+                    # v11.0: Add action execution result
+                    if action_result:
+                        knowledge_data["action_executed"] = {
+                            "success": action_result.success,
+                            "action_type": action_result.action_type.value,
+                            "goal": action_result.goal_executed,
+                            "error": action_result.error,
+                            "duration_ms": action_result.duration_ms
+                        }
+
                     await self.add_knowledge(
                         knowledge_type=KnowledgeType.OBSERVATION,
-                        data={
-                            "type": "visual_event_detected",
-                            "app_name": app_name,
-                            "trigger_text": trigger_text,
-                            "space_id": space_id,
-                            "confidence": result.confidence,
-                            "detection_time": result.detection_time,
-                            "timestamp": datetime.now().isoformat(),
-                        },
+                        data=knowledge_data,
                         confidence=result.confidence,
                     )
             else:
@@ -710,6 +922,333 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
 
         except Exception as e:
             logger.error(f"Error sending notification: {e}")
+
+    # =========================================================================
+    # v11.0: Action Execution - "Watch & Act" Core Logic
+    # =========================================================================
+
+    async def _execute_response(
+        self,
+        trigger_text: str,
+        detected_text: str,
+        action_config: ActionConfig,
+        app_name: str,
+        space_id: int,
+        confidence: float
+    ) -> Optional[ActionExecutionResult]:
+        """
+        Execute configured action in response to visual event detection.
+
+        This is the CORE of "Watch & Act" - the autonomous loop closer!
+
+        Flow:
+        1. Switch to target window (via SpatialAwarenessAgent)
+        2. Execute action based on type:
+           - SIMPLE_GOAL: Use Computer Use for natural language goal
+           - CONDITIONAL: Evaluate conditions and execute matching action
+           - WORKFLOW: Delegate to AgenticTaskRunner for complex workflows
+           - NOTIFICATION/VOICE_ALERT: Passive modes (already handled)
+        3. Return execution result
+
+        Args:
+            trigger_text: Original trigger pattern
+            detected_text: Actual detected text (may differ slightly)
+            action_config: Configuration for action to execute
+            app_name: Application where event detected
+            space_id: Space ID where event detected
+            confidence: Detection confidence
+
+        Returns:
+            ActionExecutionResult with execution details
+        """
+        import time
+        start_time = time.time()
+
+        logger.info(
+            f"[ACTION EXECUTION] Type: {action_config.action_type.value}, "
+            f"App: {app_name}, Space: {space_id}"
+        )
+
+        try:
+            self._total_actions_executed += 1
+
+            # Step 1: Switch to target window if requested
+            if action_config.switch_to_window:
+                await self._switch_to_app(app_name, space_id)
+
+            # Step 2: Execute action based on type
+            if action_config.action_type == ActionType.SIMPLE_GOAL:
+                return await self._execute_simple_goal(
+                    goal=action_config.goal,
+                    app_name=app_name,
+                    narrate=action_config.narrate,
+                    timeout=action_config.timeout_seconds,
+                    start_time=start_time
+                )
+
+            elif action_config.action_type == ActionType.CONDITIONAL:
+                return await self._execute_conditional(
+                    detected_text=detected_text,
+                    conditions=action_config.conditions,
+                    default_action=action_config.default_action,
+                    app_name=app_name,
+                    narrate=action_config.narrate,
+                    timeout=action_config.timeout_seconds,
+                    start_time=start_time
+                )
+
+            elif action_config.action_type == ActionType.WORKFLOW:
+                return await self._execute_workflow(
+                    workflow_goal=action_config.workflow_goal,
+                    workflow_context=action_config.workflow_context,
+                    app_name=app_name,
+                    narrate=action_config.narrate,
+                    timeout=action_config.timeout_seconds,
+                    start_time=start_time
+                )
+
+            elif action_config.action_type in [ActionType.NOTIFICATION, ActionType.VOICE_ALERT]:
+                # Passive modes - already handled by _send_alert
+                duration_ms = (time.time() - start_time) * 1000
+                return ActionExecutionResult(
+                    success=True,
+                    action_type=action_config.action_type,
+                    goal_executed="Passive notification",
+                    duration_ms=duration_ms
+                )
+
+            else:
+                raise ValueError(f"Unknown action type: {action_config.action_type}")
+
+        except Exception as e:
+            logger.exception(f"[ACTION EXECUTION] Failed: {e}")
+            duration_ms = (time.time() - start_time) * 1000
+            return ActionExecutionResult(
+                success=False,
+                action_type=action_config.action_type,
+                error=str(e),
+                duration_ms=duration_ms
+            )
+
+    async def _switch_to_app(self, app_name: str, space_id: int) -> bool:
+        """
+        Switch to target app/window using SpatialAwarenessAgent.
+
+        This is the "teleport" step before executing actions.
+        """
+        try:
+            logger.info(f"[TELEPORT] Switching to {app_name} on Space {space_id}")
+
+            if self.coordinator:
+                # Use SpatialAwarenessAgent to switch
+                result = await self.coordinator.request(
+                    to_agent="spatial_awareness_agent",
+                    payload={
+                        "action": "switch_to_app",
+                        "app_name": app_name,
+                        "space_id": space_id
+                    }
+                )
+
+                if result and result.get("success"):
+                    logger.info(f"[TELEPORT] ✅ Switched to {app_name}")
+                    await asyncio.sleep(0.5)  # Wait for app to focus
+                    return True
+                else:
+                    logger.warning(f"[TELEPORT] Failed to switch: {result}")
+                    return False
+            else:
+                logger.warning("[TELEPORT] No coordinator available - skipping switch")
+                return False
+
+        except Exception as e:
+            logger.error(f"[TELEPORT] Error switching to app: {e}")
+            return False
+
+    async def _execute_simple_goal(
+        self,
+        goal: Optional[str],
+        app_name: str,
+        narrate: bool,
+        timeout: float,
+        start_time: float
+    ) -> ActionExecutionResult:
+        """
+        Execute simple goal using ClaudeComputerUseConnector.
+
+        Example: "Click the Deploy button"
+        """
+        if not goal:
+            raise ValueError("Simple goal action requires a goal")
+
+        if not self._computer_use_connector:
+            raise RuntimeError("Computer Use connector not available")
+
+        logger.info(f"[SIMPLE GOAL] Executing: {goal}")
+
+        try:
+            # Execute via Computer Use
+            task_result = await self._computer_use_connector.execute_task(
+                goal=goal,
+                context={"app_name": app_name},
+                narrate=narrate
+            )
+
+            duration_ms = (time.time() - start_time) * 1000
+            success = task_result.status.value in ["success", "SUCCESS"]
+
+            return ActionExecutionResult(
+                success=success,
+                action_type=ActionType.SIMPLE_GOAL,
+                goal_executed=goal,
+                error=None if success else task_result.final_message,
+                duration_ms=duration_ms,
+                computer_use_result=asdict(task_result),
+                narration=task_result.narration_log if hasattr(task_result, 'narration_log') else []
+            )
+
+        except Exception as e:
+            duration_ms = (time.time() - start_time) * 1000
+            return ActionExecutionResult(
+                success=False,
+                action_type=ActionType.SIMPLE_GOAL,
+                goal_executed=goal,
+                error=str(e),
+                duration_ms=duration_ms
+            )
+
+    async def _execute_conditional(
+        self,
+        detected_text: str,
+        conditions: List[ConditionalAction],
+        default_action: Optional[str],
+        app_name: str,
+        narrate: bool,
+        timeout: float,
+        start_time: float
+    ) -> ActionExecutionResult:
+        """
+        Execute conditional action based on detected text.
+
+        Example conditions:
+        - If "Error" -> "Click Retry button"
+        - If "Success" -> "Click Deploy button"
+        """
+        logger.info(f"[CONDITIONAL] Evaluating {len(conditions)} conditions")
+
+        # Find matching condition
+        matched_condition = None
+        for condition in conditions:
+            if self._matches_condition(detected_text, condition):
+                matched_condition = condition
+                logger.info(
+                    f"[CONDITIONAL] ✅ Matched: '{condition.trigger_pattern}' "
+                    f"-> '{condition.action_goal}'"
+                )
+                break
+
+        # Determine which action to execute
+        if matched_condition:
+            action_goal = matched_condition.action_goal
+        elif default_action:
+            logger.info(f"[CONDITIONAL] No match, using default action")
+            action_goal = default_action
+        else:
+            duration_ms = (time.time() - start_time) * 1000
+            return ActionExecutionResult(
+                success=False,
+                action_type=ActionType.CONDITIONAL,
+                error="No conditions matched and no default action provided",
+                duration_ms=duration_ms
+            )
+
+        # Execute the matched action via simple goal
+        logger.info(f"[CONDITIONAL] Executing action: {action_goal}")
+        return await self._execute_simple_goal(
+            goal=action_goal,
+            app_name=app_name,
+            narrate=narrate,
+            timeout=timeout,
+            start_time=start_time
+        )
+
+    def _matches_condition(self, detected_text: str, condition: ConditionalAction) -> bool:
+        """Check if detected text matches a conditional pattern."""
+        import re
+
+        search_text = detected_text if condition.case_sensitive else detected_text.lower()
+        pattern = condition.trigger_pattern if condition.case_sensitive else condition.trigger_pattern.lower()
+
+        if condition.use_regex:
+            return bool(re.search(pattern, search_text))
+        else:
+            return pattern in search_text
+
+    async def _execute_workflow(
+        self,
+        workflow_goal: Optional[str],
+        workflow_context: Dict[str, Any],
+        app_name: str,
+        narrate: bool,
+        timeout: float,
+        start_time: float
+    ) -> ActionExecutionResult:
+        """
+        Execute complex workflow using AgenticTaskRunner.
+
+        Example: "Check if tests pass, if so deploy to staging, then notify team"
+        """
+        if not workflow_goal:
+            raise ValueError("Workflow action requires a workflow_goal")
+
+        if not self._agentic_task_runner:
+            # Fallback to simple goal via Computer Use
+            logger.warning("[WORKFLOW] AgenticTaskRunner unavailable, falling back to Computer Use")
+            return await self._execute_simple_goal(
+                goal=workflow_goal,
+                app_name=app_name,
+                narrate=narrate,
+                timeout=timeout,
+                start_time=start_time
+            )
+
+        logger.info(f"[WORKFLOW] Executing complex workflow: {workflow_goal}")
+
+        try:
+            # Execute via AgenticTaskRunner
+            # Note: Implementation depends on AgenticTaskRunner interface
+            # This is a placeholder - adjust based on actual interface
+            result = await self._agentic_task_runner.execute_task(
+                goal=workflow_goal,
+                context={
+                    "app_name": app_name,
+                    **workflow_context
+                },
+                narrate=narrate,
+                timeout=timeout
+            )
+
+            duration_ms = (time.time() - start_time) * 1000
+            success = getattr(result, 'success', False)
+
+            return ActionExecutionResult(
+                success=success,
+                action_type=ActionType.WORKFLOW,
+                goal_executed=workflow_goal,
+                error=None if success else getattr(result, 'error', 'Unknown error'),
+                duration_ms=duration_ms,
+                computer_use_result=result if hasattr(result, '__dict__') else None
+            )
+
+        except Exception as e:
+            duration_ms = (time.time() - start_time) * 1000
+            return ActionExecutionResult(
+                success=False,
+                action_type=ActionType.WORKFLOW,
+                goal_executed=workflow_goal,
+                error=str(e),
+                duration_ms=duration_ms
+            )
 
     async def _stop_watcher_by_id(self, watcher_id: str):
         """Stop watcher by ID and cleanup."""
