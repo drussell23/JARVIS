@@ -217,6 +217,7 @@ class RouteDecision:
     execution_allowed: bool
     denial_reason: Optional[str]
     timestamp: float = field(default_factory=time.time)
+    metadata: Dict[str, Any] = field(default_factory=dict)  # v10.0: Includes workspace_intent
 
 
 # =============================================================================
@@ -251,35 +252,61 @@ class IntentClassifier:
             re.IGNORECASE
         )
 
-    def classify(self, command: str) -> Tuple[CommandTier, List[str], Optional[str]]:
+        # v10.0: Workspace intent detector (lazy loaded)
+        self._workspace_detector = None
+
+    async def classify(self, command: str) -> Tuple[CommandTier, List[str], Optional[str], Optional[Any]]:
         """
-        Classify command intent.
+        Classify command intent with workspace awareness.
 
         Returns:
-            Tuple of (tier, detected_keywords, block_reason)
+            Tuple of (tier, detected_keywords, block_reason, workspace_result)
         """
         detected_keywords = []
+        workspace_result = None
 
         # Check for dangerous intents FIRST (highest priority)
         dangerous_matches = self._dangerous_pattern.findall(command.lower())
         if dangerous_matches:
-            return CommandTier.BLOCKED, dangerous_matches, f"Dangerous intent detected: {', '.join(dangerous_matches)}"
+            return CommandTier.BLOCKED, dangerous_matches, f"Dangerous intent detected: {', '.join(dangerous_matches)}", None
+
+        # v10.0: Check for workspace intents (before generic agentic check)
+        # This ensures "Draft email" routes to GoogleWorkspaceAgent, not generic Vision
+        try:
+            if not self._workspace_detector:
+                from core.workspace_routing_intelligence import get_workspace_detector
+                self._workspace_detector = get_workspace_detector()
+
+            workspace_result = await self._workspace_detector.detect(command)
+
+            if workspace_result.is_workspace_command and workspace_result.confidence >= 0.7:
+                logger.info(
+                    f"[IntentClassifier] ✉️  Workspace intent detected: {workspace_result.intent.value} "
+                    f"(confidence: {workspace_result.confidence:.1%}, mode: {workspace_result.execution_mode.value})"
+                )
+
+                # Workspace commands require Tier 2 (routed to GoogleWorkspaceAgent)
+                return CommandTier.TIER2_AGENTIC, [workspace_result.intent.value], None, workspace_result
+
+        except Exception as e:
+            logger.debug(f"[IntentClassifier] Workspace detection failed: {e}")
+            workspace_result = None
 
         # Check for agentic intents (requires Tier 2)
         agentic_matches = self._agentic_pattern.findall(command.lower())
         if agentic_matches:
             detected_keywords.extend(agentic_matches)
-            return CommandTier.TIER2_AGENTIC, detected_keywords, None
+            return CommandTier.TIER2_AGENTIC, detected_keywords, None, workspace_result
 
         # v2.0: Check for Tier 0 quick intents (instant local response)
         if self.config.tier0_enabled:
             tier0_matches = self._tier0_pattern.findall(command.lower())
             if tier0_matches:
                 detected_keywords.extend(tier0_matches)
-                return CommandTier.TIER0_LOCAL, detected_keywords, None
+                return CommandTier.TIER0_LOCAL, detected_keywords, None, None
 
         # Default to Tier 1
-        return CommandTier.TIER1_STANDARD, detected_keywords, None
+        return CommandTier.TIER1_STANDARD, detected_keywords, None, None
 
     def is_tier0_candidate(self, command: str) -> bool:
         """
@@ -397,8 +424,12 @@ class TieredCommandRouter:
         parsed = self._parse_wake_word(raw_command)
         logger.info(f"[TieredRouter] Parsed: tier={parsed.detected_tier.value}, wake='{parsed.wake_word}'")
 
-        # Step 2: Intent classification (may escalate, block, or detect Tier 0)
-        intent_tier, intent_keywords, block_reason = self._intent_classifier.classify(parsed.command_body)
+        # Step 2: Intent classification (may escalate, block, or detect Tier 0/Workspace)
+        intent_tier, intent_keywords, block_reason, workspace_result = await self._intent_classifier.classify(parsed.command_body)
+
+        # Store workspace context for execution
+        if workspace_result:
+            parsed.metadata["workspace_intent"] = workspace_result
 
         if block_reason:
             self._blocked_count += 1
@@ -559,6 +590,15 @@ class TieredCommandRouter:
 
         logger.info(f"[TieredRouter] Routing to {backend}: {parsed.command_body[:50]}...")
 
+        # v10.0: Log workspace routing
+        if workspace_result and workspace_result.is_workspace_command:
+            logger.info(
+                f"[TieredRouter] 📧 Workspace command → GoogleWorkspaceAgent "
+                f"(intent: {workspace_result.intent.value}, mode: {workspace_result.execution_mode.value})"
+            )
+            if workspace_result.spatial_target:
+                logger.info(f"[TieredRouter] 🎯 Target: {workspace_result.spatial_target}")
+
         return RouteDecision(
             tier=final_tier,
             backend=backend,
@@ -569,6 +609,7 @@ class TieredCommandRouter:
             watchdog_armed=watchdog_armed,
             execution_allowed=True,
             denial_reason=None,
+            metadata=parsed.metadata,  # v10.0: Pass workspace context
         )
 
     # =========================================================================
@@ -791,6 +832,10 @@ class TieredCommandRouter:
         """
         Execute a Tier 2 command (agentic, full control).
 
+        v10.0 Enhancement: Workspace-aware routing:
+        - Google Workspace commands → GoogleWorkspaceAgent (with visual mode)
+        - Other agentic commands → Proactive/Standard Computer Use
+
         v6.3 Enhancement: Intelligent routing between:
         - Proactive Parallelism (expand_and_execute) for multi-task workflows
         - Standard Computer Use (sequential) for single-task commands
@@ -798,6 +843,17 @@ class TieredCommandRouter:
         This uses the AgenticTaskRunner with Computer Use.
         """
         logger.info(f"[TieredRouter] Executing Tier 2 (Agentic): {command[:50]}...")
+
+        context = context or {}
+
+        # v10.0: Check for workspace intent and route to GoogleWorkspaceAgent
+        workspace_intent = context.get("workspace_intent")
+        if workspace_intent and workspace_intent.is_workspace_command:
+            logger.info(
+                f"[TieredRouter] 📧 Routing to GoogleWorkspaceAgent "
+                f"(intent: {workspace_intent.intent.value}, execution: {workspace_intent.execution_mode.value})"
+            )
+            return await self._execute_workspace_command(command, context, workspace_intent)
 
         try:
             # v6.3: Detect if this should use Proactive Parallelism
@@ -981,6 +1037,156 @@ class TieredCommandRouter:
             # Don't wait - let it play in background
         except Exception as e:
             logger.debug(f"[TieredRouter] Sound playback failed: {e}")
+
+    # =========================================================================
+    # v10.0: Workspace Command Execution
+    # =========================================================================
+
+    async def _execute_workspace_command(
+        self,
+        command: str,
+        context: Dict[str, Any],
+        workspace_intent: Any,  # WorkspaceIntentResult
+    ) -> Dict[str, Any]:
+        """
+        Execute workspace command via GoogleWorkspaceAgent with visual mode support.
+
+        This enables the "Iron Man" experience:
+        1. Detect workspace intent (Draft email, Check calendar, etc.)
+        2. Query spatial awareness to find Gmail/Calendar
+        3. Route to GoogleWorkspaceAgent with execution mode:
+           - visual_preferred: Uses Computer Use for drafting (visual feedback)
+           - auto: Agent decides based on availability (API → Local → Visual)
+
+        Args:
+            command: User command
+            context: Execution context
+            workspace_intent: WorkspaceIntentResult with detected intent and execution mode
+
+        Returns:
+            Execution result dict
+        """
+        try:
+            # Lazy load GoogleWorkspaceAgent
+            from backend.neural_mesh.agents.google_workspace_agent import (
+                get_google_workspace_agent,
+            )
+
+            agent = await get_google_workspace_agent()
+            if not agent:
+                logger.error("[TieredRouter] GoogleWorkspaceAgent not available")
+                return {
+                    "success": False,
+                    "error": "GoogleWorkspaceAgent not available",
+                }
+
+            # Prepare workspace context
+            workspace_context = {
+                "intent": workspace_intent.intent.value,
+                "execution_mode": workspace_intent.execution_mode.value,
+                "requires_visual": workspace_intent.requires_visual,
+                "spatial_target": workspace_intent.spatial_target,
+                "entities": workspace_intent.entities,
+                **context,  # Include original context
+            }
+
+            logger.info(
+                f"[TieredRouter] 🎬 Executing workspace command: {workspace_intent.intent.value}"
+            )
+            if workspace_intent.spatial_target:
+                logger.info(f"[TieredRouter] 🎯 Target window: {workspace_intent.spatial_target}")
+
+            # Route based on intent to appropriate GoogleWorkspaceAgent action
+            intent = workspace_intent.intent
+            from core.workspace_routing_intelligence import WorkspaceIntent
+
+            # Build payload for execute_task() based on intent
+            # The agent uses action-based routing via execute_task(payload)
+            payload = {
+                **workspace_context,  # Include all context (execution_mode, spatial_target, entities)
+            }
+
+            # Map workspace intent to agent action
+            if intent == WorkspaceIntent.DRAFT_EMAIL:
+                # Draft email - extract recipient and subject from entities
+                payload["action"] = "draft_email_reply"
+                payload["to"] = workspace_intent.entities.get("recipient", "")
+                payload["subject"] = workspace_intent.entities.get("subject", "")
+                payload["body"] = ""  # Will be generated by agent or passed from context
+
+            elif intent == WorkspaceIntent.SEND_EMAIL:
+                payload["action"] = "send_email"
+                payload["to"] = workspace_intent.entities.get("recipient", "")
+                payload["subject"] = workspace_intent.entities.get("subject", "")
+                payload["body"] = workspace_intent.entities.get("content", "")
+
+            elif intent == WorkspaceIntent.CHECK_EMAIL:
+                payload["action"] = "fetch_unread_emails"
+                payload["limit"] = context.get("limit", 10)
+
+            elif intent == WorkspaceIntent.SEARCH_EMAIL:
+                payload["action"] = "search_email"
+                payload["query"] = workspace_intent.entities.get("query", command)
+                payload["limit"] = context.get("limit", 10)
+
+            elif intent == WorkspaceIntent.CHECK_CALENDAR:
+                payload["action"] = "check_calendar_events"
+                # Extract date from entities or default to "today"
+                date_info = workspace_intent.entities.get("date", "today")
+                payload["date"] = date_info
+                payload["days"] = context.get("days", 1)
+
+            elif intent == WorkspaceIntent.CREATE_EVENT:
+                payload["action"] = "create_calendar_event"
+                payload["title"] = workspace_intent.entities.get("title", "")
+                payload["start"] = workspace_intent.entities.get("time", "")
+                payload["description"] = context.get("description", "")
+
+            elif intent == WorkspaceIntent.CREATE_DOCUMENT:
+                payload["action"] = "create_document"
+                payload["topic"] = workspace_intent.entities.get("topic", command)
+                payload["document_type"] = context.get("document_type", "essay")
+                payload["word_count"] = context.get("word_count")
+
+            elif intent == WorkspaceIntent.GET_CONTACTS:
+                payload["action"] = "get_contacts"
+                payload["query"] = workspace_intent.entities.get("name", "")
+                payload["limit"] = context.get("limit", 20)
+
+            elif intent == WorkspaceIntent.WORKSPACE_SUMMARY:
+                payload["action"] = "workspace_summary"
+
+            else:
+                # Fallback: Use natural language query handler
+                payload["action"] = "handle_workspace_query"
+                payload["query"] = command
+
+            # Execute via agent's execute_task() method
+            result = await agent.execute_task(payload)
+
+            return {
+                "success": result.get("success", False),
+                "response": result.get("response", ""),
+                "workspace_intent": workspace_intent.intent.value,
+                "execution_mode": result.get("execution_mode", workspace_intent.execution_mode.value),
+                "tier_used": result.get("tier_used", "unknown"),
+                "spatial_target": workspace_intent.spatial_target,
+                "agent": "GoogleWorkspaceAgent",
+                **result,
+            }
+
+        except Exception as e:
+            logger.error(f"[TieredRouter] Workspace command execution failed: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+                "workspace_intent": workspace_intent.intent.value,
+                "agent": "GoogleWorkspaceAgent",
+            }
+
+    # =========================================================================
+    # Statistics
+    # =========================================================================
 
     def get_stats(self) -> Dict[str, Any]:
         """Get routing statistics."""

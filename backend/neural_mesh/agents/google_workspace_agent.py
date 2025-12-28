@@ -1715,8 +1715,14 @@ class GoogleWorkspaceAgent(BaseNeuralMeshAgent):
 
         Note: Actions with "(with fallback)" use the unified executor
         and will try alternative methods if the primary fails.
+
+        v10.0 Enhancement - Visual Execution Mode ("Iron Man" Experience):
+        If payload contains execution_mode="visual_preferred" or "visual_only",
+        interactive commands (draft_email_reply, create_document) will use
+        Computer Use (Tier 3) directly for visible on-screen execution.
         """
         action = payload.get("action", "")
+        execution_mode = payload.get("execution_mode", "auto")
 
         logger.debug(f"GoogleWorkspaceAgent executing: {action}")
 
@@ -1745,6 +1751,9 @@ class GoogleWorkspaceAgent(BaseNeuralMeshAgent):
         elif action == "search_email":
             return await self._search_email(payload)
         elif action == "draft_email_reply":
+            # v10.0: Check for visual execution mode preference
+            if execution_mode in ("visual_preferred", "visual_only"):
+                return await self._draft_email_visual(payload)
             return await self._draft_email(payload)
         elif action == "send_email":
             return await self._send_email(payload)
@@ -1855,6 +1864,111 @@ class GoogleWorkspaceAgent(BaseNeuralMeshAgent):
             self._drafts_created += 1
 
         return result
+
+    async def _draft_email_visual(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        v10.0: Draft email using Computer Use (visual execution).
+
+        This provides the "Iron Man" experience - JARVIS physically switches
+        to Gmail and types the email visibly on screen using spatial awareness
+        and Computer Use.
+
+        Args:
+            payload: Dict with:
+                - to: Recipient email/name
+                - subject: Email subject
+                - body: Email body (optional, can be generated)
+                - spatial_target: Optional spatial target ("Gmail tab in Space 3")
+
+        Returns:
+            Execution result with visual tier info
+        """
+        start_time = asyncio.get_event_loop().time()
+
+        to = payload.get("to", "")
+        subject = payload.get("subject", "")
+        body = payload.get("body", "")
+        spatial_target = payload.get("spatial_target")
+
+        logger.info(
+            f"[GoogleWorkspaceAgent] 🎬 Drafting email VISUALLY "
+            f"(to: {to}, subject: {subject[:30]}...)"
+        )
+
+        # Ensure unified executor is available
+        if not self._unified_executor or not self._unified_executor._computer_use:
+            logger.warning("Computer Use not available, falling back to API")
+            return await self._draft_email(payload)
+
+        try:
+            # Step 1: Switch to Gmail using spatial awareness
+            logger.info("[GoogleWorkspaceAgent] 🎯 Switching to Gmail via spatial awareness...")
+            spatial_success = await self._unified_executor._switch_to_app_with_spatial_awareness(
+                app_name="Safari",  # Assuming Gmail in browser
+                narrate=True,
+            )
+
+            if not spatial_success:
+                logger.warning("Failed to switch to Gmail, proceeding anyway")
+
+            # Step 2: Use Computer Use to draft the email visually
+            logger.info("[GoogleWorkspaceAgent] ⌨️  Drafting email via Computer Use...")
+
+            # Build natural language goal for Computer Use
+            goal = (
+                f"Navigate to mail.google.com, click 'Compose' to start a new email, "
+                f"and fill in the following:\n"
+                f"- To: {to}\n"
+                f"- Subject: {subject}\n"
+            )
+
+            if body:
+                goal += f"- Body: {body}\n"
+            else:
+                goal += f"- Body: [Leave empty for user to write]\n"
+
+            goal += (
+                f"\n"
+                f"DO NOT send the email - just create the draft and leave it open "
+                f"for the user to review and edit."
+            )
+
+            # Execute via Computer Use
+            result = await self._unified_executor._computer_use.run(goal=goal)
+
+            execution_time_ms = (asyncio.get_event_loop().time() - start_time) * 1000
+
+            if result and result.success:
+                self._drafts_created += 1
+                logger.info(
+                    f"[GoogleWorkspaceAgent] ✅ Email drafted visually "
+                    f"({execution_time_ms:.0f}ms, {result.actions_count} actions)"
+                )
+
+                return {
+                    "success": True,
+                    "status": "drafted_visually",
+                    "tier_used": "computer_use",
+                    "execution_mode": "visual",
+                    "to": to,
+                    "subject": subject,
+                    "spatial_target": spatial_target,
+                    "actions_count": result.actions_count,
+                    "execution_time_ms": execution_time_ms,
+                    "message": (
+                        f"Email draft created visually on screen. "
+                        f"Switched to Gmail and filled in recipient ({to}) and subject ({subject}). "
+                        f"Draft is ready for you to review and edit."
+                    ),
+                }
+            else:
+                logger.warning("Computer Use failed for email draft, falling back to API")
+                return await self._draft_email(payload)
+
+        except Exception as e:
+            logger.error(f"[GoogleWorkspaceAgent] Error in visual email draft: {e}")
+            logger.info("Falling back to API for email draft")
+            return await self._draft_email(payload)
 
     async def _send_email(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Send an email."""

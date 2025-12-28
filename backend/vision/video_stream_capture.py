@@ -20,19 +20,38 @@ import numpy as np
 import psutil
 from PIL import Image
 
-# Try to import macOS-specific modules
+# Try to import advanced macOS capture system (v10.6)
 try:
-    import AVFoundation
-    import CoreMedia
-    from Quartz import CoreVideo
-    from Cocoa import NSObject
-    import objc
-    from Foundation import NSRunLoop
-    import libdispatch
-    MACOS_CAPTURE_AVAILABLE = True
+    from .macos_video_capture_advanced import (
+        create_video_capture,
+        AdvancedCaptureConfig,
+        AdvancedVideoCaptureManager,
+        check_capture_availability,
+        CaptureStatus,
+        AVFOUNDATION_AVAILABLE,
+        PYOBJC_AVAILABLE,
+    )
+    MACOS_CAPTURE_ADVANCED_AVAILABLE = True
+    MACOS_CAPTURE_AVAILABLE = AVFOUNDATION_AVAILABLE  # Backward compatibility
 except ImportError as e:
+    MACOS_CAPTURE_ADVANCED_AVAILABLE = False
     MACOS_CAPTURE_AVAILABLE = False
-    logging.warning(f"macOS capture frameworks not available - will use fallback: {e}")
+    logging.warning(f"Advanced macOS capture not available: {e}")
+    logging.info("Falling back to basic capture methods")
+
+    # Fallback: Try legacy PyObjC imports
+    try:
+        import AVFoundation
+        import CoreMedia
+        from Quartz import CoreVideo
+        from Cocoa import NSObject
+        import objc
+        from Foundation import NSRunLoop
+        import libdispatch
+        MACOS_CAPTURE_AVAILABLE = True
+    except ImportError as e2:
+        MACOS_CAPTURE_AVAILABLE = False
+        logging.warning(f"macOS capture frameworks not available - will use fallback: {e2}")
 
 # Import Swift bridge for better macOS integration
 try:
@@ -368,33 +387,73 @@ class VideoStreamCapture:
             logger.info(f"[VIDEO] Memory check passed")
             
             # Initialize capture implementation
-            # Try direct Swift capture first (most reliable for purple indicator)
-            swift_capture_started = False
-            try:
-                from .direct_swift_capture import start_direct_swift_capture
-                
-                logger.info("🟣 Starting direct Swift capture for purple indicator...")
-                success = await start_direct_swift_capture()
-                
-                if success:
-                    logger.info("✅ Direct Swift capture active - purple indicator visible!")
-                    self.capture_method = 'direct_swift'
-                    swift_capture_started = True
-                    
-                    # Start processing thread for frame analysis using screenshots
-                    self.capture_thread = threading.Thread(
-                        target=self._direct_swift_capture_loop,
-                        daemon=True
+            # Try ADVANCED macOS capture first (v10.6 - native AVFoundation)
+            advanced_capture_started = False
+            if MACOS_CAPTURE_ADVANCED_AVAILABLE:
+                try:
+                    logger.info("🚀 Starting Advanced macOS Capture (v10.6)...")
+
+                    # Check system availability first
+                    availability = check_capture_availability()
+                    logger.info(f"   System check: {availability}")
+
+                    # Create advanced capture configuration
+                    capture_config = AdvancedCaptureConfig(
+                        display_id=self.config.capture_display_id,
+                        target_fps=self.config.target_fps,
+                        resolution=self.config.resolution,
+                        max_memory_mb=self.config.memory_limit_mb,
+                        frame_buffer_size=self.config.max_frame_buffer_size,
                     )
-                    self.capture_thread.start()
-                    
-                else:
-                    logger.warning("Direct Swift capture failed, trying other methods...")
-                    
-            except ImportError as e:
-                logger.warning(f"Direct Swift capture module not available: {e}")
-            except Exception as e:
-                logger.warning(f"Direct Swift capture error: {e}")
+
+                    # Create capture manager
+                    self.advanced_capture = await create_video_capture(capture_config)
+
+                    # Start capture with frame callback
+                    success = await self.advanced_capture.start_capture(
+                        self._on_frame_captured_async
+                    )
+
+                    if success:
+                        logger.info("✅ Advanced AVFoundation capture active!")
+                        logger.info("   🟣 Purple indicator should be visible!")
+                        self.capture_method = 'advanced_avfoundation'
+                        advanced_capture_started = True
+                    else:
+                        logger.warning("Advanced capture failed, trying fallback methods...")
+
+                except Exception as e:
+                    logger.warning(f"Advanced macOS capture error: {e}", exc_info=True)
+                    advanced_capture_started = False
+
+            # Try direct Swift capture if advanced capture failed
+            swift_capture_started = False
+            if not advanced_capture_started:
+                try:
+                    from .direct_swift_capture import start_direct_swift_capture
+
+                    logger.info("🟣 Starting direct Swift capture for purple indicator...")
+                    success = await start_direct_swift_capture()
+
+                    if success:
+                        logger.info("✅ Direct Swift capture active - purple indicator visible!")
+                        self.capture_method = 'direct_swift'
+                        swift_capture_started = True
+
+                        # Start processing thread for frame analysis using screenshots
+                        self.capture_thread = threading.Thread(
+                            target=self._direct_swift_capture_loop,
+                            daemon=True
+                        )
+                        self.capture_thread.start()
+
+                    else:
+                        logger.warning("Direct Swift capture failed, trying other methods...")
+
+                except ImportError as e:
+                    logger.warning(f"Direct Swift capture module not available: {e}")
+                except Exception as e:
+                    logger.warning(f"Direct Swift capture error: {e}")
                 
             if not swift_capture_started:
                 
@@ -505,12 +564,12 @@ class VideoStreamCapture:
             return False
     
     def _on_frame_captured(self, frame: np.ndarray):
-        """Handle captured frame"""
+        """Handle captured frame (synchronous version for legacy compatibility)"""
         try:
             # Add to buffer
             self.frame_buffer.add_frame(frame)
             self.frames_processed += 1
-            
+
             # Trigger callback
             asyncio.create_task(self._trigger_event('frame_captured', {
                 'frame_number': self.frames_processed,
@@ -518,6 +577,36 @@ class VideoStreamCapture:
             }))
         except Exception as e:
             logger.error(f"Error in _on_frame_captured: {e}", exc_info=True)
+
+    async def _on_frame_captured_async(self, frame: np.ndarray, metadata: Dict[str, Any]):
+        """
+        Handle captured frame from advanced capture system (v10.6)
+
+        Args:
+            frame: numpy array of captured frame (RGB format)
+            metadata: frame metadata (timestamp, fps, dimensions, etc.)
+        """
+        try:
+            # Add to buffer
+            self.frame_buffer.add_frame(frame)
+            self.frames_processed += 1
+
+            # Update metrics from advanced capture
+            if 'fps' in metadata:
+                # Store current FPS for diagnostics
+                self._current_fps = metadata['fps']
+
+            # Trigger callback
+            await self._trigger_event('frame_captured', {
+                'frame_number': self.frames_processed,
+                'timestamp': metadata.get('timestamp', time.time()),
+                'fps': metadata.get('fps', 0.0),
+                'width': metadata.get('width', 0),
+                'height': metadata.get('height', 0),
+            })
+
+        except Exception as e:
+            logger.error(f"Error in _on_frame_captured_async: {e}", exc_info=True)
     
     def _process_frames_loop(self):
         """Process frames in separate thread"""
@@ -759,9 +848,18 @@ class VideoStreamCapture:
     async def stop_streaming(self):
         """Stop video streaming"""
         self.is_capturing = False
-        
+
+        # Stop advanced capture if using it (v10.6)
+        if hasattr(self, 'capture_method') and self.capture_method == 'advanced_avfoundation':
+            try:
+                if hasattr(self, 'advanced_capture') and self.advanced_capture:
+                    await self.advanced_capture.stop_capture()
+                    logger.info("Stopped advanced AVFoundation capture")
+            except Exception as e:
+                logger.error(f"Error stopping advanced capture: {e}")
+
         # Stop purple indicator if using it
-        if hasattr(self, 'capture_method') and self.capture_method == 'purple_indicator':
+        elif hasattr(self, 'capture_method') and self.capture_method == 'purple_indicator':
             try:
                 from .simple_purple_indicator import stop_purple_indicator
                 stop_purple_indicator()
@@ -849,7 +947,7 @@ class VideoStreamCapture:
     def get_metrics(self) -> Dict[str, Any]:
         """Get streaming metrics"""
         recent_metrics = self.metrics[-10:] if self.metrics else []
-        
+
         # Determine capture method
         capture_method = 'unknown'
         if hasattr(self, 'capture_method'):
@@ -860,8 +958,8 @@ class VideoStreamCapture:
             capture_method = 'macos_native'
         elif self.capture_thread:
             capture_method = 'screenshot_loop'
-        
-        return {
+
+        metrics = {
             'is_capturing': self.is_capturing,
             'frames_processed': self.frames_processed,
             'frames_analyzed': self.frames_analyzed,
@@ -870,8 +968,22 @@ class VideoStreamCapture:
             'recent_analysis': recent_metrics,
             'capture_method': capture_method,
             'swift_available': SWIFT_BRIDGE_AVAILABLE,
-            'macos_available': MACOS_CAPTURE_AVAILABLE
+            'macos_available': MACOS_CAPTURE_AVAILABLE,
+            'macos_advanced_available': MACOS_CAPTURE_ADVANCED_AVAILABLE,
+            'pyobjc_available': PYOBJC_AVAILABLE if MACOS_CAPTURE_ADVANCED_AVAILABLE else False,
+            'avfoundation_available': AVFOUNDATION_AVAILABLE if MACOS_CAPTURE_ADVANCED_AVAILABLE else False,
         }
+
+        # Add advanced capture metrics if using advanced capture (v10.6)
+        if hasattr(self, 'advanced_capture') and self.advanced_capture:
+            try:
+                advanced_metrics = self.advanced_capture.get_metrics()
+                metrics['advanced_capture'] = advanced_metrics
+                metrics['current_fps'] = advanced_metrics.get('current_fps', 0.0)
+            except Exception as e:
+                logger.error(f"Error getting advanced capture metrics: {e}")
+
+        return metrics
     
     # Fallback methods
     def _start_cv2_capture(self):
