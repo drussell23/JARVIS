@@ -139,6 +139,19 @@ backend_path = Path(__file__).parent / "backend"
 if str(backend_path) not in sys.path:
     sys.path.insert(0, str(backend_path))
 
+# v10.6: Structured Logging System
+try:
+    from core.logging import (
+        configure_structured_logging,
+        get_structured_logger,
+        get_global_logging_stats,
+        LoggingConfig,
+    )
+    STRUCTURED_LOGGING_AVAILABLE = True
+except ImportError:
+    STRUCTURED_LOGGING_AVAILABLE = False
+    print("[WARNING] Structured logging not available - using basic logging")
+
 # =============================================================================
 # CRITICAL: Python 3.9 Compatibility - MUST run before any Google API imports
 # =============================================================================
@@ -483,28 +496,74 @@ class PerformanceLogger:
 
 def setup_logging(config: BootstrapConfig) -> logging.Logger:
     """
-    Configure advanced logging for the supervisor.
-    
+    Configure advanced structured logging for the supervisor (v10.6).
+
+    v10.6 Features:
+    - JSON formatted logs for easy parsing and analysis
+    - Async file writing (non-blocking)
+    - Automatic log rotation (prevents huge files)
+    - Context enrichment (session IDs, tracing, stack traces)
+    - Intelligent error aggregation and pattern detection
+    - Performance metrics tracking
+    - Real-time error analysis
+
+    Logs are written to:
+    - Console: Structured JSON to stdout
+    - File: ~/.jarvis/logs/supervisor.bootstrap.jsonl (all logs)
+    - Errors: ~/.jarvis/logs/supervisor.bootstrap_errors.jsonl (errors only)
+
     Features:
     - Configurable log level via environment
     - Reduced noise from libraries
-    - Performance-friendly format
+    - Performance-friendly async format
     """
-    logging.basicConfig(
-        level=getattr(logging, config.log_level.upper()),
-        format=config.log_format,
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-    
-    # Reduce noise from libraries
-    noisy_loggers = [
-        "urllib3", "asyncio", "aiohttp", "httpx",
-        "httpcore", "charset_normalizer"
-    ]
-    for logger_name in noisy_loggers:
-        logging.getLogger(logger_name).setLevel(logging.WARNING)
-    
-    return logging.getLogger("supervisor.bootstrap")
+    if STRUCTURED_LOGGING_AVAILABLE:
+        # Configure structured logging system
+        logging_config = LoggingConfig.from_env()
+        logging_config.default_level = config.log_level.upper()
+        logging_config.console_level = config.log_level.upper()
+
+        configure_structured_logging(logging_config)
+
+        # Get structured logger
+        structured_logger = get_structured_logger("supervisor.bootstrap")
+
+        # Reduce noise from libraries (still using basic logging for third-party libs)
+        noisy_loggers = [
+            "urllib3", "asyncio", "aiohttp", "httpx",
+            "httpcore", "charset_normalizer", "google", "grpc",
+        ]
+        for logger_name in noisy_loggers:
+            logging.getLogger(logger_name).setLevel(logging.WARNING)
+
+        # Log that structured logging is active
+        structured_logger.info(
+            "Structured logging system initialized",
+            log_dir=str(logging_config.log_dir),
+            max_file_size_mb=logging_config.max_bytes / (1024 * 1024),
+            backup_count=logging_config.backup_count,
+            error_aggregation=logging_config.enable_error_aggregation,
+            performance_tracking=logging_config.enable_performance_tracking,
+        )
+
+        return structured_logger
+    else:
+        # Fallback to basic logging
+        logging.basicConfig(
+            level=getattr(logging, config.log_level.upper()),
+            format=config.log_format,
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+
+        # Reduce noise from libraries
+        noisy_loggers = [
+            "urllib3", "asyncio", "aiohttp", "httpx",
+            "httpcore", "charset_normalizer"
+        ]
+        for logger_name in noisy_loggers:
+            logging.getLogger(logger_name).setLevel(logging.WARNING)
+
+        return logging.getLogger("supervisor.bootstrap")
 
 
 # =============================================================================
