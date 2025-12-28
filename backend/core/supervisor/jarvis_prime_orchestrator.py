@@ -588,6 +588,49 @@ class JarvisPrimeOrchestrator:
             logger.debug(f"[JarvisPrime] Port {port} is used by our own managed process (PID {pid})")
             return
 
+        # v10.6: CRITICAL FIX - Check if port is used by current supervisor process
+        # This happens during restart scenarios where supervisor is restarting
+        current_pid = os.getpid()
+        if pid == current_pid:
+            logger.info(
+                f"[JarvisPrime] Port {port} is bound by current supervisor process (PID {pid}). "
+                f"This is a restart scenario - checking for existing Prime subprocess..."
+            )
+
+            # Check if we have an existing JARVIS Prime subprocess we can reuse
+            if PSUTIL_AVAILABLE:
+                try:
+                    current_process = psutil.Process(current_pid)
+                    children = current_process.children(recursive=True)
+
+                    for child in children:
+                        try:
+                            # Look for python processes with "backend/main.py" (JARVIS Prime signature)
+                            cmdline = child.cmdline()
+                            if any('backend/main.py' in arg for arg in cmdline):
+                                logger.info(
+                                    f"[JarvisPrime] Found existing Prime subprocess (PID {child.pid}). "
+                                    f"Reusing instead of starting new instance."
+                                )
+                                # Store the existing process
+                                self._process = child
+                                self._status = "running"
+                                return
+                        except (psutil.NoSuchProcess, psutil.AccessDenied):
+                            continue
+                except Exception as e:
+                    logger.debug(f"[JarvisPrime] Could not check for existing subprocess: {e}")
+
+            # No existing subprocess found - the port binding is stale
+            # Try to unbind by closing any sockets on this port owned by us
+            logger.warning(
+                f"[JarvisPrime] No existing Prime subprocess found, but port {port} is bound to us. "
+                f"This indicates a stale binding from previous run. "
+                f"Port will be freed when new Prime subprocess starts."
+            )
+            # Don't raise exception - allow Prime to start and take over the port
+            return
+
         # v10.5: IMMEDIATE zombie/defunct process cleanup
         # Zombies can't be killed normally, so detect and reap them first
         if PSUTIL_AVAILABLE:

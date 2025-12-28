@@ -15352,6 +15352,10 @@ async def _ensure_cloud_sql_proxy_fallback() -> bool:
 #   DOCKER_VERBOSE=false           # Enable verbose logging
 # =============================================================================
 
+# Import required modules for Docker daemon management
+from enum import Enum
+from dataclasses import dataclass, field
+
 class DaemonStatus(Enum):
     """Docker daemon status states"""
     UNKNOWN = "unknown"
