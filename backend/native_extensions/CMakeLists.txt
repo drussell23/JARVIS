@@ -62,23 +62,34 @@ endif()
 # Include directories
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 
-# Source files - use .mm for Objective-C++
-set(SOURCES
+# Source files for fast_capture module
+set(FAST_CAPTURE_SOURCES
     src/fast_capture.mm
     src/python_bindings.cpp
 )
 
-# Create the Python module
-pybind11_add_module(fast_capture ${SOURCES})
+# Source files for fast_capture_stream module
+# Note: Does NOT include fast_capture.mm to avoid duplicate symbols
+set(FAST_CAPTURE_STREAM_SOURCES
+    src/fast_capture_stream.mm
+    src/python_stream_bindings.cpp
+)
+
+# Create the Python modules
+pybind11_add_module(fast_capture ${FAST_CAPTURE_SOURCES})
+pybind11_add_module(fast_capture_stream ${FAST_CAPTURE_STREAM_SOURCES})
 
 # Set source file properties for Objective-C++ (only for .mm files, not during linking)
 if(APPLE)
     set_source_files_properties(src/fast_capture.mm PROPERTIES
         COMPILE_FLAGS "-x objective-c++"
     )
+    set_source_files_properties(src/fast_capture_stream.mm PROPERTIES
+        COMPILE_FLAGS "-x objective-c++"
+    )
 endif()
 
-# Set properties
+# Set properties for fast_capture module
 set_target_properties(fast_capture PROPERTIES
     CXX_VISIBILITY_PRESET hidden
     INTERPROCEDURAL_OPTIMIZATION TRUE
@@ -86,16 +97,33 @@ set_target_properties(fast_capture PROPERTIES
     SUFFIX "${PYTHON_MODULE_EXTENSION}"
 )
 
-# Link libraries
+# Set properties for fast_capture_stream module
+set_target_properties(fast_capture_stream PROPERTIES
+    CXX_VISIBILITY_PRESET hidden
+    INTERPROCEDURAL_OPTIMIZATION TRUE
+    PREFIX "${PYTHON_MODULE_PREFIX}"
+    SUFFIX "${PYTHON_MODULE_EXTENSION}"
+)
+
+# Link libraries for both modules
 target_link_libraries(fast_capture PRIVATE ${PLATFORM_LIBRARIES})
+target_link_libraries(fast_capture_stream PRIVATE ${PLATFORM_LIBRARIES})
 
 # Optimization flags
 if(CMAKE_BUILD_TYPE STREQUAL "Release")
     if(APPLE)
-        # macOS optimizations
-        target_compile_options(fast_capture PRIVATE 
-            -O3 
-            -march=native 
+        # macOS optimizations for both modules
+        target_compile_options(fast_capture PRIVATE
+            -O3
+            -march=native
+            -mtune=native
+            -ffast-math
+            -funroll-loops
+            -ftree-vectorize
+        )
+        target_compile_options(fast_capture_stream PRIVATE
+            -O3
+            -march=native
             -mtune=native
             -ffast-math
             -funroll-loops
@@ -104,7 +132,7 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release")
     endif()
 endif()
 
-# Install target
-install(TARGETS fast_capture
+# Install targets
+install(TARGETS fast_capture fast_capture_stream
     LIBRARY DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/../
 )

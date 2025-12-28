@@ -35,16 +35,16 @@
 // NOTE: Must be outside C++ namespace
 
 /**
- * Modern ScreenCaptureKit-based capture delegate
+ * Modern ScreenCaptureKit-based capture delegate for one-shot captures
  * Replaces deprecated CGWindowListCreateImage
  */
-@interface JARVISCaptureDelegate : NSObject <SCStreamDelegate, SCStreamOutput>
+@interface JARVISOneshotDelegate : NSObject <SCStreamDelegate, SCStreamOutput>
 @property (nonatomic, assign) dispatch_semaphore_t frameSemaphore;
 @property (nonatomic, assign) CMSampleBufferRef latestFrame;  // Use assign for CF types
 @property (nonatomic, assign) BOOL hasNewFrame;
 @end
 
-@implementation JARVISCaptureDelegate
+@implementation JARVISOneshotDelegate
 
 - (instancetype)init {
     self = [super init];
@@ -257,7 +257,7 @@ public:
             }
 
             // Create capture delegate
-            JARVISCaptureDelegate *delegate = [[JARVISCaptureDelegate alloc] init];
+            JARVISOneshotDelegate *delegate = [[JARVISOneshotDelegate alloc] init];
 
             // Create stream
             NSError *error = nil;
