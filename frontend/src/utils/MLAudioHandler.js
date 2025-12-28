@@ -549,6 +549,10 @@ class MLAudioHandler {
             case 'show_system_settings':
                 return this.showSystemSettings(action.params);
 
+            case 'network_retry':
+                // Network error recovery with exponential backoff
+                return await this.handleNetworkRetry(action.params, recognition);
+
             default:
                 console.warn('Unknown strategy action:', action.type);
                 return { success: false };
@@ -927,6 +931,138 @@ class MLAudioHandler {
             return {
                 success: false,
                 message: 'Audio context restart failed'
+            };
+        }
+    }
+
+    async handleNetworkRetry(params, recognition) {
+        /**
+         * Handle network error recovery with intelligent retry logic.
+         *
+         * Implements:
+         * - Exponential backoff delay
+         * - Maximum retry limit
+         * - Circuit breaker integration
+         * - Connection health monitoring
+         */
+        const { delay = 1000, max_retries = 3, retry_count = 0 } = params;
+
+        console.log(`[ML Audio] Network retry strategy: attempt ${retry_count + 1}/${max_retries}, delay ${delay}ms`);
+
+        // Check if we've exceeded retry limit
+        if (retry_count >= max_retries) {
+            console.warn('[ML Audio] Max network retries exceeded');
+            return {
+                success: false,
+                message: 'Maximum network retry attempts exceeded',
+                needsManualIntervention: true
+            };
+        }
+
+        try {
+            // Stop current recognition
+            if (recognition && recognition.stop) {
+                try {
+                    recognition.stop();
+                } catch (e) {
+                    // Recognition may already be stopped
+                    console.debug('[ML Audio] Recognition already stopped');
+                }
+            }
+
+            // Wait for specified delay (exponential backoff from backend)
+            await new Promise(resolve => setTimeout(resolve, delay));
+
+            // Verify network connectivity before restarting
+            const isOnline = navigator.onLine;
+            if (!isOnline) {
+                console.warn('[ML Audio] Network still offline, waiting...');
+
+                // Wait for online event (max 5 seconds)
+                const waitForOnline = new Promise((resolve, reject) => {
+                    const timeout = setTimeout(() => {
+                        window.removeEventListener('online', onlineHandler);
+                        reject(new Error('Network timeout'));
+                    }, 5000);
+
+                    const onlineHandler = () => {
+                        clearTimeout(timeout);
+                        window.removeEventListener('online', onlineHandler);
+                        resolve();
+                    };
+
+                    window.addEventListener('online', onlineHandler);
+                });
+
+                try {
+                    await waitForOnline;
+                    console.log('[ML Audio] Network came back online');
+                } catch {
+                    return {
+                        success: false,
+                        message: 'Network still offline after timeout',
+                        shouldRetry: retry_count + 1 < max_retries
+                    };
+                }
+            }
+
+            // Restart recognition
+            if (recognition && recognition.start) {
+                try {
+                    recognition.start();
+
+                    this.sendTelemetry('recovery', {
+                        method: 'network_retry',
+                        success: true,
+                        retry_count: retry_count + 1,
+                        delay
+                    });
+
+                    return {
+                        success: true,
+                        message: `Network recovery successful after ${retry_count + 1} attempts`,
+                        retry_count: retry_count + 1
+                    };
+                } catch (startError) {
+                    console.error('[ML Audio] Failed to restart recognition:', startError);
+
+                    // If this wasn't the last retry, suggest retrying
+                    if (retry_count + 1 < max_retries) {
+                        return {
+                            success: false,
+                            message: 'Failed to restart recognition, will retry',
+                            shouldRetry: true,
+                            retry_count: retry_count + 1
+                        };
+                    }
+
+                    return {
+                        success: false,
+                        message: 'Failed to restart recognition after all retries',
+                        needsManualIntervention: true
+                    };
+                }
+            }
+
+            return {
+                success: false,
+                message: 'Recognition object not available'
+            };
+
+        } catch (error) {
+            console.error('[ML Audio] Network retry error:', error);
+
+            this.sendTelemetry('recovery', {
+                method: 'network_retry',
+                success: false,
+                retry_count: retry_count + 1,
+                error: error.message
+            });
+
+            return {
+                success: false,
+                message: `Network retry failed: ${error.message}`,
+                shouldRetry: retry_count + 1 < max_retries
             };
         }
     }
