@@ -1,5 +1,5 @@
 # Fixed requirements for M1 Mac with Python 3.12
-fastapi==0.120.2
+fastapi==0.128.0
 uvicorn[standard]==0.27.0
 transformers>=4.36.0
 torch>=2.0.0
