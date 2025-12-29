@@ -2982,6 +2982,72 @@ class UnifiedCommandProcessor:
 
                 command_lower = command_text.lower()
 
+                # =====================================================================
+                # ROOT CAUSE FIX: Grammar-Based Intent Routing v3.0.0
+                # =====================================================================
+                # PROBLEM: Hardcoded phrase lists ("all chrome", "all safari") are brittle
+                # - Fails for new apps (Arc, VSCode, Discord, etc.)
+                # - Requires manual updates for every new application
+                #
+                # SOLUTION: Grammar-Based Routing using Regex
+                # - Matches sentence STRUCTURE, not specific words
+                # - Works for ANY application dynamically
+                # - Zero hardcoding of app names
+                #
+                # CLINICAL-GRADE PATTERN: Grammar-Based Slot Filling
+                # - Inspired by production voice assistants (Siri, Alexa)
+                # - Uses regex to extract grammatical structure
+                # - Supports ANY app without pre-configuration
+                # =====================================================================
+                import re
+
+                # Dynamic Grammar Pattern (Environment-Configurable)
+                # Pattern: \b(QUANTIFIER)\s+(?:[APP_NAME]\s+)?(TARGET_TYPE)\b
+                #
+                # Matches: "all [APP] windows", "every [APP] tab", "each [APP] instance"
+                #
+                # ✅ EXAMPLES THAT NOW WORK UNIVERSALLY (Zero Hardcoding):
+                #
+                #   Browser Apps:
+                #   - "watch all Chrome windows for bouncing ball" ✓
+                #   - "monitor every Arc tab for error message" ✓
+                #   - "track each Safari window for download complete" ✓
+                #   - "watch all Firefox tabs for login success" ✓
+                #   - "scan all Brave windows for notification" ✓
+                #
+                #   Developer Apps:
+                #   - "watch all VSCode windows for build complete" ✓
+                #   - "monitor every Terminal instance for deployment done" ✓
+                #   - "track all IntelliJ windows for test passed" ✓
+                #   - "watch each PyCharm tab for debug breakpoint" ✓
+                #   - "monitor all Xcode windows for compile success" ✓
+                #
+                #   Communication Apps:
+                #   - "watch all Slack windows for Derek mentioned" ✓
+                #   - "monitor every Discord tab for new message" ✓
+                #   - "track all Teams windows for meeting started" ✓
+                #   - "watch each Zoom window for participant joined" ✓
+                #
+                #   Creative Apps:
+                #   - "watch all Figma tabs for comment added" ✓
+                #   - "monitor every Photoshop window for export complete" ✓
+                #   - "track all Canva windows for download ready" ✓
+                #
+                #   ANY Other App:
+                #   - "watch all Spotify windows for song title" ✓
+                #   - "monitor every Notes tab for save complete" ✓
+                #   - "track each Calendar window for event reminder" ✓
+                #
+                # Grammar Pattern Components:
+                # - (all|every|each) = Quantifier (God Mode trigger)
+                # - (?:[\w\s]+\s+)? = Optional app name (ANY words)
+                # - (windows?|tabs?|instances?|spaces?) = Target type
+                #
+                god_mode_pattern = os.getenv(
+                    "JARVIS_GOD_MODE_GRAMMAR_PATTERN",
+                    r"\b(all|every|each)\s+(?:[\w\s]+\s+)?(windows?|tabs?|instances?|spaces?)\b"
+                )
+
                 # Intelligent pattern matching:
                 # - Must have monitoring keyword AND surveillance structure
                 # - Examples: "watch Chrome FOR ball", "monitor windows WHEN error"
@@ -2989,19 +3055,24 @@ class UnifiedCommandProcessor:
                 has_surveillance_structure = any(p in command_lower for p in surveillance_patterns)
                 is_surveillance_command = has_monitoring_keyword and has_surveillance_structure
 
-                # Additional heuristic: Multi-window/app monitoring
-                # "watch all Chrome windows" implies surveillance even without "for"
-                has_multi_target = any(phrase in command_lower for phrase in [
-                    "all windows", "all chrome", "all safari", "every window",
-                    "each window", "multiple windows"
-                ])
+                # Grammar-Based Multi-Target Detection (ROBUST!)
+                # No hardcoded app names - matches grammatical structure
+                has_multi_target = bool(re.search(god_mode_pattern, command_lower, re.IGNORECASE))
+
+                # If monitoring keyword + grammar pattern detected = surveillance
                 if has_monitoring_keyword and has_multi_target:
                     is_surveillance_command = True
 
+                # Extract grammar match details for logging
+                grammar_match = re.search(god_mode_pattern, command_lower, re.IGNORECASE)
+                grammar_matched_text = grammar_match.group(0) if grammar_match else None
+
                 logger.debug(
-                    f"[INTENT] Disambiguation: monitoring_keyword={has_monitoring_keyword}, "
+                    f"[INTENT] Grammar-Based Disambiguation v3.0.0: "
+                    f"monitoring_keyword={has_monitoring_keyword}, "
                     f"surveillance_structure={has_surveillance_structure}, "
                     f"multi_target={has_multi_target}, "
+                    f"grammar_match='{grammar_matched_text}', "
                     f"is_surveillance={is_surveillance_command}"
                 )
 
@@ -3009,10 +3080,16 @@ class UnifiedCommandProcessor:
                     # =====================================================================
                     # SURVEILLANCE INTENT: Route to IntelligentCommandHandler
                     # =====================================================================
-                    logger.info(
-                        f"[UNIFIED] 👁️ Surveillance Intent Detected: '{command_text}' "
-                        f"-> Routing to Neural Mesh (VisualMonitorAgent)"
-                    )
+                    if grammar_matched_text:
+                        logger.info(
+                            f"[UNIFIED] 👁️ Surveillance Intent Detected (Grammar: '{grammar_matched_text}'): "
+                            f"'{command_text}' -> Routing to Neural Mesh (VisualMonitorAgent)"
+                        )
+                    else:
+                        logger.info(
+                            f"[UNIFIED] 👁️ Surveillance Intent Detected: '{command_text}' "
+                            f"-> Routing to Neural Mesh (VisualMonitorAgent)"
+                        )
 
                     try:
                         # Lazy import to avoid circular dependencies
@@ -3033,12 +3110,15 @@ class UnifiedCommandProcessor:
                                 "command_type": "surveillance"
                             }
 
-                        # Add intent metadata
+                        # Add intent metadata with grammar-based routing details
                         result["intent_disambiguation"] = {
                             "detected_intent": "surveillance",
                             "routed_to": "IntelligentCommandHandler->VisualMonitorAgent",
+                            "routing_method": "grammar-based_v3.0.0",
                             "keywords_matched": [k for k in monitoring_keywords if k in command_lower],
                             "patterns_matched": [p for p in surveillance_patterns if p in command_lower],
+                            "grammar_match": grammar_matched_text,  # NEW: Grammar pattern matched
+                            "god_mode_detected": has_multi_target,  # NEW: Multi-target flag
                         }
 
                         logger.info(
