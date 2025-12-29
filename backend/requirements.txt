@@ -35,7 +35,7 @@ noisereduce==3.0.3
 librosa==0.10.1
 numba==0.58.1  # Required by librosa
 audioread==3.0.1
-resampy==0.4.2
+resampy==0.4.3
 
 # Automation dependencies
 icalendar==5.0.11
