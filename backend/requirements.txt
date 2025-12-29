@@ -14,7 +14,7 @@ en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_
 # Voice dependencies
 openai-whisper==20231117
 sounddevice==0.4.6
-soundfile==0.12.1
+soundfile==0.13.1
 pydub==0.25.1
 pyaudio==0.2.14
 gtts==2.5.4
