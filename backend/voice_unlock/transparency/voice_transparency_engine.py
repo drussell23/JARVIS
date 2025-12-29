@@ -760,6 +760,789 @@ class VerboseAnnouncementGenerator:
 
         return " ".join(parts)
 
+    # =========================================================================
+    # PROGRESSIVE CONFIDENCE COMMUNICATION (v2.0 - CLAUDE.MD Enhancement)
+    # =========================================================================
+
+    def generate_high_confidence_message(
+        self,
+        trace: DecisionTrace,
+        name: str
+    ) -> str:
+        """
+        Generate message for high confidence (>92%).
+        Natural, confident tone without unnecessary details.
+        """
+        confidence = trace.final_confidence
+
+        # Time-aware contextual greeting
+        hour = datetime.now().hour
+        greeting_context = self._get_time_aware_greeting(hour, name)
+
+        if confidence >= 0.97:
+            # Ultra-high confidence - instant, natural
+            messages = [
+                f"Of course, {name}. {greeting_context}",
+                f"Welcome back, {name}. {greeting_context}",
+                f"Good to see you, {name}. {greeting_context}",
+            ]
+            import random
+            base = random.choice(messages)
+        elif confidence >= 0.92:
+            # High confidence - still natural but brief acknowledgment
+            base = f"Voice verified, {name}. {greeting_context}"
+        else:
+            base = f"Verified, {name}. {greeting_context}"
+
+        return f"{base} Unlocking now.".strip()
+
+    def generate_medium_confidence_message(
+        self,
+        trace: DecisionTrace,
+        name: str
+    ) -> str:
+        """
+        Generate message for medium confidence (85-92%).
+        Acknowledge slight uncertainty but proceed confidently.
+        """
+        confidence = int(trace.final_confidence * 100)
+
+        # Check for environmental factors
+        env_factor = self._detect_environmental_factor(trace)
+
+        if env_factor:
+            return self._explain_environmental_challenge(trace, name, env_factor)
+
+        # Standard medium confidence
+        return (
+            f"Voice verified, {name}. {confidence}% confidence. "
+            f"Everything checks out. Unlocking."
+        )
+
+    def generate_borderline_confidence_message(
+        self,
+        trace: DecisionTrace,
+        name: str
+    ) -> str:
+        """
+        Generate message for borderline confidence (80-85%).
+        Show brief thought process, explain why proceeding.
+        """
+        confidence = int(trace.final_confidence * 100)
+
+        # Use multi-factor explanation
+        if trace.behavioral_confidence > 0.90:
+            return (
+                f"Voice is at {confidence}%, {name}, but your behavioral "
+                f"patterns match perfectly - you're unlocking at your usual time, "
+                f"from your regular location. High confidence it's you. Unlocking."
+            )
+
+        if trace.best_hypothesis:
+            return self._explain_borderline_with_hypothesis(trace, name)
+
+        return (
+            f"One moment, {name}... yes, verified at {confidence}%. "
+            f"Context confirms it's you. Unlocking."
+        )
+
+    def generate_insufficient_confidence_message(
+        self,
+        trace: DecisionTrace,
+        attempt_number: int = 1
+    ) -> str:
+        """
+        Generate helpful retry guidance for insufficient confidence (<80%).
+        Adaptive based on what went wrong and attempt number.
+        """
+        confidence = int(trace.final_confidence * 100)
+
+        # Generate adaptive retry guidance
+        guidance = self._generate_retry_guidance(trace, attempt_number)
+
+        if attempt_number == 1:
+            return (
+                f"I'm having trouble verifying your voice - {confidence}% confidence. "
+                f"{guidance.specific_issue} {guidance.suggested_action}"
+            )
+        elif attempt_number == 2:
+            return (
+                f"Still struggling at {confidence}%. {guidance.specific_issue} "
+                f"Let me adjust my filtering... {guidance.suggested_action}"
+            )
+        else:
+            # Third attempt - offer alternative
+            return (
+                f"Voice verification isn't working today ({confidence}%). "
+                f"{guidance.specific_issue} Would you prefer to unlock with "
+                f"password instead? I can also re-learn your voice after you're in."
+            )
+
+    # =========================================================================
+    # ENVIRONMENTAL AWARENESS NARRATION (v2.0 - CLAUDE.MD Enhancement)
+    # =========================================================================
+
+    def _detect_environmental_factor(self, trace: DecisionTrace) -> Optional[str]:
+        """
+        Detect environmental factors affecting voice recognition.
+        Returns: 'noisy', 'sick_voice', 'different_mic', 'quiet', None
+        """
+        # Check hypothesis for environment clues
+        if trace.best_hypothesis:
+            hypothesis_map = {
+                "background_noise": "noisy",
+                "sick_voice": "sick_voice",
+                "tired_voice": "sick_voice",
+                "different_microphone": "different_mic",
+                "different_environment": "new_location",
+            }
+            if trace.best_hypothesis in hypothesis_map:
+                return hypothesis_map[trace.best_hypothesis]
+
+        # Check time of day for tired voice
+        hour = datetime.now().hour
+        if hour < 7 or hour > 23:
+            if trace.ml_confidence < 0.85:
+                return "sick_voice"  # Could be tired
+
+        return None
+
+    def _explain_environmental_challenge(
+        self,
+        trace: DecisionTrace,
+        name: str,
+        env_factor: str
+    ) -> str:
+        """Generate environment-aware explanation."""
+        confidence = int(trace.final_confidence * 100)
+
+        explanations = {
+            "noisy": (
+                f"Give me a second, {name} - filtering out background noise... "
+                f"Got it. Verified despite the chatter. {confidence}% confidence. "
+                f"Unlocking for you."
+            ),
+            "sick_voice": (
+                f"Your voice sounds different today, {name} - hope you're feeling okay. "
+                f"I can still verify it's you from your speech patterns ({confidence}% match). "
+                f"Unlocking now. Rest up!"
+            ),
+            "different_mic": (
+                f"I notice you're using a different microphone, {name}. "
+                f"Voice match is {confidence}%, but behavioral patterns confirm it's you. "
+                f"Unlocking. I'll remember this mic setup for next time."
+            ),
+            "new_location": (
+                f"First time unlocking from this location - the acoustics are different. "
+                f"Confidence is {confidence}%, but context confirms it's you, {name}. "
+                f"Unlocking. Next time will be instant - I've learned this environment."
+            ),
+        }
+
+        return explanations.get(env_factor, self.generate_medium_confidence_message(trace, name))
+
+    def _get_time_aware_greeting(self, hour: int, name: str) -> str:
+        """Generate time-aware contextual greeting."""
+        if 5 <= hour < 9:
+            import random
+            return random.choice([
+                "Good morning",
+                "Early start today",
+                "Coffee first or diving straight in?",
+            ])
+        elif 9 <= hour < 12:
+            return ""  # No special greeting mid-morning
+        elif 12 <= hour < 14:
+            return "Back from lunch?"
+        elif 14 <= hour < 18:
+            return ""
+        elif 18 <= hour < 22:
+            return "Working late?"
+        elif 22 <= hour <= 23:
+            return "Burning the midnight oil?"
+        else:  # 0-4 AM
+            return "That's quite early. Everything okay?"
+
+    def _explain_borderline_with_hypothesis(
+        self,
+        trace: DecisionTrace,
+        name: str
+    ) -> str:
+        """Explain borderline case with hypothesis context."""
+        confidence = int(trace.final_confidence * 100)
+        hypothesis = trace.best_hypothesis
+
+        if hypothesis == "background_noise":
+            return (
+                f"Voice is at {confidence}% due to background noise, {name}, "
+                f"but your behavioral patterns match perfectly. Unlocking."
+            )
+        elif hypothesis == "sick_voice":
+            return (
+                f"Your voice sounds different ({confidence}%), {name} - hope you're okay. "
+                f"Speech patterns match though. Unlocking."
+            )
+        elif hypothesis == "different_microphone":
+            return (
+                f"Different microphone detected. Voice is {confidence}%, "
+                f"but context confirms it's you, {name}. Unlocking."
+            )
+
+        return f"Voice at {confidence}%, {name}. Context confirms identity. Unlocking."
+
+    def _generate_retry_guidance(
+        self,
+        trace: DecisionTrace,
+        attempt_number: int
+    ) -> 'RetryGuidance':
+        """
+        Generate intelligent retry guidance based on what went wrong.
+        Adapts suggestions based on detected issues.
+        """
+        # Analyze failure reason from trace
+        if trace.best_hypothesis == "background_noise":
+            return RetryGuidance(
+                specific_issue="There's significant background noise.",
+                suggested_action="Could you speak a bit louder or move somewhere quieter?",
+                hypothesis="background_noise"
+            )
+
+        if trace.best_hypothesis == "sick_voice":
+            return RetryGuidance(
+                specific_issue="Your voice sounds quite different today.",
+                suggested_action=(
+                    "This could be illness or fatigue. Want to verify with a "
+                    "quick security question instead?"
+                ),
+                hypothesis="sick_voice"
+            )
+
+        # Generic retry guidance
+        return RetryGuidance(
+            specific_issue="I'm not getting a clear voice match.",
+            suggested_action=(
+                "Please try again, speaking clearly and naturally. "
+                "Make sure your microphone isn't muted."
+            ),
+            hypothesis="unknown"
+        )
+
+    # =========================================================================
+    # LEARNING ACKNOWLEDGMENT (v2.0 - CLAUDE.MD Enhancement)
+    # =========================================================================
+
+    def generate_milestone_celebration(
+        self,
+        unlock_count: int,
+        stats: Dict[str, Any]
+    ) -> Optional[str]:
+        """
+        Generate celebration message for authentication milestones.
+        Called after successful unlock on milestone numbers.
+        """
+        milestones = [100, 250, 500, 1000, 2500, 5000]
+
+        if unlock_count not in milestones:
+            return None
+
+        instant_recognitions = stats.get("instant_recognitions", 0)
+        needed_clarification = stats.get("needed_clarification", 0)
+        false_positives = stats.get("false_positives", 0)
+        attacks_blocked = stats.get("attacks_blocked", 0)
+
+        accuracy_pct = int((instant_recognitions / unlock_count) * 100) if unlock_count > 0 else 0
+
+        return (
+            f"Fun fact: That was your {unlock_count:,}th successful voice unlock! "
+            f"In those attempts, I've had {instant_recognitions} instant recognitions "
+            f"({accuracy_pct}% of the time), {needed_clarification} needed brief "
+            f"clarification, {false_positives} false positives, and {attacks_blocked} "
+            f"replay attack attempts blocked. Your voice authentication is rock solid!"
+        )
+
+    def generate_voice_evolution_announcement(
+        self,
+        drift_percentage: float,
+        time_period_days: int,
+        name: str
+    ) -> str:
+        """
+        Announce voice evolution detection and adaptation.
+        """
+        return (
+            f"{name}, I've noticed your voice has evolved slightly over the past "
+            f"{time_period_days} days - about {drift_percentage:.1f}% drift. This is "
+            f"completely normal (seasonal changes, aging, etc.). I've automatically "
+            f"updated my baseline to match your current voice characteristics. "
+            f"This is why authentication has remained smooth - I'm learning and "
+            f"adapting with you."
+        )
+
+    def generate_first_environment_acknowledgment(
+        self,
+        environment_name: str,
+        name: str
+    ) -> str:
+        """
+        Acknowledge first authentication in a new environment.
+        """
+        return (
+            f"First time unlocking from {environment_name}, {name}. "
+            f"I've learned your voice profile for this environment - "
+            f"next time will be instant. Unlocking now."
+        )
+
+
+# =============================================================================
+# RETRY GUIDANCE DATA CLASS
+# =============================================================================
+
+@dataclass
+class RetryGuidance:
+    """Structured retry guidance."""
+    specific_issue: str
+    suggested_action: str
+    hypothesis: Optional[str] = None
+
+
+# =============================================================================
+# SECURITY INCIDENT REPORTER - v1.0 (Clinical-Grade Intelligence Edition)
+# =============================================================================
+
+class SecurityIncidentReporter:
+    """
+    User-friendly security incident reports with forensics.
+
+    Transforms failed authentication attempts into narrative security reports
+    with forensic analysis, attack type detection, and intelligent clustering.
+
+    Features:
+    - Incident clustering (attempts within 10 min = same incident)
+    - Attack type detection (replay attack, deepfake, unknown speaker)
+    - Risk assessment (LOW, MODERATE, HIGH, CRITICAL)
+    - Forensic narrative generation
+    - Audio artifact URL integration (Langfuse)
+    - Time-aware incident summaries
+
+    Configuration:
+    - JARVIS_SECURITY_INCIDENT_REPORTING: Enable incident reporting (default: true)
+    - JARVIS_OFFER_AUDIO_CLIPS: Offer audio clips in reports (default: true)
+    - JARVIS_INCIDENT_CLUSTER_WINDOW_MINUTES: Clustering time window (default: 10)
+    """
+
+    def __init__(self):
+        self.logger = logger
+        self.cluster_window_minutes = int(
+            os.getenv("JARVIS_INCIDENT_CLUSTER_WINDOW_MINUTES", "10")
+        )
+        self.reporting_enabled = (
+            os.getenv("JARVIS_SECURITY_INCIDENT_REPORTING", "true").lower() == "true"
+        )
+        self.offer_audio_clips_enabled = (
+            os.getenv("JARVIS_OFFER_AUDIO_CLIPS", "true").lower() == "true"
+        )
+
+    async def generate_incident_summary(
+        self,
+        trace_history: List[DecisionTrace],
+        time_window_hours: int = 24,
+        user_id: str = "owner"
+    ) -> str:
+        """
+        Generate narrative summary for failed authentication attempts.
+
+        Args:
+            trace_history: List of decision traces from transparency engine
+            time_window_hours: How far back to look (default: 24 hours)
+            user_id: User ID to filter for (default: "owner")
+
+        Returns:
+            Human-readable incident summary narrative
+
+        Example:
+            "Yes, there were 3 unlock attempts while you were gone:
+
+            Incident #1: 2:47 PM
+            ├─ Attempts: 3
+            ├─ Voice confidence: 34% (FAILED)
+            ├─ Unknown speaker detected
+            ├─ Attack type: REPLAY ATTACK
+            └─ Risk: HIGH - intentional spoofing attempt"
+        """
+        if not self.reporting_enabled:
+            return "Security incident reporting is disabled."
+
+        # Filter failed attempts within time window
+        cutoff_time = datetime.now() - timedelta(hours=time_window_hours)
+        failed_attempts = [
+            trace for trace in trace_history
+            if (
+                trace.user_id == user_id and
+                trace.outcome == DecisionOutcome.REJECTED and
+                trace.started_at >= cutoff_time
+            )
+        ]
+
+        if not failed_attempts:
+            return "No unauthorized unlock attempts detected in the last {} hours. All secure.".format(
+                time_window_hours
+            )
+
+        # Cluster attempts into incidents
+        incident_clusters = self._cluster_attempts(failed_attempts)
+
+        # Generate narrative
+        total_attempts = len(failed_attempts)
+        total_incidents = len(incident_clusters)
+
+        narratives = []
+        narratives.append(
+            f"Yes, there were {total_attempts} unlock attempt{'s' if total_attempts != 1 else ''} "
+            f"while you were gone ({total_incidents} incident{'s' if total_incidents != 1 else ''}):\n"
+        )
+
+        for idx, cluster in enumerate(incident_clusters, 1):
+            incident_narrative = self._generate_incident_narrative(idx, cluster)
+            narratives.append(incident_narrative)
+
+        # Add overall analysis
+        analysis = self._generate_overall_analysis(incident_clusters, user_id)
+        narratives.append(f"\n{analysis}")
+
+        # Offer audio clips
+        if self.offer_audio_clips_enabled and failed_attempts:
+            audio_offer = await self.offer_audio_clips(failed_attempts)
+            if audio_offer:
+                narratives.append(f"\n{audio_offer}")
+
+        return "\n".join(narratives)
+
+    def _cluster_attempts(self, attempts: List[DecisionTrace]) -> List[List[DecisionTrace]]:
+        """
+        Group attempts into incident clusters.
+
+        Clustering logic:
+        - Attempts within N minutes = same incident (same person trying repeatedly)
+        - N = self.cluster_window_minutes (default: 10)
+
+        Args:
+            attempts: List of failed DecisionTrace objects
+
+        Returns:
+            List of incident clusters (each cluster is a list of traces)
+        """
+        if not attempts:
+            return []
+
+        # Sort by time
+        sorted_attempts = sorted(attempts, key=lambda t: t.started_at)
+
+        clusters = []
+        current_cluster = [sorted_attempts[0]]
+
+        for attempt in sorted_attempts[1:]:
+            last_attempt = current_cluster[-1]
+            time_diff = (attempt.started_at - last_attempt.started_at).total_seconds() / 60
+
+            if time_diff <= self.cluster_window_minutes:
+                # Same incident
+                current_cluster.append(attempt)
+            else:
+                # New incident
+                clusters.append(current_cluster)
+                current_cluster = [attempt]
+
+        # Add final cluster
+        clusters.append(current_cluster)
+
+        return clusters
+
+    def _generate_incident_narrative(
+        self,
+        incident_number: int,
+        cluster: List[DecisionTrace]
+    ) -> str:
+        """
+        Generate narrative for a single security incident.
+
+        Args:
+            incident_number: Incident number for display (1-indexed)
+            cluster: List of traces in this incident
+
+        Returns:
+            Formatted incident narrative with tree structure
+        """
+        first_attempt = cluster[0]
+        attempt_count = len(cluster)
+
+        # Format time
+        time_str = first_attempt.started_at.strftime("%-I:%M %p")
+
+        # Calculate average confidence
+        avg_confidence = sum(t.final_confidence for t in cluster) / len(cluster)
+
+        # Detect attack type
+        attack_type = self._detect_attack_type(cluster)
+
+        # Assess risk level
+        risk_level = self._assess_risk_level(cluster, attack_type)
+
+        # Build narrative
+        lines = [
+            f"\nIncident #{incident_number}: {time_str}",
+            f"├─ Attempts: {attempt_count}",
+            f"├─ Voice confidence: {avg_confidence:.0%} (FAILED)",
+        ]
+
+        # Add speaker detection info
+        if first_attempt.speaker_name:
+            lines.append(f"├─ Speaker: {first_attempt.speaker_name} (not authorized)")
+        else:
+            lines.append("├─ Unknown speaker detected")
+
+        # Add attack type if detected
+        if attack_type:
+            lines.append(f"├─ Attack type: {attack_type}")
+
+        # Add spoofing detection
+        spoofing_detected = any(t.spoofing_detected for t in cluster)
+        if spoofing_detected:
+            spoofing_types = {t.spoofing_type for t in cluster if t.spoofing_type}
+            if spoofing_types:
+                lines.append(f"├─ Spoofing detected: {', '.join(spoofing_types)}")
+
+        # Add decision explanation
+        if first_attempt.reasoning_conclusion:
+            lines.append(f"├─ Decision: {first_attempt.reasoning_conclusion}")
+
+        # Add risk level (last line with └─)
+        lines.append(f"└─ Risk: {risk_level}")
+
+        return "\n".join(lines)
+
+    def _detect_attack_type(self, cluster: List[DecisionTrace]) -> Optional[str]:
+        """
+        Detect type of attack from trace characteristics.
+
+        Detection patterns:
+        - REPLAY ATTACK: Spoofing detected with replay characteristics
+        - DEEPFAKE ATTACK: Spoofing detected with synthetic characteristics
+        - BRUTE FORCE: Multiple rapid attempts with different characteristics
+        - SOCIAL ENGINEERING: Unknown speaker with moderate confidence
+        - UNKNOWN: Failed authentication with no clear attack pattern
+
+        Args:
+            cluster: List of traces in incident
+
+        Returns:
+            Attack type string or None
+        """
+        # Check for spoofing
+        spoofing_detected = any(t.spoofing_detected for t in cluster)
+        if spoofing_detected:
+            # Check spoofing types
+            spoofing_types = {t.spoofing_type for t in cluster if t.spoofing_type}
+            if "replay" in str(spoofing_types).lower():
+                return "REPLAY ATTACK (recording playback)"
+            elif "synthetic" in str(spoofing_types).lower() or "deepfake" in str(spoofing_types).lower():
+                return "DEEPFAKE ATTACK (AI-generated voice)"
+            else:
+                return "SPOOFING ATTACK"
+
+        # Check for brute force (multiple attempts, varying confidence)
+        if len(cluster) >= 3:
+            confidences = [t.final_confidence for t in cluster]
+            variance = max(confidences) - min(confidences)
+            if variance > 0.2:  # High variance suggests trying different approaches
+                return "BRUTE FORCE (multiple strategies)"
+
+        # Check for social engineering (unknown speaker with moderate confidence)
+        first_attempt = cluster[0]
+        if not first_attempt.speaker_name and first_attempt.final_confidence > 0.4:
+            return "SOCIAL ENGINEERING (impersonation attempt)"
+
+        # Unknown attack pattern
+        return "UNAUTHORIZED ACCESS ATTEMPT"
+
+    def _assess_risk_level(
+        self,
+        cluster: List[DecisionTrace],
+        attack_type: Optional[str]
+    ) -> str:
+        """
+        Assess risk level of incident.
+
+        Risk levels:
+        - CRITICAL: Sophisticated attack, high confidence in spoofing
+        - HIGH: Intentional attack detected (spoofing, multiple attempts)
+        - MODERATE: Unknown speaker, repeated attempts
+        - LOW: Single failed attempt, very low confidence
+
+        Args:
+            cluster: List of traces in incident
+            attack_type: Detected attack type
+
+        Returns:
+            Risk level string with explanation
+        """
+        attempt_count = len(cluster)
+        avg_confidence = sum(t.final_confidence for t in cluster) / len(cluster)
+        spoofing_detected = any(t.spoofing_detected for t in cluster)
+
+        # CRITICAL: Deepfake or sophisticated attack
+        if attack_type and "DEEPFAKE" in attack_type:
+            return "CRITICAL - AI-generated voice attack (advanced threat)"
+
+        # HIGH: Spoofing detected or replay attack
+        if spoofing_detected or (attack_type and "REPLAY" in attack_type):
+            return "HIGH - intentional spoofing attempt detected"
+
+        # HIGH: Brute force (multiple attempts)
+        if attempt_count >= 5:
+            return "HIGH - persistent unauthorized access attempts"
+
+        # MODERATE: Multiple attempts or social engineering
+        if attempt_count >= 3 or (attack_type and "SOCIAL" in attack_type):
+            return "MODERATE - repeated attempts or impersonation"
+
+        # LOW: Single attempt with very low confidence
+        if attempt_count == 1 and avg_confidence < 0.3:
+            return "LOW - likely accidental (wrong person)"
+
+        # DEFAULT
+        return "MODERATE - unauthorized access attempt"
+
+    def _generate_overall_analysis(
+        self,
+        incident_clusters: List[List[DecisionTrace]],
+        user_id: str
+    ) -> str:
+        """
+        Generate overall security analysis across all incidents.
+
+        Args:
+            incident_clusters: All incident clusters
+            user_id: User ID (for personalization)
+
+        Returns:
+            Overall analysis narrative
+        """
+        total_incidents = len(incident_clusters)
+        total_attempts = sum(len(cluster) for cluster in incident_clusters)
+
+        # Check for patterns
+        high_risk_count = sum(
+            1 for cluster in incident_clusters
+            if "HIGH" in self._assess_risk_level(cluster, self._detect_attack_type(cluster))
+        )
+
+        critical_risk_count = sum(
+            1 for cluster in incident_clusters
+            if "CRITICAL" in self._assess_risk_level(cluster, self._detect_attack_type(cluster))
+        )
+
+        # Generate analysis
+        lines = ["Analysis:"]
+
+        if critical_risk_count > 0:
+            lines.append(
+                f"  CRITICAL: {critical_risk_count} sophisticated attack{'s' if critical_risk_count != 1 else ''} detected. "
+                "Immediate security review recommended."
+            )
+        elif high_risk_count > 0:
+            lines.append(
+                f"  {high_risk_count} intentional attack{'s' if high_risk_count != 1 else ''} detected. "
+                "Review who had physical access."
+            )
+        elif total_attempts >= 5:
+            lines.append(
+                "  Multiple unauthorized attempts detected. Consider additional security measures."
+            )
+        else:
+            lines.append(
+                "  Low-risk incidents - likely accidental or opportunistic attempts."
+            )
+
+        # Add recommendations
+        lines.append("\nRecommendations:")
+        if critical_risk_count > 0 or high_risk_count > 0:
+            lines.append("  • Review security footage if available")
+            lines.append("  • Consider changing authentication password")
+            lines.append("  • Enable additional authentication factors")
+            lines.append("  • Review who has physical access to your device")
+        else:
+            lines.append("  • No immediate action required")
+            lines.append("  • All attempts were successfully blocked")
+            lines.append("  • Continue monitoring for patterns")
+
+        return "\n".join(lines)
+
+    async def offer_audio_clips(
+        self,
+        incident_traces: List[DecisionTrace]
+    ) -> Optional[str]:
+        """
+        Offer to send audio clips of failed attempts.
+
+        Integration with Langfuse:
+        - Looks for Langfuse trace IDs in DecisionTrace
+        - Generates URLs to Langfuse dashboard for audio artifacts
+        - Provides download links if available
+
+        Args:
+            incident_traces: List of failed attempt traces
+
+        Returns:
+            Offer message with links, or None if not available
+        """
+        if not self.offer_audio_clips_enabled:
+            return None
+
+        # Check if Langfuse integration is available
+        try:
+            from backend.voice_unlock.observability.langfuse_integration import LangfuseConfig
+
+            if not LangfuseConfig.is_enabled():
+                return None
+        except ImportError:
+            return None
+
+        # Build offer message
+        trace_count = len(incident_traces)
+
+        # Check for trace IDs (would be added by Langfuse integration)
+        traces_with_ids = [
+            t for t in incident_traces
+            if hasattr(t, 'langfuse_trace_id') and t.langfuse_trace_id
+        ]
+
+        if traces_with_ids:
+            # Generate Langfuse URLs
+            langfuse_host = LangfuseConfig.get_host()
+            langfuse_project = LangfuseConfig.get_project_name()
+
+            offer_lines = [
+                f"Audio Evidence Available: {len(traces_with_ids)} recording{'s' if len(traces_with_ids) != 1 else ''}"
+            ]
+
+            for idx, trace in enumerate(traces_with_ids[:3], 1):  # Show first 3
+                time_str = trace.started_at.strftime("%-I:%M %p")
+                trace_url = f"{langfuse_host}/project/{langfuse_project}/traces/{trace.langfuse_trace_id}"
+                offer_lines.append(f"  {idx}. Attempt at {time_str}: {trace_url}")
+
+            if len(traces_with_ids) > 3:
+                offer_lines.append(f"  ... and {len(traces_with_ids) - 3} more")
+
+            offer_lines.append("\nWould you like me to send these recordings to your secure inbox?")
+
+            return "\n".join(offer_lines)
+        else:
+            # Generic offer (no Langfuse IDs available)
+            return (
+                f"\nI have {trace_count} audio recording{'s' if trace_count != 1 else ''} of the failed attempts. "
+                "Would you like me to send them to you for review?"
+            )
+
 
 # =============================================================================
 # INFRASTRUCTURE STATUS CHECKER

@@ -1184,6 +1184,517 @@ class VoicePatternMemory:
 
 
 # =============================================================================
+# PERSONAL CONTEXT CHALLENGE GENERATOR - v1.0 (Clinical-Grade Intelligence Edition)
+# =============================================================================
+
+class PersonalContextChallengeGenerator:
+    """
+    Generate personalized challenge questions from behavioral patterns.
+
+    Leverages ChromaDB-stored authentication events and behavioral patterns
+    to create contextual challenge questions that only the real user can answer.
+
+    Features:
+    - Three difficulty levels (Easy, Medium, Hard)
+    - Temporal reasoning (last unlock, recent patterns, activity sequences)
+    - Location-based challenges (where did you unlock from?)
+    - Pattern-based challenges (typical unlock times, device usage)
+    - Natural language responses (fuzzy matching, time tolerance)
+
+    Challenge Types:
+    - EASY: "When did you last unlock?" (within 2 hours tolerance)
+    - MEDIUM: "Where have you been unlocking from this week?" (location patterns)
+    - HARD: "Your last unlock was morning from home. Before that?" (sequence recall)
+
+    Configuration:
+    - JARVIS_CHALLENGE_QUESTIONS: Enable challenge questions (default: true)
+    - JARVIS_CHALLENGE_DIFFICULTY: Default difficulty (easy/medium/hard, default: medium)
+    - JARVIS_CHALLENGE_TIME_TOLERANCE_HOURS: Time answer tolerance (default: 2)
+    """
+
+    def __init__(self, memory: VoicePatternMemory):
+        self.memory = memory
+        self.logger = logger
+        self.enabled = (
+            os.getenv("JARVIS_CHALLENGE_QUESTIONS", "true").lower() == "true"
+        )
+        self.default_difficulty = os.getenv("JARVIS_CHALLENGE_DIFFICULTY", "medium")
+        self.time_tolerance_hours = int(
+            os.getenv("JARVIS_CHALLENGE_TIME_TOLERANCE_HOURS", "2")
+        )
+
+    async def generate_challenge(
+        self,
+        user_id: str = "owner",
+        difficulty: str = "medium"
+    ) -> Dict[str, Any]:
+        """
+        Generate personalized challenge question from user's patterns.
+
+        Args:
+            user_id: User ID for pattern lookup
+            difficulty: Challenge difficulty (easy, medium, hard)
+
+        Returns:
+            Challenge dict with:
+            - question: The challenge question
+            - difficulty: Difficulty level
+            - expected_answer: Expected answer (for verification)
+            - answer_type: Type of answer expected (time, location, sequence)
+            - challenge_id: Unique challenge ID
+
+        Example:
+            {
+                "question": "When did you last unlock your Mac?",
+                "difficulty": "easy",
+                "expected_answer": "2024-01-15 14:30:00",
+                "answer_type": "time",
+                "challenge_id": "chal_abc123"
+            }
+        """
+        if not self.enabled:
+            return {
+                "question": "Challenge questions are disabled",
+                "difficulty": difficulty,
+                "error": "disabled"
+            }
+
+        # Get authentication history
+        try:
+            auth_events = await self.memory.get_authentication_history(
+                user_id=user_id,
+                limit=20,
+                success_only=True
+            )
+
+            if len(auth_events) < 2:
+                return {
+                    "question": "Not enough history to generate challenge",
+                    "difficulty": difficulty,
+                    "error": "insufficient_history"
+                }
+
+            # Route to difficulty-specific generator
+            if difficulty == "easy":
+                return await self._generate_last_unlock_time_challenge(
+                    user_id, auth_events
+                )
+            elif difficulty == "medium":
+                return await self._generate_recent_pattern_challenge(
+                    user_id, auth_events
+                )
+            elif difficulty == "hard":
+                return await self._generate_activity_sequence_challenge(
+                    user_id, auth_events
+                )
+            else:
+                # Default to medium
+                return await self._generate_recent_pattern_challenge(
+                    user_id, auth_events
+                )
+
+        except Exception as e:
+            self.logger.error(f"Challenge generation failed: {e}")
+            return {
+                "question": "Unable to generate challenge question",
+                "difficulty": difficulty,
+                "error": str(e)
+            }
+
+    async def _generate_last_unlock_time_challenge(
+        self,
+        user_id: str,
+        events: List[AuthenticationEventRecord]
+    ) -> Dict[str, Any]:
+        """
+        Generate EASY challenge: "When did you last unlock?"
+
+        Args:
+            user_id: User ID
+            events: Recent authentication events
+
+        Returns:
+            Challenge dict with time-based question
+        """
+        if not events:
+            return {"error": "no_events"}
+
+        # Get most recent unlock
+        last_event = events[0]
+        last_unlock_time = datetime.fromisoformat(last_event.timestamp)
+
+        # Calculate time ago
+        now = datetime.now()
+        time_diff = now - last_unlock_time
+        hours_ago = time_diff.total_seconds() / 3600
+
+        # Format question based on how long ago
+        if hours_ago < 1:
+            minutes_ago = int(time_diff.total_seconds() / 60)
+            time_description = f"about {minutes_ago} minutes ago"
+        elif hours_ago < 24:
+            hours = int(hours_ago)
+            time_description = f"about {hours} hour{'s' if hours != 1 else ''} ago"
+        else:
+            days = int(hours_ago / 24)
+            time_description = f"about {days} day{'s' if days != 1 else ''} ago"
+
+        question = f"For verification: When did you last unlock your Mac? (Hint: It was {time_description})"
+
+        return {
+            "question": question,
+            "difficulty": "easy",
+            "expected_answer": last_unlock_time.isoformat(),
+            "answer_type": "time",
+            "challenge_id": f"time_{user_id}_{int(time.time())}",
+            "tolerance_hours": self.time_tolerance_hours,
+            "hint": time_description
+        }
+
+    async def _generate_recent_pattern_challenge(
+        self,
+        user_id: str,
+        events: List[AuthenticationEventRecord]
+    ) -> Dict[str, Any]:
+        """
+        Generate MEDIUM challenge: "Where have you been unlocking from?"
+
+        Args:
+            user_id: User ID
+            events: Recent authentication events
+
+        Returns:
+            Challenge dict with location/pattern question
+        """
+        # Analyze location patterns from last 7 days
+        week_ago = datetime.now() - timedelta(days=7)
+        recent_events = [
+            e for e in events
+            if datetime.fromisoformat(e.timestamp) >= week_ago
+        ]
+
+        if len(recent_events) < 3:
+            # Fallback to easy challenge
+            return await self._generate_last_unlock_time_challenge(user_id, events)
+
+        # Extract location patterns (network SSIDs from metadata)
+        locations = set()
+        for event in recent_events:
+            metadata = event.metadata or {}
+            location = metadata.get("location", "unknown")
+            network = metadata.get("network_ssid", None)
+
+            if network:
+                locations.add(network)
+            elif location != "unknown":
+                locations.add(location)
+
+        if not locations:
+            # No location data, ask about time pattern instead
+            return await self._generate_time_pattern_challenge(user_id, recent_events)
+
+        # Generate location question
+        location_list = list(locations)
+        if len(location_list) == 1:
+            question = f"Quick verification: You've been unlocking from the same location this week. Where is that?"
+            expected_answer = location_list[0]
+        else:
+            question = f"For verification: You've unlocked from {len(location_list)} different locations this week. Can you name one of them?"
+            expected_answer = "|".join(location_list)  # Accept any
+
+        return {
+            "question": question,
+            "difficulty": "medium",
+            "expected_answer": expected_answer,
+            "answer_type": "location",
+            "challenge_id": f"location_{user_id}_{int(time.time())}",
+            "acceptable_answers": location_list
+        }
+
+    async def _generate_time_pattern_challenge(
+        self,
+        user_id: str,
+        events: List[AuthenticationEventRecord]
+    ) -> Dict[str, Any]:
+        """
+        Generate time pattern challenge (fallback for medium difficulty).
+
+        Args:
+            user_id: User ID
+            events: Recent authentication events
+
+        Returns:
+            Challenge dict about typical unlock times
+        """
+        # Analyze typical unlock hours
+        unlock_hours = []
+        for event in events[:10]:  # Last 10 unlocks
+            event_time = datetime.fromisoformat(event.timestamp)
+            unlock_hours.append(event_time.hour)
+
+        # Find most common hour
+        from collections import Counter
+        hour_counts = Counter(unlock_hours)
+        most_common_hour = hour_counts.most_common(1)[0][0]
+
+        # Format as time period
+        if 5 <= most_common_hour < 9:
+            time_period = "early morning (5-9 AM)"
+        elif 9 <= most_common_hour < 12:
+            time_period = "late morning (9 AM-noon)"
+        elif 12 <= most_common_hour < 17:
+            time_period = "afternoon (noon-5 PM)"
+        elif 17 <= most_common_hour < 21:
+            time_period = "evening (5-9 PM)"
+        else:
+            time_period = "late night (9 PM-5 AM)"
+
+        question = f"Quick verification: What time of day do you typically unlock your Mac? (Hint: Check your patterns)"
+
+        return {
+            "question": question,
+            "difficulty": "medium",
+            "expected_answer": time_period,
+            "answer_type": "time_pattern",
+            "challenge_id": f"timepattern_{user_id}_{int(time.time())}",
+            "acceptable_answers": [time_period, str(most_common_hour)],
+            "hint": f"You usually unlock around {most_common_hour}:00"
+        }
+
+    async def _generate_activity_sequence_challenge(
+        self,
+        user_id: str,
+        events: List[AuthenticationEventRecord]
+    ) -> Dict[str, Any]:
+        """
+        Generate HARD challenge: "Your last unlock was X. Before that?"
+
+        Args:
+            user_id: User ID
+            events: Recent authentication events
+
+        Returns:
+            Challenge dict requiring sequence recall
+        """
+        if len(events) < 3:
+            # Not enough history, fallback to medium
+            return await self._generate_recent_pattern_challenge(user_id, events)
+
+        # Get last 3 unlocks
+        last_unlock = events[0]
+        second_last = events[1]
+        third_last = events[2]
+
+        # Format last unlock details
+        last_time = datetime.fromisoformat(last_unlock.timestamp)
+        last_metadata = last_unlock.metadata or {}
+        last_location = last_metadata.get("location", "unknown location")
+
+        # Format time of day
+        hour = last_time.hour
+        if 5 <= hour < 12:
+            time_of_day = "morning"
+        elif 12 <= hour < 17:
+            time_of_day = "afternoon"
+        elif 17 <= hour < 21:
+            time_of_day = "evening"
+        else:
+            time_of_day = "late night"
+
+        # Ask about second-to-last unlock
+        second_time = datetime.fromisoformat(second_last.timestamp)
+        second_metadata = second_last.metadata or {}
+        second_location = second_metadata.get("location", "unknown location")
+
+        # Format expected answer
+        time_diff = last_time - second_time
+        hours_between = time_diff.total_seconds() / 3600
+
+        if hours_between < 1:
+            time_between_desc = f"{int(time_diff.total_seconds() / 60)} minutes before"
+        elif hours_between < 24:
+            time_between_desc = f"{int(hours_between)} hours before"
+        else:
+            time_between_desc = f"{int(hours_between / 24)} days before"
+
+        question = (
+            f"Verification question: Your last unlock was {time_of_day} from {last_location}. "
+            f"Where did you unlock from before that?"
+        )
+
+        return {
+            "question": question,
+            "difficulty": "hard",
+            "expected_answer": second_location,
+            "answer_type": "sequence",
+            "challenge_id": f"sequence_{user_id}_{int(time.time())}",
+            "acceptable_answers": [second_location],
+            "hint": f"It was {time_between_desc} that",
+            "sequence_context": {
+                "last": last_location,
+                "second_last": second_location,
+                "third_last": second_metadata.get("location", "unknown")
+            }
+        }
+
+    async def verify_challenge_response(
+        self,
+        challenge: Dict[str, Any],
+        user_response: str
+    ) -> Tuple[bool, str]:
+        """
+        Verify user's response to a challenge question.
+
+        Args:
+            challenge: Challenge dict from generate_challenge()
+            user_response: User's answer
+
+        Returns:
+            Tuple of (success: bool, feedback: str)
+
+        Example:
+            (True, "Correct! Unlocking now.")
+            (False, "That's not quite right. The actual answer was 2:30 PM.")
+        """
+        answer_type = challenge.get("answer_type", "unknown")
+        expected = challenge.get("expected_answer", "")
+        acceptable = challenge.get("acceptable_answers", [expected])
+
+        # Normalize user response
+        user_response_normalized = user_response.strip().lower()
+
+        if answer_type == "time":
+            # Time-based verification with tolerance
+            return await self._verify_time_response(
+                challenge, user_response_normalized
+            )
+
+        elif answer_type == "location":
+            # Location verification (fuzzy match)
+            return self._verify_location_response(
+                acceptable, user_response_normalized
+            )
+
+        elif answer_type == "time_pattern":
+            # Time pattern verification
+            return self._verify_time_pattern_response(
+                acceptable, user_response_normalized
+            )
+
+        elif answer_type == "sequence":
+            # Sequence verification
+            return self._verify_sequence_response(
+                acceptable, user_response_normalized
+            )
+
+        else:
+            # Generic string match
+            if user_response_normalized in [a.lower() for a in acceptable]:
+                return (True, "Correct! Verified.")
+            else:
+                return (False, f"Incorrect. Expected: {expected}")
+
+    async def _verify_time_response(
+        self,
+        challenge: Dict[str, Any],
+        user_response: str
+    ) -> Tuple[bool, str]:
+        """Verify time-based response with tolerance."""
+        expected_time_str = challenge.get("expected_answer", "")
+        tolerance_hours = challenge.get("tolerance_hours", 2)
+
+        try:
+            expected_time = datetime.fromisoformat(expected_time_str)
+
+            # Try to parse user's response (flexible parsing)
+            # Support formats: "2 hours ago", "14:30", "2:30 PM", etc.
+            import re
+
+            # Pattern 1: "X hours ago"
+            hours_ago_match = re.search(r"(\d+)\s*hours?\s*ago", user_response)
+            if hours_ago_match:
+                hours = int(hours_ago_match.group(1))
+                user_time = datetime.now() - timedelta(hours=hours)
+            # Pattern 2: "X minutes ago"
+            elif "minute" in user_response:
+                minutes_match = re.search(r"(\d+)\s*minutes?\s*ago", user_response)
+                if minutes_match:
+                    minutes = int(minutes_match.group(1))
+                    user_time = datetime.now() - timedelta(minutes=minutes)
+                else:
+                    raise ValueError("Could not parse time")
+            else:
+                # Assume actual time (would need more sophisticated parsing)
+                raise ValueError("Time format not recognized")
+
+            # Check if within tolerance
+            time_diff = abs((user_time - expected_time).total_seconds() / 3600)
+            if time_diff <= tolerance_hours:
+                return (True, "Correct! Time matches. Verified.")
+            else:
+                return (
+                    False,
+                    f"Close, but not quite. It was actually {challenge.get('hint', 'recently')}."
+                )
+
+        except Exception as e:
+            # Couldn't parse, give user another chance
+            return (
+                False,
+                f"I couldn't understand that time format. Try: '{challenge.get('hint', 'X hours ago')}'"
+            )
+
+    def _verify_location_response(
+        self,
+        acceptable_answers: List[str],
+        user_response: str
+    ) -> Tuple[bool, str]:
+        """Verify location response with fuzzy matching."""
+        # Normalize acceptable answers
+        acceptable_normalized = [a.strip().lower() for a in acceptable_answers]
+
+        # Direct match
+        if user_response in acceptable_normalized:
+            return (True, "Correct location! Verified.")
+
+        # Fuzzy match (substring match)
+        for acceptable in acceptable_normalized:
+            if acceptable in user_response or user_response in acceptable:
+                return (True, "Correct location! Verified.")
+
+        return (
+            False,
+            f"That location doesn't match. Expected one of: {', '.join(acceptable_answers[:3])}"
+        )
+
+    def _verify_time_pattern_response(
+        self,
+        acceptable_answers: List[str],
+        user_response: str
+    ) -> Tuple[bool, str]:
+        """Verify time pattern response."""
+        acceptable_normalized = [str(a).strip().lower() for a in acceptable_answers]
+
+        # Check for match
+        for acceptable in acceptable_normalized:
+            if acceptable in user_response or user_response in acceptable:
+                return (True, "Correct pattern! Verified.")
+
+        return (
+            False,
+            f"Not quite. You typically unlock during: {acceptable_answers[0]}"
+        )
+
+    def _verify_sequence_response(
+        self,
+        acceptable_answers: List[str],
+        user_response: str
+    ) -> Tuple[bool, str]:
+        """Verify sequence/activity response."""
+        return self._verify_location_response(acceptable_answers, user_response)
+
+
+# =============================================================================
 # FACTORY FUNCTIONS
 # =============================================================================
 
