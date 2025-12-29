@@ -63,7 +63,7 @@ langchain-experimental>=0.0.47
 duckduckgo-search==4.1.1
 numexpr==2.8.8
 wikipedia-api==0.6.0
-python-dotenv==1.0.0
+python-dotenv==1.2.1
 
 # Optional dependencies that often fail on M1
 # openai-whisper==20231117  # Often fails, install separately if needed
