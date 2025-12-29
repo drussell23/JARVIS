@@ -3092,45 +3092,119 @@ class UnifiedCommandProcessor:
                         )
 
                     try:
+                        # =====================================================================
+                        # ROOT CAUSE FIX: Robust Type Handling & Async Safety v4.0.0
+                        # =====================================================================
+                        # PROBLEM: IntelligentCommandHandler.handle_command() returns Tuple[str, str]
+                        # - Router expected dict/string
+                        # - Type mismatch caused silent crash
+                        # - Fell back to legacy VisionCommandHandler ("Application window active")
+                        #
+                        # SOLUTION: Robust unpacking for ALL return types (tuple, dict, string)
+                        # =====================================================================
+
                         # Lazy import to avoid circular dependencies
                         from voice.intelligent_command_handler import IntelligentCommandHandler
 
                         # Initialize handler dynamically
                         intelligent_handler = IntelligentCommandHandler()
 
-                        # Route to intelligent handler (has _parse_watch_command logic)
-                        result = await intelligent_handler.handle_command(command_text)
+                        # =====================================================================
+                        # Async Safety: Timeout protection for handle_command
+                        # =====================================================================
+                        # Prevent voice thread hang if handler gets stuck
+                        handler_timeout = float(os.getenv("JARVIS_HANDLER_TIMEOUT", "30"))
 
-                        # Ensure proper response format
-                        if not isinstance(result, dict):
-                            result = {
-                                "handled": True,
-                                "success": True,
-                                "response": str(result) if result else "Monitoring initiated",
-                                "command_type": "surveillance"
+                        try:
+                            result = await asyncio.wait_for(
+                                intelligent_handler.handle_command(command_text),
+                                timeout=handler_timeout
+                            )
+                        except asyncio.TimeoutError:
+                            logger.error(
+                                f"[UNIFIED] IntelligentCommandHandler timed out after {handler_timeout}s"
+                            )
+                            return {
+                                "success": False,
+                                "response": f"I'm having trouble processing that command, {self.user_name}. The system is taking longer than expected.",
+                                "command_type": command_type.value,
+                                "error": "handler_timeout",
                             }
 
-                        # Add intent metadata with grammar-based routing details
-                        result["intent_disambiguation"] = {
-                            "detected_intent": "surveillance",
-                            "routed_to": "IntelligentCommandHandler->VisualMonitorAgent",
-                            "routing_method": "grammar-based_v3.0.0",
-                            "keywords_matched": [k for k in monitoring_keywords if k in command_lower],
-                            "patterns_matched": [p for p in surveillance_patterns if p in command_lower],
-                            "grammar_match": grammar_matched_text,  # NEW: Grammar pattern matched
-                            "god_mode_detected": has_multi_target,  # NEW: Multi-target flag
+                        # =====================================================================
+                        # Robust Type Handling: Unpack tuple/dict/string
+                        # =====================================================================
+                        response_text = None
+                        handler_used = None
+
+                        # TYPE 1: Tuple (response_text, handler_type)
+                        if isinstance(result, tuple) and len(result) == 2:
+                            response_text, handler_used = result
+                            logger.debug(
+                                f"[UNIFIED] Unpacked tuple: response='{response_text[:50]}...', "
+                                f"handler='{handler_used}'"
+                            )
+
+                        # TYPE 2: Dictionary
+                        elif isinstance(result, dict):
+                            response_text = result.get("response", result.get("text", "Monitoring initiated"))
+                            handler_used = result.get("handler", result.get("type", "surveillance"))
+                            logger.debug(
+                                f"[UNIFIED] Unpacked dict: response='{response_text[:50] if response_text else 'None'}...', "
+                                f"handler='{handler_used}'"
+                            )
+
+                        # TYPE 3: String (direct response)
+                        elif isinstance(result, str):
+                            response_text = result
+                            handler_used = "surveillance"
+                            logger.debug(
+                                f"[UNIFIED] Got string response: '{response_text[:50]}...'"
+                            )
+
+                        # TYPE 4: Unknown (shouldn't happen, but handle gracefully)
+                        else:
+                            logger.warning(
+                                f"[UNIFIED] Unexpected result type from IntelligentCommandHandler: {type(result)}"
+                            )
+                            response_text = str(result) if result else "Monitoring initiated"
+                            handler_used = "unknown"
+
+                        # Ensure we have a valid response
+                        if not response_text:
+                            response_text = "Monitoring initiated"
+
+                        # =====================================================================
+                        # Build normalized response dictionary
+                        # =====================================================================
+                        normalized_result = {
+                            "handled": True,
+                            "success": True,
+                            "response": response_text,
+                            "command_type": "surveillance",
+                            "handler_used": handler_used,
+                            # Add intent metadata with grammar-based routing details
+                            "intent_disambiguation": {
+                                "detected_intent": "surveillance",
+                                "routed_to": "IntelligentCommandHandler->VisualMonitorAgent",
+                                "routing_method": "grammar-based_v3.0.0",
+                                "keywords_matched": [k for k in monitoring_keywords if k in command_lower],
+                                "patterns_matched": [p for p in surveillance_patterns if p in command_lower],
+                                "grammar_match": grammar_matched_text,
+                                "god_mode_detected": has_multi_target,
+                            }
                         }
 
                         logger.info(
-                            f"[UNIFIED] ✅ Surveillance command handled: "
-                            f"success={result.get('success', False)}"
+                            f"[UNIFIED] ✅ Surveillance command handled successfully: "
+                            f"handler='{handler_used}', response_length={len(response_text)}"
                         )
 
                         return {
-                            "success": result.get("handled", result.get("success", False)),
-                            "response": result.get("response", "Monitoring initiated"),
+                            "success": True,
+                            "response": response_text,
                             "command_type": command_type.value,
-                            **result,
+                            **normalized_result,
                         }
 
                     except ImportError as e:

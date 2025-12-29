@@ -120,6 +120,11 @@ class IntelligentCommandHandler:
     async def _get_visual_monitor_agent(self) -> Optional[VisualMonitorAgent]:
         """
         Lazy initialization of VisualMonitorAgent for God Mode surveillance.
+
+        ROOT CAUSE FIX: Async Safety v4.0.0
+        - Timeout protection prevents voice thread hang if agent init gets stuck
+        - Non-blocking initialization ensures voice system stays responsive
+
         Returns None if agent cannot be initialized.
         """
         if not VISUAL_MONITOR_AVAILABLE:
@@ -129,17 +134,43 @@ class IntelligentCommandHandler:
         if self._visual_monitor_initialized:
             return self._visual_monitor_agent
 
+        # =====================================================================
+        # ROOT CAUSE FIX: Async Safety - Timeout protection for agent init
+        # =====================================================================
+        # Prevent voice thread hang if agent initialization gets stuck
+        agent_init_timeout = float(os.getenv("JARVIS_AGENT_INIT_TIMEOUT", "10"))
+
         try:
-            logger.info("Initializing VisualMonitorAgent for God Mode surveillance...")
-            agent = VisualMonitorAgent()
-            await agent.on_initialize()
-            await agent.on_start()
+            logger.info(f"Initializing VisualMonitorAgent (timeout: {agent_init_timeout}s)...")
+
+            async def _initialize_agent():
+                """Internal async wrapper for agent initialization"""
+                agent = VisualMonitorAgent()
+                await agent.on_initialize()
+                await agent.on_start()
+                return agent
+
+            # Apply timeout to entire initialization sequence
+            agent = await asyncio.wait_for(
+                _initialize_agent(),
+                timeout=agent_init_timeout
+            )
+
             self._visual_monitor_agent = agent
             self._visual_monitor_initialized = True
             logger.info("✅ VisualMonitorAgent initialized - God Mode active")
             return agent
+
+        except asyncio.TimeoutError:
+            logger.error(
+                f"VisualMonitorAgent initialization timed out after {agent_init_timeout}s. "
+                f"God Mode unavailable."
+            )
+            self._visual_monitor_initialized = True  # Don't retry
+            return None
+
         except Exception as e:
-            logger.error(f"Failed to initialize VisualMonitorAgent: {e}")
+            logger.error(f"Failed to initialize VisualMonitorAgent: {e}", exc_info=True)
             self._visual_monitor_initialized = True  # Don't retry
             return None
 
@@ -1250,20 +1281,10 @@ class IntelligentCommandHandler:
         max_duration = watch_params.get('max_duration')
 
         # =====================================================================
-        # ROOT CAUSE FIX: Add timeout protection to prevent infinite hangs
+        # Get VisualMonitorAgent (has built-in timeout protection)
         # =====================================================================
-        initialization_timeout = float(os.getenv("JARVIS_AGENT_INIT_TIMEOUT", "10"))
-
-        # Get VisualMonitorAgent (lazy init with timeout!)
         try:
-            agent = await asyncio.wait_for(
-                self._get_visual_monitor_agent(),
-                timeout=initialization_timeout
-            )
-        except asyncio.TimeoutError:
-            logger.error(f"VisualMonitorAgent initialization timed out after {initialization_timeout}s")
-            return (f"I'm having trouble initializing my vision monitoring system, {self.user_name}. "
-                   f"This usually resolves quickly - please try again.")
+            agent = await self._get_visual_monitor_agent()
         except Exception as e:
             logger.error(f"VisualMonitorAgent initialization failed: {e}", exc_info=True)
             return self._format_error_response("initialization_failed", app_name, trigger_text)
