@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>JARVIS Stereoscopic Vision Test</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            background: #000;
+            overflow: hidden;
+            font-family: 'Courier New', monospace;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+        }
+
+        #status {
+            position: absolute;
+            top: 50px;
+            font-size: 120px;
+            font-weight: bold;
+            color: #00ff00;
+            text-shadow: 0 0 20px #00ff00;
+            z-index: 10;
+        }
+
+        #counter {
+            position: absolute;
+            top: 200px;
+            font-size: 80px;
+            font-weight: bold;
+            color: #ffff00;
+            text-shadow: 0 0 15px #ffff00;
+            z-index: 10;
+        }
+
+        #canvas {
+            border: 3px solid #333;
+            background: #111;
+        }
+
+        #ball {
+            position: absolute;
+            width: 100px;
+            height: 100px;
+            background: radial-gradient(circle at 30% 30%, #ff4444, #cc0000);
+            border-radius: 50%;
+            box-shadow: 0 0 30px rgba(255, 68, 68, 0.8);
+        }
+
+        .info {
+            position: absolute;
+            bottom: 30px;
+            font-size: 24px;
+            color: #666;
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+    <div id="status"></div>
+    <div id="counter">BOUNCE COUNT: 0</div>
+    <div id="ball"></div>
+    <div class="info">
+        JARVIS Stereoscopic Vision Test<br>
+        Ferrari Engine Multi-Space Parallel Surveillance
+    </div>
+
+    <script>
+        // Parse URL parameters
+        const urlParams = new URLSearchParams(window.location.search);
+        const mode = urlParams.get('mode') || 'vertical';
+
+        // Display mode
+        const statusDiv = document.getElementById('status');
+        statusDiv.textContent = `STATUS: ${mode.toUpperCase()}`;
+
+        // Ball element
+        const ball = document.getElementById('ball');
+        const counterDiv = document.getElementById('counter');
+
+        // Animation parameters
+        const ballSize = 100;
+        const canvasWidth = window.innerWidth;
+        const canvasHeight = window.innerHeight;
+
+        let bounceCount = 0;
+        let position = { x: canvasWidth / 2, y: canvasHeight / 2 };
+        let velocity = { x: 0, y: 0 };
+
+        // Set initial velocity based on mode
+        if (mode === 'vertical') {
+            velocity.y = 8;  // Vertical bouncing
+            velocity.x = 0;
+        } else if (mode === 'horizontal') {
+            velocity.x = 8;  // Horizontal bouncing
+            velocity.y = 0;
+        }
+
+        function updateBall() {
+            // Update position
+            position.x += velocity.x;
+            position.y += velocity.y;
+
+            // Bounce detection
+            let bounced = false;
+
+            // Vertical bouncing
+            if (mode === 'vertical') {
+                if (position.y <= 0 || position.y >= canvasHeight - ballSize) {
+                    velocity.y = -velocity.y;
+                    bounced = true;
+
+                    // Clamp position to prevent sticking
+                    if (position.y <= 0) position.y = 0;
+                    if (position.y >= canvasHeight - ballSize) position.y = canvasHeight - ballSize;
+                }
+            }
+
+            // Horizontal bouncing
+            if (mode === 'horizontal') {
+                if (position.x <= 0 || position.x >= canvasWidth - ballSize) {
+                    velocity.x = -velocity.x;
+                    bounced = true;
+
+                    // Clamp position to prevent sticking
+                    if (position.x <= 0) position.x = 0;
+                    if (position.x >= canvasWidth - ballSize) position.x = canvasWidth - ballSize;
+                }
+            }
+
+            // Increment bounce counter
+            if (bounced) {
+                bounceCount++;
+                counterDiv.textContent = `BOUNCE COUNT: ${bounceCount}`;
+
+                // Flash effect on bounce
+                counterDiv.style.color = '#ff0000';
+                setTimeout(() => {
+                    counterDiv.style.color = '#ffff00';
+                }, 100);
+            }
+
+            // Update ball position
+            ball.style.left = `${position.x}px`;
+            ball.style.top = `${position.y}px`;
+
+            // Continue animation
+            requestAnimationFrame(updateBall);
+        }
+
+        // Start animation
+        updateBall();
+
+        // Handle window resize
+        window.addEventListener('resize', () => {
+            // Keep ball within bounds on resize
+            position.x = Math.min(position.x, window.innerWidth - ballSize);
+            position.y = Math.min(position.y, window.innerHeight - ballSize);
+        });
+    </script>
+</body>
+</html>

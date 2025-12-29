@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VERTICAL - Stereoscopic Vision Test</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            background: #000;
+            overflow: hidden;
+            font-family: 'Courier New', monospace;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+        }
+
+        #status {
+            position: absolute;
+            top: 50px;
+            font-size: 120px;
+            font-weight: bold;
+            color: #00ff00;
+            text-shadow: 0 0 20px #00ff00;
+            z-index: 10;
+        }
+
+        #counter {
+            position: absolute;
+            top: 200px;
+            font-size: 80px;
+            font-weight: bold;
+            color: #ffff00;
+            text-shadow: 0 0 15px #ffff00;
+            z-index: 10;
+        }
+
+        #ball {
+            position: absolute;
+            width: 100px;
+            height: 100px;
+            background: radial-gradient(circle at 30% 30%, #ff4444, #cc0000);
+            border-radius: 50%;
+            box-shadow: 0 0 30px rgba(255, 68, 68, 0.8);
+        }
+
+        .info {
+            position: absolute;
+            bottom: 30px;
+            font-size: 24px;
+            color: #666;
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+    <div id="status">STATUS: VERTICAL</div>
+    <div id="counter">BOUNCE COUNT: 0</div>
+    <div id="ball"></div>
+    <div class="info">
+        JARVIS Stereoscopic Vision Test - VERTICAL MODE<br>
+        Ferrari Engine Multi-Space Parallel Surveillance
+    </div>
+
+    <script>
+        const ball = document.getElementById('ball');
+        const counterDiv = document.getElementById('counter');
+
+        const ballSize = 100;
+        const canvasWidth = window.innerWidth;
+        const canvasHeight = window.innerHeight;
+
+        let bounceCount = 0;
+        let position = { x: canvasWidth / 2, y: canvasHeight / 2 };
+        let velocity = { x: 0, y: 8 };  // VERTICAL bouncing
+
+        function updateBall() {
+            position.y += velocity.y;
+
+            let bounced = false;
+
+            // Vertical bounce detection
+            if (position.y <= 0 || position.y >= canvasHeight - ballSize) {
+                velocity.y = -velocity.y;
+                bounced = true;
+
+                if (position.y <= 0) position.y = 0;
+                if (position.y >= canvasHeight - ballSize) position.y = canvasHeight - ballSize;
+            }
+
+            if (bounced) {
+                bounceCount++;
+                counterDiv.textContent = `BOUNCE COUNT: ${bounceCount}`;
+                counterDiv.style.color = '#ff0000';
+                setTimeout(() => {
+                    counterDiv.style.color = '#ffff00';
+                }, 100);
+            }
+
+            ball.style.left = `${position.x}px`;
+            ball.style.top = `${position.y}px`;
+
+            requestAnimationFrame(updateBall);
+        }
+
+        updateBall();
+    </script>
+</body>
+</html>
