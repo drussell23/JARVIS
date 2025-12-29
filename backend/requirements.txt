@@ -2,7 +2,7 @@ fastapi==0.120.2
 uvicorn[standard]==0.27.0
 transformers==4.36.2
 torch==2.1.2
-accelerate==0.25.0
+accelerate==1.12.0
 coremltools>=8.0  # CoreML Neural Engine for M1 optimization
 sentencepiece==0.1.99
 protobuf>=3.19.6,<4.24
