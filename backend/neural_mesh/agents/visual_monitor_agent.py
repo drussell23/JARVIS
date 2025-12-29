@@ -207,6 +207,7 @@ class VisualMonitorConfig:
     max_multi_space_watchers: int = 20  # Safety limit for God Mode
     auto_space_switch: bool = True  # Automatically switch to detected space
     watcher_coordination_timeout: float = 300.0  # Max time for parallel watchers
+    ferrari_fps: int = 60  # Ferrari Engine target FPS (GPU-accelerated ScreenCaptureKit)
 
     # Cross-repo paths
     cross_repo_dir: str = "~/.jarvis/cross_repo"
@@ -758,7 +759,8 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                     space_id=window['space_id'],
                     trigger_text=trigger_text,
                     action_config=action_config,
-                    alert_config=alert_config
+                    alert_config=alert_config,
+                    app_name=window.get('app_name', app_name)  # v13.0: Pass app_name for Ferrari Engine
                 )
             )
 
@@ -900,62 +902,205 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
         space_id: int,
         trigger_text: str,
         action_config: Optional[Dict[str, Any]] = None,
-        alert_config: Optional[Dict[str, Any]] = None
+        alert_config: Optional[Dict[str, Any]] = None,
+        app_name: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Spawn a single Ferrari Engine watcher for a specific window.
 
-        Wrapper around existing Ferrari watcher with multi-space metadata.
+        v13.0 GOD MODE: Real Ferrari Engine integration with 60 FPS ScreenCaptureKit.
+        This is the critical connection between multi-space discovery and actual video capture.
+
+        Args:
+            watcher_id: Unique watcher identifier
+            window_id: Window ID to monitor (from Yabai/MultiSpaceWindowDetector)
+            space_id: macOS space ID where window resides
+            trigger_text: Text to detect via OCR
+            action_config: Optional action to execute on detection
+            alert_config: Optional alert configuration
+            app_name: Application name (extracted from watcher_id if not provided)
+
+        Returns:
+            Detection result dict with trigger status and metadata
         """
         logger.debug(
-            f"🏁 Spawning watcher {watcher_id} for window {window_id} "
+            f"🏁 Spawning Ferrari watcher {watcher_id} for window {window_id} "
             f"on space {space_id}"
         )
 
+        # Extract app name from watcher_id if not provided
+        # watcher_id format: "Terminal_space1_win12345"
+        if not app_name:
+            app_name = watcher_id.split('_space')[0] if '_space' in watcher_id else 'Unknown'
+
+        start_time = datetime.now()
+
         try:
-            # Create VideoWatcher config
-            watcher_config = {
-                'window_id': window_id,
-                'space_id': space_id,
-                'trigger_text': trigger_text,
-                'action_config': action_config or {},
-                'alert_config': alert_config or {},
+            # ===== STEP 1: Spawn Real Ferrari Engine VideoWatcher =====
+            logger.info(
+                f"🏎️  [{watcher_id}] Spawning Ferrari Engine for window {window_id} ({app_name})"
+            )
+
+            # Use adaptive FPS based on config
+            fps = self._config.get('ferrari_fps', 60)
+
+            # Create Ferrari Engine VideoWatcher
+            watcher = await self._spawn_ferrari_watcher(
+                window_id=window_id,
+                fps=fps,
+                app_name=app_name,
+                space_id=space_id
+            )
+
+            if not watcher:
+                # Ferrari Engine unavailable - fallback to error
+                logger.error(f"❌ [{watcher_id}] Ferrari Engine watcher creation failed")
+                return {
+                    'status': 'error',
+                    'error': 'Ferrari Engine unavailable',
+                    'watcher_id': watcher_id,
+                    'space_id': space_id,
+                    'window_id': window_id,
+                    'trigger_detected': False
+                }
+
+            logger.info(f"✅ [{watcher_id}] Ferrari Engine watcher active (60 FPS GPU capture)")
+
+            # ===== STEP 2: Convert action_config dict to ActionConfig if provided =====
+            action_config_obj = None
+            if action_config and self.config.enable_action_execution:
+                try:
+                    from backend.core.action_config import ActionConfig, ActionType
+
+                    # Parse action type
+                    action_type_str = action_config.get('type', 'notification')
+                    action_type_map = {
+                        'notification': ActionType.NOTIFICATION,
+                        'computer_use': ActionType.COMPUTER_USE,
+                        'click': ActionType.CLICK,
+                        'type': ActionType.TYPE,
+                        'execute': ActionType.EXECUTE
+                    }
+                    action_type = action_type_map.get(action_type_str, ActionType.NOTIFICATION)
+
+                    # Create ActionConfig object
+                    action_config_obj = ActionConfig(
+                        action_type=action_type,
+                        goal=action_config.get('goal', f"Respond to '{trigger_text}' in {app_name}"),
+                        context=action_config.get('context', {}),
+                        timeout_seconds=action_config.get('timeout_seconds', 30),
+                        require_confirmation=action_config.get('require_confirmation', False)
+                    )
+
+                    logger.info(
+                        f"🎯 [{watcher_id}] Action configured: {action_type.value} - {action_config_obj.goal}"
+                    )
+                except Exception as e:
+                    logger.warning(f"⚠️  [{watcher_id}] Could not create ActionConfig: {e}")
+                    action_config_obj = None
+
+            # ===== STEP 3: Monitor Ferrari Stream for Trigger =====
+            logger.info(
+                f"👁️  [{watcher_id}] Monitoring 60 FPS stream for trigger: '{trigger_text}'"
+            )
+
+            # Run Ferrari Engine visual detection
+            detection_result = await self._monitor_and_alert(
+                watcher=watcher,
+                trigger_text=trigger_text,
+                app_name=app_name,
+                space_id=space_id,
+                action_config=action_config_obj
+            )
+
+            # ===== STEP 4: Process Detection Result =====
+            # Check if trigger was actually detected (detection_result can be dict with 'detected' key)
+            trigger_detected = False
+            if detection_result:
+                # Check for explicit 'detected' key (from _ferrari_visual_detection)
+                if isinstance(detection_result, dict):
+                    trigger_detected = detection_result.get('detected', False)
+                # Or check for 'trigger_detected' key (from _monitor_and_alert)
+                if not trigger_detected and 'trigger_detected' in detection_result:
+                    trigger_detected = detection_result.get('trigger_detected', False)
+
+            if trigger_detected:
+                # Trigger detected!
+                confidence = detection_result.get('confidence', 0.0)
+                logger.info(
+                    f"🎯 [{watcher_id}] TRIGGER DETECTED! "
+                    f"Confidence: {confidence:.2f}"
+                )
+
+                # Stop watcher after detection (God Mode: first trigger wins)
+                await watcher.stop()
+
+                return {
+                    'watcher_id': watcher_id,
+                    'space_id': space_id,
+                    'window_id': window_id,
+                    'app_name': app_name,
+                    'trigger_detected': True,
+                    'trigger_text': trigger_text,
+                    'confidence': confidence,
+                    'detection_time': detection_result.get('detection_time', 0.0),
+                    'timestamp': start_time.isoformat(),
+                    'action_result': detection_result.get('action_result'),
+                    'status': 'success'
+                }
+            else:
+                # No trigger detected (timeout or error)
+                logger.info(f"⏱️  [{watcher_id}] No trigger detected (timeout or stopped)")
+
+                # Stop watcher
+                await watcher.stop()
+
+                return {
+                    'watcher_id': watcher_id,
+                    'space_id': space_id,
+                    'window_id': window_id,
+                    'trigger_detected': False,
+                    'timestamp': start_time.isoformat(),
+                    'status': 'no_trigger'
+                }
+
+        except asyncio.CancelledError:
+            # Watcher was cancelled (another watcher won the race)
+            logger.info(f"🛑 [{watcher_id}] Cancelled - another watcher detected trigger first")
+
+            # Stop watcher if it exists
+            if 'watcher' in locals() and watcher:
+                try:
+                    await watcher.stop()
+                except:
+                    pass
+
+            return {
                 'watcher_id': watcher_id,
-                'method': 'ferrari_engine'
-            }
-
-            # Use existing _spawn_ferrari_watcher infrastructure if available
-            # For now, create a simple watcher that polls for trigger
-            start_time = datetime.now()
-
-            # Simulate watching (in production, this would be VideoWatcher)
-            # For rapid implementation, we'll use a placeholder that completes immediately
-            # to demonstrate the coordination logic
-            logger.info(f"⏳ Watcher {watcher_id} active and monitoring...")
-
-            # Wait for trigger (this is where Ferrari Engine VideoWatcher would run)
-            # In production, this would be: await video_watcher.wait_for_trigger()
-            await asyncio.sleep(0.1)  # Placeholder - will be replaced with real VideoWatcher
-
-            # Inject watcher_id into result for tracking
-            result = {
-                'watcher_id': watcher_id,
                 'space_id': space_id,
                 'window_id': window_id,
-                'trigger_detected': True,
-                'timestamp': start_time.isoformat(),
-                'config': watcher_config
+                'trigger_detected': False,
+                'cancelled': True,
+                'status': 'cancelled'
             }
-
-            return result
 
         except Exception as e:
-            logger.error(f"❌ Failed to spawn watcher {watcher_id}: {e}")
+            logger.error(f"❌ [{watcher_id}] Failed to spawn/monitor watcher: {e}")
+
+            # Stop watcher if it exists
+            if 'watcher' in locals() and watcher:
+                try:
+                    await watcher.stop()
+                except:
+                    pass
+
             return {
                 'status': 'error',
                 'error': str(e),
                 'watcher_id': watcher_id,
-                'space_id': space_id
+                'space_id': space_id,
+                'window_id': window_id,
+                'trigger_detected': False
             }
 
     async def _execute_trigger_action(
