@@ -257,6 +257,9 @@ class JarvisPrimeOrchestrator:
         self._on_status_change: List[Callable[[PrimeStatus], None]] = []
         self._on_health_update: List[Callable[[PrimeHealth], None]] = []
 
+        # ROOT CAUSE FIX: Lock to prevent concurrent start/restart attempts
+        self._start_lock = asyncio.Lock()
+
         # Latency tracking for metrics
         self._latency_samples: List[float] = []
         self._max_latency_samples = 100
@@ -280,70 +283,89 @@ class JarvisPrimeOrchestrator:
         Returns:
             True if started successfully, False otherwise
         """
-        if not self.config.enabled:
-            logger.info("[JarvisPrime] Disabled via configuration")
-            self._health.status = PrimeStatus.DISABLED
-            return False
-
-        if self._started and self._process and self._process.returncode is None:
-            logger.debug("[JarvisPrime] Already running")
-            return True
-
-        try:
-            await self._announce("Initializing local brain.")
-
-            # Update status
-            self._set_status(PrimeStatus.STARTING)
-
-            # Validate JARVIS-Prime repo exists
-            if not self._validate_repo():
-                self._health.error_message = f"JARVIS-Prime repo not found at {self.config.prime_repo_path}"
-                self._set_status(PrimeStatus.FAILED)
+        # ROOT CAUSE FIX: Prevent concurrent start attempts with lock
+        async with self._start_lock:
+            if not self.config.enabled:
+                logger.info("[JarvisPrime] Disabled via configuration")
+                self._health.status = PrimeStatus.DISABLED
                 return False
 
-            # Create HTTP session for health checks
-            if self._http_session is None:
-                self._http_session = aiohttp.ClientSession(
-                    timeout=aiohttp.ClientTimeout(total=self.config.health_check_timeout_seconds)
-                )
+            if self._started and self._process and self._process.returncode is None:
+                logger.debug("[JarvisPrime] Already running")
+                return True
 
-            # ROOT CAUSE FIX: Retry logic to handle race conditions
-            max_spawn_attempts = int(os.getenv("JARVIS_PRIME_SPAWN_RETRIES", "3"))
-            spawn_retry_delay = float(os.getenv("JARVIS_PRIME_SPAWN_RETRY_DELAY", "2.0"))
+            try:
+                await self._announce("Initializing local brain.")
 
-            for attempt in range(max_spawn_attempts):
-                try:
-                    # Clean up any existing process on our port
-                    await self._ensure_port_available()
+                # Update status
+                self._set_status(PrimeStatus.STARTING)
 
-                    # Start the subprocess
-                    success = await self._spawn_process()
+                # Validate JARVIS-Prime repo exists
+                if not self._validate_repo():
+                    self._health.error_message = f"JARVIS-Prime repo not found at {self.config.prime_repo_path}"
+                    self._set_status(PrimeStatus.FAILED)
+                    return False
 
-                    if success:
-                        # Wait for it to become healthy
-                        healthy = await self._wait_for_healthy()
+                # Create HTTP session for health checks
+                if self._http_session is None:
+                    self._http_session = aiohttp.ClientSession(
+                        timeout=aiohttp.ClientTimeout(total=self.config.health_check_timeout_seconds)
+                    )
 
-                        if healthy:
-                            self._started = True
-                            self._restart_count = 0
-                            self._start_time = datetime.now()
-                            self._set_status(PrimeStatus.RUNNING)
+                # ROOT CAUSE FIX: Retry logic to handle race conditions
+                max_spawn_attempts = int(os.getenv("JARVIS_PRIME_SPAWN_RETRIES", "3"))
+                spawn_retry_delay = float(os.getenv("JARVIS_PRIME_SPAWN_RETRY_DELAY", "2.0"))
 
-                            # Start health monitoring
-                            self._health_check_task = asyncio.create_task(
-                                self._health_check_loop()
-                            )
+                for attempt in range(max_spawn_attempts):
+                    try:
+                        # ROOT CAUSE FIX: Clean up port and check if we reused existing process
+                        reused_existing = await self._ensure_port_available()
 
-                            await self._announce("Local brain online and ready.")
-                            logger.info(f"[JarvisPrime] Started successfully (PID: {self._process.pid})")
-                            return True
+                        # CRITICAL: Skip spawn if we reused an existing healthy process
+                        if reused_existing:
+                            logger.info(f"[JarvisPrime] Reused existing process, skipping spawn")
+                            success = True  # Treat as successful spawn
                         else:
-                            # Process spawned but not healthy
-                            await self._terminate_process()
+                            # Start new subprocess
+                            success = await self._spawn_process()
 
+                        if success:
+                            # Wait for it to become healthy
+                            healthy = await self._wait_for_healthy()
+
+                            if healthy:
+                                self._started = True
+                                self._restart_count = 0
+                                self._start_time = datetime.now()
+                                self._set_status(PrimeStatus.RUNNING)
+
+                                # Start health monitoring
+                                self._health_check_task = asyncio.create_task(
+                                    self._health_check_loop()
+                                )
+
+                                await self._announce("Local brain online and ready.")
+                                logger.info(f"[JarvisPrime] Started successfully (PID: {self._process.pid})")
+                                return True
+                            else:
+                                # Process spawned but not healthy
+                                await self._terminate_process()
+
+                                if attempt < max_spawn_attempts - 1:
+                                    logger.warning(
+                                        f"[JarvisPrime] Process unhealthy (attempt {attempt + 1}/{max_spawn_attempts}), "
+                                        f"retrying in {spawn_retry_delay}s..."
+                                    )
+                                    await asyncio.sleep(spawn_retry_delay)
+                                    continue
+                                else:
+                                    self._set_status(PrimeStatus.FAILED)
+                                    return False
+                        else:
+                            # Spawn failed
                             if attempt < max_spawn_attempts - 1:
                                 logger.warning(
-                                    f"[JarvisPrime] Process unhealthy (attempt {attempt + 1}/{max_spawn_attempts}), "
+                                    f"[JarvisPrime] Spawn failed (attempt {attempt + 1}/{max_spawn_attempts}), "
                                     f"retrying in {spawn_retry_delay}s..."
                                 )
                                 await asyncio.sleep(spawn_retry_delay)
@@ -351,47 +373,35 @@ class JarvisPrimeOrchestrator:
                             else:
                                 self._set_status(PrimeStatus.FAILED)
                                 return False
-                    else:
-                        # Spawn failed
+
+                    except RuntimeError as e:
+                        # Port cleanup failed - this is fatal
+                        if "Port" in str(e) and "cannot be freed" in str(e):
+                            logger.error(f"[JarvisPrime] Fatal port cleanup error: {e}")
+                            self._set_status(PrimeStatus.FAILED)
+                            self._health.error_message = str(e)
+                            return False
+
+                        # Other runtime errors - retry
                         if attempt < max_spawn_attempts - 1:
                             logger.warning(
-                                f"[JarvisPrime] Spawn failed (attempt {attempt + 1}/{max_spawn_attempts}), "
+                                f"[JarvisPrime] Start error (attempt {attempt + 1}/{max_spawn_attempts}): {e}, "
                                 f"retrying in {spawn_retry_delay}s..."
                             )
                             await asyncio.sleep(spawn_retry_delay)
                             continue
                         else:
-                            self._set_status(PrimeStatus.FAILED)
-                            return False
+                            raise
 
-                except RuntimeError as e:
-                    # Port cleanup failed - this is fatal
-                    if "Port" in str(e) and "cannot be freed" in str(e):
-                        logger.error(f"[JarvisPrime] Fatal port cleanup error: {e}")
-                        self._set_status(PrimeStatus.FAILED)
-                        self._health.error_message = str(e)
-                        return False
+                # All attempts exhausted
+                self._set_status(PrimeStatus.FAILED)
+                return False
 
-                    # Other runtime errors - retry
-                    if attempt < max_spawn_attempts - 1:
-                        logger.warning(
-                            f"[JarvisPrime] Start error (attempt {attempt + 1}/{max_spawn_attempts}): {e}, "
-                            f"retrying in {spawn_retry_delay}s..."
-                        )
-                        await asyncio.sleep(spawn_retry_delay)
-                        continue
-                    else:
-                        raise
-
-            # All attempts exhausted
-            self._set_status(PrimeStatus.FAILED)
-            return False
-
-        except Exception as e:
-            logger.error(f"[JarvisPrime] Start failed: {e}")
-            self._health.error_message = str(e)
-            self._set_status(PrimeStatus.FAILED)
-            return False
+            except Exception as e:
+                logger.error(f"[JarvisPrime] Start failed: {e}")
+                self._health.error_message = str(e)
+                self._set_status(PrimeStatus.FAILED)
+                return False
 
     async def stop(self) -> None:
         """Gracefully stop JARVIS-Prime subprocess."""
@@ -599,7 +609,7 @@ class JarvisPrimeOrchestrator:
     # Port Management (v10.4) - Process-hierarchy aware
     # =========================================================================
 
-    async def _ensure_port_available(self) -> None:
+    async def _ensure_port_available(self) -> bool:
         """
         Intelligent port coordination system - ensures port is available before starting.
 
@@ -618,6 +628,9 @@ class JarvisPrimeOrchestrator:
 
         Raises:
             RuntimeError: If port cannot be freed within timeout
+
+        Returns:
+            bool: True if reused existing process, False if port is available for new process
         """
         port = self.config.port
         max_wait_time = 45.0  # Increased from 30s to handle stubborn processes
@@ -629,12 +642,12 @@ class JarvisPrimeOrchestrator:
         pid = await self._get_pid_on_port(port)
         if pid is None:
             logger.debug(f"[JarvisPrime] Port {port} is available")
-            return
+            return False  # Port available, no reuse
 
         # CRITICAL: Check if this is our own stored process
         if self._process and self._process.pid == pid:
             logger.debug(f"[JarvisPrime] Port {port} is used by our own managed process (PID {pid})")
-            return
+            return True  # Already have this process, reusing
 
         # v10.7: ENHANCED FIX - Check if port is used by current supervisor process
         # This happens during restart scenarios where supervisor is restarting Prime
@@ -702,10 +715,10 @@ class JarvisPrimeOrchestrator:
                                             waited += 0.1
                                         self.returncode = 0
 
-                                # Store the existing process
+                                # ROOT CAUSE FIX: Store the existing process and return True to skip spawn!
                                 self._process = MockProcess(child)
-                                logger.debug(f"[JarvisPrime] Reusing existing subprocess on port {port}")
-                                return
+                                logger.info(f"[JarvisPrime] ✅ Reusing existing subprocess PID {child.pid} on port {port}")
+                                return True  # CRITICAL: Tell caller we reused, don't spawn new process!
 
                         except (psutil.NoSuchProcess, psutil.AccessDenied):
                             continue
@@ -750,7 +763,7 @@ class JarvisPrimeOrchestrator:
                 verify_pid = await self._get_pid_on_port(port)
                 if verify_pid is None:
                     logger.info(f"[JarvisPrime] Port {port} successfully freed via aggressive cleanup")
-                    return
+                    return False  # Port freed, ready for new process
                 else:
                     # CRITICAL: Port STILL not free - this is a hard failure
                     logger.error(
@@ -779,7 +792,7 @@ class JarvisPrimeOrchestrator:
                     verify_pid = await self._get_pid_on_port(port)
                     if verify_pid is None:
                         logger.info(f"[JarvisPrime] Port {port} released via socket manipulation")
-                        return
+                        return False  # Port freed
                 except Exception as e:
                     logger.error(f"[JarvisPrime] Socket release failed: {e}")
                     raise RuntimeError(f"Cannot free port {port} - no cleanup tools available")
@@ -804,7 +817,7 @@ class JarvisPrimeOrchestrator:
                         pid_check = await self._get_pid_on_port(port)
                         if pid_check is None:
                             logger.info(f"[JarvisPrime] Port {port} freed after reaping zombie")
-                            return
+                            return False  # Port freed
                     except (OSError, ChildProcessError) as e:
                         logger.debug(f"[JarvisPrime] Zombie reap failed (may not be our child): {e}")
             except (psutil.NoSuchProcess, psutil.AccessDenied):
@@ -835,7 +848,7 @@ class JarvisPrimeOrchestrator:
             # Wait for port to free up with verification
             if await self._wait_for_port_free(port, max_wait=10.0):
                 logger.info(f"[JarvisPrime] Port {port} freed via graceful shutdown")
-                return
+                return False  # Port freed
 
         # Strategy 2: Try SIGTERM (polite kill signal)
         if not is_related:  # Only if not related to us
@@ -844,7 +857,7 @@ class JarvisPrimeOrchestrator:
                 os.kill(pid, signal.SIGTERM)
                 if await self._wait_for_port_free(port, max_wait=5.0):
                     logger.info(f"[JarvisPrime] Port {port} freed via SIGTERM")
-                    return
+                    return False  # Port freed
             except (ProcessLookupError, PermissionError) as e:
                 logger.debug(f"[JarvisPrime] SIGTERM failed: {e}")
 
@@ -857,7 +870,7 @@ class JarvisPrimeOrchestrator:
             # Wait with exponential backoff for related processes
             if await self._wait_for_port_free(port, max_wait=20.0, exponential=True):
                 logger.info(f"[JarvisPrime] Port {port} eventually freed by related process")
-                return
+                return False  # Port freed
 
             # Last resort for related processes: Check if it's truly orphaned
             if await self._is_orphaned_instance(pid, process_info):
@@ -869,7 +882,7 @@ class JarvisPrimeOrchestrator:
                     os.kill(pid, signal.SIGKILL)
                     if await self._wait_for_port_free(port, max_wait=3.0):
                         logger.info(f"[JarvisPrime] Port {port} freed by removing orphaned instance")
-                        return
+                        return False  # Port freed
                 except Exception as e:
                     logger.error(f"[JarvisPrime] Failed to kill orphaned instance: {e}")
 
@@ -880,7 +893,7 @@ class JarvisPrimeOrchestrator:
                 os.kill(pid, signal.SIGKILL)
                 if await self._wait_for_port_free(port, max_wait=3.0):
                     logger.info(f"[JarvisPrime] Port {port} freed via SIGKILL")
-                    return
+                    return False  # Port freed
             except (ProcessLookupError, PermissionError) as e:
                 logger.error(f"[JarvisPrime] SIGKILL failed: {e}")
 
@@ -890,7 +903,7 @@ class JarvisPrimeOrchestrator:
 
         if pid is None:
             logger.info(f"[JarvisPrime] Port {port} is now available (took {elapsed:.1f}s)")
-            return
+            return False  # Port freed
 
         # CRITICAL: Port is STILL occupied - cannot proceed!
         error_msg = (
