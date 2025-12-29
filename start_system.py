@@ -17179,66 +17179,173 @@ async def main():
         return result
 
     async def probe_cloud_run_backend() -> dict:
-        """Probe Cloud Run ECAPA backend availability and health."""
+        """
+        Probe Cloud Run ECAPA backend availability and health with intelligent retry.
+
+        ROOT CAUSE FIX v2.0.0:
+        - Configurable timeouts (no hardcoding)
+        - Intelligent retry with exponential backoff
+        - Cold start detection and waiting
+        - Prewarm trigger for faster initialization
+        - Distinguishes transient delays from real failures
+        """
         result = {"available": False, "healthy": False, "endpoint": cloud_run_endpoint, "latency_ms": None, "error": None}
 
         try:
             import aiohttp
             import time
 
-            # Quick health check with timeout
-            timeout = aiohttp.ClientTimeout(total=10)
+            # ROOT CAUSE FIX: Configurable timeouts (not hardcoded 10s!)
+            # Cloud Run cold starts can take 30-120s for ML models
+            single_request_timeout = float(os.getenv("CLOUD_RUN_PROBE_REQUEST_TIMEOUT", "15"))  # Per-request timeout
+            max_total_wait = float(os.getenv("CLOUD_RUN_PROBE_MAX_WAIT", "60"))  # Total max wait time
+            poll_interval = float(os.getenv("CLOUD_RUN_PROBE_POLL_INTERVAL", "3"))  # Wait between retries
+            max_retries = int(os.getenv("CLOUD_RUN_PROBE_MAX_RETRIES", "10"))  # Max retry attempts
+            enable_prewarm = os.getenv("CLOUD_RUN_ENABLE_PREWARM", "true").lower() == "true"
 
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                # Try multiple possible health endpoints
-                base_url = cloud_run_endpoint.replace("/api/ml", "")
-                health_paths = ["/health", "/api/ml/health", "/status", "/api/ml/status", "/"]
+            probe_start = time.time()
+            base_url = cloud_run_endpoint.replace("/api/ml", "")
+            health_paths = ["/health", "/api/ml/health", "/status", "/api/ml/status"]
 
-                for path in health_paths:
-                    try:
-                        start_time = time.time()
-                        health_url = f"{base_url}{path}"
-                        async with session.get(health_url) as response:
-                            latency = (time.time() - start_time) * 1000
+            # ROOT CAUSE FIX: Intelligent retry loop with exponential backoff
+            for attempt in range(max_retries):
+                elapsed = time.time() - probe_start
 
-                            if response.status == 200:
-                                result["available"] = True
-                                result["latency_ms"] = latency
+                # Check if we've exceeded total wait time
+                if elapsed >= max_total_wait:
+                    result["error"] = f"Cloud Run probe timed out after {elapsed:.1f}s (max: {max_total_wait}s)"
+                    break
 
-                                # Parse health response for detailed status
-                                try:
-                                    data = await response.json()
-                                    result["ecapa_ready"] = data.get("ecapa_ready", False)
-                                    result["load_source"] = data.get("load_source", "unknown")
-                                    result["using_prebaked"] = data.get("using_prebaked_cache", False)
-                                    result["status"] = data.get("status", "unknown")
-                                    # Only mark healthy if ECAPA is ready
-                                    result["healthy"] = data.get("ecapa_ready", False)
-                                except:
-                                    # If JSON parsing fails, assume healthy if responding
-                                    result["healthy"] = True
+                try:
+                    # Per-request timeout (not total timeout!)
+                    timeout = aiohttp.ClientTimeout(total=single_request_timeout)
 
-                                return result
-                    except:
-                        continue
+                    async with aiohttp.ClientSession(timeout=timeout) as session:
+                        # ROOT CAUSE FIX: Try prewarm on first attempt to trigger model loading
+                        if attempt == 0 and enable_prewarm:
+                            prewarm_url = f"{base_url}/api/ml/prewarm"
+                            try:
+                                async with session.post(
+                                    prewarm_url,
+                                    json={"warmup": True},
+                                    timeout=aiohttp.ClientTimeout(total=10)
+                                ) as resp:
+                                    if resp.status == 200:
+                                        logger.info(f"[Cloud Run Probe] Pre-warm triggered successfully")
+                            except:
+                                pass  # Prewarm is optional, don't fail if it doesn't work
 
-                # If none of the health paths work, try the main endpoint
-                start_time = time.time()
-                async with session.get(cloud_run_endpoint) as response:
-                    latency = (time.time() - start_time) * 1000
-                    if response.status in [200, 404, 405]:  # Server is responding
-                        result["available"] = True
-                        result["latency_ms"] = latency
-                        result["error"] = "Endpoint responding but no health check"
-                    else:
-                        result["error"] = f"Endpoint returned {response.status}"
+                        # Try health endpoints
+                        health_found = False
+                        for path in health_paths:
+                            try:
+                                start_time = time.time()
+                                health_url = f"{base_url}{path}"
+                                async with session.get(health_url) as response:
+                                    latency = (time.time() - start_time) * 1000
 
-        except asyncio.TimeoutError:
-            result["error"] = "Cloud Run health check timed out"
-        except aiohttp.ClientError as e:
-            result["error"] = f"Connection error: {str(e)[:50]}"
+                                    if response.status == 200:
+                                        result["available"] = True
+                                        result["latency_ms"] = latency
+                                        health_found = True
+
+                                        # Parse health response for detailed status
+                                        try:
+                                            data = await response.json()
+                                            ecapa_ready = data.get("ecapa_ready", False)
+                                            status = data.get("status", "unknown")
+
+                                            result["ecapa_ready"] = ecapa_ready
+                                            result["load_source"] = data.get("load_source", "unknown")
+                                            result["using_prebaked"] = data.get("using_prebaked_cache", False)
+                                            result["status"] = status
+                                            result["healthy"] = ecapa_ready
+
+                                            # ROOT CAUSE FIX: If ECAPA is ready, we're done!
+                                            if ecapa_ready:
+                                                logger.info(f"[Cloud Run Probe] ECAPA ready on attempt {attempt + 1} ({elapsed:.1f}s)")
+                                                return result
+
+                                            # ROOT CAUSE FIX: If initializing, wait and retry (not an error!)
+                                            if status in ["initializing", "loading", "warming_up"]:
+                                                logger.debug(f"[Cloud Run Probe] ECAPA initializing (attempt {attempt + 1}/{max_retries}), waiting...")
+                                                # This is expected during cold start, not a failure
+                                                result["error"] = None
+                                                break  # Break inner loop, continue outer retry loop
+
+                                        except Exception as parse_err:
+                                            # If JSON parsing fails but server responded, mark available
+                                            logger.debug(f"[Cloud Run Probe] Health check returned 200 but JSON parse failed: {parse_err}")
+                                            result["healthy"] = True
+                                            return result
+
+                                        # Health endpoint found but ECAPA not ready - will retry
+                                        break
+
+                            except asyncio.TimeoutError:
+                                logger.debug(f"[Cloud Run Probe] Health path {path} timed out")
+                                continue
+                            except Exception as path_err:
+                                logger.debug(f"[Cloud Run Probe] Health path {path} error: {path_err}")
+                                continue
+
+                        # If we found health endpoint but ECAPA not ready, retry after delay
+                        if health_found and not result.get("healthy"):
+                            # ROOT CAUSE FIX: Exponential backoff (2s, 4s, 8s, 16s, 32s, capped at 60s)
+                            delay = min(poll_interval * (2 ** attempt), 60.0)
+
+                            # Only wait if we haven't exceeded total time
+                            if elapsed + delay < max_total_wait:
+                                logger.debug(f"[Cloud Run Probe] Waiting {delay:.1f}s before retry {attempt + 2}/{max_retries}")
+                                await asyncio.sleep(delay)
+                                continue
+                            else:
+                                # Would exceed total wait time
+                                result["error"] = f"ECAPA not ready within {max_total_wait}s"
+                                break
+
+                        # If no health endpoint found, try main endpoint as fallback
+                        if not health_found:
+                            try:
+                                start_time = time.time()
+                                async with session.get(cloud_run_endpoint) as response:
+                                    latency = (time.time() - start_time) * 1000
+                                    if response.status in [200, 404, 405]:  # Server is responding
+                                        result["available"] = True
+                                        result["latency_ms"] = latency
+                                        result["error"] = "Endpoint responding but no health check available"
+                                        # Can't determine ECAPA status, assume not healthy
+                                        return result
+                            except:
+                                pass
+
+                except asyncio.TimeoutError:
+                    logger.debug(f"[Cloud Run Probe] Request timed out on attempt {attempt + 1}")
+                    # ROOT CAUSE FIX: Don't immediately fail on timeout - retry with backoff
+                    if attempt < max_retries - 1:
+                        delay = min(poll_interval * (2 ** attempt), 60.0)
+                        if elapsed + delay < max_total_wait:
+                            await asyncio.sleep(delay)
+                            continue
+                    result["error"] = f"Cloud Run health check timed out after {attempt + 1} attempts"
+
+                except aiohttp.ClientError as e:
+                    logger.debug(f"[Cloud Run Probe] Connection error on attempt {attempt + 1}: {e}")
+                    # Connection errors might be transient during cold start
+                    if attempt < max_retries - 1:
+                        delay = min(poll_interval * (2 ** attempt), 60.0)
+                        if elapsed + delay < max_total_wait:
+                            await asyncio.sleep(delay)
+                            continue
+                    result["error"] = f"Connection error: {str(e)[:50]}"
+
+                except Exception as e:
+                    logger.debug(f"[Cloud Run Probe] Unexpected error on attempt {attempt + 1}: {e}")
+                    result["error"] = str(e)[:50]
+                    break
+
         except Exception as e:
-            result["error"] = str(e)[:50]
+            result["error"] = f"Probe failed: {str(e)[:50]}"
 
         return result
 
@@ -17681,10 +17788,12 @@ async def main():
         default_cloud_url = "https://jarvis-ml-888774109345.us-central1.run.app"
         cloud_endpoint = os.getenv("JARVIS_CLOUD_ML_ENDPOINT", default_cloud_url)
         
-        # Configuration for wait-for-ready
+        # Configuration for wait-for-ready (all configurable via env vars)
         ECAPA_WAIT_TIMEOUT = float(os.getenv("ECAPA_STARTUP_WAIT_TIMEOUT", "90"))  # Max 90s to wait
         ECAPA_POLL_INTERVAL = float(os.getenv("ECAPA_STARTUP_POLL_INTERVAL", "3"))  # Poll every 3s
         ECAPA_PREWARM_ENDPOINT = os.getenv("ECAPA_PREWARM_ENDPOINT", "/api/ml/prewarm")  # Trigger model load
+        ECAPA_PREWARM_TIMEOUT = float(os.getenv("ECAPA_PREWARM_TIMEOUT", "30"))  # Prewarm request timeout
+        ECAPA_HEALTH_CHECK_TIMEOUT = float(os.getenv("ECAPA_HEALTH_CHECK_TIMEOUT", "15"))  # Per-health-check timeout
         
         cloud_ecapa_ready = False
         cloud_wait_start = time.time()
@@ -17711,7 +17820,7 @@ async def main():
                     async with session.post(
                         prewarm_url,
                         json={"warmup": True},
-                        timeout=aiohttp.ClientTimeout(total=30)
+                        timeout=aiohttp.ClientTimeout(total=ECAPA_PREWARM_TIMEOUT)
                     ) as resp:
                         if resp.status == 200:
                             prewarm_data = await resp.json()
@@ -17733,8 +17842,8 @@ async def main():
                     
                     try:
                         async with session.get(
-                            health_url, 
-                            timeout=aiohttp.ClientTimeout(total=10)
+                            health_url,
+                            timeout=aiohttp.ClientTimeout(total=ECAPA_HEALTH_CHECK_TIMEOUT)
                         ) as resp:
                             if resp.status == 200:
                                 health_data = await resp.json()
