@@ -85,26 +85,46 @@ except ImportError as e:
     )
 
 # Try ScreenCaptureKit (macOS 12.3+)
+# Priority 1: Native C++ bridge (fast_capture_stream) - Ferrari Engine
 try:
-    from ScreenCaptureKit import (
-        SCStreamConfiguration,
-        SCContentFilter,
-        SCStreamDelegate,
+    import sys
+    from pathlib import Path
+    native_extensions_path = Path(__file__).parent.parent / "native_extensions"
+    if str(native_extensions_path) not in sys.path:
+        sys.path.insert(0, str(native_extensions_path))
+
+    from macos_sck_stream import (
+        AsyncCaptureStream,
+        AsyncStreamManager,
+        StreamingConfig,
+        is_sck_available
     )
-    SCREENCAPTUREKIT_AVAILABLE = True
-except ImportError:
-    SCREENCAPTUREKIT_AVAILABLE = False
-    logging.getLogger(__name__).info("ScreenCaptureKit not available (requires macOS 12.3+)")
+    SCREENCAPTUREKIT_AVAILABLE = is_sck_available()
+    NATIVE_SCK_BRIDGE_AVAILABLE = True
+    logging.getLogger(__name__).info("✅ ScreenCaptureKit native bridge loaded (Ferrari Engine)")
+except ImportError as e:
+    NATIVE_SCK_BRIDGE_AVAILABLE = False
+    # Fallback: Try PyObjC ScreenCaptureKit
+    try:
+        from ScreenCaptureKit import (
+            SCStreamConfiguration,
+            SCContentFilter,
+            SCStreamDelegate,
+        )
+        SCREENCAPTUREKIT_AVAILABLE = True
+    except ImportError:
+        SCREENCAPTUREKIT_AVAILABLE = False
+        logging.getLogger(__name__).info("ScreenCaptureKit not available (requires macOS 12.3+)")
 
 logger = logging.getLogger(__name__)
 
 
 class CaptureMethod(Enum):
     """Available capture methods in priority order"""
-    AVFOUNDATION = "avfoundation"  # Native AVFoundation (best quality, purple indicator)
-    SCREENCAPTUREKIT = "screencapturekit"  # Modern API (macOS 12.3+, best performance)
-    SCREENCAPTURE_CMD = "screencapture_cmd"  # screencapture command (fallback)
-    SCREENSHOT_LOOP = "screenshot_loop"  # Final fallback (PIL/Pillow)
+    SCREENCAPTUREKIT = "screencapturekit"  # For VideoWatcher window-specific capture (Ferrari Engine)
+    AVFOUNDATION = "avfoundation"  # ⚡ Priority 1: AVFoundation (full display, high quality, purple indicator)
+    SCREENCAPTURE_CMD = "screencapture_cmd"  # Priority 2: screencapture command (fallback)
+    SCREENSHOT_LOOP = "screenshot_loop"  # Priority 3: Final fallback (PIL/Pillow)
 
 
 class CaptureStatus(Enum):
@@ -541,10 +561,15 @@ class AdvancedVideoCaptureManager:
         self._executor = ThreadPoolExecutor(max_workers=2)
 
         logger.info(f"Advanced Video Capture Manager initialized")
+        logger.info(f"  ⚡ Ferrari Engine (Native SCK): {NATIVE_SCK_BRIDGE_AVAILABLE}")
         logger.info(f"  PyObjC available: {PYOBJC_AVAILABLE}")
         logger.info(f"  AVFoundation available: {AVFOUNDATION_AVAILABLE}")
         logger.info(f"  ScreenCaptureKit available: {SCREENCAPTUREKIT_AVAILABLE}")
         logger.info(f"  Config: {self.config.resolution} @ {self.config.target_fps} FPS")
+        if NATIVE_SCK_BRIDGE_AVAILABLE:
+            logger.info(f"  🏎️  Priority 1: ScreenCaptureKit (Adaptive FPS, GPU-accelerated)")
+        elif AVFOUNDATION_AVAILABLE:
+            logger.info(f"  📹  Priority 1: AVFoundation (High quality, purple indicator)")
 
     async def start_capture(self, frame_callback: Callable) -> bool:
         """
@@ -608,17 +633,18 @@ class AdvancedVideoCaptureManager:
         if self.config.preferred_method:
             methods.append(self.config.preferred_method)
 
-        # Then try others in order
+        # Priority 1: AVFoundation (best for full display capture)
         if AVFOUNDATION_AVAILABLE and CaptureMethod.AVFOUNDATION not in methods:
             methods.append(CaptureMethod.AVFOUNDATION)
 
-        if SCREENCAPTUREKIT_AVAILABLE and CaptureMethod.SCREENCAPTUREKIT not in methods:
-            methods.append(CaptureMethod.SCREENCAPTUREKIT)
+        # Note: ScreenCaptureKit (Ferrari Engine) optimized for window-specific capture (VideoWatcher)
+        # For full display, AVFoundation is more appropriate
 
+        # Priority 2: screencapture command (reliable fallback)
         if CaptureMethod.SCREENCAPTURE_CMD not in methods:
             methods.append(CaptureMethod.SCREENCAPTURE_CMD)
 
-        # Final fallback
+        # Priority 3: Final fallback
         if CaptureMethod.SCREENSHOT_LOOP not in methods:
             methods.append(CaptureMethod.SCREENSHOT_LOOP)
 
@@ -652,13 +678,28 @@ class AdvancedVideoCaptureManager:
         return await self.capture_impl.start_capture(self._on_frame_captured)
 
     async def _start_screencapturekit(self) -> bool:
-        """Start ScreenCaptureKit capture (macOS 12.3+)"""
+        """
+        Start ScreenCaptureKit capture using native C++ bridge (Ferrari Engine)
+
+        NOTE: Ferrari Engine (SCK) is optimized for window-specific capture.
+        For full display capture, AVFoundation is more appropriate.
+
+        This method is available but will fall through to AVFoundation
+        for full display capture. SCK excels in VideoWatcher for
+        window-specific surveillance.
+        """
         if not SCREENCAPTUREKIT_AVAILABLE:
-            logger.warning("ScreenCaptureKit not available (requires macOS 12.3+)")
+            logger.info("ScreenCaptureKit not available - Ferrari Engine is for window-specific capture")
             return False
 
-        # TODO: Implement ScreenCaptureKit support
-        logger.warning("ScreenCaptureKit support not yet implemented")
+        if not NATIVE_SCK_BRIDGE_AVAILABLE:
+            logger.info("Ferrari Engine (SCK bridge) optimized for VideoWatcher, not full display")
+            return False
+
+        # Ferrari Engine is designed for window-specific capture (VideoWatcher)
+        # For full display capture, AVFoundation is the better choice
+        logger.info("🏎️  Ferrari Engine available for window-specific VideoWatcher capture")
+        logger.info("   For full display: using AVFoundation (next in priority)")
         return False
 
     async def _start_screencapture_cmd(self) -> bool:
@@ -874,6 +915,10 @@ class VideoWatcher:
         # Frame queue (producer-consumer pattern)
         self.frame_queue: queue.Queue = queue.Queue(maxsize=config.max_buffer_size)
 
+        # ScreenCaptureKit stream (Ferrari Engine for window-specific capture)
+        self._sck_stream: Optional[Any] = None
+        self._use_sck = NATIVE_SCK_BRIDGE_AVAILABLE  # Will use SCK if available
+
         # Stats
         self.frames_captured = 0
         self.frames_analyzed = 0
@@ -884,12 +929,14 @@ class VideoWatcher:
         # Threading
         self._capture_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
+        self._frame_loop_task: Optional[asyncio.Task] = None
 
         # Metadata
         self.app_name: Optional[str] = None
         self.space_id: Optional[int] = None
 
-        logger.info(f"VideoWatcher created: {self.watcher_id} (Window {config.window_id}, {config.fps} FPS)")
+        capture_method = "ScreenCaptureKit (Ferrari)" if self._use_sck else "CGWindowListCreateImage"
+        logger.info(f"VideoWatcher created: {self.watcher_id} (Window {config.window_id}, {config.fps} FPS, Method: {capture_method})")
 
     async def start(self) -> bool:
         """Start the video watcher."""
@@ -901,7 +948,41 @@ class VideoWatcher:
         self.start_time = time.time()
         self._stop_event.clear()
 
-        # Start capture thread with low priority
+        # Try to initialize ScreenCaptureKit stream (Ferrari Engine)
+        if self._use_sck:
+            try:
+                logger.info(f"[Watcher {self.watcher_id}] Initializing Ferrari Engine for window {self.config.window_id}...")
+
+                sck_config = StreamingConfig(
+                    target_fps=self.config.fps,
+                    max_buffer_size=self.config.max_buffer_size,
+                    output_format="raw",
+                    use_gpu_acceleration=True,
+                    drop_frames_on_overflow=True,
+                    capture_cursor=False,  # Don't capture cursor for background monitoring
+                    resolution_scale=1.0
+                )
+
+                self._sck_stream = AsyncCaptureStream(self.config.window_id, sck_config)
+                success = await self._sck_stream.start()
+
+                if success:
+                    logger.info(f"🏎️  [Watcher {self.watcher_id}] Ferrari Engine started for window {self.config.window_id}")
+                    # Start async frame loop for SCK
+                    self._frame_loop_task = asyncio.create_task(self._sck_frame_loop())
+                    self.status = WatcherStatus.WATCHING
+                    return True
+                else:
+                    logger.warning(f"[Watcher {self.watcher_id}] Ferrari Engine failed to start, falling back to CGWindowListCreateImage")
+                    self._use_sck = False
+                    self._sck_stream = None
+
+            except Exception as e:
+                logger.warning(f"[Watcher {self.watcher_id}] Ferrari Engine initialization failed: {e}, falling back")
+                self._use_sck = False
+                self._sck_stream = None
+
+        # Fallback: Start traditional capture thread with CGWindowListCreateImage
         self._capture_thread = threading.Thread(
             target=self._capture_loop,
             name=f"VideoWatcher-{self.config.window_id}",
@@ -919,7 +1000,7 @@ class VideoWatcher:
         self._capture_thread.start()
         self.status = WatcherStatus.WATCHING
 
-        logger.info(f"✅ Watcher {self.watcher_id} started")
+        logger.info(f"✅ Watcher {self.watcher_id} started (fallback method)")
         return True
 
     def _capture_loop(self):
@@ -1170,6 +1251,83 @@ class VideoWatcher:
             logger.debug(f"[Fallback Capture] Error in fallback capture: {e}")
             return None
 
+    async def _sck_frame_loop(self):
+        """
+        ScreenCaptureKit frame consumption loop for VideoWatcher (Ferrari Engine)
+
+        This async loop pulls frames from the native SCK stream and pushes them
+        to the frame queue for consumption by visual event detection.
+        """
+        logger.info(f"[Watcher {self.watcher_id}] SCK frame loop started (Ferrari Engine)")
+
+        frame_count = 0
+        last_log_time = time.time()
+
+        while not self._stop_event.is_set() and self.status == WatcherStatus.WATCHING:
+            try:
+                # Get frame from SCK stream (use short timeout for responsive loop)
+                frame_data = await self._sck_stream.get_frame(timeout_ms=100)
+
+                if not frame_data:
+                    # No frame available (expected with adaptive FPS on static content)
+                    await asyncio.sleep(0.01)
+                    continue
+
+                frame_count += 1
+                self.frames_captured = frame_count
+                self.last_frame_time = time.time()
+
+                # Extract numpy array
+                frame = frame_data.get('image')
+                if frame is None:
+                    logger.debug(f"[Watcher {self.watcher_id}] Frame {frame_count} has no image data")
+                    continue
+
+                # Convert BGRA to RGB if needed
+                if len(frame.shape) == 3 and frame.shape[2] == 4:
+                    frame = frame[:, :, :3]  # Remove alpha
+                    frame = frame[:, :, ::-1]  # BGRA to RGB
+
+                # Log periodically
+                if frame_count % 10 == 1:
+                    logger.debug(
+                        f"[Watcher {self.watcher_id}] Frame {frame_count}: "
+                        f"shape={frame.shape}, "
+                        f"latency={frame_data.get('capture_latency_us', 0)/1000:.1f}ms, "
+                        f"queue_size={self.frame_queue.qsize()}"
+                    )
+
+                # Add to queue (non-blocking with overflow handling)
+                try:
+                    self.frame_queue.put_nowait({
+                        'frame': frame,
+                        'frame_number': frame_count,
+                        'timestamp': self.last_frame_time,
+                        'window_id': self.config.window_id,
+                        'capture_latency_ms': frame_data.get('capture_latency_us', 0) / 1000.0,
+                        'method': 'screencapturekit',
+                    })
+                except queue.Full:
+                    # Queue full, drop oldest frame
+                    try:
+                        self.frame_queue.get_nowait()
+                        self.frame_queue.put_nowait({
+                            'frame': frame,
+                            'frame_number': frame_count,
+                            'timestamp': self.last_frame_time,
+                            'window_id': self.config.window_id,
+                            'capture_latency_ms': frame_data.get('capture_latency_us', 0) / 1000.0,
+                            'method': 'screencapturekit',
+                        })
+                    except queue.Empty:
+                        pass
+
+            except Exception as e:
+                logger.error(f"[Watcher {self.watcher_id}] Error in SCK frame loop: {e}", exc_info=True)
+                await asyncio.sleep(0.1)  # Backoff on error
+
+        logger.info(f"[Watcher {self.watcher_id}] SCK frame loop stopped (captured {frame_count} frames)")
+
     async def get_latest_frame(self, timeout: float = 1.0) -> Optional[Dict[str, Any]]:
         """Get the latest frame from the watcher."""
         try:
@@ -1195,7 +1353,23 @@ class VideoWatcher:
         # Signal stop
         self._stop_event.set()
 
-        # Wait for capture thread
+        # Stop SCK stream if using Ferrari Engine
+        if self._sck_stream:
+            try:
+                await self._sck_stream.stop()
+                logger.info(f"[Watcher {self.watcher_id}] Ferrari Engine stream stopped")
+            except Exception as e:
+                logger.error(f"[Watcher {self.watcher_id}] Error stopping SCK stream: {e}")
+
+        # Cancel frame loop task if running
+        if self._frame_loop_task and not self._frame_loop_task.done():
+            self._frame_loop_task.cancel()
+            try:
+                await self._frame_loop_task
+            except asyncio.CancelledError:
+                pass
+
+        # Wait for capture thread (fallback method)
         if self._capture_thread and self._capture_thread.is_alive():
             self._capture_thread.join(timeout=2.0)
 
@@ -1210,8 +1384,9 @@ class VideoWatcher:
 
         # Log stats
         uptime = time.time() - self.start_time if self.start_time > 0 else 0
+        capture_method = "Ferrari Engine" if self._sck_stream else "CGWindowListCreateImage"
         logger.info(
-            f"✅ Watcher {self.watcher_id} stopped - "
+            f"✅ Watcher {self.watcher_id} stopped ({capture_method}) - "
             f"Uptime: {uptime:.1f}s, Frames: {self.frames_captured}, "
             f"Events: {self.events_detected}"
         )

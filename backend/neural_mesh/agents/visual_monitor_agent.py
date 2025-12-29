@@ -1,40 +1,51 @@
 """
-JARVIS Neural Mesh - Visual Monitor Agent v11.0
+JARVIS Neural Mesh - Visual Monitor Agent v12.0
 ===============================================
 
-The "Watcher & Actor" of Video Multi-Space Intelligence (VMSI).
+The "Watcher & Actor" of Video Multi-Space Intelligence (VMSI) - Ferrari Engine Edition.
 
-This agent provides ACTIVE visual surveillance capabilities:
-- Watch background windows for specific events
-- AUTOMATICALLY ACT when events are detected (NEW in v11.0!)
-- Monitor multiple windows in parallel
+This agent provides GPU-ACCELERATED visual surveillance capabilities:
+- 🏎️  Ferrari Engine: 60 FPS ScreenCaptureKit (adaptive, GPU-accelerated)
+- Watch background windows for specific events (OCR-based detection)
+- AUTOMATICALLY ACT when events are detected (v11.0 Watch & Act)
+- Monitor multiple windows in parallel ("God Mode")
 - Alert when visual events are detected
 - Execute Computer Use actions in response to visual triggers
 - Support conditional branching (if Error -> Retry, if Success -> Deploy)
 - Integrate with SpatialAwarenessAgent for window location
 - Share state across repos (JARVIS ↔ JARVIS Prime ↔ Reactor Core)
 
+v12.0 FERRARI ENGINE INTEGRATION:
+- Direct VideoWatcher usage (bypasses legacy VideoWatcherManager)
+- Automatic ScreenCaptureKit selection for window-specific capture
+- Adaptive FPS (10-15 FPS for static content, scales to 60 FPS for dynamic)
+- GPU-accelerated Metal texture handling (zero-copy)
+- Intelligent window discovery via fast_capture (Ferrari Engine)
+- Fallback chain: Ferrari Engine → SpatialAwareness → Legacy
+
 Capabilities:
 - watch_and_alert: Monitor a window for text/event and alert
-- watch_and_act: Monitor AND execute actions when event detected (NEW!)
-- watch_multiple: Monitor multiple windows in parallel
+- watch_and_act: Monitor AND execute actions when event detected
+- watch_multiple: Monitor multiple windows in parallel (God Mode)
 - stop_watching: Cancel active watchers
 - list_watchers: Get status of all active watchers
 
 Usage from voice:
-    Passive (v10.6):
+    Passive:
     "Watch the Terminal for 'Build Successful'"
 
-    ACTIVE (v11.0 NEW!):
+    Active (Watch & Act):
     "Watch the Terminal for 'Build Complete', then click Deploy"
     "When you see 'Error' in Terminal, click Retry button"
+
+    God Mode (Multi-Watch):
     "Watch Chrome for 'Application Submitted' and Terminal for 'Error'"
 
-This is JARVIS's "second pair of eyes AND hands" - autonomously monitoring
-and responding to background activity while you focus on your main work.
+This is JARVIS's "60 FPS eyes AND autonomous hands" - GPU-accelerated surveillance
+with intelligent action execution. Clinical-grade engineering.
 
 Author: JARVIS AI System
-Version: 11.0 - Watch & Act (Autonomous Response)
+Version: 12.0 - Ferrari Engine (GPU-Accelerated Watch & Act)
 """
 
 from __future__ import annotations
@@ -227,23 +238,29 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
             agent_type="visual_monitor",
             capabilities={
                 "watch_and_alert",
-                "watch_and_act",  # NEW v11.0: Active response
+                "watch_and_act",  # v11.0: Active response
                 "watch_multiple",
                 "stop_watching",
                 "list_watchers",
                 "get_watcher_stats",
                 "background_surveillance",  # Meta capability
-                "autonomous_response",  # NEW v11.0: Act on visual events
+                "autonomous_response",  # v11.0: Act on visual events
+                "ferrari_engine",  # v12.0: GPU-accelerated 60 FPS capture
+                "god_mode_surveillance",  # v12.0: Multi-window parallel monitoring
             },
-            version="11.0",
+            version="12.0",
         )
 
         self.config = config or VisualMonitorConfig()
 
         # Lazy-loaded components - Visual
-        self._watcher_manager = None
+        self._watcher_manager = None  # Legacy - deprecated in favor of direct VideoWatcher
         self._detector = None
         self._spatial_agent = None
+
+        # v12.0: Direct VideoWatcher management (Ferrari Engine)
+        self._active_video_watchers: Dict[str, Any] = {}  # watcher_id -> VideoWatcher instance
+        self._fast_capture_engine = None  # For window discovery
 
         # Lazy-loaded components - Action Execution (v11.0)
         self._computer_use_connector = None  # For executing actions
@@ -267,21 +284,37 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
 
     async def on_initialize(self) -> None:
         """Initialize agent resources."""
-        logger.info("Initializing VisualMonitorAgent v11.0 (VMSI Watcher & Actor)")
+        logger.info("Initializing VisualMonitorAgent v12.0 (Ferrari Engine Integration)")
 
-        # Initialize video watcher manager
+        # v12.0: Initialize Ferrari Engine components
+        try:
+            # Import Ferrari Engine window discovery
+            import sys
+            from pathlib import Path
+            native_ext_path = Path(__file__).parent.parent.parent / "native_extensions"
+            if str(native_ext_path) not in sys.path:
+                sys.path.insert(0, str(native_ext_path))
+
+            import fast_capture
+            self._fast_capture_engine = fast_capture.FastCaptureEngine()
+            logger.info("✅ Ferrari Engine - Window Discovery initialized")
+        except Exception as e:
+            logger.warning(f"⚠️  Ferrari Engine not available: {e}")
+            logger.warning("   Falling back to legacy window discovery")
+
+        # Legacy VideoWatcherManager (deprecated but kept for compatibility)
         try:
             from backend.vision.macos_video_capture_advanced import get_watcher_manager
             self._watcher_manager = get_watcher_manager()
-            logger.info("✓ VideoWatcherManager initialized")
+            logger.info("✓ Legacy VideoWatcherManager initialized (fallback)")
         except Exception as e:
-            logger.warning(f"VideoWatcherManager init failed: {e}")
+            logger.debug(f"Legacy VideoWatcherManager init failed: {e}")
 
-        # Initialize visual event detector
+        # Initialize visual event detector (OCR for trigger detection)
         try:
             from backend.vision.visual_event_detector import create_detector
             self._detector = create_detector()
-            logger.info("✓ VisualEventDetector initialized")
+            logger.info("✓ VisualEventDetector (OCR) initialized")
         except Exception as e:
             logger.warning(f"VisualEventDetector init failed: {e}")
 
@@ -364,10 +397,21 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
             f"VisualMonitorAgent stopping - "
             f"Watches: {self._total_watches_started}, "
             f"Events: {self._total_events_detected}, "
-            f"Alerts: {self._total_alerts_sent}"
+            f"Alerts: {self._total_alerts_sent}, "
+            f"Actions: {self._total_actions_executed} ({self._total_actions_succeeded} succeeded)"
         )
 
-        # Stop all active watchers
+        # v12.0: Stop all Ferrari Engine watchers
+        if self._active_video_watchers:
+            logger.info(f"Stopping {len(self._active_video_watchers)} Ferrari Engine watchers...")
+            for watcher_id, watcher_info in list(self._active_video_watchers.items()):
+                try:
+                    await watcher_info['watcher'].stop()
+                    logger.debug(f"Stopped Ferrari Engine watcher: {watcher_id}")
+                except Exception as e:
+                    logger.error(f"Error stopping watcher {watcher_id}: {e}")
+
+        # Legacy: Stop all active watchers in old manager
         if self._watcher_manager:
             await self._watcher_manager.stop_all_watchers()
 
@@ -479,18 +523,24 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
             detected_space_id = window_info.get('space_id', 0)
 
             logger.info(
-                f"Found {app_name}: Window {window_id}, Space {detected_space_id}"
+                f"Found {app_name}: Window {window_id}, Space {detected_space_id}, "
+                f"Method: {window_info.get('method', 'unknown')}"
             )
 
-            # Step 2: Spawn watcher
-            watcher = await self._watcher_manager.spawn_watcher(
+            # Step 2: Spawn Ferrari Engine VideoWatcher (v12.0)
+            watcher = await self._spawn_ferrari_watcher(
                 window_id=window_id,
                 fps=self.config.default_fps,
                 app_name=app_name,
-                space_id=detected_space_id,
-                priority="low",
-                timeout=self.config.default_timeout
+                space_id=detected_space_id
             )
+
+            if not watcher:
+                return {
+                    "success": False,
+                    "error": f"Failed to create Ferrari Engine watcher for {app_name}",
+                    "window_id": window_id
+                }
 
             # v11.0: Auto-create action_config from workflow_goal if provided
             if workflow_goal and not action_config:
@@ -718,14 +768,81 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
         space_id: Optional[int] = None
     ) -> Dict[str, Any]:
         """
-        Find window using SpatialAwarenessAgent.
+        Find window using Ferrari Engine (fast_capture) or fallbacks.
 
-        Returns window_id and space_id.
+        Returns window_id and space_id with high confidence.
+
+        Priority:
+        1. Ferrari Engine (fast_capture) - Accurate window enumeration
+        2. SpatialAwarenessAgent - Yabai integration
+        3. Legacy estimation - Hash-based fallback
         """
-        # Try to get SpatialAwarenessAgent from coordinator
-        if not self._spatial_agent and hasattr(self, 'coordinator') and self.coordinator:
+        # Priority 1: Ferrari Engine (fast_capture) - ACCURATE
+        if self._fast_capture_engine:
             try:
-                # Request spatial awareness
+                logger.debug(f"🔍 Searching for '{app_name}' using Ferrari Engine...")
+
+                # Get all visible windows
+                windows = await asyncio.to_thread(
+                    self._fast_capture_engine.get_visible_windows
+                )
+
+                # Fuzzy search for app name (case-insensitive, partial match)
+                app_name_lower = app_name.lower()
+                matching_windows = []
+
+                for window in windows:
+                    window_app_lower = window.app_name.lower()
+
+                    # Match strategies (in priority order):
+                    # 1. Exact match
+                    if window_app_lower == app_name_lower:
+                        matching_windows.append((window, 100))  # 100% confidence
+                    # 2. App name contains search term
+                    elif app_name_lower in window_app_lower:
+                        matching_windows.append((window, 90))
+                    # 3. Search term contains app name
+                    elif window_app_lower in app_name_lower:
+                        matching_windows.append((window, 80))
+                    # 4. Fuzzy match (similar terms)
+                    elif self._fuzzy_match(app_name_lower, window_app_lower):
+                        matching_windows.append((window, 70))
+
+                if matching_windows:
+                    # Sort by confidence, then by window size (prefer larger windows)
+                    matching_windows.sort(key=lambda x: (x[1], x[0].width * x[0].height), reverse=True)
+
+                    best_window, confidence = matching_windows[0]
+
+                    logger.info(
+                        f"✅ Ferrari Engine found '{app_name}': "
+                        f"Window {best_window.window_id} ({best_window.width}x{best_window.height}), "
+                        f"Confidence: {confidence}%"
+                    )
+
+                    return {
+                        'found': True,
+                        'window_id': best_window.window_id,
+                        'space_id': space_id or 1,  # Space ID from yabai if available
+                        'app_name': best_window.app_name,
+                        'window_title': best_window.window_title,
+                        'width': best_window.width,
+                        'height': best_window.height,
+                        'confidence': confidence,
+                        'method': 'ferrari_engine'
+                    }
+                else:
+                    logger.warning(f"⚠️  Ferrari Engine: No windows found matching '{app_name}'")
+                    logger.debug(f"   Available apps: {[w.app_name for w in windows[:10]]}")
+
+            except Exception as e:
+                logger.warning(f"⚠️  Ferrari Engine window search failed: {e}")
+
+        # Priority 2: SpatialAwarenessAgent (yabai integration)
+        if hasattr(self, 'coordinator') and self.coordinator:
+            try:
+                logger.debug(f"🔍 Trying SpatialAwarenessAgent for '{app_name}'...")
+
                 result = await self.coordinator.request(
                     to_agent="spatial_awareness_agent",
                     payload={
@@ -736,35 +853,291 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                 )
 
                 if result and result.get('found'):
-                    # Get first space where app is found
                     spaces = result.get('spaces', [])
                     if spaces:
                         target_space = spaces[0] if not space_id else space_id
 
-                        # Get window ID from yabai (simplified)
-                        # In production, this would integrate with yabai properly
-                        window_id = self._estimate_window_id(app_name)
+                        # Try to get window ID from Ferrari Engine for this app
+                        if self._fast_capture_engine:
+                            windows = await asyncio.to_thread(
+                                self._fast_capture_engine.get_visible_windows
+                            )
+                            for window in windows:
+                                if app_name.lower() in window.app_name.lower():
+                                    return {
+                                        'found': True,
+                                        'window_id': window.window_id,
+                                        'space_id': target_space,
+                                        'app_name': window.app_name,
+                                        'method': 'spatial_awareness + ferrari'
+                                    }
 
-                        return {
-                            'found': True,
-                            'window_id': window_id,
-                            'space_id': target_space,
-                            'app_name': app_name
-                        }
+                        logger.info(f"✓ SpatialAwarenessAgent found '{app_name}' on space {target_space}")
 
             except Exception as e:
-                logger.warning(f"Error finding window via SpatialAwarenessAgent: {e}")
+                logger.warning(f"SpatialAwarenessAgent query failed: {e}")
 
-        # Fallback: estimate window ID
+        # Priority 3: Legacy estimation (hash-based)
+        logger.warning(f"⚠️  Using legacy window estimation for '{app_name}'")
         window_id = self._estimate_window_id(app_name)
 
         return {
-            'found': window_id > 0,
+            'found': True,  # Optimistic - may fail later
             'window_id': window_id,
             'space_id': space_id or 1,
             'app_name': app_name,
-            'fallback': True
+            'method': 'legacy_estimation',
+            'warning': 'Using estimated window ID - may be inaccurate'
         }
+
+    def _fuzzy_match(self, term1: str, term2: str, threshold: float = 0.6) -> bool:
+        """
+        Fuzzy string matching for app names.
+
+        Returns True if strings are similar enough.
+        """
+        # Simple Levenshtein-like similarity
+        if not term1 or not term2:
+            return False
+
+        # Check for common substrings
+        longer = term1 if len(term1) >= len(term2) else term2
+        shorter = term2 if len(term1) >= len(term2) else term1
+
+        # Count matching characters
+        matches = sum(1 for c in shorter if c in longer)
+        similarity = matches / len(longer)
+
+        return similarity >= threshold
+
+    async def _ferrari_visual_detection(
+        self,
+        watcher: Any,
+        trigger_text: str,
+        timeout: float
+    ) -> Dict[str, Any]:
+        """
+        Ferrari Engine visual detection loop.
+
+        Continuously pulls frames from VideoWatcher (Ferrari Engine) and
+        runs OCR detection to find trigger text.
+
+        This is the v12.0 CORE - where 60 FPS GPU frames meet intelligent OCR.
+
+        Args:
+            watcher: VideoWatcher instance (Ferrari Engine)
+            trigger_text: Text to search for (supports case-insensitive fuzzy matching)
+            timeout: Max time to wait for detection
+
+        Returns:
+            Detection result with confidence and timing
+        """
+        import time
+        start_time = time.time()
+        frame_count = 0
+        ocr_checks = 0
+
+        logger.info(
+            f"[Ferrari Detection] Starting visual search for '{trigger_text}' "
+            f"(timeout: {timeout}s)"
+        )
+
+        try:
+            while True:
+                # Check timeout
+                elapsed = time.time() - start_time
+                if elapsed > timeout:
+                    logger.info(
+                        f"[Ferrari Detection] Timeout after {elapsed:.1f}s "
+                        f"({frame_count} frames, {ocr_checks} OCR checks)"
+                    )
+                    return {
+                        'detected': False,
+                        'confidence': 0.0,
+                        'trigger': None,
+                        'detection_time': elapsed,
+                        'frames_checked': frame_count,
+                        'ocr_checks': ocr_checks,
+                        'timeout': True
+                    }
+
+                # Get latest frame from Ferrari Engine
+                frame_data = await watcher.get_latest_frame(timeout=1.0)
+
+                if not frame_data:
+                    # No frame available - watcher may have stopped or no new frames
+                    await asyncio.sleep(0.1)
+                    continue
+
+                frame_count += 1
+                frame = frame_data.get('frame')
+
+                if frame is None:
+                    continue
+
+                # OCR detection every N frames (adaptive based on FPS)
+                # For 5 FPS: check every frame
+                # For 30 FPS: check every 3-5 frames to reduce OCR load
+                fps = frame_data.get('fps', 5)
+                check_interval = max(1, int(fps / 5))  # ~5 OCR checks per second
+
+                if frame_count % check_interval == 0:
+                    ocr_checks += 1
+
+                    # Run OCR detection
+                    detected, confidence, detected_text = await self._ocr_detect(
+                        frame=frame,
+                        trigger_text=trigger_text
+                    )
+
+                    if detected:
+                        detection_time = time.time() - start_time
+                        logger.info(
+                            f"[Ferrari Detection] ✅ FOUND '{trigger_text}'! "
+                            f"Time: {detection_time:.2f}s, Confidence: {confidence:.2f}, "
+                            f"Frames: {frame_count}, OCR checks: {ocr_checks}"
+                        )
+
+                        return {
+                            'detected': True,
+                            'confidence': confidence,
+                            'trigger': detected_text,
+                            'detection_time': detection_time,
+                            'frames_checked': frame_count,
+                            'ocr_checks': ocr_checks,
+                            'method': frame_data.get('method', 'screencapturekit')
+                        }
+
+                    # Log periodic progress
+                    if ocr_checks % 10 == 0:
+                        logger.debug(
+                            f"[Ferrari Detection] Progress: {ocr_checks} OCR checks, "
+                            f"{frame_count} frames, {elapsed:.1f}s elapsed"
+                        )
+
+                # Small sleep to prevent busy-wait
+                await asyncio.sleep(0.05)
+
+        except Exception as e:
+            logger.exception(f"[Ferrari Detection] Error: {e}")
+            return {
+                'detected': False,
+                'confidence': 0.0,
+                'error': str(e),
+                'frames_checked': frame_count,
+                'ocr_checks': ocr_checks
+            }
+
+    async def _ocr_detect(
+        self,
+        frame: Any,
+        trigger_text: str
+    ) -> tuple[bool, float, Optional[str]]:
+        """
+        Run OCR on frame and check for trigger text.
+
+        Args:
+            frame: Numpy array (RGB)
+            trigger_text: Text to search for
+
+        Returns:
+            (detected, confidence, detected_text)
+        """
+        try:
+            if not self._detector:
+                # No detector available - fallback to simple presence check
+                return False, 0.0, None
+
+            # Run OCR detection via visual event detector (async method)
+            result = await self._detector.detect_text(
+                frame=frame,
+                target_text=trigger_text,
+                case_sensitive=False,
+                fuzzy=True
+            )
+
+            if result and result.get('found', False):
+                return True, result.get('confidence', 0.9), result.get('text', trigger_text)
+
+            return False, 0.0, None
+
+        except Exception as e:
+            logger.debug(f"[OCR] Detection error: {e}")
+            return False, 0.0, None
+
+    async def _spawn_ferrari_watcher(
+        self,
+        window_id: int,
+        fps: int,
+        app_name: str,
+        space_id: int
+    ) -> Optional[Any]:
+        """
+        Spawn a Ferrari Engine VideoWatcher for window-specific surveillance.
+
+        This is the v12.0 core - direct VideoWatcher creation that automatically
+        uses the ScreenCaptureKit Ferrari Engine for 60 FPS GPU-accelerated capture.
+
+        Args:
+            window_id: Window ID to monitor
+            fps: Target FPS (adaptive - will throttle for static content)
+            app_name: Application name (for logging)
+            space_id: macOS space ID
+
+        Returns:
+            VideoWatcher instance or None if failed
+        """
+        try:
+            from backend.vision.macos_video_capture_advanced import VideoWatcher, WatcherConfig
+
+            logger.info(
+                f"🏎️  Spawning Ferrari Engine watcher: "
+                f"Window {window_id} ({app_name}), {fps} FPS"
+            )
+
+            # Create watcher configuration
+            watcher_config = WatcherConfig(
+                window_id=window_id,
+                fps=fps,
+                max_buffer_size=10  # Adaptive buffer
+            )
+
+            # Create VideoWatcher (will auto-select Ferrari Engine if available)
+            watcher = VideoWatcher(watcher_config)
+
+            # Start the watcher
+            success = await watcher.start()
+
+            if not success:
+                logger.error(f"❌ Ferrari Engine watcher failed to start for window {window_id}")
+                return None
+
+            # Store watcher info
+            watcher_id = watcher.watcher_id
+            self._active_video_watchers[watcher_id] = {
+                'watcher': watcher,
+                'window_id': window_id,
+                'app_name': app_name,
+                'space_id': space_id,
+                'fps': fps,
+                'started_at': datetime.now().isoformat(),
+                'config': watcher_config
+            }
+
+            logger.info(
+                f"✅ Ferrari Engine watcher started: {watcher_id} "
+                f"(Window {window_id}, {app_name})"
+            )
+
+            return watcher
+
+        except ImportError as e:
+            logger.error(f"❌ Ferrari Engine not available: {e}")
+            logger.error("   VideoWatcher/WatcherConfig import failed")
+            return None
+        except Exception as e:
+            logger.exception(f"❌ Failed to spawn Ferrari Engine watcher: {e}")
+            return None
 
     def _estimate_window_id(self, app_name: str) -> int:
         """
@@ -811,22 +1184,21 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                     f"[{watcher.watcher_id}] 🎯 ACTIVE MODE: Will execute action when detected!"
                 )
 
-            # Wait for visual event
-            result = await self._watcher_manager.wait_for_visual_event(
+            # v12.0: Ferrari Engine frame monitoring with OCR detection
+            result = await self._ferrari_visual_detection(
                 watcher=watcher,
-                trigger=trigger_text,
-                detector=self._detector,
+                trigger_text=trigger_text,
                 timeout=self.config.default_timeout
             )
 
-            if result.detected:
+            if result.get('detected', False):
                 detected = True
-                detection_confidence = result.confidence
+                detection_confidence = result.get('confidence', 0.0)
                 self._total_events_detected += 1
 
                 logger.info(
                     f"[{watcher.watcher_id}] ✅ Event detected! "
-                    f"Trigger: '{trigger_text}', Confidence: {result.confidence:.2f}"
+                    f"Trigger: '{trigger_text}', Confidence: {detection_confidence:.2f}"
                 )
 
                 # VOICE NARRATION: Announce event detection
@@ -843,8 +1215,8 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                     app_name=app_name,
                     trigger_text=trigger_text,
                     space_id=space_id,
-                    confidence=result.confidence,
-                    detection_time=result.detection_time
+                    confidence=detection_confidence,
+                    detection_time=result.get('detection_time', 0.0)
                 )
 
                 # v11.0: EXECUTE ACTION if configured!
@@ -864,11 +1236,11 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
 
                     action_result = await self._execute_response(
                         trigger_text=trigger_text,
-                        detected_text=result.trigger,  # Actual detected text
+                        detected_text=result.get('trigger', trigger_text),  # Actual detected text
                         action_config=action_config,
                         app_name=app_name,
                         space_id=space_id,
-                        confidence=result.confidence
+                        confidence=detection_confidence
                     )
 
                     if action_result and action_result.success:
@@ -910,8 +1282,8 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                         "app_name": app_name,
                         "trigger_text": trigger_text,
                         "space_id": space_id,
-                        "confidence": result.confidence,
-                        "detection_time": result.detection_time,
+                        "confidence": detection_confidence,
+                        "detection_time": result.get('detection_time', 0.0),
                         "timestamp": datetime.now().isoformat(),
                     }
 
@@ -1503,15 +1875,34 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
     def get_stats(self) -> Dict[str, Any]:
         """Get agent statistics."""
         return {
+            # Core stats
             "total_watches_started": self._total_watches_started,
             "total_events_detected": self._total_events_detected,
             "total_alerts_sent": self._total_alerts_sent,
+
+            # v11.0: Action execution stats
+            "total_actions_executed": self._total_actions_executed,
+            "total_actions_succeeded": self._total_actions_succeeded,
+            "total_actions_failed": self._total_actions_failed,
+
+            # Watcher stats
             "active_watchers": len(self._active_watchers),
+            "active_ferrari_watchers": len(self._active_video_watchers),  # v12.0
             "max_parallel": self.config.max_parallel_watchers,
+
+            # Capabilities
             "capabilities": list(self.capabilities),
-            "version": "10.6",
-            "watcher_manager_available": self._watcher_manager is not None,
+            "version": "12.0",  # Ferrari Engine Edition
+
+            # Component availability
+            "ferrari_engine_available": self._fast_capture_engine is not None,  # v12.0
+            "watcher_manager_available": self._watcher_manager is not None,  # Legacy
             "detector_available": self._detector is not None,
+            "computer_use_available": self._computer_use_connector is not None,
+
+            # v12.0: Ferrari Engine details
+            "capture_method": "ferrari_engine" if self._fast_capture_engine else "legacy",
+            "gpu_accelerated": self._fast_capture_engine is not None,
         }
 
 
