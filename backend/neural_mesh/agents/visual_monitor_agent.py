@@ -68,6 +68,8 @@ from ..data_models import (
     MessagePriority,
 )
 
+logger = logging.getLogger(__name__)
+
 # Multi-space window detection for "God Mode" parallel watching
 try:
     from backend.vision.multi_space_window_detector import MultiSpaceWindowDetector
@@ -75,8 +77,6 @@ try:
 except ImportError:
     MULTI_SPACE_AVAILABLE = False
     logger.warning("MultiSpaceWindowDetector not available - multi-space watching disabled")
-
-logger = logging.getLogger(__name__)
 
 
 # =============================================================================
@@ -730,7 +730,7 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
             logger.info(f"  - Window {w['window_id']} on Space {w['space_id']} ({w['confidence']}% match)")
 
         # Validate max watchers
-        max_watchers = self._config.get('max_parallel_watchers', 20)
+        max_watchers = self.config.max_multi_space_watchers
         if len(windows) > max_watchers:
             logger.warning(f"⚠️  Found {len(windows)} windows, limiting to {max_watchers} for safety")
             windows = windows[:max_watchers]
@@ -942,7 +942,7 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
             )
 
             # Use adaptive FPS based on config
-            fps = self._config.get('ferrari_fps', 60)
+            fps = self.config.ferrari_fps
 
             # Create Ferrari Engine VideoWatcher
             watcher = await self._spawn_ferrari_watcher(
@@ -1417,14 +1417,22 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                 logger.info(f"🔍 God Mode: Searching for ALL '{app_name}' windows across ALL spaces...")
 
                 detector = MultiSpaceWindowDetector()
-                all_windows = await detector.get_all_windows_across_spaces()
+                result = detector.get_all_windows_across_spaces()
+
+                # Extract windows list from result dict
+                all_windows = result.get('windows', [])
+
+                if not all_windows:
+                    logger.warning(f"⚠️  God Mode: No windows found in multi-space detection result")
+                    return []
 
                 # Filter for matching app across ALL spaces
                 app_name_lower = app_name.lower()
                 matching_windows = []
 
-                for window_info in all_windows:
-                    window_app = window_info.get('app_name', '')
+                for window_obj in all_windows:
+                    # Access EnhancedWindowInfo object attributes
+                    window_app = window_obj.app_name if hasattr(window_obj, 'app_name') else ''
                     window_app_lower = window_app.lower()
 
                     # Match strategies
@@ -1441,12 +1449,12 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                     if confidence > 0:
                         matching_windows.append({
                             'found': True,
-                            'window_id': window_info.get('window_id'),
-                            'space_id': window_info.get('space_id', 1),
+                            'window_id': window_obj.window_id,
+                            'space_id': window_obj.space_id if window_obj.space_id else 1,
                             'app_name': window_app,
-                            'window_title': window_info.get('title', ''),
-                            'bounds': window_info.get('bounds', {}),
-                            'is_visible': window_info.get('is_visible', True),
+                            'window_title': window_obj.window_title if hasattr(window_obj, 'window_title') else '',
+                            'bounds': window_obj.bounds if hasattr(window_obj, 'bounds') else {},
+                            'is_visible': True,  # All windows from multi-space detector are visible
                             'confidence': confidence,
                             'method': 'multi_space_detector'
                         })
@@ -2557,15 +2565,6 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
     # =========================================================================
     # Convenience methods
     # =========================================================================
-
-    async def watch(
-        self,
-        app_name: str,
-        trigger_text: str,
-        space_id: Optional[int] = None
-    ) -> Dict[str, Any]:
-        """Quick method to start watching."""
-        return await self.watch_and_alert(app_name, trigger_text, space_id)
 
     def get_stats(self) -> Dict[str, Any]:
         """Get agent statistics."""
