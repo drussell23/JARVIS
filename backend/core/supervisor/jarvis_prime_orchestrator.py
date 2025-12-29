@@ -307,37 +307,85 @@ class JarvisPrimeOrchestrator:
                     timeout=aiohttp.ClientTimeout(total=self.config.health_check_timeout_seconds)
                 )
 
-            # Clean up any existing process on our port (v10.3)
-            await self._ensure_port_available()
+            # ROOT CAUSE FIX: Retry logic to handle race conditions
+            max_spawn_attempts = int(os.getenv("JARVIS_PRIME_SPAWN_RETRIES", "3"))
+            spawn_retry_delay = float(os.getenv("JARVIS_PRIME_SPAWN_RETRY_DELAY", "2.0"))
 
-            # Start the subprocess
-            success = await self._spawn_process()
+            for attempt in range(max_spawn_attempts):
+                try:
+                    # Clean up any existing process on our port
+                    await self._ensure_port_available()
 
-            if success:
-                # Wait for it to become healthy
-                healthy = await self._wait_for_healthy()
+                    # Start the subprocess
+                    success = await self._spawn_process()
 
-                if healthy:
-                    self._started = True
-                    self._restart_count = 0
-                    self._start_time = datetime.now()
-                    self._set_status(PrimeStatus.RUNNING)
+                    if success:
+                        # Wait for it to become healthy
+                        healthy = await self._wait_for_healthy()
 
-                    # Start health monitoring
-                    self._health_check_task = asyncio.create_task(
-                        self._health_check_loop()
-                    )
+                        if healthy:
+                            self._started = True
+                            self._restart_count = 0
+                            self._start_time = datetime.now()
+                            self._set_status(PrimeStatus.RUNNING)
 
-                    await self._announce("Local brain online and ready.")
-                    logger.info(f"[JarvisPrime] Started successfully (PID: {self._process.pid})")
-                    return True
-                else:
-                    await self._terminate_process()
-                    self._set_status(PrimeStatus.FAILED)
-                    return False
-            else:
-                self._set_status(PrimeStatus.FAILED)
-                return False
+                            # Start health monitoring
+                            self._health_check_task = asyncio.create_task(
+                                self._health_check_loop()
+                            )
+
+                            await self._announce("Local brain online and ready.")
+                            logger.info(f"[JarvisPrime] Started successfully (PID: {self._process.pid})")
+                            return True
+                        else:
+                            # Process spawned but not healthy
+                            await self._terminate_process()
+
+                            if attempt < max_spawn_attempts - 1:
+                                logger.warning(
+                                    f"[JarvisPrime] Process unhealthy (attempt {attempt + 1}/{max_spawn_attempts}), "
+                                    f"retrying in {spawn_retry_delay}s..."
+                                )
+                                await asyncio.sleep(spawn_retry_delay)
+                                continue
+                            else:
+                                self._set_status(PrimeStatus.FAILED)
+                                return False
+                    else:
+                        # Spawn failed
+                        if attempt < max_spawn_attempts - 1:
+                            logger.warning(
+                                f"[JarvisPrime] Spawn failed (attempt {attempt + 1}/{max_spawn_attempts}), "
+                                f"retrying in {spawn_retry_delay}s..."
+                            )
+                            await asyncio.sleep(spawn_retry_delay)
+                            continue
+                        else:
+                            self._set_status(PrimeStatus.FAILED)
+                            return False
+
+                except RuntimeError as e:
+                    # Port cleanup failed - this is fatal
+                    if "Port" in str(e) and "cannot be freed" in str(e):
+                        logger.error(f"[JarvisPrime] Fatal port cleanup error: {e}")
+                        self._set_status(PrimeStatus.FAILED)
+                        self._health.error_message = str(e)
+                        return False
+
+                    # Other runtime errors - retry
+                    if attempt < max_spawn_attempts - 1:
+                        logger.warning(
+                            f"[JarvisPrime] Start error (attempt {attempt + 1}/{max_spawn_attempts}): {e}, "
+                            f"retrying in {spawn_retry_delay}s..."
+                        )
+                        await asyncio.sleep(spawn_retry_delay)
+                        continue
+                    else:
+                        raise
+
+            # All attempts exhausted
+            self._set_status(PrimeStatus.FAILED)
+            return False
 
         except Exception as e:
             logger.error(f"[JarvisPrime] Start failed: {e}")
@@ -665,57 +713,80 @@ class JarvisPrimeOrchestrator:
                 except Exception as e:
                     logger.debug(f"[JarvisPrime] Could not check for existing subprocess: {e}")
 
-            # No existing subprocess found - the port binding is stale
-            # This happens when supervisor binds the port but hasn't spawned Prime yet
-            # OR when a previous Prime instance crashed and left the socket in TIME_WAIT
-
-            logger.info(
-                f"[JarvisPrime] No existing Prime subprocess found, but port {port} is bound to us. "
-                f"Attempting to release port binding before starting new instance..."
+            # ROOT CAUSE FIX: No existing subprocess found - the port binding is stale
+            # This is a CRITICAL failure case that needs aggressive cleanup!
+            logger.warning(
+                f"[JarvisPrime] No existing Prime subprocess found, but port {port} is bound. "
+                f"This indicates a zombie/orphaned process. Attempting aggressive cleanup..."
             )
 
-            # Try to force release the port by using SO_REUSEADDR socket option
-            # This allows the new Prime process to bind even if port is in TIME_WAIT
+            # AGGRESSIVE FIX: Use fuser to find and kill ALL processes on the port
+            import subprocess as sp
             try:
-                import socket
+                # Find PIDs using fuser (more reliable than lsof for cleanup)
+                result = sp.run(
+                    ["lsof", "-ti", f":{port}"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
 
-                # Create a temporary socket with SO_REUSEADDR to force release
-                temp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                temp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                if result.stdout.strip():
+                    pids = result.stdout.strip().split('\n')
+                    logger.warning(f"[JarvisPrime] Found {len(pids)} processes on port {port}: {pids}")
 
-                try:
-                    temp_sock.bind(('', port))
-                    logger.debug(f"[JarvisPrime] Successfully bound temporary socket to port {port}")
-                except OSError as e:
-                    logger.debug(f"[JarvisPrime] Could not bind temporary socket: {e}")
-                finally:
-                    temp_sock.close()
-                    logger.debug(f"[JarvisPrime] Closed temporary socket, port {port} should now be available")
+                    for pid_str in pids:
+                        try:
+                            kill_pid = int(pid_str.strip())
+                            logger.warning(f"[JarvisPrime] Force killing PID {kill_pid} on port {port}")
+                            os.kill(kill_pid, signal.SIGKILL)
+                        except (ValueError, ProcessLookupError, PermissionError) as e:
+                            logger.debug(f"[JarvisPrime] Could not kill PID {pid_str}: {e}")
 
-                # Wait a moment for the port to fully release
-                await asyncio.sleep(0.5)
+                    # Wait for processes to die
+                    await asyncio.sleep(2.0)
 
                 # Verify port is now free
                 verify_pid = await self._get_pid_on_port(port)
                 if verify_pid is None:
-                    logger.info(f"[JarvisPrime] Port {port} successfully released")
+                    logger.info(f"[JarvisPrime] Port {port} successfully freed via aggressive cleanup")
                     return
                 else:
-                    logger.warning(
-                        f"[JarvisPrime] Port {port} still in use after release attempt (PID {verify_pid}). "
-                        f"Will proceed anyway - Prime may use SO_REUSEADDR."
+                    # CRITICAL: Port STILL not free - this is a hard failure
+                    logger.error(
+                        f"[JarvisPrime] CRITICAL: Port {port} still in use (PID {verify_pid}) after aggressive cleanup! "
+                        f"Cannot proceed safely."
                     )
-                    # Don't raise - allow Prime to try with SO_REUSEADDR
-                    return
+                    raise RuntimeError(
+                        f"Port {port} cannot be freed (PID {verify_pid} won't die). "
+                        f"Manual intervention required: sudo kill -9 {verify_pid}"
+                    )
 
-            except ImportError:
-                logger.debug("[JarvisPrime] socket module not available")
-                # Don't raise - allow Prime to try binding
-                return
+            except FileNotFoundError:
+                logger.warning("[JarvisPrime] lsof not available - trying manual socket release")
+                # Fallback: Try SO_REUSEADDR
+                try:
+                    import socket
+                    temp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    temp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    try:
+                        temp_sock.bind(('', port))
+                        logger.debug(f"[JarvisPrime] Bound temporary socket to port {port}")
+                    finally:
+                        temp_sock.close()
+                    await asyncio.sleep(0.5)
+
+                    verify_pid = await self._get_pid_on_port(port)
+                    if verify_pid is None:
+                        logger.info(f"[JarvisPrime] Port {port} released via socket manipulation")
+                        return
+                except Exception as e:
+                    logger.error(f"[JarvisPrime] Socket release failed: {e}")
+                    raise RuntimeError(f"Cannot free port {port} - no cleanup tools available")
+
             except Exception as e:
-                logger.debug(f"[JarvisPrime] Error during port release: {e}")
-                # Don't raise - allow Prime to try binding
-                return
+                logger.error(f"[JarvisPrime] Port cleanup error: {e}")
+                raise RuntimeError(f"Port {port} cleanup failed: {e}")
 
         # v10.5: IMMEDIATE zombie/defunct process cleanup
         # Zombies can't be killed normally, so detect and reap them first
