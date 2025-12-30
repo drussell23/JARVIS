@@ -3038,15 +3038,38 @@ class UnifiedCommandProcessor:
                 #   - "monitor every Notes tab for save complete" ✓
                 #   - "track each Calendar window for event reminder" ✓
                 #
+                # =====================================================================
+                # ROOT CAUSE FIX: Robust Pattern Matching v8.0.0
+                # =====================================================================
+                # PROBLEM: Strict regex `(?:[\w\s]+\s+)?` fails on some app names
+                # - "watch all chrome windows" sometimes doesn't match
+                # - Falls back to VisionHandler → "Application window active"
+                #
+                # SOLUTION: More aggressive pattern + fallback simple patterns
+                # - Use `.*?` (non-greedy wildcard) instead of `(?:[\w\s]+\s+)?`
+                # - Add simple fallback patterns for edge cases
+                # - Explicit logging to prove detection works
+                # =====================================================================
+
                 # Grammar Pattern Components:
                 # - (all|every|each) = Quantifier (God Mode trigger)
-                # - (?:[\w\s]+\s+)? = Optional app name (ANY words)
+                # - .*? = Non-greedy wildcard (matches ANY app name)
                 # - (windows?|tabs?|instances?|spaces?) = Target type
                 #
+                # AGGRESSIVE PATTERN: Matches "all [ANYTHING] windows"
                 god_mode_pattern = os.getenv(
                     "JARVIS_GOD_MODE_GRAMMAR_PATTERN",
-                    r"\b(all|every|each)\s+(?:[\w\s]+\s+)?(windows?|tabs?|instances?|spaces?)\b"
+                    r"\b(all|every|each)\s+.*?\s*(windows?|tabs?|instances?|spaces?)\b"
                 )
+
+                # Fallback simple patterns (if main pattern fails)
+                simple_patterns = [
+                    r"\ball\s+.*?\s+windows?\b",      # "all ... window(s)"
+                    r"\bevery\s+.*?\s+windows?\b",    # "every ... window(s)"
+                    r"\beach\s+.*?\s+windows?\b",     # "each ... window(s)"
+                    r"\ball\s+.*?\s+tabs?\b",         # "all ... tab(s)"
+                    r"\bevery\s+.*?\s+tabs?\b",       # "every ... tab(s)"
+                ]
 
                 # Intelligent pattern matching:
                 # - Must have monitoring keyword AND surveillance structure
@@ -3055,9 +3078,19 @@ class UnifiedCommandProcessor:
                 has_surveillance_structure = any(p in command_lower for p in surveillance_patterns)
                 is_surveillance_command = has_monitoring_keyword and has_surveillance_structure
 
-                # Grammar-Based Multi-Target Detection (ROBUST!)
+                # Grammar-Based Multi-Target Detection (AGGRESSIVE!)
                 # No hardcoded app names - matches grammatical structure
                 has_multi_target = bool(re.search(god_mode_pattern, command_lower, re.IGNORECASE))
+
+                # Fallback: Try simple patterns if main pattern didn't match
+                if not has_multi_target:
+                    for simple_pattern in simple_patterns:
+                        if re.search(simple_pattern, command_lower, re.IGNORECASE):
+                            has_multi_target = True
+                            logger.debug(
+                                f"[INTENT] Fallback pattern matched: '{simple_pattern}' in '{command_text}'"
+                            )
+                            break
 
                 # If monitoring keyword + grammar pattern detected = surveillance
                 if has_monitoring_keyword and has_multi_target:
@@ -3067,8 +3100,20 @@ class UnifiedCommandProcessor:
                 grammar_match = re.search(god_mode_pattern, command_lower, re.IGNORECASE)
                 grammar_matched_text = grammar_match.group(0) if grammar_match else None
 
+                # =====================================================================
+                # EXPLICIT LOGGING: Prove detection works
+                # =====================================================================
+                logger.info(
+                    f"[INTENT] Surveillance Check v8.0.0: '{command_text}' -> "
+                    f"IsSurveillance={is_surveillance_command} "
+                    f"(monitoring={has_monitoring_keyword}, "
+                    f"structure={has_surveillance_structure}, "
+                    f"multi_target={has_multi_target}, "
+                    f"grammar='{grammar_matched_text}')"
+                )
+
                 logger.debug(
-                    f"[INTENT] Grammar-Based Disambiguation v3.0.0: "
+                    f"[INTENT] Grammar-Based Disambiguation v8.0.0: "
                     f"monitoring_keyword={has_monitoring_keyword}, "
                     f"surveillance_structure={has_surveillance_structure}, "
                     f"multi_target={has_multi_target}, "
@@ -3187,7 +3232,7 @@ class UnifiedCommandProcessor:
                             "intent_disambiguation": {
                                 "detected_intent": "surveillance",
                                 "routed_to": "IntelligentCommandHandler->VisualMonitorAgent",
-                                "routing_method": "grammar-based_v3.0.0",
+                                "routing_method": "grammar-based_v8.0.0",  # Updated to v8.0.0
                                 "keywords_matched": [k for k in monitoring_keywords if k in command_lower],
                                 "patterns_matched": [p for p in surveillance_patterns if p in command_lower],
                                 "grammar_match": grammar_matched_text,
@@ -3208,21 +3253,48 @@ class UnifiedCommandProcessor:
                         }
 
                     except ImportError as e:
+                        # =====================================================================
+                        # ROOT CAUSE FIX: Prevent Fallback to Wrong Handler v8.0.0
+                        # =====================================================================
+                        # PROBLEM: Import error causes silent fallback to VisionHandler
+                        # - User gets "Application window active" instead of error
+                        #
+                        # SOLUTION: Return error immediately, don't fall through
+                        # =====================================================================
                         logger.error(
-                            f"[UNIFIED] Failed to load IntelligentCommandHandler: {e}. "
-                            f"Falling back to standard vision handler."
+                            f"[UNIFIED] ❌ Failed to load IntelligentCommandHandler: {e}. "
+                            f"Surveillance routing BLOCKED - returning error instead of fallback."
                         )
-                        # Fall through to standard vision handling
+                        return {
+                            "success": False,
+                            "response": f"I couldn't load my surveillance system, {self.user_name}. "
+                                       f"The IntelligentCommandHandler is unavailable. "
+                                       f"Error: {str(e)}",
+                            "command_type": command_type.value,
+                            "error": "import_error",
+                            "error_details": str(e),
+                        }
+
                     except Exception as e:
+                        # =====================================================================
+                        # ROOT CAUSE FIX: Prevent Fallback to Wrong Handler v8.0.0
+                        # =====================================================================
+                        # PROBLEM: Generic exception causes silent fallback to VisionHandler
+                        # - User gets "Application window active" instead of error
+                        #
+                        # SOLUTION: Return error immediately, don't fall through
+                        # =====================================================================
                         logger.error(
-                            f"[UNIFIED] Surveillance command failed: {e}",
+                            f"[UNIFIED] ❌ Surveillance command failed: {e}. "
+                            f"Returning error instead of fallback.",
                             exc_info=True
                         )
                         return {
                             "success": False,
-                            "response": f"I encountered an error setting up monitoring: {str(e)}",
+                            "response": f"I encountered an error setting up monitoring, {self.user_name}: {str(e)}",
                             "command_type": command_type.value,
-                            "error": True,
+                            "error": "execution_error",
+                            "error_details": str(e),
                         }
 
                 # =====================================================================
