@@ -1,5 +1,5 @@
 """
-JARVIS Numba Pre-loader v7.0.0
+JARVIS Numba Pre-loader v8.0.0
 ==============================
 
 CRITICAL: This module must be imported FIRST, before ANY other imports
@@ -14,49 +14,50 @@ The error occurs when:
 3. Thread B also tries to import numba.core.utils
 4. Thread B sees a partially initialized module and fails
 
-v7.0.0 Solution (BULLETPROOF):
-1. Use REENTRANT lock (RLock) to handle nested imports
-2. Use GLOBAL import lock that syncs with Python's import machinery
-3. Disable numba JIT AND threading during import
-4. Force COMPLETE initialization of ALL problematic submodules
-5. Use threading.Event with INDEFINITE blocking (no timeout loops)
-6. Triple-check module readiness before declaring success
-7. Add per-thread import tracking to detect races
-8. Mark numba as "importing" in sys.modules to prevent re-entry
-9. Expose detailed status for debugging
-
-Key Changes in v7.0:
-- RLock instead of Lock (handles recursive imports)
-- Checks sys.modules for partial imports before proceeding
-- Forces import of ALL numba submodules that cause issues
-- Uses import_module() instead of bare import for better control
-- Adds secondary barrier for whisper-specific initialization
+v8.0.0 Improvements (PRODUCTION-GRADE):
+1. Thread-safe status reads with proper locking
+2. Atomic counters using threading.Lock for waiting_threads
+3. Proper error messages for ALL failure paths (including timeout)
+4. Version-adaptive numba checks (works with all numba versions)
+5. Async initialization support via asyncio
+6. Intelligent fallback with detailed diagnostics
+7. Non-blocking status queries with snapshot semantics
+8. Graceful degradation when numba is unavailable
 
 Usage in main.py (MUST BE FIRST IMPORT):
     # CRITICAL: Pre-load numba before ANY other imports
     from core.numba_preload import ensure_numba_initialized, get_numba_status
     ensure_numba_initialized()
-    
+
+Usage in async context:
+    from core.numba_preload import ensure_numba_initialized_async
+    await ensure_numba_initialized_async()
+
 Usage in whisper_audio_fix.py (or any numba-using module):
     from core.numba_preload import wait_for_numba, is_numba_ready
-    
+
     # This BLOCKS until numba init completes - NO TIMEOUT LOOP
     wait_for_numba()
-    
+
     # Now safe to import whisper/librosa/etc
     import whisper
+
+Author: Derek Russell
+Version: 8.0.0
 """
 
 import os
 import sys
 import threading
+import asyncio
 import logging
 import time
 import importlib
-from typing import Optional, Dict, Any, Set
+from typing import Optional, Dict, Any, Set, Tuple
 from dataclasses import dataclass, field
 from enum import Enum
 from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -69,29 +70,110 @@ class NumbaStatus(Enum):
     READY = "ready"
     FAILED = "failed"
     NOT_INSTALLED = "not_installed"
+    TIMEOUT = "timeout"  # v8.0: New status for timeout scenarios
 
 
 @dataclass
 class NumbaInfo:
-    """Information about numba initialization"""
+    """Information about numba initialization - thread-safe via external lock"""
     status: NumbaStatus = NumbaStatus.NOT_STARTED
     version: Optional[str] = None
     error: Optional[str] = None
+    error_type: Optional[str] = None  # v8.0: Track error type for better diagnostics
     initialized_by_thread: Optional[str] = None
     initialized_at: Optional[float] = None
+    completed_at: Optional[float] = None  # v8.0: Track completion time
     submodules_loaded: int = 0
     import_attempts: int = 0
-    waiting_threads: int = 0
+    _waiting_threads: int = 0  # v8.0: Private, use atomic accessors
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# GLOBAL STATE - Process-level singleton with REENTRANT lock
+# GLOBAL STATE - Process-level singleton with proper synchronization
 # ═══════════════════════════════════════════════════════════════════════════════
 _numba_lock = threading.RLock()  # RLock for recursive import safety
+_status_lock = threading.Lock()  # v8.0: Separate lock for status reads
+_counter_lock = threading.Lock()  # v8.0: Lock for atomic counter operations
 _numba_info = NumbaInfo()
 _numba_module = None
 _initialization_complete = threading.Event()
 _importing_threads: Set[int] = set()  # Track threads currently importing
+
+# v8.0: Thread pool for async operations
+_async_executor: Optional[ThreadPoolExecutor] = None
+
+
+def _get_async_executor() -> ThreadPoolExecutor:
+    """Get or create the async executor (lazy initialization)."""
+    global _async_executor
+    if _async_executor is None:
+        _async_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="numba_init")
+    return _async_executor
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# v8.0: ATOMIC COUNTER OPERATIONS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _increment_waiting_threads() -> int:
+    """Atomically increment waiting threads counter."""
+    with _counter_lock:
+        _numba_info._waiting_threads += 1
+        return _numba_info._waiting_threads
+
+
+def _decrement_waiting_threads() -> int:
+    """Atomically decrement waiting threads counter."""
+    with _counter_lock:
+        _numba_info._waiting_threads = max(0, _numba_info._waiting_threads - 1)
+        return _numba_info._waiting_threads
+
+
+def _get_waiting_threads() -> int:
+    """Atomically get waiting threads count."""
+    with _counter_lock:
+        return _numba_info._waiting_threads
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# v8.0: THREAD-SAFE STATUS UPDATES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _set_status(
+    status: NumbaStatus,
+    error: Optional[str] = None,
+    error_type: Optional[str] = None,
+    version: Optional[str] = None,
+) -> None:
+    """Thread-safe status update."""
+    with _status_lock:
+        _numba_info.status = status
+        if error is not None:
+            _numba_info.error = error
+        if error_type is not None:
+            _numba_info.error_type = error_type
+        if version is not None:
+            _numba_info.version = version
+        if status in (NumbaStatus.READY, NumbaStatus.FAILED, NumbaStatus.NOT_INSTALLED, NumbaStatus.TIMEOUT):
+            _numba_info.completed_at = time.time()
+
+
+def _get_status_snapshot() -> Dict[str, Any]:
+    """Get a thread-safe snapshot of current status."""
+    with _status_lock:
+        return {
+            'status': _numba_info.status.value,
+            'version': _numba_info.version,
+            'error': _numba_info.error,
+            'error_type': _numba_info.error_type,
+            'initialized_by': _numba_info.initialized_by_thread,
+            'initialized_at': _numba_info.initialized_at,
+            'completed_at': _numba_info.completed_at,
+            'submodules_loaded': _numba_info.submodules_loaded,
+            'import_attempts': _numba_info.import_attempts,
+            'waiting_threads': _numba_info._waiting_threads,
+            'is_ready': _numba_info.status == NumbaStatus.READY,
+        }
 
 
 @contextmanager
@@ -107,9 +189,9 @@ def _numba_import_environment():
         'NUMBA_THREADING_LAYER': os.environ.get('NUMBA_THREADING_LAYER'),
         'NUMBA_CACHE_DIR': os.environ.get('NUMBA_CACHE_DIR'),
     }
-    
+
     try:
-        # CRITICAL: Disable JIT and threading during import
+        # CRITICAL: Disable JIT and threading during import to prevent race conditions
         os.environ['NUMBA_DISABLE_JIT'] = '1'
         os.environ['NUMBA_NUM_THREADS'] = '1'
         os.environ['NUMBA_THREADING_LAYER'] = 'workqueue'  # Safest option
@@ -123,225 +205,341 @@ def _numba_import_environment():
                 os.environ[key] = value
 
 
-def _check_numba_in_sys_modules() -> bool:
+def _check_numba_in_sys_modules() -> Tuple[bool, Optional[str]]:
     """
     Check if numba is already (partially) imported in sys.modules.
-    Returns True if numba appears to be fully imported, False otherwise.
+
+    v8.0: Returns (is_complete, version) tuple for better diagnostics.
+    Also uses version-adaptive checks that work with all numba versions.
+
+    Returns:
+        Tuple of (is_fully_imported, version_string)
     """
     if 'numba' not in sys.modules:
-        return False
-    
+        return False, None
+
     numba_mod = sys.modules.get('numba')
     if numba_mod is None:
-        return False
-    
+        return False, None
+
     # Check for partial initialization markers
     if not hasattr(numba_mod, '__version__'):
-        return False
-    
-    # Check for the problematic submodule
-    if 'numba.core.utils' in sys.modules:
-        utils_mod = sys.modules.get('numba.core.utils')
-        if utils_mod is not None and hasattr(utils_mod, 'get_hashable_key'):
-            return True
-    
-    return False
+        return False, None
+
+    version = numba_mod.__version__
+
+    # v8.0: Version-adaptive checks - different numba versions have different structures
+    # Check for critical submodules that indicate complete initialization
+    critical_checks = [
+        ('numba.core.utils', ['get_hashable_key', 'unified_function_type', 'PYVERSION']),
+        ('numba.core.types', ['int64', 'float64', 'boolean']),
+        ('numba.core.config', ['NUMBA_NUM_THREADS']),
+    ]
+
+    for module_name, attrs_to_check in critical_checks:
+        if module_name in sys.modules:
+            mod = sys.modules.get(module_name)
+            if mod is not None:
+                # Check if ANY of the expected attributes exist
+                for attr in attrs_to_check:
+                    if hasattr(mod, attr):
+                        return True, version
+
+    # Fallback: if numba.core exists and has expected structure, consider it ready
+    if 'numba.core' in sys.modules:
+        core_mod = sys.modules.get('numba.core')
+        if core_mod is not None and hasattr(core_mod, '__path__'):
+            return True, version
+
+    return False, version
 
 
 def _do_numba_import() -> bool:
     """
     Actually perform the numba import.
     This is called exactly ONCE per process.
-    
-    v7.0: Uses importlib for better control and imports ALL problematic submodules.
-    
+
+    v8.0: Enhanced with better error handling and diagnostics.
+
     Returns True if successful, False otherwise.
     """
-    global _numba_module, _numba_info
-    
-    _numba_info.initialized_by_thread = threading.current_thread().name
-    _numba_info.initialized_at = time.time()
-    _numba_info.import_attempts += 1
-    
+    global _numba_module
+
+    with _status_lock:
+        _numba_info.initialized_by_thread = threading.current_thread().name
+        _numba_info.initialized_at = time.time()
+        _numba_info.import_attempts += 1
+
     # Check if already fully imported (from a previous process or forked context)
-    if _check_numba_in_sys_modules():
+    is_complete, version = _check_numba_in_sys_modules()
+    if is_complete:
         _numba_module = sys.modules['numba']
-        _numba_info.version = _numba_module.__version__
-        _numba_info.status = NumbaStatus.READY
-        logger.info(f"✅ numba {_numba_info.version} already in sys.modules (reused)")
+        _set_status(NumbaStatus.READY, version=version)
+        logger.info(f"✅ numba {version} already in sys.modules (reused)")
         return True
-    
+
     with _numba_import_environment():
         try:
             # ═══════════════════════════════════════════════════════════════════
             # PHASE 1: Import main numba module
             # ═══════════════════════════════════════════════════════════════════
-            _numba_info.status = NumbaStatus.INITIALIZING
-            
+            _set_status(NumbaStatus.INITIALIZING)
+
             # Use importlib for better control over the import process
             numba = importlib.import_module('numba')
             _numba_module = numba
-            _numba_info.version = numba.__version__
-            
-            logger.debug(f"[numba_preload] Phase 1: numba {numba.__version__} base imported")
-            
+            version = numba.__version__
+
+            logger.debug(f"[numba_preload] Phase 1: numba {version} base imported")
+
             # ═══════════════════════════════════════════════════════════════════
             # PHASE 2: Force COMPLETE initialization of ALL problematic submodules
             # These must be imported in a specific order to avoid circular imports
             # ═══════════════════════════════════════════════════════════════════
-            _numba_info.status = NumbaStatus.IMPORTING_SUBMODULES
-            
-            # List of submodules that are known to cause issues
-            # Order matters! Dependencies must be imported first
-            critical_submodules = [
-                'numba.core.config',      # Configuration (no deps)
-                'numba.core.types',       # Type system (deps on config)
-                'numba.core.utils',       # Utilities (deps on types) - THE PROBLEMATIC ONE
-                'numba.core.errors',      # Error handling
-                'numba.core.typing',      # Typing utilities
-                'numba.typed',            # Typed containers
-                'numba.np.ufunc',         # NumPy integration
-            ]
-            
+            _set_status(NumbaStatus.IMPORTING_SUBMODULES, version=version)
+
+            # v8.0: Dynamic submodule list based on numba version
+            critical_submodules = _get_critical_submodules(version)
+
             loaded_count = 0
+            load_errors = []
+
             for submodule in critical_submodules:
                 try:
                     mod = importlib.import_module(submodule)
                     loaded_count += 1
-                    
-                    # For numba.core.utils, explicitly access get_hashable_key
+
+                    # For numba.core.utils, explicitly access key functions to force resolution
                     if submodule == 'numba.core.utils':
-                        if hasattr(mod, 'get_hashable_key'):
-                            # Force the function to be fully resolved
-                            _ = mod.get_hashable_key
-                            logger.debug(f"[numba_preload] ✓ get_hashable_key resolved")
-                        else:
-                            logger.debug(f"[numba_preload] get_hashable_key not found (numba version difference)")
-                    
+                        for func_name in ['get_hashable_key', 'unified_function_type']:
+                            if hasattr(mod, func_name):
+                                _ = getattr(mod, func_name)
+                                logger.debug(f"[numba_preload] ✓ {func_name} resolved")
+
                 except ImportError as e:
                     # Some submodules may not exist in all numba versions
+                    load_errors.append(f"{submodule}: {e}")
                     logger.debug(f"[numba_preload] Submodule {submodule} not available: {e}")
                 except Exception as e:
+                    load_errors.append(f"{submodule}: {e}")
                     logger.debug(f"[numba_preload] Submodule {submodule} error: {e}")
-            
-            _numba_info.submodules_loaded = loaded_count
+
+            with _status_lock:
+                _numba_info.submodules_loaded = loaded_count
+
             logger.debug(f"[numba_preload] Phase 2: {loaded_count}/{len(critical_submodules)} submodules loaded")
-            
+
             # ═══════════════════════════════════════════════════════════════════
             # PHASE 3: Verify initialization is complete
             # ═══════════════════════════════════════════════════════════════════
-            if not _check_numba_in_sys_modules():
+            is_complete, _ = _check_numba_in_sys_modules()
+            if not is_complete:
                 # Something went wrong - numba isn't fully initialized
                 logger.warning("[numba_preload] Warning: numba import completed but verification failed")
-            
-            _numba_info.status = NumbaStatus.READY
+                if load_errors:
+                    logger.debug(f"[numba_preload] Submodule errors: {load_errors}")
+
+            _set_status(NumbaStatus.READY, version=version)
             logger.info(
-                f"✅ numba {numba.__version__} pre-initialized "
+                f"✅ numba {version} pre-initialized "
                 f"(thread: {threading.current_thread().name}, "
                 f"submodules: {loaded_count})"
             )
             return True
-            
+
         except ImportError as e:
-            if 'No module named' in str(e) and 'numba' in str(e):
-                _numba_info.status = NumbaStatus.NOT_INSTALLED
-                _numba_info.error = str(e)
+            error_str = str(e)
+            if 'No module named' in error_str and 'numba' in error_str:
+                _set_status(
+                    NumbaStatus.NOT_INSTALLED,
+                    error=error_str,
+                    error_type="ImportError"
+                )
                 logger.debug(f"numba not installed (optional): {e}")
             else:
-                _numba_info.status = NumbaStatus.FAILED
-                _numba_info.error = str(e)
+                _set_status(
+                    NumbaStatus.FAILED,
+                    error=error_str,
+                    error_type="ImportError"
+                )
                 logger.warning(f"⚠️ numba import error: {e}")
             return False
-            
+
         except Exception as e:
-            _numba_info.status = NumbaStatus.FAILED
-            _numba_info.error = str(e)
+            _set_status(
+                NumbaStatus.FAILED,
+                error=str(e),
+                error_type=type(e).__name__
+            )
             logger.warning(f"⚠️ numba pre-initialization failed (non-fatal): {e}")
             return False
+
+
+def _get_critical_submodules(version: str) -> list:
+    """
+    v8.0: Get critical submodules based on numba version.
+    Different versions have different module structures.
+    """
+    # Parse version
+    try:
+        major, minor = [int(x) for x in version.split('.')[:2]]
+    except (ValueError, IndexError):
+        major, minor = 0, 0
+
+    # Base submodules (all versions)
+    submodules = [
+        'numba.core.config',
+        'numba.core.types',
+        'numba.core.utils',
+        'numba.core.errors',
+    ]
+
+    # Version-specific additions
+    if major >= 0 and minor >= 50:
+        submodules.extend([
+            'numba.core.typing',
+            'numba.typed',
+        ])
+
+    if major >= 0 and minor >= 55:
+        submodules.append('numba.np.ufunc')
+
+    return submodules
 
 
 def ensure_numba_initialized(timeout: float = 60.0) -> bool:
     """
     Ensure numba is initialized. Thread-safe and idempotent.
-    
-    v7.0: Uses RLock for recursive safety and better race handling.
-    
+
+    v8.0: Enhanced with proper timeout handling and status updates.
+
     This function can be called from any thread. The first caller will
     do the actual import, all other callers will wait for completion.
-    
+
     Args:
         timeout: Maximum time to wait for initialization (seconds)
-        
+
     Returns:
-        True if numba is available, False otherwise
+        True if numba is available and ready, False otherwise
     """
-    global _numba_info, _importing_threads
-    
+    global _importing_threads
+
     thread_id = threading.current_thread().ident
-    
+    thread_name = threading.current_thread().name
+
     # Fast path - already initialized
     if _initialization_complete.is_set():
-        return _numba_info.status == NumbaStatus.READY
-    
+        with _status_lock:
+            return _numba_info.status == NumbaStatus.READY
+
     # Check if THIS thread is already importing (recursive call)
     if thread_id in _importing_threads:
         logger.debug(f"[numba_preload] Recursive import detected in thread {thread_id}")
-        # We're in a recursive import - just check current state
-        return _numba_info.status == NumbaStatus.READY
-    
-    # Try to acquire lock for initialization (with generous timeout)
+        with _status_lock:
+            return _numba_info.status == NumbaStatus.READY
+
+    # Try to acquire lock for initialization (with timeout)
     start_time = time.time()
     acquired = _numba_lock.acquire(timeout=timeout)
-    
+
     if not acquired:
         elapsed = time.time() - start_time
+        # v8.0: Set proper status and error on timeout
+        _set_status(
+            NumbaStatus.TIMEOUT,
+            error=f"Lock acquisition timeout after {elapsed:.1f}s (thread: {thread_name})",
+            error_type="TimeoutError"
+        )
         logger.warning(f"[numba_preload] Timeout waiting for numba initialization ({elapsed:.1f}s)")
         return False
-    
+
     try:
         # Double-check after acquiring lock
         if _initialization_complete.is_set():
-            return _numba_info.status == NumbaStatus.READY
-        
+            with _status_lock:
+                return _numba_info.status == NumbaStatus.READY
+
         # Mark this thread as importing
         _importing_threads.add(thread_id)
-        
+
         # We're the initializing thread
-        logger.info(f"[numba_preload] Initializing numba from thread: {threading.current_thread().name}")
+        logger.info(f"[numba_preload] Initializing numba from thread: {thread_name}")
         success = _do_numba_import()
-        
+
         # Signal completion to ALL waiting threads
         _initialization_complete.set()
-        
+
         return success
-        
+
+    except Exception as e:
+        # v8.0: Catch any unexpected errors and set proper status
+        _set_status(
+            NumbaStatus.FAILED,
+            error=f"Unexpected error during initialization: {e}",
+            error_type=type(e).__name__
+        )
+        _initialization_complete.set()  # Still signal completion (with failure)
+        logger.error(f"[numba_preload] Unexpected error: {e}")
+        return False
+
     finally:
         # Remove thread from importing set
         _importing_threads.discard(thread_id)
         _numba_lock.release()
 
 
+async def ensure_numba_initialized_async(timeout: float = 60.0) -> bool:
+    """
+    v8.0: Async version of ensure_numba_initialized.
+
+    Runs the synchronous initialization in a thread pool to avoid
+    blocking the event loop.
+
+    Args:
+        timeout: Maximum time to wait for initialization (seconds)
+
+    Returns:
+        True if numba is available and ready, False otherwise
+    """
+    # Fast path - already initialized
+    if _initialization_complete.is_set():
+        with _status_lock:
+            return _numba_info.status == NumbaStatus.READY
+
+    # Run in thread pool to avoid blocking event loop
+    loop = asyncio.get_event_loop()
+    executor = _get_async_executor()
+
+    try:
+        return await asyncio.wait_for(
+            loop.run_in_executor(executor, ensure_numba_initialized, timeout),
+            timeout=timeout + 5.0  # Add buffer for executor overhead
+        )
+    except asyncio.TimeoutError:
+        _set_status(
+            NumbaStatus.TIMEOUT,
+            error=f"Async initialization timeout after {timeout}s",
+            error_type="AsyncTimeoutError"
+        )
+        return False
+
+
 def get_numba_status() -> Dict[str, Any]:
     """
     Get current numba status for health checks.
-    
+
+    v8.0: Thread-safe with snapshot semantics.
+
     Returns:
         Dictionary with status, version, and other info
     """
-    return {
-        'status': _numba_info.status.value,
-        'version': _numba_info.version,
-        'error': _numba_info.error,
-        'initialized_by': _numba_info.initialized_by_thread,
-        'initialized_at': _numba_info.initialized_at,
-        'is_ready': _numba_info.status == NumbaStatus.READY,
-    }
+    return _get_status_snapshot()
 
 
 def get_numba_module():
     """
     Get the numba module if available.
-    
+
     Returns:
         The numba module, or None if not available
     """
@@ -353,72 +551,79 @@ def is_numba_ready() -> bool:
     """
     Quick check if numba is ready.
     Non-blocking if initialization is complete.
+
+    v8.0: Thread-safe read.
     """
     if _initialization_complete.is_set():
-        return _numba_info.status == NumbaStatus.READY
+        with _status_lock:
+            return _numba_info.status == NumbaStatus.READY
     return False
 
 
 def wait_for_numba(timeout: float = 120.0) -> bool:
     """
     BLOCKING wait for numba initialization to complete.
-    
-    v7.0: This is the KEY function for parallel safety.
+
+    v8.0: Enhanced with atomic counter operations and better timeout handling.
+
+    This is the KEY function for parallel safety.
     Other modules should call this BEFORE importing numba-dependent packages.
-    
+
     This ensures:
     1. If main thread is initializing, we WAIT for it to complete (NO POLLING)
     2. If main thread already completed, we return immediately
     3. If no initialization started, we trigger it ourselves
-    4. Tracks waiting threads for debugging
-    
+    4. Tracks waiting threads for debugging (atomically)
+
     Args:
-        timeout: Maximum time to wait (seconds) - increased to 120s for slow systems
-        
+        timeout: Maximum time to wait (seconds) - default 120s for slow systems
+
     Returns:
         True if numba is available, False if not installed or failed
     """
-    global _numba_info
-    
     thread_name = threading.current_thread().name
-    
+
     # Fast path - already initialized
     if _initialization_complete.is_set():
-        status = _numba_info.status
+        with _status_lock:
+            status = _numba_info.status
         if status == NumbaStatus.READY:
             logger.debug(f"[wait_for_numba] Fast path: numba ready (thread: {thread_name})")
             return True
         elif status == NumbaStatus.NOT_INSTALLED:
             logger.debug(f"[wait_for_numba] Fast path: numba not installed")
             return False
-        elif status == NumbaStatus.FAILED:
-            logger.debug(f"[wait_for_numba] Fast path: numba failed")
+        else:
+            logger.debug(f"[wait_for_numba] Fast path: numba status: {status.value}")
             return False
-    
-    # Track this thread as waiting
-    _numba_info.waiting_threads += 1
-    logger.debug(f"[wait_for_numba] Thread '{thread_name}' waiting for numba ({_numba_info.waiting_threads} waiting)")
-    
+
+    # Track this thread as waiting (atomic)
+    waiting_count = _increment_waiting_threads()
+    logger.debug(f"[wait_for_numba] Thread '{thread_name}' waiting for numba ({waiting_count} waiting)")
+
     try:
         # First, try to trigger initialization ourselves if not started
-        # This handles the case where no thread has started initialization yet
-        if _numba_info.status == NumbaStatus.NOT_STARTED:
+        with _status_lock:
+            current_status = _numba_info.status
+
+        if current_status == NumbaStatus.NOT_STARTED:
             # Try to be the initializer
             return ensure_numba_initialized(timeout=timeout)
-        
+
         # ═══════════════════════════════════════════════════════════════════
         # BLOCKING WAIT - No polling, just wait for the event
-        # This is the key difference from v2.0 - we don't poll in a loop
         # ═══════════════════════════════════════════════════════════════════
         start_time = time.time()
-        
+
         # Wait for initialization to complete (or timeout)
         completed = _initialization_complete.wait(timeout=timeout)
-        
+
         elapsed = time.time() - start_time
-        
+
         if completed:
-            status = _numba_info.status
+            with _status_lock:
+                status = _numba_info.status
+
             if status == NumbaStatus.READY:
                 logger.debug(f"[wait_for_numba] Thread '{thread_name}' - numba ready after {elapsed:.1f}s")
                 return True
@@ -431,16 +636,52 @@ def wait_for_numba(timeout: float = 120.0) -> bool:
         else:
             # Timeout - but check status anyway in case event wasn't set
             logger.warning(f"[wait_for_numba] Thread '{thread_name}' timeout after {timeout}s")
-            
+
             # Last resort: try to initialize ourselves
-            if _numba_info.status == NumbaStatus.NOT_STARTED:
+            with _status_lock:
+                current_status = _numba_info.status
+
+            if current_status == NumbaStatus.NOT_STARTED:
                 logger.info(f"[wait_for_numba] Attempting initialization as fallback")
                 return ensure_numba_initialized(timeout=30.0)
-            
-            return _numba_info.status == NumbaStatus.READY
-            
+
+            with _status_lock:
+                return _numba_info.status == NumbaStatus.READY
+
     finally:
-        _numba_info.waiting_threads -= 1
+        _decrement_waiting_threads()
+
+
+async def wait_for_numba_async(timeout: float = 120.0) -> bool:
+    """
+    v8.0: Async version of wait_for_numba.
+
+    Non-blocking wait that yields to the event loop.
+
+    Args:
+        timeout: Maximum time to wait (seconds)
+
+    Returns:
+        True if numba is available, False otherwise
+    """
+    # Fast path
+    if _initialization_complete.is_set():
+        with _status_lock:
+            return _numba_info.status == NumbaStatus.READY
+
+    # Use asyncio event waiting
+    start_time = time.time()
+
+    while not _initialization_complete.is_set():
+        elapsed = time.time() - start_time
+        if elapsed >= timeout:
+            return False
+
+        # Yield to event loop with small sleep
+        await asyncio.sleep(0.05)
+
+    with _status_lock:
+        return _numba_info.status == NumbaStatus.READY
 
 
 def set_numba_bypass_marker():
@@ -461,23 +702,26 @@ def get_numba_bypass_marker() -> bool:
 def acquire_import_lock_and_wait(timeout: float = 120.0) -> bool:
     """
     The strongest guarantee: acquire Python's import lock AND wait for numba.
-    
-    v7.0: This function should be called before importing whisper or librosa.
+
+    v8.0: Thread-safe with proper status checks.
+
+    This function should be called before importing whisper or librosa.
     It ensures no other thread can be importing Python modules while we check
     numba status, preventing ALL race conditions.
-    
+
     Args:
         timeout: Maximum time to wait
-        
+
     Returns:
         True if numba is ready, False otherwise
     """
     import importlib._bootstrap as _bootstrap
-    
+
     # First, check fast path
     if _initialization_complete.is_set():
-        return _numba_info.status == NumbaStatus.READY
-    
+        with _status_lock:
+            return _numba_info.status == NumbaStatus.READY
+
     # Acquire Python's import lock for maximum safety
     # This prevents ANY imports from happening in other threads
     try:
@@ -485,7 +729,7 @@ def acquire_import_lock_and_wait(timeout: float = 120.0) -> bool:
     except (AttributeError, KeyError):
         # Not all Python versions have this, fall back to regular wait
         pass
-    
+
     # Now wait for numba to be initialized
     return wait_for_numba(timeout=timeout)
 
@@ -493,37 +737,73 @@ def acquire_import_lock_and_wait(timeout: float = 120.0) -> bool:
 def get_detailed_status() -> Dict[str, Any]:
     """
     Get detailed status for debugging numba initialization issues.
+
+    v8.0: Enhanced with more diagnostic info.
     """
     numba_in_modules = 'numba' in sys.modules
     numba_utils_in_modules = 'numba.core.utils' in sys.modules
-    
+
     numba_utils_complete = False
+    numba_version_in_modules = None
+
+    if numba_in_modules:
+        numba_mod = sys.modules.get('numba')
+        if numba_mod is not None:
+            numba_version_in_modules = getattr(numba_mod, '__version__', None)
+
     if numba_utils_in_modules:
         utils = sys.modules.get('numba.core.utils')
         if utils is not None:
-            numba_utils_complete = hasattr(utils, 'get_hashable_key')
-    
-    return {
-        'status': _numba_info.status.value,
-        'version': _numba_info.version,
-        'error': _numba_info.error,
-        'initialized_by': _numba_info.initialized_by_thread,
-        'initialized_at': _numba_info.initialized_at,
-        'submodules_loaded': _numba_info.submodules_loaded,
-        'import_attempts': _numba_info.import_attempts,
-        'waiting_threads': _numba_info.waiting_threads,
-        'is_ready': _numba_info.status == NumbaStatus.READY,
-        'numba_in_sys_modules': numba_in_modules,
-        'numba_utils_in_sys_modules': numba_utils_in_modules,
-        'numba_utils_complete': numba_utils_complete,
-        'event_is_set': _initialization_complete.is_set(),
-        'bypass_marker_set': get_numba_bypass_marker(),
-    }
+            # v8.0: Check multiple indicators
+            numba_utils_complete = any(
+                hasattr(utils, attr)
+                for attr in ['get_hashable_key', 'unified_function_type', 'PYVERSION']
+            )
+
+    with _status_lock:
+        return {
+            'status': _numba_info.status.value,
+            'version': _numba_info.version,
+            'version_in_sys_modules': numba_version_in_modules,
+            'error': _numba_info.error,
+            'error_type': _numba_info.error_type,
+            'initialized_by': _numba_info.initialized_by_thread,
+            'initialized_at': _numba_info.initialized_at,
+            'completed_at': _numba_info.completed_at,
+            'submodules_loaded': _numba_info.submodules_loaded,
+            'import_attempts': _numba_info.import_attempts,
+            'waiting_threads': _numba_info._waiting_threads,
+            'is_ready': _numba_info.status == NumbaStatus.READY,
+            'numba_in_sys_modules': numba_in_modules,
+            'numba_utils_in_sys_modules': numba_utils_in_modules,
+            'numba_utils_complete': numba_utils_complete,
+            'event_is_set': _initialization_complete.is_set(),
+            'bypass_marker_set': get_numba_bypass_marker(),
+            'current_thread': threading.current_thread().name,
+            'is_main_thread': threading.current_thread() is threading.main_thread(),
+        }
+
+
+def reset_for_testing():
+    """
+    v8.0: Reset all state for testing purposes.
+
+    WARNING: Only use in tests! This is not thread-safe during normal operation.
+    """
+    global _numba_module, _numba_info, _initialization_complete, _importing_threads
+
+    with _numba_lock:
+        with _status_lock:
+            _numba_info = NumbaInfo()
+        _numba_module = None
+        _initialization_complete.clear()
+        _importing_threads.clear()
+        os.environ.pop('_JARVIS_NUMBA_INIT_ATTEMPTED', None)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Auto-initialize if this module is imported directly
-# v7.0: Only in main thread to avoid races during parallel imports
+# v8.0: Only in main thread to avoid races during parallel imports
 # ═══════════════════════════════════════════════════════════════════════════════
 if __name__ != "__main__":
     # Check if we're in the main thread
@@ -539,4 +819,3 @@ if __name__ != "__main__":
         if not _initialization_complete.is_set():
             # Mark that we need initialization but don't block
             pass
-

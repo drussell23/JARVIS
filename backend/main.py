@@ -199,6 +199,43 @@ os.environ["HF_DATASETS_OFFLINE"] = "1"
 os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"  # Also disable telemetry
 
 # =============================================================================
+# CRITICAL: Python 3.9 Compatibility Patch - MUST be before ANY package imports
+# =============================================================================
+# google-api-core and other packages use importlib.metadata.packages_distributions()
+# which was added in Python 3.10. This patches it for Python 3.9 compatibility.
+# This MUST happen before any imports that might trigger google-api-core or similar.
+# =============================================================================
+try:
+    import importlib.metadata as _metadata
+    if not hasattr(_metadata, 'packages_distributions'):
+        # Create a fallback implementation for Python 3.9
+        def _packages_distributions_fallback():
+            """Fallback for packages_distributions() on Python 3.9."""
+            from collections import defaultdict
+            result = defaultdict(list)
+            try:
+                for dist in _metadata.distributions():
+                    if dist.name:
+                        # Map top-level packages to distribution names
+                        if dist.files:
+                            for file in dist.files:
+                                parts = str(file).split('/')
+                                if parts and parts[0] and not parts[0].startswith('_'):
+                                    top_level = parts[0].replace('.py', '')
+                                    if top_level and '.' not in top_level:
+                                        result[top_level].append(dist.name)
+                        # Also add the distribution name itself
+                        result[dist.name.replace('-', '_').lower()].append(dist.name)
+            except Exception:
+                pass  # Return empty dict on any error
+            return dict(result)
+
+        _metadata.packages_distributions = _packages_distributions_fallback
+        print("[STARTUP] ✅ Patched importlib.metadata.packages_distributions for Python 3.9")
+except Exception as e:
+    print(f"[STARTUP] ⚠️ Could not patch importlib.metadata: {e}")
+
+# =============================================================================
 # v7.0 FIX: CENTRALIZED numba pre-import - MUST be first before ANY other imports
 # =============================================================================
 # numba has threading issues when imported from multiple threads simultaneously
