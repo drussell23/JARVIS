@@ -390,7 +390,8 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
         try:
             from backend.neural_mesh.agents.spatial_awareness_agent import SpatialAwarenessAgent
             self.spatial_agent = SpatialAwarenessAgent()
-            await self.spatial_agent.initialize()
+            # Fix: Call on_initialize() not initialize() - the base Agent class uses on_initialize()
+            await self.spatial_agent.on_initialize()
             logger.info("✓ SpatialAwarenessAgent initialized (God Mode space switching enabled)")
         except Exception as e:
             logger.warning(f"SpatialAwarenessAgent init failed: {e}")
