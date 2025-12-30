@@ -929,22 +929,148 @@ class OCRStrategyManager:
         if report.final_result:
             text, confidence, method = report.final_result
             return OCRResult(
+                success=True,
                 text=text,
                 confidence=confidence,
                 method=method,
-                success=True,
+                image_hash=image_hash,
                 error=None,
                 execution_time=0.0  # Will be set by caller
             )
         else:
             return OCRResult(
+                success=False,
                 text="",
                 confidence=0.0,
                 method="none",
-                success=False,
+                image_hash=image_hash,
                 error=f"All OCR methods failed: {report.errors}",
                 execution_time=0.0
             )
+
+    async def _extract_sequential(
+        self,
+        image_path: str,
+        image_hash: str,
+        prompt: Optional[str],
+        cache_max_age: float,
+        skip_cache: bool
+    ) -> OCRResult:
+        """Extract text using sequential fallback strategy (when Error Matrix unavailable).
+
+        Attempts OCR methods in order:
+        1. Check cache (if not skipped)
+        2. Claude Vision API (if available)
+        3. Tesseract OCR (if available)
+        4. Image metadata extraction (fallback)
+
+        Args:
+            image_path: Path to the image file
+            image_hash: MD5 hash of the image
+            prompt: Optional custom prompt for Claude Vision
+            cache_max_age: Maximum cache age in seconds
+            skip_cache: Whether to skip cache lookup
+
+        Returns:
+            OCRResult with extraction results and execution metadata
+        """
+        logger.info(f"[OCR-STRATEGY] Using sequential fallback (no Error Matrix)")
+
+        # Step 1: Try cache first (unless skipped)
+        if not skip_cache:
+            cached = self.cache.get(image_hash, max_age=cache_max_age)
+            if cached:
+                logger.info(f"[OCR-STRATEGY] ✅ Cache hit (age={cached.age_seconds():.1f}s)")
+                return OCRResult(
+                    success=True,
+                    text=cached.text,
+                    confidence=cached.confidence,
+                    method=f"cached_{cached.method}",
+                    image_hash=image_hash,
+                    metadata=cached.metadata,
+                )
+
+        # Step 2: Try Claude Vision API
+        if self.claude_vision:
+            try:
+                logger.info("[OCR-STRATEGY] Attempting Claude Vision OCR")
+                text, confidence = await self.claude_vision.extract_text(image_path, prompt)
+
+                # Cache the result
+                cached_result = CachedOCR(
+                    text=text,
+                    image_hash=image_hash,
+                    timestamp=datetime.now(),
+                    method="claude_vision",
+                    confidence=confidence,
+                )
+                self.cache.store(cached_result)
+
+                return OCRResult(
+                    success=True,
+                    text=text,
+                    confidence=confidence,
+                    method="claude_vision",
+                    image_hash=image_hash,
+                )
+            except Exception as e:
+                logger.warning(f"[OCR-STRATEGY] Claude Vision failed: {e}")
+
+        # Step 3: Try Tesseract OCR
+        if self.tesseract and self.tesseract.is_available:
+            try:
+                logger.info("[OCR-STRATEGY] Attempting Tesseract OCR")
+                text, confidence = await self.tesseract.extract_text(image_path)
+
+                # Cache the result
+                cached_result = CachedOCR(
+                    text=text,
+                    image_hash=image_hash,
+                    timestamp=datetime.now(),
+                    method="tesseract",
+                    confidence=confidence,
+                )
+                self.cache.store(cached_result)
+
+                return OCRResult(
+                    success=True,
+                    text=text,
+                    confidence=confidence,
+                    method="tesseract",
+                    image_hash=image_hash,
+                )
+            except Exception as e:
+                logger.warning(f"[OCR-STRATEGY] Tesseract failed: {e}")
+
+        # Step 4: Fall back to metadata extraction
+        try:
+            logger.info("[OCR-STRATEGY] Falling back to metadata extraction")
+            metadata = await self.metadata_extractor.extract_metadata(image_path)
+            width = metadata.get("width", "?")
+            height = metadata.get("height", "?")
+            img_format = metadata.get("format", "unknown")
+            text = f"Image: {width}x{height}px, format={img_format}"
+
+            return OCRResult(
+                success=True,
+                text=text,
+                confidence=0.1,
+                method="metadata",
+                image_hash=image_hash,
+                metadata=metadata,
+            )
+        except Exception as e:
+            logger.error(f"[OCR-STRATEGY] Metadata extraction failed: {e}")
+
+        # All methods failed
+        return OCRResult(
+            success=False,
+            text="",
+            confidence=0.0,
+            method="none",
+            image_hash=image_hash,
+            error="All OCR methods failed",
+        )
 
 
 # ============================================================================
@@ -967,7 +1093,8 @@ def initialize_ocr_strategy_manager(
     cache_ttl: float = 300.0,
     max_cache_entries: int = 100,
     enable_error_matrix: bool = True,
-    anthropic_api_key: Optional[str] = None
+    anthropic_api_key: Optional[str] = None,
+    use_intelligent_selection: bool = True
 ) -> OCRStrategyManager:
     """Initialize the global OCR strategy manager.
 
@@ -976,6 +1103,7 @@ def initialize_ocr_strategy_manager(
         max_cache_entries: Maximum number of cache entries
         enable_error_matrix: Whether to enable Error Handling Matrix integration
         anthropic_api_key: Optional Anthropic API key for Claude Vision
+        use_intelligent_selection: Whether to use intelligent model selection
 
     Returns:
         The initialized OCRStrategyManager instance
@@ -989,11 +1117,25 @@ def initialize_ocr_strategy_manager(
         >>> print("OCR strategy manager initialized")
     """
     global _global_manager
+
+    # Create Anthropic API client if API key is provided
+    api_client = None
+    if anthropic_api_key:
+        try:
+            import anthropic
+            api_client = anthropic.Anthropic(api_key=anthropic_api_key)
+            logger.info("[OCR-STRATEGY] ✅ Anthropic API client created for Claude Vision OCR")
+        except ImportError:
+            logger.warning("[OCR-STRATEGY] Anthropic library not installed - Claude Vision OCR unavailable")
+        except Exception as e:
+            logger.warning(f"[OCR-STRATEGY] Failed to create Anthropic client: {e}")
+
     _global_manager = OCRStrategyManager(
+        api_client=api_client,
         cache_ttl=cache_ttl,
         max_cache_entries=max_cache_entries,
         enable_error_matrix=enable_error_matrix,
-        anthropic_api_key=anthropic_api_key
+        use_intelligent_selection=use_intelligent_selection,
     )
     logger.info("✅ Global OCR strategy manager initialized")
     return _global_manager

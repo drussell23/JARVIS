@@ -218,6 +218,15 @@ class UnifiedCommandProcessor:
         self.query_complexity_manager = None  # Query complexity classification and routing
         self.medium_complexity_handler = None  # Medium complexity (Level 2) query execution
         self.display_reference_handler = None  # Display voice command resolution
+        self.goal_autonomous_integration = None  # Goal inference + autonomous decision engine
+        self.response_strategy_manager = None  # Response strategy optimization
+        self.context_aware_manager = None  # Context-aware response management
+        self.proactive_suggestion_manager = None  # Proactive suggestions
+        self.confidence_manager = None  # Confidence scoring
+        self.multi_monitor_manager = None  # Multi-monitor management
+        self.multi_monitor_query_handler = None  # Multi-monitor query handling
+        self.change_detection_manager = None  # Change detection management
+        self.proactive_monitoring_manager = None  # Proactive monitoring
         self._resolvers_initialized = False
 
         # Initialize Intelligent Vision Router (YOLO + LLaMA + Claude intelligent routing)
@@ -244,6 +253,55 @@ class UnifiedCommandProcessor:
         except Exception as e:
             logger.error(f"[UNIFIED] Failed to initialize context graph: {e}")
             self.context_graph = None
+
+        # Step 1.1: Initialize CaptureStrategyManager (required for capture operations)
+        try:
+            from context_intelligence.managers import (
+                initialize_capture_strategy_manager,
+                get_capture_strategy_manager,
+            )
+
+            # Only initialize if not already initialized
+            if get_capture_strategy_manager() is None:
+                initialize_capture_strategy_manager(
+                    cache_ttl=60.0,
+                    max_cache_entries=100,
+                    enable_error_matrix=True,
+                )
+                logger.info("[UNIFIED] ✅ CaptureStrategyManager initialized")
+            else:
+                logger.info("[UNIFIED] ✅ CaptureStrategyManager already initialized")
+        except ImportError as e:
+            logger.warning(f"[UNIFIED] CaptureStrategyManager not available: {e}")
+        except Exception as e:
+            logger.error(f"[UNIFIED] Failed to initialize capture strategy manager: {e}")
+
+        # Step 1.2: Initialize OCRStrategyManager (required for OCR operations)
+        try:
+            import os
+            from context_intelligence.managers import (
+                initialize_ocr_strategy_manager,
+                get_ocr_strategy_manager,
+            )
+
+            # Only initialize if not already initialized
+            if get_ocr_strategy_manager() is None:
+                # Get API key for Claude Vision OCR
+                anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
+
+                initialize_ocr_strategy_manager(
+                    cache_ttl=300.0,  # 5 minutes
+                    max_cache_entries=200,
+                    enable_error_matrix=True,
+                    anthropic_api_key=anthropic_api_key,
+                )
+                logger.info("[UNIFIED] ✅ OCRStrategyManager initialized")
+            else:
+                logger.info("[UNIFIED] ✅ OCRStrategyManager already initialized")
+        except ImportError as e:
+            logger.warning(f"[UNIFIED] OCRStrategyManager not available: {e}")
+        except Exception as e:
+            logger.error(f"[UNIFIED] Failed to initialize OCR strategy manager: {e}")
 
         # Step 2: Initialize ImplicitReferenceResolver (entity/intent resolution)
         if self.context_graph:
@@ -3307,7 +3365,7 @@ class UnifiedCommandProcessor:
                 # - Uses regex to extract grammatical structure
                 # - Supports ANY app without pre-configuration
                 # =====================================================================
-                import re
+                # Note: 're' module already imported at module level (line 9)
 
                 # Dynamic Grammar Pattern (Environment-Configurable)
                 # Pattern: \b(QUANTIFIER)\s+(?:[APP_NAME]\s+)?(TARGET_TYPE)\b
