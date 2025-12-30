@@ -527,39 +527,64 @@ class ContinuousAudioBuffer {
 
   /**
    * Calibrate noise floor (call during silence)
+   * Robust implementation with null checks and error handling
    */
   calibrateNoiseFloor(durationMs = 1000) {
     return new Promise((resolve) => {
+      // =====================================================================
+      // ROOT CAUSE FIX: Check analyserNode BEFORE accessing its properties
+      // =====================================================================
+      if (!this.analyserNode || !this.analyserNode.frequencyBinCount) {
+        console.warn('[ContinuousAudioBuffer] AnalyserNode not available, using default noise floor');
+        this.metrics.noiseFloor = 0.01;
+        resolve(0.01);
+        return;
+      }
+
       const samples = [];
       const dataArray = new Float32Array(this.analyserNode.frequencyBinCount);
       const startTime = Date.now();
 
       const collectSamples = () => {
-        if (Date.now() - startTime < durationMs) {
-          this.analyserNode.getFloatTimeDomainData(dataArray);
+        // Safety check in case analyserNode becomes null during calibration
+        if (!this.analyserNode) {
+          console.warn('[ContinuousAudioBuffer] AnalyserNode became unavailable during calibration');
+          this.metrics.noiseFloor = samples.length > 0
+            ? samples[Math.floor(samples.length / 2)]
+            : 0.01;
+          resolve(this.metrics.noiseFloor);
+          return;
+        }
 
-          let sum = 0;
-          for (let i = 0; i < dataArray.length; i++) {
-            sum += dataArray[i] * dataArray[i];
+        if (Date.now() - startTime < durationMs) {
+          try {
+            this.analyserNode.getFloatTimeDomainData(dataArray);
+
+            let sum = 0;
+            for (let i = 0; i < dataArray.length; i++) {
+              sum += dataArray[i] * dataArray[i];
+            }
+            samples.push(Math.sqrt(sum / dataArray.length));
+          } catch (err) {
+            console.warn('[ContinuousAudioBuffer] Error collecting audio sample:', err);
           }
-          samples.push(Math.sqrt(sum / dataArray.length));
 
           requestAnimationFrame(collectSamples);
         } else {
           // Calculate noise floor as median of samples
-          samples.sort((a, b) => a - b);
-          this.metrics.noiseFloor = samples[Math.floor(samples.length / 2)] || 0.01;
+          if (samples.length > 0) {
+            samples.sort((a, b) => a - b);
+            this.metrics.noiseFloor = samples[Math.floor(samples.length / 2)];
+          } else {
+            this.metrics.noiseFloor = 0.01;
+          }
 
           console.log(`[ContinuousAudioBuffer] Noise floor calibrated: ${this.metrics.noiseFloor.toFixed(4)}`);
           resolve(this.metrics.noiseFloor);
         }
       };
 
-      if (this.analyserNode) {
-        collectSamples();
-      } else {
-        resolve(0.01);
-      }
+      collectSamples();
     });
   }
 }
