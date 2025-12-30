@@ -327,64 +327,68 @@ class JARVISAgentVoice(MLEnhancedVoiceSystem):
         if self.pending_confirmations:
             return await self._handle_confirmation(text)
 
-        # Check for monitoring commands FIRST - they should go directly to Claude chatbot
+        # =========================================================================
+        # ROOT CAUSE FIX v9.0.0: Route surveillance through UnifiedCommandProcessor
+        # =========================================================================
+        # PROBLEM: Monitoring commands were being routed to claude_chatbot.generate_response()
+        # which doesn't have proper surveillance detection. This caused "Application window active"
+        # responses instead of proper God Mode activation.
+        #
+        # SOLUTION: Route ALL surveillance/monitoring commands through UnifiedCommandProcessor
+        # which has robust grammar-based detection and IntelligentCommandHandler routing.
+        # =========================================================================
         text_lower = text.lower()
+
+        # Surveillance detection keywords (matches UnifiedCommandProcessor)
         monitoring_keywords = [
-            "monitor",
-            "monitoring",
-            "watch",
-            "watching",
-            "track",
-            "tracking",
-            "continuous",
-            "continuously",
-            "real-time",
-            "realtime",
-            "actively",
-            "surveillance",
-            "observe",
-            "observing",
-            "stream",
-            "streaming",
+            "monitor", "monitoring", "watch", "watching", "track", "tracking",
+            "continuous", "continuously", "real-time", "realtime", "actively",
+            "surveillance", "observe", "observing", "stream", "streaming",
+            "alert when", "notify when", "detect when", "look for", "scan for",
         ]
-        screen_keywords = ["screen", "display", "desktop", "workspace", "monitor"]
+
+        # Multi-target patterns (God Mode triggers)
+        import re
+        god_mode_pattern = r"\b(all|every|each)\s+(?:\w+\s*)?(windows?|tabs?|instances?|spaces?)\b"
+
+        # Surveillance structure patterns
+        surveillance_patterns = ["for", "when", "until", "if", "whenever", "while"]
 
         has_monitoring = any(keyword in text_lower for keyword in monitoring_keywords)
-        has_screen = any(keyword in text_lower for keyword in screen_keywords)
+        has_multi_target = bool(re.search(god_mode_pattern, text_lower, re.IGNORECASE))
+        has_surveillance_structure = any(p in text_lower for p in surveillance_patterns)
 
-        if has_monitoring and has_screen:
+        # Detect surveillance intent
+        is_surveillance_command = (
+            (has_monitoring and has_surveillance_structure) or
+            (has_monitoring and has_multi_target)
+        )
+
+        if is_surveillance_command:
             logger.info(
-                f"[JARVIS DEBUG] MONITORING COMMAND DETECTED! Routing to Claude chatbot"
+                f"[JARVIS] 👁️ SURVEILLANCE COMMAND DETECTED: '{text}' | "
+                f"monitoring={has_monitoring}, multi_target={has_multi_target}, "
+                f"structure={has_surveillance_structure}"
             )
-            # Route directly to Claude chatbot for monitoring
-            if self.claude_chatbot:
-                try:
-                    logger.info(
-                        f"[JARVIS DEBUG] Calling claude_chatbot.generate_response for monitoring command: '{text}'"
-                    )
-                    
-                    # IMPORTANT: For monitoring commands, we need to ensure they go through the monitoring handler
-                    # not the regular vision command handler
-                    response = await self.claude_chatbot.generate_response(text)
-                    
-                    # If we get a generic response, it means the command wasn't properly handled
-                    if "Task completed successfully" in response and "Yes sir, I can see your screen" in response:
-                        logger.error("[JARVIS DEBUG] Got generic response - monitoring command not properly handled!")
-                        # Try to force it through the monitoring handler
-                        if hasattr(self.claude_chatbot, '_handle_monitoring_command'):
-                            logger.info("[JARVIS DEBUG] Forcing through monitoring handler")
-                            response = await self.claude_chatbot._handle_monitoring_command(text)
-                    
-                    logger.info(
-                        f"[JARVIS DEBUG] Claude response for monitoring: {response[:200]}..."
-                    )
-                    return response
-                except Exception as e:
-                    logger.error(f"Error handling monitoring command: {e}")
-                    return f"I encountered an error setting up monitoring, {self.user_name}."
-            else:
+            logger.info("[JARVIS] Routing to UnifiedCommandProcessor (God Mode surveillance)")
 
-                return f"I need my vision capabilities to monitor your screen, {self.user_name}."
+            # Route through UnifiedCommandProcessor which has proper surveillance handling
+            try:
+                from api.unified_command_processor import UnifiedCommandProcessor
+                processor = UnifiedCommandProcessor()
+                result = await processor.process_command(text)
+
+                if result and result.get('response'):
+                    response = result['response']
+                    logger.info(f"[JARVIS] ✅ Surveillance response: {response[:100]}...")
+                    return response
+                else:
+                    logger.warning(f"[JARVIS] Surveillance result missing response: {result}")
+                    return f"I've initiated monitoring, {self.user_name}. I'll alert you when I detect what you're looking for."
+
+            except Exception as e:
+                logger.error(f"[JARVIS] ❌ Surveillance routing failed: {e}", exc_info=True)
+                return f"I encountered an error setting up monitoring, {self.user_name}: {str(e)}"
 
         # Check for document creation commands (more flexible)
         document_keywords = ["write", "create", "draft", "compose", "generate", "make", "prepare", "type"]
@@ -732,36 +736,34 @@ class JARVISAgentVoice(MLEnhancedVoiceSystem):
                 return await self._handle_vision_command(text)
 
         try:
-            # Check for monitoring commands BEFORE command interpreter
+            # =====================================================================
+            # ROOT CAUSE FIX v9.0.0: Route surveillance through UnifiedCommandProcessor
+            # =====================================================================
             text_lower = text.lower()
+
+            # Use same detection logic as UnifiedCommandProcessor
             monitoring_keywords = [
-                "monitor",
-                "monitoring",
-                "watch",
-                "watching",
-                "track",
-                "tracking",
-                "continuous",
-                "continuously",
-                "real-time",
-                "realtime",
-                "actively",
-                "surveillance",
-                "observe",
-                "observing",
-                "stream",
-                "streaming",
+                "monitor", "monitoring", "watch", "watching", "track", "tracking",
+                "alert when", "notify when", "detect when", "look for", "scan for",
             ]
-            screen_keywords = ["screen", "display", "desktop", "workspace", "monitor"]
+            surveillance_patterns = ["for", "when", "until", "if", "whenever", "while"]
+            god_mode_pattern = r"\b(all|every|each)\s+(?:\w+\s*)?(windows?|tabs?|instances?|spaces?)\b"
 
-            has_monitoring = any(
-                keyword in text_lower for keyword in monitoring_keywords
-            )
-            has_screen = any(keyword in text_lower for keyword in screen_keywords)
+            has_monitoring = any(keyword in text_lower for keyword in monitoring_keywords)
+            has_multi_target = bool(re.search(god_mode_pattern, text_lower, re.IGNORECASE))
+            has_surveillance_structure = any(p in text_lower for p in surveillance_patterns)
 
-            if has_monitoring and has_screen:
-                # This is a monitoring command - handle it directly
-                return await self._handle_vision_command(text)
+            is_surveillance = (has_monitoring and has_surveillance_structure) or (has_monitoring and has_multi_target)
+
+            if is_surveillance:
+                # Route through UnifiedCommandProcessor for proper God Mode handling
+                logger.info(f"[JARVIS] 👁️ Surveillance detected in system path: '{text}'")
+                from api.unified_command_processor import UnifiedCommandProcessor
+                processor = UnifiedCommandProcessor()
+                result = await processor.process_command(text)
+                if result and result.get('response'):
+                    return result['response']
+                return f"I've initiated monitoring, {self.user_name}."
 
             # Get system context
             context = {
@@ -939,29 +941,39 @@ class JARVISAgentVoice(MLEnhancedVoiceSystem):
                 quick_prefix = response
                 break
                 
-        # For monitoring commands - route to chatbot
-        monitoring_keywords = ["monitor", "monitoring", "watch", "watching", "continuous", "continuously"]
-        screen_keywords = ["screen", "display", "desktop", "workspace"]
-        
+        # =========================================================================
+        # ROOT CAUSE FIX v9.0.0: Route surveillance through UnifiedCommandProcessor
+        # =========================================================================
+        monitoring_keywords = [
+            "monitor", "monitoring", "watch", "watching", "track", "tracking",
+            "alert when", "notify when", "detect when", "look for", "scan for",
+        ]
+        surveillance_patterns = ["for", "when", "until", "if", "whenever", "while"]
+        god_mode_pattern = r"\b(all|every|each)\s+(?:\w+\s*)?(windows?|tabs?|instances?|spaces?)\b"
+
         has_monitoring = any(keyword in text_lower for keyword in monitoring_keywords)
-        has_screen = any(keyword in text_lower for keyword in screen_keywords)
-        
-        if has_monitoring and has_screen:
-            if hasattr(self, 'claude_chatbot') and self.claude_chatbot:
-                try:
-                    # Use timeout for faster response
-                    response = await asyncio.wait_for(
-                        self.claude_chatbot.generate_response(text),
-                        timeout=5.0  # 5 second timeout
-                    )
-                    return response
-                except asyncio.TimeoutError:
-                    return f"The monitoring setup is taking longer than expected. Let me open the monitoring view for you."
-                except Exception as e:
-                    logger.error(f"Error handling monitoring command: {e}")
-                    return f"I encountered an issue with monitoring setup."
-            else:
-                return f"I need my vision capabilities to monitor your screen."
+        has_multi_target = bool(re.search(god_mode_pattern, text_lower, re.IGNORECASE))
+        has_surveillance_structure = any(p in text_lower for p in surveillance_patterns)
+
+        is_surveillance = (has_monitoring and has_surveillance_structure) or (has_monitoring and has_multi_target)
+
+        if is_surveillance:
+            logger.info(f"[JARVIS] 👁️ Surveillance detected in vision path: '{text}'")
+            try:
+                from api.unified_command_processor import UnifiedCommandProcessor
+                processor = UnifiedCommandProcessor()
+                result = await asyncio.wait_for(
+                    processor.process_command(text),
+                    timeout=30.0  # Allow time for God Mode setup
+                )
+                if result and result.get('response'):
+                    return result['response']
+                return f"I've initiated monitoring, {self.user_name}."
+            except asyncio.TimeoutError:
+                return f"The monitoring setup is taking longer than expected, {self.user_name}."
+            except Exception as e:
+                logger.error(f"Error handling surveillance command: {e}")
+                return f"I encountered an issue with monitoring setup: {str(e)}"
                 
         # For regular vision queries, provide immediate response then analyze
         try:
