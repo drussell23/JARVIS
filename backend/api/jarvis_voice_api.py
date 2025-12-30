@@ -1853,6 +1853,85 @@ class JARVISVoiceAPI:
                     "[JARVIS API] Detected vision/multi-space command - routing to vision handler"
                 )
 
+            # =====================================================================
+            # ROOT CAUSE FIX v9.0.0: Surveillance Detection Before Vision Handler
+            # =====================================================================
+            # PROBLEM: "watch all chrome windows for bouncing ball" was being sent
+            # directly to vision_command_handler which returns "Application window active"
+            # instead of routing to IntelligentCommandHandler/VisualMonitorAgent.
+            #
+            # SOLUTION: Detect surveillance intent BEFORE calling vision handler and
+            # route through UnifiedCommandProcessor which has proper God Mode handling.
+            # =====================================================================
+            import re
+
+            cmd_lower = command.text.lower()
+
+            # Surveillance detection (same logic as UnifiedCommandProcessor)
+            monitoring_keywords = [
+                "watch", "monitor", "track", "alert when", "notify when",
+                "detect when", "look for", "scan for", "observe",
+            ]
+            surveillance_patterns = ["for", "when", "until", "if", "whenever", "while"]
+            god_mode_pattern = r"\b(all|every|each)\s+(?:\w+\s*)?(windows?|tabs?|instances?|spaces?)\b"
+
+            has_monitoring = any(k in cmd_lower for k in monitoring_keywords)
+            has_multi_target = bool(re.search(god_mode_pattern, cmd_lower, re.IGNORECASE))
+            has_surveillance_structure = any(p in cmd_lower for p in surveillance_patterns)
+
+            is_surveillance = (has_monitoring and has_surveillance_structure) or (has_monitoring and has_multi_target)
+
+            if is_surveillance:
+                logger.info(
+                    f"[JARVIS API] 👁️ SURVEILLANCE DETECTED: '{command.text}' | "
+                    f"monitoring={has_monitoring}, multi_target={has_multi_target}, "
+                    f"structure={has_surveillance_structure}"
+                )
+                logger.info("[JARVIS API] Routing to UnifiedCommandProcessor (God Mode surveillance)")
+
+                try:
+                    from .unified_command_processor import UnifiedCommandProcessor
+                    processor = UnifiedCommandProcessor()
+                    result = await asyncio.wait_for(
+                        processor.process_command(command.text),
+                        timeout=30.0
+                    )
+
+                    if result and result.get('response'):
+                        logger.info(f"[JARVIS API] ✅ Surveillance success: {result['response'][:100]}...")
+                        return {
+                            "response": result['response'],
+                            "status": "success",
+                            "command_type": "surveillance",
+                            "success": True,
+                            "god_mode": has_multi_target,
+                        }
+                    else:
+                        logger.warning(f"[JARVIS API] Surveillance result missing response: {result}")
+                        return {
+                            "response": "I've initiated monitoring. I'll alert you when I detect what you're looking for.",
+                            "status": "success",
+                            "command_type": "surveillance",
+                            "success": True,
+                        }
+
+                except asyncio.TimeoutError:
+                    logger.error("[JARVIS API] Surveillance setup timed out")
+                    return {
+                        "response": "The monitoring setup is taking longer than expected. Please try again.",
+                        "status": "error",
+                        "command_type": "surveillance",
+                        "success": False,
+                    }
+                except Exception as e:
+                    logger.error(f"[JARVIS API] ❌ Surveillance routing failed: {e}", exc_info=True)
+                    return {
+                        "response": f"I encountered an error setting up monitoring: {str(e)}",
+                        "status": "error",
+                        "command_type": "surveillance",
+                        "success": False,
+                    }
+
             try:
                 from .vision_command_handler import vision_command_handler
 
