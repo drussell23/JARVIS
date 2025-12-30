@@ -24,15 +24,19 @@ v7.0: CRITICAL NUMBA FIX
 """
 
 # =============================================================================
-# CRITICAL: NUMBA PRE-INITIALIZATION - MUST BE FIRST
+# CRITICAL: NUMBA PRE-INITIALIZATION v9.0 - MUST BE FIRST
 # =============================================================================
 # This MUST happen before ANY other imports that might use numba
 # (numpy operations, whisper, librosa, scipy with JIT, etc.)
 #
-# The numba circular import error occurs when multiple threads try to import
-# numba.core.utils simultaneously. By ensuring numba is fully initialized
-# at module load time (before ThreadPoolExecutor creates workers), we prevent
-# this race condition entirely.
+# v9.0: Uses ensure_numba_safe_for_whisper() which:
+# 1. Detects corrupted/partial numba modules
+# 2. Clears them from sys.modules if corrupted
+# 3. Disables JIT to prevent circular import issues
+# 4. Returns a safe state for Whisper to import
+#
+# This FULLY prevents the circular import error:
+#   "cannot import name 'get_hashable_key' from partially initialized module"
 # =============================================================================
 import os
 import sys
@@ -40,62 +44,74 @@ import threading
 
 _numba_ready = False
 _numba_version = None
+_numba_jit_disabled = False
 
 try:
-    # Import the centralized numba preloader
+    # Import the centralized numba preloader with v9.0 corruption handling
     from core.numba_preload import (
-        wait_for_numba,
+        ensure_numba_safe_for_whisper,
         is_numba_ready,
         get_numba_status,
-        acquire_import_lock_and_wait,
+        is_numba_corrupted,
+        clear_corrupted_numba_modules,
     )
-    
-    # BLOCKING WAIT - This ensures numba is fully initialized before we continue
-    # This is critical because the imports below (numpy, soundfile) may trigger
-    # numba indirectly, and any subsequent whisper import definitely will
-    _numba_ready = wait_for_numba(timeout=60.0)
-    
+
+    # v9.0: Use the new safe initialization that handles corruption
+    # This is the RECOMMENDED approach - it handles all edge cases
+    safety_result = ensure_numba_safe_for_whisper()
+
+    _numba_ready = safety_result.get('numba_available', False)
+    _numba_jit_disabled = safety_result.get('jit_disabled', False)
+
     if _numba_ready:
         status = get_numba_status()
         _numba_version = status.get('version')
-        # Only log in main thread to avoid log spam
         if threading.current_thread() is threading.main_thread():
             print(f"[whisper_audio_fix] ✅ numba {_numba_version} ready")
-    else:
-        status = get_numba_status()
-        if status.get('status') == 'not_installed':
-            # numba not installed is fine - whisper will work without JIT optimization
-            if threading.current_thread() is threading.main_thread():
-                print("[whisper_audio_fix] numba not installed (optional)")
-        else:
-            if threading.current_thread() is threading.main_thread():
-                print(f"[whisper_audio_fix] ⚠️ numba init issue: {status.get('error', 'unknown')}")
-                
-except ImportError:
-    # numba_preload module doesn't exist - fall back to direct import
-    if threading.current_thread() is threading.main_thread():
-        print("[whisper_audio_fix] numba_preload not available, using fallback")
-    try:
-        os.environ['NUMBA_DISABLE_JIT'] = '1'
-        os.environ['NUMBA_NUM_THREADS'] = '1'
-        import numba
-        from numba.core import utils as _numba_utils
-        _ = getattr(_numba_utils, 'get_hashable_key', None)
-        _numba_ready = True
-        _numba_version = numba.__version__
-        os.environ.pop('NUMBA_DISABLE_JIT', None)
-        os.environ.pop('NUMBA_NUM_THREADS', None)
+    elif _numba_jit_disabled:
+        # JIT disabled due to corruption or failure - this is OK
         if threading.current_thread() is threading.main_thread():
-            print(f"[whisper_audio_fix] ✅ numba {_numba_version} ready (fallback)")
+            print(f"[whisper_audio_fix] ⚠️ numba JIT disabled: {safety_result.get('reason')}")
+            print("[whisper_audio_fix] Whisper will work but without numba optimization")
+    else:
+        # numba not installed or other benign state
+        if threading.current_thread() is threading.main_thread():
+            reason = safety_result.get('reason', 'unknown')
+            if 'not_installed' in reason:
+                print("[whisper_audio_fix] numba not installed (optional)")
+            else:
+                print(f"[whisper_audio_fix] numba status: {reason}")
+
+except ImportError:
+    # numba_preload module doesn't exist - use legacy fallback with safety
+    if threading.current_thread() is threading.main_thread():
+        print("[whisper_audio_fix] numba_preload not available, using safe fallback")
+
+    # ALWAYS disable JIT for the fallback to prevent circular imports
+    os.environ['NUMBA_DISABLE_JIT'] = '1'
+    os.environ['NUMBA_NUM_THREADS'] = '1'
+    _numba_jit_disabled = True
+
+    try:
+        import numba
+        _numba_version = numba.__version__
+        _numba_ready = False  # JIT disabled, so not "fully" ready
+        if threading.current_thread() is threading.main_thread():
+            print(f"[whisper_audio_fix] numba {_numba_version} imported (JIT disabled)")
     except ImportError:
         if threading.current_thread() is threading.main_thread():
             print("[whisper_audio_fix] numba not installed (optional)")
     except Exception as e:
         if threading.current_thread() is threading.main_thread():
             print(f"[whisper_audio_fix] ⚠️ numba fallback error: {e}")
+
 except Exception as e:
+    # Any other error - disable JIT as safety measure
     if threading.current_thread() is threading.main_thread():
         print(f"[whisper_audio_fix] ⚠️ numba pre-init error: {e}")
+    os.environ['NUMBA_DISABLE_JIT'] = '1'
+    os.environ['NUMBA_NUM_THREADS'] = '1'
+    _numba_jit_disabled = True
 
 # =============================================================================
 # NOW SAFE TO IMPORT OTHER MODULES
@@ -389,36 +405,55 @@ class WhisperImportManager:
     def _pre_import_numba(self) -> Optional[str]:
         """
         Pre-import numba using centralized process-level loader.
-        
-        v7.0: Uses module-level initialization result for instant response.
-        
+
+        v9.0: Enhanced with corruption detection and recovery.
+
         The module-level code at the top of this file already called
-        wait_for_numba() before any imports happened. This method just
-        returns the cached result.
-        
-        Why module-level is critical:
-        - The module-level wait happens BEFORE ThreadPoolExecutor workers spawn
-        - By the time any thread gets here, numba is already fully initialized
-        - This eliminates ALL race conditions
-        
+        ensure_numba_safe_for_whisper() which:
+        - Detects corrupted numba modules
+        - Clears them from sys.modules
+        - Disables JIT if needed
+
+        This method returns the cached result for instant response.
+
         Returns numba version if successful, None otherwise.
         """
-        global _numba_ready, _numba_version
-        
+        global _numba_ready, _numba_version, _numba_jit_disabled
+
         # Check instance cache first
         if hasattr(self, '_numba_version_cache'):
             return self._numba_version_cache
-        
+
         # Use module-level result (already initialized at import time)
         if _numba_ready and _numba_version:
             self._numba_version_cache = _numba_version
             logger.debug(f"numba {_numba_version} ready (module-level init)")
             return _numba_version
-        
-        # Double-check with centralized loader if module-level failed
+
+        # v9.0: If JIT was disabled due to corruption, return None but mark as safe
+        if _numba_jit_disabled:
+            logger.debug("numba JIT disabled (corruption recovery or fallback)")
+            self._numba_version_cache = None
+            return None
+
+        # Double-check with centralized loader
         try:
-            from core.numba_preload import is_numba_ready as check_numba_ready, get_numba_status
-            
+            from core.numba_preload import (
+                is_numba_ready as check_numba_ready,
+                get_numba_status,
+                is_numba_corrupted,
+                ensure_numba_safe_for_whisper,
+            )
+
+            # v9.0: Check for corruption first
+            is_corrupted, corruption_reason = is_numba_corrupted()
+            if is_corrupted:
+                logger.warning(f"numba corruption detected during import check: {corruption_reason}")
+                # Use safe initialization to clean up
+                safety_result = ensure_numba_safe_for_whisper()
+                self._numba_version_cache = None
+                return None
+
             if check_numba_ready():
                 status = get_numba_status()
                 version = status.get('version')
@@ -433,7 +468,7 @@ class WhisperImportManager:
                     logger.debug(f"numba status: {status.get('status')}")
                 self._numba_version_cache = None
                 return None
-                
+
         except ImportError:
             logger.debug("numba_preload not available")
             self._numba_version_cache = None
