@@ -2451,47 +2451,18 @@ class SupervisorBootstrapper:
         
         finally:
             # ═══════════════════════════════════════════════════════════════════
-            # GRACEFUL SHUTDOWN: Give Chrome time to redirect before killing server
+            # GRACEFUL SHUTDOWN: Use HTTP API instead of kill signals
             # ═══════════════════════════════════════════════════════════════════
-            # When JARVIS starts successfully, the loading page automatically
-            # redirects Chrome to the main app (localhost:3000). If we terminate
-            # the loading server too quickly, Chrome may show:
-            # "window terminated unexpectedly (reason: 'killed', code: '15')"
+            # The loading server v5.0.1 implements intelligent graceful shutdown:
+            # 1. We request shutdown via HTTP POST /api/shutdown/graceful
+            # 2. Loading server waits for browser to naturally disconnect
+            # 3. Then it auto-shuts down, avoiding "window terminated unexpectedly"
             #
-            # Solution: Wait for Chrome to complete its redirect before shutting down.
+            # This eliminates the race condition where killing the server while
+            # Chrome is still connected causes: "reason: 'killed', code: '15'"
             # ═══════════════════════════════════════════════════════════════════
             if self._loading_server_process:
-                try:
-                    # Check if JARVIS startup was successful (env var set by supervisor)
-                    startup_complete = os.environ.get("JARVIS_STARTUP_COMPLETE") == "true"
-
-                    if startup_complete:
-                        # Give Chrome 2 seconds to redirect to main app
-                        # The loading-manager.js has a 1s fade-out animation before redirect
-                        self.logger.debug("Waiting for Chrome to complete redirect...")
-                        await asyncio.sleep(2.0)
-
-                    # Send SIGINT first for graceful shutdown (allows cleanup handlers to run)
-                    self._loading_server_process.send_signal(signal.SIGINT)
-                    try:
-                        await asyncio.wait_for(self._loading_server_process.wait(), timeout=3.0)
-                        self.logger.info("Loading server gracefully terminated")
-                    except asyncio.TimeoutError:
-                        # SIGINT didn't work, try SIGTERM
-                        self._loading_server_process.terminate()
-                        try:
-                            await asyncio.wait_for(self._loading_server_process.wait(), timeout=2.0)
-                            self.logger.info("Loading server terminated")
-                        except asyncio.TimeoutError:
-                            # Still not dead, force kill
-                            self._loading_server_process.kill()
-                            self.logger.warning("Loading server force killed (timeout)")
-
-                except ProcessLookupError:
-                    # Process already exited
-                    self.logger.debug("Loading server already exited")
-                except Exception as e:
-                    self.logger.debug(f"Loading server cleanup error: {e}")
+                await self._graceful_shutdown_loading_server()
 
             # v10.6: Stop log monitor
             if self._log_monitor:
@@ -2655,6 +2626,161 @@ class SupervisorBootstrapper:
             self.logger.exception(f"Failed to start loading page ecosystem: {e}")
             print(f"  {TerminalUI.YELLOW}⚠️  Loading page failed: {e}{TerminalUI.RESET}")
             print(f"  {TerminalUI.CYAN}💡 JARVIS will start without loading page{TerminalUI.RESET}")
+
+    async def _graceful_shutdown_loading_server(self) -> None:
+        """
+        Gracefully shutdown the loading server using HTTP API.
+
+        This method implements the v5.0.1 graceful shutdown protocol that
+        eliminates the "window terminated unexpectedly (reason: 'killed', code: '15')"
+        error by:
+
+        1. Requesting graceful shutdown via HTTP POST /api/shutdown/graceful
+        2. The loading server waits for browser to naturally disconnect
+        3. Then auto-shuts down cleanly without killing active connections
+
+        Falls back to signal-based shutdown if HTTP fails (for resilience).
+        """
+        if not self._loading_server_process:
+            return
+
+        loading_port = self.config.required_ports[2]  # 3001
+        shutdown_url = f"http://localhost:{loading_port}/api/shutdown/graceful"
+        status_url = f"http://localhost:{loading_port}/api/shutdown/status"
+
+        try:
+            import aiohttp
+
+            # Configurable timeouts from environment
+            http_timeout = float(os.getenv('LOADING_SERVER_SHUTDOWN_HTTP_TIMEOUT', '5.0'))
+            max_wait = float(os.getenv('LOADING_SERVER_SHUTDOWN_MAX_WAIT', '30.0'))
+            poll_interval = float(os.getenv('LOADING_SERVER_SHUTDOWN_POLL_INTERVAL', '0.5'))
+
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=http_timeout)
+            ) as session:
+                # Step 1: Request graceful shutdown
+                self.logger.info("Requesting graceful shutdown of loading server...")
+                try:
+                    async with session.post(
+                        shutdown_url,
+                        json={"reason": "supervisor_shutdown"}
+                    ) as resp:
+                        if resp.status == 200:
+                            result = await resp.json()
+                            status = result.get("status", "unknown")
+                            connections = result.get("connections", 0)
+
+                            if status == "immediate_shutdown":
+                                self.logger.info("Loading server shutting down immediately (no active connections)")
+                            elif status == "pending_disconnect":
+                                self.logger.info(
+                                    f"Loading server waiting for {connections} connection(s) to close..."
+                                )
+                            elif status == "already_shutting_down":
+                                self.logger.debug("Loading server already shutting down")
+                            else:
+                                self.logger.debug(f"Shutdown response: {result}")
+                        else:
+                            self.logger.warning(
+                                f"Shutdown request returned {resp.status}, falling back to signal"
+                            )
+                            await self._fallback_signal_shutdown()
+                            return
+                except aiohttp.ClientError as e:
+                    self.logger.debug(f"HTTP shutdown request failed: {e}")
+                    await self._fallback_signal_shutdown()
+                    return
+
+                # Step 2: Wait for loading server to actually shutdown
+                start_time = time.time()
+                while (time.time() - start_time) < max_wait:
+                    # Check if process has exited
+                    if self._loading_server_process.returncode is not None:
+                        self.logger.info("Loading server gracefully terminated via HTTP")
+                        return
+
+                    # Check shutdown status
+                    try:
+                        async with session.get(status_url) as resp:
+                            if resp.status == 200:
+                                status_data = await resp.json()
+                                if status_data.get("shutdown_initiated"):
+                                    # Shutdown is happening, just wait for process exit
+                                    self.logger.debug("Shutdown initiated, waiting for process exit...")
+                            else:
+                                # Server may have already died
+                                break
+                    except aiohttp.ClientError:
+                        # Server not responding, likely already shutdown
+                        self.logger.debug("Loading server no longer responding")
+                        break
+
+                    await asyncio.sleep(poll_interval)
+
+                # Wait a bit more for process to fully exit
+                try:
+                    await asyncio.wait_for(
+                        self._loading_server_process.wait(),
+                        timeout=2.0
+                    )
+                    self.logger.info("Loading server gracefully terminated")
+                    return
+                except asyncio.TimeoutError:
+                    pass
+
+        except ImportError:
+            self.logger.debug("aiohttp not available, using signal-based shutdown")
+        except Exception as e:
+            self.logger.debug(f"HTTP graceful shutdown failed: {e}")
+
+        # Fall back to signal-based shutdown if HTTP approach failed
+        await self._fallback_signal_shutdown()
+
+    async def _fallback_signal_shutdown(self) -> None:
+        """
+        Fallback shutdown using signals (for when HTTP fails).
+
+        This is the legacy approach - used only when the HTTP API is unavailable.
+        Includes a delay to give Chrome time to redirect before killing.
+        """
+        if not self._loading_server_process:
+            return
+
+        try:
+            startup_complete = os.environ.get("JARVIS_STARTUP_COMPLETE") == "true"
+
+            if startup_complete:
+                # Give Chrome time to redirect (legacy workaround)
+                self.logger.debug("Waiting for Chrome to complete redirect...")
+                await asyncio.sleep(2.0)
+
+            # Try SIGINT first for graceful shutdown
+            self._loading_server_process.send_signal(signal.SIGINT)
+            try:
+                await asyncio.wait_for(self._loading_server_process.wait(), timeout=3.0)
+                self.logger.info("Loading server terminated (SIGINT)")
+                return
+            except asyncio.TimeoutError:
+                pass
+
+            # Try SIGTERM
+            self._loading_server_process.terminate()
+            try:
+                await asyncio.wait_for(self._loading_server_process.wait(), timeout=2.0)
+                self.logger.info("Loading server terminated (SIGTERM)")
+                return
+            except asyncio.TimeoutError:
+                pass
+
+            # Force kill
+            self._loading_server_process.kill()
+            self.logger.warning("Loading server force killed (timeout)")
+
+        except ProcessLookupError:
+            self.logger.debug("Loading server already exited")
+        except Exception as e:
+            self.logger.debug(f"Loading server cleanup error: {e}")
 
     # ═══════════════════════════════════════════════════════════════════════════
     # BROWSER LOCK FILE - Prevents race conditions across all processes

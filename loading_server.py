@@ -1404,6 +1404,265 @@ connection_manager = ConnectionManager(max_connections=config.ws_max_connections
 
 
 # =============================================================================
+# Graceful Shutdown Manager - Intelligent Browser-Aware Shutdown
+# =============================================================================
+
+class GracefulShutdownManager:
+    """
+    Intelligent shutdown manager that prevents "window terminated unexpectedly" errors.
+
+    The Problem:
+        When supervisor sends SIGTERM to loading server while Chrome is still
+        connected or redirecting, Chrome shows:
+        "window terminated unexpectedly (reason: 'killed', code: '15')"
+
+    The Solution:
+        1. Track when startup is complete (progress = 100%)
+        2. Track when browser has naturally disconnected (no WebSocket connections)
+        3. Auto-shutdown gracefully after both conditions are met
+        4. Provide HTTP endpoint for supervisor to request shutdown
+
+    This eliminates the race condition by letting the browser disconnect naturally.
+    """
+
+    def __init__(
+        self,
+        connection_manager: ConnectionManager,
+        auto_shutdown_delay: float = None,
+        disconnect_grace_period: float = None,
+        max_idle_after_complete: float = None,
+    ):
+        # Dependencies
+        self._connection_manager = connection_manager
+
+        # Configuration from environment (no hardcoding)
+        self._auto_shutdown_delay = auto_shutdown_delay or float(
+            os.getenv('LOADING_SERVER_AUTO_SHUTDOWN_DELAY', '3.0')
+        )
+        self._disconnect_grace_period = disconnect_grace_period or float(
+            os.getenv('LOADING_SERVER_DISCONNECT_GRACE', '2.0')
+        )
+        self._max_idle_after_complete = max_idle_after_complete or float(
+            os.getenv('LOADING_SERVER_MAX_IDLE', '30.0')
+        )
+
+        # State tracking
+        self._startup_complete = False
+        self._shutdown_requested = False
+        self._shutdown_initiated = False
+        self._last_connection_count = 0
+        self._browser_disconnected_at: Optional[datetime] = None
+        self._startup_completed_at: Optional[datetime] = None
+
+        # Shutdown coordination
+        self._shutdown_event = asyncio.Event()
+        self._app_runner: Optional[web.AppRunner] = None
+        self._monitor_task: Optional[asyncio.Task] = None
+
+        # Lock for thread-safe operations
+        self._lock = asyncio.Lock()
+
+        logger.info(
+            f"[GracefulShutdown] Initialized - "
+            f"auto_delay={self._auto_shutdown_delay}s, "
+            f"grace_period={self._disconnect_grace_period}s, "
+            f"max_idle={self._max_idle_after_complete}s"
+        )
+
+    def set_app_runner(self, runner: web.AppRunner):
+        """Set the app runner for graceful shutdown."""
+        self._app_runner = runner
+
+    async def start_monitoring(self):
+        """Start background monitoring for auto-shutdown conditions."""
+        if self._monitor_task is None or self._monitor_task.done():
+            self._monitor_task = asyncio.create_task(self._monitor_loop())
+            logger.info("[GracefulShutdown] Monitoring started")
+
+    async def stop_monitoring(self):
+        """Stop the monitoring task."""
+        if self._monitor_task and not self._monitor_task.done():
+            self._monitor_task.cancel()
+            try:
+                await self._monitor_task
+            except asyncio.CancelledError:
+                pass
+
+    async def notify_startup_complete(self):
+        """Called when JARVIS startup reaches 100% progress."""
+        async with self._lock:
+            if not self._startup_complete:
+                self._startup_complete = True
+                self._startup_completed_at = datetime.now()
+                logger.info("[GracefulShutdown] Startup complete - watching for browser disconnect")
+                await self._check_shutdown_conditions()
+
+    async def notify_connection_change(self, current_count: int):
+        """Called when WebSocket connections change."""
+        async with self._lock:
+            previous_count = self._last_connection_count
+            self._last_connection_count = current_count
+
+            # Detect browser disconnection (went from >0 to 0)
+            if previous_count > 0 and current_count == 0:
+                self._browser_disconnected_at = datetime.now()
+                logger.info(
+                    f"[GracefulShutdown] Browser disconnected "
+                    f"(startup_complete={self._startup_complete})"
+                )
+            elif current_count > 0:
+                # Browser reconnected, reset disconnect timer
+                self._browser_disconnected_at = None
+
+            await self._check_shutdown_conditions()
+
+    async def request_shutdown(self, reason: str = "supervisor_request") -> dict:
+        """
+        Request graceful shutdown. Called via HTTP endpoint by supervisor.
+
+        Returns status dict with shutdown timing information.
+        """
+        async with self._lock:
+            if self._shutdown_initiated:
+                return {
+                    "status": "already_shutting_down",
+                    "message": "Shutdown already in progress"
+                }
+
+            self._shutdown_requested = True
+            current_connections = self._connection_manager.count
+
+            logger.info(
+                f"[GracefulShutdown] Shutdown requested (reason={reason}, "
+                f"connections={current_connections}, startup_complete={self._startup_complete})"
+            )
+
+            # If no active connections or startup never completed, shutdown immediately
+            if current_connections == 0 or not self._startup_complete:
+                await self._initiate_shutdown(f"immediate_{reason}")
+                return {
+                    "status": "immediate_shutdown",
+                    "message": "No active connections, shutting down immediately",
+                    "connections": current_connections
+                }
+
+            # Otherwise, wait for browser to disconnect naturally
+            return {
+                "status": "pending_disconnect",
+                "message": f"Waiting for {current_connections} connection(s) to close",
+                "connections": current_connections,
+                "grace_period_seconds": self._disconnect_grace_period,
+                "max_wait_seconds": self._max_idle_after_complete
+            }
+
+    async def _check_shutdown_conditions(self):
+        """Check if conditions for auto-shutdown are met."""
+        if self._shutdown_initiated:
+            return
+
+        current_connections = self._connection_manager.count
+
+        # Condition 1: Explicit shutdown requested + no connections
+        if self._shutdown_requested and current_connections == 0:
+            if self._browser_disconnected_at:
+                elapsed = (datetime.now() - self._browser_disconnected_at).total_seconds()
+                if elapsed >= self._disconnect_grace_period:
+                    await self._initiate_shutdown("requested_no_connections")
+                    return
+
+        # Condition 2: Startup complete + browser disconnected + grace period passed
+        if self._startup_complete and self._browser_disconnected_at:
+            elapsed = (datetime.now() - self._browser_disconnected_at).total_seconds()
+            if elapsed >= self._auto_shutdown_delay:
+                await self._initiate_shutdown("browser_disconnected")
+                return
+
+        # Condition 3: Startup complete + max idle time exceeded (safety net)
+        if self._startup_complete and self._startup_completed_at:
+            elapsed = (datetime.now() - self._startup_completed_at).total_seconds()
+            if elapsed >= self._max_idle_after_complete:
+                logger.warning(
+                    f"[GracefulShutdown] Max idle time exceeded ({elapsed:.1f}s), "
+                    f"forcing shutdown (connections={current_connections})"
+                )
+                await self._initiate_shutdown("max_idle_exceeded")
+
+    async def _initiate_shutdown(self, reason: str):
+        """Initiate graceful server shutdown."""
+        if self._shutdown_initiated:
+            return
+
+        self._shutdown_initiated = True
+        logger.info(f"[GracefulShutdown] Initiating shutdown (reason={reason})")
+
+        # Signal the shutdown event
+        self._shutdown_event.set()
+
+        # Cleanup runner if available
+        if self._app_runner:
+            try:
+                await self._app_runner.cleanup()
+                logger.info("[GracefulShutdown] App runner cleaned up")
+            except Exception as e:
+                logger.error(f"[GracefulShutdown] Cleanup error: {e}")
+
+    async def _monitor_loop(self):
+        """Background loop to check shutdown conditions periodically."""
+        check_interval = float(os.getenv('LOADING_SERVER_SHUTDOWN_CHECK_INTERVAL', '0.5'))
+
+        while not self._shutdown_initiated:
+            try:
+                await asyncio.sleep(check_interval)
+
+                # Update connection count
+                current_connections = self._connection_manager.count
+                if current_connections != self._last_connection_count:
+                    await self.notify_connection_change(current_connections)
+                else:
+                    # Still check conditions even without connection change
+                    async with self._lock:
+                        await self._check_shutdown_conditions()
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.debug(f"[GracefulShutdown] Monitor error: {e}")
+
+    async def wait_for_shutdown(self):
+        """Block until shutdown is complete."""
+        await self._shutdown_event.wait()
+
+    @property
+    def is_shutting_down(self) -> bool:
+        return self._shutdown_initiated
+
+    @property
+    def status(self) -> dict:
+        """Get current shutdown manager status."""
+        return {
+            "startup_complete": self._startup_complete,
+            "shutdown_requested": self._shutdown_requested,
+            "shutdown_initiated": self._shutdown_initiated,
+            "active_connections": self._connection_manager.count,
+            "browser_disconnected_at": (
+                self._browser_disconnected_at.isoformat()
+                if self._browser_disconnected_at else None
+            ),
+            "startup_completed_at": (
+                self._startup_completed_at.isoformat()
+                if self._startup_completed_at else None
+            ),
+            "auto_shutdown_delay": self._auto_shutdown_delay,
+            "disconnect_grace_period": self._disconnect_grace_period,
+            "max_idle_after_complete": self._max_idle_after_complete,
+        }
+
+
+# Global shutdown manager instance
+shutdown_manager = GracefulShutdownManager(connection_manager)
+
+
+# =============================================================================
 # Rate Limiting
 # =============================================================================
 
@@ -1804,6 +2063,11 @@ async def update_progress_endpoint(request: web.Request) -> web.Response:
         if changed:
             logger.info(f"[Progress] {progress_state.progress:.0f}% - {stage}: {message}")
 
+        # Notify shutdown manager when startup completes
+        # This enables intelligent auto-shutdown when browser disconnects
+        if stage == 'complete' or progress >= 100.0:
+            await shutdown_manager.notify_startup_complete()
+
         # Broadcast to WebSocket clients
         await connection_manager.broadcast(progress_state.to_dict())
 
@@ -1825,6 +2089,114 @@ async def update_progress_endpoint(request: web.Request) -> web.Response:
 async def handle_options(request: web.Request) -> web.Response:
     """Handle OPTIONS preflight requests."""
     return web.Response(status=204)
+
+
+# =============================================================================
+# Graceful Shutdown Endpoints - Prevents Window Termination Errors
+# =============================================================================
+
+async def graceful_shutdown_endpoint(request: web.Request) -> web.Response:
+    """
+    Request graceful server shutdown.
+
+    This endpoint allows the supervisor to request a graceful shutdown instead
+    of sending SIGTERM. The loading server will:
+    1. Wait for any active WebSocket connections to disconnect
+    2. Apply a grace period to allow browser redirects to complete
+    3. Then shutdown cleanly
+
+    This prevents the "window terminated unexpectedly (reason: 'killed', code: '15')"
+    error that occurs when the loading server is killed while Chrome is connected.
+
+    Request body (optional):
+        {
+            "reason": "supervisor_shutdown"  // Optional reason for logging
+        }
+
+    Response:
+        {
+            "status": "immediate_shutdown" | "pending_disconnect" | "already_shutting_down",
+            "message": "...",
+            "connections": N,  // Current active connections
+            "grace_period_seconds": N,  // How long we'll wait for disconnect
+            "max_wait_seconds": N  // Maximum wait time before forced shutdown
+        }
+    """
+    try:
+        # Parse optional body
+        try:
+            data = await request.json()
+            reason = data.get('reason', 'http_request')
+        except (json.JSONDecodeError, ValueError):
+            reason = 'http_request'
+
+        result = await shutdown_manager.request_shutdown(reason)
+        return web.json_response(result)
+
+    except Exception as e:
+        logger.error(f"[Shutdown] Error handling shutdown request: {e}")
+        return web.json_response({
+            "status": "error",
+            "message": str(e)
+        }, status=500)
+
+
+async def shutdown_status_endpoint(request: web.Request) -> web.Response:
+    """
+    Get current shutdown manager status.
+
+    Returns detailed information about the shutdown state, including:
+    - Whether startup is complete
+    - Whether shutdown has been requested/initiated
+    - Active connection count
+    - Timestamps for key events
+
+    Useful for the supervisor to monitor shutdown progress.
+    """
+    return web.json_response({
+        "service": "jarvis_loading_server",
+        "version": "5.0.1",  # Version bump for graceful shutdown feature
+        **shutdown_manager.status
+    })
+
+
+async def force_shutdown_endpoint(request: web.Request) -> web.Response:
+    """
+    Force immediate shutdown (for emergency situations).
+
+    Unlike /api/shutdown/graceful, this immediately initiates shutdown
+    without waiting for connections to close. Use only when graceful
+    shutdown is taking too long or has failed.
+
+    Request body (optional):
+        {
+            "reason": "force_requested"
+        }
+    """
+    try:
+        try:
+            data = await request.json()
+            reason = data.get('reason', 'force_requested')
+        except (json.JSONDecodeError, ValueError):
+            reason = 'force_requested'
+
+        logger.warning(f"[Shutdown] Force shutdown requested: {reason}")
+
+        # Directly initiate shutdown without waiting
+        await shutdown_manager._initiate_shutdown(f"force_{reason}")
+
+        return web.json_response({
+            "status": "force_shutdown_initiated",
+            "message": "Force shutdown initiated immediately",
+            "reason": reason
+        })
+
+    except Exception as e:
+        logger.error(f"[Shutdown] Error handling force shutdown: {e}")
+        return web.json_response({
+            "status": "error",
+            "message": str(e)
+        }, status=500)
 
 
 # =============================================================================
@@ -3702,12 +4074,19 @@ async def on_startup(app: web.Application):
     # Start watchdog
     app['watchdog_task'] = asyncio.create_task(system_health_watchdog())
 
+    # Start graceful shutdown monitoring (v5.0.1)
+    # This enables intelligent auto-shutdown when browser disconnects after startup complete
+    await shutdown_manager.start_monitoring()
+
     logger.info("All services started")
 
 
 async def on_shutdown(app: web.Application):
     """Cleanup on shutdown."""
     logger.info("Shutting down loading server...")
+
+    # Stop graceful shutdown monitoring (v5.0.1)
+    await shutdown_manager.stop_monitoring()
 
     # Stop watchdog
     if 'watchdog_task' in app:
@@ -3823,6 +4202,11 @@ def create_app() -> web.Application:
     app.router.add_get('/api/cross-repo/status', get_cross_repo_status)
     app.router.add_post('/api/cross-repo/update', update_cross_repo_status)
 
+    # v5.0.1: Graceful Shutdown endpoints (fixes window termination errors)
+    app.router.add_post('/api/shutdown/graceful', graceful_shutdown_endpoint)
+    app.router.add_get('/api/shutdown/status', shutdown_status_endpoint)
+    app.router.add_post('/api/shutdown/force', force_shutdown_endpoint)
+
     # CORS preflight
     app.router.add_route('OPTIONS', '/{path:.*}', handle_options)
 
@@ -3835,6 +4219,7 @@ def create_app() -> web.Application:
     app['connection_manager'] = connection_manager
     app['metrics'] = metrics
     app['config'] = config
+    app['shutdown_manager'] = shutdown_manager  # v5.0.1: Graceful shutdown
 
     return app
 
@@ -3847,6 +4232,9 @@ async def start_server(host: str = '0.0.0.0', port: Optional[int] = None):
     runner = web.AppRunner(app)
     await runner.setup()
 
+    # v5.0.1: Register runner with shutdown manager for graceful cleanup
+    shutdown_manager.set_app_runner(runner)
+
     site = web.TCPSite(runner, host, port)
     await site.start()
 
@@ -3856,7 +4244,7 @@ async def start_server(host: str = '0.0.0.0', port: Optional[int] = None):
     resolved_manager = path_resolver.resolve("loading-manager.js")
 
     logger.info(f"{'='*60}")
-    logger.info(f" JARVIS Loading Server v5.0 - Flywheel Edition")
+    logger.info(f" JARVIS Loading Server v5.0.1 - Graceful Shutdown Edition")
     logger.info(f"{'='*60}")
     logger.info(f" Server:      http://{host}:{port}")
     logger.info(f" WebSocket:   ws://{host}:{port}/ws/startup-progress")
@@ -3866,6 +4254,11 @@ async def start_server(host: str = '0.0.0.0', port: Optional[int] = None):
     logger.info(f"   loading.html:      {'✓' if resolved_loading else '✗'} {resolved_loading or 'NOT FOUND'}")
     logger.info(f"   loading-manager.js: {'✓' if resolved_manager else '✗'} {resolved_manager or 'NOT FOUND'}")
     logger.info(f"   Search paths:      {len(path_resolver.search_paths)}")
+    logger.info(f"{'='*60}")
+    logger.info(f" v5.0.1 Graceful Shutdown (fixes window termination):")
+    logger.info(f"   POST /api/shutdown/graceful  (request graceful shutdown)")
+    logger.info(f"   GET  /api/shutdown/status    (check shutdown state)")
+    logger.info(f"   POST /api/shutdown/force     (force immediate shutdown)")
     logger.info(f"{'='*60}")
     logger.info(f" v5.0 Flywheel Endpoints:")
     logger.info(f"   GET  /api/flywheel/status")
@@ -3894,16 +4287,66 @@ async def shutdown_server(runner: web.AppRunner):
 
 
 async def main():
-    """Main entry point."""
+    """
+    Main entry point with intelligent graceful shutdown.
+
+    The server can be shutdown in three ways:
+    1. KeyboardInterrupt (Ctrl+C) - traditional signal-based shutdown
+    2. Graceful shutdown via HTTP API (/api/shutdown/graceful)
+    3. Auto-shutdown when startup completes and browser disconnects
+
+    The graceful shutdown mechanism prevents the "window terminated unexpectedly"
+    error by waiting for browsers to naturally disconnect before shutting down.
+    """
     runner = await start_server()
 
+    # Create a task that completes on either:
+    # 1. Graceful shutdown request (via API or auto-detect)
+    # 2. KeyboardInterrupt (Ctrl+C)
+    keyboard_event = asyncio.Event()
+
+    def signal_handler():
+        keyboard_event.set()
+
+    # Set up signal handlers for graceful handling
+    loop = asyncio.get_running_loop()
     try:
-        # Keep server running
-        await asyncio.Event().wait()
+        import signal
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(sig, signal_handler)
+    except (NotImplementedError, ValueError):
+        # Signal handlers not available (Windows or not main thread)
+        pass
+
+    try:
+        # Wait for either shutdown event or keyboard interrupt
+        done, pending = await asyncio.wait(
+            [
+                asyncio.create_task(shutdown_manager.wait_for_shutdown()),
+                asyncio.create_task(keyboard_event.wait()),
+            ],
+            return_when=asyncio.FIRST_COMPLETED
+        )
+
+        # Cancel pending tasks
+        for task in pending:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        if keyboard_event.is_set():
+            logger.info("Received keyboard interrupt signal...")
+        else:
+            logger.info("Graceful shutdown completed...")
+
     except KeyboardInterrupt:
         logger.info("Received shutdown signal...")
     finally:
-        await shutdown_server(runner)
+        # Only cleanup runner if shutdown_manager hasn't already done it
+        if not shutdown_manager.is_shutting_down:
+            await shutdown_server(runner)
 
 
 # =============================================================================

@@ -77,7 +77,14 @@ except ImportError:
     DISKCACHE_AVAILABLE = False
     Cache = dict
 
-from pydantic import BaseModel, Field
+# Pydantic is optional - used for LangGraph state management
+try:
+    from pydantic import BaseModel, Field as PydanticField
+    PYDANTIC_AVAILABLE = True
+except ImportError:
+    PYDANTIC_AVAILABLE = False
+    BaseModel = None  # Will use dataclass fallback
+    PydanticField = None
 
 logger = logging.getLogger(__name__)
 
@@ -1217,15 +1224,29 @@ class RepositoryMapper:
 # LangGraph Reasoning Integration
 # ============================================================================
 
-class RepositoryReasoningState(BaseModel):
-    """State for repository reasoning graph."""
-    query: str = ""
-    repositories: List[str] = Field(default_factory=list)
-    current_phase: str = "analyze"
-    findings: List[Dict[str, Any]] = Field(default_factory=list)
-    recommendations: List[str] = Field(default_factory=list)
-    confidence: float = 0.0
-    error: Optional[str] = None
+# Dynamically create RepositoryReasoningState based on pydantic availability
+if PYDANTIC_AVAILABLE and BaseModel is not None:
+    class RepositoryReasoningState(BaseModel):
+        """State for repository reasoning graph (Pydantic version)."""
+        query: str = ""
+        repositories: List[str] = PydanticField(default_factory=list)
+        current_phase: str = "analyze"
+        findings: List[Dict[str, Any]] = PydanticField(default_factory=list)
+        recommendations: List[str] = PydanticField(default_factory=list)
+        confidence: float = 0.0
+        error: Optional[str] = None
+else:
+    # Fallback to dataclass when pydantic is not available
+    @dataclass
+    class RepositoryReasoningState:  # type: ignore[no-redef]
+        """State for repository reasoning graph (dataclass fallback)."""
+        query: str = ""
+        repositories: List[str] = field(default_factory=list)
+        current_phase: str = "analyze"
+        findings: List[Dict[str, Any]] = field(default_factory=list)
+        recommendations: List[str] = field(default_factory=list)
+        confidence: float = 0.0
+        error: Optional[str] = None
 
 
 class RepositoryReasoningGraph:
@@ -1429,6 +1450,13 @@ async def query_codebase(query: str) -> Dict[str, Any]:
 # ============================================================================
 
 __all__ = [
+    # Availability Flags (for graceful degradation)
+    "TREE_SITTER_AVAILABLE",
+    "NETWORKX_AVAILABLE",
+    "LANGGRAPH_AVAILABLE",
+    "DISKCACHE_AVAILABLE",
+    "PYDANTIC_AVAILABLE",
+
     # Configuration
     "RepositoryConfig",
     "RepositoryIntelligenceConfig",
