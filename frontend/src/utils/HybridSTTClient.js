@@ -7,7 +7,24 @@
  * - Handles retry logic for low-confidence results
  * - Displays STT engine info (Wav2Vec, Vosk, Whisper)
  * - Learning-enabled (every transcription recorded to database)
+ * - Integrated with MicrophonePermissionManager for proper permission handling
  */
+
+// Import permission manager - uses dynamic import to avoid circular dependencies
+let microphonePermissionManager = null;
+
+// Lazy load the permission manager
+const getPermissionManager = async () => {
+  if (!microphonePermissionManager) {
+    try {
+      const module = await import('../services/MicrophonePermissionManager.js');
+      microphonePermissionManager = module.default;
+    } catch (e) {
+      console.warn('[HybridSTT] Could not load MicrophonePermissionManager:', e);
+    }
+  }
+  return microphonePermissionManager;
+};
 
 class HybridSTTClient {
   constructor(websocket, options = {}) {
@@ -85,16 +102,59 @@ class HybridSTTClient {
     }
 
     try {
-      // Get microphone access
-      this.audioStream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          channelCount: 1,  // Mono audio
-          sampleRate: 16000, // 16kHz (optimal for STT)
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true
+      // =========================================================================
+      // Use MicrophonePermissionManager for proper permission handling
+      // =========================================================================
+      const permManager = await getPermissionManager();
+
+      if (permManager) {
+        // Pre-check if microphone can be used
+        if (!permManager.canUseMicrophone()) {
+          const state = permManager.getState();
+          console.warn('🎤 [HybridSTT] Cannot start - microphone not available:', state);
+          this._triggerEvent('error', {
+            error: 'permission-denied',
+            message: 'Microphone permission denied',
+            instructions: permManager.getPermissionInstructions()
+          });
+          return;
         }
-      });
+
+        // Request permission through the manager (with locking)
+        const result = await permManager.requestPermission('HybridSTTClient', {
+          audio: {
+            channelCount: 1,
+            sampleRate: 16000,
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true
+          }
+        });
+
+        if (!result.success) {
+          console.warn('🎤 [HybridSTT] Permission request failed:', result);
+          this._triggerEvent('error', {
+            error: result.error,
+            message: result.reason,
+            instructions: result.instructions
+          });
+          return;
+        }
+
+        this.audioStream = result.stream;
+      } else {
+        // Fallback to direct getUserMedia if manager not available
+        console.warn('🎤 [HybridSTT] Permission manager not available, using direct getUserMedia');
+        this.audioStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            channelCount: 1,
+            sampleRate: 16000,
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true
+          }
+        });
+      }
 
       // Create MediaRecorder for audio capture
       // Try different MIME types for compatibility
@@ -175,6 +235,15 @@ class HybridSTTClient {
 
     } catch (error) {
       console.error('🎤 [HybridSTT] Failed to start recording:', error);
+
+      // Inform permission manager of any permission-related errors
+      if (error.name === 'NotAllowedError' || error.name === 'PermissionDeniedError') {
+        const permManager = await getPermissionManager();
+        if (permManager) {
+          permManager.markAsDenied('HybridSTT_catch');
+        }
+      }
+
       this._triggerEvent('error', { error: error.message });
     }
   }

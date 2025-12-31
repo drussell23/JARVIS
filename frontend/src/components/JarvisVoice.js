@@ -5,6 +5,7 @@ import MicrophonePermissionHelper from './MicrophonePermissionHelper';
 import MicrophoneIndicator from './MicrophoneIndicator';
 import WorkflowProgress from './WorkflowProgress'; // Workflow progress component
 import mlAudioHandler from '../utils/MLAudioHandler'; // ML-enhanced audio handling
+import microphonePermissionManager from '../services/MicrophonePermissionManager'; // Unified microphone permission management
 import { getNetworkRecoveryManager } from '../utils/NetworkRecoveryManager'; // Advanced network recovery
 import WakeWordService from './WakeWordService'; // Wake word detection service
 import configService, {
@@ -1434,19 +1435,42 @@ const JarvisVoice = () => {
         return;
       }
 
-      // Try to get microphone access
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      stream.getTracks().forEach(track => track.stop());
+      // Use unified permission manager for proper handling
+      const result = await microphonePermissionManager.requestPermission('checkMicrophonePermission');
 
-      setMicrophonePermission('granted');
-      setMicStatus('ready');
-      // Initialize speech recognition after permission granted
-      initializeSpeechRecognition();
+      if (result.success) {
+        // Clean up the test stream
+        result.stream.getTracks().forEach(track => track.stop());
+
+        setMicrophonePermission('granted');
+        setMicStatus('ready');
+        // Initialize speech recognition after permission granted
+        initializeSpeechRecognition();
+      } else {
+        console.error('Microphone permission error:', result);
+
+        if (result.error === 'permission_denied') {
+          setMicrophonePermission('denied');
+          setMicStatus('permission_denied');
+          setError('Microphone access denied. Please grant permission to use JARVIS.');
+        } else if (result.error === 'no_device') {
+          setMicrophonePermission('no-device');
+          setMicStatus('error');
+          setError('No microphone found. Please connect a microphone.');
+        } else {
+          setMicrophonePermission('error');
+          setMicStatus('error');
+          setError('Error accessing microphone: ' + (result.reason || 'Unknown error'));
+        }
+      }
     } catch (error) {
       console.error('Microphone permission error:', error);
+
+      // Inform the permission manager
       if (error.name === 'NotAllowedError' || error.name === 'PermissionDeniedError') {
+        microphonePermissionManager.markAsDenied('checkMicrophonePermission_catch');
         setMicrophonePermission('denied');
-        setMicStatus('error');
+        setMicStatus('permission_denied');
         setError('Microphone access denied. Please grant permission to use JARVIS.');
       } else if (error.name === 'NotFoundError') {
         setMicrophonePermission('no-device');
@@ -2976,7 +3000,36 @@ const JarvisVoice = () => {
           console.error('Speech recognition error:', event.error, event);
         }
 
-        // Use ML-enhanced error handling
+        // =====================================================================
+        // CRITICAL FIX: Immediately handle permission errors BEFORE async calls
+        // =====================================================================
+        // The onend handler fires synchronously after onerror. If we don't set
+        // skipNextRestartRef IMMEDIATELY (before any await), onend will try to
+        // restart recognition and cause an infinite loop.
+        // =====================================================================
+        if (event.error === 'not-allowed' || event.error === 'audio-capture') {
+          // IMMEDIATELY set flags to prevent restart loop - DO THIS BEFORE ANY AWAIT
+          skipNextRestartRef.current = true;
+          continuousListeningRef.current = false;
+
+          // Inform the unified permission manager
+          microphonePermissionManager.markAsDenied(event.error);
+
+          console.warn(`⛔ [JarvisVoice] ${event.error} error - immediate restart prevention set`);
+
+          // Update UI state synchronously
+          setError(`🎤 Microphone ${event.error === 'not-allowed' ? 'permission denied' : 'access issue'}. Check browser permissions.`);
+          setMicStatus('permission_denied');
+          setMicrophonePermission('denied');
+          setContinuousListening(false);
+
+          // Still call ML handler for logging/analytics but don't await blocking
+          mlAudioHandler.handleAudioError(event, recognitionRef.current).catch(() => {});
+
+          return; // Exit early - don't process further
+        }
+
+        // Use ML-enhanced error handling for non-permission errors
         let mlResult = null;
         try {
           mlResult = await mlAudioHandler.handleAudioError(event, recognitionRef.current);
@@ -4039,6 +4092,14 @@ const JarvisVoice = () => {
       return;
     }
 
+    // =========================================================================
+    // Pre-check: Verify microphone permission before attempting to access
+    // =========================================================================
+    if (!microphonePermissionManager.canUseMicrophone()) {
+      console.warn('🎤 [VoiceCapture] Cannot start - microphone permission not available');
+      return; // Silently fail - voice biometrics is optional
+    }
+
     // CRITICAL: Set flag IMMEDIATELY to prevent race conditions
     // This ensures stopVoiceAudioCapture waits for recording to actually start
     isRecordingVoiceRef.current = true;
@@ -4047,7 +4108,7 @@ const JarvisVoice = () => {
     // Retry configuration
     const maxRetries = 3;
     const retryDelays = [100, 300, 1000]; // Exponential-ish backoff
-    
+
     for (let attempt = 0; attempt < maxRetries; attempt++) {
       try {
         // Clean up any existing stream first to prevent resource conflicts
@@ -4081,8 +4142,8 @@ const JarvisVoice = () => {
           console.log(`🎤 [VoiceCapture] Retry attempt ${attempt + 1}/${maxRetries}...`);
         }
         
-        // Get microphone access with robust constraints
-        voiceAudioStreamRef.current = await navigator.mediaDevices.getUserMedia({
+        // Get microphone access using unified permission manager
+        const result = await microphonePermissionManager.requestPermission('VoiceCapture', {
           audio: {
             channelCount: 1,  // Mono
             sampleRate: { ideal: 16000, min: 8000, max: 48000 }, // Flexible sample rate
@@ -4091,6 +4152,14 @@ const JarvisVoice = () => {
             autoGainControl: true
           }
         });
+
+        if (!result.success) {
+          console.warn('🎤 [VoiceCapture] Permission request failed:', result);
+          isRecordingVoiceRef.current = false;
+          return;
+        }
+
+        voiceAudioStreamRef.current = result.stream;
 
         // Try different MIME types for compatibility
         const mimeTypes = [
@@ -4439,8 +4508,42 @@ const JarvisVoice = () => {
   };
 
   const startListening = async () => {
+    // =========================================================================
+    // Pre-check: Verify microphone permission before attempting to access
+    // =========================================================================
+    // This prevents triggering permission errors that cause restart loops
+    // =========================================================================
+    if (!microphonePermissionManager.canUseMicrophone()) {
+      const state = microphonePermissionManager.getState();
+      console.warn('[JarvisVoice] startListening blocked - microphone not available:', state);
+
+      // Update UI to reflect permission issue
+      setError('🎤 Microphone permission required. Click the lock icon to enable.');
+      setMicStatus('permission_denied');
+      setMicrophonePermission('denied');
+
+      // Show instructions
+      const instructions = microphonePermissionManager.getPermissionInstructions();
+      console.log('[JarvisVoice] Permission instructions:', instructions);
+
+      return; // Don't attempt to access microphone
+    }
+
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      // Use unified permission manager for proper locking
+      const result = await microphonePermissionManager.requestPermission('startListening', {
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+      });
+
+      if (!result.success) {
+        console.warn('[JarvisVoice] Permission request failed:', result);
+        setError(`🎤 ${result.reason || 'Microphone access denied'}`);
+        setMicStatus('permission_denied');
+        setMicrophonePermission('denied');
+        return;
+      }
+
+      const stream = result.stream;
 
       mediaRecorderRef.current = new MediaRecorder(stream);
       audioChunksRef.current = [];
@@ -4465,7 +4568,14 @@ const JarvisVoice = () => {
       }, 5000);
     } catch (err) {
       console.error('Failed to start recording:', err);
+
+      // Inform the permission manager
+      if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
+        microphonePermissionManager.markAsDenied('startListening_catch');
+      }
+
       setError('Microphone access denied');
+      setMicStatus('permission_denied');
     }
   };
 
