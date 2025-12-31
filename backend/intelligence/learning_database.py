@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import asyncio
 import calendar
+import functools
 import hashlib
 import json
 import logging
+import random
 import time
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
@@ -121,6 +123,162 @@ def _safe_get(row, key: str, default: Any = None) -> Any:
         return row[key] if row[key] is not None else default
     except (KeyError, IndexError, TypeError):
         return default
+
+
+# ============================================================================
+# SQLITE CONNECTION FACTORY WITH CONCURRENCY PROTECTION
+# ============================================================================
+# These utilities provide robust SQLite connection handling to prevent
+# "database is locked" errors in high-concurrency async environments.
+#
+# Key features:
+# - busy_timeout: SQLite waits up to 30s before throwing SQLITE_BUSY
+# - WAL mode: Enables concurrent reads during writes
+# - Retry with exponential backoff: Handles transient lock failures
+# - Proper isolation level for transaction control
+# ============================================================================
+
+# Default SQLite connection settings for concurrent access
+SQLITE_BUSY_TIMEOUT_MS = 30000  # 30 seconds - wait before SQLITE_BUSY error
+SQLITE_RETRY_MAX_ATTEMPTS = 5   # Maximum retry attempts for transient errors
+SQLITE_RETRY_BASE_DELAY = 0.1   # Base delay in seconds (100ms)
+SQLITE_RETRY_MAX_DELAY = 5.0    # Maximum delay in seconds
+
+
+async def create_sqlite_connection(
+    path: str,
+    timeout: float = 30.0,
+    isolation_level: Optional[str] = None
+) -> aiosqlite.Connection:
+    """
+    Create an aiosqlite connection with proper concurrency settings.
+
+    This factory function ensures all SQLite connections have:
+    - Proper busy_timeout to prevent immediate SQLITE_BUSY errors
+    - WAL mode for better concurrent access
+    - Row factory for dict-like access
+    - Optimized PRAGMA settings for performance
+
+    Args:
+        path: Path to the SQLite database file
+        timeout: Busy timeout in seconds (default: 30s)
+        isolation_level: Transaction isolation level (default: None = autocommit off)
+
+    Returns:
+        Configured aiosqlite.Connection ready for concurrent use
+    """
+    # Connect with timeout (this is the Python-level timeout)
+    conn = await aiosqlite.connect(
+        path,
+        timeout=timeout,
+        isolation_level=isolation_level
+    )
+
+    # Set row factory for convenient access
+    conn.row_factory = aiosqlite.Row
+
+    # Configure SQLite for concurrent access with robust settings
+    # busy_timeout in milliseconds - SQLite will wait this long before SQLITE_BUSY
+    await conn.execute(f"PRAGMA busy_timeout = {int(timeout * 1000)}")
+
+    # WAL mode enables concurrent reads during writes
+    await conn.execute("PRAGMA journal_mode = WAL")
+
+    # NORMAL sync is faster than FULL and safe with WAL
+    await conn.execute("PRAGMA synchronous = NORMAL")
+
+    # Larger cache for better performance
+    await conn.execute("PRAGMA cache_size = 10000")
+
+    # Store temp tables in memory for speed
+    await conn.execute("PRAGMA temp_store = MEMORY")
+
+    # Enable foreign keys
+    await conn.execute("PRAGMA foreign_keys = ON")
+
+    logger.debug(f"SQLite connection created with busy_timeout={timeout}s, WAL mode")
+
+    return conn
+
+
+def with_db_retry(
+    max_attempts: int = SQLITE_RETRY_MAX_ATTEMPTS,
+    base_delay: float = SQLITE_RETRY_BASE_DELAY,
+    max_delay: float = SQLITE_RETRY_MAX_DELAY,
+    retryable_errors: tuple = (
+        "database is locked",
+        "database is busy",
+        "cannot start a transaction within a transaction",
+    )
+):
+    """
+    Decorator that adds retry logic with exponential backoff to async database operations.
+
+    This decorator catches transient SQLite errors (like "database is locked") and
+    retries the operation with exponential backoff, preventing spurious failures
+    in high-concurrency environments.
+
+    Args:
+        max_attempts: Maximum number of retry attempts
+        base_delay: Initial delay between retries (doubles each attempt)
+        max_delay: Maximum delay between retries
+        retryable_errors: Tuple of error message substrings that trigger retry
+
+    Returns:
+        Decorated async function with retry logic
+
+    Example:
+        @with_db_retry(max_attempts=5)
+        async def store_data(self, data):
+            async with self._db_lock:
+                await self.db.execute(...)
+    """
+    def decorator(func):
+        @functools.wraps(func)
+        async def wrapper(*args, **kwargs):
+            last_error = None
+
+            for attempt in range(max_attempts):
+                try:
+                    return await func(*args, **kwargs)
+
+                except Exception as e:
+                    error_msg = str(e).lower()
+
+                    # Check if this is a retryable error
+                    is_retryable = any(
+                        retryable_err.lower() in error_msg
+                        for retryable_err in retryable_errors
+                    )
+
+                    if not is_retryable:
+                        # Non-retryable error - re-raise immediately
+                        raise
+
+                    last_error = e
+
+                    if attempt < max_attempts - 1:
+                        # Calculate delay with exponential backoff
+                        delay = min(base_delay * (2 ** attempt), max_delay)
+                        # Add jitter to prevent thundering herd
+                        jitter = delay * 0.1 * random.random()
+                        actual_delay = delay + jitter
+
+                        logger.warning(
+                            f"Database operation failed (attempt {attempt + 1}/{max_attempts}): {e}. "
+                            f"Retrying in {actual_delay:.2f}s..."
+                        )
+                        await asyncio.sleep(actual_delay)
+                    else:
+                        logger.error(
+                            f"Database operation failed after {max_attempts} attempts: {e}"
+                        )
+
+            # All retries exhausted
+            raise last_error
+
+        return wrapper
+    return decorator
 
 
 # ============================================================================
@@ -1977,26 +2135,26 @@ class JARVISLearningDatabase:
                     self.db = DatabaseConnectionWrapper(adapter)
                 else:
                     logger.info("📂 Using SQLite (Cloud SQL not configured)")
-                    self.db = await aiosqlite.connect(str(self.sqlite_path))
-                    self.db.row_factory = aiosqlite.Row
+                    # Use centralized connection factory with proper concurrency settings
+                    self.db = await create_sqlite_connection(str(self.sqlite_path))
 
             except asyncio.TimeoutError:
                 logger.warning(
                     "⏱️  Cloud SQL adapter initialization timeout (15s exceeded)\n"
                     "   → Falling back to local SQLite"
                 )
-                self.db = await aiosqlite.connect(str(self.sqlite_path))
-                self.db.row_factory = aiosqlite.Row
+                # Use centralized connection factory with proper concurrency settings
+                self.db = await create_sqlite_connection(str(self.sqlite_path))
 
             except Exception as e:
                 logger.warning(f"⚠️  Cloud SQL adapter failed: {e}")
                 logger.info("📂 Falling back to SQLite")
-                self.db = await aiosqlite.connect(str(self.sqlite_path))
-                self.db.row_factory = aiosqlite.Row
+                # Use centralized connection factory with proper concurrency settings
+                self.db = await create_sqlite_connection(str(self.sqlite_path))
         else:
             logger.info("📂 Using SQLite (Cloud adapter not available)")
-            self.db = await aiosqlite.connect(str(self.sqlite_path))
-            self.db.row_factory = aiosqlite.Row
+            # Use centralized connection factory with proper concurrency settings
+            self.db = await create_sqlite_connection(str(self.sqlite_path))
 
         # Check if using Cloud SQL (PostgreSQL) or SQLite
         is_cloud = isinstance(self.db, DatabaseConnectionWrapper) and self.db.is_cloud
@@ -2034,12 +2192,9 @@ class JARVISLearningDatabase:
 
         db = self._ensure_db_initialized()
         async with db.cursor() as cursor:
-            # Enable WAL mode for better concurrency (SQLite only)
-            if not is_cloud:
-                await cursor.execute("PRAGMA journal_mode=WAL")
-                await cursor.execute("PRAGMA synchronous=NORMAL")
-                await cursor.execute("PRAGMA cache_size=10000")
-                await cursor.execute("PRAGMA temp_store=MEMORY")
+            # NOTE: WAL mode and other PRAGMA settings are now configured in
+            # create_sqlite_connection() for consistent concurrency handling.
+            # Setting busy_timeout there ensures all connections wait properly.
 
             # Goals table with enhanced tracking
             await cursor.execute(
@@ -5097,6 +5252,7 @@ class JARVISLearningDatabase:
 
             await self.db.commit()
 
+    @with_db_retry(max_attempts=5, base_delay=0.1, max_delay=5.0)
     async def _flush_pattern_batch(self):
         """Flush pending patterns with intelligent deduplication and merging"""
         if not self.pending_patterns:
@@ -5615,6 +5771,7 @@ class JARVISLearningDatabase:
             logger.error(f"Error storing workflow: {e}", exc_info=True)
             raise
 
+    @with_db_retry(max_attempts=5, base_delay=0.1, max_delay=5.0)
     async def store_space_transition(
         self,
         from_space: int,
@@ -5693,6 +5850,7 @@ class JARVISLearningDatabase:
         except Exception as e:
             logger.error(f"Error storing space transition: {e}", exc_info=True)
 
+    @with_db_retry(max_attempts=5, base_delay=0.1, max_delay=5.0)
     async def store_behavioral_pattern(
         self,
         behavior_type: str,
@@ -5789,6 +5947,7 @@ class JARVISLearningDatabase:
             logger.error(f"Error storing behavioral pattern: {e}", exc_info=True)
             raise
 
+    @with_db_retry(max_attempts=5, base_delay=0.1, max_delay=5.0)
     async def store_temporal_pattern(
         self,
         pattern_type: str,
@@ -5885,6 +6044,7 @@ class JARVISLearningDatabase:
         except Exception as e:
             logger.error(f"Error storing temporal pattern: {e}", exc_info=True)
 
+    @with_db_retry(max_attempts=5, base_delay=0.1, max_delay=5.0)
     async def store_proactive_suggestion(
         self,
         suggestion_type: str,
@@ -5943,6 +6103,7 @@ class JARVISLearningDatabase:
             logger.error(f"Error storing suggestion: {e}", exc_info=True)
             raise
 
+    @with_db_retry(max_attempts=5, base_delay=0.1, max_delay=5.0)
     async def update_suggestion_feedback(self, suggestion_id: int, accepted: bool):
         """
         Update suggestion with user feedback
