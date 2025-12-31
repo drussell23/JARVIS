@@ -467,14 +467,22 @@ class GhostHandsOrchestrator:
             logger.warning(f"[GHOST-HANDS] N-Optic Nerve init failed: {e}")
 
     async def _init_actuator(self) -> None:
-        """Initialize Background Actuator."""
+        """Initialize Yabai-Aware Actuator for cross-space capabilities."""
         try:
-            from ghost_hands.background_actuator import get_background_actuator
+            # Use Yabai-Aware Actuator for cross-space window targeting
+            from ghost_hands.yabai_aware_actuator import get_yabai_actuator
 
-            self._actuator = await get_background_actuator()
-            logger.info("[GHOST-HANDS] Background Actuator connected")
+            self._actuator = await get_yabai_actuator()
+            logger.info("[GHOST-HANDS] Yabai-Aware Actuator connected (cross-space enabled)")
         except Exception as e:
-            logger.warning(f"[GHOST-HANDS] Background Actuator init failed: {e}")
+            logger.warning(f"[GHOST-HANDS] Yabai-Aware Actuator init failed: {e}")
+            # Fallback to legacy actuator if Yabai isn't available
+            try:
+                from ghost_hands.background_actuator import get_background_actuator
+                self._actuator = await get_background_actuator()
+                logger.info("[GHOST-HANDS] Fallback: Background Actuator connected")
+            except Exception as e2:
+                logger.error(f"[GHOST-HANDS] All actuators failed: {e2}")
 
     async def _init_narration(self) -> None:
         """Initialize Narration Engine."""
@@ -792,10 +800,29 @@ class GhostHandsOrchestrator:
         task: GhostTask,
         trigger_event: Any,
     ) -> bool:
-        """Execute a single action."""
+        """
+        Execute a single action with cross-space window targeting.
+
+        The trigger_event from N-Optic Nerve contains the exact window_id and space_id
+        where the trigger was detected. We pass this targeting data to the actuator
+        for surgical, cross-space action execution.
+        """
         try:
             action_type = action.action_type
             params = action.params
+
+            # Extract targeting data from the Vision Event (THE KEY INSIGHT!)
+            # This is what enables cross-space actions - we know exactly which window
+            window_id = getattr(trigger_event, 'window_id', None)
+            space_id = getattr(trigger_event, 'space_id', None)
+            app_name = getattr(trigger_event, 'app_name', None) or task.watch_app
+
+            # Log targeting info for debugging
+            if window_id:
+                logger.debug(
+                    f"[GHOST-HANDS] Action targeting: window={window_id}, "
+                    f"space={space_id}, app={app_name}"
+                )
 
             # Narration actions
             if action_type == GhostActionType.NARRATE_PERCEPTION:
@@ -836,12 +863,15 @@ class GhostHandsOrchestrator:
                 await asyncio.sleep(min(timeout, 5))
                 return True
 
-            # Actuator actions
+            # Actuator actions - NOW WITH CROSS-SPACE TARGETING!
+            # The window_id and space_id from trigger_event enable surgical actions
             elif action_type == GhostActionType.CLICK:
                 if not self._actuator:
                     return False
                 report = await self._actuator.click(
-                    app_name=task.watch_app,
+                    app_name=app_name,
+                    window_id=window_id,      # THE GOLDEN PATH: exact window targeting
+                    space_id=space_id,        # Space hint for faster routing
                     selector=params.get("selector"),
                     coordinates=params.get("coordinates"),
                 )
@@ -852,7 +882,9 @@ class GhostHandsOrchestrator:
                     return False
                 report = await self._actuator.type_text(
                     text=params.get("text", ""),
-                    app_name=task.watch_app,
+                    app_name=app_name,
+                    window_id=window_id,      # Cross-space typing
+                    space_id=space_id,
                     selector=params.get("selector"),
                 )
                 return report.result.name == "SUCCESS"
@@ -862,7 +894,9 @@ class GhostHandsOrchestrator:
                     return False
                 report = await self._actuator.press_key(
                     key=params.get("key", "return"),
-                    app_name=task.watch_app,
+                    app_name=app_name,
+                    window_id=window_id,      # Cross-space key press
+                    space_id=space_id,
                     modifiers=params.get("modifiers"),
                 )
                 return report.result.name == "SUCCESS"
@@ -872,7 +906,8 @@ class GhostHandsOrchestrator:
                     return False
                 report = await self._actuator.run_applescript(
                     script=params.get("script", ""),
-                    app_name=task.watch_app,
+                    app_name=app_name,
+                    window_id=window_id,      # Context for logging
                 )
                 return report.result.name == "SUCCESS"
 

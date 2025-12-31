@@ -957,6 +957,380 @@ class YabaiAwareActuator:
             "accessibility_available": self.accessibility._initialized,
         }
 
+    # =========================================================================
+    # Orchestrator Compatibility Layer
+    # =========================================================================
+    # These methods provide a unified interface that the GhostHandsOrchestrator
+    # expects, while leveraging cross-space capabilities when window_id is known.
+
+    async def click(
+        self,
+        app_name: Optional[str] = None,
+        window_id: Optional[int] = None,
+        space_id: Optional[int] = None,
+        selector: Optional[str] = None,
+        coordinates: Optional[Tuple[float, float]] = None,
+    ) -> CrossSpaceActionReport:
+        """
+        Smart click that routes to cross-space click when window_id is available.
+
+        This is the primary interface used by the Orchestrator.
+
+        Args:
+            app_name: Application name (fallback for window discovery)
+            window_id: Direct window ID (preferred - enables surgical cross-space click)
+            space_id: Space ID hint (used with window_id for faster routing)
+            selector: Element title/label to click
+            coordinates: Window-local (x, y) coordinates
+
+        Returns:
+            CrossSpaceActionReport with execution details
+        """
+        # Priority 1: Direct window targeting (THE GOLDEN PATH)
+        if window_id:
+            logger.debug(f"[COMPAT] Click via window_id={window_id}")
+            return await self.click_in_window(
+                window_id=window_id,
+                element_title=selector,
+                coordinates=coordinates,
+            )
+
+        # Priority 2: App name → discover window → click
+        if app_name:
+            logger.debug(f"[COMPAT] Click via app_name={app_name}, discovering window...")
+            windows = await self.find_windows(app_name)
+
+            if not windows:
+                return CrossSpaceActionReport(
+                    result=CrossSpaceActionResult.WINDOW_NOT_FOUND,
+                    window_id=0,
+                    target_space=0,
+                    backend_used="none",
+                    duration_ms=0,
+                    focus_preserved=True,
+                    error=f"No windows found for app '{app_name}'",
+                )
+
+            # If space_id hint is provided, prefer windows on that space
+            if space_id:
+                space_windows = [w for w in windows if w.space_id == space_id]
+                if space_windows:
+                    windows = space_windows
+
+            # Use first matching window
+            target = windows[0]
+            logger.debug(f"[COMPAT] Discovered window {target.window_id} on Space {target.space_id}")
+
+            return await self.click_in_window(
+                window_id=target.window_id,
+                element_title=selector,
+                coordinates=coordinates,
+            )
+
+        # No targeting info - fail gracefully
+        return CrossSpaceActionReport(
+            result=CrossSpaceActionResult.FAILED,
+            window_id=0,
+            target_space=0,
+            backend_used="none",
+            duration_ms=0,
+            focus_preserved=True,
+            error="No window_id or app_name provided",
+        )
+
+    async def type_text(
+        self,
+        text: str,
+        app_name: Optional[str] = None,
+        window_id: Optional[int] = None,
+        space_id: Optional[int] = None,
+        selector: Optional[str] = None,
+    ) -> CrossSpaceActionReport:
+        """
+        Smart type that routes to cross-space typing when window_id is available.
+
+        Args:
+            text: Text to type
+            app_name: Application name (fallback)
+            window_id: Direct window ID (preferred)
+            space_id: Space ID hint
+            selector: Element to focus before typing
+
+        Returns:
+            CrossSpaceActionReport with execution details
+        """
+        start_time = time.time()
+
+        # Resolve window_id if not provided
+        target_window_id = window_id
+        if not target_window_id and app_name:
+            windows = await self.find_windows(app_name)
+            if windows:
+                if space_id:
+                    space_windows = [w for w in windows if w.space_id == space_id]
+                    if space_windows:
+                        windows = space_windows
+                target_window_id = windows[0].window_id
+
+        if not target_window_id:
+            return CrossSpaceActionReport(
+                result=CrossSpaceActionResult.FAILED,
+                window_id=0,
+                target_space=0,
+                backend_used="none",
+                duration_ms=0,
+                focus_preserved=True,
+                error="Could not resolve target window for typing",
+            )
+
+        return await self.type_in_window(
+            window_id=target_window_id,
+            text=text,
+            element_title=selector,
+        )
+
+    async def press_key(
+        self,
+        key: str,
+        app_name: Optional[str] = None,
+        window_id: Optional[int] = None,
+        space_id: Optional[int] = None,
+        modifiers: Optional[List[str]] = None,
+    ) -> CrossSpaceActionReport:
+        """
+        Press a key in a specific window with optional modifiers.
+
+        Args:
+            key: Key name (return, escape, tab, etc.)
+            app_name: Application name (fallback)
+            window_id: Direct window ID (preferred)
+            space_id: Space ID hint
+            modifiers: Key modifiers (command, shift, option, control)
+
+        Returns:
+            CrossSpaceActionReport with execution details
+        """
+        start_time = time.time()
+        self._stats["total_actions"] += 1
+
+        # Resolve window
+        target_window_id = window_id
+        target_space = space_id or 0
+
+        if not target_window_id and app_name:
+            windows = await self.find_windows(app_name)
+            if windows:
+                if space_id:
+                    space_windows = [w for w in windows if w.space_id == space_id]
+                    if space_windows:
+                        windows = space_windows
+                target_window_id = windows[0].window_id
+                target_space = windows[0].space_id
+
+        if not target_window_id:
+            return CrossSpaceActionReport(
+                result=CrossSpaceActionResult.FAILED,
+                window_id=0,
+                target_space=0,
+                backend_used="none",
+                duration_ms=0,
+                focus_preserved=True,
+                error="Could not resolve target window for key press",
+            )
+
+        # Get window info
+        window = await self.yabai.get_window(target_window_id)
+        if not window:
+            return CrossSpaceActionReport(
+                result=CrossSpaceActionResult.WINDOW_NOT_FOUND,
+                window_id=target_window_id,
+                target_space=target_space,
+                backend_used="none",
+                duration_ms=0,
+                focus_preserved=True,
+                error=f"Window {target_window_id} not found",
+            )
+
+        # Execute via space switch fallback with CGEvent keyboard
+        if self.fallback:
+            async def key_action():
+                await self.yabai.focus_window(target_window_id)
+                await asyncio.sleep(0.05)
+
+                try:
+                    from Quartz import (
+                        CGEventCreateKeyboardEvent,
+                        CGEventPost,
+                        CGEventSetFlags,
+                        kCGHIDEventTap,
+                        kCGEventFlagMaskCommand,
+                        kCGEventFlagMaskShift,
+                        kCGEventFlagMaskAlternate,
+                        kCGEventFlagMaskControl,
+                    )
+
+                    # Get key code
+                    key_code = self._get_key_code(key)
+
+                    # Build modifier flags
+                    flags = 0
+                    if modifiers:
+                        mod_map = {
+                            "command": kCGEventFlagMaskCommand,
+                            "shift": kCGEventFlagMaskShift,
+                            "option": kCGEventFlagMaskAlternate,
+                            "control": kCGEventFlagMaskControl,
+                        }
+                        for mod in modifiers:
+                            if mod.lower() in mod_map:
+                                flags |= mod_map[mod.lower()]
+
+                    # Key down
+                    event_down = CGEventCreateKeyboardEvent(None, key_code, True)
+                    if flags:
+                        CGEventSetFlags(event_down, flags)
+                    CGEventPost(kCGHIDEventTap, event_down)
+
+                    await asyncio.sleep(0.03)
+
+                    # Key up
+                    event_up = CGEventCreateKeyboardEvent(None, key_code, False)
+                    if flags:
+                        CGEventSetFlags(event_up, flags)
+                    CGEventPost(kCGHIDEventTap, event_up)
+
+                    return True
+
+                except Exception as e:
+                    logger.error(f"[COMPAT] Key press failed: {e}")
+                    return False
+
+            success = await self.fallback.execute_on_space(window.space_id, key_action)
+
+            if success:
+                self._stats["successful_actions"] += 1
+                return CrossSpaceActionReport(
+                    result=CrossSpaceActionResult.SUCCESS,
+                    window_id=target_window_id,
+                    target_space=window.space_id,
+                    backend_used="space_switch_fallback",
+                    duration_ms=(time.time() - start_time) * 1000,
+                    focus_preserved=True,
+                )
+
+        self._stats["failed_actions"] += 1
+        return CrossSpaceActionReport(
+            result=CrossSpaceActionResult.FAILED,
+            window_id=target_window_id,
+            target_space=window.space_id,
+            backend_used="none",
+            duration_ms=(time.time() - start_time) * 1000,
+            focus_preserved=True,
+            error="Key press failed",
+        )
+
+    def _get_key_code(self, key: str) -> int:
+        """Get macOS virtual key code for a key name."""
+        key_codes = {
+            # Letters
+            "a": 0, "s": 1, "d": 2, "f": 3, "h": 4, "g": 5, "z": 6, "x": 7,
+            "c": 8, "v": 9, "b": 11, "q": 12, "w": 13, "e": 14, "r": 15,
+            "y": 16, "t": 17, "1": 18, "2": 19, "3": 20, "4": 21, "6": 22,
+            "5": 23, "=": 24, "9": 25, "7": 26, "-": 27, "8": 28, "0": 29,
+            "]": 30, "o": 31, "u": 32, "[": 33, "i": 34, "p": 35, "l": 37,
+            "j": 38, "'": 39, "k": 40, ";": 41, "\\": 42, ",": 43, "/": 44,
+            "n": 45, "m": 46, ".": 47,
+            # Special keys
+            "return": 36, "enter": 36, "tab": 48, "space": 49, " ": 49,
+            "delete": 51, "backspace": 51, "escape": 53, "esc": 53,
+            "command": 55, "shift": 56, "capslock": 57, "option": 58,
+            "control": 59, "rightshift": 60, "rightoption": 61,
+            "rightcontrol": 62, "function": 63, "fn": 63,
+            # Arrow keys
+            "left": 123, "right": 124, "down": 125, "up": 126,
+            # Function keys
+            "f1": 122, "f2": 120, "f3": 99, "f4": 118, "f5": 96, "f6": 97,
+            "f7": 98, "f8": 100, "f9": 101, "f10": 109, "f11": 103, "f12": 111,
+            # Misc
+            "home": 115, "end": 119, "pageup": 116, "pagedown": 121,
+            "help": 114, "forwarddelete": 117,
+        }
+        return key_codes.get(key.lower(), 36)  # Default to Return
+
+    async def run_applescript(
+        self,
+        script: str,
+        app_name: Optional[str] = None,
+        window_id: Optional[int] = None,
+    ) -> CrossSpaceActionReport:
+        """
+        Run an AppleScript, optionally targeted at a specific app.
+
+        Args:
+            script: AppleScript code to execute
+            app_name: Target application (for context)
+            window_id: Window ID (for context/logging)
+
+        Returns:
+            CrossSpaceActionReport with execution details
+        """
+        start_time = time.time()
+        self._stats["total_actions"] += 1
+
+        try:
+            result = await asyncio.create_subprocess_exec(
+                "osascript", "-e", script,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(result.communicate(), timeout=10.0)
+
+            if result.returncode == 0:
+                self._stats["successful_actions"] += 1
+                return CrossSpaceActionReport(
+                    result=CrossSpaceActionResult.SUCCESS,
+                    window_id=window_id or 0,
+                    target_space=0,
+                    backend_used="applescript",
+                    duration_ms=(time.time() - start_time) * 1000,
+                    focus_preserved=True,
+                    metadata={"output": stdout.decode()[:500]},
+                )
+            else:
+                self._stats["failed_actions"] += 1
+                return CrossSpaceActionReport(
+                    result=CrossSpaceActionResult.FAILED,
+                    window_id=window_id or 0,
+                    target_space=0,
+                    backend_used="applescript",
+                    duration_ms=(time.time() - start_time) * 1000,
+                    focus_preserved=True,
+                    error=stderr.decode()[:200],
+                )
+
+        except asyncio.TimeoutError:
+            self._stats["failed_actions"] += 1
+            return CrossSpaceActionReport(
+                result=CrossSpaceActionResult.TIMEOUT,
+                window_id=window_id or 0,
+                target_space=0,
+                backend_used="applescript",
+                duration_ms=(time.time() - start_time) * 1000,
+                focus_preserved=True,
+                error="AppleScript execution timed out",
+            )
+        except Exception as e:
+            self._stats["failed_actions"] += 1
+            return CrossSpaceActionReport(
+                result=CrossSpaceActionResult.FAILED,
+                window_id=window_id or 0,
+                target_space=0,
+                backend_used="applescript",
+                duration_ms=(time.time() - start_time) * 1000,
+                focus_preserved=True,
+                error=str(e),
+            )
+
 
 # =============================================================================
 # Convenience Functions
