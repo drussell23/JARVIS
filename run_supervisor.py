@@ -2505,23 +2505,61 @@ class SupervisorBootstrapper:
         try:
             # Step 1: Start loading server subprocess
             loading_server_script = Path(__file__).parent / "loading_server.py"
-            
+
             if not loading_server_script.exists():
                 self.logger.warning(f"Loading server script not found: {loading_server_script}")
                 print(f"  {TerminalUI.YELLOW}⚠️  Loading server not available - will skip browser{TerminalUI.RESET}")
                 return
-            
+
             self.logger.info(f"Starting loading server: {loading_server_script}")
-            
-            # Start as async subprocess
+
+            # Determine the best Python executable to use:
+            # 1. Prefer venv Python for correct dependencies
+            # 2. Fall back to sys.executable if venv not found
+            project_root = Path(__file__).parent
+            venv_python = project_root / "venv" / "bin" / "python3"
+            if not venv_python.exists():
+                venv_python = project_root / "venv" / "bin" / "python"
+
+            if venv_python.exists():
+                python_executable = str(venv_python)
+                self.logger.debug(f"Using venv Python: {python_executable}")
+            else:
+                python_executable = sys.executable
+                self.logger.warning(f"Venv not found, using system Python: {python_executable}")
+
+            # Set up environment with PYTHONPATH for proper imports
+            env = os.environ.copy()
+            pythonpath_parts = [
+                str(project_root),
+                str(project_root / "backend"),
+            ]
+            existing_pythonpath = env.get("PYTHONPATH", "")
+            if existing_pythonpath:
+                pythonpath_parts.append(existing_pythonpath)
+            env["PYTHONPATH"] = os.pathsep.join(pythonpath_parts)
+
+            # Create log file for loading server output (helps debugging)
+            logs_dir = project_root / "backend" / "logs"
+            logs_dir.mkdir(parents=True, exist_ok=True)
+            loading_server_log = logs_dir / f"loading_server_{time.strftime('%Y%m%d_%H%M%S')}.log"
+            self._loading_server_log_path = loading_server_log
+
+            # Open log file for subprocess output
+            log_file = open(loading_server_log, "w")
+            self._loading_server_log_file = log_file  # Keep reference for cleanup
+
+            # Start as async subprocess with proper environment
             self._loading_server_process = await asyncio.create_subprocess_exec(
-                sys.executable,
+                python_executable,
                 str(loading_server_script),
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
+                stdout=log_file,
+                stderr=asyncio.subprocess.STDOUT,  # Combine stderr into log
+                env=env,
             )
-            
+
             print(f"  {TerminalUI.GREEN}✓ Loading server started (PID {self._loading_server_process.pid}){TerminalUI.RESET}")
+            self.logger.debug(f"Loading server log: {loading_server_log}")
             
             # Step 2: Wait for server to be ready (intelligent adaptive health check)
             import aiohttp
@@ -2591,8 +2629,25 @@ class SupervisorBootstrapper:
                 # Check if process is still running
                 if self._loading_server_process.returncode is not None:
                     print(f"  {TerminalUI.RED}✗ Loading server exited unexpectedly (code: {self._loading_server_process.returncode}){TerminalUI.RESET}")
+                    # Show log file location and last few lines for debugging
+                    if hasattr(self, '_loading_server_log_path') and self._loading_server_log_path.exists():
+                        print(f"  {TerminalUI.YELLOW}📄 Log file: {self._loading_server_log_path}{TerminalUI.RESET}")
+                        try:
+                            # Flush and read log file
+                            if hasattr(self, '_loading_server_log_file'):
+                                self._loading_server_log_file.flush()
+                            with open(self._loading_server_log_path, 'r') as f:
+                                lines = f.readlines()
+                                if lines:
+                                    print(f"  {TerminalUI.YELLOW}Last log entries:{TerminalUI.RESET}")
+                                    for line in lines[-10:]:
+                                        print(f"    {line.rstrip()}")
+                        except Exception as log_err:
+                            self.logger.debug(f"Could not read log file: {log_err}")
                 else:
                     print(f"  {TerminalUI.YELLOW}⚠️  Loading server slow to respond - continuing (may still be starting){TerminalUI.RESET}")
+                    if hasattr(self, '_loading_server_log_path'):
+                        print(f"  {TerminalUI.CYAN}📄 Log file: {self._loading_server_log_path}{TerminalUI.RESET}")
             else:
                 print(f"  {TerminalUI.GREEN}✓ Loading server ready at {loading_url}{TerminalUI.RESET}")
             
@@ -2642,6 +2697,7 @@ class SupervisorBootstrapper:
         Falls back to signal-based shutdown if HTTP fails (for resilience).
         """
         if not self._loading_server_process:
+            self._cleanup_loading_server_log()  # Cleanup even if no process
             return
 
         loading_port = self.config.required_ports[2]  # 3001
@@ -2698,6 +2754,7 @@ class SupervisorBootstrapper:
                     # Check if process has exited
                     if self._loading_server_process.returncode is not None:
                         self.logger.info("Loading server gracefully terminated via HTTP")
+                        self._cleanup_loading_server_log()
                         return
 
                     # Check shutdown status
@@ -2725,6 +2782,7 @@ class SupervisorBootstrapper:
                         timeout=2.0
                     )
                     self.logger.info("Loading server gracefully terminated")
+                    self._cleanup_loading_server_log()
                     return
                 except asyncio.TimeoutError:
                     pass
@@ -2781,6 +2839,20 @@ class SupervisorBootstrapper:
             self.logger.debug("Loading server already exited")
         except Exception as e:
             self.logger.debug(f"Loading server cleanup error: {e}")
+        finally:
+            # Always cleanup log file handle
+            self._cleanup_loading_server_log()
+
+    def _cleanup_loading_server_log(self) -> None:
+        """Clean up loading server log file handle."""
+        if hasattr(self, '_loading_server_log_file') and self._loading_server_log_file:
+            try:
+                self._loading_server_log_file.close()
+                self.logger.debug("Loading server log file closed")
+            except Exception as e:
+                self.logger.debug(f"Error closing log file: {e}")
+            finally:
+                self._loading_server_log_file = None
 
     # ═══════════════════════════════════════════════════════════════════════════
     # BROWSER LOCK FILE - Prevents race conditions across all processes
