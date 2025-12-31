@@ -360,10 +360,16 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
         This creates a UX problem: the user says "Watch Chrome" but sees no visual
         confirmation that JARVIS is actually watching.
 
+        CRITICAL INSIGHT:
+        An empty AVCaptureSession WITHOUT input won't trigger the purple icon!
+        macOS is smart enough to know nothing is being captured. We MUST attach
+        a valid screen input to force the indicator to appear.
+
         SOLUTION:
-        Start a lightweight AVCaptureSession that triggers the purple indicator.
-        This is purely for visual feedback - the actual capture still uses
-        ScreenCaptureKit for performance.
+        1. Create AVCaptureSession with minimal preset
+        2. Attach AVCaptureScreenInput for the main display
+        3. Set extremely low framerate (1 FPS) to minimize resource usage
+        4. We only need the purple light, not the actual video frames
 
         Returns:
             True if indicator activated, False otherwise
@@ -376,44 +382,96 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
 
             loop = asyncio.get_event_loop()
 
-            def _start_indicator_session():
-                """Start AVCaptureSession in thread (may have blocking init)."""
+            def _start_indicator_session_with_input():
+                """
+                Start AVCaptureSession WITH screen input (required for purple light).
+
+                An empty session won't trigger the indicator - macOS optimizes it away.
+                We must attach actual screen capture input, but at minimal framerate.
+                """
                 try:
                     import AVFoundation
+                    from Quartz import CGMainDisplayID
+                    from CoreMedia import CMTimeMake
 
-                    # Create lightweight capture session (doesn't capture anything,
-                    # just triggers the macOS privacy indicator)
+                    # 1. Create Session with minimal preset
                     session = AVFoundation.AVCaptureSession.alloc().init()
 
-                    # Configure for minimal resource usage
+                    # Use low preset if available (reduces memory/CPU)
                     if hasattr(AVFoundation, 'AVCaptureSessionPresetLow'):
                         session.setSessionPreset_(AVFoundation.AVCaptureSessionPresetLow)
 
-                    # Start the session (this triggers the purple icon)
+                    # 2. Create Screen Input for main display
+                    # This is REQUIRED - without input, no purple light!
+                    display_id = CGMainDisplayID()
+                    screen_input = AVFoundation.AVCaptureScreenInput.alloc().initWithDisplayID_(display_id)
+
+                    if screen_input is None:
+                        logger.warning("Failed to create AVCaptureScreenInput")
+                        return None
+
+                    # 3. Configure for MINIMAL resource usage
+                    # We only want the purple light, not actual video capture
+                    # Set to 1 FPS (1 frame per second) - absolute minimum
+                    try:
+                        # CMTimeMake(value, timescale) = value/timescale seconds per frame
+                        # CMTimeMake(1, 1) = 1 second per frame = 1 FPS
+                        min_frame_duration = CMTimeMake(1, 1)
+                        screen_input.setMinFrameDuration_(min_frame_duration)
+                    except Exception as e:
+                        logger.debug(f"Could not set min frame duration: {e}")
+                        # Continue anyway - framerate is just an optimization
+
+                    # Disable cursor capture to reduce overhead
+                    try:
+                        screen_input.setCapturesCursor_(False)
+                    except Exception:
+                        pass  # Not critical
+
+                    # Disable mouse clicks capture
+                    try:
+                        screen_input.setCapturesMouseClicks_(False)
+                    except Exception:
+                        pass  # Not critical
+
+                    # 4. Add input to session (THIS triggers the purple light)
+                    if session.canAddInput_(screen_input):
+                        session.addInput_(screen_input)
+                    else:
+                        logger.warning("Cannot add screen input to indicator session")
+                        return None
+
+                    # 5. Start the session - purple light should appear NOW
                     session.startRunning()
 
-                    return session
-                except ImportError:
-                    logger.debug("AVFoundation not available for purple indicator")
+                    # Verify session is actually running
+                    if session.isRunning():
+                        return session
+                    else:
+                        logger.warning("Indicator session failed to start running")
+                        return None
+
+                except ImportError as e:
+                    logger.debug(f"AVFoundation/Quartz not available: {e}")
                     return None
                 except Exception as e:
                     logger.debug(f"Purple indicator session failed: {e}")
                     return None
 
             # Run in executor with timeout (AVFoundation init can be slow)
-            indicator_timeout = float(os.getenv('JARVIS_INDICATOR_TIMEOUT', '3.0'))
+            indicator_timeout = float(os.getenv('JARVIS_INDICATOR_TIMEOUT', '5.0'))
 
             try:
                 self._indicator_session = await asyncio.wait_for(
-                    loop.run_in_executor(None, _start_indicator_session),
+                    loop.run_in_executor(None, _start_indicator_session_with_input),
                     timeout=indicator_timeout
                 )
 
                 if self._indicator_session:
-                    logger.info("🟣 Purple Video Indicator ACTIVATED - Visual confirmation of monitoring")
+                    logger.info("🟣 Purple Video Indicator ACTIVATED - JARVIS is watching!")
                     return True
                 else:
-                    logger.debug("Purple indicator not available (AVFoundation may be missing)")
+                    logger.debug("Purple indicator not available (AVFoundation/permissions may be missing)")
                     return False
 
             except asyncio.TimeoutError:
