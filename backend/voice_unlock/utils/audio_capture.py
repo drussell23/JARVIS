@@ -560,16 +560,28 @@ class SoundDeviceBackend(AudioBackend):
             return False
 
     async def read_chunk(self) -> Optional[np.ndarray]:
-        """Read audio chunk from thread-safe queue."""
+        """Read audio chunk from thread-safe queue (non-blocking async)."""
         if not self._stream_callback_active:
             return None
 
         try:
-            # Use thread-safe queue with timeout
-            audio_data = self._audio_queue.get(timeout=0.5)
-            return audio_data
-        except queue.Empty:
-            return None
+            # First try non-blocking get
+            try:
+                audio_data = self._audio_queue.get_nowait()
+                return audio_data
+            except queue.Empty:
+                pass
+
+            # If queue is empty, wait a bit and try again
+            # Use a short sleep to yield to event loop
+            await asyncio.sleep(0.01)
+
+            try:
+                audio_data = self._audio_queue.get_nowait()
+                return audio_data
+            except queue.Empty:
+                return None
+
         except Exception as e:
             logger.error(f"Error reading audio chunk: {e}")
             return None
