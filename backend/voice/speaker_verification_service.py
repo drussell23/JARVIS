@@ -270,8 +270,11 @@ def is_chromadb_available() -> bool:
     return _CHROMADB_AVAILABLE
 
 
-# Backwards compatibility aliases
-CHROMADB_AVAILABLE = property(lambda self: is_chromadb_available())
+# Backwards compatibility: CHROMADB_AVAILABLE as a callable check
+# Note: Use is_chromadb_available() function instead for new code
+def get_chromadb_available() -> bool:
+    """Backwards compatible check for ChromaDB availability."""
+    return is_chromadb_available()
 
 # ============================================================================
 # LAZY LOADING: Langfuse and LangGraph
@@ -656,7 +659,8 @@ class VoicePatternStore:
 
     async def initialize(self):
         """Initialize ChromaDB client and collection."""
-        if not CHROMADB_AVAILABLE:
+        # Use the lazy-loading function to check and import chromadb
+        if not is_chromadb_available():
             self.logger.warning("ChromaDB not available - pattern store disabled")
             return
 
@@ -665,9 +669,10 @@ class VoicePatternStore:
             import os
             os.makedirs(self.persist_directory, exist_ok=True)
 
-            self._client = chromadb.PersistentClient(
+            # Use the lazy-loaded _chromadb module
+            self._client = _chromadb.PersistentClient(
                 path=self.persist_directory,
-                settings=chromadb.Settings(anonymized_telemetry=False)
+                settings=_chromadb.Settings(anonymized_telemetry=False)
             )
 
             self._collection = self._client.get_or_create_collection(
