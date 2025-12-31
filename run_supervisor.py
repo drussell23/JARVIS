@@ -5631,6 +5631,10 @@ class SupervisorBootstrapper:
                     pending = [t for t in self.topics.values() if not t.scraped]
                     return sorted(pending, key=lambda t: -t.priority)[:limit]
 
+                def get_pending_goals(self, limit: int = 10) -> List[DiscoveredTopic]:
+                    """Alias for get_pending_topics for backward compatibility."""
+                    return self.get_pending_topics(limit)
+
                 def get_all_topics(self) -> List[DiscoveredTopic]:
                     """Get all topics sorted by priority."""
                     return sorted(self.topics.values(), key=lambda t: -t.priority)

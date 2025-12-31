@@ -565,14 +565,19 @@ class NeuralMeshCoordinator:
                 "training_events": MessageType.BROADCAST,
                 "agent_events": MessageType.NOTIFICATION,
                 "system_events": MessageType.BROADCAST,
+                "context_sync": MessageType.BROADCAST,
+                "state_sync": MessageType.BROADCAST,
+                "model_updates": MessageType.BROADCAST,
             }
 
             message_type = topic_map.get(topic, MessageType.BROADCAST)
 
             # Subscribe via the bus
+            # Bus.subscribe expects: agent_name, message_type, callback
+            agent_name = subscriber_id or f"external_{topic}"
             await self._bus.subscribe(
-                subscriber_id=subscriber_id or f"external_{topic}",
-                message_types=[message_type],
+                agent_name=agent_name,
+                message_type=message_type,
                 callback=callback,
             )
 

@@ -60,6 +60,70 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================================
+# SQLITE ROW HELPER FUNCTIONS
+# ============================================================================
+# sqlite3.Row objects don't have .get() method like dicts, so we need helpers
+# ============================================================================
+
+def _row_to_dict(row) -> Dict[str, Any]:
+    """
+    Convert a sqlite3.Row or aiosqlite.Row to a dictionary.
+
+    This enables .get() access with default values, which sqlite3.Row doesn't support.
+    Works with any row-like object that has keys() method.
+
+    Args:
+        row: sqlite3.Row, aiosqlite.Row, or dict-like object
+
+    Returns:
+        Dictionary with all row values
+    """
+    if row is None:
+        return {}
+    if isinstance(row, dict):
+        return row
+    # Handle sqlite3.Row and aiosqlite.Row
+    try:
+        if hasattr(row, 'keys'):
+            return {key: row[key] for key in row.keys()}
+        # Fallback for tuple-like rows (shouldn't happen with row_factory)
+        return dict(row)
+    except Exception as e:
+        logger.warning(f"Could not convert row to dict: {e}")
+        return {}
+
+
+def _safe_get(row, key: str, default: Any = None) -> Any:
+    """
+    Safely get a value from a sqlite3.Row or dict with a default.
+
+    This is a robust replacement for row.get() which doesn't exist on sqlite3.Row.
+
+    Args:
+        row: sqlite3.Row, dict, or any object with key access
+        key: The key to retrieve
+        default: Default value if key doesn't exist or access fails
+
+    Returns:
+        The value at key, or default if not found
+    """
+    if row is None:
+        return default
+    try:
+        # Try dict-like .get() first (works for dicts)
+        if hasattr(row, 'get'):
+            return row.get(key, default)
+        # Try direct key access (works for sqlite3.Row)
+        if hasattr(row, 'keys') and key in row.keys():
+            value = row[key]
+            return value if value is not None else default
+        # Direct index access
+        return row[key] if row[key] is not None else default
+    except (KeyError, IndexError, TypeError):
+        return default
+
+
+# ============================================================================
 # DATABASE WRAPPER CLASSES
 # ============================================================================
 # These classes provide a robust, async, dynamic abstraction layer that makes
@@ -6255,20 +6319,22 @@ class JARVISLearningDatabase:
                     )
 
                 profiles = []
-                for row in rows:
+                for raw_row in rows:
+                    # Convert sqlite3.Row to dict for .get() support
+                    row = _row_to_dict(raw_row)
                     profile = {
-                        "speaker_id": row["speaker_id"],
-                        "speaker_name": row["speaker_name"],
-                        "voiceprint_embedding": row["voiceprint_embedding"],
-                        "total_samples": row["total_samples"],
-                        "average_pitch_hz": row["average_pitch_hz"],
-                        "recognition_confidence": row["recognition_confidence"],
-                        "is_primary_user": bool(row["is_primary_user"]),
-                        "security_level": row["security_level"] or "standard",
-                        "created_at": row["created_at"],
-                        "last_updated": row["last_updated"],
+                        "speaker_id": row.get("speaker_id"),
+                        "speaker_name": row.get("speaker_name"),
+                        "voiceprint_embedding": row.get("voiceprint_embedding"),
+                        "total_samples": row.get("total_samples"),
+                        "average_pitch_hz": row.get("average_pitch_hz"),
+                        "recognition_confidence": row.get("recognition_confidence"),
+                        "is_primary_user": bool(row.get("is_primary_user", False)),
+                        "security_level": row.get("security_level") or "standard",
+                        "created_at": row.get("created_at"),
+                        "last_updated": row.get("last_updated"),
                         "embedding_dimension": row.get("embedding_dimension"),
-                        "updated_at": row["last_updated"],  # Map last_updated to updated_at for compatibility
+                        "updated_at": row.get("last_updated"),  # Map last_updated to updated_at for compatibility
                         "enrollment_quality_score": row.get("enrollment_quality_score"),
                         "feature_extraction_version": row.get("feature_extraction_version"),
 
