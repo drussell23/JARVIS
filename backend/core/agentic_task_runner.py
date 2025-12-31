@@ -660,23 +660,50 @@ class AgenticTaskRunner:
                     self.logger.warning(f"[AgenticRunner] ✗ Direct Connector: {e}")
 
             # Initialize UAE (optional) - connects to intelligence.uae_integration
+            # Uses lazy initialization pattern: if UAE not yet initialized, initialize it now
             if self._availability.get("uae") and self.config.uae_enabled:
                 try:
                     # Try the new intelligence module path first
-                    from intelligence.uae_integration import get_uae, get_enhanced_uae
-                    self._uae = get_uae()
+                    from intelligence.uae_integration import (
+                        get_uae,
+                        get_enhanced_uae,
+                        initialize_uae,
+                        is_uae_initialized,  # Proper check function (not private variable)
+                    )
+
+                    # Lazy initialization: if UAE hasn't been initialized yet, do it now
+                    # This ensures UAE is available regardless of startup order
+                    if not is_uae_initialized():
+                        self.logger.info("[AgenticRunner] UAE not yet initialized - performing lazy initialization...")
+                        try:
+                            await initialize_uae(
+                                vision_analyzer=None,  # Will be connected later if needed
+                                sai_monitoring_interval=5.0,
+                                enable_auto_start=True,
+                                enable_learning_db=True,
+                                enable_yabai=True,
+                                enable_proactive_intelligence=False,  # Don't start proactive in lazy mode
+                                enable_chain_of_thought=True,
+                                enable_unified_orchestrator=True,
+                            )
+                            self.logger.info("[AgenticRunner] ✓ UAE lazy initialization complete")
+                        except Exception as init_err:
+                            self.logger.warning(f"[AgenticRunner] UAE lazy initialization failed: {init_err}")
+
+                    # Now get the initialized UAE instances (silent=True to avoid redundant warnings)
+                    self._uae = get_uae(silent=True)
                     if self._uae and not self._uae.is_active:
                         await self._uae.start()
 
                     # Also get enhanced UAE for chain-of-thought reasoning
-                    self._enhanced_uae = get_enhanced_uae()
+                    self._enhanced_uae = get_enhanced_uae(silent=True)
 
                     if self._uae:
                         self.logger.info("[AgenticRunner] ✓ UAE (screen awareness)")
                         if self._enhanced_uae:
                             self.logger.info("[AgenticRunner] ✓ Enhanced UAE (chain-of-thought)")
                     else:
-                        self.logger.warning("[AgenticRunner] UAE not initialized by supervisor")
+                        self.logger.debug("[AgenticRunner] UAE initialization returned None")
                 except ImportError:
                     # Fallback to legacy path
                     try:

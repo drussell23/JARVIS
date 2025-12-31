@@ -407,30 +407,61 @@ async def initialize_uae(
         raise
 
 
-def get_uae() -> Optional[UnifiedAwarenessEngine]:
+def is_uae_initialized() -> bool:
+    """
+    Check if UAE has been initialized.
+
+    This function allows callers to check initialization state before
+    calling get_uae() to avoid warning logs during lazy initialization.
+
+    Returns:
+        True if UAE has been initialized, False otherwise
+    """
+    return _uae_initialized and _uae_instance is not None
+
+
+def is_enhanced_uae_initialized() -> bool:
+    """
+    Check if EnhancedUAE has been initialized.
+
+    Returns:
+        True if EnhancedUAE has been initialized, False otherwise
+    """
+    return _enhanced_uae_instance is not None
+
+
+def get_uae(silent: bool = False) -> Optional[UnifiedAwarenessEngine]:
     """
     Get global UAE instance
+
+    Args:
+        silent: If True, don't log warnings if not initialized (for lazy init checks)
 
     Returns:
         UAE instance or None if not initialized
     """
     if not _uae_initialized or _uae_instance is None:
-        logger.warning("[UAE] UAE not initialized - call initialize_uae() first")
+        if not silent:
+            logger.warning("[UAE] UAE not initialized - call initialize_uae() first")
         return None
 
     return _uae_instance
 
 
-def get_enhanced_uae():
+def get_enhanced_uae(silent: bool = False):
     """
     Get global EnhancedUAE instance with chain-of-thought reasoning.
+
+    Args:
+        silent: If True, don't log warnings if not initialized (for lazy init checks)
 
     Returns:
         EnhancedUAE instance or None if not initialized
     """
     global _enhanced_uae_instance
     if _enhanced_uae_instance is None:
-        logger.warning("[UAE] EnhancedUAE not initialized - call initialize_uae(enable_chain_of_thought=True)")
+        if not silent:
+            logger.warning("[UAE] EnhancedUAE not initialized - call initialize_uae(enable_chain_of_thought=True)")
         return None
     return _enhanced_uae_instance
 
