@@ -1087,6 +1087,12 @@ const JarvisVoice = () => {
       connectWebSocket();
 
       await checkJarvisStatus();
+
+      // v2.0: Reset permission manager denial state on mount to ensure clean slate
+      // This prevents stale denial state from blocking permission requests
+      console.log('🎤 Resetting microphone permission manager state...');
+      microphonePermissionManager.resetDenialState();
+
       await checkMicrophonePermission();
       await initializeWakeWordService();
     };

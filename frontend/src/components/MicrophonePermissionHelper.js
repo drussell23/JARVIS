@@ -1,5 +1,6 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import './MicrophonePermissionHelper.css';
+import microphonePermissionManager from '../services/MicrophonePermissionManager';
 
 const MicrophonePermissionHelper = ({ onPermissionGranted }) => {
   const [permissionStatus, setPermissionStatus] = useState('checking');
@@ -10,6 +11,16 @@ const MicrophonePermissionHelper = ({ onPermissionGranted }) => {
     checkMicrophonePermission();
     detectBrowser();
   }, []);
+
+  // v2.0: Call onPermissionGranted when permission status changes to 'granted'
+  // This ensures the parent component is notified even when permission was
+  // already granted before the component mounted
+  useEffect(() => {
+    if (permissionStatus === 'granted' && onPermissionGranted) {
+      console.log('[MicrophonePermissionHelper] Permission already granted, notifying parent');
+      onPermissionGranted();
+    }
+  }, [permissionStatus, onPermissionGranted]);
 
   const detectBrowser = () => {
     const userAgent = navigator.userAgent;
@@ -62,22 +73,85 @@ const MicrophonePermissionHelper = ({ onPermissionGranted }) => {
     }
   };
 
-  const requestMicrophoneAccess = async () => {
+  const requestMicrophoneAccess = useCallback(async () => {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      stream.getTracks().forEach(track => track.stop());
-      setPermissionStatus('granted');
-      onPermissionGranted && onPermissionGranted();
+      console.log('[MicrophonePermissionHelper] User clicked Grant Access - requesting microphone permission');
+
+      // v2.0: Reset manager's denial state when user explicitly requests permission
+      // This allows retry even if manager thinks permission was denied
+      microphonePermissionManager.resetDenialState();
+
+      // Try through the unified permission manager first for proper state tracking
+      const result = await microphonePermissionManager.requestPermission('MicrophonePermissionHelper', {
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        }
+      });
+
+      if (result.success) {
+        // Clean up the stream (manager returns it)
+        if (result.stream) {
+          result.stream.getTracks().forEach(track => track.stop());
+        }
+        console.log('[MicrophonePermissionHelper] Permission granted via manager');
+        setPermissionStatus('granted');
+        onPermissionGranted && onPermissionGranted();
+        return;
+      }
+
+      // If manager blocked due to denial state, try direct getUserMedia as fallback
+      if (result.error === 'permission_denied') {
+        console.log('[MicrophonePermissionHelper] Manager blocked request, trying direct getUserMedia');
+
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+              echoCancellation: true,
+              noiseSuppression: true,
+              autoGainControl: true,
+            }
+          });
+          stream.getTracks().forEach(track => track.stop());
+
+          console.log('[MicrophonePermissionHelper] Direct getUserMedia succeeded');
+          setPermissionStatus('granted');
+          onPermissionGranted && onPermissionGranted();
+          return;
+        } catch (directError) {
+          // Fall through to error handling
+          console.warn('[MicrophonePermissionHelper] Direct getUserMedia failed:', directError);
+          throw directError;
+        }
+      }
+
+      // Handle other manager errors
+      if (result.error === 'no_device') {
+        setPermissionStatus('no-device');
+      } else if (result.error === 'device_busy') {
+        setPermissionStatus('error');
+        console.warn('[MicrophonePermissionHelper] Microphone is busy:', result.reason);
+      } else {
+        setPermissionStatus('error');
+      }
+
     } catch (error) {
+      console.error('[MicrophonePermissionHelper] Permission request error:', error);
+
       if (error.name === 'NotAllowedError' || error.name === 'PermissionDeniedError') {
         setPermissionStatus('denied');
+        microphonePermissionManager.markAsDenied('user_denied_via_helper');
       } else if (error.name === 'NotFoundError') {
         setPermissionStatus('no-device');
+      } else if (error.name === 'NotReadableError' || error.name === 'TrackStartError') {
+        setPermissionStatus('error');
+        console.warn('[MicrophonePermissionHelper] Microphone is in use by another application');
       } else {
         setPermissionStatus('error');
       }
     }
-  };
+  }, [onPermissionGranted]);
 
   const getBrowserInstructions = () => {
     switch (browserInfo) {

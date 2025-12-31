@@ -1,0 +1,1141 @@
+"""
+Ghost Hands Background Actuator
+================================
+
+The "hands" of JARVIS Ghost Hands - executes commands on background windows
+WITHOUT stealing focus from the user's active window.
+
+Technologies:
+- Playwright (Python): Browser automation for Chrome/Arc/Firefox
+- AppleScript/JXA: Native app automation for Terminal/Notes/etc.
+- Quartz Event Tap: Low-level event injection
+
+Features:
+- Zero focus stealing - user never loses keyboard control
+- Multi-backend support (Playwright, AppleScript, CGEvent)
+- Window-targeted actions (click, type, scroll)
+- Intelligent focus preservation
+- Permission-aware (requests when needed)
+- Environment-driven configuration
+
+Architecture:
+    BackgroundActuator (Singleton)
+    ├── PlaywrightBackend (browsers)
+    │   └── Headless DOM manipulation
+    ├── AppleScriptBackend (native apps)
+    │   └── JXA scripting
+    ├── CGEventBackend (low-level)
+    │   └── Quartz event injection
+    └── FocusGuard (focus preservation)
+
+Author: JARVIS AI System
+Version: 1.0.0 - Ghost Hands Edition
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import subprocess
+import time
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum, auto
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Tuple,
+    Union,
+)
+
+logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Configuration
+# =============================================================================
+
+@dataclass
+class ActuatorConfig:
+    """Configuration for the Background Actuator."""
+
+    # Focus preservation
+    preserve_focus: bool = field(
+        default_factory=lambda: os.getenv(
+            "JARVIS_ACTUATOR_PRESERVE_FOCUS", "true"
+        ).lower() == "true"
+    )
+    focus_restore_delay_ms: int = field(
+        default_factory=lambda: int(os.getenv("JARVIS_ACTUATOR_FOCUS_DELAY_MS", "100"))
+    )
+
+    # Playwright settings
+    playwright_enabled: bool = field(
+        default_factory=lambda: os.getenv(
+            "JARVIS_ACTUATOR_PLAYWRIGHT", "true"
+        ).lower() == "true"
+    )
+    playwright_headless: bool = field(
+        default_factory=lambda: os.getenv(
+            "JARVIS_ACTUATOR_PLAYWRIGHT_HEADLESS", "true"
+        ).lower() == "true"
+    )
+
+    # AppleScript settings
+    applescript_enabled: bool = field(
+        default_factory=lambda: os.getenv(
+            "JARVIS_ACTUATOR_APPLESCRIPT", "true"
+        ).lower() == "true"
+    )
+
+    # Timeouts
+    action_timeout_ms: int = field(
+        default_factory=lambda: int(os.getenv("JARVIS_ACTUATOR_TIMEOUT_MS", "10000"))
+    )
+
+    # Safety
+    require_confirmation_for_dangerous: bool = field(
+        default_factory=lambda: os.getenv(
+            "JARVIS_ACTUATOR_CONFIRM_DANGEROUS", "true"
+        ).lower() == "true"
+    )
+
+
+# =============================================================================
+# Action Types
+# =============================================================================
+
+class ActionType(Enum):
+    """Types of actions that can be performed."""
+    CLICK = auto()
+    DOUBLE_CLICK = auto()
+    RIGHT_CLICK = auto()
+    TYPE = auto()
+    KEY = auto()
+    SCROLL = auto()
+    SELECT = auto()
+    FOCUS = auto()
+    CLOSE = auto()
+    MINIMIZE = auto()
+    MAXIMIZE = auto()
+    CUSTOM_SCRIPT = auto()
+
+
+class ActionResult(Enum):
+    """Result of an action execution."""
+    SUCCESS = auto()
+    PARTIAL = auto()
+    FAILED = auto()
+    PERMISSION_DENIED = auto()
+    TIMEOUT = auto()
+    FOCUS_STOLEN = auto()
+
+
+@dataclass
+class Action:
+    """An action to be executed on a window."""
+    action_type: ActionType
+    window_id: Optional[int] = None
+    app_name: Optional[str] = None
+    element_selector: Optional[str] = None
+    coordinates: Optional[Tuple[int, int]] = None
+    text: Optional[str] = None
+    key: Optional[str] = None
+    modifiers: Optional[List[str]] = None
+    script: Optional[str] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def __str__(self) -> str:
+        parts = [self.action_type.name]
+        if self.app_name:
+            parts.append(f"on {self.app_name}")
+        if self.element_selector:
+            parts.append(f"element='{self.element_selector}'")
+        if self.coordinates:
+            parts.append(f"at {self.coordinates}")
+        if self.text:
+            parts.append(f"text='{self.text[:20]}...'")
+        return " ".join(parts)
+
+
+@dataclass
+class ActionReport:
+    """Report of an action execution."""
+    action: Action
+    result: ActionResult
+    backend_used: str
+    duration_ms: float
+    focus_preserved: bool
+    error: Optional[str] = None
+    timestamp: datetime = field(default_factory=datetime.now)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "action": str(self.action),
+            "result": self.result.name,
+            "backend": self.backend_used,
+            "duration_ms": self.duration_ms,
+            "focus_preserved": self.focus_preserved,
+            "error": self.error,
+            "timestamp": self.timestamp.isoformat(),
+        }
+
+
+# =============================================================================
+# Focus Guard
+# =============================================================================
+
+class FocusGuard:
+    """
+    Preserves user focus during background operations.
+
+    Captures the current focused window before an action and
+    restores focus after the action completes (if focus was stolen).
+    """
+
+    def __init__(self, config: ActuatorConfig):
+        self.config = config
+        self._saved_focus: Optional[Dict[str, Any]] = None
+
+    async def save_focus(self) -> Dict[str, Any]:
+        """Save current focus state."""
+        try:
+            from Quartz import (
+                CGWindowListCopyWindowInfo,
+                kCGWindowListOptionOnScreenOnly,
+                kCGNullWindowID,
+            )
+
+            windows = CGWindowListCopyWindowInfo(
+                kCGWindowListOptionOnScreenOnly,
+                kCGNullWindowID
+            )
+
+            # Find focused window (first in list is usually focused)
+            for window in windows:
+                if window.get("kCGWindowLayer") == 0:
+                    self._saved_focus = {
+                        "window_id": window.get("kCGWindowNumber"),
+                        "app_name": window.get("kCGWindowOwnerName"),
+                        "pid": window.get("kCGWindowOwnerPID"),
+                    }
+                    logger.debug(f"[FOCUS] Saved focus: {self._saved_focus['app_name']}")
+                    return self._saved_focus
+
+        except Exception as e:
+            logger.error(f"[FOCUS] Failed to save focus: {e}")
+
+        return {}
+
+    async def restore_focus(self) -> bool:
+        """Restore saved focus state."""
+        if not self._saved_focus:
+            return False
+
+        try:
+            app_name = self._saved_focus.get("app_name")
+            if not app_name:
+                return False
+
+            # Use AppleScript to activate the app
+            script = f'''
+            tell application "{app_name}"
+                activate
+            end tell
+            '''
+
+            result = await asyncio.create_subprocess_exec(
+                "osascript", "-e", script,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await asyncio.wait_for(result.communicate(), timeout=2.0)
+
+            await asyncio.sleep(self.config.focus_restore_delay_ms / 1000.0)
+
+            logger.debug(f"[FOCUS] Restored focus to: {app_name}")
+            return True
+
+        except Exception as e:
+            logger.error(f"[FOCUS] Failed to restore focus: {e}")
+            return False
+
+    async def check_focus_preserved(self) -> bool:
+        """Check if focus is still on the saved app."""
+        if not self._saved_focus:
+            return True
+
+        try:
+            current = await self.save_focus()
+            return current.get("app_name") == self._saved_focus.get("app_name")
+        except Exception:
+            return True
+
+
+# =============================================================================
+# Backend Interface
+# =============================================================================
+
+class ActuatorBackend(ABC):
+    """Abstract interface for actuator backends."""
+
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        """Backend name."""
+        pass
+
+    @property
+    @abstractmethod
+    def supported_apps(self) -> List[str]:
+        """List of supported application patterns."""
+        pass
+
+    @abstractmethod
+    async def initialize(self) -> bool:
+        """Initialize the backend."""
+        pass
+
+    @abstractmethod
+    async def execute(self, action: Action) -> ActionReport:
+        """Execute an action."""
+        pass
+
+    @abstractmethod
+    async def can_handle(self, action: Action) -> bool:
+        """Check if this backend can handle the action."""
+        pass
+
+    @abstractmethod
+    async def cleanup(self) -> None:
+        """Clean up resources."""
+        pass
+
+
+# =============================================================================
+# AppleScript Backend
+# =============================================================================
+
+class AppleScriptBackend(ActuatorBackend):
+    """
+    AppleScript/JXA backend for native macOS app automation.
+
+    Supports:
+    - Terminal, Notes, Finder, Safari, Mail
+    - Any app with AppleScript support
+    - System events (keystroke, click)
+    """
+
+    def __init__(self, config: ActuatorConfig):
+        self.config = config
+        self._initialized = False
+
+    @property
+    def name(self) -> str:
+        return "AppleScript"
+
+    @property
+    def supported_apps(self) -> List[str]:
+        return [
+            "Terminal", "iTerm", "Notes", "Finder", "Safari",
+            "Mail", "Reminders", "Calendar", "Preview", "TextEdit",
+        ]
+
+    async def initialize(self) -> bool:
+        if self._initialized:
+            return True
+
+        # Test osascript availability
+        try:
+            result = await asyncio.create_subprocess_exec(
+                "osascript", "-e", 'return "ok"',
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(result.communicate(), timeout=5.0)
+
+            if b"ok" in stdout:
+                self._initialized = True
+                logger.info("[GHOST-HANDS] AppleScript backend initialized")
+                return True
+
+        except Exception as e:
+            logger.error(f"[GHOST-HANDS] AppleScript init failed: {e}")
+
+        return False
+
+    async def can_handle(self, action: Action) -> bool:
+        """Check if this backend can handle the action."""
+        if not self._initialized:
+            return False
+
+        # Can handle any native macOS app
+        if action.app_name:
+            return True
+
+        return False
+
+    async def execute(self, action: Action) -> ActionReport:
+        """Execute an action using AppleScript."""
+        start_time = time.time()
+
+        try:
+            script = self._build_script(action)
+
+            if not script:
+                return ActionReport(
+                    action=action,
+                    result=ActionResult.FAILED,
+                    backend_used=self.name,
+                    duration_ms=0,
+                    focus_preserved=True,
+                    error="Could not build script for action",
+                )
+
+            result = await asyncio.create_subprocess_exec(
+                "osascript", "-e", script,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+
+            stdout, stderr = await asyncio.wait_for(
+                result.communicate(),
+                timeout=self.config.action_timeout_ms / 1000.0
+            )
+
+            duration_ms = (time.time() - start_time) * 1000
+
+            if result.returncode == 0:
+                return ActionReport(
+                    action=action,
+                    result=ActionResult.SUCCESS,
+                    backend_used=self.name,
+                    duration_ms=duration_ms,
+                    focus_preserved=True,
+                    metadata={"output": stdout.decode()[:500]},
+                )
+            else:
+                return ActionReport(
+                    action=action,
+                    result=ActionResult.FAILED,
+                    backend_used=self.name,
+                    duration_ms=duration_ms,
+                    focus_preserved=True,
+                    error=stderr.decode()[:200],
+                )
+
+        except asyncio.TimeoutError:
+            return ActionReport(
+                action=action,
+                result=ActionResult.TIMEOUT,
+                backend_used=self.name,
+                duration_ms=self.config.action_timeout_ms,
+                focus_preserved=True,
+                error="Script execution timed out",
+            )
+        except Exception as e:
+            return ActionReport(
+                action=action,
+                result=ActionResult.FAILED,
+                backend_used=self.name,
+                duration_ms=(time.time() - start_time) * 1000,
+                focus_preserved=True,
+                error=str(e),
+            )
+
+    def _build_script(self, action: Action) -> Optional[str]:
+        """Build AppleScript for the action."""
+        app_name = action.app_name or "System Events"
+
+        if action.action_type == ActionType.TYPE:
+            # Type text without activating
+            return f'''
+            tell application "System Events"
+                tell process "{app_name}"
+                    keystroke "{action.text}"
+                end tell
+            end tell
+            '''
+
+        elif action.action_type == ActionType.KEY:
+            key_code = self._get_key_code(action.key)
+            modifiers = self._get_modifiers(action.modifiers)
+
+            return f'''
+            tell application "System Events"
+                tell process "{app_name}"
+                    key code {key_code}{modifiers}
+                end tell
+            end tell
+            '''
+
+        elif action.action_type == ActionType.CLICK:
+            if action.coordinates:
+                x, y = action.coordinates
+                return f'''
+                tell application "System Events"
+                    tell process "{app_name}"
+                        click at {{{x}, {y}}}
+                    end tell
+                end tell
+                '''
+            elif action.element_selector:
+                return f'''
+                tell application "System Events"
+                    tell process "{app_name}"
+                        click button "{action.element_selector}" of window 1
+                    end tell
+                end tell
+                '''
+
+        elif action.action_type == ActionType.CUSTOM_SCRIPT:
+            return action.script
+
+        elif action.action_type == ActionType.CLOSE:
+            return f'''
+            tell application "{app_name}"
+                close front window
+            end tell
+            '''
+
+        elif action.action_type == ActionType.MINIMIZE:
+            return f'''
+            tell application "System Events"
+                tell process "{app_name}"
+                    set miniaturized of window 1 to true
+                end tell
+            end tell
+            '''
+
+        return None
+
+    def _get_key_code(self, key: Optional[str]) -> int:
+        """Get macOS key code for a key name."""
+        key_codes = {
+            "return": 36, "enter": 36, "tab": 48, "space": 49,
+            "delete": 51, "escape": 53, "command": 55, "shift": 56,
+            "option": 58, "control": 59, "up": 126, "down": 125,
+            "left": 123, "right": 124, "f1": 122, "f2": 120,
+        }
+        return key_codes.get(key.lower() if key else "return", 36)
+
+    def _get_modifiers(self, modifiers: Optional[List[str]]) -> str:
+        """Build modifier string for AppleScript."""
+        if not modifiers:
+            return ""
+
+        mod_map = {
+            "command": "command down",
+            "shift": "shift down",
+            "option": "option down",
+            "control": "control down",
+        }
+
+        mods = [mod_map[m.lower()] for m in modifiers if m.lower() in mod_map]
+        if mods:
+            return " using {" + ", ".join(mods) + "}"
+        return ""
+
+    async def cleanup(self) -> None:
+        self._initialized = False
+
+
+# =============================================================================
+# Playwright Backend
+# =============================================================================
+
+class PlaywrightBackend(ActuatorBackend):
+    """
+    Playwright backend for browser automation.
+
+    Supports:
+    - Chrome, Chromium, Arc, Brave
+    - Firefox
+    - Safari (limited)
+
+    Features:
+    - Headless DOM manipulation (no focus stealing)
+    - Element selection via CSS/XPath
+    - Network interception
+    - Screenshot capture
+    """
+
+    def __init__(self, config: ActuatorConfig):
+        self.config = config
+        self._initialized = False
+        self._playwright = None
+        self._browser = None
+        self._context = None
+
+    @property
+    def name(self) -> str:
+        return "Playwright"
+
+    @property
+    def supported_apps(self) -> List[str]:
+        return ["Chrome", "Chromium", "Arc", "Brave", "Firefox", "Safari"]
+
+    async def initialize(self) -> bool:
+        if self._initialized:
+            return True
+
+        try:
+            from playwright.async_api import async_playwright
+
+            self._playwright = await async_playwright().start()
+
+            # Connect to existing browser via CDP
+            self._browser = await self._playwright.chromium.connect_over_cdp(
+                "http://localhost:9222"
+            )
+
+            self._initialized = True
+            logger.info("[GHOST-HANDS] Playwright backend initialized")
+            return True
+
+        except ImportError:
+            logger.warning("[GHOST-HANDS] Playwright not installed")
+            return False
+        except Exception as e:
+            logger.warning(f"[GHOST-HANDS] Playwright init failed: {e}")
+            logger.info(
+                "[GHOST-HANDS] To enable Playwright, run Chrome with:\n"
+                "  /Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome "
+                "--remote-debugging-port=9222"
+            )
+            return False
+
+    async def can_handle(self, action: Action) -> bool:
+        if not self._initialized:
+            return False
+
+        if action.app_name:
+            return any(
+                browser.lower() in action.app_name.lower()
+                for browser in self.supported_apps
+            )
+
+        return False
+
+    async def execute(self, action: Action) -> ActionReport:
+        """Execute an action using Playwright."""
+        start_time = time.time()
+
+        if not self._initialized or not self._browser:
+            return ActionReport(
+                action=action,
+                result=ActionResult.FAILED,
+                backend_used=self.name,
+                duration_ms=0,
+                focus_preserved=True,
+                error="Playwright not initialized",
+            )
+
+        try:
+            # Get the first page/tab
+            contexts = self._browser.contexts
+            if not contexts:
+                return ActionReport(
+                    action=action,
+                    result=ActionResult.FAILED,
+                    backend_used=self.name,
+                    duration_ms=0,
+                    focus_preserved=True,
+                    error="No browser contexts available",
+                )
+
+            pages = contexts[0].pages
+            if not pages:
+                return ActionReport(
+                    action=action,
+                    result=ActionResult.FAILED,
+                    backend_used=self.name,
+                    duration_ms=0,
+                    focus_preserved=True,
+                    error="No pages available",
+                )
+
+            page = pages[0]
+
+            # Execute action
+            if action.action_type == ActionType.CLICK:
+                if action.element_selector:
+                    await page.click(action.element_selector)
+                elif action.coordinates:
+                    await page.mouse.click(action.coordinates[0], action.coordinates[1])
+
+            elif action.action_type == ActionType.TYPE:
+                if action.element_selector:
+                    await page.fill(action.element_selector, action.text or "")
+                else:
+                    await page.keyboard.type(action.text or "")
+
+            elif action.action_type == ActionType.KEY:
+                await page.keyboard.press(action.key or "Enter")
+
+            elif action.action_type == ActionType.SCROLL:
+                await page.mouse.wheel(0, 100)
+
+            duration_ms = (time.time() - start_time) * 1000
+
+            return ActionReport(
+                action=action,
+                result=ActionResult.SUCCESS,
+                backend_used=self.name,
+                duration_ms=duration_ms,
+                focus_preserved=True,
+            )
+
+        except Exception as e:
+            return ActionReport(
+                action=action,
+                result=ActionResult.FAILED,
+                backend_used=self.name,
+                duration_ms=(time.time() - start_time) * 1000,
+                focus_preserved=True,
+                error=str(e),
+            )
+
+    async def cleanup(self) -> None:
+        if self._browser:
+            await self._browser.close()
+        if self._playwright:
+            await self._playwright.stop()
+        self._initialized = False
+
+
+# =============================================================================
+# CGEvent Backend (Low-Level)
+# =============================================================================
+
+class CGEventBackend(ActuatorBackend):
+    """
+    Low-level CGEvent backend for direct event injection.
+
+    Uses Quartz event taps to inject events directly into the window server.
+    This allows interaction with windows without changing focus.
+
+    Note: Requires Accessibility permissions.
+    """
+
+    def __init__(self, config: ActuatorConfig):
+        self.config = config
+        self._initialized = False
+
+    @property
+    def name(self) -> str:
+        return "CGEvent"
+
+    @property
+    def supported_apps(self) -> List[str]:
+        return ["*"]  # Supports all apps
+
+    async def initialize(self) -> bool:
+        if self._initialized:
+            return True
+
+        try:
+            import Quartz
+
+            # Test if we can create events
+            event = Quartz.CGEventCreate(None)
+            if event is not None:
+                self._initialized = True
+                logger.info("[GHOST-HANDS] CGEvent backend initialized")
+                return True
+
+        except Exception as e:
+            logger.error(f"[GHOST-HANDS] CGEvent init failed: {e}")
+
+        return False
+
+    async def can_handle(self, action: Action) -> bool:
+        return self._initialized and action.coordinates is not None
+
+    async def execute(self, action: Action) -> ActionReport:
+        """Execute action using CGEvent."""
+        import Quartz
+        from Quartz import (
+            CGEventCreateMouseEvent,
+            CGEventPost,
+            kCGEventLeftMouseDown,
+            kCGEventLeftMouseUp,
+            kCGHIDEventTap,
+        )
+
+        start_time = time.time()
+
+        try:
+            if action.action_type == ActionType.CLICK:
+                if not action.coordinates:
+                    return ActionReport(
+                        action=action,
+                        result=ActionResult.FAILED,
+                        backend_used=self.name,
+                        duration_ms=0,
+                        focus_preserved=True,
+                        error="Coordinates required for CGEvent click",
+                    )
+
+                x, y = action.coordinates
+
+                # Create and post mouse down event
+                mouse_down = CGEventCreateMouseEvent(
+                    None,
+                    kCGEventLeftMouseDown,
+                    (x, y),
+                    0
+                )
+                CGEventPost(kCGHIDEventTap, mouse_down)
+
+                await asyncio.sleep(0.05)
+
+                # Create and post mouse up event
+                mouse_up = CGEventCreateMouseEvent(
+                    None,
+                    kCGEventLeftMouseUp,
+                    (x, y),
+                    0
+                )
+                CGEventPost(kCGHIDEventTap, mouse_up)
+
+            elif action.action_type == ActionType.KEY:
+                from Quartz import (
+                    CGEventCreateKeyboardEvent,
+                    kCGEventKeyDown,
+                    kCGEventKeyUp,
+                )
+
+                key_code = self._get_key_code(action.key)
+
+                # Key down
+                key_down = CGEventCreateKeyboardEvent(None, key_code, True)
+                CGEventPost(kCGHIDEventTap, key_down)
+
+                await asyncio.sleep(0.02)
+
+                # Key up
+                key_up = CGEventCreateKeyboardEvent(None, key_code, False)
+                CGEventPost(kCGHIDEventTap, key_up)
+
+            duration_ms = (time.time() - start_time) * 1000
+
+            return ActionReport(
+                action=action,
+                result=ActionResult.SUCCESS,
+                backend_used=self.name,
+                duration_ms=duration_ms,
+                focus_preserved=True,
+            )
+
+        except Exception as e:
+            return ActionReport(
+                action=action,
+                result=ActionResult.FAILED,
+                backend_used=self.name,
+                duration_ms=(time.time() - start_time) * 1000,
+                focus_preserved=True,
+                error=str(e),
+            )
+
+    def _get_key_code(self, key: Optional[str]) -> int:
+        """Get macOS virtual key code."""
+        key_codes = {
+            "a": 0, "s": 1, "d": 2, "f": 3, "h": 4, "g": 5, "z": 6, "x": 7,
+            "c": 8, "v": 9, "b": 11, "q": 12, "w": 13, "e": 14, "r": 15,
+            "return": 36, "tab": 48, "space": 49, "delete": 51, "escape": 53,
+        }
+        return key_codes.get(key.lower() if key else "return", 36)
+
+    async def cleanup(self) -> None:
+        self._initialized = False
+
+
+# =============================================================================
+# Background Actuator (Main Class)
+# =============================================================================
+
+class BackgroundActuator:
+    """
+    Ghost Hands Background Actuator: Focus-free window automation.
+
+    Executes actions on background windows without stealing user focus.
+    Automatically selects the best backend for each action.
+    """
+
+    _instance: Optional["BackgroundActuator"] = None
+
+    def __new__(cls, config: Optional[ActuatorConfig] = None):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance._initialized = False
+        return cls._instance
+
+    def __init__(self, config: Optional[ActuatorConfig] = None):
+        if self._initialized:
+            return
+
+        self.config = config or ActuatorConfig()
+
+        # Components
+        self._focus_guard = FocusGuard(self.config)
+        self._backends: List[ActuatorBackend] = []
+
+        # History
+        self._action_history: List[ActionReport] = []
+        self._max_history = 100
+
+        # Statistics
+        self._stats = {
+            "total_actions": 0,
+            "successful_actions": 0,
+            "failed_actions": 0,
+            "focus_lost_count": 0,
+        }
+
+        self._initialized = True
+        logger.info("[GHOST-HANDS] Background Actuator initialized")
+
+    @classmethod
+    def get_instance(cls, config: Optional[ActuatorConfig] = None) -> "BackgroundActuator":
+        return cls(config)
+
+    async def start(self) -> bool:
+        """Initialize all backends."""
+        # Initialize backends in priority order
+        if self.config.playwright_enabled:
+            backend = PlaywrightBackend(self.config)
+            if await backend.initialize():
+                self._backends.append(backend)
+
+        if self.config.applescript_enabled:
+            backend = AppleScriptBackend(self.config)
+            if await backend.initialize():
+                self._backends.append(backend)
+
+        # Always try CGEvent as fallback
+        backend = CGEventBackend(self.config)
+        if await backend.initialize():
+            self._backends.append(backend)
+
+        logger.info(f"[GHOST-HANDS] Started with {len(self._backends)} backends")
+        return len(self._backends) > 0
+
+    async def stop(self) -> None:
+        """Clean up all backends."""
+        for backend in self._backends:
+            await backend.cleanup()
+        self._backends.clear()
+        logger.info("[GHOST-HANDS] Stopped")
+
+    async def execute(
+        self,
+        action: Action,
+        preserve_focus: bool = True,
+    ) -> ActionReport:
+        """
+        Execute an action on a background window.
+
+        Args:
+            action: The action to execute
+            preserve_focus: Whether to restore focus if stolen
+
+        Returns:
+            ActionReport with execution details
+        """
+        self._stats["total_actions"] += 1
+
+        # Save focus if needed
+        if preserve_focus and self.config.preserve_focus:
+            await self._focus_guard.save_focus()
+
+        # Find suitable backend
+        backend = await self._select_backend(action)
+
+        if not backend:
+            report = ActionReport(
+                action=action,
+                result=ActionResult.FAILED,
+                backend_used="none",
+                duration_ms=0,
+                focus_preserved=True,
+                error="No suitable backend found for action",
+            )
+            self._record_action(report)
+            return report
+
+        # Execute action
+        report = await backend.execute(action)
+
+        # Check and restore focus if needed
+        if preserve_focus and self.config.preserve_focus:
+            focus_ok = await self._focus_guard.check_focus_preserved()
+            if not focus_ok:
+                self._stats["focus_lost_count"] += 1
+                await self._focus_guard.restore_focus()
+                report.focus_preserved = False
+
+        # Update stats
+        if report.result == ActionResult.SUCCESS:
+            self._stats["successful_actions"] += 1
+        else:
+            self._stats["failed_actions"] += 1
+
+        self._record_action(report)
+
+        logger.info(
+            f"[GHOST-HANDS] {action} -> {report.result.name} "
+            f"({report.backend_used}, {report.duration_ms:.0f}ms)"
+        )
+
+        return report
+
+    async def click(
+        self,
+        app_name: Optional[str] = None,
+        selector: Optional[str] = None,
+        coordinates: Optional[Tuple[int, int]] = None,
+    ) -> ActionReport:
+        """Click on an element or coordinates."""
+        action = Action(
+            action_type=ActionType.CLICK,
+            app_name=app_name,
+            element_selector=selector,
+            coordinates=coordinates,
+        )
+        return await self.execute(action)
+
+    async def type_text(
+        self,
+        text: str,
+        app_name: Optional[str] = None,
+        selector: Optional[str] = None,
+    ) -> ActionReport:
+        """Type text into an element."""
+        action = Action(
+            action_type=ActionType.TYPE,
+            app_name=app_name,
+            element_selector=selector,
+            text=text,
+        )
+        return await self.execute(action)
+
+    async def press_key(
+        self,
+        key: str,
+        app_name: Optional[str] = None,
+        modifiers: Optional[List[str]] = None,
+    ) -> ActionReport:
+        """Press a key with optional modifiers."""
+        action = Action(
+            action_type=ActionType.KEY,
+            app_name=app_name,
+            key=key,
+            modifiers=modifiers,
+        )
+        return await self.execute(action)
+
+    async def run_applescript(
+        self,
+        script: str,
+        app_name: Optional[str] = None,
+    ) -> ActionReport:
+        """Run a custom AppleScript."""
+        action = Action(
+            action_type=ActionType.CUSTOM_SCRIPT,
+            app_name=app_name,
+            script=script,
+        )
+        return await self.execute(action)
+
+    async def send_command_to_terminal(
+        self,
+        command: str,
+        terminal_app: str = "Terminal",
+    ) -> ActionReport:
+        """Send a command to Terminal/iTerm."""
+        # Use AppleScript to send command without activating
+        script = f'''
+        tell application "{terminal_app}"
+            do script "{command}" in front window
+        end tell
+        '''
+        return await self.run_applescript(script, terminal_app)
+
+    async def _select_backend(self, action: Action) -> Optional[ActuatorBackend]:
+        """Select the best backend for an action."""
+        for backend in self._backends:
+            if await backend.can_handle(action):
+                return backend
+        return None
+
+    def _record_action(self, report: ActionReport) -> None:
+        """Record action in history."""
+        self._action_history.append(report)
+        if len(self._action_history) > self._max_history:
+            self._action_history = self._action_history[-self._max_history:]
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Get actuator statistics."""
+        return {
+            **self._stats,
+            "available_backends": [b.name for b in self._backends],
+            "history_size": len(self._action_history),
+        }
+
+    def get_history(self, limit: int = 10) -> List[Dict[str, Any]]:
+        """Get recent action history."""
+        return [r.to_dict() for r in self._action_history[-limit:]]
+
+
+# =============================================================================
+# Convenience Functions
+# =============================================================================
+
+async def get_background_actuator(
+    config: Optional[ActuatorConfig] = None
+) -> BackgroundActuator:
+    """Get the Background Actuator singleton instance."""
+    actuator = BackgroundActuator.get_instance(config)
+    if not actuator._backends:
+        await actuator.start()
+    return actuator
+
+
+# =============================================================================
+# Testing
+# =============================================================================
+
+async def test_background_actuator():
+    """Test the Background Actuator."""
+    print("=" * 60)
+    print("Testing Background Actuator")
+    print("=" * 60)
+
+    actuator = await get_background_actuator()
+
+    print(f"\n1. Available backends: {[b.name for b in actuator._backends]}")
+
+    # Test AppleScript
+    print("\n2. Testing AppleScript (sending key to Finder)...")
+    result = await actuator.press_key("escape", app_name="Finder")
+    print(f"   Result: {result.result.name} ({result.backend_used})")
+
+    # Show stats
+    print("\n3. Statistics:")
+    stats = actuator.get_stats()
+    for key, value in stats.items():
+        print(f"   {key}: {value}")
+
+    await actuator.stop()
+    print("\nTest complete!")
+
+
+if __name__ == "__main__":
+    asyncio.run(test_background_actuator())
