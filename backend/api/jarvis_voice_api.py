@@ -1935,45 +1935,114 @@ class JARVISVoiceAPI:
             try:
                 from .vision_command_handler import vision_command_handler
 
-                # Ensure vision handler is initialized
+                # Ensure vision handler is initialized - WITH TIMEOUT PROTECTION
                 if not vision_command_handler.intelligence:
                     logger.info("[JARVIS API] Initializing vision command handler...")
-                    # Try to get API key from SecretManager, app state, or environment
-                    api_key = None
 
-                    # First try SecretManager
-                    try:
-                        from core.secret_manager import get_anthropic_key
-                        api_key = get_anthropic_key()
-                        if api_key:
-                            logger.info("[JARVIS API] ✅ Got API key from SecretManager")
-                    except Exception as e:
-                        logger.debug(f"[JARVIS API] SecretManager not available: {e}")
+                    # ===========================================================
+                    # ASYNC PARALLEL API KEY RETRIEVAL WITH FAST-FAIL
+                    # ===========================================================
+                    async def _get_api_key_from_secret_manager():
+                        """Try SecretManager - 3s timeout"""
+                        try:
+                            from core.secret_manager import get_anthropic_key
+                            key = await asyncio.wait_for(
+                                asyncio.get_event_loop().run_in_executor(None, get_anthropic_key),
+                                timeout=3.0
+                            )
+                            if key:
+                                logger.info("[JARVIS API] ✅ Got API key from SecretManager")
+                            return key
+                        except asyncio.TimeoutError:
+                            logger.warning("[JARVIS API] SecretManager timed out (3s)")
+                            return None
+                        except Exception as e:
+                            logger.debug(f"[JARVIS API] SecretManager not available: {e}")
+                            return None
 
-                    # Then try app state
-                    if not api_key:
+                    async def _get_api_key_from_app_state():
+                        """Try app state - fast check"""
                         try:
                             from api.jarvis_factory import get_app_state
-
                             app_state = get_app_state()
                             if (
                                 app_state
                                 and hasattr(app_state, "vision_analyzer")
                                 and app_state.vision_analyzer
                             ):
-                                api_key = getattr(app_state.vision_analyzer, "api_key", None)
-                                if api_key:
+                                key = getattr(app_state.vision_analyzer, "api_key", None)
+                                if key:
                                     logger.info("[JARVIS API] Got API key from app state")
-                        except:
+                                return key
+                        except Exception:
                             pass
+                        return None
 
-                    # Finally try environment
-                    if not api_key:
-                        api_key = os.getenv("ANTHROPIC_API_KEY")
-                        if api_key:
+                    async def _get_api_key_from_env():
+                        """Try environment - instant"""
+                        key = os.getenv("ANTHROPIC_API_KEY")
+                        if key:
                             logger.info("[JARVIS API] Got API key from environment")
+                        return key
 
-                    await vision_command_handler.initialize_intelligence(api_key)
+                    # Run all API key retrievals in parallel - first success wins
+                    api_key = None
+                    try:
+                        # Start all tasks
+                        secret_manager_task = asyncio.create_task(_get_api_key_from_secret_manager())
+                        app_state_task = asyncio.create_task(_get_api_key_from_app_state())
+                        env_task = asyncio.create_task(_get_api_key_from_env())
+
+                        # Wait for fastest completion - max 5s total
+                        done, pending = await asyncio.wait(
+                            [secret_manager_task, app_state_task, env_task],
+                            timeout=5.0,
+                            return_when=asyncio.ALL_COMPLETED
+                        )
+
+                        # Cancel any pending tasks
+                        for task in pending:
+                            task.cancel()
+
+                        # Get first non-None result (prioritize: secret_manager > app_state > env)
+                        for task in [secret_manager_task, app_state_task, env_task]:
+                            if task in done and not task.cancelled():
+                                try:
+                                    result = task.result()
+                                    if result:
+                                        api_key = result
+                                        break
+                                except Exception:
+                                    pass
+                    except Exception as e:
+                        logger.warning(f"[JARVIS API] Parallel API key retrieval error: {e}")
+
+                    # ===========================================================
+                    # INITIALIZE WITH TIMEOUT - 10 SECOND MAX
+                    # ===========================================================
+                    try:
+                        await asyncio.wait_for(
+                            vision_command_handler.initialize_intelligence(api_key),
+                            timeout=10.0
+                        )
+                        logger.info("[JARVIS API] ✅ Vision handler initialized successfully")
+                    except asyncio.TimeoutError:
+                        logger.error("[JARVIS API] ❌ Vision handler initialization timed out (10s)")
+                        return {
+                            "response": "I'm still warming up my vision systems. Please try again in a moment.",
+                            "status": "initializing",
+                            "command_type": "vision",
+                            "success": False,
+                            "retry_suggested": True,
+                        }
+                    except ValueError as ve:
+                        logger.error(f"[JARVIS API] Vision handler configuration error: {ve}")
+                        return {
+                            "response": f"Vision features require configuration. {str(ve)}",
+                            "status": "error",
+                            "command_type": "vision",
+                            "success": False,
+                        }
 
                 logger.info(f"[JARVIS API] Calling vision handler for: '{command.text}'")
                 try:

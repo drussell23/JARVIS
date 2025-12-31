@@ -502,7 +502,52 @@ class VisionCommandHandler:
         """
         Internal command handling logic (called with timeout wrapper).
         """
-        
+
+        # ===========================================================
+        # FAST-FAIL DETECTION - Return immediately for common issues
+        # ===========================================================
+        # 1. Check if intelligence is initialized
+        if not self.intelligence:
+            logger.warning("[VISION] ⚠️ Fast-fail: Intelligence not initialized")
+            return {
+                "handled": True,
+                "response": "I'm still initializing my vision systems. Please try again in a moment.",
+                "error": True,
+                "fast_fail": "intelligence_not_ready",
+            }
+
+        # 2. Check for empty/invalid command
+        if not command_text or not command_text.strip():
+            logger.warning("[VISION] ⚠️ Fast-fail: Empty command")
+            return {
+                "handled": True,
+                "response": "I didn't catch that, Sir. Could you please repeat your request?",
+                "error": True,
+                "fast_fail": "empty_command",
+            }
+
+        # 3. Check command length (prevent processing extremely long inputs)
+        if len(command_text) > 5000:
+            logger.warning(f"[VISION] ⚠️ Fast-fail: Command too long ({len(command_text)} chars)")
+            return {
+                "handled": True,
+                "response": "That request is quite lengthy. Could you please summarize what you'd like me to do?",
+                "error": True,
+                "fast_fail": "command_too_long",
+            }
+
+        # 4. Fast pre-check for non-vision commands (handled elsewhere)
+        command_lower = command_text.lower()
+        non_vision_keywords = [
+            "weather", "temperature", "forecast",
+            "time", "date", "alarm", "timer", "reminder",
+            "play", "pause", "stop", "music", "volume",
+            "email", "message", "call", "text",
+        ]
+        if any(keyword in command_lower for keyword in non_vision_keywords):
+            # These might be handled by other systems - let them pass through
+            logger.info(f"[VISION] Non-vision keyword detected, will check if handled")
+
         # IMPORTANT: Check if this is a lock/unlock screen command - should NOT be handled by vision
         command_lower = command_text.lower()
         if ("lock" in command_lower and "screen" in command_lower) or (

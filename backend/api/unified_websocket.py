@@ -1358,7 +1358,76 @@ class UnifiedWebSocketManager:
                             command_obj = JARVISCommand(text=command_text, audio_data=audio_data_received)
 
                             logger.info(f"[WS] Processing command via jarvis_api: {command_text}")
-                            jarvis_result = await jarvis_api.process_command(command_obj)
+
+                            # ===========================================================
+                            # PROGRESS CALLBACK SYSTEM - Real-time frontend updates
+                            # ===========================================================
+                            progress_cancelled = asyncio.Event()
+                            progress_stages = [
+                                {"stage": "analyzing", "message": "🧠 Analyzing your request..."},
+                                {"stage": "processing", "message": "⚙️ Processing command..."},
+                                {"stage": "vision_init", "message": "👁️ Initializing vision..."},
+                                {"stage": "api_call", "message": "📡 Connecting to AI..."},
+                                {"stage": "generating", "message": "✨ Generating response..."},
+                            ]
+
+                            async def send_progress_updates():
+                                """Send periodic progress updates to keep frontend informed"""
+                                try:
+                                    stage_index = 0
+                                    while not progress_cancelled.is_set():
+                                        if stage_index < len(progress_stages):
+                                            stage = progress_stages[stage_index]
+                                        else:
+                                            stage = progress_stages[-1]  # Stay on last stage
+
+                                        await websocket.send_json({
+                                            "type": "processing_progress",
+                                            "stage": stage["stage"],
+                                            "message": stage["message"],
+                                            "stage_index": min(stage_index, len(progress_stages) - 1),
+                                            "total_stages": len(progress_stages),
+                                            "timestamp": time.time(),
+                                        })
+
+                                        # Wait 2 seconds between updates, or until cancelled
+                                        try:
+                                            await asyncio.wait_for(
+                                                progress_cancelled.wait(),
+                                                timeout=2.0
+                                            )
+                                            break  # Cancelled
+                                        except asyncio.TimeoutError:
+                                            stage_index += 1
+                                except Exception as e:
+                                    logger.debug(f"[WS] Progress update task ended: {e}")
+
+                            # Start progress updates in background
+                            progress_task = asyncio.create_task(send_progress_updates())
+
+                            # ===========================================================
+                            # PROCESS COMMAND WITH TIMEOUT - 45 SECOND MAX
+                            # ===========================================================
+                            try:
+                                jarvis_result = await asyncio.wait_for(
+                                    jarvis_api.process_command(command_obj),
+                                    timeout=45.0
+                                )
+                            except asyncio.TimeoutError:
+                                logger.error(f"[WS] Command processing timed out after 45s: {command_text}")
+                                jarvis_result = {
+                                    "response": "I apologize, but processing took too long. Please try again with a simpler request.",
+                                    "status": "timeout",
+                                    "success": False,
+                                }
+                            finally:
+                                # Cancel progress updates
+                                progress_cancelled.set()
+                                progress_task.cancel()
+                                try:
+                                    await progress_task
+                                except asyncio.CancelledError:
+                                    pass
 
                             result = {
                                 "response": jarvis_result.get("response", ""),
