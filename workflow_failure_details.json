@@ -1,12 +1,12 @@
 {
-  "workflow_name": "File Integrity Check",
-  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/20610330367",
-  "branch": "main",
-  "commit_sha": "3b0c77c",
-  "run_number": 147,
-  "failed_count": 2,
-  "fix_branch": "fix/ci/file-integrity-check-run147-20251231-021403",
-  "pr_title": "\ud83d\udea8 Fix CI/CD: File Integrity Check (Run #147)",
+  "workflow_name": "PR Automation & Validation",
+  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/20610357030",
+  "branch": "fix/ci/file-integrity-check-run147-20251231-021403",
+  "commit_sha": "b45b003",
+  "run_number": 1231,
+  "failed_count": 1,
+  "fix_branch": "fix/ci/pr-automation-validation-run1231-20251231-021525",
+  "pr_title": "\ud83d\udea8 Fix CI/CD: PR Automation & Validation (Run #1231)",
   "analyses": [
     {
       "error_patterns": [
@@ -14,158 +14,41 @@
           "pattern": "ERROR|Error|error",
           "matches": [
             {
-              "line_number": 14,
-              "content": "2025-12-31T02:12:33.3714503Z ModuleNotFoundError: No module named 'logging.handlers'",
+              "line_number": 27,
+              "content": "2025-12-31T02:14:34.8131035Z   subjectPatternError: The PR title must start with a capital letter.",
               "severity": "high",
               "emoji": "\u274c"
             },
             {
-              "line_number": 30,
-              "content": "2025-12-31T02:12:33.4037273Z ModuleNotFoundError: No module named 'logging.handlers'",
-              "severity": "high",
-              "emoji": "\u274c"
-            },
-            {
-              "line_number": 46,
-              "content": "2025-12-31T02:12:33.4374248Z ModuleNotFoundError: No module named 'logging.handlers'",
-              "severity": "high",
-              "emoji": "\u274c"
-            },
-            {
-              "line_number": 62,
-              "content": "2025-12-31T02:12:33.4657845Z ModuleNotFoundError: No module named 'logging.handlers'",
-              "severity": "high",
-              "emoji": "\u274c"
-            },
-            {
-              "line_number": 68,
-              "content": "2025-12-31T02:12:33.4726855Z \u001b[36;1m  echo \"\u274c **Syntax Errors:** 1 file(s)\" >> $GITHUB_STEP_SUMMARY\u001b[0m",
+              "line_number": 39,
+              "content": "2025-12-31T02:14:35.3741634Z ##[error]No release type found in pull request title \"\ud83d\udea8 Fix CI/CD: File Integrity Check (Run #147)\". Add a prefix to indicate what kind of release this pull request corresponds to. For reference, see https://www.conventionalcommits.org/",
               "severity": "high",
               "emoji": "\u274c"
             }
           ],
-          "count": 5
+          "count": 2
         },
         {
-          "pattern": "FAIL|Failed|failed",
+          "pattern": "timeout|timed out",
           "matches": [
             {
-              "line_number": 97,
-              "content": "2025-12-31T02:12:33.6259097Z ##[warning]The process '/usr/bin/git' failed with exit code 128",
-              "severity": "high",
-              "emoji": "\ud83d\udca5"
-            }
-          ],
-          "count": 1
-        },
-        {
-          "pattern": "WARN|Warning|warning",
-          "matches": [
-            {
-              "line_number": 75,
-              "content": "2025-12-31T02:12:33.4728629Z \u001b[36;1m  echo \"\u26a0\ufe0f **Truncation Warnings:** 3\" >> $GITHUB_STEP_SUMMARY\u001b[0m",
+              "line_number": 31,
+              "content": "- fix: Resolve database connection timeout",
               "severity": "medium",
-              "emoji": "\u26a0\ufe0f"
-            },
-            {
-              "line_number": 97,
-              "content": "2025-12-31T02:12:33.6259097Z ##[warning]The process '/usr/bin/git' failed with exit code 128",
-              "severity": "medium",
-              "emoji": "\u26a0\ufe0f"
-            }
-          ],
-          "count": 2
-        }
-      ],
-      "suggested_fixes": [
-        "Review the logs above for specific error messages"
-      ],
-      "severity": "high",
-      "category": "syntax_error",
-      "similar_failures": []
-    },
-    {
-      "error_patterns": [
-        {
-          "pattern": "ERROR|Error|error",
-          "matches": [
-            {
-              "line_number": 60,
-              "content": "2025-12-31T02:12:30.4037674Z ##[group]Run ERRORS=0",
-              "severity": "high",
-              "emoji": "\u274c"
-            },
-            {
-              "line_number": 61,
-              "content": "2025-12-31T02:12:30.4038593Z \u001b[36;1mERRORS=0\u001b[0m",
-              "severity": "high",
-              "emoji": "\u274c"
-            },
-            {
-              "line_number": 66,
-              "content": "2025-12-31T02:12:30.4043716Z \u001b[36;1m    ERRORS=$((ERRORS + 1))\u001b[0m",
-              "severity": "high",
-              "emoji": "\u274c"
-            },
-            {
-              "line_number": 70,
-              "content": "2025-12-31T02:12:30.4047696Z \u001b[36;1mif [ $ERRORS -gt 0 ]; then\u001b[0m",
-              "severity": "high",
-              "emoji": "\u274c"
-            },
-            {
-              "line_number": 71,
-              "content": "2025-12-31T02:12:30.4048829Z \u001b[36;1m  echo \"::error::Found $ERRORS files with syntax errors\"\u001b[0m",
-              "severity": "high",
-              "emoji": "\u274c"
-            },
-            {
-              "line_number": 86,
-              "content": "2025-12-31T02:13:26.9381150Z ##[error]Found 1 files with syntax errors",
-              "severity": "high",
-              "emoji": "\u274c"
-            },
-            {
-              "line_number": 87,
-              "content": "2025-12-31T02:13:26.9391087Z ##[error]Process completed with exit code 1.",
-              "severity": "high",
-              "emoji": "\u274c"
-            }
-          ],
-          "count": 7
-        },
-        {
-          "pattern": "FAIL|Failed|failed",
-          "matches": [
-            {
-              "line_number": 97,
-              "content": "2025-12-31T02:13:27.0997710Z ##[warning]The process '/usr/bin/git' failed with exit code 128",
-              "severity": "high",
-              "emoji": "\ud83d\udca5"
-            }
-          ],
-          "count": 1
-        },
-        {
-          "pattern": "WARN|Warning|warning",
-          "matches": [
-            {
-              "line_number": 97,
-              "content": "2025-12-31T02:13:27.0997710Z ##[warning]The process '/usr/bin/git' failed with exit code 128",
-              "severity": "medium",
-              "emoji": "\u26a0\ufe0f"
+              "emoji": "\u23f1\ufe0f"
             }
           ],
           "count": 1
         }
       ],
       "suggested_fixes": [
-        "Review the logs above for specific error messages"
+        "Consider increasing timeout values or optimizing slow operations",
+        "Check service availability and network connectivity"
       ],
       "severity": "high",
-      "category": "syntax_error",
+      "category": "timeout",
       "similar_failures": []
     }
   ],
-  "timestamp": "2025-12-31T02:14:03.476939"
+  "timestamp": "2025-12-31T02:15:25.856712"
 }

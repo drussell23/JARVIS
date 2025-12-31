@@ -2,106 +2,58 @@
 
 ## Executive Summary
 
-- **Workflow**: File Integrity Check
-- **Run Number**: #147
-- **Branch**: `main`
-- **Commit**: `3b0c77c81a1985ff3d7cc0bdcb349a0eb0127559`
+- **Workflow**: PR Automation & Validation
+- **Run Number**: #1231
+- **Branch**: `fix/ci/file-integrity-check-run147-20251231-021403`
+- **Commit**: `b45b003ee83829a75bc04af321949005659c147a`
 - **Status**: ❌ FAILED
-- **Timestamp**: 2025-12-31T02:12:22Z
-- **Triggered By**: @drussell23
-- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/20610330367)
+- **Timestamp**: 2025-12-31T02:14:29Z
+- **Triggered By**: @cubic-dev-ai[bot]
+- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/20610357030)
 
 ## Failure Overview
 
-Total Failed Jobs: **2**
+Total Failed Jobs: **1**
 
 | # | Job Name | Category | Severity | Duration |
 |---|----------|----------|----------|----------|
-| 1 | Python File Integrity | syntax_error | high | 8s |
-| 2 | Full Repository Scan | syntax_error | high | 62s |
+| 1 | Validate PR Title | timeout | high | 5s |
 
 ## Detailed Analysis
 
-### 1. Python File Integrity
+### 1. Validate PR Title
 
 **Status**: ❌ failure
-**Category**: Syntax Error
+**Category**: Timeout
 **Severity**: HIGH
-**Started**: 2025-12-31T02:12:27Z
-**Completed**: 2025-12-31T02:12:35Z
-**Duration**: 8 seconds
-**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/20610330367/job/59193579564)
+**Started**: 2025-12-31T02:14:32Z
+**Completed**: 2025-12-31T02:14:37Z
+**Duration**: 5 seconds
+**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/20610357030/job/59193645323)
 
 #### Failed Steps
 
-- **Step 5**: Check file syntax
+- **Step 2**: Validate Conventional Commits
 
 #### Error Analysis
 
 **Detected Error Patterns:**
 
 - Pattern: `ERROR|Error|error`
-  - Occurrences: 5
-  - Sample matches:
-    - Line 14: `2025-12-31T02:12:33.3714503Z ModuleNotFoundError: No module named 'logging.handlers'`
-    - Line 30: `2025-12-31T02:12:33.4037273Z ModuleNotFoundError: No module named 'logging.handlers'`
-    - Line 46: `2025-12-31T02:12:33.4374248Z ModuleNotFoundError: No module named 'logging.handlers'`
-
-- Pattern: `FAIL|Failed|failed`
-  - Occurrences: 1
-  - Sample matches:
-    - Line 97: `2025-12-31T02:12:33.6259097Z ##[warning]The process '/usr/bin/git' failed with exit code 128`
-
-- Pattern: `WARN|Warning|warning`
   - Occurrences: 2
   - Sample matches:
-    - Line 75: `2025-12-31T02:12:33.4728629Z [36;1m  echo "⚠️ **Truncation Warnings:** 3" >> $GITHUB_STEP_SUMMARY[`
-    - Line 97: `2025-12-31T02:12:33.6259097Z ##[warning]The process '/usr/bin/git' failed with exit code 128`
+    - Line 27: `2025-12-31T02:14:34.8131035Z   subjectPatternError: The PR title must start with a capital letter.`
+    - Line 39: `2025-12-31T02:14:35.3741634Z ##[error]No release type found in pull request title "🚨 Fix CI/CD: File`
+
+- Pattern: `timeout|timed out`
+  - Occurrences: 1
+  - Sample matches:
+    - Line 31: `- fix: Resolve database connection timeout`
 
 #### Suggested Fixes
 
-1. Review the logs above for specific error messages
-
----
-
-### 2. Full Repository Scan
-
-**Status**: ❌ failure
-**Category**: Syntax Error
-**Severity**: HIGH
-**Started**: 2025-12-31T02:12:26Z
-**Completed**: 2025-12-31T02:13:28Z
-**Duration**: 62 seconds
-**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/20610330367/job/59193579567)
-
-#### Failed Steps
-
-- **Step 5**: Full syntax check
-
-#### Error Analysis
-
-**Detected Error Patterns:**
-
-- Pattern: `ERROR|Error|error`
-  - Occurrences: 7
-  - Sample matches:
-    - Line 60: `2025-12-31T02:12:30.4037674Z ##[group]Run ERRORS=0`
-    - Line 61: `2025-12-31T02:12:30.4038593Z [36;1mERRORS=0[0m`
-    - Line 66: `2025-12-31T02:12:30.4043716Z [36;1m    ERRORS=$((ERRORS + 1))[0m`
-
-- Pattern: `FAIL|Failed|failed`
-  - Occurrences: 1
-  - Sample matches:
-    - Line 97: `2025-12-31T02:13:27.0997710Z ##[warning]The process '/usr/bin/git' failed with exit code 128`
-
-- Pattern: `WARN|Warning|warning`
-  - Occurrences: 1
-  - Sample matches:
-    - Line 97: `2025-12-31T02:13:27.0997710Z ##[warning]The process '/usr/bin/git' failed with exit code 128`
-
-#### Suggested Fixes
-
-1. Review the logs above for specific error messages
+1. Consider increasing timeout values or optimizing slow operations
+2. Check service availability and network connectivity
 
 ---
 
@@ -121,5 +73,5 @@ Total Failed Jobs: **2**
 
 ---
 
-📊 *Report generated on 2025-12-31T02:14:03.476637*
+📊 *Report generated on 2025-12-31T02:15:25.856606*
 🤖 *JARVIS CI/CD Auto-PR Manager*
