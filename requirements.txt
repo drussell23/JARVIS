@@ -1,5 +1,6 @@
 aiohappyeyeballs==2.6.1
 aiohttp==3.13.2
+aiohttp_cors==0.8.1
 aiosignal==1.4.0
 aiosqlite==0.19.0
 annotated-doc==0.0.4
@@ -135,6 +136,7 @@ typing_extensions==4.15.0
 urllib3==2.3.0
 uvicorn==0.38.0
 uvloop==0.22.1
+watchdog==6.0.0
 watchfiles==1.1.1
 webrtcvad==2.0.10
 websocket-client==1.9.0
