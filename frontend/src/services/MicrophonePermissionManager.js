@@ -99,31 +99,52 @@ class MicrophonePermissionManager {
   /**
    * Check permission state with fresh query (async).
    * Updates internal state and returns result.
+   *
+   * v2.0: CRITICAL FIX - Do NOT use enumerateDevices() to determine device availability
+   * before permission is granted. Browsers (especially Safari) return empty arrays
+   * or don't report audio devices until AFTER getUserMedia succeeds once.
+   * The authoritative way to know if a device exists is to try getUserMedia and
+   * handle the NotFoundError.
    */
   async checkPermission() {
     try {
       // Use Permissions API if available
       if (navigator.permissions?.query) {
-        const result = await navigator.permissions.query({ name: 'microphone' });
-        this._updateState({ permission: result.state, lastChecked: Date.now() });
-        return result.state;
-      }
+        try {
+          const result = await navigator.permissions.query({ name: 'microphone' });
+          this._updateState({ permission: result.state, lastChecked: Date.now() });
 
-      // Fallback: check if we have any audio devices
-      if (navigator.mediaDevices?.enumerateDevices) {
-        const devices = await navigator.mediaDevices.enumerateDevices();
-        const hasAudioInput = devices.some(d => d.kind === 'audioinput');
-        this._updateState({
-          deviceAvailable: hasAudioInput,
-          lastChecked: Date.now()
-        });
+          // v2.0: Only check device availability if permission is already granted
+          // Before permission grant, browsers don't reliably report devices
+          if (result.state === 'granted' && navigator.mediaDevices?.enumerateDevices) {
+            const devices = await navigator.mediaDevices.enumerateDevices();
+            const audioInputs = devices.filter(d => d.kind === 'audioinput');
+            const hasAudioInput = audioInputs.length > 0;
 
-        if (!hasAudioInput) {
-          return 'unavailable';
+            this._updateState({
+              deviceAvailable: hasAudioInput,
+            });
+
+            console.log(`[MicPermissionManager] Found ${audioInputs.length} audio input device(s)`);
+
+            // Only return 'unavailable' if we're CERTAIN there's no device
+            // (permission granted + enumeration shows no devices)
+            if (!hasAudioInput) {
+              return 'unavailable';
+            }
+          }
+
+          return result.state;
+        } catch (permError) {
+          // Permissions API query failed (e.g., Safari doesn't support 'microphone' query)
+          console.log('[MicPermissionManager] Permissions API query failed, will try getUserMedia:', permError.message);
+          // Fall through to return 'prompt' - let getUserMedia be the authority
         }
       }
 
-      // Can't determine - assume prompt
+      // v2.0: If we can't query permissions, assume 'prompt' state
+      // Do NOT try to enumerate devices here - it's unreliable before permission grant
+      // The correct flow is: try getUserMedia -> if NotFoundError, then no device
       return 'prompt';
     } catch (error) {
       console.warn('[MicPermissionManager] Permission check failed:', error);
