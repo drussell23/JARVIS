@@ -2,25 +2,25 @@
  * TrainingStatus Component - Real-Time Training Progress Display
  * =============================================================
  *
- * Connects to the Reactor-Core feedback WebSocket to display
- * live training progress in the JARVIS UI.
+ * Displays live training progress from the Reactor-Core feedback system
+ * via the Unified WebSocket Service.
  *
  * Features:
- * - Real-time progress updates via WebSocket
+ * - Real-time progress updates via unified WebSocket
  * - Animated progress bar with stage indicators
  * - Minimized/expanded view toggle
  * - Auto-hide when no training active
  * - Cinematic JARVIS styling
  *
- * Architecture:
- *   Reactor-Core → WebSocket → This Component → UI Display
+ * Architecture (v9.0 - Unified):
+ *   Reactor-Core → UnifiedWebSocketService → This Component → UI Display
  *
  * @author JARVIS AI System
- * @version 1.0.0 (Feedback Loop)
+ * @version 2.0.0 (Unified WebSocket Edition)
  */
 
-import React, { useState, useEffect, useRef, useCallback } from 'react';
-import configService from '../services/DynamicConfigService';
+import React, { useState, useEffect, useCallback } from 'react';
+import { useUnifiedWebSocket } from '../services/UnifiedWebSocketService';
 import './TrainingStatus.css';
 
 // Training stage configurations with icons and colors
@@ -42,156 +42,67 @@ const STAGE_CONFIG = {
   cancelled: { icon: '🚫', label: 'Cancelled', color: '#888888' },
 };
 
-// WebSocket reconnection settings
-const WS_RECONNECT_DELAY = 3000;
-const WS_MAX_RECONNECT_ATTEMPTS = 5;
-
 const TrainingStatus = () => {
-  // State
-  const [status, setStatus] = useState(null);
-  const [isConnected, setIsConnected] = useState(false);
+  // Use the unified WebSocket service for training status
+  const { trainingStatus, trainingConnected } = useUnifiedWebSocket();
+
+  // Local UI state
   const [isMinimized, setIsMinimized] = useState(false);
   const [showPanel, setShowPanel] = useState(false);
   const [recentUpdates, setRecentUpdates] = useState([]);
-
-  // Refs
-  const wsRef = useRef(null);
-  const reconnectAttempts = useRef(0);
-  const reconnectTimer = useRef(null);
 
   // Get stage configuration
   const getStageConfig = useCallback((stage) => {
     return STAGE_CONFIG[stage] || STAGE_CONFIG.idle;
   }, []);
 
-  // Connect to WebSocket
-  const connectWebSocket = useCallback(() => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      return; // Already connected
+  // Handle training status updates
+  useEffect(() => {
+    if (!trainingStatus) return;
+
+    // Show panel when training is active
+    if (trainingStatus.status === 'running' || trainingStatus.progress > 0) {
+      setShowPanel(true);
     }
 
-    try {
-      // Get WebSocket URL from config service
-      const wsBaseUrl = configService.getWebSocketUrl() ||
-        `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.hostname}:8010`;
-
-      const wsUrl = `${wsBaseUrl}/reactor-core/training/ws`;
-      console.log('[TrainingStatus] Connecting to WebSocket:', wsUrl);
-
-      const ws = new WebSocket(wsUrl);
-      wsRef.current = ws;
-
-      ws.onopen = () => {
-        console.log('[TrainingStatus] WebSocket connected');
-        setIsConnected(true);
-        reconnectAttempts.current = 0;
+    // Add to recent updates (keep last 10)
+    setRecentUpdates(prev => {
+      const newUpdate = {
+        id: trainingStatus.timestamp || Date.now(),
+        stage: trainingStatus.stage,
+        progress: trainingStatus.progress,
+        message: trainingStatus.message,
+        timestamp: new Date().toLocaleTimeString(),
       };
 
-      ws.onmessage = (event) => {
-        try {
-          const data = JSON.parse(event.data);
-          console.log('[TrainingStatus] Received:', data.type);
+      // Avoid duplicates
+      if (prev.length > 0 && prev[0].stage === newUpdate.stage && prev[0].progress === newUpdate.progress) {
+        return prev;
+      }
 
-          if (data.type === 'training_status' || data.type === 'current_state') {
-            const trainingData = data.data || data;
+      return [newUpdate, ...prev.slice(0, 9)];
+    });
 
-            // Update status
-            setStatus(trainingData);
-
-            // Show panel when training is active
-            if (trainingData.status === 'running' || trainingData.progress > 0) {
-              setShowPanel(true);
-            }
-
-            // Add to recent updates (keep last 10)
-            setRecentUpdates(prev => {
-              const newUpdate = {
-                id: Date.now(),
-                stage: trainingData.stage,
-                progress: trainingData.progress,
-                message: trainingData.message,
-                timestamp: new Date().toLocaleTimeString(),
-              };
-              return [newUpdate, ...prev.slice(0, 9)];
-            });
-
-            // Auto-hide after completion
-            if (trainingData.status === 'completed') {
-              setTimeout(() => {
-                setShowPanel(false);
-              }, 10000); // Hide after 10 seconds
-            }
-          } else if (data.type === 'connected') {
-            console.log('[TrainingStatus] Server acknowledged connection');
-          }
-        } catch (e) {
-          console.error('[TrainingStatus] Failed to parse message:', e);
-        }
-      };
-
-      ws.onerror = (error) => {
-        console.error('[TrainingStatus] WebSocket error:', error);
-      };
-
-      ws.onclose = () => {
-        console.log('[TrainingStatus] WebSocket closed');
-        setIsConnected(false);
-        wsRef.current = null;
-
-        // Attempt reconnection
-        if (reconnectAttempts.current < WS_MAX_RECONNECT_ATTEMPTS) {
-          reconnectAttempts.current++;
-          console.log(`[TrainingStatus] Reconnecting (${reconnectAttempts.current}/${WS_MAX_RECONNECT_ATTEMPTS})...`);
-
-          reconnectTimer.current = setTimeout(() => {
-            connectWebSocket();
-          }, WS_RECONNECT_DELAY);
-        }
-      };
-    } catch (error) {
-      console.error('[TrainingStatus] Failed to create WebSocket:', error);
+    // Auto-hide after completion
+    if (trainingStatus.status === 'completed') {
+      const timer = setTimeout(() => {
+        setShowPanel(false);
+      }, 10000); // Hide after 10 seconds
+      return () => clearTimeout(timer);
     }
-  }, []);
-
-  // Initialize WebSocket connection
-  useEffect(() => {
-    // Small delay to ensure config is ready
-    const initTimer = setTimeout(() => {
-      connectWebSocket();
-    }, 1000);
-
-    return () => {
-      clearTimeout(initTimer);
-      clearTimeout(reconnectTimer.current);
-      if (wsRef.current) {
-        wsRef.current.close();
-        wsRef.current = null;
-      }
-    };
-  }, [connectWebSocket]);
-
-  // Send ping to keep connection alive
-  useEffect(() => {
-    const pingInterval = setInterval(() => {
-      if (wsRef.current?.readyState === WebSocket.OPEN) {
-        wsRef.current.send(JSON.stringify({ type: 'ping' }));
-      }
-    }, 30000);
-
-    return () => clearInterval(pingInterval);
-  }, []);
+  }, [trainingStatus]);
 
   // Don't render if no training active and panel is hidden
-  if (!showPanel && !status?.status) {
+  if (!showPanel && !trainingStatus?.status) {
     return null;
   }
 
   // Get current stage config
-  const stageConfig = getStageConfig(status?.stage || 'idle');
-  const progress = status?.progress || 0;
-  const isActive = status?.status === 'running';
-  const isComplete = status?.status === 'completed';
-  const isFailed = status?.status === 'failed';
+  const stageConfig = getStageConfig(trainingStatus?.stage || 'idle');
+  const progress = trainingStatus?.progress || 0;
+  const isActive = trainingStatus?.status === 'running';
+  const isComplete = trainingStatus?.status === 'completed';
+  const isFailed = trainingStatus?.status === 'failed';
 
   return (
     <div className={`training-status-container ${isMinimized ? 'minimized' : ''} ${isActive ? 'active' : ''}`}>
@@ -216,8 +127,8 @@ const TrainingStatus = () => {
             <div className="training-title">
               <span className="training-icon">🧠</span>
               <span>Neural Training</span>
-              {status?.job_id && (
-                <span className="training-job-id">#{status.job_id}</span>
+              {trainingStatus?.job_id && (
+                <span className="training-job-id">#{trainingStatus.job_id}</span>
               )}
             </div>
             <div className="training-controls">
@@ -270,29 +181,29 @@ const TrainingStatus = () => {
 
             {/* Status Message */}
             <div className="training-message">
-              {status?.message || 'Waiting for training data...'}
+              {trainingStatus?.message || 'Waiting for training data...'}
             </div>
           </div>
 
           {/* Metrics (if available) */}
-          {status?.metrics && Object.keys(status.metrics).length > 0 && (
+          {trainingStatus?.metrics && Object.keys(trainingStatus.metrics).length > 0 && (
             <div className="training-metrics">
-              {status.metrics.loss !== undefined && (
+              {trainingStatus.metrics.loss !== undefined && (
                 <div className="metric">
                   <span className="metric-label">Loss</span>
-                  <span className="metric-value">{status.metrics.loss.toFixed(4)}</span>
+                  <span className="metric-value">{trainingStatus.metrics.loss.toFixed(4)}</span>
                 </div>
               )}
-              {status.metrics.eval_accuracy !== undefined && (
+              {trainingStatus.metrics.eval_accuracy !== undefined && (
                 <div className="metric">
                   <span className="metric-label">Accuracy</span>
-                  <span className="metric-value">{(status.metrics.eval_accuracy * 100).toFixed(1)}%</span>
+                  <span className="metric-value">{(trainingStatus.metrics.eval_accuracy * 100).toFixed(1)}%</span>
                 </div>
               )}
-              {status.metrics.examples_trained !== undefined && (
+              {trainingStatus.metrics.examples_trained !== undefined && (
                 <div className="metric">
                   <span className="metric-label">Examples</span>
-                  <span className="metric-value">{status.metrics.examples_trained}</span>
+                  <span className="metric-value">{trainingStatus.metrics.examples_trained}</span>
                 </div>
               )}
             </div>
@@ -316,9 +227,9 @@ const TrainingStatus = () => {
 
           {/* Status Footer */}
           <div className="training-footer">
-            <div className={`connection-status ${isConnected ? 'connected' : 'disconnected'}`}>
+            <div className={`connection-status ${trainingConnected ? 'connected' : 'disconnected'}`}>
               <span className="connection-dot" />
-              {isConnected ? 'Live' : 'Reconnecting...'}
+              {trainingConnected ? 'Live' : 'Connecting...'}
             </div>
             {isComplete && (
               <div className="completion-badge">

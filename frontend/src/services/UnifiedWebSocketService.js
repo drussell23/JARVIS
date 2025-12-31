@@ -70,42 +70,126 @@ class UnifiedWebSocketService {
       source: null,                // Speech source (tts_backend, cai_feedback, etc.)
     };
 
+    // v9.0: Training Status State (Reactor-Core Feedback Loop)
+    // Unified handling for training progress - replaces independent TrainingStatus WebSocket
+    this.trainingStatus = null;    // { status, stage, progress, message, job_id, metrics }
+    this.trainingConnected = false;
+
     // Wait for config and then connect
     this._initializeWhenReady();
   }
 
   async _initializeWhenReady() {
-    try {
-      // Wait for config service to discover backend
-      const config = await configService.waitForConfig(30000);
+    // =========================================================================
+    // Resilient Initialization with Progressive Fallback
+    // =========================================================================
+    // Instead of hard timeout, try multiple strategies:
+    // 1. Wait for config discovery (with reasonable timeout)
+    // 2. Retry with exponential backoff
+    // 3. Use environment inference as final fallback
+    // =========================================================================
 
-      if (config?.WS_BASE_URL) {
-        // Configure endpoints
-        this.client.endpoints = [
-          {
-            path: `${config.WS_BASE_URL}/ws`,
-            capabilities: ['general', 'voice', 'command'],
-            priority: 10
-          },
-          {
-            // Backend mounts vision WS at /vision/ws/vision
-            path: `${config.WS_BASE_URL}/vision/ws/vision`,
-            capabilities: ['vision', 'monitoring'],
-            priority: 8
-          },
-          {
-            // Broadcast WebSocket for maintenance mode events from supervisor
-            path: `${config.WS_BASE_URL}/api/broadcast/ws`,
-            capabilities: ['broadcast', 'maintenance'],
-            priority: 5
+    const MAX_INIT_ATTEMPTS = 5;
+    const BASE_DELAY = 2000;
+
+    for (let attempt = 1; attempt <= MAX_INIT_ATTEMPTS; attempt++) {
+      try {
+        // Progressive timeout: 10s, 15s, 20s, 25s, 30s
+        const timeout = 10000 + (attempt - 1) * 5000;
+        console.log(`[UnifiedWebSocket] Initialization attempt ${attempt}/${MAX_INIT_ATTEMPTS} (timeout: ${timeout}ms)`);
+
+        // Try to get config - might already be ready
+        let config = null;
+        try {
+          config = await configService.waitForConfig(timeout);
+        } catch (configError) {
+          console.warn(`[UnifiedWebSocket] Config wait failed (attempt ${attempt}):`, configError.message);
+        }
+
+        // If config not available, try environment inference
+        if (!config?.WS_BASE_URL) {
+          config = this._inferConfigFromEnvironment();
+          if (config) {
+            console.log('[UnifiedWebSocket] Using inferred config:', config.WS_BASE_URL);
           }
-        ];
+        }
 
-        this.isInitialized = true;
-        this._setupClientHandlers();
+        if (config?.WS_BASE_URL) {
+          // Configure endpoints - including reactor-core training
+          this.client.endpoints = [
+            {
+              path: `${config.WS_BASE_URL}/ws`,
+              capabilities: ['general', 'voice', 'command'],
+              priority: 10
+            },
+            {
+              // Reactor-Core training feedback (v9.0)
+              path: `${config.WS_BASE_URL}/reactor-core/training/ws`,
+              capabilities: ['training', 'feedback'],
+              priority: 9
+            },
+            {
+              // Backend mounts vision WS at /vision/ws/vision
+              path: `${config.WS_BASE_URL}/vision/ws/vision`,
+              capabilities: ['vision', 'monitoring'],
+              priority: 8
+            },
+            {
+              // Broadcast WebSocket for maintenance mode events from supervisor
+              path: `${config.WS_BASE_URL}/api/broadcast/ws`,
+              capabilities: ['broadcast', 'maintenance'],
+              priority: 5
+            }
+          ];
+
+          this.isInitialized = true;
+          this._setupClientHandlers();
+          console.log(`[UnifiedWebSocket] Initialized successfully on attempt ${attempt}`);
+          return; // Success!
+        }
+
+        // Config not available - wait before retry
+        if (attempt < MAX_INIT_ATTEMPTS) {
+          const delay = BASE_DELAY * Math.pow(1.5, attempt - 1);
+          console.log(`[UnifiedWebSocket] Waiting ${delay}ms before retry...`);
+          await new Promise(resolve => setTimeout(resolve, delay));
+        }
+
+      } catch (error) {
+        console.error(`[UnifiedWebSocket] Initialization attempt ${attempt} failed:`, error.message);
+
+        if (attempt < MAX_INIT_ATTEMPTS) {
+          const delay = BASE_DELAY * Math.pow(1.5, attempt - 1);
+          await new Promise(resolve => setTimeout(resolve, delay));
+        }
       }
+    }
+
+    console.error('[UnifiedWebSocket] All initialization attempts failed - service will operate in degraded mode');
+  }
+
+  /**
+   * Infer WebSocket configuration from environment when config service unavailable
+   */
+  _inferConfigFromEnvironment() {
+    try {
+      const hostname = window.location.hostname || 'localhost';
+      const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
+      // Try to get port from environment or URL params
+      const urlParams = new URLSearchParams(window.location.search);
+      const port = urlParams.get('port') ||
+                   process.env.REACT_APP_BACKEND_PORT ||
+                   localStorage.getItem('jarvis_backend_port') ||
+                   '8010';
+
+      return {
+        WS_BASE_URL: `${protocol}://${hostname}:${port}`,
+        API_BASE_URL: `${window.location.protocol}//${hostname}:${port}`,
+        inferred: true
+      };
     } catch (error) {
-      console.error('[UnifiedWebSocket] Initialization failed:', error.message);
+      console.error('[UnifiedWebSocket] Environment inference failed:', error);
+      return null;
     }
   }
 
@@ -634,6 +718,64 @@ class UnifiedWebSocketService {
         }
       }
     });
+
+    // ═══════════════════════════════════════════════════════════════════
+    // v9.0: TRAINING STATUS (Reactor-Core Feedback Loop)
+    // ═══════════════════════════════════════════════════════════════════
+    // These events come from /reactor-core/training/ws endpoint
+    // Replaces the independent TrainingStatus WebSocket connection
+    // ═══════════════════════════════════════════════════════════════════
+
+    // Handle training status updates
+    this.client.on('training_status', (data) => {
+      const trainingData = data?.data || data;
+      console.log('🧠 [TRAINING] Status update:', trainingData.stage, `${trainingData.progress?.toFixed(1)}%`);
+
+      this.trainingStatus = {
+        status: trainingData.status || 'idle',
+        stage: trainingData.stage || 'idle',
+        progress: trainingData.progress || 0,
+        message: trainingData.message || '',
+        job_id: trainingData.job_id || null,
+        metrics: trainingData.metrics || null,
+        timestamp: Date.now(),
+      };
+
+      this._notifySubscribers('training_status', this.trainingStatus);
+    });
+
+    // Handle current state (initial state on connect)
+    this.client.on('current_state', (data) => {
+      const trainingData = data?.data || data;
+      console.log('🧠 [TRAINING] Current state received:', trainingData.stage);
+
+      this.trainingStatus = {
+        status: trainingData.status || 'idle',
+        stage: trainingData.stage || 'idle',
+        progress: trainingData.progress || 0,
+        message: trainingData.message || '',
+        job_id: trainingData.job_id || null,
+        metrics: trainingData.metrics || null,
+        timestamp: Date.now(),
+      };
+
+      this._notifySubscribers('training_status', this.trainingStatus);
+    });
+
+    // Handle training connected acknowledgment
+    this.client.on('connected', (data) => {
+      // Check if this is from the training endpoint
+      if (data?.endpoint?.includes('training')) {
+        console.log('🧠 [TRAINING] WebSocket connected to training endpoint');
+        this.trainingConnected = true;
+        this._notifySubscribers('training_connection', { connected: true });
+      }
+    });
+
+    // Handle training ping/pong (keep alive)
+    this.client.on('pong', () => {
+      // Training endpoint responded to ping - connection healthy
+    });
   }
 
   /**
@@ -931,7 +1073,11 @@ export function useUnifiedWebSocket() {
     speechEndedAt: null,
     source: null,
   });
-  
+
+  // v9.0: Training Status (Reactor-Core Feedback Loop)
+  const [trainingStatus, setTrainingStatus] = React.useState(null);
+  const [trainingConnected, setTrainingConnected] = React.useState(false);
+
   const service = React.useMemo(() => getUnifiedWebSocketService(), []);
 
   React.useEffect(() => {
@@ -1069,6 +1215,23 @@ export function useUnifiedWebSocket() {
       });
     });
 
+    // v9.0: Subscribe to Training Status updates (Reactor-Core Feedback Loop)
+    const unsubscribeTrainingStatus = service.subscribe('training_status', (data) => {
+      setTrainingStatus({
+        status: data.status || 'idle',
+        stage: data.stage || 'idle',
+        progress: data.progress || 0,
+        message: data.message || '',
+        job_id: data.job_id || null,
+        metrics: data.metrics || null,
+        timestamp: data.timestamp || Date.now(),
+      });
+    });
+
+    const unsubscribeTrainingConnection = service.subscribe('training_connection', (data) => {
+      setTrainingConnected(data.connected);
+    });
+
     // Initial connection state
     setConnected(service.isConnected());
     setMaintenanceMode(service.isInMaintenanceMode());
@@ -1089,6 +1252,10 @@ export function useUnifiedWebSocket() {
       setStats(service.getStats());
     }, 5000);
 
+    // Initial training state
+    setTrainingStatus(service.trainingStatus || null);
+    setTrainingConnected(service.trainingConnected || false);
+
     return () => {
       unsubscribeConnection();
       unsubscribeMaintenance();
@@ -1100,6 +1267,8 @@ export function useUnifiedWebSocket() {
       unsubscribeHotReload();
       unsubscribeDevMode();
       unsubscribeSpeechState();
+      unsubscribeTrainingStatus();
+      unsubscribeTrainingConnection();
       clearInterval(interval);
     };
   }, [service]);
@@ -1135,6 +1304,10 @@ export function useUnifiedWebSocket() {
     speechState,
     isJarvisSpeaking: speechState.isSpeaking || speechState.inCooldown, // Convenience helper
     shouldBlockAudio: () => speechState.isSpeaking || speechState.inCooldown, // Method for audio processing
+    // v9.0: Training Status (Reactor-Core Feedback Loop)
+    trainingStatus,
+    trainingConnected,
+    isTrainingActive: trainingStatus?.status === 'running', // Convenience helper
     // Actions
     connect: (capability) => service.connect(capability),
     disconnect: () => service.disconnect(),
