@@ -349,35 +349,10 @@ class VBIConfig:
         
         # Progress stage definitions
         self.progress_stages = self._json_config.get('progress_stages', {})
-    
-    def _load_json_config(self) -> dict:
-        """Load configuration from JSON file if available."""
-        config_paths = [
-            os.path.join(os.path.dirname(__file__), '..', 'config', 'cloud_first_config.json'),
-            '/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/backend/config/cloud_first_config.json',
-        ]
-        
-        for config_path in config_paths:
-            try:
-                if os.path.exists(config_path):
-                    import json
-                    with open(config_path, 'r') as f:
-                        config = json.load(f)
-                        logger.debug(f"Loaded cloud-first config from {config_path}")
-                        return config
-            except Exception as e:
-                logger.debug(f"Could not load config from {config_path}: {e}")
-        
-        return {}
-    
-    def _get_bool_config(self, env_key: str, default: bool) -> bool:
-        """Get boolean config from env var or default."""
-        env_val = os.getenv(env_key)
-        if env_val is not None:
-            return env_val.lower() in ('true', '1', 'yes', 'on')
-        return default
 
-        # Behavior
+        # =======================================================================
+        # BEHAVIOR SETTINGS
+        # =======================================================================
         self.announce_confidence = os.getenv('VBI_ANNOUNCE_CONFIDENCE', 'borderline').lower()
         self.use_behavioral_fusion = os.getenv('VBI_USE_BEHAVIORAL', 'true').lower() == 'true'
         self.enable_learning_feedback = os.getenv('VBI_LEARNING_FEEDBACK', 'true').lower() == 'true'
@@ -480,6 +455,33 @@ class VBIConfig:
         self.enable_cost_tracking = os.getenv('VBI_COST_TRACKING', 'true').lower() == 'true'
         self.cost_cache_enabled = os.getenv('VBI_COST_CACHE', 'true').lower() == 'true'
         self.cost_cache_similarity_threshold = float(os.getenv('VBI_COST_CACHE_THRESHOLD', '0.98'))
+
+    def _load_json_config(self) -> dict:
+        """Load configuration from JSON file if available."""
+        config_paths = [
+            os.path.join(os.path.dirname(__file__), '..', 'config', 'cloud_first_config.json'),
+            '/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/backend/config/cloud_first_config.json',
+        ]
+
+        for config_path in config_paths:
+            try:
+                if os.path.exists(config_path):
+                    import json
+                    with open(config_path, 'r') as f:
+                        config = json.load(f)
+                        logger.debug(f"Loaded cloud-first config from {config_path}")
+                        return config
+            except Exception as e:
+                logger.debug(f"Could not load config from {config_path}: {e}")
+
+        return {}
+
+    def _get_bool_config(self, env_key: str, default: bool) -> bool:
+        """Get boolean config from env var or default."""
+        env_val = os.getenv(env_key)
+        if env_val is not None:
+            return env_val.lower() in ('true', '1', 'yes', 'on')
+        return default
 
     def __getattr__(self, name: str):
         """Fallback for missing config attributes - provides sensible defaults."""

@@ -675,10 +675,23 @@ WantedBy=default.target
             'auto_heal_triggered': False
         }
 
-        # Check for psycopg2 dependency (PostgreSQL driver)
+        # Check for psycopg2 dependency (PostgreSQL driver) using unified driver manager
+        psycopg2 = None
         try:
-            import psycopg2
+            from intelligence.unified_database_drivers import get_driver_manager, DriverStatus
+            driver_manager = get_driver_manager()
+            status = driver_manager.check_driver('psycopg2', auto_install=True)
+            if status == DriverStatus.READY:
+                psycopg2 = driver_manager.get_psycopg2()
         except ImportError:
+            # Fallback to direct import if unified manager not available
+            try:
+                import psycopg2 as _psycopg2
+                psycopg2 = _psycopg2
+            except ImportError:
+                pass
+
+        if psycopg2 is None:
             logger.warning("[CLOUDSQL] ❌ psycopg2 not installed - database connection checks disabled")
             health_data['connection_active'] = False
             health_data['error'] = 'psycopg2 not installed'
@@ -1146,10 +1159,23 @@ WantedBy=default.target
             'issues': []
         }
 
-        # Check for psycopg2 dependency
+        # Check for psycopg2 dependency using unified driver manager
+        psycopg2 = None
         try:
-            import psycopg2
+            from intelligence.unified_database_drivers import get_driver_manager, DriverStatus
+            driver_manager = get_driver_manager()
+            status = driver_manager.check_driver('psycopg2', auto_install=True)
+            if status == DriverStatus.READY:
+                psycopg2 = driver_manager.get_psycopg2()
         except ImportError:
+            # Fallback to direct import
+            try:
+                import psycopg2 as _psycopg2
+                psycopg2 = _psycopg2
+            except ImportError:
+                pass
+
+        if psycopg2 is None:
             logger.warning("[CLOUDSQL] ❌ psycopg2 not installed - voice profile checks disabled")
             profile_data['status'] = 'psycopg2_missing'
             profile_data['error'] = 'psycopg2 not installed'

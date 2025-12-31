@@ -185,6 +185,26 @@ import os
 import subprocess
 import sys
 
+# =============================================================================
+# CRITICAL: NUMBA JIT DISABLE - MUST BE FIRST BEFORE ANY OTHER IMPORTS
+# =============================================================================
+# This MUST happen BEFORE any module that might import numba (whisper, librosa,
+# scipy with JIT, etc.). Setting it here prevents the circular import error:
+#   "cannot import name 'get_hashable_key' from partially initialized module"
+#
+# The error occurs because:
+# 1. Multiple threads try to import numba simultaneously during parallel imports
+# 2. Thread A starts importing numba.core.utils
+# 3. Thread B also tries to import before Thread A finishes
+# 4. Thread B sees a partially initialized module and crashes
+#
+# By disabling JIT at the very start, we prevent numba from doing the complex
+# compilation that causes race conditions. Whisper/librosa work fine without JIT.
+# =============================================================================
+os.environ["NUMBA_DISABLE_JIT"] = "1"
+os.environ["NUMBA_NUM_THREADS"] = "1"
+os.environ["NUMBA_THREADING_LAYER"] = "workqueue"
+
 # Set critical environment variables FIRST
 if sys.platform == "darwin":  # macOS specific
     os.environ["OBJC_DISABLE_INITIALIZE_FORK_SAFETY"] = "YES"
