@@ -18,6 +18,10 @@ class MicrophonePermissionManager {
     }
     MicrophonePermissionManager.instance = this;
 
+    // v3.0: Comprehensive debugging for microphone issues
+    this._debug = true; // Enable debug logging
+    this._log('MicrophonePermissionManager v3.0 initializing...');
+
     // =========================================================================
     // Permission State
     // =========================================================================
@@ -54,6 +58,29 @@ class MicrophonePermissionManager {
     // Initialize
     // =========================================================================
     this._initializePermissionMonitoring();
+  }
+
+  // ===========================================================================
+  // v3.0: Debug Logging
+  // ===========================================================================
+  _log(message, data = null) {
+    if (this._debug) {
+      const timestamp = new Date().toISOString().split('T')[1].split('.')[0];
+      if (data) {
+        console.log(`[MicPerm ${timestamp}] ${message}`, data);
+      } else {
+        console.log(`[MicPerm ${timestamp}] ${message}`);
+      }
+    }
+  }
+
+  _error(message, error = null) {
+    const timestamp = new Date().toISOString().split('T')[1].split('.')[0];
+    if (error) {
+      console.error(`[MicPerm ${timestamp}] ❌ ${message}`, error);
+    } else {
+      console.error(`[MicPerm ${timestamp}] ❌ ${message}`);
+    }
   }
 
   // ===========================================================================
@@ -100,89 +127,122 @@ class MicrophonePermissionManager {
    * Check permission state with fresh query (async).
    * Updates internal state and returns result.
    *
-   * v2.0: CRITICAL FIX - Do NOT use enumerateDevices() to determine device availability
-   * before permission is granted. Browsers (especially Safari) return empty arrays
-   * or don't report audio devices until AFTER getUserMedia succeeds once.
-   * The authoritative way to know if a device exists is to try getUserMedia and
-   * handle the NotFoundError.
+   * v3.0: COMPREHENSIVE DEBUGGING + ROBUST DETECTION
+   * - Do NOT use enumerateDevices() to determine device availability before permission
+   * - Only use getUserMedia errors as authoritative "no device" indicator
+   * - Detailed logging at every step
    */
   async checkPermission() {
+    this._log('checkPermission() called');
+
     try {
-      // Use Permissions API if available
+      // Step 1: Check browser support
+      this._log('Step 1: Checking browser support...');
+      if (!navigator.mediaDevices) {
+        this._error('navigator.mediaDevices not available');
+        return 'unsupported';
+      }
+      if (!navigator.mediaDevices.getUserMedia) {
+        this._error('getUserMedia not available');
+        return 'unsupported';
+      }
+      this._log('Step 1: Browser support OK ✓');
+
+      // Step 2: Try Permissions API
+      this._log('Step 2: Checking Permissions API...');
       if (navigator.permissions?.query) {
         try {
           const result = await navigator.permissions.query({ name: 'microphone' });
+          this._log(`Step 2: Permissions API returned: "${result.state}"`, {
+            state: result.state,
+            name: result.name
+          });
+
           this._updateState({ permission: result.state, lastChecked: Date.now() });
 
-          // v2.0: Only check device availability if permission is already granted
-          // Before permission grant, browsers don't reliably report devices
-          if (result.state === 'granted' && navigator.mediaDevices?.enumerateDevices) {
-            const devices = await navigator.mediaDevices.enumerateDevices();
-            const audioInputs = devices.filter(d => d.kind === 'audioinput');
-            const hasAudioInput = audioInputs.length > 0;
+          // v3.0: Only check device availability if permission is ALREADY granted
+          if (result.state === 'granted') {
+            this._log('Step 2a: Permission granted, checking devices...');
+            if (navigator.mediaDevices?.enumerateDevices) {
+              const devices = await navigator.mediaDevices.enumerateDevices();
+              const audioInputs = devices.filter(d => d.kind === 'audioinput');
+              this._log(`Step 2a: Found ${audioInputs.length} audio input(s)`, audioInputs.map(d => ({
+                deviceId: d.deviceId?.substring(0, 8) + '...',
+                label: d.label || '(no label)',
+                kind: d.kind
+              })));
 
-            this._updateState({
-              deviceAvailable: hasAudioInput,
-            });
+              this._updateState({ deviceAvailable: audioInputs.length > 0 });
 
-            console.log(`[MicPermissionManager] Found ${audioInputs.length} audio input device(s)`);
-
-            // Only return 'unavailable' if we're CERTAIN there's no device
-            // (permission granted + enumeration shows no devices)
-            if (!hasAudioInput) {
-              return 'unavailable';
+              if (audioInputs.length === 0) {
+                this._error('Step 2a: Permission granted but NO audio devices found!');
+                return 'unavailable';
+              }
             }
+          } else {
+            this._log(`Step 2b: Permission is "${result.state}", NOT checking devices (unreliable before grant)`);
           }
 
           return result.state;
+
         } catch (permError) {
-          // Permissions API query failed (e.g., Safari doesn't support 'microphone' query)
-          console.log('[MicPermissionManager] Permissions API query failed, will try getUserMedia:', permError.message);
-          // Fall through to return 'prompt' - let getUserMedia be the authority
+          // Safari doesn't support 'microphone' permission query
+          this._log('Step 2: Permissions API query failed (expected on Safari):', permError.message);
         }
+      } else {
+        this._log('Step 2: Permissions API not available');
       }
 
-      // v2.0: If we can't query permissions, assume 'prompt' state
-      // Do NOT try to enumerate devices here - it's unreliable before permission grant
-      // The correct flow is: try getUserMedia -> if NotFoundError, then no device
+      // Step 3: Fallback - assume 'prompt' and let getUserMedia be authoritative
+      this._log('Step 3: Falling back to "prompt" state');
       return 'prompt';
+
     } catch (error) {
-      console.warn('[MicPermissionManager] Permission check failed:', error);
+      this._error('checkPermission() failed with exception:', error);
       return 'unknown';
     }
   }
 
   /**
    * Request microphone permission with proper locking.
-   * Prevents concurrent requests that cause race conditions.
+   * v3.0: Comprehensive debugging + robust error handling
    *
    * @param {string} requesterId - Identifier for who is requesting (for debugging)
    * @param {object} options - getUserMedia options
    * @returns {Promise<{success: boolean, stream?: MediaStream, error?: string}>}
    */
   async requestPermission(requesterId = 'unknown', options = {}) {
+    this._log(`requestPermission() called by "${requesterId}"`);
+    this._log('Current state:', this.state);
+
     // Quick pre-check - don't even try if hard denied
-    if (!this.canUseMicrophone()) {
-      console.log(`[MicPermissionManager] Request from ${requesterId} blocked - permission not available`);
+    const canUse = this.canUseMicrophone();
+    this._log(`canUseMicrophone() = ${canUse}`);
+
+    if (!canUse) {
+      const reason = this._getDenialReason();
+      this._error(`Request from "${requesterId}" blocked: ${reason}`);
       return {
         success: false,
         error: 'permission_denied',
-        reason: this._getDenialReason(),
+        reason: reason,
         instructions: this.getPermissionInstructions(),
       };
     }
 
     // Acquire lock to prevent concurrent requests
+    this._log('Acquiring lock...');
     const lockAcquired = await this._acquireLock(requesterId);
-    if (!lockAcquired) {
-      console.log(`[MicPermissionManager] Request from ${requesterId} - waiting for lock`);
-    }
+    this._log(`Lock acquired: ${lockAcquired}`);
 
     try {
       // Fresh permission check before requesting
+      this._log('Calling checkPermission()...');
       const currentState = await this.checkPermission();
+      this._log(`checkPermission() returned: "${currentState}"`);
 
       if (currentState === 'denied') {
+        this._error('Permission is DENIED by browser');
         this._handleDenial('permission_api_denied');
         return {
           success: false,
@@ -193,10 +253,20 @@ class MicrophonePermissionManager {
       }
 
       if (currentState === 'unavailable') {
+        this._error('No devices available (permission granted but no mic found)');
         return {
           success: false,
           error: 'no_device',
-          reason: 'No microphone device found',
+          reason: 'No microphone device found (permission granted, device missing)',
+        };
+      }
+
+      if (currentState === 'unsupported') {
+        this._error('Browser does not support getUserMedia');
+        return {
+          success: false,
+          error: 'unsupported',
+          reason: 'Browser does not support microphone access',
         };
       }
 
@@ -210,12 +280,18 @@ class MicrophonePermissionManager {
         }
       };
 
-      console.log(`[MicPermissionManager] Requesting getUserMedia for ${requesterId}`);
+      this._log(`Calling getUserMedia with constraints:`, audioConstraints);
+      this._log('>>> This should trigger browser permission dialog if needed <<<');
+
       const stream = await navigator.mediaDevices.getUserMedia(audioConstraints);
 
       // Success!
+      this._log('✅ getUserMedia SUCCESS!', {
+        streamId: stream.id,
+        tracks: stream.getTracks().map(t => ({ kind: t.kind, label: t.label, id: t.id }))
+      });
+
       this._handleSuccess();
-      console.log(`[MicPermissionManager] Permission granted for ${requesterId}`);
 
       return {
         success: true,
@@ -223,8 +299,15 @@ class MicrophonePermissionManager {
       };
 
     } catch (error) {
-      // Handle specific error types
+      // Handle specific error types with detailed logging
+      this._error(`getUserMedia FAILED:`, {
+        name: error.name,
+        message: error.message,
+        stack: error.stack?.split('\n').slice(0, 3).join('\n')
+      });
+
       if (error.name === 'NotAllowedError' || error.name === 'PermissionDeniedError') {
+        this._error('User DENIED permission or browser blocked access');
         this._handleDenial('user_denied');
         return {
           success: false,
@@ -235,19 +318,48 @@ class MicrophonePermissionManager {
       }
 
       if (error.name === 'NotFoundError' || error.name === 'DevicesNotFoundError') {
+        this._error('NO MICROPHONE DEVICE FOUND (NotFoundError)');
         this._updateState({ deviceAvailable: false });
         return {
           success: false,
           error: 'no_device',
-          reason: 'No microphone found',
+          reason: 'No microphone found - getUserMedia threw NotFoundError',
         };
       }
 
       if (error.name === 'NotReadableError' || error.name === 'TrackStartError') {
+        this._error('Microphone is BUSY or not readable');
         return {
           success: false,
           error: 'device_busy',
-          reason: 'Microphone is in use by another application',
+          reason: 'Microphone is in use by another application or not readable',
+        };
+      }
+
+      if (error.name === 'OverconstrainedError') {
+        this._error('Audio constraints cannot be satisfied');
+        return {
+          success: false,
+          error: 'overconstrained',
+          reason: 'Audio constraints cannot be satisfied by available device',
+        };
+      }
+
+      if (error.name === 'AbortError') {
+        this._error('getUserMedia was aborted');
+        return {
+          success: false,
+          error: 'aborted',
+          reason: 'Microphone access request was aborted',
+        };
+      }
+
+      if (error.name === 'SecurityError') {
+        this._error('Security error - possibly not HTTPS or localhost');
+        return {
+          success: false,
+          error: 'security',
+          reason: 'Security error - microphone requires HTTPS or localhost',
         };
       }
 
@@ -499,6 +611,175 @@ class MicrophonePermissionManager {
     }
 
     return { name, version, ua };
+  }
+
+  // ===========================================================================
+  // v3.0: Comprehensive Diagnostic Method
+  // Call this from browser console: window.microphonePermissionManager.runDiagnostics()
+  // ===========================================================================
+  async runDiagnostics() {
+    console.log('═══════════════════════════════════════════════════════════════');
+    console.log('🎤 MICROPHONE DIAGNOSTICS v3.0');
+    console.log('═══════════════════════════════════════════════════════════════');
+
+    const results = {
+      timestamp: new Date().toISOString(),
+      browser: this.browser,
+      currentState: this.state,
+      tests: {}
+    };
+
+    // Test 1: Browser API Support
+    console.log('\n📋 Test 1: Browser API Support');
+    results.tests.browserSupport = {
+      mediaDevices: !!navigator.mediaDevices,
+      getUserMedia: !!navigator.mediaDevices?.getUserMedia,
+      enumerateDevices: !!navigator.mediaDevices?.enumerateDevices,
+      permissionsApi: !!navigator.permissions?.query,
+    };
+    console.log('  mediaDevices:', results.tests.browserSupport.mediaDevices ? '✅' : '❌');
+    console.log('  getUserMedia:', results.tests.browserSupport.getUserMedia ? '✅' : '❌');
+    console.log('  enumerateDevices:', results.tests.browserSupport.enumerateDevices ? '✅' : '❌');
+    console.log('  Permissions API:', results.tests.browserSupport.permissionsApi ? '✅' : '❌');
+
+    // Test 2: Permissions API Query
+    console.log('\n📋 Test 2: Permissions API Query');
+    try {
+      if (navigator.permissions?.query) {
+        const perm = await navigator.permissions.query({ name: 'microphone' });
+        results.tests.permissionQuery = {
+          success: true,
+          state: perm.state,
+          name: perm.name
+        };
+        console.log('  Permission state:', perm.state);
+      } else {
+        results.tests.permissionQuery = { success: false, reason: 'API not available' };
+        console.log('  ⚠️ Permissions API not available');
+      }
+    } catch (e) {
+      results.tests.permissionQuery = { success: false, error: e.message };
+      console.log('  ❌ Query failed:', e.message);
+    }
+
+    // Test 3: Device Enumeration
+    console.log('\n📋 Test 3: Device Enumeration');
+    try {
+      if (navigator.mediaDevices?.enumerateDevices) {
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const audioInputs = devices.filter(d => d.kind === 'audioinput');
+        results.tests.deviceEnumeration = {
+          success: true,
+          totalDevices: devices.length,
+          audioInputs: audioInputs.length,
+          devices: audioInputs.map(d => ({
+            deviceId: d.deviceId ? d.deviceId.substring(0, 16) + '...' : '(empty)',
+            label: d.label || '(no label - permission needed)',
+            kind: d.kind
+          }))
+        };
+        console.log(`  Total devices: ${devices.length}`);
+        console.log(`  Audio inputs: ${audioInputs.length}`);
+        audioInputs.forEach((d, i) => {
+          console.log(`    [${i}] ${d.label || '(no label)'} - ${d.deviceId?.substring(0, 16) || '(no id)'}...`);
+        });
+        if (audioInputs.length === 0) {
+          console.log('  ⚠️ No audio inputs found - this is normal if permission not yet granted');
+        }
+      } else {
+        results.tests.deviceEnumeration = { success: false, reason: 'API not available' };
+      }
+    } catch (e) {
+      results.tests.deviceEnumeration = { success: false, error: e.message };
+      console.log('  ❌ Enumeration failed:', e.message);
+    }
+
+    // Test 4: Direct getUserMedia Test
+    console.log('\n📋 Test 4: Direct getUserMedia Test');
+    console.log('  ⏳ Attempting getUserMedia (may show browser permission dialog)...');
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const tracks = stream.getTracks();
+      results.tests.getUserMedia = {
+        success: true,
+        streamId: stream.id,
+        tracks: tracks.map(t => ({ kind: t.kind, label: t.label, enabled: t.enabled }))
+      };
+      console.log('  ✅ SUCCESS! Stream obtained:', stream.id);
+      tracks.forEach(t => {
+        console.log(`    Track: ${t.kind} - ${t.label} (enabled: ${t.enabled})`);
+      });
+      // Clean up
+      tracks.forEach(t => t.stop());
+      console.log('  🧹 Stream cleaned up');
+    } catch (e) {
+      results.tests.getUserMedia = {
+        success: false,
+        errorName: e.name,
+        errorMessage: e.message
+      };
+      console.log(`  ❌ FAILED: ${e.name}`);
+      console.log(`  Message: ${e.message}`);
+
+      // Provide specific guidance
+      if (e.name === 'NotAllowedError') {
+        console.log('\n  💡 SOLUTION: You need to grant microphone permission');
+        console.log('     - Check browser address bar for microphone icon');
+        console.log('     - Check macOS System Preferences > Security & Privacy > Microphone');
+        console.log('     - Ensure your browser has microphone access enabled');
+      } else if (e.name === 'NotFoundError') {
+        console.log('\n  💡 SOLUTION: No microphone detected');
+        console.log('     - Check if microphone is connected');
+        console.log('     - Check macOS Sound preferences for input devices');
+        console.log('     - Try a different microphone');
+      } else if (e.name === 'NotReadableError') {
+        console.log('\n  💡 SOLUTION: Microphone is busy');
+        console.log('     - Close other apps using the microphone');
+        console.log('     - Try restarting your browser');
+      }
+    }
+
+    // Test 5: Re-enumerate after permission
+    console.log('\n📋 Test 5: Re-enumerate Devices (after permission attempt)');
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const audioInputs = devices.filter(d => d.kind === 'audioinput');
+      results.tests.postPermissionEnumeration = {
+        success: true,
+        audioInputs: audioInputs.length,
+        hasLabels: audioInputs.some(d => d.label !== ''),
+        devices: audioInputs.map(d => ({ label: d.label, deviceId: d.deviceId?.substring(0, 16) }))
+      };
+      console.log(`  Audio inputs: ${audioInputs.length}`);
+      console.log(`  Has labels: ${results.tests.postPermissionEnumeration.hasLabels ? '✅ Yes' : '❌ No (permission not granted)'}`);
+      audioInputs.forEach((d, i) => {
+        console.log(`    [${i}] ${d.label || '(still no label)'}`);
+      });
+    } catch (e) {
+      results.tests.postPermissionEnumeration = { success: false, error: e.message };
+    }
+
+    // Summary
+    console.log('\n═══════════════════════════════════════════════════════════════');
+    console.log('📊 SUMMARY');
+    console.log('═══════════════════════════════════════════════════════════════');
+    console.log('Browser:', `${this.browser.name} ${this.browser.version}`);
+    console.log('Manager State:', JSON.stringify(this.state, null, 2));
+    console.log('getUserMedia:', results.tests.getUserMedia?.success ? '✅ WORKING' : '❌ FAILED');
+
+    if (!results.tests.getUserMedia?.success) {
+      console.log('\n🔧 RECOMMENDED ACTIONS:');
+      console.log('1. Open a new browser tab');
+      console.log('2. Navigate to: chrome://settings/content/microphone (for Chrome)');
+      console.log('3. Ensure this site is in the "Allow" list');
+      console.log('4. Check macOS System Preferences > Security & Privacy > Privacy > Microphone');
+      console.log('5. Ensure your browser app has a checkmark');
+    }
+
+    console.log('\n📋 Full results saved to: window.lastMicDiagnostics');
+    window.lastMicDiagnostics = results;
+
+    return results;
   }
 }
 
