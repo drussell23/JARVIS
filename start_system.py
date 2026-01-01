@@ -648,6 +648,70 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+
+# =============================================================================
+# LAZY ASYNC LOCK HELPER - Python 3.9 Compatibility
+# =============================================================================
+# In Python 3.9, asyncio.Lock() cannot be created outside an async context.
+# This helper provides lazy initialization that works in both sync and async code.
+
+class LazyAsyncLock:
+    """
+    A lazy-initialized asyncio.Lock that works in Python 3.9+.
+
+    The lock is created on first use within an async context, avoiding the
+    "no current event loop" error that occurs when creating asyncio.Lock()
+    in __init__ methods outside of async functions.
+
+    Usage:
+        class MyClass:
+            def __init__(self):
+                self._lock = LazyAsyncLock()
+
+            async def my_method(self):
+                async with self._lock:
+                    # protected code
+    """
+    __slots__ = ('_lock', '_sync_lock')
+
+    def __init__(self):
+        self._lock: Optional[asyncio.Lock] = None
+        self._sync_lock = threading.Lock()
+
+    def _get_lock(self) -> asyncio.Lock:
+        """Get or create the asyncio.Lock (must be called from async context)."""
+        if self._lock is None:
+            with self._sync_lock:
+                if self._lock is None:
+                    self._lock = asyncio.Lock()
+        return self._lock
+
+    async def acquire(self) -> bool:
+        """Acquire the lock."""
+        return await self._get_lock().acquire()
+
+    def release(self) -> None:
+        """Release the lock."""
+        if self._lock is not None:
+            self._lock.release()
+
+    def locked(self) -> bool:
+        """Check if locked."""
+        if self._lock is None:
+            return False
+        return self._lock.locked()
+
+    async def __aenter__(self):
+        """Async context manager entry."""
+        await self._get_lock().acquire()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Async context manager exit."""
+        self._lock.release()
+        return False
+
+
 # =============================================================================
 # HYPER-RUNTIME ENGINE v9.0: Rust-First Async Architecture
 # =============================================================================
@@ -1655,7 +1719,7 @@ class GlobalSessionManager:
         if self._initialized:
             return
 
-        self._lock = asyncio.Lock()
+        self._lock = LazyAsyncLock()  # Lazy init for Python 3.9 compatibility
         self._sync_lock = threading.Lock()
 
         # Session identity
@@ -4175,7 +4239,7 @@ class CacheStatisticsTracker:
             cost_per_inference: Cost in USD per ML inference (for savings calculation)
             max_event_log_size: Maximum events to keep in the rolling log
         """
-        self._lock = asyncio.Lock()
+        self._lock = LazyAsyncLock()  # Lazy init for Python 3.9 compatibility
 
         # Core counters (use underscore prefix for internal access)
         self._cache_hits: int = 0
@@ -5960,7 +6024,7 @@ class IntelligentChromeIncognitoManager:
         self._incognito_window_id: Optional[int] = None
         self._incognito_tab_id: Optional[int] = None
         self._session_started: bool = False
-        self._lock = asyncio.Lock()
+        self._lock = LazyAsyncLock()  # Lazy init for Python 3.9 compatibility
         self._last_operation_time: Optional[datetime] = None
         self._operation_count: int = 0
         self._error_count: int = 0
@@ -15175,13 +15239,17 @@ _browser_opened_this_startup = False
 
 # Global lock for browser operations - prevents race conditions between concurrent calls
 # This is a module-level lock that ALL browser operations must acquire
-_browser_operation_lock: Optional[asyncio.Lock] = None
+# Using LazyAsyncLock for Python 3.9 compatibility
+_browser_operation_lock: Optional[LazyAsyncLock] = None
+_browser_sync_lock = threading.Lock()
 
-def _get_browser_lock() -> asyncio.Lock:
-    """Get or create the global browser operation lock."""
+def _get_browser_lock() -> LazyAsyncLock:
+    """Get or create the global browser operation lock (Python 3.9 compatible)."""
     global _browser_operation_lock
     if _browser_operation_lock is None:
-        _browser_operation_lock = asyncio.Lock()
+        with _browser_sync_lock:
+            if _browser_operation_lock is None:
+                _browser_operation_lock = LazyAsyncLock()
     return _browser_operation_lock
 
 
@@ -19374,7 +19442,7 @@ class AdvancedStartupBootstrapper:
         self._interrupt_count: int = 0
         self._last_interrupt_time: float = 0
         self._hybrid_coordinator: Optional[Any] = None
-        self._lock = asyncio.Lock() if hasattr(asyncio, 'Lock') else None
+        self._lock = LazyAsyncLock()  # Lazy init for Python 3.9 compatibility
 
         # Discover paths immediately (sync, required for early setup)
         self._discover_paths()
