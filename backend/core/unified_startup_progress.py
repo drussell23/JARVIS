@@ -33,6 +33,7 @@ Features:
 import asyncio
 import json
 import logging
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -41,6 +42,37 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 from weakref import WeakSet
 
 import aiohttp
+
+# Python 3.9 compatible lock - lazily initializes asyncio.Lock
+try:
+    from backend.utils.python39_compat import AsyncLock
+except ImportError:
+    # Fallback: Define inline if import fails
+    class AsyncLock:
+        """Python 3.9-safe lock that lazily creates asyncio.Lock."""
+        def __init__(self):
+            self._thread_lock = threading.RLock()
+            self._async_lock: Optional[asyncio.Lock] = None
+
+        def _get_async_lock(self) -> asyncio.Lock:
+            if self._async_lock is None:
+                try:
+                    self._async_lock = asyncio.Lock()
+                except RuntimeError:
+                    pass
+            return self._async_lock
+
+        async def __aenter__(self):
+            async_lock = self._get_async_lock()
+            if async_lock:
+                await async_lock.acquire()
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            async_lock = self._get_async_lock()
+            if async_lock and async_lock.locked():
+                async_lock.release()
+            return False
 
 logger = logging.getLogger(__name__)
 
@@ -113,7 +145,8 @@ class UnifiedStartupProgressHub:
     """
 
     _instance: Optional["UnifiedStartupProgressHub"] = None
-    _lock = asyncio.Lock()
+    _lock = None  # Lazily initialized - Python 3.9 compatible
+    _lock_init = threading.Lock()  # Thread-safe lazy init
 
     def __init__(self):
         # Core state
@@ -145,8 +178,8 @@ class UnifiedStartupProgressHub:
         # HTTP session for loading server sync
         self._session: Optional[aiohttp.ClientSession] = None
 
-        # Lock for thread safety
-        self._state_lock = asyncio.Lock()
+        # Lock for thread safety - Python 3.9 compatible
+        self._state_lock = AsyncLock()
 
         # System info
         self._memory_info: Optional[Dict[str, Any]] = None
@@ -174,9 +207,19 @@ class UnifiedStartupProgressHub:
         }
 
     @classmethod
+    def _get_class_lock(cls) -> asyncio.Lock:
+        """Lazily create the class-level asyncio.Lock (Python 3.9 safe)."""
+        if cls._lock is None:
+            with cls._lock_init:
+                if cls._lock is None:
+                    cls._lock = asyncio.Lock()
+        return cls._lock
+
+    @classmethod
     async def get_instance(cls) -> "UnifiedStartupProgressHub":
         """Get or create the singleton instance"""
-        async with cls._lock:
+        lock = cls._get_class_lock()
+        async with lock:
             if cls._instance is None:
                 cls._instance = cls()
             return cls._instance
@@ -184,9 +227,10 @@ class UnifiedStartupProgressHub:
     @classmethod
     def get_instance_sync(cls) -> "UnifiedStartupProgressHub":
         """Synchronous version for non-async contexts"""
-        if cls._instance is None:
-            cls._instance = cls()
-        return cls._instance
+        with cls._lock_init:
+            if cls._instance is None:
+                cls._instance = cls()
+            return cls._instance
 
     # =========================================================================
     # Initialization

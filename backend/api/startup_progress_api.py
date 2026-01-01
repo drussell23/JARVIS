@@ -12,9 +12,41 @@ to the UnifiedStartupProgressHub as the single source of truth.
 
 import asyncio
 import logging
-from typing import Dict, List, Set
+import threading
+from typing import Dict, List, Optional, Set
 from datetime import datetime
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+
+# Python 3.9 compatible lock - lazily initializes asyncio.Lock
+try:
+    from backend.utils.python39_compat import AsyncLock
+except ImportError:
+    # Fallback: Define inline if import fails
+    class AsyncLock:
+        """Python 3.9-safe lock that lazily creates asyncio.Lock."""
+        def __init__(self):
+            self._thread_lock = threading.RLock()
+            self._async_lock: Optional[asyncio.Lock] = None
+
+        def _get_async_lock(self) -> asyncio.Lock:
+            if self._async_lock is None:
+                try:
+                    self._async_lock = asyncio.Lock()
+                except RuntimeError:
+                    pass
+            return self._async_lock
+
+        async def __aenter__(self):
+            async_lock = self._get_async_lock()
+            if async_lock:
+                await async_lock.acquire()
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            async_lock = self._get_async_lock()
+            if async_lock and async_lock.locked():
+                async_lock.release()
+            return False
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +76,7 @@ class StartupProgressManager:
 
     def __init__(self):
         self.connections: Set[WebSocket] = set()
-        self._lock = asyncio.Lock()
+        self._lock = AsyncLock()  # Python 3.9 compatible
 
         # Get the unified hub (if available)
         self._hub: UnifiedStartupProgressHub = None

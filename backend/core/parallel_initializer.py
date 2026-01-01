@@ -36,10 +36,45 @@ import asyncio
 import logging
 import os
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional
+
+# Python 3.9 compatible lock - lazily initializes asyncio.Lock
+try:
+    from backend.utils.python39_compat import AsyncLock
+except ImportError:
+    try:
+        from utils.python39_compat import AsyncLock
+    except ImportError:
+        # Fallback: Define inline if import fails
+        class AsyncLock:
+            """Python 3.9-safe lock that lazily creates asyncio.Lock."""
+            def __init__(self):
+                self._thread_lock = threading.RLock()
+                self._async_lock: Optional[asyncio.Lock] = None
+
+            def _get_async_lock(self) -> asyncio.Lock:
+                if self._async_lock is None:
+                    try:
+                        self._async_lock = asyncio.Lock()
+                    except RuntimeError:
+                        pass
+                return self._async_lock
+
+            async def __aenter__(self):
+                async_lock = self._get_async_lock()
+                if async_lock:
+                    await async_lock.acquire()
+                return self
+
+            async def __aexit__(self, exc_type, exc_val, exc_tb):
+                async_lock = self._get_async_lock()
+                if async_lock and async_lock.locked():
+                    async_lock.release()
+                return False
 
 # Import the startup progress broadcaster for real-time WebSocket updates
 from core.startup_progress_broadcaster import get_startup_broadcaster
@@ -138,12 +173,14 @@ class ParallelInitializer:
         self.components: Dict[str, ComponentInit] = {}
         self.started_at: Optional[float] = None
         self.background_task: Optional[asyncio.Task] = None
-        self._lock = asyncio.Lock()
-        self._ready_event = asyncio.Event()
-        self._full_mode_event = asyncio.Event()
-        self._shutdown_event = asyncio.Event()
+        self._lock = AsyncLock()  # Python 3.9 compatible
+        # Note: asyncio.Event() can be created outside event loop in Python 3.9
+        # but we'll create them lazily for safety
+        self._ready_event: Optional[asyncio.Event] = None
+        self._full_mode_event: Optional[asyncio.Event] = None
+        self._shutdown_event: Optional[asyncio.Event] = None
         # v2.0: Interactive readiness - fires when user can interact (WebSocket + Voice API)
-        self._interactive_ready_event = asyncio.Event()
+        self._interactive_ready_event: Optional[asyncio.Event] = None
         # v2.0: Watchdog task for detecting stale components
         self._watchdog_task: Optional[asyncio.Task] = None
         # v2.0: Track if interactive mode was announced
@@ -154,6 +191,30 @@ class ParallelInitializer:
 
         # Register standard components
         self._register_components()
+
+    def _get_ready_event(self) -> asyncio.Event:
+        """Lazily create the ready event (Python 3.9 safe)."""
+        if self._ready_event is None:
+            self._ready_event = asyncio.Event()
+        return self._ready_event
+
+    def _get_full_mode_event(self) -> asyncio.Event:
+        """Lazily create the full mode event (Python 3.9 safe)."""
+        if self._full_mode_event is None:
+            self._full_mode_event = asyncio.Event()
+        return self._full_mode_event
+
+    def _get_shutdown_event(self) -> asyncio.Event:
+        """Lazily create the shutdown event (Python 3.9 safe)."""
+        if self._shutdown_event is None:
+            self._shutdown_event = asyncio.Event()
+        return self._shutdown_event
+
+    def _get_interactive_ready_event(self) -> asyncio.Event:
+        """Lazily create the interactive ready event (Python 3.9 safe)."""
+        if self._interactive_ready_event is None:
+            self._interactive_ready_event = asyncio.Event()
+        return self._interactive_ready_event
 
     def _register_components(self):
         """
@@ -279,7 +340,7 @@ class ParallelInitializer:
         await self._mark_complete("config")
 
         # Server is ready for basic health checks
-        self._ready_event.set()
+        self._get_ready_event().set()
         logger.info("Server ready for health checks")
 
         # Launch background initialization
@@ -314,7 +375,7 @@ class ParallelInitializer:
 
             # Initialize each priority group
             for priority, group in sorted(priority_groups.items()):
-                if self._shutdown_event.is_set():
+                if self._get_shutdown_event().is_set():
                     break
 
                 logger.info(f"Initializing priority {priority} components: {[c.name for c in group]}")
@@ -350,7 +411,7 @@ class ParallelInitializer:
                 logger.warning(f"DEGRADED MODE: Critical components failed: {failed_critical}")
             else:
                 self.app.state.startup_phase = "FULL_MODE"
-                self._full_mode_event.set()
+                self._get_full_mode_event().set()
                 logger.info("")
                 logger.info("=" * 60)
                 logger.info("FULL MODE - All Systems Operational")
@@ -407,7 +468,7 @@ class ParallelInitializer:
 
         start_time = time.time()
 
-        while not self._shutdown_event.is_set():
+        while not self._get_shutdown_event().is_set():
             try:
                 elapsed = time.time() - start_time
 
@@ -436,11 +497,11 @@ class ParallelInitializer:
                         )
 
                 # Check for interactive readiness
-                if not self._interactive_ready_event.is_set():
+                if not self._get_interactive_ready_event().is_set():
                     await self._check_interactive_ready()
 
                 # If full mode is set, we're done
-                if self._full_mode_event.is_set():
+                if self._get_full_mode_event().is_set():
                     logger.info("🐕 Watchdog: Full mode reached, stopping")
                     break
 
@@ -462,7 +523,7 @@ class ParallelInitializer:
 
         Interactive components: unified_websocket, jarvis_voice_api, voice_unlock_api
         """
-        if self._interactive_ready_event.is_set():
+        if self._get_interactive_ready_event().is_set():
             return
 
         interactive_components = [
@@ -480,7 +541,7 @@ class ParallelInitializer:
         if websocket_ready and websocket_ready.phase == InitPhase.COMPLETE:
             # WebSocket is ready - we can accept connections
             if len(ready_interactive) >= 1:  # At least WebSocket
-                self._interactive_ready_event.set()
+                self._get_interactive_ready_event().set()
                 self.app.state.interactive_ready = True
 
                 if not self._interactive_announced:
@@ -504,7 +565,7 @@ class ParallelInitializer:
 
     def is_interactive_ready(self) -> bool:
         """Check if interactive components are ready"""
-        return self._interactive_ready_event.is_set()
+        return self._get_interactive_ready_event().is_set()
 
     async def _init_component(self, name: str):
         """
@@ -2268,9 +2329,9 @@ class ParallelInitializer:
                 simplified_failed.add(mapped)
 
         # Determine if startup is complete
-        is_complete = self._full_mode_event.is_set()
+        is_complete = self._get_full_mode_event().is_set()
         # v2.0: Check for interactive readiness
-        is_interactive = self._interactive_ready_event.is_set()
+        is_interactive = self._get_interactive_ready_event().is_set()
 
         # Generate status message
         if is_complete:
@@ -2302,7 +2363,7 @@ class ParallelInitializer:
                 "pending_count": len(pending_components),
                 "total": len(self.components),
             },
-            "ready_for_requests": self._ready_event.is_set(),
+            "ready_for_requests": self._get_ready_event().is_set(),
             # v2.0: Interactive readiness (user can interact even if not full_mode)
             "interactive_ready": is_interactive,
             "full_mode": is_complete,
@@ -2367,7 +2428,7 @@ class ParallelInitializer:
     async def wait_for_full_mode(self, timeout: float = 300.0) -> bool:
         """Wait for FULL_MODE to be reached"""
         try:
-            await asyncio.wait_for(self._full_mode_event.wait(), timeout=timeout)
+            await asyncio.wait_for(self._get_full_mode_event().wait(), timeout=timeout)
             return True
         except asyncio.TimeoutError:
             return False
@@ -2382,7 +2443,7 @@ class ParallelInitializer:
         logger.info("PARALLEL INITIALIZER SHUTDOWN")
         logger.info("=" * 60)
 
-        self._shutdown_event.set()
+        self._get_shutdown_event().set()
 
         # Use TaskLifecycleManager if available for coordinated shutdown
         if TASK_MANAGER_AVAILABLE:
