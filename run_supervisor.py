@@ -3700,21 +3700,24 @@ class SupervisorBootstrapper:
                                     last_status = status
                                 
                                 # Check for operational readiness
-                                # v10.0: Progressive readiness - accept when ready=True from backend
+                                # v20.0: Progressive readiness - accept when ready=True from backend
+                                # Now includes "interactive" status for faster startup
                                 is_ready = (
                                     data.get("ready") == True or
                                     data.get("operational") == True or
-                                    status in ["ready", "operational", "degraded", "warming_up", "websocket_ready"]
+                                    status in ["ready", "operational", "degraded", "warming_up", "websocket_ready", "interactive"]
                                 )
                                 
                                 # Also accept if WebSocket is ready (core functionality)
                                 details = data.get("details", {})
                                 websocket_ready = details.get("websocket_ready", False)
-                                
-                                # v10.0: WebSocket ready = immediately interactive
+                                # v2.0: Check for ParallelInitializer's interactive_ready
+                                parallel_interactive = details.get("parallel_initializer_interactive", False)
+
+                                # v20.0: Interactive ready (WebSocket or ParallelInitializer)
                                 # No need to wait for ML models - they warm in background
-                                if websocket_ready and not is_ready:
-                                    self.logger.info(f"✅ WebSocket ready - accepting as interactive")
+                                if (websocket_ready or parallel_interactive) and not is_ready:
+                                    self.logger.info(f"✅ Interactive ready - accepting (ws={websocket_ready}, pi={parallel_interactive})")
                                     is_ready = True
                                 
                                 # v10.0: Accept any status where ready=True (backend makes decision)

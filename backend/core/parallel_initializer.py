@@ -1,5 +1,5 @@
 """
-JARVIS Parallel Initializer v1.0.0
+JARVIS Parallel Initializer v2.0.0
 ==================================
 
 Runs ALL heavy initialization as background tasks AFTER uvicorn starts serving.
@@ -9,6 +9,10 @@ Key Features:
 - ML models, databases, neural mesh load in background
 - Progress is tracked and reported via /health endpoint
 - Graceful degradation if components fail
+- v2.0: Circuit breakers for stale component detection
+- v2.0: Progressive readiness (interactive_ready before full_mode)
+- v2.0: Watchdog for hung component detection
+- v2.0: Reduced timeouts for faster startup
 
 Usage in main.py lifespan:
     from core.parallel_initializer import ParallelInitializer
@@ -65,7 +69,7 @@ class InitPhase(Enum):
 
 @dataclass
 class ComponentInit:
-    """Tracks a single component initialization"""
+    """Tracks a single component initialization with circuit breaker support"""
     name: str
     phase: InitPhase = InitPhase.PENDING
     start_time: Optional[float] = None
@@ -74,11 +78,29 @@ class ComponentInit:
     priority: int = 50  # 0-100, lower = earlier
     dependencies: List[str] = field(default_factory=list)
     is_critical: bool = False
+    # v2.0: Circuit breaker fields
+    is_interactive: bool = False  # True for components needed for user interaction
+    stale_threshold_seconds: float = 30.0  # Mark as stale after this duration in RUNNING
 
     @property
     def duration_ms(self) -> Optional[float]:
         if self.start_time and self.end_time:
             return (self.end_time - self.start_time) * 1000
+        return None
+
+    @property
+    def is_stale(self) -> bool:
+        """Check if component is stuck in RUNNING state too long"""
+        if self.phase != InitPhase.RUNNING or self.start_time is None:
+            return False
+        elapsed = time.time() - self.start_time
+        return elapsed > self.stale_threshold_seconds
+
+    @property
+    def running_seconds(self) -> Optional[float]:
+        """Get how long component has been running"""
+        if self.phase == InitPhase.RUNNING and self.start_time:
+            return time.time() - self.start_time
         return None
 
 
@@ -88,6 +110,12 @@ class ParallelInitializer:
 
     The key insight is that uvicorn should start serving immediately,
     and all heavy initialization should run in background tasks.
+
+    v2.0 Enhancements:
+    - Progressive readiness: interactive_ready fires when user can interact
+    - Stale component detection: watchdog marks hung components as failed
+    - Circuit breakers: prevent cascade failures from slow components
+    - Reduced timeouts: faster startup with graceful degradation
     """
 
     def __init__(self, app):
@@ -99,6 +127,12 @@ class ParallelInitializer:
         self._ready_event = asyncio.Event()
         self._full_mode_event = asyncio.Event()
         self._shutdown_event = asyncio.Event()
+        # v2.0: Interactive readiness - fires when user can interact (WebSocket + Voice API)
+        self._interactive_ready_event = asyncio.Event()
+        # v2.0: Watchdog task for detecting stale components
+        self._watchdog_task: Optional[asyncio.Task] = None
+        # v2.0: Track if interactive mode was announced
+        self._interactive_announced = False
 
         # Store references for cleanup
         self._tasks: List[asyncio.Task] = []
@@ -107,7 +141,14 @@ class ParallelInitializer:
         self._register_components()
 
     def _register_components(self):
-        """Register all JARVIS components with priorities"""
+        """
+        Register all JARVIS components with priorities and circuit breaker settings.
+
+        v2.0 Enhancements:
+        - is_interactive: Components needed for user interaction (faster stale threshold)
+        - stale_threshold: How long before marking as stale (default 30s)
+        - Reduced timeouts for non-critical components
+        """
         # Cost-safe gating for cloud/spot features (explicit opt-in; no hardcoded cloud usage)
         enable_spot_vm = (
             os.getenv("JARVIS_SPOT_VM_ENABLED", "false").lower() == "true"
@@ -120,73 +161,82 @@ class ParallelInitializer:
         enable_vbi_prewarm = os.getenv("JARVIS_VBI_PREWARM_ENABLED", "false").lower() == "true"
 
         # Phase 1: Critical infrastructure (truly parallel - no dependencies!)
-        self._add_component("config", priority=1, is_critical=True)
-        # Cloud SQL proxy is independent - doesn't need config
-        self._add_component("cloud_sql_proxy", priority=10)
-        # Learning DB can retry if proxy not ready - doesn't block on proxy dependency
-        self._add_component("learning_database", priority=12)
+        # Config is instant, don't need circuit breaker
+        self._add_component("config", priority=1, is_critical=True, stale_threshold=5.0)
+        # Cloud SQL proxy - give it more time but not critical for interactive use
+        self._add_component("cloud_sql_proxy", priority=10, stale_threshold=45.0)
+        # Learning DB can retry if proxy not ready - moderate threshold
+        self._add_component("learning_database", priority=12, stale_threshold=40.0)
 
         # Phase 2: ML Infrastructure (parallel, non-blocking)
         # All these can start simultaneously
-        self._add_component("memory_aware_startup", priority=20)
+        self._add_component("memory_aware_startup", priority=20, stale_threshold=15.0)
         if enable_spot_vm:
-            self._add_component("gcp_vm_manager", priority=20)  # Same priority = parallel
-        self._add_component("cloud_ml_router", priority=20)  # Removed memory_aware dependency
+            self._add_component("gcp_vm_manager", priority=20, stale_threshold=30.0)
+        self._add_component("cloud_ml_router", priority=20, stale_threshold=20.0)
         if enable_cloud_ml or enable_spot_vm:
-            self._add_component("cloud_ecapa_client", priority=20)  # Same priority = parallel
+            self._add_component("cloud_ecapa_client", priority=20, stale_threshold=30.0)
         # VBI runs in background - doesn't block anything
         if enable_vbi_prewarm:
-            self._add_component("vbi_prewarm", priority=21)  # Slightly after ML infra
-        self._add_component("vbi_health_monitor", priority=21)
-        self._add_component("ml_engine_registry", priority=22)
+            self._add_component("vbi_prewarm", priority=21, stale_threshold=45.0)
+        self._add_component("vbi_health_monitor", priority=21, stale_threshold=20.0)
+        self._add_component("ml_engine_registry", priority=22, stale_threshold=30.0)
 
-        # Phase 3: Voice System (parallel - speaker_verification has internal retry logic)
-        # Removed hard dependency on learning_database - it will retry if needed
-        self._add_component("speaker_verification", priority=30)
-        # Voice unlock API doesn't need speaker_verification to be fully ready
-        self._add_component("voice_unlock_api", priority=30)
-        self._add_component("jarvis_voice_api", priority=30)  # All voice at same priority
-        self._add_component("unified_websocket", priority=30)  # WebSocket can start anytime
+        # Phase 3: Voice System (parallel - INTERACTIVE components!)
+        # These are needed for user interaction - mark as interactive with faster thresholds
+        self._add_component("speaker_verification", priority=30, stale_threshold=40.0)
+        # Voice unlock API is INTERACTIVE - needed for unlock commands
+        self._add_component("voice_unlock_api", priority=30, is_interactive=True, stale_threshold=20.0)
+        # JARVIS voice API is INTERACTIVE - needed for voice commands
+        self._add_component("jarvis_voice_api", priority=30, is_interactive=True, stale_threshold=20.0)
+        # WebSocket is CRITICAL for interactive use - fastest threshold
+        self._add_component("unified_websocket", priority=30, is_interactive=True, stale_threshold=15.0)
 
         # Phase 4: Intelligence Systems (parallel, can be slow but non-blocking)
-        # All at same priority so they run truly in parallel
-        self._add_component("neural_mesh", priority=40)
-        self._add_component("goal_inference", priority=40)
-        self._add_component("uae_engine", priority=40)  # Moved to same priority
-        self._add_component("hybrid_orchestrator", priority=40)
-        self._add_component("vision_analyzer", priority=40)  # Moved here
-        self._add_component("display_monitor", priority=40)
+        # These are NOT interactive - can complete in background after startup
+        self._add_component("neural_mesh", priority=40, stale_threshold=60.0)
+        self._add_component("goal_inference", priority=40, stale_threshold=30.0)
+        self._add_component("uae_engine", priority=40, stale_threshold=30.0)
+        self._add_component("hybrid_orchestrator", priority=40, stale_threshold=30.0)
+        self._add_component("vision_analyzer", priority=40, stale_threshold=30.0)
+        self._add_component("display_monitor", priority=40, stale_threshold=20.0)
 
         # Phase 5: Supporting services (parallel)
-        self._add_component("dynamic_components", priority=50)
+        self._add_component("dynamic_components", priority=50, stale_threshold=30.0)
 
         # Phase 6: Agentic System (soft dependencies - will work even if deps not ready)
-        # Removed hard dependencies - agentic system has fallback logic
-        self._add_component("agentic_system", priority=55)
+        # Agentic system is heavy - give it more time but skip if too slow
+        self._add_component("agentic_system", priority=55, stale_threshold=60.0)
 
     def _add_component(
         self,
         name: str,
         priority: int = 50,
         is_critical: bool = False,
-        dependencies: List[str] = None
+        dependencies: List[str] = None,
+        is_interactive: bool = False,
+        stale_threshold: float = 30.0
     ):
-        """Add a component to track"""
+        """Add a component to track with circuit breaker support"""
         self.components[name] = ComponentInit(
             name=name,
             priority=priority,
             is_critical=is_critical,
-            dependencies=dependencies or []
+            dependencies=dependencies or [],
+            is_interactive=is_interactive,
+            stale_threshold_seconds=stale_threshold
         )
 
     async def minimal_setup(self):
         """
         Minimal setup that runs BEFORE yield.
         This should complete in <1 second.
+
+        v2.0: Also starts the stale component watchdog.
         """
         self.started_at = time.time()
         logger.info("=" * 60)
-        logger.info("JARVIS Parallel Startup v1.0.0")
+        logger.info("JARVIS Parallel Startup v2.0.0")
         logger.info("=" * 60)
 
         # Initialize app state FIRST before marking any components
@@ -195,6 +245,8 @@ class ParallelInitializer:
         self.app.state.startup_progress = 0.0
         self.app.state.components_ready = set()
         self.app.state.components_failed = set()
+        # v2.0: Track interactive readiness
+        self.app.state.interactive_ready = False
 
         # Mark config as complete (it's just loading env vars)
         await self._mark_complete("config")
@@ -209,6 +261,13 @@ class ParallelInitializer:
             name="parallel_init"
         )
         self._tasks.append(self.background_task)
+
+        # v2.0: Start watchdog for stale component detection
+        self._watchdog_task = asyncio.create_task(
+            self._stale_component_watchdog(),
+            name="stale_watchdog"
+        )
+        self._tasks.append(self._watchdog_task)
 
     async def _background_initialization(self):
         """
@@ -303,6 +362,122 @@ class ParallelInitializer:
                 groups[comp.priority] = []
             groups[comp.priority].append(comp)
         return groups
+
+    async def _stale_component_watchdog(self):
+        """
+        v2.0: Watchdog task that detects stale (hung) components.
+
+        Runs in background and:
+        1. Checks for components stuck in RUNNING state too long
+        2. Marks stale components as SKIPPED (not FAILED) for graceful degradation
+        3. Checks for interactive readiness (WebSocket + Voice API)
+        4. Broadcasts interactive ready when core components are available
+        """
+        logger.info("🐕 Stale component watchdog started")
+
+        check_interval = 3.0  # Check every 3 seconds
+        max_runtime = 180.0  # Stop watchdog after 3 minutes
+
+        start_time = time.time()
+
+        while not self._shutdown_event.is_set():
+            try:
+                elapsed = time.time() - start_time
+
+                # Stop watchdog after max runtime
+                if elapsed > max_runtime:
+                    logger.info("🐕 Watchdog completed (max runtime reached)")
+                    break
+
+                # Check for stale components
+                stale_components = []
+                for name, comp in self.components.items():
+                    if comp.is_stale:
+                        stale_components.append((name, comp.running_seconds))
+
+                # Mark stale components as skipped
+                for name, running_secs in stale_components:
+                    comp = self.components.get(name)
+                    if comp and comp.phase == InitPhase.RUNNING:
+                        logger.warning(
+                            f"⚠️ Watchdog: {name} stale after {running_secs:.0f}s "
+                            f"(threshold: {comp.stale_threshold_seconds}s) - skipping"
+                        )
+                        await self._mark_skipped(
+                            name,
+                            f"Stale after {running_secs:.0f}s (watchdog)"
+                        )
+
+                # Check for interactive readiness
+                if not self._interactive_ready_event.is_set():
+                    await self._check_interactive_ready()
+
+                # If full mode is set, we're done
+                if self._full_mode_event.is_set():
+                    logger.info("🐕 Watchdog: Full mode reached, stopping")
+                    break
+
+                await asyncio.sleep(check_interval)
+
+            except asyncio.CancelledError:
+                logger.info("🐕 Watchdog cancelled")
+                break
+            except Exception as e:
+                logger.warning(f"🐕 Watchdog error: {e}")
+                await asyncio.sleep(check_interval)
+
+    async def _check_interactive_ready(self):
+        """
+        v2.0: Check if interactive components are ready.
+
+        Interactive readiness means the user can start interacting with JARVIS,
+        even if background components (ML models, neural mesh) are still loading.
+
+        Interactive components: unified_websocket, jarvis_voice_api, voice_unlock_api
+        """
+        if self._interactive_ready_event.is_set():
+            return
+
+        interactive_components = [
+            name for name, comp in self.components.items()
+            if comp.is_interactive
+        ]
+
+        ready_interactive = [
+            name for name in interactive_components
+            if self.components[name].phase == InitPhase.COMPLETE
+        ]
+
+        # Need at least WebSocket to be interactive
+        websocket_ready = self.components.get("unified_websocket")
+        if websocket_ready and websocket_ready.phase == InitPhase.COMPLETE:
+            # WebSocket is ready - we can accept connections
+            if len(ready_interactive) >= 1:  # At least WebSocket
+                self._interactive_ready_event.set()
+                self.app.state.interactive_ready = True
+
+                if not self._interactive_announced:
+                    self._interactive_announced = True
+                    logger.info("")
+                    logger.info("=" * 60)
+                    logger.info("🟢 INTERACTIVE MODE - User can interact!")
+                    logger.info(f"   Ready: {', '.join(ready_interactive)}")
+                    pending = [n for n in interactive_components if n not in ready_interactive]
+                    if pending:
+                        logger.info(f"   Still loading: {', '.join(pending)}")
+                    logger.info("=" * 60)
+
+                    # Broadcast interactive ready to frontend
+                    broadcaster = get_startup_broadcaster()
+                    await broadcaster.broadcast_component_complete(
+                        component="interactive_ready",
+                        message="JARVIS is ready for interaction!",
+                        duration_ms=None
+                    )
+
+    def is_interactive_ready(self) -> bool:
+        """Check if interactive components are ready"""
+        return self._interactive_ready_event.is_set()
 
     async def _init_component(self, name: str):
         """
@@ -1342,6 +1517,11 @@ class ParallelInitializer:
         - is_complete: Whether startup is fully complete
         - message: Current status message
 
+        v2.0 Enhancements:
+        - interactive_ready: True when user can interact (WebSocket + Voice API)
+        - stale_components: List of components stuck in RUNNING too long
+        - running_components: Components currently initializing with duration
+
         Also includes detailed component info for debugging.
         """
         elapsed = time.time() - self.started_at if self.started_at else 0
@@ -1355,10 +1535,24 @@ class ParallelInitializer:
             name for name, c in self.components.items()
             if c.phase == InitPhase.FAILED
         ]
+        skipped_components = [
+            name for name, c in self.components.items()
+            if c.phase == InitPhase.SKIPPED
+        ]
         pending_components = [
             name for name, c in self.components.items()
             if c.phase in (InitPhase.PENDING, InitPhase.RUNNING)
         ]
+        # v2.0: Track stale and running components
+        stale_components = [
+            name for name, c in self.components.items()
+            if c.is_stale
+        ]
+        running_components = {
+            name: c.running_seconds
+            for name, c in self.components.items()
+            if c.phase == InitPhase.RUNNING and c.running_seconds is not None
+        }
 
         # Map internal component names to supervisor-expected names
         # Supervisor expects: database, voice, vision, models, websocket, backend, agentic
@@ -1400,12 +1594,18 @@ class ParallelInitializer:
 
         # Determine if startup is complete
         is_complete = self._full_mode_event.is_set()
+        # v2.0: Check for interactive readiness
+        is_interactive = self._interactive_ready_event.is_set()
 
         # Generate status message
         if is_complete:
             message = "JARVIS startup complete!"
+        elif is_interactive:
+            message = f"JARVIS ready for interaction! ({len(pending_components)} components still loading)"
         elif failed_components:
             message = f"Startup in progress ({len(failed_components)} failures)"
+        elif stale_components:
+            message = f"Startup in progress ({len(stale_components)} components slow)"
         elif pending_components:
             message = f"Initializing {len(pending_components)} components..."
         else:
@@ -1423,18 +1623,26 @@ class ParallelInitializer:
                 # Also include counts for backwards compatibility
                 "ready_count": len(ready_components),
                 "failed_count": len(failed_components),
+                "skipped_count": len(skipped_components),
                 "pending_count": len(pending_components),
                 "total": len(self.components),
             },
             "ready_for_requests": self._ready_event.is_set(),
+            # v2.0: Interactive readiness (user can interact even if not full_mode)
+            "interactive_ready": is_interactive,
             "full_mode": is_complete,
             "is_complete": is_complete,
+            # v2.0: Stale component tracking
+            "stale_components": stale_components,
+            "running_components": running_components,
             # Detailed component info for debugging
             "components_detail": {
                 name: {
                     "status": comp.phase.value,
                     "duration_ms": comp.duration_ms,
                     "error": comp.error,
+                    "is_stale": comp.is_stale,
+                    "running_seconds": comp.running_seconds,
                 }
                 for name, comp in self.components.items()
             },
@@ -1442,6 +1650,7 @@ class ParallelInitializer:
             "internal_components": {
                 "ready": ready_components,
                 "failed": failed_components,
+                "skipped": skipped_components,
                 "pending": pending_components,
             }
         }

@@ -4230,20 +4230,30 @@ async def health_ready():
         details["database_connected"] = False
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # DETERMINE OVERALL READINESS (Progressive Model v1.0)
+    # DETERMINE OVERALL READINESS (Progressive Model v2.0)
     # ═══════════════════════════════════════════════════════════════════════════
     # Progressive readiness levels:
-    # 1. websocket_ready → user can interact (core readiness)
-    # 2. voice_operational → voice features work
-    # 3. ml_ready → full ML capabilities
+    # 1. interactive_ready → ParallelInitializer says user can interact
+    # 2. websocket_ready → WebSocket routes registered
+    # 3. voice_operational → voice features work
+    # 4. ml_ready → full ML capabilities
     #
-    # Key insight: WebSocket ready = user can interact, even without voice
+    # Key insight: Interactive ready OR WebSocket ready = user can interact
     # Voice/ML can warm up in background while user interacts
     # ═══════════════════════════════════════════════════════════════════════════
-    
+
     voice_operational = ml_ready or speaker_service_ready or voice_ready
-    core_ready = websocket_ready  # WebSocket is the ONLY hard requirement for interaction
-    full_ready = websocket_ready and voice_operational
+
+    # v2.0: Check ParallelInitializer's interactive_ready state
+    interactive_ready = getattr(app.state, 'interactive_ready', False)
+    if hasattr(app.state, 'parallel_initializer'):
+        pi = app.state.parallel_initializer
+        if hasattr(pi, 'is_interactive_ready') and callable(pi.is_interactive_ready):
+            interactive_ready = pi.is_interactive_ready()
+        details["parallel_initializer_interactive"] = interactive_ready
+
+    core_ready = websocket_ready or interactive_ready  # Either is sufficient
+    full_ready = core_ready and voice_operational
 
     # Determine status based on progressive levels
     if full_ready and len(critical_services_failed) == 0:
@@ -4252,11 +4262,15 @@ async def health_ready():
     elif full_ready:
         status = "degraded"  # Some non-critical services failed
         ready = True
-    elif websocket_ready and ml_warmup_info.get("is_warming_up"):
-        # KEY FIX: WebSocket ready + ML warming = ready for interaction!
+    elif core_ready and ml_warmup_info.get("is_warming_up"):
+        # KEY FIX: Core ready + ML warming = ready for interaction!
         # ML can continue warming while user interacts
         status = "warming_up"
         ready = True  # Changed from False - user CAN interact while warming
+    elif interactive_ready:
+        # ParallelInitializer says we're interactive
+        status = "interactive"
+        ready = True
     elif websocket_ready:
         # WebSocket ready but no voice yet - still interactive
         status = "websocket_ready"
