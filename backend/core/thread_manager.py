@@ -1490,62 +1490,99 @@ def shutdown_third_party_threads(timeout: float = 5.0) -> Dict[str, Any]:
     # Phase 1: PyTorch cleanup
     try:
         import torch
-        
-        # Reduce thread count
-        if hasattr(torch, 'set_num_threads'):
-            torch.set_num_threads(1)
-        if hasattr(torch, 'set_num_interop_threads'):
-            torch.set_num_interop_threads(1)
-        
-        # Clear CUDA
+
+        # NOTE: Do NOT call set_num_threads or set_num_interop_threads during shutdown.
+        # These can only be called once and before any parallel work starts.
+        # Calling them after parallel work has started raises RuntimeError.
+        # Instead, we focus on synchronizing and releasing GPU memory.
+
+        # Clear CUDA if available
         if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
-        
-        # Clear MPS (Apple Silicon)
+            try:
+                torch.cuda.synchronize()  # Wait for all CUDA operations
+                torch.cuda.empty_cache()  # Release cached memory
+            except Exception as cuda_e:
+                logger.debug(f"CUDA cleanup: {cuda_e}")
+
+        # Clear MPS (Apple Silicon) if available
         if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-            if hasattr(torch.mps, 'empty_cache'):
-                torch.mps.empty_cache()
-        
+            try:
+                if hasattr(torch.mps, 'synchronize'):
+                    torch.mps.synchronize()  # Wait for MPS operations
+                if hasattr(torch.mps, 'empty_cache'):
+                    torch.mps.empty_cache()  # Release cached memory
+            except Exception as mps_e:
+                logger.debug(f"MPS cleanup: {mps_e}")
+
+        # Signal completion - PyTorch worker threads are daemon threads
+        # and will exit when the main process exits
         stats["pytorch_cleaned"] = True
-        logger.debug("PyTorch threads signaled for cleanup")
-        
+        logger.debug("PyTorch GPU memory released; daemon threads will exit with process")
+
     except ImportError:
         logger.debug("PyTorch not installed")
     except Exception as e:
-        logger.debug(f"PyTorch cleanup error: {e}")
+        logger.debug(f"PyTorch cleanup partial: {e}")
     
     # Phase 2: Database pools
     try:
-        # SQLAlchemy
+        # SQLAlchemy - sync cleanup
         try:
             from sqlalchemy.orm import close_all_sessions
             close_all_sessions()
+            logger.debug("SQLAlchemy sessions closed")
         except ImportError:
             pass
         except Exception as e:
             logger.debug(f"SQLAlchemy cleanup: {e}")
-        
-        # Connection managers
+
+        # Connection managers - handle event loop lifecycle carefully
         try:
             from intelligence.cloud_database_adapter import get_database_adapter
             adapter = get_database_adapter()
             if hasattr(adapter, 'close'):
                 import asyncio
+
+                # Check if we can use an existing loop
                 try:
                     loop = asyncio.get_running_loop()
+                    # We're in an async context - schedule but don't wait
+                    # The event loop owner will handle cleanup
+                    if not loop.is_closed():
+                        asyncio.ensure_future(adapter.close())
+                        logger.debug("Database close scheduled on running loop")
                 except RuntimeError:
-                    loop = asyncio.new_event_loop()
-                loop.run_until_complete(adapter.close())
+                    # No running loop - check if there's a non-closed loop
+                    try:
+                        loop = asyncio.get_event_loop()
+                        if not loop.is_closed():
+                            loop.run_until_complete(adapter.close())
+                            logger.debug("Database closed on existing loop")
+                        else:
+                            # Event loop is closed - use sync close if available
+                            if hasattr(adapter, 'close_sync'):
+                                adapter.close_sync()
+                                logger.debug("Database closed synchronously")
+                            else:
+                                # Create new loop as last resort
+                                new_loop = asyncio.new_event_loop()
+                                try:
+                                    new_loop.run_until_complete(adapter.close())
+                                    logger.debug("Database closed on new loop")
+                                finally:
+                                    new_loop.close()
+                    except Exception as loop_e:
+                        logger.debug(f"Event loop unavailable for database cleanup: {loop_e}")
+
         except ImportError:
             pass
         except Exception as e:
             logger.debug(f"Database adapter cleanup: {e}")
-        
+
         stats["db_pools_cleaned"] = True
-        
+
     except Exception as e:
-        logger.debug(f"Database cleanup error: {e}")
+        logger.debug(f"Database cleanup partial: {e}")
     
     # Phase 3: Force garbage collection
     gc.collect()
