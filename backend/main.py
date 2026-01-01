@@ -6585,7 +6585,27 @@ async def ensure_uae_loaded(app_state):
 if __name__ == "__main__":
     import argparse
 
-    import uvicorn
+    # ==========================================================================
+    # HYPER-RUNTIME v9.0: Rust-First Server Architecture
+    # ==========================================================================
+    # Intelligent runtime selection:
+    #   Level 3 (HYPER):    Granian (Rust/Tokio) - 3-5x faster
+    #   Level 2 (FAST):     uvloop (C/libuv)     - 2-4x faster
+    #   Level 1 (STANDARD): asyncio              - Python baseline
+    # ==========================================================================
+    try:
+        from core.hyper_runtime import (
+            start_hyper_server,
+            get_runtime_engine,
+            ServerConfig,
+        )
+        HYPER_RUNTIME_AVAILABLE = True
+        _runtime = get_runtime_engine()
+        print(f"⚡ [HYPER-RUNTIME] {_runtime.name} engine ready (Level {_runtime.level.value}/3)")
+    except ImportError:
+        HYPER_RUNTIME_AVAILABLE = False
+        import uvicorn
+        print("🐍 [RUNTIME] Using standard uvicorn (hyper_runtime not available)")
 
     # Parse command line arguments
     parser = argparse.ArgumentParser(description="JARVIS Backend Server")
@@ -6616,8 +6636,18 @@ if __name__ == "__main__":
             pass
     atexit.register(cleanup_on_exit)
 
-    # Use optimized settings if enabled
-    if OPTIMIZE_STARTUP:
+    # Start server with best available runtime
+    if HYPER_RUNTIME_AVAILABLE:
+        # Use Hyper-Runtime (Granian/Rust or uvloop fallback)
+        config = ServerConfig(
+            host="0.0.0.0",
+            port=args.port,
+            log_level="info" if OPTIMIZE_STARTUP else "warning",
+            websockets=True,
+        )
+        start_hyper_server("main:app", config=config)
+    elif OPTIMIZE_STARTUP:
+        # Fallback: uvicorn with optimized settings
         uvicorn.run(
             app,
             host="0.0.0.0",
@@ -6627,4 +6657,5 @@ if __name__ == "__main__":
             loop="asyncio",  # Use asyncio (uvloop disabled due to speechbrain/torch compatibility)
         )
     else:
+        # Fallback: standard uvicorn
         uvicorn.run(app, host="0.0.0.0", port=args.port)

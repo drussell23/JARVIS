@@ -649,36 +649,53 @@ from pathlib import Path
 from typing import Optional
 
 # =============================================================================
-# HYPER-SPEED ENGINE v8.0: uvloop Cython Event Loop
+# HYPER-RUNTIME ENGINE v9.0: Rust-First Async Architecture
 # =============================================================================
-# uvloop provides 2-4x faster async operations by using Cython.
-# Must be activated BEFORE any asyncio operations or event loop creation.
+# Intelligent runtime selection that maximizes async performance:
+#   Level 3 (HYPER):    Granian (Rust/Tokio) - 3-5x faster than uvicorn
+#   Level 2 (FAST):     uvloop (C/libuv)     - 2-4x faster than asyncio
+#   Level 1 (STANDARD): asyncio              - Python standard library
 # =============================================================================
-_UVLOOP_ACTIVE = False
-if sys.platform != "win32":
-    try:
-        import uvloop
-        uvloop.install()  # Install as default event loop policy
-        _UVLOOP_ACTIVE = True
-    except ImportError:
-        pass  # uvloop not installed - use standard asyncio
-    except Exception:
-        pass  # Any error - fall back gracefully
+
+# Add paths first (needed for hyper_runtime import)
+project_root = Path(__file__).parent
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
+
+backend_dir = project_root / "backend"
+if backend_dir.exists() and str(backend_dir) not in sys.path:
+    sys.path.insert(0, str(backend_dir))
+
+# Initialize hyper-runtime (auto-detects and activates best engine)
+_HYPER_RUNTIME_LEVEL = 1  # Default to standard
+_HYPER_RUNTIME_NAME = "asyncio"
+try:
+    from core.hyper_runtime import (
+        get_runtime_engine,
+        activate_runtime,
+        RuntimeLevel,
+    )
+    _runtime_engine = activate_runtime()
+    _HYPER_RUNTIME_LEVEL = _runtime_engine.level.value
+    _HYPER_RUNTIME_NAME = _runtime_engine.name
+except ImportError:
+    # Fallback to uvloop if hyper_runtime not available
+    if sys.platform != "win32":
+        try:
+            import uvloop
+            uvloop.install()
+            _HYPER_RUNTIME_LEVEL = 2
+            _HYPER_RUNTIME_NAME = "uvloop"
+        except ImportError:
+            pass
+except Exception:
+    pass  # Fall back to standard asyncio
 
 import aiohttp
 import psutil
 
 # Cost tracking for hybrid cloud monitoring
 try:
-    # Add project root to path first (for 'from backend.X' imports)
-    project_root = Path(__file__).parent
-    if str(project_root) not in sys.path:
-        sys.path.insert(0, str(project_root))
-
-    # Add backend directory to path (for 'from core.X' imports)
-    backend_dir = project_root / "backend"
-    if backend_dir.exists() and str(backend_dir) not in sys.path:
-        sys.path.insert(0, str(backend_dir))
 
     from core.cost_tracker import get_cost_tracker
 

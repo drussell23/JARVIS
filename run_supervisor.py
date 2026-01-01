@@ -246,28 +246,46 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 # =============================================================================
-# HYPER-SPEED ENGINE: uvloop Cython Event Loop Activation (v8.0)
+# HYPER-RUNTIME ENGINE v9.0: Rust-First Async Architecture
 # =============================================================================
-# uvloop is a drop-in replacement for asyncio's event loop, written in Cython.
-# It provides 2-4x faster async operations by bypassing Python's C-API overhead.
-# This MUST be activated before any asyncio.run() or event loop creation.
+# Intelligent runtime selection that maximizes async performance:
+#   Level 3 (HYPER):    Granian (Rust/Tokio) - 3-5x faster than uvicorn
+#   Level 2 (FAST):     uvloop (C/libuv)     - 2-4x faster than asyncio
+#   Level 1 (STANDARD): asyncio              - Python standard library
+#
+# The system auto-detects the best available runtime and activates it.
+# For HTTP servers, Granian replaces the entire Python async stack with Rust.
 # =============================================================================
-_UVLOOP_ACTIVE = False
-if sys.platform != "win32":  # uvloop doesn't support Windows
-    try:
-        import uvloop
-        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-        _UVLOOP_ACTIVE = True
-        # Silent activation - will be logged properly once logging is configured
-    except ImportError:
-        pass  # uvloop not installed - fall back to standard asyncio
-    except Exception:
-        pass  # Any other error - fall back gracefully
 
-# Add backend to path
+# Add backend to path first (needed for hyper_runtime import)
 backend_path = Path(__file__).parent / "backend"
 if str(backend_path) not in sys.path:
     sys.path.insert(0, str(backend_path))
+
+# Initialize hyper-runtime (auto-detects and activates best engine)
+_HYPER_RUNTIME_LEVEL = 1  # Default to standard
+_HYPER_RUNTIME_NAME = "asyncio"
+try:
+    from core.hyper_runtime import (
+        get_runtime_engine,
+        activate_runtime,
+        RuntimeLevel,
+    )
+    _runtime_engine = activate_runtime()
+    _HYPER_RUNTIME_LEVEL = _runtime_engine.level.value
+    _HYPER_RUNTIME_NAME = _runtime_engine.name
+except ImportError:
+    # Fallback to uvloop if hyper_runtime not available
+    if sys.platform != "win32":
+        try:
+            import uvloop
+            asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+            _HYPER_RUNTIME_LEVEL = 2
+            _HYPER_RUNTIME_NAME = "uvloop"
+        except ImportError:
+            pass
+except Exception:
+    pass  # Fall back to standard asyncio
 
 # v10.6: Structured Logging System with Real-Time Monitoring
 try:
@@ -2268,12 +2286,18 @@ class SupervisorBootstrapper:
             # Print banner
             TerminalUI.print_banner()
 
-            # v8.0: Log Hyper-Speed Engine status
-            if _UVLOOP_ACTIVE:
-                self.logger.info("🚀 [KERNEL] uvloop Cython Engine ACTIVE - 2-4x faster async operations")
-                TerminalUI.print_success("Hyper-Speed Engine: uvloop Cython active")
-            else:
-                self.logger.debug("[KERNEL] Using standard asyncio event loop")
+            # v9.0: Log Hyper-Runtime Engine status
+            runtime_icons = {3: "⚡", 2: "🚀", 1: "🐍"}
+            runtime_descs = {
+                3: "Granian Rust/Tokio (3-5x faster)",
+                2: "uvloop C/libuv (2-4x faster)",
+                1: "asyncio Python (standard)",
+            }
+            icon = runtime_icons.get(_HYPER_RUNTIME_LEVEL, "❓")
+            desc = runtime_descs.get(_HYPER_RUNTIME_LEVEL, "unknown")
+
+            self.logger.info(f"{icon} [HYPER-RUNTIME] {_HYPER_RUNTIME_NAME} Engine ACTIVE - {desc}")
+            TerminalUI.print_success(f"Hyper-Runtime: {_HYPER_RUNTIME_NAME} (Level {_HYPER_RUNTIME_LEVEL}/3)")
 
             # Phase 1: Cleanup existing instances
             self.perf.start("cleanup")
