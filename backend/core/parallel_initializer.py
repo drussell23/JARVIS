@@ -44,6 +44,21 @@ from typing import Any, Callable, Dict, List, Optional
 # Import the startup progress broadcaster for real-time WebSocket updates
 from core.startup_progress_broadcaster import get_startup_broadcaster
 
+# Import Hyper-Speed AI Loader for Ghost Proxy model loading
+try:
+    from core.ai_loader import (
+        get_ai_manager,
+        get_optimization_router,
+        ModelPriority,
+        ModelStatus,
+        OptimizationEngine,
+        ModelCategory,
+    )
+    AI_LOADER_AVAILABLE = True
+except ImportError as e:
+    AI_LOADER_AVAILABLE = False
+    logging.getLogger(__name__).warning(f"AI Loader not available: {e}")
+
 # Import TaskLifecycleManager for proper task tracking
 try:
     from core.task_lifecycle_manager import (
@@ -163,6 +178,14 @@ class ParallelInitializer:
         # Phase 1: Critical infrastructure (truly parallel - no dependencies!)
         # Config is instant, don't need circuit breaker
         self._add_component("config", priority=1, is_critical=True, stale_threshold=5.0)
+
+        # Phase 1.5: Hyper-Speed AI Loader (initializes BEFORE any ML models)
+        # This enables Ghost Proxy pattern for instant startup
+        if AI_LOADER_AVAILABLE:
+            self._add_component("ai_loader", priority=5, is_critical=False, stale_threshold=10.0)
+            # Optimized voice models use Ghost Proxies - instant registration
+            self._add_component("optimized_voice_models", priority=6, is_interactive=True, stale_threshold=5.0)
+
         # Cloud SQL proxy - give it more time but not critical for interactive use
         self._add_component("cloud_sql_proxy", priority=10, stale_threshold=45.0)
         # Learning DB can retry if proxy not ready - moderate threshold
@@ -622,6 +645,244 @@ class ParallelInitializer:
     # =========================================================================
     # Component-specific initializers
     # =========================================================================
+
+    async def _init_ai_loader(self):
+        """
+        Initialize the Hyper-Speed AI Loader with Unified Optimization Router.
+
+        This is the core of the non-blocking startup architecture:
+        - Creates the AsyncModelManager singleton
+        - Discovers available optimization engines (Rust, JIT, ONNX, etc.)
+        - Prepares the router for intelligent model loading
+
+        After this completes, all subsequent model registrations will use
+        Ghost Proxies for instant startup with background loading.
+        """
+        if not AI_LOADER_AVAILABLE:
+            logger.warning("AI Loader not available - skipping initialization")
+            return
+
+        try:
+            logger.info("=" * 60)
+            logger.info("HYPER-SPEED AI LOADER INITIALIZATION")
+            logger.info("=" * 60)
+
+            # Get the global AI Manager (singleton)
+            ai_manager = get_ai_manager()
+
+            # Discover available optimization engines
+            router = get_optimization_router()
+            engines = router.discover_engines()
+
+            # Count available engines
+            available_engines = [
+                (e.name, c.speedup_factor)
+                for e, c in engines.items()
+                if c.available
+            ]
+
+            logger.info(f"   Optimization Router: {len(available_engines)} engines available")
+            for name, speedup in available_engines[:4]:  # Show top 4
+                logger.info(f"      {name}: {speedup}x speedup")
+
+            # Store in app state for global access
+            self.app.state.ai_manager = ai_manager
+            self.app.state.optimization_router = router
+            self.app.state.ai_loader_ready = True
+
+            logger.info("   ✅ AI Loader ready - Ghost Proxy pattern enabled")
+            logger.info("   All ML models will now use non-blocking background loading")
+            logger.info("=" * 60)
+
+        except Exception as e:
+            logger.error(f"AI Loader initialization failed: {e}", exc_info=True)
+            self.app.state.ai_loader_ready = False
+            # Don't raise - system can still function with direct loading
+            raise
+
+    async def _init_optimized_voice_models(self):
+        """
+        Register Voice Models via Hyper-Speed AI Loader.
+
+        This method demonstrates the Ghost Proxy pattern:
+        1. Define heavy loader functions (DON'T run them!)
+        2. Register with AI Manager (returns instant proxy)
+        3. Attach proxies to app.state (server thinks models are ready)
+        4. Background loading happens automatically
+
+        Result: This method completes in <0.01s instead of 4+ seconds,
+        because we're just registering proxies, not loading models.
+        """
+        if not AI_LOADER_AVAILABLE:
+            logger.info("AI Loader not available - voice models will load directly")
+            return
+
+        try:
+            logger.info("=" * 60)
+            logger.info("OPTIMIZED VOICE MODEL REGISTRATION (Ghost Proxies)")
+            logger.info("=" * 60)
+
+            ai_manager = get_ai_manager()
+            start_time = time.time()
+
+            # =========================================================
+            # 1. ECAPA-TDNN Speaker Embedding Model (Heavy - 4+ seconds normally)
+            # =========================================================
+            def load_ecapa_heavy():
+                """Heavy loader for ECAPA-TDNN model - runs in background thread."""
+                try:
+                    from cloud_services.ecapa_cloud_service import ECAPAModelManager
+                    manager = ECAPAModelManager()
+                    logger.info("   [BACKGROUND] ECAPA model loaded")
+                    return manager
+                except ImportError:
+                    # Try alternative import path
+                    try:
+                        from speechbrain.pretrained import EncoderClassifier
+                        model = EncoderClassifier.from_hparams(
+                            source="speechbrain/spkrec-ecapa-voxceleb",
+                            savedir="/tmp/ecapa_model",
+                        )
+                        logger.info("   [BACKGROUND] ECAPA (SpeechBrain) loaded")
+                        return model
+                    except Exception as e:
+                        logger.warning(f"   [BACKGROUND] ECAPA load failed: {e}")
+                        return None
+
+            # Register with AI Manager - returns INSTANTLY!
+            ecapa_proxy = ai_manager.register_model(
+                name="ecapa_speaker",
+                loader_func=load_ecapa_heavy,
+                priority=ModelPriority.HIGH,  # Load first
+                hints={
+                    "category": "voice",
+                    "quantization": "int8",
+                    "prefer_speed": True,
+                },
+                quantize=True,
+            )
+
+            # Attach to app.state - server can use this immediately
+            self.app.state.ecapa_model = ecapa_proxy
+            logger.info(f"   ✅ ECAPA Speaker Model registered (proxy: {ecapa_proxy.status.name})")
+
+            # =========================================================
+            # 2. Voice Unlock Classifier (Medium - 2+ seconds normally)
+            # =========================================================
+            def load_voice_unlock_classifier():
+                """Heavy loader for voice unlock classifier."""
+                try:
+                    from voice_unlock.intelligent_voice_unlock_service import (
+                        get_voice_unlock_service,
+                    )
+                    service = get_voice_unlock_service()
+                    logger.info("   [BACKGROUND] Voice unlock classifier loaded")
+                    return service
+                except Exception as e:
+                    logger.warning(f"   [BACKGROUND] Voice unlock load failed: {e}")
+                    return None
+
+            voice_unlock_proxy = ai_manager.register_model(
+                name="voice_unlock_classifier",
+                loader_func=load_voice_unlock_classifier,
+                priority=ModelPriority.HIGH,
+                hints={
+                    "category": "voice",
+                    "engine": "rust_int8",  # Prefer Rust INT8 if available
+                },
+                quantize=True,
+            )
+
+            self.app.state.voice_unlock_classifier = voice_unlock_proxy
+            logger.info(f"   ✅ Voice Unlock Classifier registered (proxy: {voice_unlock_proxy.status.name})")
+
+            # =========================================================
+            # 3. Speaker Verification Service (if learning_db available)
+            # =========================================================
+            learning_db = getattr(self.app.state, 'learning_db', None)
+
+            def load_speaker_verification():
+                """Heavy loader for speaker verification service."""
+                try:
+                    from voice.speaker_verification_service import SpeakerVerificationService
+                    if learning_db:
+                        service = SpeakerVerificationService(learning_db)
+                        # Can't call async from sync, but service will init on first use
+                        logger.info("   [BACKGROUND] Speaker verification service loaded")
+                        return service
+                    return None
+                except Exception as e:
+                    logger.warning(f"   [BACKGROUND] Speaker verification load failed: {e}")
+                    return None
+
+            speaker_proxy = ai_manager.register_model(
+                name="speaker_verification",
+                loader_func=load_speaker_verification,
+                priority=ModelPriority.NORMAL,
+                hints={"category": "voice"},
+                quantize=False,  # Service doesn't need quantization
+            )
+
+            self.app.state.speaker_verification_proxy = speaker_proxy
+            logger.info(f"   ✅ Speaker Verification registered (proxy: {speaker_proxy.status.name})")
+
+            # =========================================================
+            # 4. VAD (Voice Activity Detection) Model
+            # =========================================================
+            def load_vad_model():
+                """Heavy loader for VAD model."""
+                try:
+                    import torch
+                    vad_model, utils = torch.hub.load(
+                        repo_or_dir='snakers4/silero-vad',
+                        model='silero_vad',
+                        force_reload=False,
+                        onnx=True,  # Use ONNX for speed
+                    )
+                    logger.info("   [BACKGROUND] VAD (Silero) loaded")
+                    return {"model": vad_model, "utils": utils}
+                except Exception as e:
+                    logger.warning(f"   [BACKGROUND] VAD load failed: {e}")
+                    return None
+
+            vad_proxy = ai_manager.register_model(
+                name="vad_silero",
+                loader_func=load_vad_model,
+                priority=ModelPriority.NORMAL,
+                hints={
+                    "category": "voice",
+                    "engine": "onnx",  # Prefer ONNX
+                },
+                quantize=False,
+            )
+
+            self.app.state.vad_model = vad_proxy
+            logger.info(f"   ✅ VAD Model registered (proxy: {vad_proxy.status.name})")
+
+            # =========================================================
+            # Registration complete - measure time
+            # =========================================================
+            elapsed_ms = (time.time() - start_time) * 1000
+
+            logger.info("")
+            logger.info(f"   🚀 All voice models registered in {elapsed_ms:.1f}ms!")
+            logger.info("   Models are loading in BACKGROUND - server is ready NOW")
+            logger.info("   First request may wait briefly if model not yet loaded")
+            logger.info("=" * 60)
+
+            # Store registration status
+            self.app.state.voice_models_registered = True
+            self.app.state.voice_model_proxies = {
+                "ecapa_speaker": ecapa_proxy,
+                "voice_unlock_classifier": voice_unlock_proxy,
+                "speaker_verification": speaker_proxy,
+                "vad_silero": vad_proxy,
+            }
+
+        except Exception as e:
+            logger.error(f"Voice model registration failed: {e}", exc_info=True)
+            self.app.state.voice_models_registered = False
+            # Don't raise - voice models will be loaded directly as fallback
 
     async def _init_cloud_sql_proxy(self):
         """
@@ -1151,6 +1412,22 @@ class ParallelInitializer:
 
     async def _init_speaker_verification(self):
         """Initialize speaker verification service and pre-warm ECAPA classifier"""
+        # Check if we already have Ghost Proxies from AI Loader
+        voice_proxies = getattr(self.app.state, 'voice_model_proxies', {})
+
+        if voice_proxies.get('speaker_verification'):
+            # Already registered via AI Loader - just wait for it to be ready
+            proxy = voice_proxies['speaker_verification']
+            logger.info(f"   Speaker verification: using Ghost Proxy ({proxy.status.name})")
+
+            # Store reference globally for compatibility
+            import voice.speaker_verification_service as sv
+            sv._global_speaker_service = proxy  # Will auto-wait when accessed
+
+            # Don't block - the proxy handles waiting
+            return
+
+        # Fallback: Load directly if AI Loader not available
         try:
             from voice.speaker_verification_service import SpeakerVerificationService
 
@@ -1171,6 +1448,11 @@ class ParallelInitializer:
             logger.warning(f"Speaker verification failed: {e}")
 
         # Pre-warm local ECAPA classifier to avoid 12s cold start on first unlock
+        # Skip if AI Loader is handling this via Ghost Proxy
+        if voice_proxies.get('ecapa_speaker'):
+            logger.info("   ECAPA pre-warm: handled by AI Loader Ghost Proxy")
+            return
+
         try:
             from voice_unlock.intelligent_voice_unlock_service import prewarm_ecapa_classifier
             logger.info("   Pre-warming ECAPA classifier for voice unlock...")
@@ -1652,8 +1934,42 @@ class ParallelInitializer:
                 "failed": failed_components,
                 "skipped": skipped_components,
                 "pending": pending_components,
-            }
+            },
+            # AI Loader stats (if available)
+            "ai_loader": self._get_ai_loader_status(),
         }
+
+    def _get_ai_loader_status(self) -> Dict[str, Any]:
+        """Get AI Loader status for health endpoint."""
+        if not AI_LOADER_AVAILABLE:
+            return {"available": False, "reason": "Not imported"}
+
+        if not getattr(self.app.state, 'ai_loader_ready', False):
+            return {"available": True, "initialized": False}
+
+        try:
+            ai_manager = getattr(self.app.state, 'ai_manager', None)
+            if ai_manager is None:
+                return {"available": True, "initialized": False}
+
+            stats = ai_manager.get_stats()
+            return {
+                "available": True,
+                "initialized": True,
+                "models": {
+                    "total": stats["summary"]["total"],
+                    "ready": stats["summary"]["ready"],
+                    "loading": stats["summary"]["loading"],
+                    "failed": stats["summary"]["failed"],
+                },
+                "router": {
+                    "engines_available": stats["router"]["available_count"],
+                    "engines_total": stats["router"]["total_count"],
+                },
+                "memory_mb": stats["summary"]["total_memory_mb"],
+            }
+        except Exception as e:
+            return {"available": True, "initialized": True, "error": str(e)}
 
     async def wait_for_full_mode(self, timeout: float = 300.0) -> bool:
         """Wait for FULL_MODE to be reached"""
@@ -1722,6 +2038,16 @@ class ParallelInitializer:
                 logger.info(f"TaskLifecycleManager shutdown: {result.get('status', 'unknown')}")
             except Exception as e:
                 logger.warning(f"TaskLifecycleManager shutdown error: {e}")
+
+        # Shutdown AI Loader (unloads all models)
+        if AI_LOADER_AVAILABLE:
+            try:
+                ai_manager = getattr(self.app.state, 'ai_manager', None)
+                if ai_manager:
+                    await ai_manager.shutdown()
+                    logger.info("AI Loader shutdown complete")
+            except Exception as e:
+                logger.warning(f"AI Loader shutdown error: {e}")
 
         logger.info("Parallel initializer shutdown complete")
         logger.info("=" * 60)
