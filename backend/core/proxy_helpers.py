@@ -1,5 +1,5 @@
 """
-JARVIS Proxy Helpers v1.0
+JARVIS Proxy Helpers v2.0
 =========================
 
 Utilities for safely accessing Ghost Model Proxies throughout the application.
@@ -9,22 +9,38 @@ These helpers provide:
 - Warming state detection and handling
 - HTTP-friendly error responses for FastAPI routes
 - Async-aware waiting with configurable timeouts
+- FastAPI Dependency Injection support
 
 Usage in FastAPI routes:
-    from core.proxy_helpers import get_model_proxy, require_model_ready
+
+    # Option 1: Dependency Injection (RECOMMENDED)
+    from core.proxy_helpers import RequiresModel
+
+    @router.post("/analyze")
+    async def analyze_image(
+        request: Request,
+        vision: Any = Depends(RequiresModel("vision_analyzer"))
+    ):
+        return await vision.analyze(image)
+
+    # Option 2: Decorator
+    from core.proxy_helpers import requires_model
+
+    @router.post("/analyze")
+    @requires_model("vision_analyzer")
+    async def analyze_image(request: Request):
+        vision = request.app.state.vision_analyzer
+        return await vision.analyze(image)
+
+    # Option 3: Manual (for complex scenarios)
+    from core.proxy_helpers import require_model_ready
 
     @router.post("/analyze")
     async def analyze_image(request: Request):
-        # Option 1: Get proxy and handle warming state
-        vision = get_model_proxy(request.app.state, "vision_analyzer")
-        if not vision.is_ready:
-            raise HTTPException(503, "Vision system warming up...")
-
-        # Option 2: Require model to be ready (waits or raises)
         vision = await require_model_ready(request.app.state, "vision_analyzer")
         return await vision.analyze(image)
 
-Version: 1.0.0 - Ghost Proxy Utilities
+Version: 2.0.0 - FastAPI Dependency Injection + Ghost Proxy Utilities
 """
 
 import asyncio
@@ -403,11 +419,165 @@ def http_exception_for_proxy_error(error: Union[ProxyNotReadyError, ProxyNotFoun
     return HTTPException(status_code=500, detail=str(error))
 
 
+# =============================================================================
+# FastAPI Dependency Injection
+# =============================================================================
+
+class RequiresModel:
+    """
+    FastAPI Dependency that ensures a model is ready before route execution.
+
+    This is the RECOMMENDED way to access Ghost Proxies in FastAPI routes.
+    It integrates seamlessly with FastAPI's dependency injection system and
+    provides automatic waiting, error handling, and OpenAPI documentation.
+
+    Args:
+        model_name: Name of the required model
+        timeout: Max seconds to wait for model (default: 30s)
+        allow_warming: If True, returns proxy even if still loading
+        return_none_if_missing: If True, returns None instead of raising 503
+
+    Usage:
+        from core.proxy_helpers import RequiresModel
+        from fastapi import Depends
+
+        @router.post("/analyze")
+        async def analyze_image(
+            request: Request,
+            vision: Any = Depends(RequiresModel("vision_analyzer"))
+        ):
+            # vision is guaranteed to be ready here
+            return await vision.analyze(image)
+
+        # Multiple models
+        @router.post("/transcribe")
+        async def transcribe(
+            request: Request,
+            whisper: Any = Depends(RequiresModel("whisper_model")),
+            vad: Any = Depends(RequiresModel("vad_silero")),
+        ):
+            return await whisper.transcribe(audio, vad=vad)
+
+        # Optional model (won't fail if missing)
+        @router.post("/analyze")
+        async def analyze(
+            request: Request,
+            yolo: Optional[Any] = Depends(RequiresModel("yolo_detector", return_none_if_missing=True))
+        ):
+            if yolo:
+                return await yolo.detect(image)
+            return {"status": "yolo not available"}
+    """
+
+    def __init__(
+        self,
+        model_name: str,
+        timeout: float = 30.0,
+        allow_warming: bool = False,
+        return_none_if_missing: bool = False,
+    ):
+        self.model_name = model_name
+        self.timeout = timeout
+        self.allow_warming = allow_warming
+        self.return_none_if_missing = return_none_if_missing
+
+    async def __call__(self, request: "Request") -> Any:
+        """
+        FastAPI calls this when resolving the dependency.
+
+        Args:
+            request: FastAPI Request object (injected automatically)
+
+        Returns:
+            The ready model/proxy
+
+        Raises:
+            HTTPException 503: If model not ready after timeout
+            HTTPException 500: If model not registered (unless return_none_if_missing)
+        """
+        from fastapi import HTTPException
+
+        try:
+            proxy = get_model_proxy(
+                request.app.state,
+                self.model_name,
+                raise_if_missing=not self.return_none_if_missing,
+            )
+        except ProxyNotFoundError:
+            if self.return_none_if_missing:
+                return None
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "error": "model_not_registered",
+                    "model": self.model_name,
+                    "message": f"Model '{self.model_name}' is not registered",
+                }
+            )
+
+        if proxy is None:
+            return None
+
+        # If already ready, return immediately
+        if is_proxy_ready(proxy):
+            return proxy
+
+        # If warming is allowed and model is loading, return the proxy
+        if self.allow_warming and is_proxy_loading(proxy):
+            return proxy
+
+        # Wait for the model to become ready
+        try:
+            ready = await wait_for_proxy(proxy, timeout=self.timeout)
+        except asyncio.TimeoutError:
+            ready = False
+
+        if not ready:
+            state = get_proxy_state(proxy)
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": "model_warming_up",
+                    "model": self.model_name,
+                    "state": state.value,
+                    "message": f"Model '{self.model_name}' not ready after {self.timeout}s",
+                    "retry_after": 5.0,
+                },
+                headers={"Retry-After": "5"},
+            )
+
+        return proxy
+
+
+def requires_model_dependency(
+    model_name: str,
+    timeout: float = 30.0,
+) -> RequiresModel:
+    """
+    Factory function for creating model dependencies.
+
+    This is an alternative syntax for RequiresModel that some may prefer.
+
+    Usage:
+        vision_dep = requires_model_dependency("vision_analyzer")
+
+        @router.post("/analyze")
+        async def analyze(vision: Any = Depends(vision_dep)):
+            return await vision.analyze(image)
+    """
+    return RequiresModel(model_name, timeout=timeout)
+
+
+# =============================================================================
 # Decorator for routes that require a model
+# =============================================================================
 
 def requires_model(model_name: str, timeout: float = 30.0):
     """
     Decorator that ensures a model is ready before route execution.
+
+    Note: For new code, prefer using RequiresModel with Depends() instead.
+    This decorator is provided for backward compatibility and simpler cases.
 
     Args:
         model_name: Name of the required model
@@ -450,3 +620,129 @@ def requires_model(model_name: str, timeout: float = 30.0):
 
         return wrapper
     return decorator
+
+
+# =============================================================================
+# Optimization Stats for Health Endpoints
+# =============================================================================
+
+def get_optimization_stats(app_state: Any) -> dict:
+    """
+    Get comprehensive optimization statistics for all registered proxies.
+
+    This is designed for the /api/optimization/stats endpoint.
+
+    Args:
+        app_state: FastAPI app.state object
+
+    Returns:
+        Dict with detailed stats about AI loader, router, and all proxies
+    """
+    result = {
+        "ai_loader": {"available": False},
+        "router": {"available": False},
+        "proxies": {},
+        "summary": {
+            "total": 0,
+            "ready": 0,
+            "loading": 0,
+            "failed": 0,
+            "lazy": 0,
+        },
+    }
+
+    # Get AI Manager stats
+    ai_manager = getattr(app_state, 'ai_manager', None)
+    if ai_manager:
+        try:
+            stats = ai_manager.get_stats()
+            result["ai_loader"] = {
+                "available": True,
+                "initialized": True,
+                "config": stats.get("config", {}),
+                "memory_mb": stats["summary"]["total_memory_mb"],
+            }
+            result["router"] = stats.get("router", {"available": False})
+            result["summary"] = {
+                "total": stats["summary"]["total"],
+                "ready": stats["summary"]["ready"],
+                "loading": stats["summary"]["loading"],
+                "failed": stats["summary"]["failed"],
+                "lazy": 0,  # Will count below
+            }
+
+            # Get detailed proxy info
+            for name, model_stats in stats.get("models", {}).items():
+                engine = model_stats.get("engine", "unknown")
+                result["proxies"][name] = {
+                    "status": model_stats["status"],
+                    "ready": model_stats["status"] == "READY",
+                    "engine": engine,
+                    "priority": model_stats.get("priority", "NORMAL"),
+                    "quantized": model_stats.get("quantized", False),
+                    "load_time_ms": model_stats.get("load_duration_ms", 0),
+                    "memory_mb": model_stats.get("memory_mb", 0),
+                    "calls": model_stats.get("calls_total", 0),
+                    "calls_while_warming": model_stats.get("calls_while_warming", 0),
+                }
+
+                # Count lazy proxies
+                if model_stats.get("priority") == "LAZY":
+                    result["summary"]["lazy"] += 1
+
+        except Exception as e:
+            result["ai_loader"]["error"] = str(e)
+
+    # Also include stats from app.state proxies dicts for completeness
+    for category, proxies_attr in [
+        ("voice", "voice_model_proxies"),
+        ("vision", "vision_model_proxies"),
+        ("intelligence", "intelligence_proxies"),
+    ]:
+        proxies = getattr(app_state, proxies_attr, {})
+        for name, proxy in proxies.items():
+            if name not in result["proxies"] and proxy is not None:
+                result["proxies"][name] = {
+                    "status": get_proxy_state(proxy).value,
+                    "ready": is_proxy_ready(proxy),
+                    "category": category,
+                    "engine": "unknown",
+                }
+
+    return result
+
+
+def get_engine_breakdown(app_state: Any) -> dict:
+    """
+    Get breakdown of models by optimization engine.
+
+    Args:
+        app_state: FastAPI app.state object
+
+    Returns:
+        Dict with engine names as keys and model lists as values
+    """
+    breakdown = {}
+
+    ai_manager = getattr(app_state, 'ai_manager', None)
+    if not ai_manager:
+        return {"error": "AI Manager not available"}
+
+    try:
+        stats = ai_manager.get_stats()
+        for name, model_stats in stats.get("models", {}).items():
+            engine = model_stats.get("engine", "unknown")
+            if engine not in breakdown:
+                breakdown[engine] = {
+                    "count": 0,
+                    "models": [],
+                    "total_memory_mb": 0,
+                }
+            breakdown[engine]["count"] += 1
+            breakdown[engine]["models"].append(name)
+            breakdown[engine]["total_memory_mb"] += model_stats.get("memory_mb", 0)
+
+    except Exception as e:
+        breakdown["error"] = str(e)
+
+    return breakdown

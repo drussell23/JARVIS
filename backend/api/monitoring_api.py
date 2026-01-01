@@ -394,6 +394,204 @@ def track_api_call(endpoint: str, response_time_ms: float, success: bool = True)
 
 
 # =============================================================================
+# v10.0: AI LOADER OPTIMIZATION STATS
+# =============================================================================
+
+@router.get("/optimization/stats")
+async def get_optimization_stats(request) -> Dict[str, Any]:
+    """
+    Get comprehensive AI Loader optimization statistics.
+
+    Returns:
+    - AI Loader status (available, initialized)
+    - Router statistics (available engines, their capabilities)
+    - Per-model stats (status, engine, load time, memory)
+    - Summary (total models, ready, loading, failed)
+
+    This endpoint provides full visibility into:
+    - Which optimization engine each model is using (Rust, JIT, ONNX, Safetensors)
+    - Model loading progress and status
+    - Memory usage per model
+    - Request queuing statistics
+    """
+    try:
+        from core.proxy_helpers import get_optimization_stats as _get_opt_stats
+
+        stats = _get_opt_stats(request.app.state)
+        stats["timestamp"] = datetime.now().isoformat()
+        stats["uptime_seconds"] = (datetime.now() - _start_time).total_seconds()
+
+        return stats
+    except ImportError as e:
+        return {
+            "status": "unavailable",
+            "message": "Proxy helpers not available",
+            "error": str(e),
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        logger.error(f"Optimization stats error: {e}")
+        return {
+            "status": "error",
+            "message": str(e),
+            "timestamp": datetime.now().isoformat()
+        }
+
+
+@router.get("/optimization/engines")
+async def get_engine_breakdown(request) -> Dict[str, Any]:
+    """
+    Get breakdown of models by optimization engine.
+
+    Returns which models are using which engines:
+    - RUST_INT8: Rust-accelerated INT8 quantization
+    - JIT_TRACE: TorchScript traced (70x faster startup)
+    - ONNX: ONNX Runtime optimized
+    - SAFETENSORS: Zero-copy mmap loading
+    - STANDARD: Standard PyTorch loading
+
+    Example response:
+    {
+        "SAFETENSORS": {
+            "count": 8,
+            "models": ["ecapa_speaker", "vision_analyzer", ...],
+            "total_memory_mb": 245.5
+        },
+        "JIT_TRACE": {
+            "count": 2,
+            "models": ["whisper_encoder", "vad_silero"],
+            "total_memory_mb": 120.0
+        }
+    }
+    """
+    try:
+        from core.proxy_helpers import get_engine_breakdown as _get_breakdown
+
+        breakdown = _get_breakdown(request.app.state)
+        breakdown["timestamp"] = datetime.now().isoformat()
+
+        return breakdown
+    except ImportError as e:
+        return {
+            "status": "unavailable",
+            "message": "Proxy helpers not available",
+            "error": str(e),
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        logger.error(f"Engine breakdown error: {e}")
+        return {
+            "status": "error",
+            "message": str(e),
+            "timestamp": datetime.now().isoformat()
+        }
+
+
+@router.get("/optimization/proxies")
+async def get_proxy_status(request) -> Dict[str, Any]:
+    """
+    Get detailed status of all Ghost Proxies.
+
+    Returns per-proxy information:
+    - status: GHOST, QUEUED, LOADING, READY, FAILED
+    - ready: boolean
+    - category: voice, vision, intelligence
+    - loading: boolean
+
+    This is useful for debugging which models are still warming up.
+    """
+    try:
+        from core.proxy_helpers import get_all_proxy_stats
+
+        stats = get_all_proxy_stats(request.app.state)
+
+        # Calculate summary
+        total = len(stats)
+        ready = sum(1 for s in stats.values() if s.get("ready"))
+        loading = sum(1 for s in stats.values() if s.get("loading"))
+
+        return {
+            "proxies": stats,
+            "summary": {
+                "total": total,
+                "ready": ready,
+                "loading": loading,
+                "not_ready": total - ready,
+            },
+            "timestamp": datetime.now().isoformat()
+        }
+    except ImportError as e:
+        return {
+            "status": "unavailable",
+            "message": "Proxy helpers not available",
+            "error": str(e),
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        logger.error(f"Proxy status error: {e}")
+        return {
+            "status": "error",
+            "message": str(e),
+            "timestamp": datetime.now().isoformat()
+        }
+
+
+@router.get("/health/ai-loader")
+async def get_ai_loader_health(request) -> Dict[str, Any]:
+    """
+    Quick health check for the AI Loader system.
+
+    Returns a simple health status suitable for load balancer checks:
+    - healthy: All critical models are ready
+    - warming: Some models still loading
+    - degraded: Some models failed to load
+    """
+    try:
+        ai_manager = getattr(request.app.state, 'ai_manager', None)
+
+        if not ai_manager:
+            return {
+                "status": "disabled",
+                "message": "AI Loader not initialized",
+                "timestamp": datetime.now().isoformat()
+            }
+
+        stats = ai_manager.get_stats()
+        summary = stats["summary"]
+
+        # Determine health status
+        if summary["failed"] > 0:
+            status = "degraded"
+        elif summary["loading"] > 0:
+            status = "warming"
+        else:
+            status = "healthy"
+
+        return {
+            "status": status,
+            "models": {
+                "total": summary["total"],
+                "ready": summary["ready"],
+                "loading": summary["loading"],
+                "failed": summary["failed"],
+            },
+            "router": {
+                "engines_available": stats["router"]["available_count"],
+                "engines_total": stats["router"]["total_count"],
+            },
+            "memory_mb": summary["total_memory_mb"],
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        logger.error(f"AI Loader health check error: {e}")
+        return {
+            "status": "error",
+            "message": str(e),
+            "timestamp": datetime.now().isoformat()
+        }
+
+
+# =============================================================================
 # v9.0: GCP RATE LIMIT & QUOTA MONITORING
 # =============================================================================
 
