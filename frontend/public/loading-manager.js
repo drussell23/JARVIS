@@ -1,5 +1,5 @@
 /**
- * JARVIS Advanced Loading Manager v5.1 - Zero-Touch Edition
+ * JARVIS Advanced Loading Manager v5.2 - Graceful Fallback Edition
  *
  * ARCHITECTURE: Display-only client that trusts start_system.py as authority
  *
@@ -30,6 +30,14 @@
  * - Dead Man's Switch monitoring display
  * - Update validation progress
  * - DMS rollback stage handling
+ *
+ * v5.2 Graceful Fallback Features:
+ * - Intelligent frontend unavailability handling
+ * - "Continue to Backend" button when frontend is slow/unavailable
+ * - frontend_optional URL parameter support
+ * - Automatic fallback after 60s stuck at 95%+
+ * - Clear user instructions when frontend not running
+ * - Retry button for frontend reconnection
  */
 
 class JARVISLoadingManager {
@@ -42,6 +50,14 @@ class JARVISLoadingManager {
             wsProtocol: window.location.protocol === 'https:' ? 'wss:' : 'ws:',
             httpProtocol: window.location.protocol,
             hostname: window.location.hostname || 'localhost',
+            // v5.2: Intelligent frontend handling
+            // When true, system can complete startup even if frontend is unavailable
+            // This is set dynamically from supervisor or via URL parameter
+            frontendOptional: this.getFrontendOptionalFromURL(),
+            // Maximum time to wait for frontend before falling back to backend-only mode
+            frontendWaitTimeoutMs: 90000, // 90 seconds
+            // After this many seconds of waiting for frontend, show helpful message
+            frontendSlowThresholdSecs: 30,
             reconnect: {
                 enabled: true,
                 initialDelay: 500,
@@ -1560,7 +1576,8 @@ class JARVISLoadingManager {
         const pollInterval = setInterval(async () => {
             try {
                 // ═══════════════════════════════════════════════════════════════════════════
-                // v4.0 STUCK DETECTION: If at 95%+ for too long, force completion
+                // v5.2 STUCK DETECTION: Intelligent completion with frontend fallback
+                // If at 95%+ for too long, intelligently complete with fallback options
                 // ═══════════════════════════════════════════════════════════════════════════
                 if (this.state.progress >= 95 && this.state.progress < 100 && !this.state.redirecting) {
                     if (!stuckAt95Timer) {
@@ -1569,16 +1586,17 @@ class JARVISLoadingManager {
                     } else {
                         const stuckDuration = Date.now() - stuckAt95Timer;
                         console.log(`[Stuck Detection] At ${Math.round(this.state.progress)}% for ${Math.round(stuckDuration/1000)}s`);
-                        
+
                         if (stuckDuration >= STUCK_TIMEOUT_MS) {
                             // We're stuck - check if services are actually ready
                             const backendHealthy = await this.checkBackendHealth();
                             const frontendReady = await this.checkFrontendReady();
-                            
+
                             if (backendHealthy && frontendReady) {
-                                console.log('[JARVIS] ✅ Stuck detection: Services ready, forcing completion');
+                                // Both services ready - complete and redirect to frontend
+                                console.log('[JARVIS] ✅ Stuck detection: All services ready, forcing completion');
                                 clearInterval(pollInterval);
-                                
+
                                 this.handleProgressUpdate({
                                     stage: 'complete',
                                     message: 'JARVIS is online!',
@@ -1590,8 +1608,24 @@ class JARVISLoadingManager {
                                     }
                                 });
                                 return;
-                            } else if (backendHealthy) {
-                                console.log('[Stuck Detection] Backend ready, waiting for frontend...');
+                            } else if (backendHealthy && !frontendReady) {
+                                // v5.2: Backend ready but frontend not available
+                                console.log('[Stuck Detection] Backend ready, frontend not available');
+
+                                // Show the fallback button after 30s stuck
+                                if (stuckDuration >= 30000) {
+                                    this.showBackendFallbackButton();
+                                }
+
+                                // If frontend is optional OR we've been stuck for too long (60s+), complete
+                                if (this.config.frontendOptional || stuckDuration >= 60000) {
+                                    console.log('[JARVIS] ✅ Stuck detection: Backend ready, completing without frontend');
+                                    clearInterval(pollInterval);
+
+                                    // Show helpful message instead of redirecting to broken frontend
+                                    await this.handleFrontendUnavailable();
+                                    return;
+                                }
                             }
                         }
                     }
@@ -3375,20 +3409,24 @@ class JARVISLoadingManager {
 
     async waitForFrontendWithRetries() {
         /**
-         * Intelligent frontend waiting with exponential backoff.
+         * v5.2: Intelligent frontend waiting with graceful fallback.
+         *
          * This is the CRITICAL gate that prevents redirecting to an unavailable frontend.
+         * However, v5.2 adds intelligent fallback when frontend isn't available.
          *
          * Strategy:
          * - Quick initial checks (frontend might already be up)
          * - Exponential backoff to avoid hammering
-         * - Maximum wait time before giving up
+         * - Maximum wait time before activating fallback mode
          * - Clear status updates to the user
+         * - v5.2: Graceful fallback with user options when frontend unavailable
          */
         const config = {
-            maxWaitTime: 60000,        // Maximum 60 seconds total wait
+            maxWaitTime: this.config.frontendWaitTimeoutMs || 90000, // 90 seconds max
             initialDelay: 500,          // Start with 500ms between checks
             maxDelay: 3000,             // Cap delay at 3 seconds
             backoffMultiplier: 1.5,     // Increase delay by 50% each attempt
+            slowThreshold: this.config.frontendSlowThresholdSecs || 30, // Show warning after 30s
         };
 
         const startTime = Date.now();
@@ -3397,7 +3435,9 @@ class JARVISLoadingManager {
 
         console.log('[Frontend Wait] Starting intelligent wait for frontend...');
         this.updateStatusText('Waiting for frontend...', 'loading');
-        this.elements.statusMessage.textContent = 'Starting user interface...';
+        if (this.elements.statusMessage) {
+            this.elements.statusMessage.textContent = 'Starting user interface...';
+        }
 
         while (Date.now() - startTime < config.maxWaitTime) {
             attempt++;
@@ -3418,17 +3458,28 @@ class JARVISLoadingManager {
 
             // Update user-facing status
             if (elapsed < 10) {
-                this.elements.statusMessage.textContent = 'Starting user interface...';
-            } else if (elapsed < 30) {
-                this.elements.statusMessage.textContent = 'Frontend is initializing...';
+                if (this.elements.statusMessage) {
+                    this.elements.statusMessage.textContent = 'Starting user interface...';
+                }
+            } else if (elapsed < config.slowThreshold) {
+                if (this.elements.statusMessage) {
+                    this.elements.statusMessage.textContent = 'Frontend is initializing...';
+                }
                 this.updateStatusText('Starting frontend...', 'loading');
             } else {
-                this.elements.statusMessage.textContent = `Still waiting for frontend (${elapsed}s)...`;
+                // v5.2: After slow threshold, show more helpful message
+                if (this.elements.statusMessage) {
+                    this.elements.statusMessage.textContent = `Still waiting for frontend (${elapsed}s)...`;
+                }
                 this.updateStatusText('Frontend slow to start...', 'warning');
+
+                // v5.2: Show the fallback button early (after slowThreshold)
+                // so user can proceed to backend if they want
+                this.showBackendFallbackButton();
             }
 
             // Update progress to show we're making progress in waiting
-            const waitProgress = 95 + Math.min(4, (elapsed / 60) * 4); // 95% -> 99% over 60s
+            const waitProgress = 95 + Math.min(4, (elapsed / config.maxWaitTime * 1000) * 4); // 95% -> 99%
             this.state.progress = waitProgress;
             this.state.targetProgress = waitProgress;
             this.updateProgressBar();
@@ -3438,7 +3489,15 @@ class JARVISLoadingManager {
             delay = Math.min(delay * config.backoffMultiplier, config.maxDelay);
         }
 
-        console.error(`[Frontend Wait] ✗ Frontend failed to become ready after ${config.maxWaitTime / 1000}s`);
+        // v5.2: Frontend didn't become ready - activate graceful fallback
+        console.warn(`[Frontend Wait] ✗ Frontend failed to become ready after ${config.maxWaitTime / 1000}s`);
+        console.log('[Frontend Wait] Activating graceful fallback mode...');
+
+        // Handle frontend unavailability gracefully
+        await this.handleFrontendUnavailable();
+
+        // Return false to indicate frontend is not ready
+        // The caller should handle this appropriately
         return false;
     }
 
@@ -3616,6 +3675,173 @@ class JARVISLoadingManager {
 
     sleep(ms) {
         return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    /**
+     * v5.2: Get frontend_optional setting from URL parameters or environment.
+     * This allows the supervisor to signal that frontend is optional.
+     *
+     * URL param: ?frontend_optional=true
+     * This is set when starting in headless/API-only mode.
+     */
+    getFrontendOptionalFromURL() {
+        try {
+            const urlParams = new URLSearchParams(window.location.search);
+            const param = urlParams.get('frontend_optional');
+            if (param !== null) {
+                return param.toLowerCase() === 'true';
+            }
+            // Default: frontend is NOT optional (require it for redirect)
+            return false;
+        } catch (e) {
+            console.debug('[Config] Error parsing URL params:', e);
+            return false;
+        }
+    }
+
+    /**
+     * v5.2: Update frontend_optional setting dynamically.
+     * Called when supervisor signals that frontend is optional.
+     */
+    setFrontendOptional(optional) {
+        this.config.frontendOptional = optional;
+        console.log(`[Config] Frontend optional mode: ${optional}`);
+    }
+
+    /**
+     * v5.2: Handle frontend unavailability gracefully.
+     * When frontend is not available after timeout, provide helpful fallback.
+     *
+     * Options:
+     * 1. Redirect to backend API docs/health page
+     * 2. Show inline message with instructions
+     * 3. Keep showing loading with periodic retry
+     */
+    async handleFrontendUnavailable() {
+        console.log('[Fallback] Frontend unavailable - activating fallback mode');
+
+        // Update UI to show helpful message
+        if (this.elements.statusMessage) {
+            this.elements.statusMessage.innerHTML = `
+                <span style="color: #f59e0b;">Frontend is not running</span>
+            `;
+        }
+
+        // Show instructions
+        if (this.elements.subtitle) {
+            this.elements.subtitle.innerHTML = `
+                <span style="font-size: 0.9rem;">
+                    Backend is ready! To start the frontend:<br>
+                    <code style="background: #1a1a2e; padding: 4px 8px; border-radius: 4px; margin-top: 8px; display: inline-block;">
+                        cd frontend && npm start
+                    </code>
+                </span>
+            `;
+        }
+
+        // Add a "Continue to Backend" button
+        this.showBackendFallbackButton();
+
+        // If frontend_optional is set, redirect to backend after a brief pause
+        if (this.config.frontendOptional) {
+            console.log('[Fallback] Frontend optional - redirecting to backend in 3s');
+            await this.sleep(3000);
+            const backendUrl = `${this.config.httpProtocol}//${this.config.hostname}:${this.config.backendPort}`;
+            window.location.href = backendUrl;
+        }
+    }
+
+    /**
+     * v5.2: Show a button to manually redirect to backend.
+     */
+    showBackendFallbackButton() {
+        const existingButton = document.getElementById('backend-fallback-btn');
+        if (existingButton) return; // Already shown
+
+        const backendUrl = `${this.config.httpProtocol}//${this.config.hostname}:${this.config.backendPort}`;
+
+        const buttonContainer = document.createElement('div');
+        buttonContainer.id = 'backend-fallback-container';
+        buttonContainer.style.cssText = `
+            margin-top: 20px;
+            text-align: center;
+            animation: fadeIn 0.5s ease-out;
+        `;
+
+        const button = document.createElement('button');
+        button.id = 'backend-fallback-btn';
+        button.innerHTML = '🔧 Continue to Backend API';
+        button.style.cssText = `
+            background: linear-gradient(135deg, #0066cc, #004499);
+            border: none;
+            color: white;
+            padding: 12px 24px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 600;
+            box-shadow: 0 4px 15px rgba(0, 102, 204, 0.3);
+            transition: all 0.3s ease;
+        `;
+        button.onmouseover = () => {
+            button.style.transform = 'translateY(-2px)';
+            button.style.boxShadow = '0 6px 20px rgba(0, 102, 204, 0.4)';
+        };
+        button.onmouseout = () => {
+            button.style.transform = 'translateY(0)';
+            button.style.boxShadow = '0 4px 15px rgba(0, 102, 204, 0.3)';
+        };
+        button.onclick = () => {
+            window.location.href = backendUrl;
+        };
+
+        buttonContainer.appendChild(button);
+
+        // Add retry button too
+        const retryButton = document.createElement('button');
+        retryButton.innerHTML = '🔄 Retry Frontend';
+        retryButton.style.cssText = `
+            background: transparent;
+            border: 1px solid #444;
+            color: #888;
+            padding: 8px 16px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 12px;
+            margin-left: 12px;
+            transition: all 0.3s ease;
+        `;
+        retryButton.onmouseover = () => {
+            retryButton.style.borderColor = '#666';
+            retryButton.style.color = '#aaa';
+        };
+        retryButton.onmouseout = () => {
+            retryButton.style.borderColor = '#444';
+            retryButton.style.color = '#888';
+        };
+        retryButton.onclick = async () => {
+            retryButton.disabled = true;
+            retryButton.innerHTML = '⏳ Checking...';
+            const isReady = await this.checkFrontendReady();
+            if (isReady) {
+                buttonContainer.remove();
+                const frontendUrl = `${this.config.httpProtocol}//${this.config.hostname}:${this.config.mainAppPort}`;
+                window.location.href = frontendUrl;
+            } else {
+                retryButton.innerHTML = '🔄 Retry Frontend';
+                retryButton.disabled = false;
+            }
+        };
+
+        buttonContainer.appendChild(retryButton);
+
+        // Insert after progress bar
+        const progressContainer = document.querySelector('.progress-container');
+        if (progressContainer && progressContainer.parentNode) {
+            progressContainer.parentNode.insertBefore(buttonContainer, progressContainer.nextSibling);
+        } else {
+            document.body.appendChild(buttonContainer);
+        }
     }
 
     showPartialCompletionNotice(servicesReady = [], servicesFailed = []) {
