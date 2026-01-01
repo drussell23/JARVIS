@@ -4500,9 +4500,9 @@ class MetricsDatabase:
                         correction_confidence, times_applied, last_applied, source
                     ) VALUES (?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(hallucination_normalized) DO UPDATE SET
-                        times_applied = times_applied + 1,
+                        times_applied = hallucination_corrections.times_applied + 1,
                         last_applied = ?,
-                        correction_confidence = MAX(correction_confidence, ?)
+                        correction_confidence = MAX(hallucination_corrections.correction_confidence, ?)
                 """, (
                     now, normalized, corrected_text,
                     confidence, 1, now, "auto_learned",
@@ -4654,10 +4654,10 @@ class MetricsDatabase:
                     last_used, success_count, failure_count
                 ) VALUES (?, ?, ?, 1, ?, ?, ?)
                 ON CONFLICT(context, phrase_normalized) DO UPDATE SET
-                    occurrence_count = occurrence_count + 1,
+                    occurrence_count = user_behavioral_patterns.occurrence_count + 1,
                     last_used = ?,
-                    success_count = success_count + ?,
-                    failure_count = failure_count + ?
+                    success_count = user_behavioral_patterns.success_count + ?,
+                    failure_count = user_behavioral_patterns.failure_count + ?
             """, (
                 context, phrase, normalized, now, 1 if success else 0, 0 if success else 1,
                 now, 1 if success else 0, 0 if success else 1

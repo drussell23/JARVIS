@@ -3404,11 +3404,11 @@ class JARVISLearningDatabase:
                      avg_execution_time, confidence, last_updated)
                     VALUES (?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(goal_type, action_type) DO UPDATE SET
-                        success_count = success_count + ?,
-                        failure_count = failure_count + ?,
-                        avg_execution_time = (avg_execution_time * (success_count + failure_count) + ?)
-                                            / (success_count + failure_count + 1),
-                        confidence = CAST(success_count + ? AS REAL) / (success_count + failure_count + 1),
+                        success_count = goal_action_mappings.success_count + ?,
+                        failure_count = goal_action_mappings.failure_count + ?,
+                        avg_execution_time = (goal_action_mappings.avg_execution_time * (goal_action_mappings.success_count + goal_action_mappings.failure_count) + ?)
+                                            / (goal_action_mappings.success_count + goal_action_mappings.failure_count + 1),
+                        confidence = CAST(goal_action_mappings.success_count + ? AS REAL) / (goal_action_mappings.success_count + goal_action_mappings.failure_count + 1),
                         last_updated = ?
                 """,
                     (
@@ -4570,7 +4570,7 @@ class JARVISLearningDatabase:
                         pattern_data = excluded.pattern_data,
                         confidence = excluded.confidence,
                         success_rate = excluded.success_rate,
-                        occurrence_count = occurrence_count + 1,
+                        occurrence_count = patterns.occurrence_count + 1,
                         last_seen = excluded.last_seen,
                         metadata = excluded.metadata
                     """,
@@ -4834,8 +4834,8 @@ class JARVISLearningDatabase:
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(category, key) DO UPDATE SET
                         value = ?,
-                        confidence = (confidence * update_count + ?) / (update_count + 1),
-                        update_count = update_count + 1,
+                        confidence = (user_preferences.confidence * user_preferences.update_count + ?) / (user_preferences.update_count + 1),
+                        update_count = user_preferences.update_count + 1,
                         updated_at = ?
                 """,
                     (
