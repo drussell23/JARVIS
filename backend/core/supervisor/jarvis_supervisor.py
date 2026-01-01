@@ -1234,31 +1234,88 @@ class JARVISSupervisor:
 
             return {}
         
+        # === INTEGRATED SERVICE HEALTH CHECKS ===
+        # Track JARVIS Prime and Reactor Core for unified health reporting
+        jarvis_prime_port = int(os.environ.get("JARVIS_PRIME_PORT", "8000"))
+        jarvis_prime_url = f"http://localhost:{jarvis_prime_port}"
+        reactor_core_port = int(os.environ.get("REACTOR_CORE_PORT", "8001"))
+        reactor_core_url = f"http://localhost:{reactor_core_port}"
+
+        # Track integrated services (optional - don't block startup)
+        jarvis_prime_state = HealthCheckState()
+        reactor_core_state = HealthCheckState()
+
+        async def check_integrated_services() -> Dict[str, bool]:
+            """
+            Check JARVIS Prime and Reactor Core health in parallel.
+            These are optional - main startup doesn't block on them.
+            """
+            results = {"jarvis_prime": False, "reactor_core": False}
+
+            try:
+                # Check JARVIS Prime (local LLM brain)
+                prime_task = asyncio.create_task(
+                    check_endpoint_smart(f"{jarvis_prime_url}/health", jarvis_prime_state, timeout=2.0)
+                )
+                # Check Reactor Core (training/learning pipeline)
+                reactor_task = asyncio.create_task(
+                    check_endpoint_smart(f"{reactor_core_url}/health", reactor_core_state, timeout=2.0)
+                )
+
+                prime_ready, reactor_ready = await asyncio.gather(
+                    prime_task, reactor_task, return_exceptions=True
+                )
+
+                results["jarvis_prime"] = prime_ready if not isinstance(prime_ready, Exception) else False
+                results["reactor_core"] = reactor_ready if not isinstance(reactor_ready, Exception) else False
+
+            except Exception as e:
+                logger.debug(f"Integrated services check error: {e}")
+
+            return results
+
         async def parallel_health_check() -> Tuple[bool, bool, dict]:
-            """Run backend and frontend health checks in parallel."""
+            """
+            Run ALL health checks in parallel:
+            - Main backend (required)
+            - Frontend (optional based on config)
+            - JARVIS Prime (optional - local LLM)
+            - Reactor Core (optional - training pipeline)
+            """
+            # Create all health check tasks
             backend_task = asyncio.create_task(
                 check_endpoint_smart(f"{backend_url}/health", backend_state)
             )
             frontend_task = asyncio.create_task(
                 check_endpoint_smart(frontend_url, frontend_state)
             )
-            
-            # Wait for both
-            backend_ready, frontend_ready = await asyncio.gather(
-                backend_task, frontend_task, return_exceptions=True
+            integrated_task = asyncio.create_task(
+                check_integrated_services()
             )
-            
+
+            # Wait for all
+            backend_ready, frontend_ready, integrated_status = await asyncio.gather(
+                backend_task, frontend_task, integrated_task, return_exceptions=True
+            )
+
             # Handle exceptions
             if isinstance(backend_ready, Exception):
+                logger.debug(f"Backend check exception: {backend_ready}")
                 backend_ready = False
             if isinstance(frontend_ready, Exception):
+                logger.debug(f"Frontend check exception: {frontend_ready}")
                 frontend_ready = False
-            
+            if isinstance(integrated_status, Exception):
+                integrated_status = {"jarvis_prime": False, "reactor_core": False}
+
             # Get system status if backend is ready
             system_status = {}
             if backend_ready:
                 system_status = await check_system_status()
-            
+                # Add integrated services status
+                system_status["jarvis_prime_ready"] = integrated_status.get("jarvis_prime", False)
+                system_status["reactor_core_ready"] = integrated_status.get("reactor_core", False)
+
             return backend_ready, frontend_ready, system_status
         
         # === PROGRESS CALCULATION (uses hub as single source of truth) ===
@@ -1525,50 +1582,57 @@ class JARVISSupervisor:
                         ready_for_completion = True
 
                     # ═══════════════════════════════════════════════════════════════════
-                    # FALLBACK 4: Last resort timeout (after adaptive_timeout * 1.2)
-                    # v5.0: INTELLIGENT completion check - DON'T declare ready if:
-                    #   - Status is "unknown" (backend isn't reporting properly)
-                    #   - No services are ready (system is clearly still initializing)
-                    #   - Progress is below 50% (major components missing)
-                    # This prevents false "ready" announcements that confuse users
+                    # FALLBACK 4: PROGRESS-BASED COMPLETION (after 90 seconds)
+                    # v6.0: If backend is responding AND progress is high, complete startup.
+                    # This is pragmatic - if most components are ready, let user interact.
+                    # Remaining components will finish loading in the background.
+                    # ═══════════════════════════════════════════════════════════════════
+                    backend_progress = system_status.get("progress", 0) if system_status else 0
+                    current_hub_progress = get_progress()
+                    effective_progress = max(backend_progress, current_hub_progress)
+
+                    if (not ready_for_completion and
+                        backend_ready and
+                        elapsed > 90 and
+                        effective_progress >= 70):
+                        logger.info(
+                            f"✅ Progress-based completion: {effective_progress}% after {elapsed:.0f}s - "
+                            f"completing startup (remaining components will load in background)"
+                        )
+                        ready_for_completion = True
+
+                    # ═══════════════════════════════════════════════════════════════════
+                    # FALLBACK 5: BACKEND HTTP OK + TIMEOUT (after 120 seconds)
+                    # v6.0: If backend is responding to HTTP at all, and we've waited
+                    # long enough, complete startup. The user can at least interact
+                    # with basic functionality.
+                    # ═══════════════════════════════════════════════════════════════════
+                    if (not ready_for_completion and
+                        backend_ready and
+                        elapsed > 120):
+                        logger.warning(
+                            f"⏰ Extended wait ({elapsed:.0f}s) - backend HTTP OK, completing startup. "
+                            f"Progress: {effective_progress}%, Frontend: {'ready' if frontend_ready else 'loading'}"
+                        )
+                        ready_for_completion = True
+
+                    # ═══════════════════════════════════════════════════════════════════
+                    # FALLBACK 6: Last resort timeout (after adaptive_timeout * 1.2)
+                    # v6.0: Simplified - if backend responds, complete. User can interact.
                     # ═══════════════════════════════════════════════════════════════════
                     if (not ready_for_completion and
                         elapsed > adaptive_timeout * 1.2 and
-                        backend_ready and
-                        (frontend_ready or frontend_optional)):
-                        
+                        backend_ready):
+
                         services_ready = system_status.get('services_ready', []) if system_status else []
-                        current_progress = get_progress()
-                        
-                        # v5.0: Intelligent readiness check - system must show REAL progress
-                        is_actually_ready = (
-                            # Status must not be unknown
-                            backend_status != "unknown" and
-                            backend_status != "error" and
-                            # Either services are ready OR progress indicates readiness
-                            (len(services_ready) > 0 or current_progress >= 50)
-                        )
-                        
-                        if is_actually_ready:
-                            logger.warning(f"⏰ Extended timeout ({elapsed:.0f}s) - completing with available services")
-                            logger.warning(f"   Status: {backend_status}, Services: {services_ready}, Progress: {current_progress}%")
-                            ready_for_completion = True
-                        else:
-                            # System is NOT actually ready - log but DON'T declare complete
-                            # This prevents the "JARVIS is ready" announcement when it's clearly not
-                            logger.warning(
-                                f"⏰ Extended timeout ({elapsed:.0f}s) but system NOT ready - continuing wait"
-                            )
-                            logger.warning(
-                                f"   Status: {backend_status}, Services: {services_ready}, "
-                                f"Progress: {current_progress}% (need >50% or services ready)"
-                            )
-                            # Extend the timeout to give system more time
-                            # Will check again on next iteration
+
+                        logger.warning(f"⏰ Timeout fallback ({elapsed:.0f}s) - completing with backend ready")
+                        logger.warning(f"   Progress: {effective_progress}%, Services: {services_ready}")
+                        ready_for_completion = True
 
                     # ═══════════════════════════════════════════════════════════════════
-                    # FALLBACK 5: HARD timeout - system is stuck (after 2x adaptive_timeout)
-                    # v5.0: If we've waited 2x the timeout and system is STILL not ready,
+                    # FALLBACK 7: HARD timeout - system is stuck (after 2x adaptive_timeout)
+                    # v6.0: If we've waited 2x the timeout and system is STILL not ready,
                     # mark as partial completion with clear warning to user
                     # ═══════════════════════════════════════════════════════════════════
                     hard_timeout = adaptive_timeout * 2.0
