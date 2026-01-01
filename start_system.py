@@ -14605,11 +14605,22 @@ except Exception as e:
                 pass
             
             # Wait for frontend with retries
-            # Wait for frontend with configurable timeout
+            # v5.2: Make frontend wait non-blocking when FRONTEND_OPTIONAL is set
+            frontend_optional = os.getenv("FRONTEND_OPTIONAL", "false").lower() == "true"
             frontend_timeout = int(os.getenv("JARVIS_FRONTEND_TIMEOUT", "60"))
-            frontend_ready = await self._wait_for_frontend_ready(max_wait=frontend_timeout)
-        
-        # NOW broadcast 100% completion - only after frontend is verified
+
+            if frontend_optional:
+                # Non-blocking: Start frontend check as background task, don't wait
+                print(f"{Colors.CYAN}Frontend optional mode - proceeding without waiting{Colors.ENDC}")
+                # Quick check (5 seconds) to see if frontend is already up
+                frontend_ready = await self._verify_frontend_ready()
+                if not frontend_ready:
+                    print(f"{Colors.YELLOW}Frontend not yet available (optional - continuing){Colors.ENDC}")
+            else:
+                # Blocking: Wait for frontend with full timeout
+                frontend_ready = await self._wait_for_frontend_ready(max_wait=frontend_timeout)
+
+        # NOW broadcast 100% completion - frontend may or may not be ready
         # CRITICAL: Skip if supervisor is handling loading page (avoid duplicate completion signals)
         supervisor_handling_loading = os.environ.get("JARVIS_SUPERVISOR_LOADING") == "1"
 
@@ -14619,18 +14630,31 @@ except Exception as e:
             try:
                 import aiohttp
                 url = "http://localhost:3001/api/update-progress"
+
+                # v5.2: Choose redirect URL based on frontend availability
+                if frontend_ready:
+                    redirect_url = f"http://localhost:{self.ports['frontend']}"
+                    message = "JARVIS is ready!"
+                    sublabel = "System ready!"
+                else:
+                    # Redirect to backend API if frontend not available
+                    redirect_url = f"http://localhost:{self.ports['main_api']}"
+                    message = "JARVIS ready (backend mode)"
+                    sublabel = "Frontend not available - using backend API"
+
                 data = {
                     "stage": "complete",
-                    "message": "JARVIS is ready!" if frontend_ready else "JARVIS ready (frontend may still be loading)",
+                    "message": message,
                     "progress": 100,
                     "timestamp": datetime.now().isoformat(),
                     "metadata": {
                         "icon": "✅",
                         "label": "Complete",
-                        "sublabel": "System ready!" if frontend_ready else "Frontend initializing...",
+                        "sublabel": sublabel,
                         "success": True,
                         "frontend_verified": frontend_ready,
-                        "redirect_url": f"http://localhost:{self.ports['frontend']}"
+                        "frontend_optional": frontend_optional if 'frontend_optional' in dir() else False,
+                        "redirect_url": redirect_url
                     }
                 }
                 async with aiohttp.ClientSession() as session:

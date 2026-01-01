@@ -2327,10 +2327,13 @@ class SupervisorBootstrapper:
             # CRITICAL: Optimize Frontend Memory & Timeout based on resources
             # Reduce Node memory to 2GB (from default 4GB) to prevent relief pressure
             os.environ["JARVIS_FRONTEND_MEMORY_MB"] = "2048"
-            # Increase timeout to 600s to prevent early shutdown on slow systems
-            # (Observed startup time takes up to 4 minutes)
-            os.environ["JARVIS_FRONTEND_TIMEOUT"] = "600"
-            self.logger.info("🔄 Configured Frontend: 2GB RAM limit, 600s timeout")
+            # v5.2: Reduced frontend timeout to 60s (was 600s which blocked startup)
+            # Frontend is optional - backend can complete startup without it
+            # The loading page now has graceful fallback when frontend isn't available
+            os.environ["JARVIS_FRONTEND_TIMEOUT"] = "60"
+            # Signal that frontend is optional (loading page will show fallback options)
+            os.environ["FRONTEND_OPTIONAL"] = "true"
+            self.logger.info("🔄 Configured Frontend: 2GB RAM limit, 60s timeout, optional mode")
 
             # Propagate warnings for downstream handling
             if resources.warnings:
@@ -2739,18 +2742,21 @@ class SupervisorBootstrapper:
             # - Close ALL existing JARVIS windows (localhost:3000, :3001, :8010)
             # - Open ONE fresh incognito window
             # - This ensures a clean, predictable single-window experience
+            # v5.2: Add frontend_optional parameter to loading URL
+            frontend_optional = os.environ.get("FRONTEND_OPTIONAL", "false").lower() == "true"
+            loading_url_with_params = f"{loading_url}?frontend_optional={str(frontend_optional).lower()}"
             if platform.system() == "Darwin":  # macOS
                 try:
-                    opened = await self._ensure_single_jarvis_window(loading_url)
+                    opened = await self._ensure_single_jarvis_window(loading_url_with_params)
                     if opened:
                         print(f"  {TerminalUI.GREEN}✓ Single JARVIS window ready{TerminalUI.RESET}")
                     else:
                         print(f"  {TerminalUI.YELLOW}⚠️  Could not open Chrome automatically{TerminalUI.RESET}")
-                        print(f"  {TerminalUI.CYAN}💡 Open manually: {loading_url}{TerminalUI.RESET}")
+                        print(f"  {TerminalUI.CYAN}💡 Open manually: {loading_url_with_params}{TerminalUI.RESET}")
                 except Exception as e:
                     self.logger.debug(f"Failed to open Chrome: {e}")
                     print(f"  {TerminalUI.YELLOW}⚠️  Could not open Chrome automatically{TerminalUI.RESET}")
-                    print(f"  {TerminalUI.CYAN}💡 Open manually: {loading_url}{TerminalUI.RESET}")
+                    print(f"  {TerminalUI.CYAN}💡 Open manually: {loading_url_with_params}{TerminalUI.RESET}")
             
             # Step 4: Set environment variable to signal start_system.py
             os.environ["JARVIS_SUPERVISOR_LOADING"] = "1"
