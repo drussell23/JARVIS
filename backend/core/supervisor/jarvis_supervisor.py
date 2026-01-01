@@ -1343,48 +1343,79 @@ class JARVISSupervisor:
             while self.state == SupervisorState.RUNNING and self._progress_reporter:
                 elapsed = time.time() - start_time
                 adaptive_timeout = get_adaptive_timeout()
-                
-                # Check for slow startup
+
+                # Check for slow startup announcement
                 if not slow_startup_announced and elapsed > slow_threshold:
                     slow_startup_announced = True
                     key_milestones_narrated.add("slow")
                     await self._startup_narrator.announce_slow_startup()
-                
-                # Check for timeout
-                if elapsed > adaptive_timeout:
-                    # ═══════════════════════════════════════════════════════════════════
-                    # INTELLIGENT TIMEOUT HANDLING
-                    # ═══════════════════════════════════════════════════════════════════
-                    # Timeout is a warning, not necessarily a failure. Let the completion
-                    # check below determine if we should complete or continue waiting.
-                    #
-                    # Key principle: Only FAIL if nothing is working. If services are
-                    # still initializing, let them continue.
-                    # ═══════════════════════════════════════════════════════════════════
 
-                    if not backend_state.is_ready and not frontend_state.is_ready:
-                        # Neither backend nor frontend ready - actual failure
-                        logger.warning(f"⚠️ Startup timeout after {elapsed:.1f}s - no services responding")
+                # ═══════════════════════════════════════════════════════════════════
+                # HEALTH CHECKS FIRST - Run before timeout decision
+                # ═══════════════════════════════════════════════════════════════════
+                backend_ready = False
+                frontend_ready = False
+                system_status = {}
+
+                try:
+                    backend_ready, frontend_ready, system_status = await parallel_health_check()
+                except Exception as health_err:
+                    logger.debug(f"Health check error: {health_err}")
+
+                # Get progress from multiple sources for best accuracy
+                hub_progress = get_progress()
+                backend_progress = system_status.get("progress", 0) if system_status else 0
+                effective_progress = max(hub_progress, backend_progress)
+
+                # ═══════════════════════════════════════════════════════════════════
+                # INTELLIGENT TIMEOUT HANDLING (v7.0)
+                # ═══════════════════════════════════════════════════════════════════
+                # Only fail if:
+                # 1. We've exceeded timeout AND
+                # 2. No services are responding AND
+                # 3. Progress is below 50% (no significant work done)
+                #
+                # This prevents false failures when:
+                # - Backend is making progress but health endpoint is slow
+                # - Services are initializing but not yet reporting "ready"
+                # ═══════════════════════════════════════════════════════════════════
+                if elapsed > adaptive_timeout:
+                    # Check if we should fail or continue
+                    services_responding = backend_ready or frontend_ready or backend_state.is_ready or frontend_state.is_ready
+                    significant_progress = effective_progress >= 50
+
+                    if not services_responding and not significant_progress:
+                        # ACTUAL failure - nothing is working and no progress
+                        logger.warning(f"⚠️ Startup timeout after {elapsed:.1f}s - no services responding (progress: {effective_progress}%)")
                         await self._progress_reporter.fail(
                             f"Startup timeout after {int(elapsed)}s",
-                            error=f"Backend: not ready, Frontend: not ready"
+                            error=f"Backend: {'ready' if backend_ready else 'not ready'}, Frontend: {'ready' if frontend_ready else 'not ready'}, Progress: {effective_progress}%"
                         )
                         await self._startup_narrator.announce_error("Startup timeout - no services responding")
                         break
 
-                    # Backend or frontend is responding - don't fail, just log and continue
-                    # The completion check below will handle the logic
-                    if elapsed > adaptive_timeout * 1.5:
-                        # Extended timeout warning
+                    # Services responding OR making progress - don't fail, let fallbacks handle it
+                    if elapsed > adaptive_timeout * 1.5 and not services_responding:
                         logger.warning(
-                            f"⏰ Extended startup time: {elapsed:.0f}s "
-                            f"(backend={'ready' if backend_state.is_ready else 'starting'}, "
-                            f"frontend={'ready' if frontend_state.is_ready else 'starting'})"
+                            f"⏰ Extended startup ({elapsed:.0f}s) - Progress: {effective_progress}%, "
+                            f"Backend: {'ready' if backend_ready else 'starting'}, "
+                            f"Frontend: {'ready' if frontend_ready else 'starting'}"
                         )
-                
-                # === PARALLEL HEALTH CHECKS ===
+
+                # ═══════════════════════════════════════════════════════════════════
+                # PROGRESS-BASED AUTO-COMPLETION (v7.0)
+                # ═══════════════════════════════════════════════════════════════════
+                # If progress is high enough, complete startup regardless of health check state
+                # This handles cases where the backend is working but /health is slow
+                if effective_progress >= 85 and elapsed > 60:
+                    logger.info(f"✅ Progress-based completion: {effective_progress}% after {elapsed:.0f}s")
+                    # Mark backend as ready based on progress
+                    if not backend_state.is_ready:
+                        backend_state.record_success()
+                        backend_ready = True
+
+                # === PROCESS HEALTH CHECK RESULTS ===
                 try:
-                    backend_ready, frontend_ready, system_status = await parallel_health_check()
                     
                     # === UPDATE PROGRESS BASED ON STATE ===
                     
