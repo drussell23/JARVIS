@@ -648,6 +648,23 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+# =============================================================================
+# HYPER-SPEED ENGINE v8.0: uvloop Cython Event Loop
+# =============================================================================
+# uvloop provides 2-4x faster async operations by using Cython.
+# Must be activated BEFORE any asyncio operations or event loop creation.
+# =============================================================================
+_UVLOOP_ACTIVE = False
+if sys.platform != "win32":
+    try:
+        import uvloop
+        uvloop.install()  # Install as default event loop policy
+        _UVLOOP_ACTIVE = True
+    except ImportError:
+        pass  # uvloop not installed - use standard asyncio
+    except Exception:
+        pass  # Any error - fall back gracefully
+
 import aiohttp
 import psutil
 
