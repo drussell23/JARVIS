@@ -117,6 +117,7 @@ class ActionType(str, Enum):
     WORKFLOW = "workflow"  # Complex multi-step workflow via AgenticTaskRunner
     NOTIFICATION = "notification"  # Just notify (passive mode)
     VOICE_ALERT = "voice_alert"  # Voice alert only
+    GHOST_HANDS = "ghost_hands"  # Cross-space action via Ghost Hands (ZERO focus stealing!)
 
 
 @dataclass
@@ -142,8 +143,14 @@ class ActionConfig:
     workflow_goal: Optional[str] = None  # Complex goal for AgenticTaskRunner
     workflow_context: Dict[str, Any] = field(default_factory=dict)
 
+    # Ghost Hands (for GHOST_HANDS) - ZERO FOCUS STEALING!
+    ghost_hands_actions: List[Dict[str, Any]] = field(default_factory=list)  # List of GhostAction configs
+    ghost_hands_coordinates: Optional[tuple] = None  # (x, y) for click actions
+    ghost_hands_element: Optional[str] = None  # Element selector/title to click
+    preserve_user_focus: bool = True  # Always preserve user's current focus
+
     # Common settings
-    switch_to_window: bool = True  # Switch to window before acting
+    switch_to_window: bool = True  # Switch to window before acting (ignored for GHOST_HANDS)
     narrate: bool = True  # Voice narration during execution
     require_confirmation: bool = False  # Ask user before acting
     timeout_seconds: float = 30.0  # Max time for action execution
@@ -2615,12 +2622,16 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                         except Exception as e:
                             logger.warning(f"TTS failed: {e}")
 
+                    # Extract window_id for surgical cross-space targeting
+                    window_id = watcher.window_id if hasattr(watcher, 'window_id') else None
+
                     action_result = await self._execute_response(
                         trigger_text=trigger_text,
                         detected_text=result.get('trigger', trigger_text),  # Actual detected text
                         action_config=action_config,
                         app_name=app_name,
                         space_id=space_id,
+                        window_id=window_id,  # THE KEY: Pass window_id for Ghost Hands targeting!
                         confidence=detection_confidence
                     )
 
@@ -2958,21 +2969,30 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
         action_config: ActionConfig,
         app_name: str,
         space_id: int,
-        confidence: float
+        window_id: Optional[int] = None,  # THE KEY: Exact window for cross-space targeting
+        confidence: float = 0.0
     ) -> Optional[ActionExecutionResult]:
         """
         Execute configured action in response to visual event detection.
 
         This is the CORE of "Watch & Act" - the autonomous loop closer!
 
+        v13.0 GHOST HANDS INTEGRATION:
+        - When ActionType.GHOST_HANDS is used, we SKIP focus switching entirely
+        - Instead, we use the YabaiAwareActuator to execute actions on the
+          exact window_id, even if it's on a different Space
+        - User's focus is NEVER stolen - they stay on their current Space
+
         Flow:
-        1. Switch to target window (via SpatialAwarenessAgent)
-        2. Execute action based on type:
+        1. For GHOST_HANDS: Execute via YabaiAwareActuator (NO focus switch!)
+        2. For other types: Switch to target window (via SpatialAwarenessAgent)
+        3. Execute action based on type:
+           - GHOST_HANDS: Cross-space click/type via Ghost Hands
            - SIMPLE_GOAL: Use Computer Use for natural language goal
            - CONDITIONAL: Evaluate conditions and execute matching action
            - WORKFLOW: Delegate to AgenticTaskRunner for complex workflows
            - NOTIFICATION/VOICE_ALERT: Passive modes (already handled)
-        3. Return execution result
+        4. Return execution result
 
         Args:
             trigger_text: Original trigger pattern
@@ -2980,6 +3000,7 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
             action_config: Configuration for action to execute
             app_name: Application where event detected
             space_id: Space ID where event detected
+            window_id: EXACT window ID for surgical cross-space targeting
             confidence: Detection confidence
 
         Returns:
@@ -2990,14 +3011,33 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
 
         logger.info(
             f"[ACTION EXECUTION] Type: {action_config.action_type.value}, "
-            f"App: {app_name}, Space: {space_id}"
+            f"App: {app_name}, Space: {space_id}, Window: {window_id}"
         )
 
         try:
             self._total_actions_executed += 1
 
-            # Step 1: Switch to target window if requested
-            if action_config.switch_to_window:
+            # =================================================================
+            # v13.0 GHOST HANDS: Zero-Focus Cross-Space Execution
+            # =================================================================
+            # If GHOST_HANDS action type, we NEVER switch focus!
+            # Instead, we use YabaiAwareActuator to surgically interact
+            # with the exact window, even on a hidden Space.
+            # =================================================================
+            if action_config.action_type == ActionType.GHOST_HANDS:
+                return await self._execute_ghost_hands(
+                    trigger_text=trigger_text,
+                    detected_text=detected_text,
+                    action_config=action_config,
+                    app_name=app_name,
+                    space_id=space_id,
+                    window_id=window_id,
+                    start_time=start_time
+                )
+
+            # Step 1: Switch to target window if requested (LEGACY path)
+            # GHOST_HANDS skips this entirely (handled above)
+            if action_config.switch_to_window and action_config.action_type != ActionType.GHOST_HANDS:
                 await self._switch_to_app(app_name, space_id)
 
             # Step 2: Execute action based on type
@@ -3270,6 +3310,193 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                 success=False,
                 action_type=ActionType.WORKFLOW,
                 goal_executed=workflow_goal,
+                error=str(e),
+                duration_ms=duration_ms
+            )
+
+    # =========================================================================
+    # v13.0 GHOST HANDS: Zero-Focus Cross-Space Execution
+    # =========================================================================
+    # This is THE KEY INNOVATION: Execute actions on windows in OTHER Spaces
+    # without EVER switching the user's focus. JARVIS becomes invisible.
+    # =========================================================================
+
+    async def _execute_ghost_hands(
+        self,
+        trigger_text: str,
+        detected_text: str,
+        action_config: ActionConfig,
+        app_name: str,
+        space_id: int,
+        window_id: Optional[int],
+        start_time: float
+    ) -> ActionExecutionResult:
+        """
+        Execute action via Ghost Hands - ZERO FOCUS STEALING.
+
+        This is the surgical, cross-space action execution that makes JARVIS
+        truly invisible. The user NEVER sees their focus change.
+
+        Flow:
+        1. Initialize YabaiAwareActuator (lazy load)
+        2. Use window_id to target exact window (THE GOLDEN PATH)
+        3. Execute click/type via cross-space mechanisms
+        4. User stays on their current Space, completely undisturbed
+
+        Args:
+            trigger_text: What triggered this action
+            detected_text: Actual detected text
+            action_config: Configuration including coordinates/element
+            app_name: Application name
+            space_id: Space where window lives
+            window_id: EXACT window ID for surgical targeting
+            start_time: Start time for duration tracking
+
+        Returns:
+            ActionExecutionResult with Ghost Hands execution details
+        """
+        import time
+
+        logger.info(
+            f"[GHOST HANDS] 👻 Zero-focus execution starting! "
+            f"Window: {window_id}, Space: {space_id}, App: {app_name}"
+        )
+
+        # Voice narration: Announce invisible action
+        if action_config.narrate and self._tts_callback:
+            try:
+                await self._tts_callback(
+                    f"Ghost hands activated. Acting on {app_name} in background."
+                )
+            except Exception as e:
+                logger.warning(f"[GHOST HANDS] TTS failed: {e}")
+
+        try:
+            # Lazy load the YabaiAwareActuator
+            from ghost_hands.yabai_aware_actuator import get_yabai_actuator
+
+            actuator = await get_yabai_actuator()
+
+            if not actuator.yabai._initialized:
+                raise RuntimeError("Yabai not available for cross-space actions")
+
+            # Determine action to execute
+            coordinates = action_config.ghost_hands_coordinates
+            element = action_config.ghost_hands_element
+            goal = action_config.goal  # Can use goal as fallback description
+
+            # If no specific coordinates or element, click center of window
+            if not coordinates and not element and window_id:
+                window_info = await actuator.get_window_info(window_id)
+                if window_info:
+                    # Click center of window
+                    coordinates = (
+                        window_info.frame.width / 2,
+                        window_info.frame.height / 2
+                    )
+                    logger.info(f"[GHOST HANDS] Auto-targeting center: {coordinates}")
+
+            # Execute via YabaiAwareActuator
+            if window_id:
+                # THE GOLDEN PATH: We have exact window targeting!
+                logger.info(
+                    f"[GHOST HANDS] 🎯 Surgical click on window {window_id} "
+                    f"(Space {space_id})"
+                )
+
+                report = await actuator.click(
+                    window_id=window_id,
+                    space_id=space_id,
+                    selector=element,
+                    coordinates=coordinates,
+                )
+
+                success = report.result.name == "SUCCESS"
+
+                duration_ms = (time.time() - start_time) * 1000
+
+                # Log the result
+                if success:
+                    logger.info(
+                        f"[GHOST HANDS] ✅ Click executed via {report.backend_used} "
+                        f"in {report.duration_ms:.0f}ms, focus preserved: {report.focus_preserved}"
+                    )
+                else:
+                    logger.warning(
+                        f"[GHOST HANDS] ❌ Click failed: {report.error}"
+                    )
+
+                # Voice narration: Announce result
+                if action_config.narrate and self._tts_callback:
+                    try:
+                        if success:
+                            await self._tts_callback("Ghost hands action complete.")
+                        else:
+                            await self._tts_callback(f"Ghost hands failed: {report.error}")
+                    except Exception as e:
+                        logger.warning(f"[GHOST HANDS] TTS failed: {e}")
+
+                return ActionExecutionResult(
+                    success=success,
+                    action_type=ActionType.GHOST_HANDS,
+                    goal_executed=goal or f"Click on window {window_id}",
+                    error=report.error if not success else None,
+                    duration_ms=duration_ms,
+                    computer_use_result={
+                        "backend": report.backend_used,
+                        "focus_preserved": report.focus_preserved,
+                        "target_space": report.target_space,
+                        "window_id": report.window_id,
+                    }
+                )
+
+            else:
+                # Fallback: No window_id, try to discover from app_name
+                logger.warning(
+                    f"[GHOST HANDS] No window_id provided, discovering from {app_name}"
+                )
+
+                report = await actuator.click(
+                    app_name=app_name,
+                    space_id=space_id,
+                    selector=element,
+                    coordinates=coordinates,
+                )
+
+                success = report.result.name == "SUCCESS"
+                duration_ms = (time.time() - start_time) * 1000
+
+                return ActionExecutionResult(
+                    success=success,
+                    action_type=ActionType.GHOST_HANDS,
+                    goal_executed=goal or f"Click on {app_name}",
+                    error=report.error if not success else None,
+                    duration_ms=duration_ms,
+                    computer_use_result={
+                        "backend": report.backend_used,
+                        "focus_preserved": report.focus_preserved,
+                        "discovered_window": report.window_id,
+                    }
+                )
+
+        except ImportError as e:
+            logger.error(f"[GHOST HANDS] Ghost Hands module not available: {e}")
+            duration_ms = (time.time() - start_time) * 1000
+            return ActionExecutionResult(
+                success=False,
+                action_type=ActionType.GHOST_HANDS,
+                goal_executed=action_config.goal,
+                error=f"Ghost Hands not available: {e}",
+                duration_ms=duration_ms
+            )
+
+        except Exception as e:
+            logger.exception(f"[GHOST HANDS] Execution failed: {e}")
+            duration_ms = (time.time() - start_time) * 1000
+            return ActionExecutionResult(
+                success=False,
+                action_type=ActionType.GHOST_HANDS,
+                goal_executed=action_config.goal,
                 error=str(e),
                 duration_ms=duration_ms
             )
