@@ -1572,7 +1572,8 @@ class JARVISLoadingManager {
         let consecutiveHealthyChecks = 0;
         const requiredConsecutiveChecks = 3;
         let stuckAt95Timer = null;
-        const STUCK_TIMEOUT_MS = 30000; // 30 seconds stuck = force complete
+        // v6.0: Increased from 30s to 60s - webpack can take 30-60+ seconds to compile
+        const STUCK_TIMEOUT_MS = 60000; // 60 seconds stuck = start checking
         
         const pollInterval = setInterval(async () => {
             try {
@@ -1610,16 +1611,18 @@ class JARVISLoadingManager {
                                 });
                                 return;
                             } else if (backendHealthy && !frontendReady) {
-                                // v5.2: Backend ready but frontend not available
-                                console.log('[Stuck Detection] Backend ready, frontend not available');
+                                // v6.0: Backend ready but frontend still compiling
+                                console.log('[Stuck Detection] Backend ready, frontend compiling...');
 
-                                // Show the fallback button after 30s stuck
-                                if (stuckDuration >= 30000) {
+                                // v6.0: Show fallback button after 90s stuck (increased from 30s)
+                                // Webpack compilation can take 60-90+ seconds
+                                if (stuckDuration >= 90000) {
                                     this.showBackendFallbackButton();
                                 }
 
-                                // If frontend is optional OR we've been stuck for too long (60s+), complete
-                                if (this.config.frontendOptional || stuckDuration >= 60000) {
+                                // v6.0: Only give up if frontendOptional is set (increased from 60s to 120s)
+                                // CRITICAL: Don't auto-redirect to backend just because webpack is slow
+                                if (this.config.frontendOptional || stuckDuration >= 120000) {
                                     console.log('[JARVIS] ✅ Stuck detection: Backend ready, completing without frontend');
                                     clearInterval(pollInterval);
 
@@ -3731,21 +3734,31 @@ class JARVISLoadingManager {
     async handleFrontendUnavailable() {
         console.log('[Fallback] Frontend unavailable - activating fallback mode');
 
+        // v6.0: Check one more time if frontend is actually ready
+        // Webpack might have just finished compiling
+        const isReady = await this.checkFrontendReady();
+        if (isReady) {
+            console.log('[Fallback] Frontend is now ready! Redirecting...');
+            const frontendUrl = `${this.config.httpProtocol}//${this.config.hostname}:${this.config.mainAppPort}`;
+            window.location.href = frontendUrl;
+            return;
+        }
+
         // Update UI to show helpful message
         if (this.elements.statusMessage) {
             this.elements.statusMessage.innerHTML = `
-                <span style="color: #f59e0b;">Frontend is not running</span>
+                <span style="color: #f59e0b;">Frontend is still starting</span>
             `;
         }
 
-        // Show instructions
+        // v6.0: Show more helpful message about webpack compilation
         if (this.elements.subtitle) {
             this.elements.subtitle.innerHTML = `
                 <span style="font-size: 0.9rem;">
-                    Backend is ready! To start the frontend:<br>
-                    <code style="background: #1a1a2e; padding: 4px 8px; border-radius: 4px; margin-top: 8px; display: inline-block;">
-                        cd frontend && npm start
-                    </code>
+                    Backend is ready! Frontend (webpack) is still compiling.<br>
+                    <span style="color: #888; font-size: 0.8rem;">
+                        This can take 60-90+ seconds on first start.
+                    </span>
                 </span>
             `;
         }
@@ -3753,13 +3766,67 @@ class JARVISLoadingManager {
         // Add a "Continue to Backend" button
         this.showBackendFallbackButton();
 
-        // If frontend_optional is set, redirect to backend after a brief pause
-        if (this.config.frontendOptional) {
-            console.log('[Fallback] Frontend optional - redirecting to backend in 3s');
+        // v6.0: CRITICAL - Only auto-redirect if frontend_optional is EXPLICITLY set
+        // This prevents auto-redirecting to backend when webpack is just slow
+        if (this.config.frontendOptional === true) {
+            console.log('[Fallback] Frontend optional EXPLICITLY set - redirecting to backend in 3s');
             await this.sleep(3000);
             const backendUrl = `${this.config.httpProtocol}//${this.config.hostname}:${this.config.backendPort}`;
             window.location.href = backendUrl;
+        } else {
+            // v6.0: Start background retry for frontend
+            console.log('[Fallback] Starting background retry for frontend...');
+            this._startFrontendRetry();
         }
+    }
+
+    /**
+     * v6.0: Background retry for frontend when it's slow to start.
+     * Keeps checking periodically and redirects when ready.
+     */
+    _startFrontendRetry() {
+        // Don't start multiple retries
+        if (this._frontendRetryInterval) return;
+
+        let attempts = 0;
+        const maxAttempts = 30; // 30 attempts * 5 seconds = 2.5 minutes
+        const retryInterval = 5000; // Check every 5 seconds
+
+        this._frontendRetryInterval = setInterval(async () => {
+            attempts++;
+            console.log(`[Fallback] Retry #${attempts} - checking frontend...`);
+
+            const isReady = await this.checkFrontendReady();
+            if (isReady) {
+                clearInterval(this._frontendRetryInterval);
+                this._frontendRetryInterval = null;
+                console.log('[Fallback] Frontend ready! Redirecting...');
+                const frontendUrl = `${this.config.httpProtocol}//${this.config.hostname}:${this.config.mainAppPort}`;
+                window.location.href = frontendUrl;
+            } else if (attempts >= maxAttempts) {
+                clearInterval(this._frontendRetryInterval);
+                this._frontendRetryInterval = null;
+                console.warn('[Fallback] Max retries reached - frontend may be unavailable');
+                // Update message to be more definitive
+                if (this.elements.statusMessage) {
+                    this.elements.statusMessage.innerHTML = `
+                        <span style="color: #ef4444;">Frontend failed to start</span>
+                    `;
+                }
+            } else if (attempts % 6 === 0) {
+                // Update status every 30 seconds
+                if (this.elements.subtitle) {
+                    this.elements.subtitle.innerHTML = `
+                        <span style="font-size: 0.9rem;">
+                            Still waiting for frontend... (${attempts * 5}s)<br>
+                            <span style="color: #888; font-size: 0.8rem;">
+                                Use the button below to skip to backend.
+                            </span>
+                        </span>
+                    `;
+                }
+            }
+        }, retryInterval);
     }
 
     /**
