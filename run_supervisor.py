@@ -245,6 +245,25 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
+# =============================================================================
+# HYPER-SPEED ENGINE: uvloop Cython Event Loop Activation (v8.0)
+# =============================================================================
+# uvloop is a drop-in replacement for asyncio's event loop, written in Cython.
+# It provides 2-4x faster async operations by bypassing Python's C-API overhead.
+# This MUST be activated before any asyncio.run() or event loop creation.
+# =============================================================================
+_UVLOOP_ACTIVE = False
+if sys.platform != "win32":  # uvloop doesn't support Windows
+    try:
+        import uvloop
+        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+        _UVLOOP_ACTIVE = True
+        # Silent activation - will be logged properly once logging is configured
+    except ImportError:
+        pass  # uvloop not installed - fall back to standard asyncio
+    except Exception:
+        pass  # Any other error - fall back gracefully
+
 # Add backend to path
 backend_path = Path(__file__).parent / "backend"
 if str(backend_path) not in sys.path:
@@ -2245,10 +2264,17 @@ class SupervisorBootstrapper:
         try:
             # Setup signal handlers
             self._setup_signal_handlers()
-            
+
             # Print banner
             TerminalUI.print_banner()
-            
+
+            # v8.0: Log Hyper-Speed Engine status
+            if _UVLOOP_ACTIVE:
+                self.logger.info("🚀 [KERNEL] uvloop Cython Engine ACTIVE - 2-4x faster async operations")
+                TerminalUI.print_success("Hyper-Speed Engine: uvloop Cython active")
+            else:
+                self.logger.debug("[KERNEL] Using standard asyncio event loop")
+
             # Phase 1: Cleanup existing instances
             self.perf.start("cleanup")
             TerminalUI.print_phase(1, 4, "Checking for existing instances")
