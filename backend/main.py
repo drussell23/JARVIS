@@ -1365,13 +1365,19 @@ async def parallel_lifespan(app: FastAPI):
 
     v4.0: Ultra-fast startup - all heavy initialization runs in background.
     Server should respond to /health/ping within 1-2 seconds.
-    
+
     Key optimizations:
     - Module-level debug tasks deferred to background
     - Thread manager initialized lazily
     - All ML models loaded in background
     """
-    from backend.core.parallel_initializer import ParallelInitializer
+    # Robust import that works in both contexts:
+    # 1. When running via `python -m backend.main` (PYTHONPATH includes project root)
+    # 2. When app object is passed directly (working dir may be backend/)
+    try:
+        from backend.core.parallel_initializer import ParallelInitializer
+    except ImportError:
+        from core.parallel_initializer import ParallelInitializer
 
     # v4.0: Ultra-minimal pre-yield setup
     logger.info("=" * 60)
