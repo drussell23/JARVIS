@@ -131,12 +131,19 @@ except ImportError:
 
 class ActionType(str, Enum):
     """Types of actions that can be executed in response to visual events."""
+    # Core action types
     SIMPLE_GOAL = "simple_goal"  # Natural language goal for Computer Use
     CONDITIONAL = "conditional"  # Conditional branching (if X -> do Y)
     WORKFLOW = "workflow"  # Complex multi-step workflow via AgenticTaskRunner
     NOTIFICATION = "notification"  # Just notify (passive mode)
     VOICE_ALERT = "voice_alert"  # Voice alert only
     GHOST_HANDS = "ghost_hands"  # Cross-space action via Ghost Hands (ZERO focus stealing!)
+
+    # Extended action types (for action_config dict compatibility)
+    COMPUTER_USE = "computer_use"  # Generic computer use action
+    CLICK = "click"  # Click action
+    TYPE = "type"  # Type/keyboard action
+    EXECUTE = "execute"  # Execute command/script
 
 
 @dataclass
@@ -1948,28 +1955,31 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
             logger.info(f"✅ [{watcher_id}] Ferrari Engine watcher active (60 FPS GPU capture)")
 
             # ===== STEP 2: Convert action_config dict to ActionConfig if provided =====
+            # Uses local ActionConfig and ActionType classes defined at module top
             action_config_obj = None
             if action_config and self.config.enable_action_execution:
                 try:
-                    from backend.core.action_config import ActionConfig, ActionType
-
-                    # Parse action type
+                    # Parse action type using local ActionType enum
                     action_type_str = action_config.get('type', 'notification')
                     action_type_map = {
                         'notification': ActionType.NOTIFICATION,
                         'computer_use': ActionType.COMPUTER_USE,
                         'click': ActionType.CLICK,
                         'type': ActionType.TYPE,
-                        'execute': ActionType.EXECUTE
+                        'execute': ActionType.EXECUTE,
+                        'simple_goal': ActionType.SIMPLE_GOAL,
+                        'workflow': ActionType.WORKFLOW,
+                        'ghost_hands': ActionType.GHOST_HANDS,
+                        'voice_alert': ActionType.VOICE_ALERT,
                     }
                     action_type = action_type_map.get(action_type_str, ActionType.NOTIFICATION)
 
-                    # Create ActionConfig object
+                    # Create ActionConfig object using local class
                     action_config_obj = ActionConfig(
                         action_type=action_type,
                         goal=action_config.get('goal', f"Respond to '{trigger_text}' in {app_name}"),
-                        context=action_config.get('context', {}),
-                        timeout_seconds=action_config.get('timeout_seconds', 30),
+                        workflow_context=action_config.get('context', {}),
+                        timeout_seconds=float(action_config.get('timeout_seconds', 30)),
                         require_confirmation=action_config.get('require_confirmation', False)
                     )
 

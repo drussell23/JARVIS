@@ -1,8 +1,14 @@
 """
-Visual Event Detector v10.6
+Visual Event Detector v10.7
 ===========================
 
 Production-grade visual event detection for Video Multi-Space Intelligence (VMSI).
+
+CRITICAL FIXES v10.7 (Jan 2026):
+================================
+- FIXED: Cache thread safety - all cache operations now protected by lock
+- FIXED: Stats counters thread safety - atomic access via properties
+- ADDED: Configurable cache size via JARVIS_DETECTOR_CACHE_MAX_SIZE env var
 
 Features:
 - OCR text detection (pytesseract)
@@ -12,6 +18,7 @@ Features:
 - Multi-region analysis
 - Confidence scoring
 - Async/await throughout
+- Thread-safe operations
 - Zero hardcoding
 
 This is the "eyes" that analyze frames from VideoWatcher streams.
@@ -21,6 +28,7 @@ import asyncio
 import logging
 import os
 import re
+import threading
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple, Union, TYPE_CHECKING
@@ -129,6 +137,13 @@ class VisualEventDetector:
     - Color patterns (progress bars, status indicators)
 
     This is the core intelligence for VMSI - analyzing what's happening in background windows.
+
+    THREAD SAFETY v10.7:
+    ====================
+    - Cache operations protected by lock (prevents dict corruption)
+    - Stats counters use lock protection
+    - Semaphore is lazily initialized per event loop
+    - Multiple async coroutines can safely access shared state
     """
 
     def __init__(self, config: Optional[DetectorConfig] = None):
@@ -139,13 +154,15 @@ class VisualEventDetector:
         self._cv_available = OPENCV_AVAILABLE
         self._fuzzy_available = FUZZYWUZZY_AVAILABLE
 
-        # Stats
-        self.total_detections = 0
-        self.successful_detections = 0
-        self.failed_detections = 0
-        self.cache_hits = 0
+        # Stats with lock protection
+        self._stats_lock = threading.Lock()
+        self._total_detections = 0
+        self._successful_detections = 0
+        self._failed_detections = 0
+        self._cache_hits = 0
 
-        # Cache (frame hash -> result)
+        # Cache (frame hash -> result) with lock protection
+        self._cache_lock = threading.Lock()
         self._cache: Dict[str, Any] = {}
         self._cache_timestamps: Dict[str, float] = {}
 
@@ -159,6 +176,50 @@ class VisualEventDetector:
             f"OCR: {self._ocr_available}, CV: {self._cv_available}, "
             f"Fuzzy: {self._fuzzy_available}"
         )
+
+    @property
+    def total_detections(self) -> int:
+        """Thread-safe access to total detections."""
+        with self._stats_lock:
+            return self._total_detections
+
+    @total_detections.setter
+    def total_detections(self, value: int):
+        with self._stats_lock:
+            self._total_detections = value
+
+    @property
+    def successful_detections(self) -> int:
+        """Thread-safe access to successful detections."""
+        with self._stats_lock:
+            return self._successful_detections
+
+    @successful_detections.setter
+    def successful_detections(self, value: int):
+        with self._stats_lock:
+            self._successful_detections = value
+
+    @property
+    def failed_detections(self) -> int:
+        """Thread-safe access to failed detections."""
+        with self._stats_lock:
+            return self._failed_detections
+
+    @failed_detections.setter
+    def failed_detections(self, value: int):
+        with self._stats_lock:
+            self._failed_detections = value
+
+    @property
+    def cache_hits(self) -> int:
+        """Thread-safe access to cache hits."""
+        with self._stats_lock:
+            return self._cache_hits
+
+    @cache_hits.setter
+    def cache_hits(self, value: int):
+        with self._stats_lock:
+            self._cache_hits = value
 
     def _get_semaphore(self) -> asyncio.Semaphore:
         """Lazily create semaphore on first async use."""
@@ -653,51 +714,65 @@ class VisualEventDetector:
         return f"{frame.shape}_{frame.mean():.2f}"
 
     def _get_from_cache(self, key: str) -> Optional[Any]:
-        """Get result from cache if not expired."""
+        """Get result from cache if not expired (thread-safe)."""
         import time
 
-        if key not in self._cache:
-            return None
+        with self._cache_lock:
+            if key not in self._cache:
+                return None
 
-        # Check if expired
-        timestamp = self._cache_timestamps.get(key, 0)
-        if (time.time() - timestamp) > self.config.cache_ttl_seconds:
-            # Expired
-            del self._cache[key]
-            del self._cache_timestamps[key]
-            return None
+            # Check if expired
+            timestamp = self._cache_timestamps.get(key, 0)
+            if (time.time() - timestamp) > self.config.cache_ttl_seconds:
+                # Expired - remove atomically
+                self._cache.pop(key, None)
+                self._cache_timestamps.pop(key, None)
+                return None
 
-        return self._cache[key]
+            return self._cache[key]
 
     def _add_to_cache(self, key: str, value: Any):
-        """Add result to cache."""
+        """Add result to cache (thread-safe)."""
         import time
 
-        self._cache[key] = value
-        self._cache_timestamps[key] = time.time()
+        with self._cache_lock:
+            self._cache[key] = value
+            self._cache_timestamps[key] = time.time()
 
-        # Limit cache size
-        if len(self._cache) > 100:
-            # Remove oldest entries
-            oldest_key = min(self._cache_timestamps, key=self._cache_timestamps.get)
-            del self._cache[oldest_key]
-            del self._cache_timestamps[oldest_key]
+            # Limit cache size - get configurable max from environment
+            max_cache_size = int(os.getenv('JARVIS_DETECTOR_CACHE_MAX_SIZE', '100'))
+            if len(self._cache) > max_cache_size:
+                # Remove oldest entries
+                try:
+                    oldest_key = min(self._cache_timestamps, key=self._cache_timestamps.get)
+                    self._cache.pop(oldest_key, None)
+                    self._cache_timestamps.pop(oldest_key, None)
+                except ValueError:
+                    # Empty dict edge case
+                    pass
 
     def get_stats(self) -> Dict[str, Any]:
-        """Get detector statistics."""
-        success_rate = (
-            self.successful_detections / self.total_detections
-            if self.total_detections > 0
-            else 0.0
-        )
+        """Get detector statistics (thread-safe)."""
+        # Thread-safe access to stats
+        with self._stats_lock:
+            total = self._total_detections
+            successful = self._successful_detections
+            failed = self._failed_detections
+            cache_hits = self._cache_hits
+
+        # Thread-safe access to cache size
+        with self._cache_lock:
+            cache_size = len(self._cache)
+
+        success_rate = successful / total if total > 0 else 0.0
 
         return {
-            'total_detections': self.total_detections,
-            'successful_detections': self.successful_detections,
-            'failed_detections': self.failed_detections,
+            'total_detections': total,
+            'successful_detections': successful,
+            'failed_detections': failed,
             'success_rate': round(success_rate, 3),
-            'cache_hits': self.cache_hits,
-            'cache_size': len(self._cache),
+            'cache_hits': cache_hits,
+            'cache_size': cache_size,
             'capabilities': {
                 'ocr': self._ocr_available,
                 'computer_vision': self._cv_available,

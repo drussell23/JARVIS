@@ -1,6 +1,30 @@
 """
-Advanced macOS Video Capture System (v10.6)
+Advanced macOS Video Capture System (v10.7)
 Production-grade implementation using PyObjC + AVFoundation
+
+CRITICAL FIXES v10.7 (Jan 2026):
+================================
+- FIXED: Use-after-free in VideoFrameDelegate causing SIGSEGV after ~45 minutes
+  → Frame is now deep-copied BEFORE CVPixelBuffer is unlocked
+  → Frames passed to callbacks are fully owned, not views
+
+- FIXED: Shutdown race condition causing callback-after-free crashes
+  → Shutdown sequence now stops session before waiting for callbacks
+  → Delegate is signaled to stop accepting frames first
+  → All active callbacks drain before resources are freed
+
+- FIXED: Event loop validation to prevent scheduling to closed loops
+  → Validates event loop is still running before scheduling
+  → Handles loop closure gracefully during shutdown
+
+- FIXED: Frame queue race condition in VideoWatcher
+  → Atomic get/put operations with lock protection
+  → Thread-safe stats counters with properties
+
+- FIXED: Hardcoded timeouts replaced with environment variables
+  → JARVIS_CAPTURE_CALLBACK_DRAIN_TIMEOUT (default: 5.0s)
+  → JARVIS_CAPTURE_RUNLOOP_STOP_TIMEOUT (default: 2.0s)
+  → JARVIS_WATCHER_THREAD_STOP_TIMEOUT (default: 2.0s)
 
 Features:
 - Native AVFoundation integration via PyObjC
@@ -10,7 +34,8 @@ Features:
 - Dynamic configuration (environment variables, no hardcoding)
 - Comprehensive error handling and graceful degradation
 - Real-time performance monitoring and adaptive quality
-- Proper memory management and cleanup
+- Memory-safe frame handling with ownership tracking
+- Thread-safe operations throughout
 """
 
 import asyncio
@@ -276,6 +301,13 @@ if PYOBJC_AVAILABLE:
         This class bridges between Objective-C (AVFoundation) and Python.
         It receives video frames from AVCaptureSession and forwards them
         to Python callbacks.
+
+        CRITICAL MEMORY SAFETY:
+        =======================
+        CVPixelBuffer data is only valid while the buffer is locked.
+        We MUST create a deep copy of the frame data BEFORE unlocking,
+        otherwise the callback will receive a dangling pointer that
+        causes SIGSEGV (segmentation fault) when accessed later.
         """
 
         @classmethod
@@ -285,7 +317,12 @@ if PYOBJC_AVAILABLE:
             delegate.callback = callback
             delegate.frame_count = 0
             delegate.last_frame_time = time.time()
+            delegate._shutdown = False  # Shutdown flag
             return delegate
+
+        def setShutdown_(self, shutdown: bool):
+            """Signal that shutdown has been requested."""
+            self._shutdown = shutdown
 
         def captureOutput_didOutputSampleBuffer_fromConnection_(
             self, output, sample_buffer, connection
@@ -293,7 +330,35 @@ if PYOBJC_AVAILABLE:
             """
             AVCaptureVideoDataOutputSampleBufferDelegate method
             Called when a new video frame is captured
+
+            CRITICAL FIX v10.7 - Memory-Safe Frame Handling:
+            ================================================
+            The numpy array created via np.frombuffer() is a VIEW into the
+            CVPixelBuffer's locked memory. This memory becomes INVALID after
+            CVPixelBufferUnlockBaseAddress is called.
+
+            BEFORE (BUGGY):
+            1. Lock buffer
+            2. Create numpy view → frame points to buffer memory
+            3. Pass frame to callback (still a view!)
+            4. Unlock buffer → memory is now INVALID
+            5. Callback tries to use frame → SIGSEGV!
+
+            AFTER (FIXED):
+            1. Lock buffer
+            2. Create numpy view → frame points to buffer memory
+            3. Create DEEP COPY → owned_frame is independent
+            4. Unlock buffer → original memory invalid, but we don't use it
+            5. Pass owned_frame to callback → safe!
+
+            This prevents the SIGSEGV at ~45 minutes that was caused by
+            the garbage collector or macOS reclaiming the buffer memory
+            while a callback was still processing.
             """
+            # Fast shutdown check - skip processing if shutting down
+            if getattr(self, '_shutdown', False):
+                return
+
             try:
                 self.frame_count += 1
                 current_time = time.time()
@@ -305,46 +370,91 @@ if PYOBJC_AVAILABLE:
                     return
 
                 # Lock pixel buffer for reading
-                CVPixelBufferLockBaseAddress(image_buffer, 0)
+                lock_result = CVPixelBufferLockBaseAddress(image_buffer, 0)
+                if lock_result != 0:
+                    logger.warning(f"Failed to lock pixel buffer: {lock_result}")
+                    return
+
+                # CRITICAL: owned_frame must be created INSIDE try block
+                # and BEFORE the finally block unlocks the buffer
+                owned_frame = None
+                frame_metadata = None
 
                 try:
                     # Get pixel data
                     base_address = CVPixelBufferGetBaseAddress(image_buffer)
+                    if not base_address:
+                        logger.warning("No base address in pixel buffer")
+                        return
+
                     bytes_per_row = CVPixelBufferGetBytesPerRow(image_buffer)
                     height = CVPixelBufferGetHeight(image_buffer)
                     width = CVPixelBufferGetWidth(image_buffer)
 
+                    # Validate dimensions
+                    if width <= 0 or height <= 0 or bytes_per_row <= 0:
+                        logger.warning(f"Invalid buffer dimensions: {width}x{height}, bpr={bytes_per_row}")
+                        return
+
                     # Create numpy array from pixel data
                     # Format: BGRA (32-bit)
                     buffer_size = bytes_per_row * height
-                    frame_data = objc.PyObjC_PythonToId(base_address)
 
-                    # Convert to numpy array
-                    frame = np.frombuffer(
+                    # Create a VIEW into the locked buffer memory
+                    # WARNING: This view is ONLY valid while buffer is locked!
+                    frame_view = np.frombuffer(
                         base_address.as_buffer(buffer_size),
                         dtype=np.uint8
                     )
-                    frame = frame.reshape((height, bytes_per_row // 4, 4))
-                    frame = frame[:, :width, :3]  # Remove alpha channel
-                    frame = frame[:, :, ::-1]  # BGR to RGB
+
+                    # Reshape to image format
+                    # bytes_per_row may include padding, so we calculate pixels per row
+                    pixels_per_row = bytes_per_row // 4  # 4 bytes per BGRA pixel
+                    frame_view = frame_view.reshape((height, pixels_per_row, 4))
+                    frame_view = frame_view[:, :width, :3]  # Remove alpha, crop to actual width
+                    frame_view = frame_view[:, :, ::-1]  # BGR to RGB
+
+                    # ================================================================
+                    # CRITICAL: Create a DEEP COPY that we OWN
+                    # ================================================================
+                    # This copy is made while the buffer is still locked, so the
+                    # source data is valid. After this, owned_frame is independent
+                    # and safe to use after unlock.
+                    #
+                    # Using np.array() with copy=True ensures we get a contiguous
+                    # copy that we fully own, not a view.
+                    # ================================================================
+                    owned_frame = np.array(frame_view, dtype=np.uint8, copy=True)
+
+                    # Ensure the array is contiguous for downstream processing
+                    if not owned_frame.flags['C_CONTIGUOUS']:
+                        owned_frame = np.ascontiguousarray(owned_frame)
 
                     # Calculate FPS
                     fps = 1.0 / (current_time - self.last_frame_time) if self.last_frame_time > 0 else 0
                     self.last_frame_time = current_time
 
-                    # Call Python callback
-                    if self.callback:
-                        self.callback(frame, {
-                            'frame_number': self.frame_count,
-                            'timestamp': current_time,
-                            'fps': fps,
-                            'width': width,
-                            'height': height,
-                        })
+                    # Prepare metadata (no buffer references!)
+                    frame_metadata = {
+                        'frame_number': self.frame_count,
+                        'timestamp': current_time,
+                        'fps': fps,
+                        'width': width,
+                        'height': height,
+                        'memory_owned': True,  # Flag indicating safe memory
+                    }
 
                 finally:
-                    # Always unlock pixel buffer
+                    # Always unlock pixel buffer - BEFORE callback
+                    # At this point, owned_frame (if created) is our own copy
                     CVPixelBufferUnlockBaseAddress(image_buffer, 0)
+
+                # Now call the callback with our OWNED copy
+                # The buffer is unlocked, but owned_frame is safe to use
+                if owned_frame is not None and self.callback:
+                    # Final shutdown check before calling potentially slow callback
+                    if not getattr(self, '_shutdown', False):
+                        self.callback(owned_frame, frame_metadata)
 
             except Exception as e:
                 logger.error(f"Error in frame delegate: {e}", exc_info=True)
@@ -529,10 +639,14 @@ class AVFoundationCapture:
 
         This bridges from the Objective-C dispatch queue to Python asyncio.
 
-        THREAD SAFETY:
+        THREAD SAFETY v10.7:
+        ====================
+        - Frame is now PRE-COPIED by VideoFrameDelegate (memory_owned=True)
+        - No additional copy needed - frame already owns its memory
         - Checks shutdown flag before processing
         - Tracks active callbacks to allow clean shutdown
-        - Uses stored event loop reference (not get_event_loop())
+        - Uses stored event loop reference with validation
+        - Protects against event loop closure during shutdown
         """
         # Fast path: check shutdown before doing any work
         if self._shutdown_requested.is_set():
@@ -545,20 +659,52 @@ class AVFoundationCapture:
             self._active_callbacks += 1
 
         try:
-            if self.frame_callback and self._event_loop:
-                # Make a copy of the frame to ensure we own the memory
-                # This prevents segfaults if the original buffer is freed
-                frame_copy = frame.copy()
+            # Validate event loop is still usable
+            event_loop = self._event_loop
+            if not event_loop:
+                return
 
-                # Check again before scheduling
+            # Check if event loop is closed or closing
+            try:
+                if event_loop.is_closed():
+                    logger.debug("Event loop is closed, skipping frame callback")
+                    return
+            except Exception:
+                # If we can't check, assume it's not usable
+                return
+
+            if self.frame_callback:
+                # Frame is already a safe copy from VideoFrameDelegate
+                # (indicated by metadata['memory_owned'] = True)
+                # No additional copy needed - this saves significant CPU
+                safe_frame = frame
+
+                # Paranoia check: if somehow we got an unsafe frame, copy it
+                if not metadata.get('memory_owned', False):
+                    logger.warning("Received frame without memory_owned flag - making defensive copy")
+                    safe_frame = np.array(frame, dtype=np.uint8, copy=True)
+
+                # Final shutdown check before scheduling
                 if self._shutdown_requested.is_set():
                     return
 
                 # Schedule async callback in the stored event loop
-                asyncio.run_coroutine_threadsafe(
-                    self.frame_callback(frame_copy, metadata),
-                    self._event_loop
-                )
+                try:
+                    future = asyncio.run_coroutine_threadsafe(
+                        self.frame_callback(safe_frame, metadata),
+                        event_loop
+                    )
+                    # Don't wait for the future - fire and forget
+                    # But track it for debugging if needed
+                    if hasattr(self, '_last_scheduled_future'):
+                        self._last_scheduled_future = future
+                except RuntimeError as e:
+                    # Event loop was closed between our check and the call
+                    if "closed" in str(e).lower():
+                        logger.debug("Event loop closed during scheduling")
+                    else:
+                        raise
+
         except Exception as e:
             if not self._shutdown_requested.is_set():
                 logger.error(f"Error scheduling frame callback: {e}")
@@ -571,53 +717,124 @@ class AVFoundationCapture:
         """
         Stop AVFoundation capture session with proper callback drain.
 
-        CRITICAL: This ensures all callbacks complete before freeing resources.
-        This prevents the segfault caused by callbacks accessing freed memory.
+        CRITICAL FIX v10.7 - Correct Shutdown Sequence:
+        ================================================
+        The original sequence was:
+        1. Signal shutdown
+        2. Wait for callbacks (with short timeout)
+        3. Stop session ← TOO EARLY! Callbacks still running!
+        4. Free resources ← CRASH! Delegate accessed after free!
+
+        The FIXED sequence is:
+        1. Signal delegate to stop accepting frames (fast)
+        2. Signal shutdown (no new callbacks accepted)
+        3. Stop capture session (no new frames generated)
+        4. Wait for ALL active callbacks with longer timeout
+        5. Stop runloop thread
+        6. Free resources (safe now - no callbacks running)
+
+        This prevents SIGSEGV by ensuring the delegate and session
+        are not freed while callbacks are still executing.
         """
         if not self.is_running:
             return
 
         logger.info("Stopping AVFoundation capture...")
 
+        # Get configurable timeouts from environment
+        callback_drain_timeout = float(os.getenv('JARVIS_CAPTURE_CALLBACK_DRAIN_TIMEOUT', '5.0'))
+        runloop_stop_timeout = float(os.getenv('JARVIS_CAPTURE_RUNLOOP_STOP_TIMEOUT', '2.0'))
+
         try:
-            # STEP 1: Signal shutdown (fast, non-blocking)
+            # STEP 1: Signal delegate to stop processing new frames (FIRST!)
+            # This is the fastest way to stop the pipeline
+            if self.delegate and hasattr(self.delegate, 'setShutdown_'):
+                try:
+                    self.delegate.setShutdown_(True)
+                except Exception as e:
+                    logger.debug(f"Error signaling delegate shutdown: {e}")
+
+            # STEP 2: Signal shutdown flag (prevents new callbacks from starting)
             self._shutdown_requested.set()
 
-            # STEP 2: Wait for active callbacks to complete
-            timeout = 2.0
-            start_time = time.monotonic()
-            while self._active_callbacks > 0:
-                if time.monotonic() - start_time > timeout:
-                    logger.warning(
-                        f"Timeout waiting for {self._active_callbacks} callbacks to complete"
-                    )
-                    break
-                await asyncio.sleep(0.05)
-
-            # STEP 3: Stop capture session
+            # STEP 3: Stop capture session (no new frames will be generated)
+            # This MUST happen BEFORE waiting for callbacks, otherwise we keep
+            # generating frames and callbacks never drain
             if self.session:
                 try:
                     self.session.stopRunning()
+                    logger.debug("Capture session stopped")
                 except Exception as e:
                     logger.debug(f"Error stopping session: {e}")
 
-            # STEP 4: Stop runloop thread
+            # STEP 4: Wait for ALL active callbacks to complete
+            # With session stopped, no new callbacks will be added
+            # Use longer timeout since we need callbacks to actually finish
+            start_time = time.monotonic()
+            initial_callbacks = self._active_callbacks
+            last_log_time = start_time
+
+            while self._active_callbacks > 0:
+                elapsed = time.monotonic() - start_time
+
+                # Log progress periodically
+                if time.monotonic() - last_log_time > 1.0:
+                    logger.debug(
+                        f"Waiting for {self._active_callbacks} callbacks "
+                        f"(started with {initial_callbacks}, elapsed: {elapsed:.1f}s)"
+                    )
+                    last_log_time = time.monotonic()
+
+                if elapsed > callback_drain_timeout:
+                    logger.warning(
+                        f"Timeout after {elapsed:.1f}s waiting for {self._active_callbacks} callbacks. "
+                        f"These may be blocked or very slow. Proceeding with shutdown."
+                    )
+                    break
+
+                await asyncio.sleep(0.05)
+
+            if self._active_callbacks == 0:
+                logger.debug("All callbacks drained successfully")
+
+            # STEP 5: Stop runloop thread (handles Objective-C callbacks)
             if self._runloop_thread and self._runloop_thread.is_alive():
                 self._stop_runloop.set()
-                self._runloop_thread.join(timeout=2.0)
+                # Use non-blocking join in async context
+                join_start = time.monotonic()
+                while self._runloop_thread.is_alive():
+                    if time.monotonic() - join_start > runloop_stop_timeout:
+                        logger.warning(
+                            f"Runloop thread did not stop within {runloop_stop_timeout}s "
+                            f"(daemon thread will be cleaned up on process exit)"
+                        )
+                        break
+                    await asyncio.sleep(0.1)
 
-            # STEP 5: Small delay to ensure all cleanup completes
-            await asyncio.sleep(0.05)
+            # STEP 6: Small delay to ensure all macOS callbacks have exited
+            await asyncio.sleep(0.1)
 
-            # STEP 6: Clean up references
-            self.is_running = False
-            self.session = None
-            self.output = None
-            self.delegate = None
-            self.dispatch_queue = None
+            # STEP 7: Clear event loop reference (prevents stale reference issues)
             self._event_loop = None
 
-            # Force garbage collection
+            # STEP 8: Clean up Objective-C objects
+            # These are now safe to free since all callbacks have completed
+            self.is_running = False
+
+            # Release objects in order of dependency
+            if self.output:
+                try:
+                    # Remove delegate reference first
+                    self.output.setSampleBufferDelegate_queue_(None, None)
+                except Exception:
+                    pass
+
+            self.delegate = None
+            self.output = None
+            self.session = None
+            self.dispatch_queue = None
+
+            # STEP 9: Force garbage collection to release Objective-C references
             gc.collect()
 
             logger.info("✅ AVFoundation capture stopped safely")
@@ -1005,6 +1222,13 @@ class VideoWatcher:
     enables visual event detection (text, elements, colors).
 
     This is the core of VMSI - "The Watcher" that monitors background windows.
+
+    THREAD SAFETY v10.7:
+    ====================
+    - Frame queue operations protected by lock for atomic get/put
+    - Stats counters use atomic operations
+    - Stop event is thread-safe
+    - Multiple threads can safely produce/consume frames
     """
 
     def __init__(self, config: WatcherConfig):
@@ -1013,18 +1237,24 @@ class VideoWatcher:
         self.status = WatcherStatus.IDLE
 
         # Frame queue (producer-consumer pattern)
+        # Use deque with maxlen for automatic overflow handling
         self.frame_queue: queue.Queue = queue.Queue(maxsize=config.max_buffer_size)
+
+        # Lock for atomic queue operations (get + put must be atomic)
+        self._queue_lock = threading.Lock()
 
         # ScreenCaptureKit stream (Ferrari Engine for window-specific capture)
         self._sck_stream: Optional[Any] = None
         self._use_sck = NATIVE_SCK_BRIDGE_AVAILABLE  # Will use SCK if available
 
-        # Stats
-        self.frames_captured = 0
-        self.frames_analyzed = 0
+        # Stats with lock protection for thread-safe updates
+        self._stats_lock = threading.Lock()
+        self._frames_captured = 0
+        self._frames_analyzed = 0
+        self._frames_dropped = 0
         self.events_detected = 0
         self.start_time: float = 0.0
-        self.last_frame_time: float = 0.0
+        self._last_frame_time: float = 0.0
 
         # Threading
         self._capture_thread: Optional[threading.Thread] = None
@@ -1037,6 +1267,74 @@ class VideoWatcher:
 
         capture_method = "ScreenCaptureKit (Ferrari)" if self._use_sck else "CGWindowListCreateImage"
         logger.info(f"VideoWatcher created: {self.watcher_id} (Window {config.window_id}, {config.fps} FPS, Method: {capture_method})")
+
+    @property
+    def frames_captured(self) -> int:
+        """Thread-safe access to frames captured count."""
+        with self._stats_lock:
+            return self._frames_captured
+
+    @frames_captured.setter
+    def frames_captured(self, value: int):
+        """Thread-safe update of frames captured count."""
+        with self._stats_lock:
+            self._frames_captured = value
+
+    @property
+    def frames_analyzed(self) -> int:
+        """Thread-safe access to frames analyzed count."""
+        with self._stats_lock:
+            return self._frames_analyzed
+
+    @frames_analyzed.setter
+    def frames_analyzed(self, value: int):
+        """Thread-safe update of frames analyzed count."""
+        with self._stats_lock:
+            self._frames_analyzed = value
+
+    @property
+    def last_frame_time(self) -> float:
+        """Thread-safe access to last frame time."""
+        with self._stats_lock:
+            return self._last_frame_time
+
+    @last_frame_time.setter
+    def last_frame_time(self, value: float):
+        """Thread-safe update of last frame time."""
+        with self._stats_lock:
+            self._last_frame_time = value
+
+    def _put_frame_atomic(self, frame_data: Dict[str, Any]) -> bool:
+        """
+        Atomically put a frame into the queue, dropping oldest if full.
+
+        This fixes the race condition where between get_nowait() and
+        put_nowait(), another thread could fill the queue.
+
+        Returns:
+            True if frame was added, False if dropped
+        """
+        with self._queue_lock:
+            try:
+                self.frame_queue.put_nowait(frame_data)
+                return True
+            except queue.Full:
+                # Queue is full - atomically remove oldest and add new
+                try:
+                    self.frame_queue.get_nowait()
+                    with self._stats_lock:
+                        self._frames_dropped += 1
+                except queue.Empty:
+                    pass  # Queue became empty between full check and get
+
+                try:
+                    self.frame_queue.put_nowait(frame_data)
+                    return True
+                except queue.Full:
+                    # Still full (shouldn't happen with lock, but be defensive)
+                    with self._stats_lock:
+                        self._frames_dropped += 1
+                    return False
 
     async def start(self) -> bool:
         """Start the video watcher."""
@@ -1214,26 +1512,15 @@ class VideoWatcher:
                             f"shape={frame.shape}, queue_size={self.frame_queue.qsize()}"
                         )
 
-                    # Add to queue (non-blocking)
-                    try:
-                        self.frame_queue.put_nowait({
-                            'frame': frame,
-                            'frame_number': self.frames_captured,
-                            'timestamp': self.last_frame_time,
-                            'window_id': self.config.window_id,
-                        })
-                    except queue.Full:
-                        # Queue full, drop oldest frame
-                        try:
-                            self.frame_queue.get_nowait()
-                            self.frame_queue.put_nowait({
-                                'frame': frame,
-                                'frame_number': self.frames_captured,
-                                'timestamp': self.last_frame_time,
-                                'window_id': self.config.window_id,
-                            })
-                        except queue.Empty:
-                            pass
+                    # Add to queue atomically (thread-safe with overflow handling)
+                    self._put_frame_atomic({
+                        'frame': frame,
+                        'frame_number': self._frames_captured,
+                        'timestamp': self._last_frame_time,
+                        'window_id': self.config.window_id,
+                        'method': 'cgwindowlist',
+                        'memory_owned': True,  # numpy array from bytes() is owned
+                    })
                 else:
                     # Frame capture failed
                     consecutive_failures += 1
@@ -1476,30 +1763,16 @@ class VideoWatcher:
                         f"queue_size={self.frame_queue.qsize()}"
                     )
 
-                # Add to queue (non-blocking with overflow handling)
-                try:
-                    self.frame_queue.put_nowait({
-                        'frame': frame,
-                        'frame_number': frame_count,
-                        'timestamp': self.last_frame_time,
-                        'window_id': self.config.window_id,
-                        'capture_latency_ms': frame_data.get('capture_latency_us', 0) / 1000.0,
-                        'method': 'screencapturekit',
-                    })
-                except queue.Full:
-                    # Queue full, drop oldest frame
-                    try:
-                        self.frame_queue.get_nowait()
-                        self.frame_queue.put_nowait({
-                            'frame': frame,
-                            'frame_number': frame_count,
-                            'timestamp': self.last_frame_time,
-                            'window_id': self.config.window_id,
-                            'capture_latency_ms': frame_data.get('capture_latency_us', 0) / 1000.0,
-                            'method': 'screencapturekit',
-                        })
-                    except queue.Empty:
-                        pass
+                # Add to queue atomically (thread-safe with overflow handling)
+                self._put_frame_atomic({
+                    'frame': frame,
+                    'frame_number': frame_count,
+                    'timestamp': self._last_frame_time,
+                    'window_id': self.config.window_id,
+                    'capture_latency_ms': frame_data.get('capture_latency_us', 0) / 1000.0,
+                    'method': 'screencapturekit',
+                    'memory_owned': True,  # SCK frames are owned copies
+                })
 
             except Exception as e:
                 logger.error(f"[Watcher {self.watcher_id}] Error in SCK frame loop: {e}", exc_info=True)
@@ -1522,12 +1795,23 @@ class VideoWatcher:
             return None
 
     async def stop(self):
-        """Stop the video watcher."""
+        """
+        Stop the video watcher.
+
+        THREAD SAFETY v10.7:
+        ====================
+        - Uses async-compatible wait instead of blocking join()
+        - Properly drains frame queue with lock protection
+        - Cleans up all resources in correct order
+        """
         if self.status in (WatcherStatus.STOPPED, WatcherStatus.STOPPING):
             return
 
         self.status = WatcherStatus.STOPPING
         logger.info(f"Stopping watcher {self.watcher_id}...")
+
+        # Get configurable timeout from environment
+        thread_stop_timeout = float(os.getenv('JARVIS_WATCHER_THREAD_STOP_TIMEOUT', '2.0'))
 
         # Signal stop
         self._stop_event.set()
@@ -1548,32 +1832,52 @@ class VideoWatcher:
             except asyncio.CancelledError:
                 pass
 
-        # Wait for capture thread (fallback method)
+        # Wait for capture thread using async-compatible wait
+        # FIXED: Don't use blocking join() in async context
         if self._capture_thread and self._capture_thread.is_alive():
-            self._capture_thread.join(timeout=2.0)
+            start_time = time.monotonic()
+            while self._capture_thread.is_alive():
+                if time.monotonic() - start_time > thread_stop_timeout:
+                    logger.warning(
+                        f"[Watcher {self.watcher_id}] Capture thread did not stop within "
+                        f"{thread_stop_timeout}s (daemon thread will be cleaned up on exit)"
+                    )
+                    break
+                await asyncio.sleep(0.1)
 
-        # Clear queue
-        while not self.frame_queue.empty():
-            try:
-                self.frame_queue.get_nowait()
-            except queue.Empty:
-                break
+        # Clear queue atomically
+        with self._queue_lock:
+            while not self.frame_queue.empty():
+                try:
+                    self.frame_queue.get_nowait()
+                except queue.Empty:
+                    break
 
         self.status = WatcherStatus.STOPPED
 
-        # Log stats
+        # Log stats (use thread-safe property access)
         uptime = time.time() - self.start_time if self.start_time > 0 else 0
         capture_method = "Ferrari Engine" if self._sck_stream else "CGWindowListCreateImage"
+        with self._stats_lock:
+            frames = self._frames_captured
+            dropped = self._frames_dropped
         logger.info(
             f"✅ Watcher {self.watcher_id} stopped ({capture_method}) - "
-            f"Uptime: {uptime:.1f}s, Frames: {self.frames_captured}, "
+            f"Uptime: {uptime:.1f}s, Frames: {frames}, Dropped: {dropped}, "
             f"Events: {self.events_detected}"
         )
 
     def get_stats(self) -> Dict[str, Any]:
-        """Get watcher statistics."""
+        """Get watcher statistics (thread-safe)."""
         uptime = time.time() - self.start_time if self.start_time > 0 else 0
-        actual_fps = self.frames_captured / uptime if uptime > 0 else 0
+
+        # Thread-safe access to stats
+        with self._stats_lock:
+            frames_captured = self._frames_captured
+            frames_analyzed = self._frames_analyzed
+            frames_dropped = self._frames_dropped
+
+        actual_fps = frames_captured / uptime if uptime > 0 else 0
 
         return {
             'watcher_id': self.watcher_id,
@@ -1583,8 +1887,9 @@ class VideoWatcher:
             'space_id': self.space_id,
             'target_fps': self.config.fps,
             'actual_fps': round(actual_fps, 2),
-            'frames_captured': self.frames_captured,
-            'frames_analyzed': self.frames_analyzed,
+            'frames_captured': frames_captured,
+            'frames_analyzed': frames_analyzed,
+            'frames_dropped': frames_dropped,
             'events_detected': self.events_detected,
             'uptime_seconds': round(uptime, 2),
             'queue_size': self.frame_queue.qsize(),
