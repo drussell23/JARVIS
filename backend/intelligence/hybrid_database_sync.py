@@ -1965,7 +1965,7 @@ class HybridDatabaseSync:
                                         acoustic_features = EXCLUDED.acoustic_features,
                                         total_samples = EXCLUDED.total_samples,
                                         last_updated = EXCLUDED.last_updated
-                                """, row[0], row[1], row[2], row[3], row[4] if len(row) > 4 else 0, row[5] if len(row) > 5 else datetime.now().isoformat())
+                                """, row[0], row[1], row[2], row[3], row[4] if len(row) > 4 else 0, row[5] if len(row) > 5 else datetime.now())
 
                             elif operation == "update" and table == "speaker_profiles":
                                 # Update existing profile
@@ -1977,7 +1977,7 @@ class HybridDatabaseSync:
                                         total_samples = $5,
                                         last_updated = $6
                                     WHERE speaker_id = $1
-                                """, row[0], row[1], row[2], row[3], row[4] if len(row) > 4 else 0, row[5] if len(row) > 5 else datetime.now().isoformat())
+                                """, row[0], row[1], row[2], row[3], row[4] if len(row) > 4 else 0, row[5] if len(row) > 5 else datetime.now())
 
                             elif operation == "delete":
                                 # Delete record

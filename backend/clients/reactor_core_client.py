@@ -88,12 +88,30 @@ class ReactorCoreConfig:
         default_factory=lambda: int(os.getenv("REACTOR_CORE_POOL_SIZE", "10"))
     )
 
-    # Health Check Settings
+    # Health Check Settings - v2.0 Adaptive Health System
     health_check_interval: float = field(
         default_factory=lambda: float(os.getenv("REACTOR_CORE_HEALTH_INTERVAL", "60.0"))
     )
     health_check_timeout: float = field(
-        default_factory=lambda: float(os.getenv("REACTOR_CORE_HEALTH_TIMEOUT", "5.0"))
+        default_factory=lambda: float(os.getenv("REACTOR_CORE_HEALTH_TIMEOUT", "10.0"))  # v2.0: Increased from 5s
+    )
+    # v2.0: Adaptive timeout range
+    health_check_timeout_min: float = field(
+        default_factory=lambda: float(os.getenv("REACTOR_CORE_HEALTH_TIMEOUT_MIN", "5.0"))
+    )
+    health_check_timeout_max: float = field(
+        default_factory=lambda: float(os.getenv("REACTOR_CORE_HEALTH_TIMEOUT_MAX", "30.0"))
+    )
+    # v2.0: Startup grace period
+    startup_grace_period: float = field(
+        default_factory=lambda: float(os.getenv("REACTOR_CORE_STARTUP_GRACE", "120.0"))
+    )
+    # v2.0: Hysteresis thresholds
+    recovery_threshold: int = field(
+        default_factory=lambda: int(os.getenv("REACTOR_CORE_RECOVERY_THRESHOLD", "3"))
+    )
+    offline_threshold: int = field(
+        default_factory=lambda: int(os.getenv("REACTOR_CORE_OFFLINE_THRESHOLD", "3"))
     )
 
     # Training Trigger Settings
@@ -236,6 +254,15 @@ class ReactorCoreClient:
         self._on_connection_lost: List[Callable] = []
         self._on_connection_restored: List[Callable] = []
 
+        # v2.0: Adaptive Health System State
+        self._current_timeout: float = self.config.health_check_timeout
+        self._consecutive_failures: int = 0
+        self._consecutive_successes: int = 0
+        self._in_startup_grace: bool = True
+        self._startup_time: Optional[datetime] = None
+        self._last_failure_reason: Optional[str] = None
+        self._health_check_interval_multiplier: float = 1.0
+
     async def initialize(self) -> bool:
         """
         Initialize the client and establish connection.
@@ -268,7 +295,11 @@ class ReactorCoreClient:
                 timeout=timeout,
             )
 
-            # Initial health check
+            # v2.0: Record startup time for grace period
+            self._startup_time = datetime.now()
+            self._in_startup_grace = True
+
+            # Initial health check (don't fail init if Reactor-Core is down)
             self._is_online = await self.health_check()
 
             # Start background health monitor
@@ -312,42 +343,145 @@ class ReactorCoreClient:
 
     async def health_check(self) -> bool:
         """
-        Check if Reactor-Core is online and healthy.
+        v2.0: Adaptive health check with intelligent timeout and grace period.
+
+        Features:
+        - Adaptive timeout that scales based on failures
+        - Startup grace period (doesn't log warnings during warmup)
+        - Hysteresis for going online/offline
+        - Classifies failure reasons
 
         Returns:
             True if Reactor-Core is online and responding
         """
         if not self._session:
+            self._last_failure_reason = "no_session"
             return False
 
         try:
+            import aiohttp
+
+            # v2.0: Use adaptive timeout
+            adaptive_timeout = aiohttp.ClientTimeout(total=self._current_timeout)
+
             async with self._session.get(
                 f"{self.config.api_url}/health",
-                timeout=self.config.health_check_timeout,
+                timeout=adaptive_timeout,
             ) as response:
                 if response.status == 200:
                     self._last_health_check = datetime.now()
-                    was_offline = not self._is_online
-                    self._is_online = True
+                    self._consecutive_failures = 0
+                    self._consecutive_successes += 1
+                    self._last_failure_reason = None
 
+                    # v2.0: Gradually reduce timeout on success (with floor)
+                    self._current_timeout = max(
+                        self.config.health_check_timeout_min,
+                        self._current_timeout * 0.9
+                    )
+
+                    # v2.0: Reduce interval multiplier on success
+                    self._health_check_interval_multiplier = max(
+                        1.0,
+                        self._health_check_interval_multiplier * 0.8
+                    )
+
+                    # v2.0: Require multiple successes before going online (hysteresis)
+                    was_offline = not self._is_online
                     if was_offline:
-                        logger.info("[ReactorClient] Reactor-Core is now ONLINE")
-                        await self._emit_event("connection_restored")
+                        if self._consecutive_successes >= self.config.recovery_threshold:
+                            self._is_online = True
+                            logger.info(
+                                f"[ReactorClient] Reactor-Core is now ONLINE "
+                                f"(after {self._consecutive_successes} successful checks)"
+                            )
+                            await self._emit_event("connection_restored")
+                        else:
+                            logger.debug(
+                                f"[ReactorClient] Recovery in progress "
+                                f"({self._consecutive_successes}/{self.config.recovery_threshold})"
+                            )
+                    else:
+                        self._is_online = True
 
                     return True
                 else:
-                    self._is_online = False
+                    self._consecutive_failures += 1
+                    self._consecutive_successes = 0
+                    self._last_failure_reason = f"http_{response.status}"
+
+                    # v2.0: Only go offline after threshold failures
+                    if self._is_online and self._consecutive_failures >= self.config.offline_threshold:
+                        if not self._is_in_startup_grace():
+                            self._is_online = False
+                            logger.warning(
+                                f"[ReactorClient] Reactor-Core went OFFLINE: "
+                                f"HTTP {response.status} ({self._consecutive_failures} failures)"
+                            )
+                            await self._emit_event("connection_lost", {"error": f"HTTP {response.status}"})
+
                     return False
 
-        except Exception as e:
-            was_online = self._is_online
-            self._is_online = False
+        except asyncio.TimeoutError:
+            self._consecutive_failures += 1
+            self._consecutive_successes = 0
+            self._last_failure_reason = "timeout"
 
-            if was_online:
-                logger.warning(f"[ReactorClient] Reactor-Core went OFFLINE: {e}")
-                await self._emit_event("connection_lost", {"error": str(e)})
+            # v2.0: Increase timeout for next attempt (with ceiling)
+            self._current_timeout = min(
+                self.config.health_check_timeout_max,
+                self._current_timeout * 1.5
+            )
+
+            # v2.0: Only log warnings outside startup grace
+            if self._is_online and self._consecutive_failures >= self.config.offline_threshold:
+                if not self._is_in_startup_grace():
+                    self._is_online = False
+                    logger.warning(
+                        f"[ReactorClient] Reactor-Core went OFFLINE: "
+                        f"timeout after {self._current_timeout:.1f}s "
+                        f"({self._consecutive_failures} failures)"
+                    )
+                    await self._emit_event("connection_lost", {"error": "timeout"})
+            elif not self._is_in_startup_grace() and self._consecutive_failures > 0:
+                logger.debug(
+                    f"[ReactorClient] Health check timeout "
+                    f"(attempt {self._consecutive_failures}, next timeout: {self._current_timeout:.1f}s)"
+                )
 
             return False
+
+        except Exception as e:
+            self._consecutive_failures += 1
+            self._consecutive_successes = 0
+            self._last_failure_reason = f"error:{type(e).__name__}"
+
+            # v2.0: Only go offline after threshold failures
+            if self._is_online and self._consecutive_failures >= self.config.offline_threshold:
+                if not self._is_in_startup_grace():
+                    self._is_online = False
+                    logger.warning(f"[ReactorClient] Reactor-Core went OFFLINE: {e}")
+                    await self._emit_event("connection_lost", {"error": str(e)})
+            elif not self._is_in_startup_grace() and self._consecutive_failures > 0:
+                logger.debug(f"[ReactorClient] Health check error: {e}")
+
+            return False
+
+    def _is_in_startup_grace(self) -> bool:
+        """v2.0: Check if we're still in the startup grace period."""
+        if not self._in_startup_grace:
+            return False
+
+        if self._startup_time is None:
+            return True
+
+        elapsed = (datetime.now() - self._startup_time).total_seconds()
+        if elapsed >= self.config.startup_grace_period:
+            self._in_startup_grace = False
+            logger.debug(f"[ReactorClient] Startup grace period ended after {elapsed:.1f}s")
+            return False
+
+        return True
 
     @property
     def is_online(self) -> bool:
@@ -869,11 +1003,33 @@ class ReactorCoreClient:
         return None
 
     async def _health_monitor_loop(self) -> None:
-        """Background health monitoring loop."""
+        """
+        v2.0: Adaptive background health monitoring loop.
+
+        Features:
+        - Adaptive interval that slows down during failures
+        - Faster recovery when coming back online
+        - Intelligent backoff to reduce load on failing services
+        """
         while True:
             try:
-                await asyncio.sleep(self.config.health_check_interval)
-                await self.health_check()
+                # v2.0: Use adaptive interval based on health state
+                adaptive_interval = (
+                    self.config.health_check_interval *
+                    self._health_check_interval_multiplier
+                )
+                await asyncio.sleep(adaptive_interval)
+
+                healthy = await self.health_check()
+
+                if not healthy:
+                    # v2.0: Increase interval on failures (back off)
+                    self._health_check_interval_multiplier = min(
+                        4.0,  # Max 4x the base interval
+                        self._health_check_interval_multiplier * 1.2
+                    )
+                # Success handling is done in health_check
+
             except asyncio.CancelledError:
                 break
             except Exception as e:

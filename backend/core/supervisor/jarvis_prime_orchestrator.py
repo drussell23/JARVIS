@@ -92,7 +92,30 @@ class JarvisPrimeConfig:
         default_factory=lambda: float(os.getenv("JARVIS_PRIME_HEALTH_INTERVAL", "10.0"))
     )
     health_check_timeout_seconds: float = field(
-        default_factory=lambda: float(os.getenv("JARVIS_PRIME_HEALTH_TIMEOUT", "5.0"))
+        default_factory=lambda: float(os.getenv("JARVIS_PRIME_HEALTH_TIMEOUT", "10.0"))  # v10.8: Increased from 5s
+    )
+
+    # v10.8: Adaptive Health System Configuration
+    health_check_timeout_min_seconds: float = field(
+        default_factory=lambda: float(os.getenv("JARVIS_PRIME_HEALTH_TIMEOUT_MIN", "5.0"))
+    )
+    health_check_timeout_max_seconds: float = field(
+        default_factory=lambda: float(os.getenv("JARVIS_PRIME_HEALTH_TIMEOUT_MAX", "30.0"))
+    )
+    startup_grace_period_seconds: float = field(
+        default_factory=lambda: float(os.getenv("JARVIS_PRIME_STARTUP_GRACE", "60.0"))
+    )
+    health_recovery_threshold: int = field(
+        default_factory=lambda: int(os.getenv("JARVIS_PRIME_RECOVERY_THRESHOLD", "3"))
+    )
+    degradation_warning_threshold: int = field(
+        default_factory=lambda: int(os.getenv("JARVIS_PRIME_DEGRADE_WARN", "2"))
+    )
+    degradation_critical_threshold: int = field(
+        default_factory=lambda: int(os.getenv("JARVIS_PRIME_DEGRADE_CRIT", "5"))
+    )
+    restart_failure_threshold: int = field(
+        default_factory=lambda: int(os.getenv("JARVIS_PRIME_RESTART_THRESHOLD", "8"))
     )
 
     # Recovery settings
@@ -266,6 +289,14 @@ class JarvisPrimeOrchestrator:
 
         # Docker-specific state
         self._docker_container_id: Optional[str] = None
+
+        # v10.8: Adaptive Health System State
+        self._current_timeout: float = self.config.health_check_timeout_seconds
+        self._consecutive_successes: int = 0
+        self._in_startup_grace: bool = True
+        self._startup_complete_time: Optional[datetime] = None
+        self._last_failure_reason: Optional[str] = None
+        self._health_check_interval_multiplier: float = 1.0  # Dynamically adjusted
 
         logger.info(
             f"[JarvisPrime] Orchestrator initialized "
@@ -489,18 +520,30 @@ class JarvisPrimeOrchestrator:
 
     async def check_health(self) -> bool:
         """
-        Perform a health check.
+        v10.8: Perform an adaptive health check with intelligent timeout.
+
+        Features:
+        - Adaptive timeout that scales based on failures
+        - Classifies failure reasons (timeout, connection refused, error)
+        - Tracks consecutive successes for hysteresis recovery
 
         Returns:
             True if healthy
         """
         if not self._http_session:
+            self._last_failure_reason = "no_session"
             return False
 
         try:
             start_time = time.perf_counter()
 
-            async with self._http_session.get(self.config.health_url) as response:
+            # v10.8: Use adaptive timeout with aiohttp
+            adaptive_timeout = aiohttp.ClientTimeout(total=self._current_timeout)
+
+            async with self._http_session.get(
+                self.config.health_url,
+                timeout=adaptive_timeout
+            ) as response:
                 latency_ms = (time.perf_counter() - start_time) * 1000
                 self._record_latency(latency_ms)
 
@@ -512,29 +555,123 @@ class JarvisPrimeOrchestrator:
                     self._health.model_loaded = data.get("model_loaded", False)
                     self._health.model_name = data.get("model_name")
 
+                    # v10.8: Track consecutive successes for hysteresis
+                    self._consecutive_successes += 1
+                    self._last_failure_reason = None
+
+                    # v10.8: Gradually reduce timeout on success (with floor)
+                    self._current_timeout = max(
+                        self.config.health_check_timeout_min_seconds,
+                        self._current_timeout * 0.9  # Reduce by 10% per success
+                    )
+
+                    # v10.8: Reduce interval multiplier on success
+                    self._health_check_interval_multiplier = max(
+                        1.0,
+                        self._health_check_interval_multiplier * 0.8
+                    )
+
                     return True
                 else:
                     self._health.consecutive_failures += 1
+                    self._consecutive_successes = 0
+                    self._last_failure_reason = f"http_{response.status}"
                     return False
 
         except asyncio.TimeoutError:
-            logger.warning("[JarvisPrime] Health check timed out")
+            elapsed = time.perf_counter() - start_time
             self._health.consecutive_failures += 1
-            return False
-        except aiohttp.ClientError as e:
-            logger.warning(f"[JarvisPrime] Health check failed: {e}")
-            self._health.consecutive_failures += 1
-            return False
-        except Exception as e:
-            logger.error(f"[JarvisPrime] Health check error: {e}")
-            self._health.consecutive_failures += 1
+            self._consecutive_successes = 0
+            self._last_failure_reason = "timeout"
+
+            # v10.8: Increase timeout for next attempt (with ceiling)
+            self._current_timeout = min(
+                self.config.health_check_timeout_max_seconds,
+                self._current_timeout * 1.5  # Increase by 50% on timeout
+            )
+
+            # v10.8: Only warn if outside startup grace period
+            if not self._is_in_startup_grace():
+                logger.warning(
+                    f"[JarvisPrime] Health check timed out after {elapsed:.1f}s "
+                    f"(adaptive timeout: {self._current_timeout:.1f}s, "
+                    f"failures: {self._health.consecutive_failures})"
+                )
+            else:
+                logger.debug(
+                    f"[JarvisPrime] Health check timeout during startup grace "
+                    f"(timeout: {self._current_timeout:.1f}s)"
+                )
+
             return False
 
+        except aiohttp.ClientConnectorError as e:
+            self._health.consecutive_failures += 1
+            self._consecutive_successes = 0
+            self._last_failure_reason = "connection_refused"
+
+            if not self._is_in_startup_grace():
+                logger.warning(f"[JarvisPrime] Health check connection refused: {e}")
+            else:
+                logger.debug(f"[JarvisPrime] Connection refused during startup grace")
+
+            return False
+
+        except aiohttp.ClientError as e:
+            self._health.consecutive_failures += 1
+            self._consecutive_successes = 0
+            self._last_failure_reason = f"client_error:{type(e).__name__}"
+
+            if not self._is_in_startup_grace():
+                logger.warning(f"[JarvisPrime] Health check failed: {e}")
+            return False
+
+        except Exception as e:
+            self._health.consecutive_failures += 1
+            self._consecutive_successes = 0
+            self._last_failure_reason = f"error:{type(e).__name__}"
+            logger.error(f"[JarvisPrime] Health check error: {e}")
+            return False
+
+    def _is_in_startup_grace(self) -> bool:
+        """v10.8: Check if we're still in the startup grace period."""
+        if not self._in_startup_grace:
+            return False
+
+        if self._startup_complete_time is None:
+            return True  # Still starting
+
+        elapsed = (datetime.now() - self._startup_complete_time).total_seconds()
+        if elapsed >= self.config.startup_grace_period_seconds:
+            self._in_startup_grace = False
+            logger.debug(f"[JarvisPrime] Startup grace period ended after {elapsed:.1f}s")
+            return False
+
+        return True
+
     async def _health_check_loop(self) -> None:
-        """Background health check loop with auto-recovery."""
+        """
+        v10.8: Adaptive background health check loop with intelligent recovery.
+
+        Features:
+        - Startup grace period (no degradation during initial warmup)
+        - Hysteresis for recovery (require multiple successes before RUNNING)
+        - Configurable degradation thresholds
+        - Adaptive check interval that slows down during issues
+        - Better failure classification and logging
+        """
+        # v10.8: Mark startup complete time when health loop starts
+        self._startup_complete_time = datetime.now()
+        self._in_startup_grace = True
+
         while not self._shutdown_event.is_set():
             try:
-                await asyncio.sleep(self.config.health_check_interval_seconds)
+                # v10.8: Use adaptive interval based on health state
+                adaptive_interval = (
+                    self.config.health_check_interval_seconds *
+                    self._health_check_interval_multiplier
+                )
+                await asyncio.sleep(adaptive_interval)
 
                 if self._shutdown_event.is_set():
                     break
@@ -552,27 +689,68 @@ class JarvisPrimeOrchestrator:
                         await self.restart()
                     continue
 
-                # Perform health check
+                # Perform adaptive health check
                 healthy = await self.check_health()
 
                 if not healthy:
-                    if self._health.consecutive_failures >= 3:
-                        logger.warning(
-                            f"[JarvisPrime] {self._health.consecutive_failures} consecutive failures"
-                        )
-                        self._set_status(PrimeStatus.DEGRADED)
+                    # v10.8: Increase interval on failures (back off)
+                    self._health_check_interval_multiplier = min(
+                        4.0,  # Max 4x the base interval
+                        self._health_check_interval_multiplier * 1.2
+                    )
 
-                        if self._health.consecutive_failures >= 5:
-                            logger.error("[JarvisPrime] Too many failures, triggering restart")
-                            await self.restart()
-                    else:
-                        # Minor degradation
-                        if self._health.status == PrimeStatus.RUNNING:
+                    # v10.8: Skip degradation during startup grace
+                    if self._is_in_startup_grace():
+                        logger.debug(
+                            f"[JarvisPrime] Ignoring failure during startup grace "
+                            f"(failures: {self._health.consecutive_failures})"
+                        )
+                        continue
+
+                    # v10.8: Progressive degradation based on configurable thresholds
+                    failures = self._health.consecutive_failures
+
+                    if failures >= self.config.restart_failure_threshold:
+                        logger.error(
+                            f"[JarvisPrime] Critical failure threshold reached "
+                            f"({failures} failures, reason: {self._last_failure_reason}). "
+                            f"Triggering restart..."
+                        )
+                        await self.restart()
+
+                    elif failures >= self.config.degradation_critical_threshold:
+                        if self._health.status != PrimeStatus.DEGRADED:
+                            logger.warning(
+                                f"[JarvisPrime] Critical degradation: {failures} consecutive failures "
+                                f"(reason: {self._last_failure_reason}, "
+                                f"timeout: {self._current_timeout:.1f}s)"
+                            )
                             self._set_status(PrimeStatus.DEGRADED)
+
+                    elif failures >= self.config.degradation_warning_threshold:
+                        if self._health.status == PrimeStatus.RUNNING:
+                            logger.info(
+                                f"[JarvisPrime] Warning: {failures} consecutive failures "
+                                f"(reason: {self._last_failure_reason}). "
+                                f"Increasing timeout to {self._current_timeout:.1f}s"
+                            )
+                            # Stay RUNNING but log warning
+
                 else:
-                    # Healthy - restore status if degraded
+                    # Healthy check
+                    # v10.8: Require hysteresis for recovery from DEGRADED
                     if self._health.status == PrimeStatus.DEGRADED:
-                        self._set_status(PrimeStatus.RUNNING)
+                        if self._consecutive_successes >= self.config.health_recovery_threshold:
+                            logger.info(
+                                f"[JarvisPrime] Recovered after {self._consecutive_successes} "
+                                f"consecutive successful health checks"
+                            )
+                            self._set_status(PrimeStatus.RUNNING)
+                        else:
+                            logger.debug(
+                                f"[JarvisPrime] Recovery in progress "
+                                f"({self._consecutive_successes}/{self.config.health_recovery_threshold})"
+                            )
 
                 # Notify callbacks
                 for callback in self._on_health_update:

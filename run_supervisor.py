@@ -2498,9 +2498,19 @@ class SupervisorBootstrapper:
             # Phase 3.5: Start Loading Page (BEFORE JARVIS spawns)
             TerminalUI.print_divider()
             print(f"  {TerminalUI.CYAN}🌐 Starting Loading Page Server...{TerminalUI.RESET}")
-            
+
             await self._start_loading_page_ecosystem()
-            
+
+            # ═══════════════════════════════════════════════════════════════════
+            # CRITICAL FIX v20.1: Re-broadcast Two-Tier state AFTER loading server starts
+            # ═══════════════════════════════════════════════════════════════════
+            # Two-Tier components initialize in Phase 2, BEFORE loading server starts.
+            # This causes the frontend to show "Initializing..." forever because it
+            # never received the *_ready broadcasts. Re-broadcast here to fix this.
+            # ═══════════════════════════════════════════════════════════════════
+            if self._loading_server_process:
+                await self._rebroadcast_two_tier_state()
+
             # Phase 4: Start JARVIS
             TerminalUI.print_divider()
             TerminalUI.print_phase(4, 4, "Launching JARVIS Core")
@@ -3424,6 +3434,90 @@ class SupervisorBootstrapper:
     ) -> bool:
         """Alias for _broadcast_to_loading_page for semantic clarity."""
         return await self._broadcast_to_loading_page(stage, message, progress, metadata)
+
+    async def _rebroadcast_two_tier_state(self) -> bool:
+        """
+        v20.1: Re-broadcast Two-Tier security state to loading server.
+
+        CRITICAL FIX: Two-Tier components (Watchdog, Router, VBIA, Voice Auth) are
+        initialized in Phase 2, BEFORE the loading server starts in Phase 3.5.
+        This causes the frontend to show "Initializing..." forever because it never
+        received the *_ready broadcasts.
+
+        This method re-broadcasts the current Two-Tier state AFTER the loading server
+        is ready, ensuring the frontend displays the correct component states.
+
+        Returns:
+            True if broadcast succeeded, False otherwise
+        """
+        if not self._loading_server_process:
+            return False
+
+        try:
+            # Gather current Two-Tier component states
+            watchdog_ready = self._watchdog is not None
+            router_ready = self._tiered_routing_enabled  # Router is ready if routing is enabled
+            vbia_ready = self._vbia_adapter is not None
+
+            # Build the complete Two-Tier state
+            two_tier_state = {
+                "watchdog_ready": watchdog_ready,
+                "router_ready": router_ready,
+                "vbia_adapter_ready": vbia_ready,
+                "tier1_operational": router_ready,
+                "tier2_operational": router_ready,
+                "watchdog_status": "active" if watchdog_ready else "disabled",
+                "watchdog_mode": "monitoring" if watchdog_ready else "idle",
+                "vbia_tier1_threshold": 0.70,
+                "vbia_tier2_threshold": 0.85,
+                "vbia_liveness_enabled": True,
+            }
+
+            # Determine overall status
+            all_ready = watchdog_ready and router_ready and vbia_ready
+            some_ready = watchdog_ready or router_ready or vbia_ready
+
+            if all_ready:
+                two_tier_state["overall_status"] = "ready"
+                two_tier_state["message"] = "Two-Tier Security System fully operational"
+                progress = 89
+            elif some_ready:
+                two_tier_state["overall_status"] = "partial"
+                components = []
+                if watchdog_ready:
+                    components.append("Watchdog")
+                if router_ready:
+                    components.append("Router")
+                if vbia_ready:
+                    components.append("VBIA")
+                two_tier_state["message"] = f"Partial: {', '.join(components)} ready"
+                progress = 85
+            else:
+                two_tier_state["overall_status"] = "initializing"
+                two_tier_state["message"] = "Two-Tier Security initializing..."
+                progress = 80
+
+            # Broadcast the current state
+            success = await self._broadcast_startup_progress(
+                stage="two_tier_rebroadcast",
+                message=two_tier_state["message"],
+                progress=progress,
+                metadata={"two_tier": two_tier_state}
+            )
+
+            if success:
+                self.logger.info(f"🔄 Re-broadcast Two-Tier state: {two_tier_state['overall_status']}")
+                self.logger.info(f"   Watchdog: {'✅' if watchdog_ready else '❌'}, "
+                               f"Router: {'✅' if router_ready else '❌'}, "
+                               f"VBIA: {'✅' if vbia_ready else '❌'}")
+            else:
+                self.logger.warning("⚠️ Failed to re-broadcast Two-Tier state")
+
+            return success
+
+        except Exception as e:
+            self.logger.warning(f"⚠️ Two-Tier state re-broadcast error: {e}")
+            return False
 
     async def _broadcast_jarvis_prime_status(
         self,

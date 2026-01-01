@@ -4582,8 +4582,8 @@ class JARVISLearningDatabase:
                         pattern.get("confidence", 0.5),
                         pattern.get("success_rate", 0.5),
                         1,
-                        datetime.now().isoformat(),
-                        datetime.now().isoformat(),
+                        datetime.now(),
+                        datetime.now(),
                         json.dumps(pattern.get("metadata", {})),
                     ),
                 )
@@ -5561,7 +5561,7 @@ class JARVISLearningDatabase:
                     window_title,
                     json.dumps(window_position) if window_position else None,
                     focus_duration,
-                    now.isoformat(),
+                    now,
                     now.weekday(),
                     now.hour,
                     is_fullscreen,
@@ -5629,7 +5629,7 @@ class JARVISLearningDatabase:
                         confidence = ?
                     WHERE pattern_id = ?
                 """,
-                    (new_freq, new_avg, new_total, timestamp.isoformat(), new_conf, pattern_id),
+                    (new_freq, new_avg, new_total, timestamp, new_conf, pattern_id),
                 )
 
             else:
@@ -5651,7 +5651,7 @@ class JARVISLearningDatabase:
                         session_duration,
                         hour,
                         day,
-                        timestamp.isoformat(),
+                        timestamp,
                         0.3,
                         json.dumps({}),
                     ),
@@ -5729,7 +5729,7 @@ class JARVISLearningDatabase:
                     (
                         new_freq,
                         new_success_rate,
-                        now.isoformat(),
+                        now,
                         json.dumps(time_patterns[-20:]),  # Keep last 20
                         min(0.99, confidence + 0.05),
                         wf_id,
@@ -5757,8 +5757,8 @@ class JARVISLearningDatabase:
                         1,
                         duration,
                         1.0 if success else 0.0,
-                        now.isoformat(),
-                        now.isoformat(),
+                        now,
+                        now,
                         json.dumps([hour]),
                         confidence,
                         json.dumps(metadata) if metadata else None,
@@ -5821,7 +5821,7 @@ class JARVISLearningDatabase:
                             timestamp = ?
                         WHERE transition_id = ?
                     """,
-                        (freq + 1, now.isoformat(), trans_id),
+                        (freq + 1, now, trans_id),
                     )
                 else:
                     # Create new
@@ -5838,7 +5838,7 @@ class JARVISLearningDatabase:
                             trigger_app,
                             trigger_action,
                             1,
-                            now.isoformat(),
+                            now,
                             now.hour,
                             now.weekday(),
                             json.dumps(metadata) if metadata else None,
@@ -5910,7 +5910,7 @@ class JARVISLearningDatabase:
                             prediction_accuracy = ?
                         WHERE behavior_id = ?
                     """,
-                        (freq + 1, new_conf, now.isoformat(), prediction_accuracy, beh_id),
+                        (freq + 1, new_conf, now, prediction_accuracy, beh_id),
                     )
 
                     await self.db.commit()
@@ -5934,8 +5934,8 @@ class JARVISLearningDatabase:
                             confidence,
                             json.dumps(temporal_pattern) if temporal_pattern else None,
                             json.dumps(contextual_triggers) if contextual_triggers else None,
-                            now.isoformat(),
-                            now.isoformat(),
+                            now,
+                            now,
                             prediction_accuracy,
                             json.dumps(metadata) if metadata else None,
                         ),
@@ -6010,7 +6010,7 @@ class JARVISLearningDatabase:
                             last_occurrence = ?
                         WHERE temporal_id = ?
                     """,
-                        (new_freq, new_conf, now.isoformat(), temp_id),
+                        (new_freq, new_conf, now, temp_id),
                     )
                 else:
                     # Create new
@@ -6034,7 +6034,7 @@ class JARVISLearningDatabase:
                             target,
                             frequency,
                             confidence,
-                            now.isoformat(),
+                            now,
                             json.dumps(metadata) if metadata else None,
                         ),
                     )
@@ -6091,7 +6091,7 @@ class JARVISLearningDatabase:
                         0,
                         0,
                         0.0,
-                        now.isoformat(),
+                        now,
                         None,
                         json.dumps(metadata) if metadata else None,
                     ),
@@ -6154,7 +6154,7 @@ class JARVISLearningDatabase:
                             accepted_count,
                             rejected_count,
                             acceptance_rate,
-                            now.isoformat(),
+                            now,
                             suggestion_id,
                         ),
                     )
@@ -7601,7 +7601,7 @@ class CrossRepoSync:
                 ORDER BY created_at DESC
                 LIMIT 100
                 """,
-                (since_time.isoformat(),)
+                (since_time,)
             ) as cursor:
                 async for row in cursor:
                     data['goals'].append({
