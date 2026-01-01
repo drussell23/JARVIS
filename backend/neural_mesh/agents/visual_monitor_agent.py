@@ -284,6 +284,10 @@ class VisualMonitorConfig:
     heartbeat_narration_interval: float = field(
         default_factory=lambda: float(os.getenv("JARVIS_HEARTBEAT_INTERVAL", "30"))
     )
+    # v15.0: First heartbeat comes earlier for immediate feedback
+    first_heartbeat_delay_seconds: float = field(
+        default_factory=lambda: float(os.getenv("JARVIS_FIRST_HEARTBEAT_DELAY", "10"))
+    )
     # Near-miss: When we see interesting text but not the trigger
     near_miss_narration_enabled: bool = field(
         default_factory=lambda: os.getenv("JARVIS_NEAR_MISS_NARRATION", "true").lower() == "true"
@@ -320,15 +324,22 @@ class NarrationState:
     Prevents spam while ensuring meaningful updates reach the user.
     Uses adaptive debouncing based on:
     - Time since last narration
-    - Narration type (heartbeat vs near-miss vs activity)
+    - Narration type (heartbeat vs near-miss vs activity vs startup)
     - Content similarity (don't repeat similar messages)
     - User activity patterns
+
+    v15.0: Enhanced transparency - startup confirmation and early heartbeats
     """
     # Timing state
     last_heartbeat_time: float = 0.0
     last_near_miss_time: float = 0.0
     last_activity_time: float = 0.0
     last_any_narration_time: float = 0.0
+    last_startup_time: float = 0.0  # v15.0: Track startup narration
+
+    # v15.0: Startup confirmation state
+    startup_confirmed: bool = False  # Whether initial startup was narrated
+    monitoring_start_time: float = 0.0  # When monitoring started
 
     # Content tracking (to avoid repetition)
     last_near_miss_text: str = ""
@@ -352,11 +363,13 @@ class NarrationState:
         Check if narration is allowed based on rate limiting and cooldowns.
 
         Args:
-            narration_type: "heartbeat", "near_miss", or "activity"
+            narration_type: "heartbeat", "near_miss", "activity", "startup", or "error"
             config: VisualMonitorConfig with timing parameters
 
         Returns:
             True if narration is allowed
+
+        v15.0: Added "startup" and "error" types that bypass MIN_GAP for transparency
         """
         import time
         now = time.time()
@@ -366,18 +379,36 @@ class NarrationState:
             self.narrations_this_minute = 0
             self.minute_start_time = now
 
-        # Global rate limit
-        if self.narrations_this_minute >= config.max_narrations_per_minute:
+        # Global rate limit (higher limit for startup/error)
+        if narration_type in ("startup", "error"):
+            # Critical narrations allowed even near rate limit
+            if self.narrations_this_minute >= config.max_narrations_per_minute + 2:
+                return False
+        elif self.narrations_this_minute >= config.max_narrations_per_minute:
             return False
 
-        # Minimum gap between any narrations (prevents overwhelming user)
+        # v15.0: Startup and error types bypass MIN_GAP - these are critical for transparency
+        if narration_type in ("startup", "error"):
+            # Only check cooldown since last startup/error, not general MIN_GAP
+            if narration_type == "startup":
+                return now - self.last_startup_time >= 2.0  # Allow after 2s cooldown
+            else:  # error
+                return True  # Errors always allowed (critical feedback)
+
+        # Minimum gap between regular narrations (prevents overwhelming user)
         MIN_GAP_SECONDS = 5.0
         if now - self.last_any_narration_time < MIN_GAP_SECONDS:
             return False
 
         # Type-specific cooldowns
         if narration_type == "heartbeat":
-            return now - self.last_heartbeat_time >= config.heartbeat_narration_interval
+            # v15.0: First heartbeat comes earlier (10s), subsequent at normal interval (30s)
+            if not self.startup_confirmed:
+                # Before startup confirmation, allow heartbeat after 10s
+                first_heartbeat_delay = getattr(config, 'first_heartbeat_delay_seconds', 10.0)
+                return now - self.monitoring_start_time >= first_heartbeat_delay
+            else:
+                return now - self.last_heartbeat_time >= config.heartbeat_narration_interval
         elif narration_type == "near_miss":
             return (config.near_miss_narration_enabled and
                     now - self.last_near_miss_time >= config.near_miss_cooldown_seconds)
@@ -388,7 +419,10 @@ class NarrationState:
         return True
 
     def record_narration(self, narration_type: str, content: str = "") -> None:
-        """Record that a narration was made (for rate limiting)."""
+        """Record that a narration was made (for rate limiting).
+
+        v15.0: Added startup and error types for transparency
+        """
         import time
         now = time.time()
 
@@ -409,6 +443,15 @@ class NarrationState:
             self.last_activity_description = content
             self.consecutive_heartbeats = 0
             self.consecutive_near_misses = 0
+        elif narration_type == "startup":
+            # v15.0: Startup confirmation
+            self.last_startup_time = now
+            self.startup_confirmed = True
+            self.consecutive_heartbeats = 0
+            self.consecutive_near_misses = 0
+        elif narration_type == "error":
+            # v15.0: Error narration - doesn't affect other counters
+            pass
 
     def is_similar_content(self, content: str, narration_type: str) -> bool:
         """Check if content is too similar to recent narrations (avoid repetition)."""
@@ -1269,6 +1312,19 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                 f"🚨 God Mode window discovery timed out after {find_window_timeout}s for '{app_name}'. "
                 f"MultiSpaceWindowDetector or Yabai may be unresponsive."
             )
+
+            # v15.0: ERROR NARRATION - User should know when window discovery fails
+            if self.config.working_out_loud_enabled:
+                try:
+                    await self._narrate_working_out_loud(
+                        message=f"I couldn't find {app_name} windows. The window system took too long to respond.",
+                        narration_type="error",
+                        watcher_id=f"discovery_{app_name}",
+                        priority="high"
+                    )
+                except Exception as e:
+                    logger.warning(f"Error narration failed: {e}")
+
             return {
                 'status': 'error',
                 'error': f"Window discovery timed out after {find_window_timeout}s (Yabai/MultiSpaceDetector unresponsive)",
@@ -1278,6 +1334,19 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
 
         if not windows or len(windows) == 0:
             logger.warning(f"⚠️  No windows found for {app_name}")
+
+            # v15.0: ERROR NARRATION - User should know when no windows found
+            if self.config.working_out_loud_enabled:
+                try:
+                    await self._narrate_working_out_loud(
+                        message=f"I don't see any {app_name} windows open. Please open {app_name} and try again.",
+                        narration_type="error",
+                        watcher_id=f"discovery_{app_name}",
+                        priority="high"
+                    )
+                except Exception as e:
+                    logger.warning(f"Error narration failed: {e}")
+
             return {
                 'status': 'error',
                 'error': f"No windows found for {app_name}",
@@ -1541,6 +1610,38 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                 self._god_mode_tasks = {}
             self._god_mode_tasks[god_mode_task_id] = coordination_task
 
+            # =====================================================================
+            # v15.0: IMMEDIATE STARTUP CONFIRMATION - "Working Out Loud" transparency
+            # =====================================================================
+            # CRITICAL: Narrate to user immediately so they know watchers started
+            # This fixes the "silent background" problem where user gets no feedback
+            # =====================================================================
+            if self.config.working_out_loud_enabled:
+                try:
+                    # Get or create narration state for startup tracking
+                    startup_state = self._get_narration_state(god_mode_task_id)
+                    import time
+                    startup_state.monitoring_start_time = time.time()
+
+                    # Build confirmation message
+                    num_watchers = len(watcher_tasks)
+                    spaces_list = [meta['space_id'] for meta in watcher_metadata]
+                    if num_watchers == 1:
+                        startup_msg = f"I've connected to {app_name}. Monitoring for '{trigger_text}' now."
+                    else:
+                        startup_msg = f"I've connected to {num_watchers} {app_name} windows across spaces {', '.join(map(str, spaces_list))}. Monitoring for '{trigger_text}'."
+
+                    # Send startup confirmation via TTS
+                    await self._narrate_working_out_loud(
+                        message=startup_msg,
+                        narration_type="startup",
+                        watcher_id=god_mode_task_id,
+                        priority="normal"
+                    )
+                    logger.info(f"[God Mode] 🎙️ Startup confirmation narrated: {startup_msg}")
+                except Exception as e:
+                    logger.warning(f"[God Mode] Startup narration failed: {e}")
+
             # Return immediately with acknowledgment
             return {
                 'success': True,
@@ -1708,6 +1809,19 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
             if not watcher:
                 # Ferrari Engine unavailable - fallback to error
                 logger.error(f"❌ [{watcher_id}] Ferrari Engine watcher creation failed")
+
+                # v15.0: ERROR NARRATION - User should know when watchers fail
+                if self.config.working_out_loud_enabled:
+                    try:
+                        await self._narrate_working_out_loud(
+                            message=f"I couldn't connect to {app_name} on space {space_id}. Ferrari Engine is unavailable.",
+                            narration_type="error",
+                            watcher_id=watcher_id,
+                            priority="high"
+                        )
+                    except Exception as e:
+                        logger.warning(f"Error narration failed: {e}")
+
                 return {
                     'status': 'error',
                     'error': 'Ferrari Engine unavailable',
@@ -2468,11 +2582,14 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
             f"(timeout: {timeout}s, Working Out Loud: {self.config.working_out_loud_enabled})"
         )
 
-        # v14.0: Initial narration - announce monitoring start
+        # v15.0: Initialize monitoring start time for first heartbeat timing
+        narration_state.monitoring_start_time = start_time
+
+        # v14.0: Initial narration - announce monitoring start (now uses "startup" type)
         if self.config.working_out_loud_enabled:
             await self._narrate_working_out_loud(
                 message=f"I'm now watching {app_name} for '{trigger_text}'.",
-                narration_type="activity",
+                narration_type="startup",  # v15.0: Changed from "activity" to "startup"
                 watcher_id=watcher_id,
                 priority="normal"
             )
@@ -3449,6 +3566,100 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
             watcher_id=watcher_id,
             priority="low"
         )
+
+    # =========================================================================
+    # v15.0: Watcher Status Query - "Are you still watching?"
+    # =========================================================================
+
+    async def get_active_watcher_status(self) -> Dict[str, Any]:
+        """
+        Get status of all active watchers for user queries like "are you still watching?".
+
+        Returns:
+            {
+                'active_watchers': int,
+                'watchers': [
+                    {
+                        'task_id': str,
+                        'app_name': str,
+                        'trigger_text': str,
+                        'elapsed_seconds': float,
+                        'status': 'monitoring' | 'pending' | 'completed'
+                    }
+                ],
+                'summary': str  # Human-readable summary
+            }
+        """
+        import time
+        now = time.time()
+
+        if not hasattr(self, '_god_mode_tasks') or not self._god_mode_tasks:
+            return {
+                'active_watchers': 0,
+                'watchers': [],
+                'summary': "I'm not currently watching anything."
+            }
+
+        watchers = []
+        for task_id, task in list(self._god_mode_tasks.items()):
+            # Parse task_id for app name and trigger (format: god_mode_AppName_timestamp)
+            parts = task_id.split('_')
+            app_name = parts[2] if len(parts) > 2 else "Unknown"
+
+            # Get narration state for timing info
+            state = self._narration_states.get(task_id)
+            elapsed = now - state.monitoring_start_time if state else 0
+
+            status = 'completed' if task.done() else 'monitoring'
+
+            watchers.append({
+                'task_id': task_id,
+                'app_name': app_name,
+                'elapsed_seconds': elapsed,
+                'status': status
+            })
+
+        active_count = sum(1 for w in watchers if w['status'] == 'monitoring')
+
+        # Build summary message
+        if active_count == 0:
+            summary = "I finished monitoring. No active watchers."
+        elif active_count == 1:
+            w = next(w for w in watchers if w['status'] == 'monitoring')
+            minutes = int(w['elapsed_seconds'] // 60)
+            seconds = int(w['elapsed_seconds'] % 60)
+            if minutes > 0:
+                summary = f"Yes! I'm still watching {w['app_name']}. {minutes} minutes and {seconds} seconds in."
+            else:
+                summary = f"Yes! I'm still watching {w['app_name']}. {seconds} seconds in."
+        else:
+            apps = [w['app_name'] for w in watchers if w['status'] == 'monitoring']
+            summary = f"Yes! I'm watching {active_count} apps: {', '.join(apps)}."
+
+        return {
+            'active_watchers': active_count,
+            'watchers': watchers,
+            'summary': summary
+        }
+
+    async def narrate_watcher_status(self) -> bool:
+        """
+        Narrate the current watcher status via TTS.
+
+        Called when user asks "are you still watching?" or similar.
+        """
+        status = await self.get_active_watcher_status()
+
+        if self.config.working_out_loud_enabled:
+            # Use a special watcher_id for status queries
+            return await self._narrate_working_out_loud(
+                message=status['summary'],
+                narration_type="startup",  # Use startup type to bypass MIN_GAP
+                watcher_id="status_query",
+                priority="normal"
+            )
+
+        return False
 
     def _calculate_text_similarity(self, text1: str, text2: str) -> float:
         """
