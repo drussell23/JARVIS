@@ -283,16 +283,41 @@ class JARVISSupervisor:
         logger.info(f"🔧 Supervisor initialized (mode: {self.config.mode.value})")
     
     def _find_entry_point(self) -> str:
-        """Find the JARVIS entry point script."""
+        """
+        Find the JARVIS entry point script.
+
+        Supports two modes controlled by JARVIS_FAST_STARTUP env var:
+        - Normal mode: Uses start_system.py (full features, longer startup)
+        - Fast mode: Uses backend/main.py directly (minimal overhead, instant startup)
+        """
+        # Determine project root (where venv and backend directories are)
+        # Going up from: backend/core/supervisor/jarvis_supervisor.py
+        self._project_root = Path(__file__).parent.parent.parent.parent.resolve()
+
+        # Check for fast startup mode (direct main.py)
+        fast_mode = os.environ.get("JARVIS_FAST_STARTUP", "").lower() in ("1", "true", "yes")
+
+        if fast_mode:
+            # Fast mode: Use backend/main.py directly via -m flag
+            # Return special marker that _spawn_jarvis will recognize
+            main_py = self._project_root / "backend" / "main.py"
+            if main_py.exists():
+                logger.info("⚡ Fast startup mode enabled - using direct main.py")
+                return "__FAST_MODE__"
+
+        # Normal mode: Use start_system.py for full feature set
         possible_paths = [
-            Path(__file__).parent.parent.parent.parent / "start_system.py",
+            self._project_root / "start_system.py",
             Path("start_system.py"),
             Path("backend/start_system.py"),
         ]
         for p in possible_paths:
             if p.exists():
                 return str(p.resolve())
-        raise FileNotFoundError("Could not find start_system.py")
+
+        # Fallback to fast mode if start_system.py not found
+        logger.warning("start_system.py not found, falling back to direct main.py startup")
+        return "__FAST_MODE__"
     
     def _set_state(self, new_state: SupervisorState) -> None:
         """Update state and notify callbacks."""
@@ -812,14 +837,41 @@ class JARVISSupervisor:
         voice_init_task = asyncio.create_task(_init_voice_systems())
         logger.info("🔊 Voice system initialization started (background)")
 
-        # Build command
+        # Build command - supports fast mode (direct main.py) and normal mode (start_system.py)
         python_executable = sys.executable
-        cmd = [python_executable, self.jarvis_entry_point]
-        
+
+        # Determine project root for PYTHONPATH setup
+        project_root = getattr(self, '_project_root', None)
+        if not project_root:
+            project_root = Path(__file__).parent.parent.parent.parent.resolve()
+
+        if self.jarvis_entry_point == "__FAST_MODE__":
+            # Fast mode: Use python -m backend.main for direct startup
+            # This is the fastest way to start JARVIS (skips start_system.py overhead)
+            cmd = [python_executable, "-B", "-m", "backend.main"]
+            logger.info("⚡ Using fast startup: python -m backend.main")
+        else:
+            # Normal mode: Use start_system.py for full feature set
+            cmd = [python_executable, self.jarvis_entry_point]
+
         # Add supervisor-specific environment
         env = os.environ.copy()
         env["JARVIS_SUPERVISED"] = "1"
         env["JARVIS_SUPERVISOR_PID"] = str(os.getpid())
+
+        # CRITICAL: Set PYTHONPATH to include both project root and backend directory
+        # This ensures all imports work correctly regardless of startup mode:
+        # - Project root: for "from backend.X" imports
+        # - Backend dir: for "from core.X" imports (legacy compatibility)
+        pythonpath_parts = [
+            str(project_root),
+            str(project_root / "backend"),
+        ]
+        existing_pythonpath = env.get("PYTHONPATH", "")
+        if existing_pythonpath:
+            pythonpath_parts.append(existing_pythonpath)
+        env["PYTHONPATH"] = os.pathsep.join(pythonpath_parts)
+        logger.debug(f"📁 PYTHONPATH set to: {env['PYTHONPATH']}")
         
         # Tell start_system.py that supervisor is handling loading page
         if self._progress_reporter:

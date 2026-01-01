@@ -2271,14 +2271,168 @@ class SupervisorBootstrapper:
         os.environ["CI"] = "true"
 
         self._setup_signal_handlers()
-    
-    async def run(self) -> int:
+
+    async def _run_fast_startup(self) -> int:
         """
-        Run the complete bootstrap sequence.
-        
+        Fast startup mode - minimal overhead, instant JARVIS boot.
+
+        Skips:
+        - Resource validation and optimization
+        - Loading page browser display
+        - Voice narration
+        - Heavy initialization phases
+
+        Performs:
+        - Quick port cleanup (8010 only)
+        - PYTHONPATH configuration
+        - Direct main.py startup via supervisor
+
         Returns:
             Exit code (0 for success, non-zero for failure)
         """
+        import subprocess
+        import signal
+        from pathlib import Path
+
+        print(f"\n{TerminalUI.CYAN}{'═' * 60}{TerminalUI.RESET}")
+        print(f"{TerminalUI.CYAN}⚡ JARVIS FAST STARTUP MODE{TerminalUI.RESET}")
+        print(f"{TerminalUI.CYAN}{'═' * 60}{TerminalUI.RESET}\n")
+
+        self.logger.info("⚡ Fast startup mode - minimal initialization")
+
+        # Step 1: Quick port cleanup (8010 only)
+        self.perf.start("fast_cleanup")
+        ports_to_clean = [8010]
+
+        for port in ports_to_clean:
+            try:
+                result = subprocess.run(
+                    ["lsof", "-ti", f":{port}"],
+                    capture_output=True, text=True, timeout=5
+                )
+                if result.stdout.strip():
+                    pids = result.stdout.strip().split('\n')
+                    for pid in pids:
+                        if pid:
+                            try:
+                                os.kill(int(pid), signal.SIGTERM)
+                                self.logger.info(f"⚡ Killed process {pid} on port {port}")
+                            except (ProcessLookupError, ValueError):
+                                pass
+                    # Brief wait for port release
+                    await asyncio.sleep(0.3)
+            except subprocess.TimeoutExpired:
+                pass
+            except Exception as e:
+                self.logger.debug(f"Port cleanup warning: {e}")
+
+        self.perf.end("fast_cleanup")
+        print(f"  {TerminalUI.GREEN}✓ Port cleanup complete{TerminalUI.RESET}")
+
+        # Step 2: Configure environment
+        project_root = Path(__file__).parent.resolve()
+
+        # Set PYTHONPATH for proper imports
+        pythonpath_parts = [
+            str(project_root),
+            str(project_root / "backend"),
+        ]
+        existing_pythonpath = os.environ.get("PYTHONPATH", "")
+        if existing_pythonpath:
+            pythonpath_parts.append(existing_pythonpath)
+        os.environ["PYTHONPATH"] = os.pathsep.join(pythonpath_parts)
+
+        # Signal fast mode to supervisor
+        os.environ["JARVIS_FAST_STARTUP"] = "true"
+        os.environ["JARVIS_CLEANUP_DONE"] = "1"
+        os.environ["JARVIS_CLEANUP_TIMESTAMP"] = str(time.time())
+
+        self.logger.info(f"📁 PYTHONPATH: {os.environ['PYTHONPATH']}")
+        print(f"  {TerminalUI.GREEN}✓ Environment configured{TerminalUI.RESET}")
+
+        # Step 3: Import and run supervisor
+        self.perf.start("fast_supervisor")
+        try:
+            # Dynamic import to avoid circular dependencies
+            from backend.core.supervisor.jarvis_supervisor import JARVISSupervisor
+
+            print(f"\n{TerminalUI.YELLOW}⚡ Starting JARVIS Core...{TerminalUI.RESET}")
+
+            supervisor = JARVISSupervisor()
+
+            print(f"\n{TerminalUI.GREEN}{'═' * 60}{TerminalUI.RESET}")
+            print(f"{TerminalUI.GREEN}⚡ JARVIS FAST MODE STARTING{TerminalUI.RESET}")
+            print(f"{TerminalUI.GREEN}   Backend: http://localhost:8010{TerminalUI.RESET}")
+            print(f"{TerminalUI.GREEN}{'═' * 60}{TerminalUI.RESET}\n")
+
+            # Run supervisor (blocks until shutdown)
+            await supervisor.run()
+            self.perf.end("fast_supervisor")
+            return 0
+
+        except ImportError as e:
+            self.logger.error(f"Failed to import supervisor: {e}")
+            print(f"  {TerminalUI.RED}✗ Import error: {e}{TerminalUI.RESET}")
+
+            # Fallback: direct subprocess execution
+            print(f"\n{TerminalUI.YELLOW}⚡ Falling back to direct execution...{TerminalUI.RESET}")
+
+            python_exe = sys.executable
+            cmd = [python_exe, "-B", "-m", "backend.main"]
+
+            env = os.environ.copy()
+
+            try:
+                process = subprocess.Popen(
+                    cmd,
+                    cwd=str(project_root),
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1
+                )
+
+                print(f"\n{TerminalUI.GREEN}⚡ JARVIS started (PID: {process.pid}){TerminalUI.RESET}")
+                print(f"{TerminalUI.GREEN}   Backend: http://localhost:8010{TerminalUI.RESET}\n")
+
+                # Stream output
+                try:
+                    for line in process.stdout:
+                        print(line, end='')
+                except KeyboardInterrupt:
+                    self.logger.info("Shutdown requested...")
+                    process.terminate()
+                    process.wait(timeout=5)
+
+                return process.returncode or 0
+
+            except Exception as sub_e:
+                self.logger.error(f"Fallback execution failed: {sub_e}")
+                return 1
+
+        except Exception as e:
+            self.logger.error(f"Fast startup failed: {e}")
+            print(f"  {TerminalUI.RED}✗ Startup failed: {e}{TerminalUI.RESET}")
+            return 1
+
+    async def run(self) -> int:
+        """
+        Run the complete bootstrap sequence.
+
+        Supports fast startup mode (JARVIS_FAST_STARTUP=true) which skips
+        resource validation, loading page, and other non-essential initialization
+        for instant JARVIS startup.
+
+        Returns:
+            Exit code (0 for success, non-zero for failure)
+        """
+        # Check for fast startup mode
+        fast_startup = os.environ.get("JARVIS_FAST_STARTUP", "").lower() in ("1", "true", "yes")
+
+        if fast_startup:
+            return await self._run_fast_startup()
+
         try:
             # Setup signal handlers
             self._setup_signal_handlers()
