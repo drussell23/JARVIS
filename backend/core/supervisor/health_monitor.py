@@ -104,13 +104,23 @@ class HealthMonitor:
         logger.info("🔧 Health monitor initialized")
     
     async def _get_session(self) -> aiohttp.ClientSession:
-        """Get or create aiohttp session."""
+        """Get or create aiohttp session with registry registration."""
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(
                     total=self.config.health.check_timeout_seconds
                 )
             )
+            # Register with HTTP client registry for proper cleanup on shutdown
+            try:
+                from core.thread_manager import register_http_client
+                register_http_client(
+                    self._session,
+                    name="HealthMonitor",
+                    owner="core.supervisor.health_monitor"
+                )
+            except ImportError:
+                pass  # Registry not available
         return self._session
     
     def record_boot_start(self) -> None:

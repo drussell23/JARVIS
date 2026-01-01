@@ -222,6 +222,16 @@ class UnifiedStartupProgressHub:
             self._session = aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=2.0)
             )
+            # Register with HTTP client registry for proper cleanup on shutdown
+            try:
+                from core.thread_manager import register_http_client
+                register_http_client(
+                    self._session,
+                    name="UnifiedStartupProgress",
+                    owner="core.unified_startup_progress"
+                )
+            except ImportError:
+                pass  # Registry not available
 
         # CRITICAL: Register ALL components UPFRONT with default weights
         # This ensures the denominator (total_weight) is fixed from the start

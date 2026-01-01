@@ -764,7 +764,7 @@ class JarvisPrimeClient:
         )
 
     async def _get_http_client(self):
-        """Lazy load HTTP client."""
+        """Lazy load HTTP client with registry registration."""
         if self._http_client is None:
             try:
                 import httpx
@@ -772,6 +772,16 @@ class JarvisPrimeClient:
                     timeout=httpx.Timeout(60.0, connect=10.0),
                     limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
                 )
+                # Register with HTTP client registry for proper cleanup on shutdown
+                try:
+                    from core.thread_manager import register_http_client
+                    register_http_client(
+                        self._http_client,
+                        name="JarvisPrimeClient",
+                        owner="core.jarvis_prime_client"
+                    )
+                except ImportError:
+                    pass  # Registry not available
             except ImportError:
                 logger.warning("[JarvisPrimeClient] httpx not available")
         return self._http_client

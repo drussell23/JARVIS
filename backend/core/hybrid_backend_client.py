@@ -168,6 +168,16 @@ class HybridBackendClient:
                 max_keepalive_connections=self.config['hybrid']['connection_pool']['max_keepalive_connections'],
             ),
         )
+        # Register with HTTP client registry for proper cleanup on shutdown
+        try:
+            from core.thread_manager import register_http_client
+            register_http_client(
+                self.client,
+                name="HybridBackendClient",
+                owner="core.hybrid_backend_client"
+            )
+        except ImportError:
+            pass  # Registry not available
 
         # Initialize backends
         self.backends: Dict[str, Backend] = {}

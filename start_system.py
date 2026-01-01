@@ -277,6 +277,32 @@ Browser Automation Features (v13.4.0):
 All 11 components must load for full functionality.
 """
 
+# =============================================================================
+# CRITICAL: PYTHON 3.9 COMPATIBILITY PATCH - MUST BE FIRST!
+# =============================================================================
+# This MUST happen BEFORE any module that imports google-api-core or other
+# packages that use importlib.metadata.packages_distributions() which was
+# added in Python 3.10. Without this patch, Python 3.9 users see:
+#   "module 'importlib.metadata' has no attribute 'packages_distributions'"
+# =============================================================================
+import sys as _sys
+if _sys.version_info < (3, 10):
+    try:
+        from importlib import metadata as _metadata
+        if not hasattr(_metadata, 'packages_distributions'):
+            def _packages_distributions_fallback():
+                """Minimal fallback for packages_distributions on Python 3.9."""
+                try:
+                    import importlib_metadata as _backport
+                    if hasattr(_backport, 'packages_distributions'):
+                        return _backport.packages_distributions()
+                except ImportError:
+                    pass
+                return {}
+            _metadata.packages_distributions = _packages_distributions_fallback
+    except Exception:
+        pass
+
 # ============================================================================
 # Advanced Virtual Environment Auto-Detection & Activation System
 # Zero-hardcoding • Cross-platform • Dynamic • Robust

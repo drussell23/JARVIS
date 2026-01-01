@@ -1575,5 +1575,611 @@ def shutdown_third_party_threads(timeout: float = 5.0) -> Dict[str, Any]:
     
     logger.info(f"Third-party thread cleanup: PyTorch {stats['torch_threads_before']}->{stats['torch_threads_after']}, "
                 f"remaining={stats['remaining_non_daemon']}, took {stats['duration']:.2f}s")
-    
+
     return stats
+
+
+# =============================================================================
+# HTTP CLIENT REGISTRY - Centralized lifecycle management for aiohttp/httpx
+# =============================================================================
+
+class HTTPClientRegistry:
+    """
+    Centralized registry for HTTP client sessions (aiohttp.ClientSession, httpx.AsyncClient).
+
+    This solves the "Unclosed client session" warnings by:
+    1. Tracking all created HTTP clients via weak references
+    2. Providing centralized async cleanup during shutdown
+    3. Supporting both aiohttp and httpx clients
+    4. Graceful degradation when clients are already closed
+
+    Usage:
+        # Register a client when created
+        from core.thread_manager import get_http_client_registry
+        registry = get_http_client_registry()
+
+        session = aiohttp.ClientSession()
+        registry.register(session, name="my-service")
+
+        # On shutdown, all registered clients are closed automatically
+        await registry.close_all()
+    """
+
+    _instance: Optional['HTTPClientRegistry'] = None
+    _instance_lock = threading.Lock()
+
+    def __new__(cls) -> 'HTTPClientRegistry':
+        """Singleton pattern for global registry."""
+        with cls._instance_lock:
+            if cls._instance is None:
+                cls._instance = super().__new__(cls)
+                cls._instance._initialized = False
+            return cls._instance
+
+    def __init__(self):
+        """Initialize registry (only once due to singleton)."""
+        if self._initialized:
+            return
+
+        self._initialized = True
+        self._lock = threading.RLock()
+        self._clients: Dict[int, Dict[str, Any]] = {}
+        self._closed = False
+
+        logger.debug("🌐 HTTPClientRegistry initialized")
+
+    def register(
+        self,
+        client: Any,
+        name: str = "unnamed",
+        owner: Optional[str] = None
+    ) -> int:
+        """
+        Register an HTTP client for lifecycle management.
+
+        Args:
+            client: aiohttp.ClientSession or httpx.AsyncClient instance
+            name: Human-readable name for logging
+            owner: Optional owner module/class name
+
+        Returns:
+            Client ID for later reference
+        """
+        if self._closed:
+            logger.warning(f"Cannot register client '{name}': registry is closed")
+            return -1
+
+        client_id = id(client)
+
+        # Determine client type
+        client_type = type(client).__module__ + "." + type(client).__name__
+
+        # Get close method
+        close_method = None
+        if hasattr(client, 'aclose'):  # httpx.AsyncClient
+            close_method = 'aclose'
+        elif hasattr(client, 'close'):  # aiohttp.ClientSession
+            close_method = 'close'
+
+        # Capture creation stack for debugging
+        try:
+            creator_stack = ''.join(traceback.format_stack()[:-2][-3:])
+        except Exception:
+            creator_stack = None
+
+        with self._lock:
+            self._clients[client_id] = {
+                "client_ref": weakref.ref(client),
+                "name": name,
+                "type": client_type,
+                "close_method": close_method,
+                "owner": owner,
+                "created_at": datetime.now(),
+                "creator_stack": creator_stack,
+                "closed": False,
+            }
+
+        logger.debug(f"📝 Registered HTTP client: {name} ({client_type})")
+        return client_id
+
+    def unregister(self, client_id: int) -> bool:
+        """
+        Unregister an HTTP client.
+
+        Args:
+            client_id: The client ID to unregister
+
+        Returns:
+            True if found and removed, False otherwise
+        """
+        with self._lock:
+            if client_id in self._clients:
+                info = self._clients.pop(client_id)
+                logger.debug(f"📤 Unregistered HTTP client: {info['name']}")
+                return True
+            return False
+
+    def get_all_clients(self) -> List[Dict[str, Any]]:
+        """Get list of all registered clients."""
+        with self._lock:
+            result = []
+            for client_id, info in self._clients.items():
+                client = info["client_ref"]()
+                result.append({
+                    "id": client_id,
+                    "name": info["name"],
+                    "type": info["type"],
+                    "alive": client is not None,
+                    "closed": info["closed"],
+                    "owner": info["owner"],
+                    "age_seconds": (datetime.now() - info["created_at"]).total_seconds(),
+                })
+            return result
+
+    async def close_client(self, client_id: int) -> bool:
+        """
+        Close a specific client.
+
+        Args:
+            client_id: The client ID to close
+
+        Returns:
+            True if successfully closed, False otherwise
+        """
+        with self._lock:
+            info = self._clients.get(client_id)
+            if not info:
+                return False
+            if info["closed"]:
+                return True  # Already closed
+
+        client = info["client_ref"]()
+        if client is None:
+            # Client was garbage collected
+            with self._lock:
+                info["closed"] = True
+            return True
+
+        try:
+            close_method = info.get("close_method")
+            if close_method:
+                method = getattr(client, close_method, None)
+                if method:
+                    result = method()
+                    if asyncio.iscoroutine(result):
+                        await result
+                    with self._lock:
+                        info["closed"] = True
+                    logger.debug(f"✅ Closed HTTP client: {info['name']}")
+                    return True
+        except Exception as e:
+            logger.debug(f"Error closing HTTP client {info['name']}: {e}")
+
+        return False
+
+    async def close_all(self, timeout: float = 10.0) -> Dict[str, Any]:
+        """
+        Close all registered HTTP clients.
+
+        Args:
+            timeout: Maximum time to wait for all clients to close
+
+        Returns:
+            Cleanup statistics
+        """
+        if self._closed:
+            return {"already_closed": True}
+
+        start_time = time.time()
+        stats = {
+            "total_clients": 0,
+            "closed": 0,
+            "already_closed": 0,
+            "failed": 0,
+            "gc_collected": 0,
+            "errors": [],
+            "duration": 0.0,
+        }
+
+        with self._lock:
+            clients_to_close = list(self._clients.items())
+            stats["total_clients"] = len(clients_to_close)
+
+        if not clients_to_close:
+            logger.debug("No HTTP clients to close")
+            return stats
+
+        logger.info(f"🌐 Closing {len(clients_to_close)} HTTP client(s)...")
+
+        # Close clients with timeout
+        close_tasks = []
+        for client_id, info in clients_to_close:
+            if info["closed"]:
+                stats["already_closed"] += 1
+                continue
+
+            client = info["client_ref"]()
+            if client is None:
+                stats["gc_collected"] += 1
+                with self._lock:
+                    info["closed"] = True
+                continue
+
+            # Create close task
+            close_tasks.append(self._close_with_timeout(client_id, info, client, timeout / 2))
+
+        if close_tasks:
+            results = await asyncio.gather(*close_tasks, return_exceptions=True)
+            for result in results:
+                if isinstance(result, Exception):
+                    stats["failed"] += 1
+                    stats["errors"].append(str(result))
+                elif result:
+                    stats["closed"] += 1
+                else:
+                    stats["failed"] += 1
+
+        self._closed = True
+        stats["duration"] = time.time() - start_time
+
+        logger.info(f"✅ HTTP client cleanup complete: {stats['closed']}/{stats['total_clients']} closed "
+                   f"in {stats['duration']:.2f}s")
+
+        return stats
+
+    async def _close_with_timeout(
+        self,
+        client_id: int,
+        info: Dict[str, Any],
+        client: Any,
+        timeout: float
+    ) -> bool:
+        """Close a client with timeout."""
+        try:
+            close_method = info.get("close_method")
+            if not close_method:
+                return False
+
+            method = getattr(client, close_method, None)
+            if not method:
+                return False
+
+            result = method()
+            if asyncio.iscoroutine(result):
+                await asyncio.wait_for(result, timeout=timeout)
+
+            with self._lock:
+                info["closed"] = True
+
+            logger.debug(f"   ✅ {info['name']}")
+            return True
+
+        except asyncio.TimeoutError:
+            logger.warning(f"   ⏱️ Timeout closing {info['name']}")
+            return False
+        except Exception as e:
+            logger.debug(f"   ❌ Error closing {info['name']}: {e}")
+            return False
+
+    def get_report(self) -> str:
+        """Generate a human-readable report."""
+        clients = self.get_all_clients()
+
+        lines = [
+            "",
+            "=" * 70,
+            "🌐 HTTP CLIENT REGISTRY REPORT",
+            "=" * 70,
+            f"Total Registered: {len(clients)}",
+            f"Registry Closed:  {self._closed}",
+            "",
+        ]
+
+        if clients:
+            lines.append("Registered Clients:")
+            for client in clients:
+                status = "✅ closed" if client["closed"] else ("💀 GC'd" if not client["alive"] else "🔵 open")
+                lines.append(f"  - {client['name']}: {client['type']} [{status}] "
+                           f"(age: {client['age_seconds']:.1f}s)")
+
+        lines.append("=" * 70)
+        lines.append("")
+
+        return "\n".join(lines)
+
+
+# Global HTTP client registry instance
+_http_client_registry: Optional[HTTPClientRegistry] = None
+_http_registry_lock = threading.Lock()
+
+
+def get_http_client_registry() -> HTTPClientRegistry:
+    """Get the global HTTP client registry instance."""
+    global _http_client_registry
+
+    with _http_registry_lock:
+        if _http_client_registry is None:
+            _http_client_registry = HTTPClientRegistry()
+        return _http_client_registry
+
+
+def register_http_client(client: Any, name: str = "unnamed", owner: Optional[str] = None) -> int:
+    """
+    Convenience function to register an HTTP client.
+
+    Args:
+        client: aiohttp.ClientSession or httpx.AsyncClient
+        name: Human-readable name
+        owner: Optional owner module/class
+
+    Returns:
+        Client ID
+    """
+    registry = get_http_client_registry()
+    return registry.register(client, name=name, owner=owner)
+
+
+async def close_all_http_clients(timeout: float = 10.0) -> Dict[str, Any]:
+    """
+    Convenience function to close all HTTP clients.
+
+    Args:
+        timeout: Maximum time to wait
+
+    Returns:
+        Cleanup statistics
+    """
+    registry = get_http_client_registry()
+    return await registry.close_all(timeout=timeout)
+
+
+# =============================================================================
+# COMPREHENSIVE SHUTDOWN COORDINATOR - Single point for all cleanup
+# =============================================================================
+
+class ShutdownCoordinator:
+    """
+    Coordinates complete application shutdown including:
+    - HTTP clients (aiohttp, httpx)
+    - Thread pools (executors)
+    - Third-party library threads (PyTorch, etc.)
+    - Managed threads
+    - Database connections
+
+    Provides a single entry point for clean shutdown with multi-phase
+    escalation and comprehensive logging.
+    """
+
+    _instance: Optional['ShutdownCoordinator'] = None
+    _instance_lock = threading.Lock()
+
+    def __new__(cls) -> 'ShutdownCoordinator':
+        """Singleton pattern."""
+        with cls._instance_lock:
+            if cls._instance is None:
+                cls._instance = super().__new__(cls)
+                cls._instance._initialized = False
+            return cls._instance
+
+    def __init__(self):
+        """Initialize coordinator."""
+        if self._initialized:
+            return
+
+        self._initialized = True
+        self._shutdown_started = False
+        self._shutdown_complete = False
+        self._shutdown_lock = threading.Lock()
+        self._shutdown_event = asyncio.Event() if asyncio.get_event_loop().is_running() else None
+
+        logger.debug("🛑 ShutdownCoordinator initialized")
+
+    def is_shutting_down(self) -> bool:
+        """Check if shutdown has been initiated."""
+        return self._shutdown_started
+
+    def is_shutdown_complete(self) -> bool:
+        """Check if shutdown is complete."""
+        return self._shutdown_complete
+
+    async def shutdown(
+        self,
+        timeout: float = 20.0,
+        skip_http: bool = False,
+        skip_threads: bool = False,
+        skip_executors: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Execute comprehensive shutdown.
+
+        Args:
+            timeout: Total timeout for shutdown
+            skip_http: Skip HTTP client cleanup
+            skip_threads: Skip third-party thread cleanup
+            skip_executors: Skip executor shutdown
+
+        Returns:
+            Comprehensive shutdown statistics
+        """
+        with self._shutdown_lock:
+            if self._shutdown_started:
+                logger.warning("Shutdown already in progress")
+                return {"already_started": True}
+            self._shutdown_started = True
+
+        start_time = time.time()
+        stats = {
+            "phases": {},
+            "total_duration": 0.0,
+            "success": True,
+            "errors": [],
+        }
+
+        logger.info("=" * 70)
+        logger.info("🛑 COMPREHENSIVE SHUTDOWN INITIATED")
+        logger.info("=" * 70)
+
+        phase_timeout = timeout / 4  # Divide timeout among phases
+
+        # Phase 1: HTTP Clients
+        if not skip_http:
+            logger.info("📌 Phase 1/4: HTTP Client Cleanup")
+            try:
+                http_stats = await close_all_http_clients(timeout=phase_timeout)
+                stats["phases"]["http_clients"] = http_stats
+                logger.info(f"   ✅ HTTP: {http_stats.get('closed', 0)} clients closed")
+            except Exception as e:
+                logger.error(f"   ❌ HTTP cleanup error: {e}")
+                stats["errors"].append(f"HTTP: {e}")
+        else:
+            stats["phases"]["http_clients"] = {"skipped": True}
+
+        # Phase 2: Executor Registry
+        if not skip_executors:
+            logger.info("📌 Phase 2/4: Executor Shutdown")
+            try:
+                registry = get_executor_registry()
+                executor_stats = await registry.shutdown_all_async(timeout=phase_timeout)
+                stats["phases"]["executors"] = executor_stats
+                logger.info(f"   ✅ Executors: {executor_stats.get('successful', 0)}/{executor_stats.get('total_executors', 0)} shutdown")
+            except Exception as e:
+                logger.error(f"   ❌ Executor shutdown error: {e}")
+                stats["errors"].append(f"Executors: {e}")
+        else:
+            stats["phases"]["executors"] = {"skipped": True}
+
+        # Phase 3: Thread Manager
+        if not skip_threads:
+            logger.info("📌 Phase 3/4: Thread Manager Shutdown")
+            try:
+                thread_stats = await shutdown_all_threads_async(timeout=phase_timeout)
+                stats["phases"]["thread_manager"] = thread_stats
+                logger.info(f"   ✅ Thread manager shutdown complete")
+            except Exception as e:
+                logger.error(f"   ❌ Thread manager error: {e}")
+                stats["errors"].append(f"Threads: {e}")
+        else:
+            stats["phases"]["thread_manager"] = {"skipped": True}
+
+        # Phase 4: Third-party Libraries (PyTorch, etc.)
+        logger.info("📌 Phase 4/4: Third-party Library Cleanup")
+        try:
+            # Run in executor to avoid blocking
+            loop = asyncio.get_event_loop()
+            third_party_stats = await loop.run_in_executor(
+                None,
+                lambda: shutdown_third_party_threads(timeout=phase_timeout)
+            )
+            stats["phases"]["third_party"] = third_party_stats
+            logger.info(f"   ✅ Third-party: {third_party_stats.get('remaining_non_daemon', 0)} threads remaining")
+        except Exception as e:
+            logger.error(f"   ❌ Third-party cleanup error: {e}")
+            stats["errors"].append(f"Third-party: {e}")
+
+        # Final stats
+        stats["total_duration"] = time.time() - start_time
+        stats["success"] = len(stats["errors"]) == 0
+        self._shutdown_complete = True
+
+        # Log final summary
+        logger.info("=" * 70)
+        if stats["success"]:
+            logger.info(f"✅ SHUTDOWN COMPLETE in {stats['total_duration']:.2f}s")
+        else:
+            logger.warning(f"⚠️ SHUTDOWN COMPLETED WITH ERRORS in {stats['total_duration']:.2f}s")
+            for error in stats["errors"]:
+                logger.warning(f"   • {error}")
+        logger.info("=" * 70)
+
+        # Final thread report
+        remaining = [
+            t for t in threading.enumerate()
+            if t != threading.main_thread() and not t.daemon and t.is_alive()
+        ]
+        if remaining:
+            logger.warning(f"⚠️ {len(remaining)} non-daemon threads still running:")
+            for t in remaining[:10]:  # Log first 10
+                logger.warning(f"   • {t.name}")
+        else:
+            logger.info("✅ All non-daemon threads have stopped")
+
+        return stats
+
+    def shutdown_sync(self, timeout: float = 20.0) -> Dict[str, Any]:
+        """
+        Synchronous shutdown wrapper.
+
+        Args:
+            timeout: Total timeout for shutdown
+
+        Returns:
+            Shutdown statistics
+        """
+        try:
+            # Try to get existing event loop
+            try:
+                loop = asyncio.get_running_loop()
+                # We're in an async context - schedule on that loop
+                future = asyncio.ensure_future(self.shutdown(timeout=timeout))
+                # Can't wait here, return immediately
+                return {"scheduled": True, "async": True}
+            except RuntimeError:
+                pass
+
+            # Create new event loop
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                return loop.run_until_complete(self.shutdown(timeout=timeout))
+            finally:
+                loop.close()
+
+        except Exception as e:
+            logger.error(f"Sync shutdown error: {e}")
+            return {"error": str(e)}
+
+
+# Global shutdown coordinator
+_shutdown_coordinator: Optional[ShutdownCoordinator] = None
+_coordinator_lock = threading.Lock()
+
+
+def get_shutdown_coordinator() -> ShutdownCoordinator:
+    """Get the global shutdown coordinator instance."""
+    global _shutdown_coordinator
+
+    with _coordinator_lock:
+        if _shutdown_coordinator is None:
+            _shutdown_coordinator = ShutdownCoordinator()
+        return _shutdown_coordinator
+
+
+async def comprehensive_shutdown(timeout: float = 20.0) -> Dict[str, Any]:
+    """
+    Execute comprehensive application shutdown.
+
+    This is the recommended single entry point for shutdown.
+    Handles HTTP clients, executors, threads, and third-party libraries.
+
+    Args:
+        timeout: Total timeout for all phases
+
+    Returns:
+        Comprehensive shutdown statistics
+    """
+    coordinator = get_shutdown_coordinator()
+    return await coordinator.shutdown(timeout=timeout)
+
+
+def comprehensive_shutdown_sync(timeout: float = 20.0) -> Dict[str, Any]:
+    """
+    Synchronous version of comprehensive_shutdown.
+
+    Args:
+        timeout: Total timeout for all phases
+
+    Returns:
+        Shutdown statistics
+    """
+    coordinator = get_shutdown_coordinator()
+    return coordinator.shutdown_sync(timeout=timeout)

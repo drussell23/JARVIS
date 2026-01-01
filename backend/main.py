@@ -178,6 +178,38 @@ Startup Narrator Voice Announcements (v6.2):
 - Configuration: Enable/disable via STARTUP_NARRATOR_VOICE environment variable
 """
 
+# =============================================================================
+# CRITICAL: PYTHON 3.9 COMPATIBILITY PATCH - MUST BE FIRST!
+# =============================================================================
+# This MUST happen BEFORE any module that imports google-api-core or other
+# packages that use importlib.metadata.packages_distributions() which was
+# added in Python 3.10. Without this patch, Python 3.9 users see:
+#   "module 'importlib.metadata' has no attribute 'packages_distributions'"
+#
+# The patch adds a fallback implementation for packages_distributions().
+# =============================================================================
+import sys as _sys
+if _sys.version_info < (3, 10):
+    try:
+        from importlib import metadata as _metadata
+        if not hasattr(_metadata, 'packages_distributions'):
+            # Create minimal fallback that returns empty mapping
+            # Full implementation is in utils/python39_compat.py if needed
+            def _packages_distributions_fallback():
+                """Minimal fallback for packages_distributions on Python 3.9."""
+                try:
+                    # Try importlib_metadata backport first
+                    import importlib_metadata as _backport
+                    if hasattr(_backport, 'packages_distributions'):
+                        return _backport.packages_distributions()
+                except ImportError:
+                    pass
+                # Return empty mapping as last resort
+                return {}
+            _metadata.packages_distributions = _packages_distributions_fallback
+    except Exception:
+        pass  # Silently fail if we can't patch
+
 # CRITICAL: Set multiprocessing start method to 'spawn' BEFORE any other imports
 # This prevents segmentation faults from semaphore leaks on macOS
 import multiprocessing
@@ -494,13 +526,21 @@ try:
         ThreadPolicy,
         create_managed_thread,
         shutdown_all_threads_async,
-        shutdown_all_threads
+        shutdown_all_threads,
+        # v2.0: Comprehensive shutdown coordinator
+        comprehensive_shutdown,
+        get_shutdown_coordinator,
+        register_http_client,
+        get_http_client_registry,
+        close_all_http_clients,
     )
     THREAD_MANAGER_AVAILABLE = True
-    logger.info("✅ Advanced Thread Manager available")
+    logger.info("✅ Advanced Thread Manager available (v2.0 with HTTP client registry)")
 except ImportError as e:
     logger.warning(f"⚠️  Advanced Thread Manager not available: {e}")
     THREAD_MANAGER_AVAILABLE = False
+    comprehensive_shutdown = None
+    register_http_client = None
 
 # Load environment variables (force override of system env vars)
 try:
@@ -3070,38 +3110,52 @@ async def lifespan(app: FastAPI):  # type: ignore[misc]
     except Exception as e:
         logger.warning(f"Voice Auth Intelligence shutdown error: {e}")
 
-    # Shutdown Advanced Thread Manager with multi-phase escalation
-    if THREAD_MANAGER_AVAILABLE and thread_manager:
+    # ═══════════════════════════════════════════════════════════════════════════
+    # COMPREHENSIVE SHUTDOWN v2.0 - Single entry point for all cleanup
+    # Handles: HTTP clients (aiohttp/httpx), Thread pools, PyTorch, Executors
+    # ═══════════════════════════════════════════════════════════════════════════
+    if THREAD_MANAGER_AVAILABLE and comprehensive_shutdown:
         try:
-            logger.info("🧵 Shutting down Advanced Thread Manager...")
-            logger.info("   Using 4-phase escalation (20s total timeout)")
-            logger.info("   Phase 1: Graceful shutdown (8s)")
-            logger.info("   Phase 2: Forceful shutdown (5s)")
-            logger.info("   Phase 3: Terminate threads (4s)")
-            logger.info("   Phase 4: Emergency cleanup (3s)")
+            logger.info("🧵 Starting Comprehensive Shutdown v2.0...")
+            logger.info("   4-phase cleanup: HTTP Clients → Executors → Threads → Third-party")
 
-            # Shutdown with configured 20-second timeout
-            shutdown_stats = await shutdown_all_threads_async(timeout=20.0)
+            # Execute comprehensive shutdown with 20-second timeout
+            shutdown_stats = await comprehensive_shutdown(timeout=20.0)
 
-            logger.info("✅ Thread Manager shutdown complete")
-            logger.info(f"   • Total threads: {shutdown_stats.get('total_threads', 0)}")
-            logger.info(f"   • Gracefully stopped: {shutdown_stats.get('graceful_count', 0)}")
-            logger.info(f"   • Force stopped: {shutdown_stats.get('forceful_count', 0)}")
-            logger.info(f"   • Terminated: {shutdown_stats.get('terminated_count', 0)}")
-
-            if shutdown_stats.get('leaked_threads', 0) > 0:
-                logger.warning(f"   ⚠️  Leaked threads: {shutdown_stats['leaked_threads']}")
+            # Log results
+            if shutdown_stats.get("success"):
+                logger.info(f"✅ Comprehensive shutdown complete in {shutdown_stats.get('total_duration', 0):.2f}s")
             else:
-                logger.info("   ✅ No thread leaks detected!")
+                logger.warning(f"⚠️ Comprehensive shutdown completed with issues:")
+                for error in shutdown_stats.get("errors", []):
+                    logger.warning(f"   • {error}")
 
-            # Print detailed thread report
-            if thread_manager:
+            # Log phase details
+            phases = shutdown_stats.get("phases", {})
+            if "http_clients" in phases and not phases["http_clients"].get("skipped"):
+                http_stats = phases["http_clients"]
+                logger.info(f"   • HTTP Clients: {http_stats.get('closed', 0)} closed, "
+                           f"{http_stats.get('gc_collected', 0)} GC'd")
+            if "executors" in phases and not phases["executors"].get("skipped"):
+                exec_stats = phases["executors"]
+                logger.info(f"   • Executors: {exec_stats.get('successful', 0)}/{exec_stats.get('total_executors', 0)} shutdown")
+            if "third_party" in phases:
+                tp_stats = phases["third_party"]
+                logger.info(f"   • Third-party: {tp_stats.get('remaining_non_daemon', 0)} threads remaining")
+
+            # Print detailed thread report if available
+            if thread_manager and hasattr(thread_manager, 'print_report'):
                 logger.info("   📊 Final Thread Report:")
                 thread_manager.print_report()
 
         except Exception as e:
-            logger.error(f"❌ Thread Manager shutdown failed: {e}", exc_info=True)
-            logger.warning("   Some threads may still be running")
+            logger.error(f"❌ Comprehensive shutdown failed: {e}", exc_info=True)
+            logger.warning("   Falling back to legacy shutdown...")
+            # Fallback to legacy shutdown
+            try:
+                await shutdown_all_threads_async(timeout=10.0)
+            except Exception as fallback_e:
+                logger.error(f"   Fallback shutdown also failed: {fallback_e}")
     elif not THREAD_MANAGER_AVAILABLE:
         logger.warning("⚠️  Thread Manager not available - manual thread cleanup required")
 

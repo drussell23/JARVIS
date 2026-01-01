@@ -151,3 +151,6 @@ cloud-sql-python-connector>=1.7.0
 
 # GCP Secret Manager
 google-cloud-secret-manager>=2.20.0
+
+# GCP Compute Engine (for Spot VM auto-creation)
+google-cloud-compute>=1.40.0

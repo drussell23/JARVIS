@@ -202,6 +202,33 @@ _ensure_venv_python()
 del _os, _sys, _Path, _ensure_venv_python
 
 # =============================================================================
+# CRITICAL: PYTHON 3.9 COMPATIBILITY PATCH - MUST BE BEFORE ANY IMPORTS!
+# =============================================================================
+# This MUST happen BEFORE any module that imports google-api-core or other
+# packages that use importlib.metadata.packages_distributions() which was
+# added in Python 3.10. Without this patch, Python 3.9 users see:
+#   "module 'importlib.metadata' has no attribute 'packages_distributions'"
+# =============================================================================
+import sys as _sys
+if _sys.version_info < (3, 10):
+    try:
+        from importlib import metadata as _metadata
+        if not hasattr(_metadata, 'packages_distributions'):
+            def _packages_distributions_fallback():
+                """Minimal fallback for packages_distributions on Python 3.9."""
+                try:
+                    import importlib_metadata as _backport
+                    if hasattr(_backport, 'packages_distributions'):
+                        return _backport.packages_distributions()
+                except ImportError:
+                    pass
+                return {}
+            _metadata.packages_distributions = _packages_distributions_fallback
+    except Exception:
+        pass
+del _sys
+
+# =============================================================================
 # NORMAL IMPORTS START HERE
 # =============================================================================
 import asyncio
