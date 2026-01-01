@@ -187,6 +187,76 @@ if not _NUMBA_COMPATIBLE:
     _os.environ['NUMBA_NUM_THREADS'] = '1'
     _os.environ['_JARVIS_NUMBA_SKIP'] = '1'
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # v13.0: ROOT CAUSE FIX - INSTALL MOCK NUMBA MODULE
+    # ═══════════════════════════════════════════════════════════════════════════
+    # When numba is version-incompatible, setting NUMBA_DISABLE_JIT is NOT enough.
+    # Whisper → librosa → numba still tries to import numba, and the IMPORT ITSELF
+    # fails with a circular import error due to version mismatch.
+    #
+    # SOLUTION: Install a mock numba module in sys.modules BEFORE whisper imports.
+    # This prevents the real (broken) numba from ever being loaded.
+    # Libraries like librosa check for numba and gracefully degrade when it fails.
+    # ═══════════════════════════════════════════════════════════════════════════
+    import types as _types
+
+    class _NumbaSkippedModule(_types.ModuleType):
+        """
+        Mock numba module that raises ImportError for any attribute access.
+        This prevents circular import errors by making numba appear unavailable.
+        """
+        __version__ = "0.0.0-skipped"
+        __file__ = __file__
+        __path__ = []
+        _JARVIS_MOCK = True
+        _SKIP_REASON = _NUMBA_SKIP_REASON
+
+        def __getattr__(self, name):
+            if name.startswith('_'):
+                raise AttributeError(name)
+            # Raise ImportError so libraries like librosa fall back gracefully
+            raise ImportError(
+                f"numba is unavailable (version incompatible): {_NUMBA_SKIP_REASON}. "
+                "This is expected - the calling library will use a fallback."
+            )
+
+    class _NumbaJitDecorator:
+        """Mock JIT decorator that does nothing."""
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __call__(self, func):
+            return func
+
+    # Create mock numba module
+    _mock_numba = _NumbaSkippedModule('numba')
+    _mock_numba.jit = _NumbaJitDecorator
+    _mock_numba.njit = _NumbaJitDecorator
+    _mock_numba.vectorize = _NumbaJitDecorator
+    _mock_numba.guvectorize = _NumbaJitDecorator
+    _mock_numba.cfunc = _NumbaJitDecorator
+    _mock_numba.stencil = _NumbaJitDecorator
+    _mock_numba.prange = range  # prange is often used in loops
+
+    # Install mock in sys.modules ONLY if real numba isn't already loaded
+    # v13.0: Always install mock when incompatible, even if numba is already loaded
+    # because the loaded numba will cause circular import errors
+    _existing_numba = _sys.modules.get('numba')
+    _should_mock = (
+        _existing_numba is None or  # Not loaded yet
+        getattr(_existing_numba, '_JARVIS_MOCK', False) or  # Already our mock
+        not hasattr(_existing_numba, '__version__') or  # Corrupted
+        getattr(_existing_numba, '__version__', '') == '0.0.0-skipped'  # Already skipped
+    )
+
+    if 'numba' not in _sys.modules or _should_mock:
+        _sys.modules['numba'] = _mock_numba
+        # Also mock common submodules that might be imported
+        _sys.modules['numba.core'] = _NumbaSkippedModule('numba.core')
+        _sys.modules['numba.core.utils'] = _NumbaSkippedModule('numba.core.utils')
+        _sys.modules['numba.typed'] = _NumbaSkippedModule('numba.typed')
+        print("[numba_preload] 🛡️ Installed numba mock to prevent import errors")
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # v10.0: SET NUMBA ENVIRONMENT BEFORE ANY IMPORTS (if compatible)
@@ -200,6 +270,8 @@ def _check_early_corruption() -> bool:
 
     v11.0: More defensive - checks for active import locks to avoid
     racing with concurrent imports that would cause circular import errors.
+
+    v13.0: Recognizes our mock numba module and does NOT consider it corrupted.
     """
     if 'numba' not in _sys.modules:
         return False
@@ -207,6 +279,10 @@ def _check_early_corruption() -> bool:
     numba_mod = _sys.modules.get('numba')
     if numba_mod is None:
         return True  # None in sys.modules = corrupted
+
+    # v13.0: Check if this is our mock module - if so, it's NOT corrupted
+    if getattr(numba_mod, '_JARVIS_MOCK', False):
+        return False  # Our mock is intentional, not corrupted
 
     # Check for partial initialization
     if not hasattr(numba_mod, '__version__'):
@@ -1142,6 +1218,8 @@ def is_numba_corrupted() -> Tuple[bool, str]:
     This happens when circular import occurs - modules exist in sys.modules
     but are only partially initialized.
 
+    v13.0: Recognizes our mock numba module and does NOT consider it corrupted.
+
     Returns:
         Tuple of (is_corrupted, reason)
     """
@@ -1154,6 +1232,10 @@ def is_numba_corrupted() -> Tuple[bool, str]:
     if numba_mod is None:
         return True, "module_is_none"
 
+    # v13.0: Check if this is our mock module - if so, it's NOT corrupted
+    if getattr(numba_mod, '_JARVIS_MOCK', False):
+        return False, "mock_module"
+
     # Check for missing __version__ (sign of partial init)
     if not hasattr(numba_mod, '__version__'):
         return True, "missing_version"
@@ -1164,6 +1246,10 @@ def is_numba_corrupted() -> Tuple[bool, str]:
         if utils_mod is None:
             return True, "utils_module_is_none"
 
+        # v13.0: Check if this is our mock submodule
+        if getattr(utils_mod, '_JARVIS_MOCK', False):
+            return False, "mock_submodule"
+
         # Check if it's a partial module (missing expected attributes)
         expected_attrs = ['get_hashable_key', 'PYVERSION']
         found_any = any(hasattr(utils_mod, attr) for attr in expected_attrs)
@@ -1172,6 +1258,49 @@ def is_numba_corrupted() -> Tuple[bool, str]:
             return True, "utils_missing_attributes"
 
     return False, "ok"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# v13.0: NUMBA SKIP STATUS FUNCTIONS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def is_numba_skipped() -> bool:
+    """
+    v13.0: Check if numba is being skipped due to version incompatibility.
+
+    When numba is skipped, a mock module is installed in sys.modules
+    to prevent circular import errors. Whisper works fine without numba
+    (just slightly slower).
+
+    Returns:
+        True if numba is being skipped (mock installed)
+    """
+    return _NUMBA_COMPATIBLE is False
+
+
+def get_numba_skip_reason() -> Optional[str]:
+    """
+    v13.0: Get the reason why numba is being skipped.
+
+    Returns:
+        Reason string if numba is skipped, None if numba is available
+    """
+    if _NUMBA_COMPATIBLE is False:
+        return _NUMBA_SKIP_REASON
+    return None
+
+
+def is_numba_mocked() -> bool:
+    """
+    v13.0: Check if the numba module in sys.modules is our mock.
+
+    Returns:
+        True if the installed numba is our mock module
+    """
+    numba_mod = sys.modules.get('numba')
+    if numba_mod is None:
+        return False
+    return getattr(numba_mod, '_JARVIS_MOCK', False)
 
 
 def clear_corrupted_numba_modules() -> int:

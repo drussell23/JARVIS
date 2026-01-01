@@ -4504,16 +4504,113 @@ async def health_ready():
         details["database_connected"] = False
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # DETERMINE OVERALL READINESS (Progressive Model v2.0)
+    # CHECK 6: Ghost Proxy Models (CRITICAL - Frontend must wait for these!)
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Ghost Proxies are "empty shells" that materialize in the background.
+    # The frontend MUST wait until critical proxies are ready before redirecting.
+    # This prevents the "instant ready" false positive.
+    # ═══════════════════════════════════════════════════════════════════════════
+    ghosts_ready = True
+    ghost_stats = {
+        "total": 0,
+        "ready": 0,
+        "loading": 0,
+        "failed": 0,
+        "by_category": {},
+    }
+    ghost_details = {}
+
+    try:
+        from core.proxy_helpers import get_all_proxy_stats, is_proxy_ready
+
+        # Get all proxy stats dynamically (no hardcoding!)
+        all_proxies = get_all_proxy_stats(app.state)
+
+        # Define which categories are CRITICAL for user interaction
+        # These must be ready before we report "ready" to frontend
+        critical_categories = {"voice", "vision"}
+
+        for name, proxy_info in all_proxies.items():
+            category = proxy_info.get("category", "other")
+            is_ready = proxy_info.get("ready", False)
+            is_loading = proxy_info.get("loading", False)
+            state = proxy_info.get("state", "unknown")
+
+            ghost_stats["total"] += 1
+
+            # Track by category
+            if category not in ghost_stats["by_category"]:
+                ghost_stats["by_category"][category] = {
+                    "total": 0, "ready": 0, "loading": 0
+                }
+            ghost_stats["by_category"][category]["total"] += 1
+
+            if is_ready:
+                ghost_stats["ready"] += 1
+                ghost_stats["by_category"][category]["ready"] += 1
+                ghost_details[name] = "ready"
+            elif is_loading:
+                ghost_stats["loading"] += 1
+                ghost_stats["by_category"][category]["loading"] += 1
+                ghost_details[name] = "loading"
+
+                # If a CRITICAL category model is still loading, we're NOT ready
+                if category in critical_categories:
+                    ghosts_ready = False
+            elif state == "failed":
+                ghost_stats["failed"] += 1
+                ghost_details[name] = "failed"
+            else:
+                ghost_details[name] = state
+
+                # Unknown/ghost state in critical category = not ready
+                if category in critical_categories:
+                    ghosts_ready = False
+
+        # Additional check: Require at least one model per critical category
+        for category in critical_categories:
+            cat_stats = ghost_stats["by_category"].get(category, {})
+            if cat_stats.get("ready", 0) == 0 and cat_stats.get("total", 0) > 0:
+                # Category has models but none ready
+                ghosts_ready = False
+                ghost_details[f"{category}_category"] = "no_models_ready"
+            elif cat_stats.get("total", 0) == 0:
+                # Category has no models registered yet
+                ghosts_ready = False
+                ghost_details[f"{category}_category"] = "not_registered"
+
+        details["ghost_proxies"] = {
+            "ready": ghosts_ready,
+            "stats": ghost_stats,
+            "models": ghost_details,
+        }
+
+        if ghosts_ready:
+            critical_services_ready.append("ghost_proxies")
+        else:
+            critical_services_failed.append("ghost_proxies")
+
+    except ImportError:
+        # proxy_helpers not available - can't check ghosts
+        details["ghost_proxies"] = {"available": False, "ready": True}
+        # Don't block on missing module
+    except Exception as e:
+        details["ghost_proxies"] = {"error": str(e)[:100], "ready": False}
+        ghosts_ready = False
+        critical_services_failed.append("ghost_proxies")
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # DETERMINE OVERALL READINESS (Progressive Model v3.0 - Ghost-Aware)
     # ═══════════════════════════════════════════════════════════════════════════
     # Progressive readiness levels:
-    # 1. interactive_ready → ParallelInitializer says user can interact
-    # 2. websocket_ready → WebSocket routes registered
-    # 3. voice_operational → voice features work
-    # 4. ml_ready → full ML capabilities
+    # 1. ghosts_ready → Ghost Proxies (Voice + Vision) are materialized
+    # 2. interactive_ready → ParallelInitializer says user can interact
+    # 3. websocket_ready → WebSocket routes registered
+    # 4. voice_operational → voice features work
+    # 5. ml_ready → full ML capabilities
     #
-    # Key insight: Interactive ready OR WebSocket ready = user can interact
-    # Voice/ML can warm up in background while user interacts
+    # CRITICAL: The frontend MUST wait for Ghost Proxies to be ready!
+    # Without this, the loading page redirects before AI models are usable.
     # ═══════════════════════════════════════════════════════════════════════════
 
     voice_operational = ml_ready or speaker_service_ready or voice_ready
@@ -4529,26 +4626,61 @@ async def health_ready():
     core_ready = websocket_ready or interactive_ready  # Either is sufficient
     full_ready = core_ready and voice_operational
 
-    # Determine status based on progressive levels
-    if full_ready and len(critical_services_failed) == 0:
+    # ═══════════════════════════════════════════════════════════════════════════
+    # v3.0 GHOST-AWARE READINESS DECISION
+    # ═══════════════════════════════════════════════════════════════════════════
+    # The server HTTP endpoint is up, but AI models may still be loading.
+    # We MUST wait for Ghost Proxies to materialize before signaling "ready".
+    #
+    # Status progression:
+    # 1. "initializing" → HTTP not ready
+    # 2. "warming_up"   → HTTP ready, Ghost Proxies still loading (KEEP WAITING)
+    # 3. "ready"        → Everything ready, frontend can proceed
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    if not ghosts_ready and core_ready:
+        # Server is up but AI models are still loading
+        # This is the KEY FIX: Frontend must wait!
+        status = "warming_up"
+        ready = False  # <-- CRITICAL: Keep frontend waiting
+
+        # Add helpful info about what's loading
+        loading_models = [k for k, v in ghost_details.items() if v == "loading"]
+        details["warming_up_reason"] = {
+            "message": "AI models are initializing in background",
+            "models_loading": loading_models[:5],  # Show up to 5
+            "total_loading": ghost_stats.get("loading", 0),
+            "total_ready": ghost_stats.get("ready", 0),
+        }
+
+    elif full_ready and ghosts_ready and len(critical_services_failed) == 0:
         status = "ready"
         ready = True
-    elif full_ready:
-        status = "degraded"  # Some non-critical services failed
+
+    elif full_ready and ghosts_ready:
+        status = "degraded"  # Some non-critical services failed but usable
         ready = True
-    elif core_ready and ml_warmup_info.get("is_warming_up"):
-        # KEY FIX: Core ready + ML warming = ready for interaction!
-        # ML can continue warming while user interacts
-        status = "warming_up"
-        ready = True  # Changed from False - user CAN interact while warming
-    elif interactive_ready:
-        # ParallelInitializer says we're interactive
+
+    elif core_ready and ghosts_ready and ml_warmup_info.get("is_warming_up"):
+        # Ghosts ready but ML engine still optimizing - good enough
+        status = "operational"
+        ready = True
+
+    elif interactive_ready and ghosts_ready:
+        # ParallelInitializer says we're interactive AND ghosts ready
         status = "interactive"
         ready = True
-    elif websocket_ready:
-        # WebSocket ready but no voice yet - still interactive
+
+    elif websocket_ready and ghosts_ready:
+        # WebSocket ready + ghosts ready - user can interact
         status = "websocket_ready"
-        ready = True  # User can interact via text
+        ready = True
+
+    elif core_ready and not ghosts_ready:
+        # Redundant case covered above, but explicit for clarity
+        status = "warming_up"
+        ready = False
+
     else:
         status = "initializing"
         ready = False
@@ -4556,10 +4688,14 @@ async def health_ready():
     # Event loop is always responsive if we got here
     details["event_loop"] = True
 
+    # Add ghost status to top-level for easy frontend access
+    details["ghosts_materialized"] = ghosts_ready
+
     return {
         "status": status,
         "ready": ready,
         "operational": core_ready,
+        "ghosts_ready": ghosts_ready,  # Explicit field for frontend
         "details": details,
         "services": {
             "ready": critical_services_ready,

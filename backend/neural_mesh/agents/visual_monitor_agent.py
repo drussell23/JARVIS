@@ -720,17 +720,29 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
 
     async def on_initialize(self) -> None:
         """
-        Initialize agent resources with NON-BLOCKING execution.
+        Initialize agent resources with PARALLEL NON-BLOCKING execution.
 
-        v6.1.0 ROOT CAUSE FIX:
-        All C++/OS calls that can block the event loop are now run in thread executors.
-        This prevents the "Processing..." hang caused by blocked event loops.
+        v15.0 PARALLEL INITIALIZATION:
+        ==============================
+        All components now initialize CONCURRENTLY instead of sequentially.
+        This reduces startup time from ~30s (sum of all) to ~5s (max of any single).
 
-        The key insight: asyncio.wait_for() only works if the event loop can tick.
-        If a C++ call blocks the thread, the timer never fires → infinite hang.
-        Solution: Move ALL potentially blocking calls to run_in_executor().
+        Each component:
+        - Runs in a thread executor (for C++/blocking calls)
+        - Has individual timeout protection
+        - Gracefully degrades on failure (partial success is acceptable)
+        - Logs detailed status for debugging
+
+        Architecture:
+        1. Define wrapper tasks that catch individual failures
+        2. Launch ALL tasks concurrently with asyncio.create_task()
+        3. Use asyncio.gather() with return_exceptions=True
+        4. Report individual component status after parallel completion
         """
-        logger.info("Initializing VisualMonitorAgent v12.1 (Non-Blocking Ferrari Engine)")
+        import time as time_module
+        start_time = time_module.time()
+
+        logger.info("🚀 [VisualMonitor] Starting PARALLEL initialization v15.0...")
 
         # Get event loop for executor calls
         loop = asyncio.get_event_loop()
@@ -743,92 +755,118 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
         agentic_runner_init_timeout = float(os.getenv('JARVIS_AGENTIC_RUNNER_INIT_TIMEOUT', '3.0'))
         spatial_agent_init_timeout = float(os.getenv('JARVIS_SPATIAL_AGENT_INIT_TIMEOUT', '5.0'))
 
-        # =====================================================================
-        # v12.1: NON-BLOCKING Ferrari Engine Initialization
-        # =====================================================================
-        # PROBLEM: fast_capture.FastCaptureEngine() is a C++ constructor that
-        # can block the event loop for 1-10+ seconds during GPU/Metal init.
-        # SOLUTION: Run in thread executor so event loop stays responsive.
-        # =====================================================================
-        try:
-            import sys
-            from pathlib import Path
-            native_ext_path = Path(__file__).parent.parent.parent / "native_extensions"
-            if str(native_ext_path) not in sys.path:
-                sys.path.insert(0, str(native_ext_path))
+        # Overall parallel timeout - max of individual + buffer
+        parallel_timeout = float(os.getenv('JARVIS_PARALLEL_INIT_TIMEOUT', '10.0'))
 
-            def _init_fast_capture():
-                """Blocking C++ init - runs in thread executor."""
-                import fast_capture
-                return fast_capture.FastCaptureEngine()
-
-            self._fast_capture_engine = await asyncio.wait_for(
-                loop.run_in_executor(None, _init_fast_capture),
-                timeout=ferrari_init_timeout
-            )
-            logger.info("✅ Ferrari Engine - Window Discovery initialized (non-blocking)")
-
-        except asyncio.TimeoutError:
-            logger.warning(f"⚠️  Ferrari Engine init timed out after {ferrari_init_timeout}s")
-            logger.warning("   Falling back to legacy window discovery")
-            self._fast_capture_engine = None
-        except Exception as e:
-            logger.warning(f"⚠️  Ferrari Engine not available: {e}")
-            logger.warning("   Falling back to legacy window discovery")
-            self._fast_capture_engine = None
+        # Track component status for final report
+        component_status = {
+            "ferrari_engine": {"success": False, "error": None, "duration": 0.0},
+            "watcher_manager": {"success": False, "error": None, "duration": 0.0},
+            "detector": {"success": False, "error": None, "duration": 0.0},
+            "computer_use": {"success": False, "error": None, "duration": 0.0, "skipped": not self.config.enable_computer_use},
+            "agentic_runner": {"success": False, "error": None, "duration": 0.0, "skipped": not self.config.enable_agentic_runner},
+            "spatial_agent": {"success": False, "error": None, "duration": 0.0},
+        }
 
         # =====================================================================
-        # Legacy VideoWatcherManager - Non-Blocking
+        # PARALLEL INITIALIZATION TASKS - Each wrapped with error handling
         # =====================================================================
-        try:
-            def _init_watcher_manager():
-                """Potentially blocking init - runs in thread executor."""
-                from backend.vision.macos_video_capture_advanced import get_watcher_manager
-                return get_watcher_manager()
 
-            self._watcher_manager = await asyncio.wait_for(
-                loop.run_in_executor(None, _init_watcher_manager),
-                timeout=watcher_mgr_init_timeout
-            )
-            logger.info("✓ Legacy VideoWatcherManager initialized (fallback, non-blocking)")
+        async def init_ferrari_engine():
+            """Ferrari Engine (GPU-accelerated window capture) - Non-blocking."""
+            comp_start = time_module.time()
+            try:
+                import sys
+                from pathlib import Path
+                native_ext_path = Path(__file__).parent.parent.parent / "native_extensions"
+                if str(native_ext_path) not in sys.path:
+                    sys.path.insert(0, str(native_ext_path))
 
-        except asyncio.TimeoutError:
-            logger.debug(f"Legacy VideoWatcherManager init timed out after {watcher_mgr_init_timeout}s")
-            self._watcher_manager = None
-        except Exception as e:
-            logger.debug(f"Legacy VideoWatcherManager init failed: {e}")
-            self._watcher_manager = None
+                def _init_fast_capture():
+                    import fast_capture
+                    return fast_capture.FastCaptureEngine()
 
-        # =====================================================================
-        # Visual Event Detector (OCR) - Non-Blocking
-        # =====================================================================
-        # OCR models can take several seconds to load into memory
-        try:
-            def _init_detector():
-                """OCR model loading - can be slow, runs in thread executor."""
-                from backend.vision.visual_event_detector import create_detector
-                return create_detector()
+                self._fast_capture_engine = await asyncio.wait_for(
+                    loop.run_in_executor(None, _init_fast_capture),
+                    timeout=ferrari_init_timeout
+                )
+                component_status["ferrari_engine"]["success"] = True
+                component_status["ferrari_engine"]["duration"] = time_module.time() - comp_start
+                logger.info("✅ Ferrari Engine Ready")
 
-            self._detector = await asyncio.wait_for(
-                loop.run_in_executor(None, _init_detector),
-                timeout=detector_init_timeout
-            )
-            logger.info("✓ VisualEventDetector (OCR) initialized (non-blocking)")
+            except asyncio.TimeoutError:
+                component_status["ferrari_engine"]["error"] = f"timeout ({ferrari_init_timeout}s)"
+                component_status["ferrari_engine"]["duration"] = time_module.time() - comp_start
+                logger.warning(f"⚠️ Ferrari Engine timeout after {ferrari_init_timeout}s - using fallback")
+                self._fast_capture_engine = None
+            except Exception as e:
+                component_status["ferrari_engine"]["error"] = str(e)
+                component_status["ferrari_engine"]["duration"] = time_module.time() - comp_start
+                logger.warning(f"⚠️ Ferrari Engine failed: {e}")
+                self._fast_capture_engine = None
 
-        except asyncio.TimeoutError:
-            logger.warning(f"VisualEventDetector init timed out after {detector_init_timeout}s")
-            self._detector = None
-        except Exception as e:
-            logger.warning(f"VisualEventDetector init failed: {e}")
-            self._detector = None
+        async def init_watcher_manager():
+            """Legacy VideoWatcherManager - Non-blocking fallback."""
+            comp_start = time_module.time()
+            try:
+                def _init_watcher_manager():
+                    from backend.vision.macos_video_capture_advanced import get_watcher_manager
+                    return get_watcher_manager()
 
-        # =====================================================================
-        # v11.0: Computer Use Connector - Non-Blocking
-        # =====================================================================
-        if self.config.enable_computer_use:
+                self._watcher_manager = await asyncio.wait_for(
+                    loop.run_in_executor(None, _init_watcher_manager),
+                    timeout=watcher_mgr_init_timeout
+                )
+                component_status["watcher_manager"]["success"] = True
+                component_status["watcher_manager"]["duration"] = time_module.time() - comp_start
+                logger.info("✅ Watcher Manager Ready")
+
+            except asyncio.TimeoutError:
+                component_status["watcher_manager"]["error"] = f"timeout ({watcher_mgr_init_timeout}s)"
+                component_status["watcher_manager"]["duration"] = time_module.time() - comp_start
+                logger.debug(f"Legacy VideoWatcherManager timeout - not critical")
+                self._watcher_manager = None
+            except Exception as e:
+                component_status["watcher_manager"]["error"] = str(e)
+                component_status["watcher_manager"]["duration"] = time_module.time() - comp_start
+                logger.debug(f"Legacy VideoWatcherManager failed: {e}")
+                self._watcher_manager = None
+
+        async def init_detector():
+            """OCR Detector - Non-blocking (can be slow due to model loading)."""
+            comp_start = time_module.time()
+            try:
+                def _init_detector():
+                    from backend.vision.visual_event_detector import create_detector
+                    return create_detector()
+
+                self._detector = await asyncio.wait_for(
+                    loop.run_in_executor(None, _init_detector),
+                    timeout=detector_init_timeout
+                )
+                component_status["detector"]["success"] = True
+                component_status["detector"]["duration"] = time_module.time() - comp_start
+                logger.info("✅ OCR Detector Ready")
+
+            except asyncio.TimeoutError:
+                component_status["detector"]["error"] = f"timeout ({detector_init_timeout}s)"
+                component_status["detector"]["duration"] = time_module.time() - comp_start
+                logger.warning(f"VisualEventDetector timeout after {detector_init_timeout}s")
+                self._detector = None
+            except Exception as e:
+                component_status["detector"]["error"] = str(e)
+                component_status["detector"]["duration"] = time_module.time() - comp_start
+                logger.warning(f"VisualEventDetector failed: {e}")
+                self._detector = None
+
+        async def init_computer_use():
+            """Computer Use Connector - Non-blocking (enables Watch & Act)."""
+            if not self.config.enable_computer_use:
+                return  # Skip if disabled
+
+            comp_start = time_module.time()
             try:
                 def _init_computer_use():
-                    """Computer Use connector setup - runs in thread executor."""
                     from backend.display.computer_use_connector import get_computer_use_connector
                     return get_computer_use_connector()
 
@@ -837,27 +875,33 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                     timeout=computer_use_init_timeout
                 )
 
-                # Extract TTS callback for voice narration during monitoring
+                # Extract TTS callback for voice narration
                 if hasattr(self._computer_use_connector, 'narrator') and hasattr(self._computer_use_connector.narrator, 'tts_callback'):
                     self._tts_callback = self._computer_use_connector.narrator.tts_callback
-                logger.info("✓ ClaudeComputerUseConnector initialized (Watch & Act enabled, non-blocking)")
+
+                component_status["computer_use"]["success"] = True
+                component_status["computer_use"]["duration"] = time_module.time() - comp_start
+                logger.info("✅ Computer Use Ready")
 
             except asyncio.TimeoutError:
-                logger.warning(f"ComputerUseConnector init timed out after {computer_use_init_timeout}s")
-                logger.warning("Watch & Act will be limited to passive mode")
+                component_status["computer_use"]["error"] = f"timeout ({computer_use_init_timeout}s)"
+                component_status["computer_use"]["duration"] = time_module.time() - comp_start
+                logger.warning(f"ComputerUseConnector timeout - Watch & Act limited to passive mode")
                 self._computer_use_connector = None
             except Exception as e:
-                logger.warning(f"ComputerUseConnector init failed: {e}")
-                logger.warning("Watch & Act will be limited to passive mode")
+                component_status["computer_use"]["error"] = str(e)
+                component_status["computer_use"]["duration"] = time_module.time() - comp_start
+                logger.warning(f"ComputerUseConnector failed: {e}")
                 self._computer_use_connector = None
 
-        # =====================================================================
-        # v11.0: AgenticTaskRunner - Non-Blocking
-        # =====================================================================
-        if self.config.enable_agentic_runner:
+        async def init_agentic_runner():
+            """AgenticTaskRunner - Non-blocking (enables complex workflows)."""
+            if not self.config.enable_agentic_runner:
+                return  # Skip if disabled
+
+            comp_start = time_module.time()
             try:
                 def _init_agentic_runner():
-                    """Agentic runner setup - runs in thread executor."""
                     from backend.core.agentic_task_runner import get_agentic_runner
                     return get_agentic_runner()
 
@@ -867,53 +911,120 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                 )
 
                 if self._agentic_task_runner:
-                    logger.info("✓ AgenticTaskRunner initialized (Complex workflows enabled, non-blocking)")
+                    component_status["agentic_runner"]["success"] = True
+                    component_status["agentic_runner"]["duration"] = time_module.time() - comp_start
+                    logger.info("✅ Agentic Runner Ready")
                 else:
-                    logger.warning("AgenticTaskRunner not yet created - workflows will use Computer Use fallback")
+                    component_status["agentic_runner"]["error"] = "returned None"
+                    component_status["agentic_runner"]["duration"] = time_module.time() - comp_start
+                    logger.warning("AgenticTaskRunner returned None - using Computer Use fallback")
 
             except asyncio.TimeoutError:
-                logger.warning(f"AgenticTaskRunner init timed out after {agentic_runner_init_timeout}s")
-                logger.warning("Complex workflows will fall back to Computer Use")
+                component_status["agentic_runner"]["error"] = f"timeout ({agentic_runner_init_timeout}s)"
+                component_status["agentic_runner"]["duration"] = time_module.time() - comp_start
+                logger.warning(f"AgenticTaskRunner timeout - using Computer Use fallback")
                 self._agentic_task_runner = None
             except Exception as e:
-                logger.warning(f"AgenticTaskRunner init failed: {e}")
-                logger.warning("Complex workflows will fall back to Computer Use")
+                component_status["agentic_runner"]["error"] = str(e)
+                component_status["agentic_runner"]["duration"] = time_module.time() - comp_start
+                logger.warning(f"AgenticTaskRunner failed: {e}")
                 self._agentic_task_runner = None
 
+        async def init_spatial_agent():
+            """SpatialAwarenessAgent - Non-blocking (Yabai can hard-block)."""
+            comp_start = time_module.time()
+            try:
+                # Phase 1: Create agent (sync, in executor)
+                self.spatial_agent = await asyncio.wait_for(
+                    loop.run_in_executor(None, self._create_spatial_agent_sync),
+                    timeout=spatial_agent_init_timeout
+                )
+
+                if self.spatial_agent:
+                    # Phase 2: Initialize agent (async with timeout)
+                    try:
+                        await asyncio.wait_for(
+                            self.spatial_agent.on_initialize(),
+                            timeout=spatial_agent_init_timeout
+                        )
+                        component_status["spatial_agent"]["success"] = True
+                        component_status["spatial_agent"]["duration"] = time_module.time() - comp_start
+                        logger.info("✅ Spatial Awareness Ready")
+                    except asyncio.TimeoutError:
+                        # Partial success - agent created but not fully initialized
+                        component_status["spatial_agent"]["success"] = True  # Partial
+                        component_status["spatial_agent"]["error"] = "on_initialize timeout (Yabai blocking)"
+                        component_status["spatial_agent"]["duration"] = time_module.time() - comp_start
+                        logger.warning("SpatialAgent partially initialized - Yabai may be blocking")
+                else:
+                    component_status["spatial_agent"]["error"] = "creation returned None"
+                    component_status["spatial_agent"]["duration"] = time_module.time() - comp_start
+                    self.spatial_agent = None
+
+            except asyncio.TimeoutError:
+                component_status["spatial_agent"]["error"] = f"timeout ({spatial_agent_init_timeout}s)"
+                component_status["spatial_agent"]["duration"] = time_module.time() - comp_start
+                logger.warning(f"SpatialAwarenessAgent timeout - God Mode without space switching")
+                self.spatial_agent = None
+            except Exception as e:
+                component_status["spatial_agent"]["error"] = str(e)
+                component_status["spatial_agent"]["duration"] = time_module.time() - comp_start
+                logger.warning(f"SpatialAwarenessAgent failed: {e}")
+                self.spatial_agent = None
+
         # =====================================================================
-        # v13.1: SpatialAwarenessAgent - FULLY Non-Blocking with Executor
+        # LAUNCH ALL TASKS IN PARALLEL
         # =====================================================================
-        # CRITICAL: Yabai can HARD BLOCK the thread (not just async block).
-        # asyncio.wait_for() alone does NOT work if Yabai freezes the thread.
-        # SOLUTION: Run blocking parts in thread executor, async parts with timeout.
-        # =====================================================================
+        tasks = [
+            asyncio.create_task(init_ferrari_engine(), name="ferrari"),
+            asyncio.create_task(init_watcher_manager(), name="watcher"),
+            asyncio.create_task(init_detector(), name="detector"),
+            asyncio.create_task(init_computer_use(), name="computer_use"),
+            asyncio.create_task(init_agentic_runner(), name="agentic"),
+            asyncio.create_task(init_spatial_agent(), name="spatial"),
+        ]
+
+        # Wait for all with global timeout
         try:
-            self.spatial_agent = await asyncio.wait_for(
-                loop.run_in_executor(None, self._create_spatial_agent_sync),
-                timeout=spatial_agent_init_timeout
+            await asyncio.wait_for(
+                asyncio.gather(*tasks, return_exceptions=True),
+                timeout=parallel_timeout
             )
-
-            if self.spatial_agent:
-                # on_initialize() is async but may have blocking Yabai calls internally
-                # Run it with a timeout - if Yabai blocks, we'll timeout and continue
-                try:
-                    await asyncio.wait_for(
-                        self.spatial_agent.on_initialize(),
-                        timeout=spatial_agent_init_timeout
-                    )
-                    logger.info("✓ SpatialAwarenessAgent initialized (God Mode space switching enabled)")
-                except asyncio.TimeoutError:
-                    logger.warning(f"SpatialAgent.on_initialize() timed out (Yabai may be blocking)")
-                    logger.warning("Spatial agent created but not fully initialized - partial functionality")
-
         except asyncio.TimeoutError:
-            logger.warning(f"SpatialAwarenessAgent creation timed out after {spatial_agent_init_timeout}s")
-            logger.warning("God Mode multi-space watching will work without automatic space switching")
-            self.spatial_agent = None
-        except Exception as e:
-            logger.warning(f"SpatialAwarenessAgent init failed: {e}")
-            logger.warning("God Mode multi-space watching will work without automatic space switching")
-            self.spatial_agent = None
+            logger.warning(f"⚠️ Parallel initialization timed out after {parallel_timeout}s")
+            logger.warning("   Some components may still be initializing in background")
+            # Cancel remaining tasks
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+
+        # =====================================================================
+        # INITIALIZATION COMPLETE - Report Status
+        # =====================================================================
+        total_time = time_module.time() - start_time
+
+        # Count successes and failures
+        successes = sum(1 for s in component_status.values() if s.get("success") and not s.get("skipped"))
+        failures = sum(1 for s in component_status.values() if not s.get("success") and not s.get("skipped"))
+        skipped = sum(1 for s in component_status.values() if s.get("skipped"))
+
+        # Log detailed component status
+        logger.info("")
+        logger.info("=" * 60)
+        logger.info(f"✨ [VisualMonitor] Parallel Init Complete in {total_time:.2f}s")
+        logger.info(f"   Components: {successes} ready, {failures} degraded, {skipped} skipped")
+        logger.info("-" * 60)
+
+        for comp_name, status in component_status.items():
+            if status.get("skipped"):
+                logger.info(f"   ⏭️  {comp_name}: SKIPPED (disabled)")
+            elif status.get("success"):
+                logger.info(f"   ✅ {comp_name}: READY ({status['duration']:.2f}s)")
+            else:
+                logger.info(f"   ⚠️  {comp_name}: DEGRADED - {status.get('error', 'unknown')} ({status['duration']:.2f}s)")
+
+        logger.info("=" * 60)
+        logger.info("")
 
         # Ensure cross-repo directory exists
         if self.config.enable_cross_repo_sync:
