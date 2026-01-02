@@ -76,6 +76,27 @@ except ImportError:
     except ImportError as e:
         logger.warning(f"VisualMonitorAgent not available: {e}")
 
+# v11.1: Import IntelligentErrorReporter for detailed error diagnosis
+IntelligentErrorReporter = None
+INTELLIGENT_ERROR_REPORTER_AVAILABLE = False
+try:
+    from voice.intelligent_error_reporter import (
+        IntelligentErrorReporter,
+        diagnose_surveillance_error,
+        ErrorCategory,
+    )
+    INTELLIGENT_ERROR_REPORTER_AVAILABLE = True
+except ImportError:
+    try:
+        from backend.voice.intelligent_error_reporter import (
+            IntelligentErrorReporter,
+            diagnose_surveillance_error,
+            ErrorCategory,
+        )
+        INTELLIGENT_ERROR_REPORTER_AVAILABLE = True
+    except ImportError as e:
+        logger.warning(f"IntelligentErrorReporter not available: {e}")
+
 class ResponseStyle(Enum):
     """
     Response style variations based on time of day and context.
@@ -158,6 +179,19 @@ class IntelligentCommandHandler:
             'average_confidence': 0.0,
         }
         self.last_milestone_announced = 0
+
+        # v11.1: Intelligent Error Reporter for detailed diagnostics
+        self._error_reporter: Optional[IntelligentErrorReporter] = None
+        if INTELLIGENT_ERROR_REPORTER_AVAILABLE and IntelligentErrorReporter is not None:
+            try:
+                self._error_reporter = IntelligentErrorReporter(
+                    user_name=user_name,
+                    include_technical_details=True,
+                    health_probe_timeout=3.0,
+                )
+                logger.info("[CommandHandler] v11.1 IntelligentErrorReporter initialized")
+            except Exception as e:
+                logger.warning(f"Failed to initialize IntelligentErrorReporter: {e}")
 
         # ===================================================================
         # Phase 2: Real-Time Interaction Intelligence (v7.0)
@@ -638,11 +672,57 @@ class IntelligentCommandHandler:
         self,
         error_type: str,
         app_name: str,
-        trigger_text: str
+        trigger_text: str,
+        exception: Optional[Exception] = None,
     ) -> str:
-        """Format error responses in natural, helpful language."""
+        """
+        Format error responses in natural, helpful language.
+
+        v11.1 Enhancement: When an exception is provided, uses IntelligentErrorReporter
+        to diagnose the root cause and provide actionable details instead of
+        generic "I hit a snag" messages.
+        """
         import random
 
+        # v11.1: If we have an exception and error reporter, do intelligent diagnosis
+        if exception is not None and self._error_reporter is not None:
+            try:
+                # Run diagnosis synchronously using asyncio
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    # We're in an async context - create a task
+                    # For synchronous fallback, use the legacy messages
+                    # but log the detailed error
+                    logger.error(
+                        f"[CommandHandler] Surveillance error for {app_name}: "
+                        f"{type(exception).__name__}: {exception}",
+                        exc_info=True
+                    )
+                    # Return message with technical detail
+                    return self._format_detailed_error_sync(
+                        exception, error_type, app_name, trigger_text
+                    )
+                else:
+                    diagnosis = loop.run_until_complete(
+                        self._error_reporter.diagnose_error(
+                            exception,
+                            context={
+                                "app_name": app_name,
+                                "trigger_text": trigger_text,
+                            }
+                        )
+                    )
+                    # Log full diagnosis
+                    logger.error(
+                        f"[CommandHandler] Error Diagnosis: {diagnosis.to_dict()}",
+                    )
+                    return diagnosis.to_voice_message(include_technical=True)
+
+            except Exception as diag_error:
+                logger.warning(f"Error diagnosis failed: {diag_error}")
+                # Fall through to legacy handling
+
+        # Legacy fallback for when no exception is provided
         if error_type == "initialization_failed":
             return random.choice([
                 f"I'm sorry, {self.user_name}. My visual surveillance system isn't responding right now. Try again in a moment?",
@@ -656,13 +736,97 @@ class IntelligentCommandHandler:
                 f"I'm not finding any {app_name} windows to monitor. Is {app_name} open?",
             ])
         elif error_type == "runtime_error":
+            # v11.1: Include exception message if available
+            if exception:
+                exc_msg = str(exception)[:100]
+                return (
+                    f"I encountered an error while monitoring {app_name}, {self.user_name}. "
+                    f"Technical details: {type(exception).__name__}: {exc_msg}"
+                )
             return random.choice([
                 f"I hit a snag while monitoring {app_name}, {self.user_name}. Want to try again?",
                 f"Something went wrong with the surveillance on {app_name}. Let's give it another shot?",
                 f"Had an issue watching {app_name}. This is unusual - shall we try once more?",
             ])
         else:
+            if exception:
+                return (
+                    f"Sorry, {self.user_name}. Error while watching {app_name}: "
+                    f"{type(exception).__name__}: {str(exception)[:100]}"
+                )
             return f"Sorry, {self.user_name}. I ran into an issue while trying to watch {app_name}."
+
+    def _format_detailed_error_sync(
+        self,
+        exception: Exception,
+        error_type: str,
+        app_name: str,
+        trigger_text: str,
+    ) -> str:
+        """
+        v11.1: Format detailed error message synchronously.
+
+        Used when we can't run async diagnosis but still want to expose
+        the actual error instead of masking it.
+        """
+        exc_type = type(exception).__name__
+        exc_msg = str(exception)
+
+        # Classify based on error message patterns
+        error_lower = exc_msg.lower()
+
+        if "yabai" in error_lower:
+            if "timeout" in error_lower or "timed out" in error_lower:
+                return (
+                    f"The window manager (yabai) timed out while monitoring {app_name}, {self.user_name}. "
+                    f"It may be overwhelmed by requests. Try: brew services restart yabai"
+                )
+            elif "connection" in error_lower or "refused" in error_lower:
+                return (
+                    f"I can't connect to the window manager (yabai), {self.user_name}. "
+                    f"It appears to be stopped. Try: brew services restart yabai"
+                )
+            elif "permission" in error_lower:
+                return (
+                    f"Yabai needs accessibility permissions, {self.user_name}. "
+                    f"Check System Settings > Privacy & Security > Accessibility."
+                )
+
+        elif "ghost" in error_lower or "virtual" in error_lower or "display" in error_lower:
+            return (
+                f"The Ghost Display isn't available for background monitoring, {self.user_name}. "
+                f"BetterDisplay may need to create a virtual display."
+            )
+
+        elif "screen" in error_lower and "recording" in error_lower:
+            return (
+                f"I don't have screen recording permission, {self.user_name}. "
+                f"Enable it in System Settings > Privacy & Security > Screen Recording."
+            )
+
+        elif "window" in error_lower and ("not found" in error_lower or "no window" in error_lower):
+            return (
+                f"I don't see any {app_name} windows open, {self.user_name}. "
+                f"Please open {app_name} first."
+            )
+
+        elif "ocr" in error_lower or "tesseract" in error_lower:
+            return (
+                f"The text recognition system failed, {self.user_name}. "
+                f"Error: {exc_type}: {exc_msg[:80]}"
+            )
+
+        elif "timeout" in error_lower or exc_type == "TimeoutError":
+            return (
+                f"The operation timed out while monitoring {app_name}, {self.user_name}. "
+                f"The system may be under heavy load."
+            )
+
+        # Generic but still informative
+        return (
+            f"I encountered an error monitoring {app_name}, {self.user_name}. "
+            f"Error: {exc_type}: {exc_msg[:100]}"
+        )
 
     def _format_timeout_response(
         self,
@@ -1554,7 +1718,8 @@ class IntelligentCommandHandler:
             agent = await self._get_visual_monitor_agent()
         except Exception as e:
             logger.error(f"VisualMonitorAgent initialization failed: {e}", exc_info=True)
-            return self._format_error_response("initialization_failed", app_name, trigger_text)
+            # v11.1: Pass exception for intelligent diagnosis
+            return self._format_error_response("initialization_failed", app_name, trigger_text, exception=e)
 
         if not agent:
             return self._format_error_response("initialization_failed", app_name, trigger_text)
@@ -1625,7 +1790,8 @@ class IntelligentCommandHandler:
 
         except Exception as e:
             logger.error(f"Surveillance command execution error: {e}", exc_info=True)
-            return self._format_error_response("runtime_error", app_name, trigger_text)
+            # v11.1: Pass exception for intelligent diagnosis - NO MORE "I hit a snag"!
+            return self._format_error_response("runtime_error", app_name, trigger_text, exception=e)
 
     def _format_surveillance_response(
         self,
