@@ -544,6 +544,8 @@ class NeuralMeshCoordinator:
 
         This allows external systems to receive messages from the Neural Mesh.
 
+        v18.0: Enhanced with robust error handling and dynamic type resolution.
+
         Args:
             topic: Topic to subscribe to (e.g., "safety_events", "training_events")
             callback: Async callback function to call when message received
@@ -559,18 +561,35 @@ class NeuralMeshCoordinator:
         try:
             from .data_models import MessageType
 
-            # Map topic to message type
-            topic_map = {
-                "safety_events": MessageType.BROADCAST,
-                "training_events": MessageType.BROADCAST,
-                "agent_events": MessageType.NOTIFICATION,
-                "system_events": MessageType.BROADCAST,
-                "context_sync": MessageType.BROADCAST,
-                "state_sync": MessageType.BROADCAST,
-                "model_updates": MessageType.BROADCAST,
+            # v18.0: Dynamic topic-to-MessageType mapping with fallback safety
+            # This resolves enum types safely to prevent AttributeError crashes
+            def _safe_get_message_type(type_name: str) -> MessageType:
+                """Safely get MessageType by name with fallback to BROADCAST."""
+                try:
+                    return MessageType[type_name]
+                except KeyError:
+                    logger.warning(
+                        f"[NEURAL-MESH] MessageType.{type_name} not found, "
+                        f"falling back to BROADCAST"
+                    )
+                    return MessageType.BROADCAST
+
+            # Map topic to message type name (strings for safety)
+            topic_type_names = {
+                "safety_events": "BROADCAST",
+                "training_events": "BROADCAST",
+                "agent_events": "NOTIFICATION",
+                "system_events": "BROADCAST",
+                "context_sync": "BROADCAST",
+                "state_sync": "BROADCAST",
+                "model_updates": "BROADCAST",
+                "error_events": "NOTIFICATION",
+                "health_events": "NOTIFICATION",
             }
 
-            message_type = topic_map.get(topic, MessageType.BROADCAST)
+            # Get the type name for this topic (default to BROADCAST)
+            type_name = topic_type_names.get(topic, "BROADCAST")
+            message_type = _safe_get_message_type(type_name)
 
             # Subscribe via the bus
             # Bus.subscribe expects: agent_name, message_type, callback
@@ -581,11 +600,17 @@ class NeuralMeshCoordinator:
                 callback=callback,
             )
 
-            logger.info(f"[NEURAL-MESH] Subscribed to topic: {topic}")
+            logger.info(
+                f"[NEURAL-MESH] Subscribed to topic: {topic} "
+                f"(type: {message_type.value}, subscriber: {agent_name})"
+            )
             return True
 
         except Exception as e:
-            logger.error(f"[NEURAL-MESH] Failed to subscribe to '{topic}': {e}")
+            logger.error(
+                f"[NEURAL-MESH] Failed to subscribe to '{topic}': {type(e).__name__}: {e}",
+                exc_info=True
+            )
             return False
 
     async def publish_event(

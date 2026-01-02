@@ -112,6 +112,8 @@ class MessageType(Enum):
     REQUEST = "request"
     RESPONSE = "response"
     BROADCAST = "broadcast"
+    NOTIFICATION = "notification"  # v18.0: Agent event notifications (lifecycle, status)
+    SUBSCRIPTION = "subscription"  # v18.0: Topic subscription messages
     CUSTOM = "custom"
 
 
