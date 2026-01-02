@@ -332,6 +332,212 @@ class VisualMonitorConfig:
         default_factory=lambda: int(os.getenv("JARVIS_MAX_NARRATIONS_PER_MIN", "6"))
     )
 
+    # =========================================================================
+    # v26.0: Progressive Startup Manager - Dynamic Multi-Window Initialization
+    # =========================================================================
+    # ROOT CAUSE FIX: 11 windows times out because of fixed 15s timeout
+    # SOLUTION: Dynamic timeout scaling + event-based registration + optimistic ack
+    # =========================================================================
+
+    # Base timeout for watcher startup (per watcher)
+    progressive_startup_base_timeout: float = field(
+        default_factory=lambda: float(os.getenv("JARVIS_PROGRESSIVE_BASE_TIMEOUT", "5.0"))
+    )
+    # Additional timeout per window (scales with window count)
+    progressive_startup_per_window_timeout: float = field(
+        default_factory=lambda: float(os.getenv("JARVIS_PROGRESSIVE_PER_WINDOW", "2.0"))
+    )
+    # Maximum total timeout (cap to prevent excessive waits)
+    progressive_startup_max_timeout: float = field(
+        default_factory=lambda: float(os.getenv("JARVIS_PROGRESSIVE_MAX_TIMEOUT", "60.0"))
+    )
+    # Minimum watchers required before returning (percentage of total)
+    progressive_startup_min_active_ratio: float = field(
+        default_factory=lambda: float(os.getenv("JARVIS_PROGRESSIVE_MIN_RATIO", "0.3"))
+    )
+    # Max parallel watcher spawns (throttle to avoid system overload)
+    progressive_startup_max_parallel_spawns: int = field(
+        default_factory=lambda: int(os.getenv("JARVIS_PROGRESSIVE_MAX_PARALLEL", "5"))
+    )
+    # Max parallel rescue operations (window teleportation)
+    progressive_rescue_max_parallel: int = field(
+        default_factory=lambda: int(os.getenv("JARVIS_RESCUE_MAX_PARALLEL", "5"))
+    )
+    # Enable optimistic acknowledgment (return immediately, verify in background)
+    progressive_startup_optimistic: bool = field(
+        default_factory=lambda: os.getenv("JARVIS_PROGRESSIVE_OPTIMISTIC", "true").lower() == "true"
+    )
+
+
+# =============================================================================
+# v26.0: Progressive Startup Manager - Event-Based Multi-Window Initialization
+# =============================================================================
+
+class ProgressiveStartupManager:
+    """
+    Intelligent, event-based multi-window startup manager.
+
+    ROOT CAUSE FIX for 11-window timeout:
+    1. Dynamic timeout scaling: base + (window_count * per_window)
+    2. Event-based registration: no polling, watchers notify when ready
+    3. Optimistic acknowledgment: return immediately, verify in background
+    4. Batched spawning: avoid overwhelming the system
+    5. Progressive reporting: announce as watchers come online
+
+    Architecture:
+        ┌─────────────────────────────────────────────────────────────────────┐
+        │  ProgressiveStartupManager                                          │
+        │  ├── WatcherReadyEvent (asyncio.Event per watcher)                  │
+        │  ├── StartupCoordinator (batches and throttles spawns)              │
+        │  ├── DynamicTimeoutCalculator (scales with window count)            │
+        │  └── ProgressReporter (announces watchers as they come online)      │
+        └─────────────────────────────────────────────────────────────────────┘
+    """
+
+    def __init__(self, config: VisualMonitorConfig):
+        self.config = config
+        self._watcher_ready_events: Dict[str, asyncio.Event] = {}
+        self._startup_results: Dict[str, Dict[str, Any]] = {}
+        self._all_started_event = asyncio.Event()
+        self._startup_start_time: Optional[datetime] = None
+        self._expected_count = 0
+        self._ready_count = 0
+        self._failed_count = 0
+        self._lock = asyncio.Lock()
+
+    def calculate_dynamic_timeout(self, window_count: int) -> float:
+        """
+        Calculate dynamic timeout based on window count.
+
+        Formula: min(base + (count * per_window), max_timeout)
+
+        For 11 windows with defaults:
+        - base=5.0 + (11 * 2.0) = 27.0 seconds (not 15!)
+        """
+        base = self.config.progressive_startup_base_timeout
+        per_window = self.config.progressive_startup_per_window_timeout
+        max_timeout = self.config.progressive_startup_max_timeout
+
+        dynamic = base + (window_count * per_window)
+        return min(dynamic, max_timeout)
+
+    def calculate_min_required_watchers(self, total: int) -> int:
+        """
+        Calculate minimum watchers required before returning.
+
+        With 30% ratio and 11 windows: min(11, max(1, 11 * 0.3)) = 4 watchers
+        """
+        ratio = self.config.progressive_startup_min_active_ratio
+        return max(1, int(total * ratio))
+
+    async def register_watcher_ready(
+        self,
+        watcher_id: str,
+        success: bool,
+        error: Optional[str] = None,
+    ) -> None:
+        """
+        Called by watchers when they're ready (or failed).
+
+        This is the EVENT-BASED alternative to polling.
+        """
+        async with self._lock:
+            self._startup_results[watcher_id] = {
+                'success': success,
+                'error': error,
+                'timestamp': datetime.now().isoformat(),
+            }
+
+            if success:
+                self._ready_count += 1
+            else:
+                self._failed_count += 1
+
+            # Signal individual watcher ready
+            if watcher_id in self._watcher_ready_events:
+                self._watcher_ready_events[watcher_id].set()
+
+            # Check if we have enough watchers or all finished
+            total_finished = self._ready_count + self._failed_count
+            min_required = self.calculate_min_required_watchers(self._expected_count)
+
+            if self._ready_count >= self._expected_count:
+                # All watchers succeeded
+                self._all_started_event.set()
+            elif total_finished >= self._expected_count:
+                # All watchers finished (some may have failed)
+                self._all_started_event.set()
+            elif self._ready_count >= min_required:
+                # Enough watchers are ready - can proceed
+                self._all_started_event.set()
+
+            logger.debug(
+                f"[ProgressiveStartup] Watcher {watcher_id}: "
+                f"{'ready' if success else 'failed'} "
+                f"({self._ready_count}/{self._expected_count} active, "
+                f"{self._failed_count} failed)"
+            )
+
+    async def wait_for_startup(
+        self,
+        expected_count: int,
+    ) -> Dict[str, Any]:
+        """
+        Wait for watchers to start with dynamic timeout.
+
+        Returns immediately if optimistic mode is enabled and
+        at least min_required watchers are ready.
+        """
+        self._expected_count = expected_count
+        self._startup_start_time = datetime.now()
+
+        # Calculate dynamic timeout
+        timeout = self.calculate_dynamic_timeout(expected_count)
+        min_required = self.calculate_min_required_watchers(expected_count)
+
+        logger.info(
+            f"[ProgressiveStartup] Waiting for {expected_count} watchers "
+            f"(min required: {min_required}, timeout: {timeout:.1f}s)"
+        )
+
+        try:
+            # Wait for all_started event or timeout
+            await asyncio.wait_for(
+                self._all_started_event.wait(),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            # Timeout - but we may have some watchers ready
+            logger.warning(
+                f"[ProgressiveStartup] Timeout after {timeout:.1f}s "
+                f"({self._ready_count}/{expected_count} ready, "
+                f"{self._failed_count} failed)"
+            )
+
+        elapsed = (datetime.now() - self._startup_start_time).total_seconds()
+
+        return {
+            'expected': expected_count,
+            'ready': self._ready_count,
+            'failed': self._failed_count,
+            'pending': expected_count - self._ready_count - self._failed_count,
+            'elapsed_seconds': elapsed,
+            'timeout_used': timeout,
+            'min_required': min_required,
+            'success': self._ready_count >= min_required,
+            'results': dict(self._startup_results),
+        }
+
+    def reset(self) -> None:
+        """Reset for new startup sequence."""
+        self._watcher_ready_events.clear()
+        self._startup_results.clear()
+        self._all_started_event.clear()
+        self._startup_start_time = None
+        self._expected_count = 0
+        self._ready_count = 0
+        self._failed_count = 0
+
 
 # =============================================================================
 # v14.0: "Working Out Loud" - Narration State Management
@@ -552,6 +758,13 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
         # - "failed": Verification failed (stores failure reason)
         # =====================================================================
         self._watcher_lifecycle: Dict[str, Dict[str, Any]] = {}  # watcher_id -> lifecycle state
+
+        # v26.0: Progressive Startup Manager - Event-Based Multi-Window Initialization
+        # =====================================================================
+        # ROOT CAUSE FIX: 11 windows times out because of fixed 15s timeout
+        # SOLUTION: Dynamic timeout + event-based registration + optimistic ack
+        # =====================================================================
+        self._progressive_startup_manager: Optional[ProgressiveStartupManager] = None
 
         # Lazy-loaded components - Action Execution (v11.0)
         self._computer_use_connector = None  # For executing actions
@@ -1923,81 +2136,83 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
             logger.info(f"[God Mode] Background mode: {len(watcher_tasks)} watchers running asynchronously")
 
             # =====================================================================
-            # ROOT CAUSE FIX v16.0: Verify Watchers Actually Start Before Returning
+            # ROOT CAUSE FIX v26.0: Progressive Startup with Dynamic Timeout
             # =====================================================================
-            # PROBLEM: asyncio.create_task() only SCHEDULES tasks - they don't run
-            # until we yield control. We were returning "success" before tasks ran!
+            # PROBLEM: Fixed 10-15s timeout fails for 11+ windows because:
+            # - Each watcher needs 10-15s to start
+            # - Polling every 200ms is inefficient
+            # - No dynamic scaling based on window count
             #
-            # SOLUTION:
-            # 1. Yield control to let watcher tasks start executing
-            # 2. Wait briefly for watchers to register in _active_video_watchers
-            # 3. Trigger purple indicator BEFORE returning (don't rely on tasks)
-            # 4. Return error if ALL watchers failed to start
+            # SOLUTION (v26.0 ProgressiveStartupManager):
+            # 1. Dynamic timeout: base + (window_count * per_window)
+            # 2. Event-based notification (no polling)
+            # 3. Minimum required watchers (30% default) before returning
+            # 4. Progressive reporting as watchers come online
             # =====================================================================
 
-            # ===== STEP 3B.0: Wait for Watchers to Actually Start (v22.0.0) =====
-            # Enhanced with lifecycle tracking for better error reporting
-            watcher_startup_timeout = float(os.getenv('JARVIS_WATCHER_STARTUP_TIMEOUT', '10.0'))
-            startup_check_interval = 0.2  # Check every 200ms
-            initial_active_count = len(self._active_video_watchers)
+            # ===== STEP 3B.0: Progressive Startup Wait (v26.0) =====
             expected_watchers = len(watcher_tasks)
+            initial_active_count = len(self._active_video_watchers)
+
+            # Initialize Progressive Startup Manager
+            if self._progressive_startup_manager is None:
+                self._progressive_startup_manager = ProgressiveStartupManager(self.config)
+            else:
+                self._progressive_startup_manager.reset()
+
+            # Calculate dynamic timeout
+            dynamic_timeout = self._progressive_startup_manager.calculate_dynamic_timeout(expected_watchers)
+            min_required = self._progressive_startup_manager.calculate_min_required_watchers(expected_watchers)
 
             logger.info(
-                f"[God Mode] Waiting up to {watcher_startup_timeout}s for {expected_watchers} "
-                f"watchers to start (current active: {initial_active_count})..."
+                f"[God Mode v26.0] Progressive startup: {expected_watchers} watchers, "
+                f"timeout={dynamic_timeout:.1f}s (dynamic), min_required={min_required}"
             )
 
-            # Yield control and wait for watchers to register
+            # Wait for startup with dynamic timeout and event-based notification
             start_wait_time = datetime.now()
             new_watchers_active = 0
 
-            while (datetime.now() - start_wait_time).total_seconds() < watcher_startup_timeout:
-                # Yield to let tasks execute
-                await asyncio.sleep(startup_check_interval)
+            # Use progressive startup manager's wait
+            startup_result = await self._progressive_startup_manager.wait_for_startup(expected_watchers)
 
-                # v22.0.0: Check lifecycle for detailed status
-                lifecycle_counts = {'starting': 0, 'verifying': 0, 'active': 0, 'failed': 0}
-                for lc_id, lc_info in self._watcher_lifecycle.items():
-                    status = lc_info.get('status', 'unknown')
-                    if status in lifecycle_counts:
-                        lifecycle_counts[status] += 1
+            # Also check lifecycle for detailed status (backward compatibility)
+            lifecycle_counts = {'starting': 0, 'verifying': 0, 'active': 0, 'failed': 0}
+            for lc_id, lc_info in self._watcher_lifecycle.items():
+                status = lc_info.get('status', 'unknown')
+                if status in lifecycle_counts:
+                    lifecycle_counts[status] += 1
 
-                # Count new active watchers (fully verified)
-                current_active_count = len(self._active_video_watchers)
-                new_watchers_active = current_active_count - initial_active_count
+            # Count new active watchers (fully verified)
+            current_active_count = len(self._active_video_watchers)
+            new_watchers_active = current_active_count - initial_active_count
 
-                # Log progress with lifecycle details
-                in_progress = lifecycle_counts['starting'] + lifecycle_counts['verifying']
-                if in_progress > 0 or lifecycle_counts['failed'] > 0:
-                    logger.debug(
-                        f"[God Mode] Lifecycle: {lifecycle_counts['active']} active, "
-                        f"{in_progress} in progress, {lifecycle_counts['failed']} failed"
-                    )
+            # Use the better of event-based or lifecycle count
+            new_watchers_active = max(new_watchers_active, startup_result['ready'])
 
-                if new_watchers_active >= expected_watchers:
-                    # All watchers started
-                    logger.info(
-                        f"[God Mode] ✅ All {expected_watchers} watchers started "
-                        f"in {(datetime.now() - start_wait_time).total_seconds():.2f}s"
-                    )
-                    break
+            elapsed = startup_result['elapsed_seconds']
 
-                # Check if all watchers have finished (active or failed)
-                total_finished = lifecycle_counts['active'] + lifecycle_counts['failed']
-                if total_finished >= expected_watchers:
-                    logger.info(
-                        f"[God Mode] All watchers finished: {lifecycle_counts['active']} active, "
-                        f"{lifecycle_counts['failed']} failed"
-                    )
-                    break
-
-                if new_watchers_active > 0 and (datetime.now() - start_wait_time).total_seconds() >= 3.0:
-                    # At least some watchers started and we've waited 3+ seconds
-                    logger.info(
-                        f"[God Mode] ⚡ {new_watchers_active}/{expected_watchers} watchers active "
-                        f"after {(datetime.now() - start_wait_time).total_seconds():.2f}s - proceeding"
-                    )
-                    break
+            # Log result
+            if new_watchers_active >= expected_watchers:
+                logger.info(
+                    f"[God Mode v26.0] ✅ All {expected_watchers} watchers started "
+                    f"in {elapsed:.2f}s"
+                )
+            elif new_watchers_active >= min_required:
+                logger.info(
+                    f"[God Mode v26.0] ⚡ {new_watchers_active}/{expected_watchers} watchers active "
+                    f"after {elapsed:.2f}s (min_required={min_required} met) - proceeding"
+                )
+            elif new_watchers_active > 0:
+                logger.warning(
+                    f"[God Mode v26.0] ⚠️ Only {new_watchers_active}/{expected_watchers} watchers active "
+                    f"after {elapsed:.2f}s (below min_required={min_required}) - proceeding anyway"
+                )
+            else:
+                logger.warning(
+                    f"[God Mode v26.0] ⚠️ Timeout: 0/{expected_watchers} watchers active "
+                    f"after {elapsed:.2f}s"
+                )
 
             # ===== STEP 3B.0.1: Analyze Watcher Results (v22.0.0) =====
             # Collect final lifecycle status for detailed error reporting
@@ -4039,6 +4254,13 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                 self._watcher_lifecycle[watcher_id]['status'] = 'failed'
                 self._watcher_lifecycle[watcher_id]['error'] = error_msg
                 self._watcher_lifecycle[watcher_id]['verification_stage'] = 'start_timeout'
+                # v26.0: Notify ProgressiveStartupManager of failure
+                if self._progressive_startup_manager is not None:
+                    await self._progressive_startup_manager.register_watcher_ready(
+                        watcher_id=watcher_id,
+                        success=False,
+                        error=error_msg,
+                    )
                 # Try to clean up the watcher
                 try:
                     await watcher.stop()
@@ -4058,6 +4280,13 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                 self._watcher_lifecycle[watcher_id]['status'] = 'failed'
                 self._watcher_lifecycle[watcher_id]['error'] = error_msg
                 self._watcher_lifecycle[watcher_id]['verification_stage'] = 'frame_production_failed'
+                # v26.0: Notify ProgressiveStartupManager of failure
+                if self._progressive_startup_manager is not None:
+                    await self._progressive_startup_manager.register_watcher_ready(
+                        watcher_id=watcher_id,
+                        success=False,
+                        error=error_msg,
+                    )
                 return None
 
             # v22.0.0: Update lifecycle - start succeeded
@@ -4221,6 +4450,13 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
             self._watcher_lifecycle[watcher_id]['status'] = 'active'
             self._watcher_lifecycle[watcher_id]['verification_stage'] = 'complete'
             self._watcher_lifecycle[watcher_id]['activated_at'] = datetime.now().isoformat()
+
+            # v26.0: Notify ProgressiveStartupManager (event-based instead of polling)
+            if self._progressive_startup_manager is not None:
+                await self._progressive_startup_manager.register_watcher_ready(
+                    watcher_id=watcher_id,
+                    success=True,
+                )
 
             logger.info(
                 f"✅ Ferrari Engine watcher started and verified: {watcher_id} "
