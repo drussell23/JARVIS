@@ -1699,28 +1699,38 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
         logger.debug("[God Mode] Cleared watcher lifecycle tracker for new session")
 
         # =====================================================================
-        # v30.0: PROACTIVE YABAI PERMISSION CHECK
+        # v30.1: FAST PROACTIVE YABAI PERMISSION CHECK
         # =====================================================================
         # ROOT CAUSE FIX: Detect missing accessibility permissions BEFORE
         # attempting any window operations. This is the "smoking gun" behind
         # silent failures - yabai can query but not control windows.
         #
-        # By checking upfront, we can:
-        # 1. Fail fast with clear error message
-        # 2. Open accessibility settings automatically
-        # 3. Give user actionable fix instructions
+        # v30.1 CRITICAL: Check MUST complete in <2 seconds to avoid
+        # "Processing..." hang. Uses timeout wrapper for safety.
         # =====================================================================
+        PERMISSION_CHECK_TIMEOUT = 2.0  # Maximum time for permission check
+
         try:
             from backend.vision.yabai_space_detector import (
                 ensure_yabai_permissions,
                 check_yabai_permissions,
             )
 
-            # Check permissions with detailed diagnostics
-            perm_ok, perm_error = await ensure_yabai_permissions(
-                auto_open_settings=False,  # Don't auto-open, just detect
-                narrate_issues=True
-            )
+            # Check permissions with timeout wrapper
+            try:
+                perm_ok, perm_error = await asyncio.wait_for(
+                    ensure_yabai_permissions(
+                        auto_open_settings=False,  # Don't auto-open, just detect
+                        narrate_issues=True
+                    ),
+                    timeout=PERMISSION_CHECK_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                # Permission check timed out - log warning but continue
+                logger.warning(
+                    f"[God Mode v30.1] Permission check timed out after {PERMISSION_CHECK_TIMEOUT}s - continuing"
+                )
+                perm_ok, perm_error = True, None  # Assume OK and let operations fail naturally
 
             if not perm_ok and perm_error:
                 # Log the detailed error
