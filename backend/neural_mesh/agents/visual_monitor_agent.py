@@ -1732,6 +1732,20 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                         f"Stopping {watcher_count} watchers..."
                     )
                     await self._stop_all_watchers()
+
+                    # v16.1: Narrate connection error to user
+                    if self.config.working_out_loud_enabled:
+                        try:
+                            await self._narrate_working_out_loud(
+                                message=f"Connection lost while monitoring {app_name}. "
+                                        f"Monitoring stopped. Please try again.",
+                                narration_type="error",
+                                watcher_id=god_mode_task_id,
+                                priority="high"
+                            )
+                        except Exception:
+                            pass  # Don't let narration failure mask the real error
+
                     return {
                         'status': 'connection_error',
                         'error': f"Connection lost: {str(e)}",
@@ -1746,6 +1760,19 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                         f"Stopping {watcher_count} watchers..."
                     )
                     await self._stop_all_watchers()
+
+                    # v16.1: Narrate cancellation to user
+                    if self.config.working_out_loud_enabled:
+                        try:
+                            await self._narrate_working_out_loud(
+                                message=f"Monitoring of {app_name} stopped as requested.",
+                                narration_type="activity",
+                                watcher_id=god_mode_task_id,
+                                priority="normal"
+                            )
+                        except Exception:
+                            pass
+
                     # Re-raise to properly propagate cancellation
                     raise
 
@@ -1757,6 +1784,20 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                         exc_info=True
                     )
                     await self._stop_all_watchers()
+
+                    # v16.1: Narrate OS error to user
+                    if self.config.working_out_loud_enabled:
+                        try:
+                            await self._narrate_working_out_loud(
+                                message=f"A system error occurred while monitoring {app_name}. "
+                                        f"Monitoring stopped.",
+                                narration_type="error",
+                                watcher_id=god_mode_task_id,
+                                priority="high"
+                            )
+                        except Exception:
+                            pass
+
                     return {
                         'status': 'os_error',
                         'error': f"OS error: {str(e)}",
@@ -1772,6 +1813,20 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                         exc_info=True  # Full stack trace for debugging
                     )
                     await self._stop_all_watchers()
+
+                    # v16.1: Narrate unexpected error to user
+                    if self.config.working_out_loud_enabled:
+                        try:
+                            await self._narrate_working_out_loud(
+                                message=f"An unexpected error occurred while monitoring {app_name}. "
+                                        f"Monitoring stopped. Error: {type(e).__name__}",
+                                narration_type="error",
+                                watcher_id=god_mode_task_id,
+                                priority="high"
+                            )
+                        except Exception:
+                            pass
+
                     return {
                         'status': 'error',
                         'error': str(e),
@@ -2066,6 +2121,66 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                     'trigger_detected': False
                 }
 
+            # =====================================================================
+            # ROOT CAUSE FIX v16.1: Verify Watcher Is Actually Running
+            # =====================================================================
+            # PROBLEM: Watcher object created but stream may not be active
+            # - watcher.start() may have failed silently
+            # - Stream may have disconnected immediately
+            # - Permission dialogs may have blocked capture
+            #
+            # SOLUTION: Check watcher status before proceeding
+            # =====================================================================
+            watcher_is_running = False
+            try:
+                # Check multiple indicators of watcher health
+                if hasattr(watcher, 'is_running'):
+                    watcher_is_running = watcher.is_running()
+                elif hasattr(watcher, 'running'):
+                    watcher_is_running = watcher.running
+                elif hasattr(watcher, '_running'):
+                    watcher_is_running = watcher._running
+                else:
+                    # No status method - assume running if watcher object exists
+                    watcher_is_running = True
+                    logger.debug(f"[{watcher_id}] No is_running method - assuming active")
+            except Exception as e:
+                logger.warning(f"[{watcher_id}] Could not check watcher status: {e}")
+                watcher_is_running = True  # Optimistic - proceed and let monitoring reveal issues
+
+            if not watcher_is_running:
+                logger.error(f"❌ [{watcher_id}] Watcher created but NOT running - stream failed to start")
+
+                # Attempt cleanup
+                try:
+                    if hasattr(watcher, 'stop'):
+                        await watcher.stop()
+                except Exception:
+                    pass
+
+                # Narrate error to user
+                if self.config.working_out_loud_enabled:
+                    try:
+                        await self._narrate_working_out_loud(
+                            message=f"Watcher for {app_name} on space {space_id} failed to start. "
+                                    f"Check screen recording permissions.",
+                            narration_type="error",
+                            watcher_id=watcher_id,
+                            priority="high"
+                        )
+                    except Exception as e:
+                        logger.warning(f"Error narration failed: {e}")
+
+                return {
+                    'status': 'error',
+                    'error': 'Watcher failed to start - stream not running',
+                    'watcher_id': watcher_id,
+                    'space_id': space_id,
+                    'window_id': window_id,
+                    'trigger_detected': False,
+                    'suggestion': 'Check System Preferences > Security & Privacy > Screen Recording'
+                }
+
             logger.info(f"✅ [{watcher_id}] Ferrari Engine watcher active (60 FPS GPU capture)")
 
             # ===== STEP 2: Convert action_config dict to ActionConfig if provided =====
@@ -2348,11 +2463,52 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
         """
         if all_spaces and self.config.multi_space_enabled:
             logger.info(f"🌌 God Mode: Watching ALL {app_name} windows across all spaces")
-            return await self.watch_app_across_all_spaces(
+
+            result = await self.watch_app_across_all_spaces(
                 app_name=app_name,
                 trigger_text=trigger_text,
                 **kwargs
             )
+
+            # =====================================================================
+            # ROOT CAUSE FIX v16.1: Verify God Mode Result Before Returning
+            # =====================================================================
+            # PROBLEM: watch_app_across_all_spaces may return error status but
+            # caller doesn't check - assumes success
+            #
+            # SOLUTION: Check result status and provide clear success/failure info
+            # =====================================================================
+            if result.get('status') == 'error' or result.get('success') is False:
+                # God Mode failed - ensure caller knows
+                logger.error(
+                    f"❌ God Mode failed for {app_name}: {result.get('error', 'Unknown error')}"
+                )
+                return {
+                    'success': False,
+                    'status': 'error',
+                    'error': result.get('error', 'God Mode failed to start'),
+                    'total_watchers': result.get('total_watchers', 0),
+                    'expected_watchers': result.get('expected_watchers', 0),
+                    'app_name': app_name,
+                    'trigger_text': trigger_text,
+                    'suggestion': result.get('suggestion', 'Check that the app is open and try again')
+                }
+
+            # God Mode started successfully
+            logger.info(
+                f"✅ God Mode active: {result.get('total_watchers', 0)} watchers monitoring "
+                f"'{trigger_text}' in {app_name}"
+            )
+            return {
+                'success': True,
+                'status': result.get('status', 'monitoring'),
+                'total_watchers': result.get('total_watchers', 0),
+                'expected_watchers': result.get('expected_watchers', 0),
+                'god_mode_task_id': result.get('god_mode_task_id'),
+                'message': result.get('message', f"Monitoring {app_name} for '{trigger_text}'"),
+                'startup_time_seconds': result.get('startup_time_seconds', 0),
+                'spaces_monitored': result.get('spaces_monitored', [])
+            }
         else:
             if all_spaces and not self.config.multi_space_enabled:
                 logger.warning("God Mode disabled in config - using single-window mode")
