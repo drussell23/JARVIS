@@ -1,6 +1,6 @@
 """
-JARVIS Neural Mesh - Visual Monitor Agent v14.0
-===============================================
+JARVIS Neural Mesh - Visual Monitor Agent v14.0 (v28.2 Window Validation)
+==========================================================================
 
 The "Watcher & Actor" of Video Multi-Space Intelligence (VMSI) - Ferrari Engine Edition.
 
@@ -16,6 +16,14 @@ This agent provides GPU-ACCELERATED visual surveillance capabilities:
 - Share state across repos (JARVIS ↔ JARVIS Prime ↔ Reactor Core)
 - 👻 Ghost Hands: Cross-space actions without focus stealing (v13.0)
 - 🗣️ Working Out Loud: Real-time narration during monitoring (v14.0)
+
+v28.2 SMART WINDOW CACHE - ROBUST YABAI VALIDATION:
+- ROOT CAUSE FIX: "Window not found" validation failure
+- PROBLEM: yabai's `--window <id>` query fails for windows not fully indexed
+- SOLUTION: Query ALL windows from yabai, build cache, filter by ID
+- Graceful fallback: Skip yabai checks for unknown windows, use frame capture test
+- Cache with TTL: Efficient repeated queries without hammering yabai
+- Thread-safe: Async lock for concurrent cache updates
 
 v14.0 WORKING OUT LOUD - TRANSPARENT CO-PILOT MODE:
 - Heartbeat narration: Regular status updates during monitoring
@@ -817,6 +825,18 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
 
         # v14.0: "Working Out Loud" - Narration state per watcher
         self._narration_states: Dict[str, NarrationState] = {}
+
+        # v28.2: Smart Window Cache - Robust yabai Window Query System
+        # =====================================================================
+        # ROOT CAUSE FIX: "Window not found" validation failure
+        # PROBLEM: yabai's `--window <id>` query fails for windows that exist
+        #          but aren't fully indexed, or when using CGWindowID vs yabai ID
+        # SOLUTION: Query ALL windows, build lookup cache, filter by ID
+        # =====================================================================
+        self._yabai_windows_cache: Dict[int, Dict[str, Any]] = {}  # window_id -> window_info
+        self._yabai_cache_timestamp: float = 0.0  # When cache was last populated
+        self._yabai_cache_ttl: float = 2.0  # Cache TTL in seconds (windows change fast)
+        self._yabai_cache_lock: Optional[asyncio.Lock] = None  # Thread-safe cache updates
 
     # =========================================================================
     # Helper Methods for Non-Blocking Initialization
@@ -4244,73 +4264,88 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
             current_space = None
             is_minimized = False
 
+            # v28.2: Track if yabai checks should be skipped for this window
+            skip_yabai_checks = False
+
             if has_yabai and yabai:
                 try:
                     # Query window info directly from yabai
                     window_info = await self._query_window_info_async(window_id)
 
                     if window_info is None:
-                        if attempt < max_retries - 1:
-                            await asyncio.sleep(retry_delay_ms / 1000.0)
-                            continue
-                        validation_details['checks_failed'].append('window_exists')
-                        return (
-                            False,
-                            f"Window {window_id} not found (may have been closed)",
-                            validation_details
-                        )
-
-                    current_space = window_info.get('space')
-                    is_minimized = window_info.get('is-minimized', False)
-
-                    # Check 3: Is window minimized?
-                    if is_minimized:
-                        # Try to unminimize
-                        try:
-                            unminimize_result = await asyncio.wait_for(
-                                asyncio.to_thread(
-                                    lambda: os.system(f'/opt/homebrew/bin/yabai -m window {window_id} --deminimize')
-                                ),
-                                timeout=2.0
+                        # v28.2: Yabai doesn't know this window, but ScreenCaptureKit might
+                        # This can happen for:
+                        # 1. Windows yabai hasn't indexed yet
+                        # 2. System UI windows not managed by yabai
+                        # 3. Certain app windows (e.g., some Chrome windows)
+                        #
+                        # Instead of failing, skip yabai checks and try frame capture directly
+                        if attempt == 0:
+                            logger.debug(
+                                f"[Validation] Window {window_id} not in yabai cache - "
+                                f"will try frame capture directly (yabai may not track this window)"
                             )
-                            # Re-check after unminimize
-                            await asyncio.sleep(0.1)
-                            window_info = await self._query_window_info_async(window_id)
-                            is_minimized = window_info.get('is-minimized', False) if window_info else True
-                        except Exception as e:
-                            logger.debug(f"[Validation] Unminimize failed: {e}")
+                        validation_details['yabai_status'] = 'not_found_but_may_be_capturable'
+                        # Skip remaining yabai checks, proceed to frame capture test
+                        skip_yabai_checks = True
+                    else:
+                        current_space = window_info.get('space')
+                        is_minimized = window_info.get('is-minimized', False)
+                        validation_details['checks_passed'].append('window_exists')
 
+                    # v28.2: Skip yabai-specific checks if window wasn't found in yabai
+                    if not skip_yabai_checks:
+                        # Check 3: Is window minimized?
                         if is_minimized:
-                            validation_details['checks_failed'].append('not_minimized')
-                            return (
-                                False,
-                                f"Window {window_id} is minimized (ScreenCaptureKit cannot capture minimized windows)",
-                                validation_details
-                            )
-
-                    validation_details['checks_passed'].append('not_minimized')
-
-                    # Check 4: Is window on visible space?
-                    if ghost_space is not None:
-                        if current_space != ghost_space:
-                            # Window not on Ghost Display - may still be moving
-                            if attempt < max_retries - 1:
-                                logger.debug(
-                                    f"[Validation] Window {window_id} on space {current_space}, "
-                                    f"expected {ghost_space} - retry {attempt + 1}/{max_retries}"
+                            # Try to unminimize
+                            try:
+                                unminimize_result = await asyncio.wait_for(
+                                    asyncio.to_thread(
+                                        lambda: os.system(f'/opt/homebrew/bin/yabai -m window {window_id} --deminimize')
+                                    ),
+                                    timeout=2.0
                                 )
-                                await asyncio.sleep(retry_delay_ms / 1000.0)
-                                continue
+                                # Re-check after unminimize
+                                await asyncio.sleep(0.1)
+                                window_info = await self._query_window_info_async(window_id)
+                                is_minimized = window_info.get('is-minimized', False) if window_info else True
+                            except Exception as e:
+                                logger.debug(f"[Validation] Unminimize failed: {e}")
 
-                            validation_details['checks_failed'].append('on_visible_space')
-                            return (
-                                False,
-                                f"Window {window_id} still on space {current_space} "
-                                f"(expected Ghost Display space {ghost_space}) - teleportation may have failed",
-                                validation_details
-                            )
+                            if is_minimized:
+                                validation_details['checks_failed'].append('not_minimized')
+                                return (
+                                    False,
+                                    f"Window {window_id} is minimized (ScreenCaptureKit cannot capture minimized windows)",
+                                    validation_details
+                                )
 
-                    validation_details['checks_passed'].append('on_visible_space')
+                        validation_details['checks_passed'].append('not_minimized')
+
+                        # Check 4: Is window on visible space?
+                        if ghost_space is not None:
+                            if current_space != ghost_space:
+                                # Window not on Ghost Display - may still be moving
+                                if attempt < max_retries - 1:
+                                    logger.debug(
+                                        f"[Validation] Window {window_id} on space {current_space}, "
+                                        f"expected {ghost_space} - retry {attempt + 1}/{max_retries}"
+                                    )
+                                    await asyncio.sleep(retry_delay_ms / 1000.0)
+                                    continue
+
+                                validation_details['checks_failed'].append('on_visible_space')
+                                return (
+                                    False,
+                                    f"Window {window_id} still on space {current_space} "
+                                    f"(expected Ghost Display space {ghost_space}) - teleportation may have failed",
+                                    validation_details
+                                )
+
+                        validation_details['checks_passed'].append('on_visible_space')
+                    else:
+                        # v28.2: Yabai doesn't know this window, skip minimized/space checks
+                        validation_details['skipped_checks'] = ['not_minimized', 'on_visible_space']
 
                 except asyncio.TimeoutError:
                     logger.debug(f"[Validation] Yabai query timed out for window {window_id}")
@@ -4370,16 +4405,107 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
             validation_details
         )
 
-    async def _query_window_info_async(self, window_id: int) -> Optional[Dict[str, Any]]:
+    async def _refresh_yabai_windows_cache(self, force: bool = False) -> bool:
         """
-        Query window info from yabai asynchronously.
+        v28.2: Refresh the yabai windows cache by querying ALL windows.
+
+        ROOT CAUSE FIX: yabai's `--window <id>` query can fail for windows
+        that exist but aren't fully indexed. Querying ALL windows and filtering
+        is more reliable.
 
         Args:
-            window_id: Window ID to query
+            force: If True, refresh even if cache is still valid
+
+        Returns:
+            True if cache was refreshed successfully, False otherwise
+        """
+        import time
+
+        # Initialize lock if needed (lazy init for thread safety)
+        if self._yabai_cache_lock is None:
+            self._yabai_cache_lock = asyncio.Lock()
+
+        current_time = time.time()
+
+        # Check if cache is still valid
+        if not force and (current_time - self._yabai_cache_timestamp) < self._yabai_cache_ttl:
+            return True  # Cache is still valid
+
+        async with self._yabai_cache_lock:
+            # Double-check after acquiring lock (another task might have refreshed)
+            if not force and (current_time - self._yabai_cache_timestamp) < self._yabai_cache_ttl:
+                return True
+
+            try:
+                # Query ALL windows from yabai (robust approach)
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        lambda: subprocess.run(
+                            ['/opt/homebrew/bin/yabai', '-m', 'query', '--windows'],
+                            capture_output=True,
+                            text=True,
+                            timeout=3
+                        )
+                    ),
+                    timeout=5.0
+                )
+
+                if result.returncode != 0 or not result.stdout:
+                    logger.debug(f"[WindowCache] Yabai query failed: {result.stderr}")
+                    return False
+
+                windows_list = json.loads(result.stdout)
+
+                # Build lookup cache by window ID
+                new_cache: Dict[int, Dict[str, Any]] = {}
+                for window in windows_list:
+                    wid = window.get("id")
+                    if wid is not None:
+                        new_cache[wid] = window
+
+                self._yabai_windows_cache = new_cache
+                self._yabai_cache_timestamp = current_time
+
+                logger.debug(f"[WindowCache] Refreshed cache with {len(new_cache)} windows")
+                return True
+
+            except asyncio.TimeoutError:
+                logger.debug("[WindowCache] Yabai query timed out")
+                return False
+            except json.JSONDecodeError as e:
+                logger.debug(f"[WindowCache] JSON parse error: {e}")
+                return False
+            except Exception as e:
+                logger.debug(f"[WindowCache] Cache refresh failed: {e}")
+                return False
+
+    async def _query_window_info_async(self, window_id: int) -> Optional[Dict[str, Any]]:
+        """
+        v28.2: Query window info from yabai asynchronously using smart cache.
+
+        ROOT CAUSE FIX: Previous implementation used `--window <id>` which fails
+        for windows not fully indexed by yabai. New approach queries ALL windows
+        and filters by ID, with intelligent caching.
+
+        Args:
+            window_id: Window ID to query (CGWindowID from ScreenCaptureKit)
 
         Returns:
             Window info dict or None if not found
         """
+        # First, try from cache
+        if window_id in self._yabai_windows_cache:
+            # Cache hit - verify it's not stale
+            import time
+            if (time.time() - self._yabai_cache_timestamp) < self._yabai_cache_ttl:
+                return self._yabai_windows_cache[window_id]
+
+        # Cache miss or stale - refresh cache
+        if await self._refresh_yabai_windows_cache():
+            # Try again from refreshed cache
+            return self._yabai_windows_cache.get(window_id)
+
+        # Yabai unavailable - try direct query as fallback
         try:
             result = await asyncio.wait_for(
                 asyncio.to_thread(
@@ -4394,12 +4520,44 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
             )
 
             if result.returncode == 0 and result.stdout:
-                return json.loads(result.stdout)
-            return None
+                window_info = json.loads(result.stdout)
+                # Cache this result
+                self._yabai_windows_cache[window_id] = window_info
+                return window_info
 
         except Exception as e:
-            logger.debug(f"[Validation] Window query failed: {e}")
-            return None
+            logger.debug(f"[Validation] Window query fallback failed: {e}")
+
+        return None
+
+    async def _query_windows_batch_async(
+        self,
+        window_ids: List[int]
+    ) -> Dict[int, Optional[Dict[str, Any]]]:
+        """
+        v28.2: Query multiple windows efficiently using cache.
+
+        More efficient than calling _query_window_info_async multiple times
+        because it refreshes the cache once and looks up all windows.
+
+        Args:
+            window_ids: List of window IDs to query
+
+        Returns:
+            Dict mapping window_id to window_info (or None if not found)
+        """
+        # Refresh cache once
+        await self._refresh_yabai_windows_cache(force=True)
+
+        # Look up all windows from cache
+        results: Dict[int, Optional[Dict[str, Any]]] = {}
+        for wid in window_ids:
+            results[wid] = self._yabai_windows_cache.get(wid)
+
+        found = sum(1 for v in results.values() if v is not None)
+        logger.debug(f"[WindowCache] Batch query: {found}/{len(window_ids)} windows found")
+
+        return results
 
     async def _validate_windows_batch(
         self,
