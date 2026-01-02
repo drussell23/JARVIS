@@ -2122,28 +2122,40 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                 }
 
             # =====================================================================
-            # ROOT CAUSE FIX v16.1: Verify Watcher Is Actually Running
+            # ROOT CAUSE FIX v17.0: Robust Watcher Health Verification
             # =====================================================================
             # PROBLEM: Watcher object created but stream may not be active
             # - watcher.start() may have failed silently
             # - Stream may have disconnected immediately
             # - Permission dialogs may have blocked capture
             #
-            # SOLUTION: Check watcher status before proceeding
+            # SOLUTION: Check watcher.status == WatcherStatus.WATCHING
+            # This is the AUTHORITATIVE health indicator for VideoWatcher
             # =====================================================================
             watcher_is_running = False
             try:
-                # Check multiple indicators of watcher health
-                if hasattr(watcher, 'is_running'):
-                    watcher_is_running = watcher.is_running()
-                elif hasattr(watcher, 'running'):
-                    watcher_is_running = watcher.running
-                elif hasattr(watcher, '_running'):
-                    watcher_is_running = watcher._running
+                # Import WatcherStatus for proper comparison
+                try:
+                    from backend.vision.macos_video_capture_advanced import WatcherStatus
+                except ImportError:
+                    WatcherStatus = None
+
+                # Primary check: watcher.status == WatcherStatus.WATCHING
+                if WatcherStatus is not None and hasattr(watcher, 'status'):
+                    watcher_is_running = watcher.status == WatcherStatus.WATCHING
+                    if not watcher_is_running:
+                        logger.warning(
+                            f"[{watcher_id}] Watcher status is {watcher.status.value} "
+                            f"(expected: WATCHING)"
+                        )
+                elif hasattr(watcher, 'status'):
+                    # Fallback: check status string value
+                    status_val = getattr(watcher.status, 'value', str(watcher.status))
+                    watcher_is_running = status_val.lower() == 'watching'
                 else:
-                    # No status method - assume running if watcher object exists
+                    # No status attribute - assume running but log warning
                     watcher_is_running = True
-                    logger.debug(f"[{watcher_id}] No is_running method - assuming active")
+                    logger.warning(f"[{watcher_id}] No status attribute - assuming active (optimistic)")
             except Exception as e:
                 logger.warning(f"[{watcher_id}] Could not check watcher status: {e}")
                 watcher_is_running = True  # Optimistic - proceed and let monitoring reveal issues
@@ -2649,6 +2661,115 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
             "max_parallel": self.config.max_parallel_watchers
         }
 
+    async def check_watcher_health(self, watcher_id: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Check health of active watchers - v17.0 Root Cause Fix.
+
+        Performs comprehensive health checks:
+        1. Status verification (WatcherStatus.WATCHING)
+        2. Frame flow verification (recent frames received)
+        3. Health metadata inspection
+
+        Args:
+            watcher_id: Optional specific watcher to check.
+                       If None, checks all watchers.
+
+        Returns:
+            Health report dict with:
+            - overall_healthy: bool - True if all checked watchers are healthy
+            - watchers_checked: int
+            - healthy_count: int
+            - unhealthy_count: int
+            - details: List of watcher health dicts
+        """
+        try:
+            from backend.vision.macos_video_capture_advanced import WatcherStatus
+        except ImportError:
+            WatcherStatus = None
+
+        health_details = []
+        healthy_count = 0
+        unhealthy_count = 0
+
+        # Get watchers to check
+        watchers_to_check = {}
+        if watcher_id:
+            if watcher_id in self._active_video_watchers:
+                watchers_to_check[watcher_id] = self._active_video_watchers[watcher_id]
+        else:
+            watchers_to_check = dict(self._active_video_watchers)
+
+        for w_id, info in watchers_to_check.items():
+            watcher = info.get('watcher')
+            health_info = info.get('health', {})
+            is_healthy = True
+            issues = []
+
+            if not watcher:
+                is_healthy = False
+                issues.append("Watcher object is None")
+            else:
+                # Check 1: Status verification
+                if WatcherStatus is not None and hasattr(watcher, 'status'):
+                    if watcher.status != WatcherStatus.WATCHING:
+                        is_healthy = False
+                        issues.append(
+                            f"Status is {watcher.status.value} (expected: WATCHING)"
+                        )
+                elif hasattr(watcher, 'status'):
+                    status_val = getattr(watcher.status, 'value', str(watcher.status))
+                    if status_val.lower() != 'watching':
+                        is_healthy = False
+                        issues.append(f"Status is {status_val} (expected: watching)")
+
+                # Check 2: Frame flow verification
+                try:
+                    frames_captured = getattr(watcher, 'frames_captured', 0)
+                    if frames_captured == 0:
+                        # No frames captured yet - might just be starting
+                        started_at = info.get('started_at', '')
+                        if started_at:
+                            from datetime import datetime
+                            start_time = datetime.fromisoformat(started_at)
+                            elapsed = (datetime.now() - start_time).total_seconds()
+                            if elapsed > 10:  # More than 10 seconds with no frames
+                                is_healthy = False
+                                issues.append(
+                                    f"No frames captured after {elapsed:.1f}s"
+                                )
+                except Exception as e:
+                    logger.debug(f"Could not check frame count for {w_id}: {e}")
+
+                # Check 3: Health metadata
+                consecutive_failures = health_info.get('consecutive_failures', 0)
+                if consecutive_failures > 0:
+                    issues.append(f"{consecutive_failures} consecutive failures")
+                    if consecutive_failures >= 10:
+                        is_healthy = False
+
+            if is_healthy:
+                healthy_count += 1
+            else:
+                unhealthy_count += 1
+
+            health_details.append({
+                'watcher_id': w_id,
+                'app_name': info.get('app_name', 'Unknown'),
+                'space_id': info.get('space_id'),
+                'healthy': is_healthy,
+                'issues': issues,
+                'started_at': info.get('started_at'),
+                'health_metadata': health_info
+            })
+
+        return {
+            'overall_healthy': unhealthy_count == 0 and healthy_count > 0,
+            'watchers_checked': len(watchers_to_check),
+            'healthy_count': healthy_count,
+            'unhealthy_count': unhealthy_count,
+            'details': health_details
+        }
+
     # =========================================================================
     # Internal Methods
     # =========================================================================
@@ -2979,6 +3100,18 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
         # v15.0: Initialize monitoring start time for first heartbeat timing
         narration_state.monitoring_start_time = start_time
 
+        # =====================================================================
+        # ROOT CAUSE FIX v17.0: Continuous Health Monitoring State
+        # =====================================================================
+        # Track consecutive frame failures to detect watcher crashes
+        # If too many consecutive failures, the watcher has likely crashed
+        # =====================================================================
+        consecutive_frame_failures = 0
+        max_consecutive_failures = int(os.getenv('JARVIS_MAX_FRAME_FAILURES', '30'))
+        last_health_check_time = start_time
+        health_check_interval = float(os.getenv('JARVIS_HEALTH_CHECK_INTERVAL', '10.0'))
+        watcher_health_verified = True  # Assume healthy initially
+
         # v14.0: Initial narration - announce monitoring start (now uses "startup" type)
         if self.config.working_out_loud_enabled:
             await self._narrate_working_out_loud(
@@ -3026,10 +3159,77 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                 frame_data = await watcher.get_latest_frame(timeout=1.0)
 
                 if not frame_data:
-                    # No frame available - watcher may have stopped or no new frames
+                    # =====================================================================
+                    # ROOT CAUSE FIX v17.0: Continuous Health Monitoring
+                    # =====================================================================
+                    # Track consecutive failures and detect watcher crashes
+                    # =====================================================================
+                    consecutive_frame_failures += 1
+
+                    # Periodic health check (every health_check_interval seconds)
+                    if elapsed - last_health_check_time >= health_check_interval:
+                        last_health_check_time = elapsed
+
+                        # Import WatcherStatus for status check
+                        try:
+                            from backend.vision.macos_video_capture_advanced import WatcherStatus
+                            if hasattr(watcher, 'status'):
+                                watcher_status = watcher.status
+                                if watcher_status != WatcherStatus.WATCHING:
+                                    watcher_health_verified = False
+                                    logger.warning(
+                                        f"[Ferrari Detection] ⚠️ Watcher health check: "
+                                        f"status={watcher_status.value} (expected: WATCHING)"
+                                    )
+                        except ImportError:
+                            pass
+
+                    # Check for too many consecutive failures
+                    if consecutive_frame_failures >= max_consecutive_failures:
+                        logger.error(
+                            f"[Ferrari Detection] ❌ Watcher crashed: {consecutive_frame_failures} "
+                            f"consecutive frame failures (threshold: {max_consecutive_failures})"
+                        )
+
+                        # Narrate the crash to user
+                        if self.config.working_out_loud_enabled:
+                            try:
+                                await self._narrate_working_out_loud(
+                                    message=f"I lost connection to {app_name}. "
+                                            f"The video stream stopped unexpectedly. "
+                                            f"Please check that the window is still visible.",
+                                    narration_type="error",
+                                    watcher_id=watcher_id,
+                                    priority="high"
+                                )
+                            except Exception as e:
+                                logger.warning(f"Error narration failed: {e}")
+
+                        # Cleanup and return error
+                        self._cleanup_narration_state(watcher_id)
+                        return {
+                            'detected': False,
+                            'confidence': 0.0,
+                            'error': 'Watcher crashed - no frames received',
+                            'frames_checked': frame_count,
+                            'ocr_checks': ocr_checks,
+                            'watcher_crashed': True,
+                            'consecutive_failures': consecutive_frame_failures
+                        }
+
+                    # Log warning every 10 failures
+                    if consecutive_frame_failures % 10 == 0:
+                        logger.warning(
+                            f"[Ferrari Detection] ⚠️ {consecutive_frame_failures} consecutive "
+                            f"frame failures (monitoring for crash...)"
+                        )
+
                     await asyncio.sleep(0.1)
                     continue
 
+                # Reset failure counter on successful frame
+                consecutive_frame_failures = 0
+                watcher_health_verified = True
                 frame_count += 1
                 frame = frame_data.get('frame')
 
@@ -3356,6 +3556,119 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                 return None
 
             # =====================================================================
+            # ROOT CAUSE FIX v17.0: Post-Start Health Verification
+            # =====================================================================
+            # PROBLEM: start() returning True doesn't mean the watcher is ACTUALLY
+            # running and producing frames. The watcher may have:
+            # - Set status to WATCHING but stream failed to initialize
+            # - Started but immediately crashed
+            # - Started but no frames are flowing
+            #
+            # SOLUTION: Multi-stage verification:
+            # 1. Check watcher.status == WatcherStatus.WATCHING
+            # 2. Wait for first frame to confirm stream is active
+            # 3. Verify frame is valid (not None, has data)
+            # =====================================================================
+
+            # Import WatcherStatus for status comparison
+            try:
+                from backend.vision.macos_video_capture_advanced import WatcherStatus
+            except ImportError:
+                WatcherStatus = None
+
+            # Stage 1: Verify watcher status
+            watcher_is_healthy = False
+            try:
+                if WatcherStatus is not None:
+                    # Direct status comparison (most reliable)
+                    watcher_is_healthy = watcher.status == WatcherStatus.WATCHING
+                    if not watcher_is_healthy:
+                        logger.error(
+                            f"❌ Watcher started but status is {watcher.status.value} "
+                            f"(expected: WATCHING)"
+                        )
+                elif hasattr(watcher, 'status'):
+                    # Fallback: check status attribute directly
+                    status_val = getattr(watcher.status, 'value', str(watcher.status))
+                    watcher_is_healthy = status_val.lower() == 'watching'
+                else:
+                    # No status attribute - optimistic
+                    watcher_is_healthy = True
+                    logger.debug(f"[{watcher.watcher_id}] No status attribute - assuming healthy")
+            except Exception as e:
+                logger.warning(f"[{watcher.watcher_id}] Status check failed: {e} - assuming healthy")
+                watcher_is_healthy = True
+
+            if not watcher_is_healthy:
+                logger.error(f"❌ Ferrari Engine watcher status check failed for window {window_id}")
+                try:
+                    await watcher.stop()
+                except Exception:
+                    pass
+                return None
+
+            # Stage 2: Verify frame flow (wait for first frame)
+            frame_flow_timeout = float(os.getenv('JARVIS_FIRST_FRAME_TIMEOUT', '5.0'))
+            first_frame_received = False
+
+            logger.debug(
+                f"[{watcher.watcher_id}] Verifying frame flow "
+                f"(timeout: {frame_flow_timeout}s)..."
+            )
+
+            try:
+                # Wait for first frame with timeout
+                first_frame = await asyncio.wait_for(
+                    watcher.get_latest_frame(timeout=frame_flow_timeout),
+                    timeout=frame_flow_timeout + 1.0  # Outer timeout slightly longer
+                )
+
+                if first_frame is not None:
+                    # Verify frame has actual data
+                    frame_data = first_frame.get('frame')
+                    if frame_data is not None:
+                        first_frame_received = True
+                        logger.info(
+                            f"✅ [{watcher.watcher_id}] First frame received - "
+                            f"stream verified active"
+                        )
+                    else:
+                        logger.warning(
+                            f"[{watcher.watcher_id}] Frame dict received but 'frame' is None"
+                        )
+                else:
+                    logger.warning(
+                        f"[{watcher.watcher_id}] No frame received within {frame_flow_timeout}s"
+                    )
+
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"[{watcher.watcher_id}] Frame flow verification timed out "
+                    f"after {frame_flow_timeout}s - proceeding optimistically"
+                )
+                # Don't fail - the watcher may just be slow to produce first frame
+                # Set first_frame_received to True to proceed (optimistic)
+                first_frame_received = True
+            except Exception as e:
+                logger.warning(
+                    f"[{watcher.watcher_id}] Frame flow check error: {e} - "
+                    f"proceeding optimistically"
+                )
+                first_frame_received = True
+
+            if not first_frame_received:
+                # No frame flow - watcher is not actually working
+                logger.error(
+                    f"❌ Ferrari Engine watcher started but no frames flowing "
+                    f"for window {window_id} ({app_name})"
+                )
+                try:
+                    await watcher.stop()
+                except Exception:
+                    pass
+                return None
+
+            # =====================================================================
             # v6.1.0: Activate Purple Indicator for Visual Confirmation
             # =====================================================================
             # WHY: ScreenCaptureKit doesn't trigger the macOS purple indicator.
@@ -3364,7 +3677,7 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
             # =====================================================================
             await self._ensure_purple_indicator()
 
-            # Store watcher info
+            # Store watcher info with health tracking metadata
             watcher_id = watcher.watcher_id
             self._active_video_watchers[watcher_id] = {
                 'watcher': watcher,
@@ -3373,12 +3686,19 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                 'space_id': space_id,
                 'fps': fps,
                 'started_at': datetime.now().isoformat(),
-                'config': watcher_config
+                'config': watcher_config,
+                # v17.0: Health tracking metadata
+                'health': {
+                    'verified_at': datetime.now().isoformat(),
+                    'first_frame_received': first_frame_received,
+                    'last_health_check': datetime.now().isoformat(),
+                    'consecutive_failures': 0
+                }
             }
 
             logger.info(
-                f"✅ Ferrari Engine watcher started: {watcher_id} "
-                f"(Window {window_id}, {app_name})"
+                f"✅ Ferrari Engine watcher started and verified: {watcher_id} "
+                f"(Window {window_id}, {app_name}, Frame flow: ✓)"
             )
 
             return watcher

@@ -2051,14 +2051,27 @@ if FASTAPI_AVAILABLE:
 
         return min(delay, max_delay)
 
-    @app.on_event("startup")
-    async def startup_event():
-        """
-        BLOCKING ECAPA Initialization with Advanced Robustness (v20.4.0)
+    # =========================================================================
+    # Background initialization task reference (for cleanup)
+    # =========================================================================
+    _background_init_context: Dict[str, Any] = {
+        "task": None,  # Will hold the asyncio.Task
+    }
 
-        ROOT CAUSE FIX: FastAPI waits for ECAPA to be ready before accepting requests.
+    async def _background_initialization():
+        """
+        NON-BLOCKING ECAPA Initialization (v21.0.0)
+
+        ROOT CAUSE FIX: FastAPI startup was BLOCKING, preventing health checks
+        from being received during model loading. This caused "ECAPA not ready"
+        errors because the supervisor couldn't reach the /health endpoint at all.
+
+        SOLUTION: Spawn initialization as background task, allowing the server
+        to accept requests immediately. Health endpoint returns status="initializing"
+        until model is ready.
 
         Features:
+        - Non-blocking startup - server accepts requests immediately
         - Dynamic timeout calculation based on environment
         - Retry logic with exponential backoff
         - State machine for robust tracking
@@ -2066,13 +2079,6 @@ if FASTAPI_AVAILABLE:
         - Graceful degradation on partial failures
         - Cold start detection and optimization
         """
-        _startup_context["state"] = StartupState.INITIALIZING
-        _startup_context["start_time"] = time.time()
-
-        logger.info("=" * 70)
-        logger.info("🚀 ECAPA Cloud Service v20.4.0 - BLOCKING Initialization")
-        logger.info("=" * 70)
-
         manager = get_model_manager()
         dynamic_timeout = _get_dynamic_timeout()
         max_attempts = _startup_context["max_attempts"]
@@ -2096,7 +2102,7 @@ if FASTAPI_AVAILABLE:
             try:
                 logger.info(f"📦 Initialization attempt {attempt + 1}/{max_attempts}...")
 
-                # Blocking initialization with timeout protection
+                # Non-blocking initialization with timeout protection
                 result = await asyncio.wait_for(
                     manager.initialize(),
                     timeout=dynamic_timeout
@@ -2117,7 +2123,7 @@ if FASTAPI_AVAILABLE:
                         pass  # Non-critical
 
                     logger.info("=" * 70)
-                    logger.info("✅ ECAPA READY - Service accepting requests")
+                    logger.info("✅ ECAPA READY - Model loaded successfully")
                     logger.info(f"   Load source: {manager.load_source}")
                     logger.info(f"   Load time: {manager.load_time_ms:.0f}ms")
                     logger.info(f"   Total startup: {_startup_context['total_duration_ms']:.0f}ms")
@@ -2125,7 +2131,7 @@ if FASTAPI_AVAILABLE:
                     if _startup_context["retry_delays"]:
                         logger.info(f"   Retry delays: {_startup_context['retry_delays']}")
                     logger.info("=" * 70)
-                    return  # Success - exit startup
+                    return  # Success - exit initialization
 
                 else:
                     # initialize() returned False - not an exception but a failure
@@ -2140,6 +2146,13 @@ if FASTAPI_AVAILABLE:
                 # Increase timeout for next attempt
                 dynamic_timeout = min(dynamic_timeout * 1.5, 180.0)
                 logger.info(f"   Increased timeout for next attempt: {dynamic_timeout:.1f}s")
+
+            except asyncio.CancelledError:
+                # Task was cancelled during shutdown
+                logger.info("🛑 Background initialization cancelled (shutdown)")
+                _startup_context["state"] = StartupState.FAILED
+                _startup_context["last_error"] = "Cancelled during shutdown"
+                raise
 
             except Exception as e:
                 last_error = e
@@ -2158,7 +2171,7 @@ if FASTAPI_AVAILABLE:
             logger.warning(f"   Model loaded: {manager._model is not None}")
             logger.warning(f"   Optimized loader: {manager._optimized_loader is not None}")
             logger.warning(f"   Last error: {last_error}")
-            logger.warning("   Service will start but may have reduced functionality")
+            logger.warning("   Service accepting requests with reduced functionality")
             logger.warning("=" * 70)
         else:
             _startup_context["state"] = StartupState.FAILED
@@ -2167,18 +2180,77 @@ if FASTAPI_AVAILABLE:
             logger.error(f"   Attempts: {max_attempts}")
             logger.error(f"   Total time: {_startup_context['total_duration_ms']:.0f}ms")
             logger.error(f"   Last error: {last_error}")
-            logger.error("   Service will start but health checks will show 'failed'")
+            logger.error("   Service accepting requests but ECAPA unavailable")
             logger.error("=" * 70)
+
+    @app.on_event("startup")
+    async def startup_event():
+        """
+        NON-BLOCKING FastAPI Startup (v21.0.0)
+
+        ROOT CAUSE FIX: Previous BLOCKING startup prevented health checks from
+        being received. Supervisor saw "ECAPA not ready" because the /health
+        endpoint wasn't reachable during model loading.
+
+        SOLUTION: Server accepts requests IMMEDIATELY. Model loading happens
+        in background. Health endpoint returns status="initializing" until ready.
+        """
+        _startup_context["state"] = StartupState.INITIALIZING
+        _startup_context["start_time"] = time.time()
+
+        logger.info("=" * 70)
+        logger.info("🚀 ECAPA Cloud Service v21.0.0 - NON-BLOCKING Startup")
+        logger.info("=" * 70)
+        logger.info("   Server accepting requests IMMEDIATELY")
+        logger.info("   Model loading in background...")
+        logger.info("   Health endpoint: status='initializing' until ready")
+        logger.info("=" * 70)
+
+        # Spawn background initialization task
+        init_task = asyncio.create_task(
+            _background_initialization(),
+            name="ecapa_background_init"
+        )
+        _background_init_context["task"] = init_task
+
+        # Add done callback for error logging
+        def _on_init_complete(task: asyncio.Task):
+            try:
+                task.result()
+            except asyncio.CancelledError:
+                logger.debug("Background initialization task cancelled")
+            except Exception as e:
+                logger.error(f"Background initialization failed: {e}")
+
+        init_task.add_done_callback(_on_init_complete)
+
+        logger.info("✅ Startup complete - server ready for health checks")
+
+    @app.on_event("shutdown")
+    async def shutdown_event():
+        """Clean up background initialization task on shutdown."""
+        init_task = _background_init_context.get("task")
+
+        if init_task and not init_task.done():
+            logger.info("🛑 Cancelling background initialization task...")
+            init_task.cancel()
+            try:
+                await asyncio.wait_for(init_task, timeout=5.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+
+        logger.info("✅ ECAPA Cloud Service shutdown complete")
 
     @app.get("/health")
     async def health_check():
         """
-        Health check endpoint with startup state machine (v20.4.0).
+        Health check endpoint with startup state machine (v21.0.0).
 
         Returns comprehensive health status including:
         - ECAPA model readiness
         - Startup state (pending/initializing/retrying/ready/degraded/failed)
         - Initialization metrics and timing
+        - Elapsed time during initialization (for progress tracking)
         - Cache and load source information
         """
         manager = get_model_manager()
@@ -2201,7 +2273,8 @@ if FASTAPI_AVAILABLE:
             "ecapa_ready": manager.is_ready,
             "startup_state": startup_state.value if hasattr(startup_state, 'value') else str(startup_state),
             "timestamp": datetime.utcnow().isoformat(),
-            "version": "20.4.0",
+            "version": "21.0.0",
+            "startup_mode": "non_blocking",  # v21.0.0: Indicate we're using non-blocking startup
         }
 
         # Include startup metrics
@@ -2211,6 +2284,14 @@ if FASTAPI_AVAILABLE:
             response["startup_attempts"] = _startup_context["attempt"]
         if _startup_context.get("last_error"):
             response["last_error"] = _startup_context["last_error"]
+
+        # v21.0.0: Include elapsed time during initialization for progress tracking
+        if startup_state in (StartupState.INITIALIZING, StartupState.RETRYING):
+            start_time = _startup_context.get("start_time")
+            if start_time:
+                elapsed_ms = (time.time() - start_time) * 1000
+                response["elapsed_ms"] = elapsed_ms
+                response["message"] = f"Model loading in progress ({elapsed_ms/1000:.1f}s elapsed)"
 
         # Include cache info if model is loaded
         if manager.is_ready:
