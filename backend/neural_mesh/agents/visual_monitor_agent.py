@@ -1699,6 +1699,79 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
         logger.debug("[God Mode] Cleared watcher lifecycle tracker for new session")
 
         # =====================================================================
+        # v30.0: PROACTIVE YABAI PERMISSION CHECK
+        # =====================================================================
+        # ROOT CAUSE FIX: Detect missing accessibility permissions BEFORE
+        # attempting any window operations. This is the "smoking gun" behind
+        # silent failures - yabai can query but not control windows.
+        #
+        # By checking upfront, we can:
+        # 1. Fail fast with clear error message
+        # 2. Open accessibility settings automatically
+        # 3. Give user actionable fix instructions
+        # =====================================================================
+        try:
+            from backend.vision.yabai_space_detector import (
+                ensure_yabai_permissions,
+                check_yabai_permissions,
+            )
+
+            # Check permissions with detailed diagnostics
+            perm_ok, perm_error = await ensure_yabai_permissions(
+                auto_open_settings=False,  # Don't auto-open, just detect
+                narrate_issues=True
+            )
+
+            if not perm_ok and perm_error:
+                # Log the detailed error
+                logger.error(f"[God Mode v30.0] ❌ YABAI PERMISSION ISSUE:\n{perm_error}")
+
+                # Narrate to user if enabled
+                if self.config.working_out_loud_enabled:
+                    try:
+                        # Simplified message for voice
+                        voice_msg = (
+                            "I can't control windows right now. "
+                            "Yabai needs accessibility permission. "
+                            "Please check System Settings, Privacy and Security, Accessibility, "
+                            "and enable yabai."
+                        )
+                        await self._narrate_working_out_loud(
+                            message=voice_msg,
+                            narration_type="error",
+                            watcher_id="yabai_permission_error",
+                            priority="high"
+                        )
+                    except Exception as e:
+                        logger.warning(f"[God Mode] Narration failed: {e}")
+
+                # Return error with fix instructions
+                return {
+                    'success': False,
+                    'status': 'error',
+                    'error': 'yabai_permission_denied',
+                    'error_message': perm_error,
+                    'fix_instructions': (
+                        "1. Open System Settings → Privacy & Security → Accessibility\n"
+                        "2. Find 'yabai' and toggle it ON\n"
+                        "3. Run: yabai --restart-service"
+                    ),
+                    'total_watchers': 0,
+                    'app_name': app_name,
+                    'trigger_text': trigger_text,
+                    'message': "Yabai lacks accessibility permissions - cannot control windows"
+                }
+
+            logger.info("[God Mode v30.0] ✅ Yabai permissions verified")
+
+        except ImportError:
+            # Module not available - continue without check
+            logger.debug("[God Mode v30.0] Permission check module not available - skipping")
+        except Exception as e:
+            # Don't fail on permission check errors - log and continue
+            logger.warning(f"[God Mode v30.0] Permission check failed: {e} - continuing anyway")
+
+        # =====================================================================
         # ROOT CAUSE FIX: Timeout Protection for God Mode Window Discovery v6.0.0
         # =====================================================================
         # PROBLEM: _find_window(find_all=True) can block forever

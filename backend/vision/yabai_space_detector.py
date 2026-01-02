@@ -5271,6 +5271,454 @@ async def ensure_yabai_ready(timeout_seconds: float = 10.0) -> bool:
     return False
 
 
+# =============================================================================
+# v30.0: COMPREHENSIVE YABAI HEALTH & PERMISSION DETECTION
+# =============================================================================
+# ROOT CAUSE FIX: Detect when yabai lacks accessibility permissions
+# This is the "smoking gun" behind silent window control failures:
+# - Yabai can QUERY windows/spaces (socket works)
+# - But can't CONTROL windows (accessibility permission denied)
+# - macOS shows permission popup that user may have dismissed
+#
+# This system provides:
+# 1. Proactive permission detection before operations
+# 2. Clear diagnostics when permissions are missing
+# 3. Actionable guidance to fix the issue
+# 4. Caching to avoid repeated checks
+# =============================================================================
+
+@dataclass
+class YabaiPermissionStatus:
+    """v30.0: Comprehensive yabai permission and health status."""
+    # Basic availability
+    yabai_installed: bool = False
+    yabai_path: Optional[str] = None
+    yabai_running: bool = False
+    yabai_pid: Optional[int] = None
+
+    # Query capability (socket works)
+    can_query_windows: bool = False
+    can_query_spaces: bool = False
+    can_query_displays: bool = False
+
+    # Control capability (accessibility permissions)
+    can_move_windows: bool = False
+    can_focus_windows: bool = False
+    can_switch_spaces: bool = False
+
+    # Scripting Addition (SIP-dependent)
+    scripting_addition_loaded: bool = False
+    sip_status: Optional[str] = None
+
+    # Overall status
+    fully_functional: bool = False
+    needs_accessibility_permission: bool = False
+    needs_restart: bool = False
+
+    # Diagnostics
+    error_message: Optional[str] = None
+    fix_instructions: Optional[str] = None
+    last_check: Optional[datetime] = None
+    check_duration_ms: float = 0.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for reporting."""
+        return {
+            "yabai_installed": self.yabai_installed,
+            "yabai_path": self.yabai_path,
+            "yabai_running": self.yabai_running,
+            "yabai_pid": self.yabai_pid,
+            "can_query_windows": self.can_query_windows,
+            "can_query_spaces": self.can_query_spaces,
+            "can_query_displays": self.can_query_displays,
+            "can_move_windows": self.can_move_windows,
+            "can_focus_windows": self.can_focus_windows,
+            "can_switch_spaces": self.can_switch_spaces,
+            "scripting_addition_loaded": self.scripting_addition_loaded,
+            "sip_status": self.sip_status,
+            "fully_functional": self.fully_functional,
+            "needs_accessibility_permission": self.needs_accessibility_permission,
+            "needs_restart": self.needs_restart,
+            "error_message": self.error_message,
+            "fix_instructions": self.fix_instructions,
+            "last_check": self.last_check.isoformat() if self.last_check else None,
+            "check_duration_ms": self.check_duration_ms,
+        }
+
+
+# Module-level cache for permission status
+_YABAI_PERMISSION_CACHE: Optional[YabaiPermissionStatus] = None
+_YABAI_PERMISSION_CACHE_TIME: Optional[datetime] = None
+_YABAI_PERMISSION_CACHE_TTL = 30.0  # 30 seconds
+
+
+async def check_yabai_permissions(force_recheck: bool = False) -> YabaiPermissionStatus:
+    """
+    v30.0: Comprehensive yabai permission and health check.
+
+    This is the DEFINITIVE check for whether yabai can actually control windows.
+    It tests not just if yabai is running, but if it has the OS permissions
+    needed to move windows, switch spaces, etc.
+
+    Args:
+        force_recheck: If True, bypass cache and recheck
+
+    Returns:
+        YabaiPermissionStatus with detailed health and permission info
+    """
+    global _YABAI_PERMISSION_CACHE, _YABAI_PERMISSION_CACHE_TIME
+
+    # Check cache
+    if not force_recheck and _YABAI_PERMISSION_CACHE and _YABAI_PERMISSION_CACHE_TIME:
+        cache_age = (datetime.now() - _YABAI_PERMISSION_CACHE_TIME).total_seconds()
+        if cache_age < _YABAI_PERMISSION_CACHE_TTL:
+            return _YABAI_PERMISSION_CACHE
+
+    start_time = time.time()
+    status = YabaiPermissionStatus()
+
+    try:
+        # =====================================================================
+        # PHASE 1: Check if yabai is installed
+        # =====================================================================
+        yabai_path = shutil.which("yabai")
+        if not yabai_path:
+            for path in ["/opt/homebrew/bin/yabai", "/usr/local/bin/yabai"]:
+                if os.path.isfile(path) and os.access(path, os.X_OK):
+                    yabai_path = path
+                    break
+
+        status.yabai_installed = yabai_path is not None
+        status.yabai_path = yabai_path
+
+        if not yabai_path:
+            status.error_message = "Yabai is not installed"
+            status.fix_instructions = "Install yabai: brew install koekeishiya/formulae/yabai"
+            status.last_check = datetime.now()
+            status.check_duration_ms = (time.time() - start_time) * 1000
+            _YABAI_PERMISSION_CACHE = status
+            _YABAI_PERMISSION_CACHE_TIME = datetime.now()
+            return status
+
+        # =====================================================================
+        # PHASE 2: Check if yabai process is running
+        # =====================================================================
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "pgrep", "-x", "yabai",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=2.0)
+            status.yabai_running = proc.returncode == 0
+            if status.yabai_running:
+                status.yabai_pid = int(stdout.decode().strip().split()[0])
+        except Exception as e:
+            logger.debug(f"[v30.0] pgrep check failed: {e}")
+            status.yabai_running = False
+
+        if not status.yabai_running:
+            status.error_message = "Yabai is not running"
+            status.fix_instructions = "Start yabai: yabai --start-service"
+            status.needs_restart = True
+            status.last_check = datetime.now()
+            status.check_duration_ms = (time.time() - start_time) * 1000
+            _YABAI_PERMISSION_CACHE = status
+            _YABAI_PERMISSION_CACHE_TIME = datetime.now()
+            return status
+
+        # =====================================================================
+        # PHASE 3: Test QUERY capabilities (socket communication)
+        # =====================================================================
+        async def test_query(cmd: List[str]) -> Tuple[bool, Optional[str]]:
+            """Test a yabai query command."""
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    yabai_path, *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=3.0)
+                if proc.returncode == 0:
+                    return True, stdout.decode()
+                return False, stderr.decode()
+            except asyncio.TimeoutError:
+                return False, "timeout"
+            except Exception as e:
+                return False, str(e)
+
+        # Test query capabilities
+        status.can_query_windows, _ = await test_query(["-m", "query", "--windows"])
+        status.can_query_spaces, _ = await test_query(["-m", "query", "--spaces"])
+        status.can_query_displays, _ = await test_query(["-m", "query", "--displays"])
+
+        # =====================================================================
+        # PHASE 4: Check scripting addition status
+        # =====================================================================
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                yabai_path, "-m", "query", "--spaces", "--space",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=2.0)
+            stderr_text = stderr.decode()
+
+            # Check for scripting addition errors
+            if "scripting-addition" in stderr_text.lower() or "sa" in stderr_text.lower():
+                status.scripting_addition_loaded = False
+            else:
+                status.scripting_addition_loaded = True
+        except Exception:
+            status.scripting_addition_loaded = False
+
+        # =====================================================================
+        # PHASE 5: TEST CONTROL CAPABILITIES (The Critical Test!)
+        # =====================================================================
+        # This is where accessibility permissions matter. Yabai can query
+        # without permissions, but CONTROL operations will fail.
+
+        # Test 1: Try to focus a window (requires accessibility)
+        try:
+            # Get first window ID
+            proc = await asyncio.create_subprocess_exec(
+                yabai_path, "-m", "query", "--windows", "--window", "first",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=2.0)
+
+            if proc.returncode == 0 and stdout:
+                window_data = json.loads(stdout.decode())
+                window_id = window_data.get("id")
+
+                if window_id:
+                    # Try to focus this window (will fail without accessibility)
+                    focus_proc = await asyncio.create_subprocess_exec(
+                        yabai_path, "-m", "window", str(window_id), "--focus",
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    )
+                    _, focus_stderr = await asyncio.wait_for(
+                        focus_proc.communicate(), timeout=2.0
+                    )
+
+                    focus_error = focus_stderr.decode().lower()
+
+                    # Check for permission-related errors
+                    if focus_proc.returncode == 0:
+                        status.can_focus_windows = True
+                        status.can_move_windows = True  # If focus works, move likely works
+                    elif any(x in focus_error for x in [
+                        "permission", "accessibility", "not permitted",
+                        "operation not permitted", "authorization"
+                    ]):
+                        status.can_focus_windows = False
+                        status.can_move_windows = False
+                        status.needs_accessibility_permission = True
+                    else:
+                        # Other error (maybe window doesn't exist anymore)
+                        # Don't flag as permission issue
+                        status.can_focus_windows = None  # Unknown
+                        status.can_move_windows = None
+        except Exception as e:
+            logger.debug(f"[v30.0] Focus test failed: {e}")
+            status.can_focus_windows = None
+            status.can_move_windows = None
+
+        # Test 2: Check if space switching works
+        try:
+            # Get current space
+            proc = await asyncio.create_subprocess_exec(
+                yabai_path, "-m", "query", "--spaces", "--space",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=2.0)
+
+            if proc.returncode == 0:
+                space_data = json.loads(stdout.decode())
+                current_space = space_data.get("index", 1)
+
+                # Don't actually switch spaces - just check if the command
+                # is accepted (we'll switch to current space which is a no-op)
+                switch_proc = await asyncio.create_subprocess_exec(
+                    yabai_path, "-m", "space", "--focus", str(current_space),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                _, switch_stderr = await asyncio.wait_for(
+                    switch_proc.communicate(), timeout=2.0
+                )
+
+                switch_error = switch_stderr.decode().lower()
+
+                if switch_proc.returncode == 0:
+                    status.can_switch_spaces = True
+                elif any(x in switch_error for x in [
+                    "permission", "accessibility", "not permitted"
+                ]):
+                    status.can_switch_spaces = False
+                    status.needs_accessibility_permission = True
+                else:
+                    # Scripting addition might be needed for space switching
+                    if "scripting" in switch_error or "sa" in switch_error:
+                        status.scripting_addition_loaded = False
+                    status.can_switch_spaces = False
+        except Exception as e:
+            logger.debug(f"[v30.0] Space switch test failed: {e}")
+            status.can_switch_spaces = None
+
+        # =====================================================================
+        # PHASE 6: Determine overall status and provide guidance
+        # =====================================================================
+        status.fully_functional = (
+            status.yabai_running and
+            status.can_query_windows and
+            status.can_focus_windows is True and
+            status.can_switch_spaces is True
+        )
+
+        if status.needs_accessibility_permission:
+            status.error_message = (
+                "Yabai lacks accessibility permissions. "
+                "Window control operations will fail silently."
+            )
+            status.fix_instructions = (
+                "Grant accessibility permissions:\n"
+                "1. Open System Settings > Privacy & Security > Accessibility\n"
+                "2. Find 'yabai' in the list\n"
+                "3. Toggle it ON (or OFF then ON to reset)\n"
+                "4. Run: yabai --restart-service"
+            )
+        elif not status.scripting_addition_loaded and not status.can_switch_spaces:
+            status.error_message = (
+                "Yabai scripting addition not loaded. "
+                "Space switching will not work."
+            )
+            status.fix_instructions = (
+                "Load scripting addition:\n"
+                "1. Ensure SIP is partially disabled for yabai\n"
+                "2. Run: sudo yabai --load-sa\n"
+                "3. Run: yabai --restart-service"
+            )
+        elif status.fully_functional:
+            status.error_message = None
+            status.fix_instructions = None
+
+        status.last_check = datetime.now()
+        status.check_duration_ms = (time.time() - start_time) * 1000
+
+        # Log result
+        if status.needs_accessibility_permission:
+            logger.warning(
+                f"[v30.0] ⚠️ YABAI PERMISSION ISSUE DETECTED:\n"
+                f"   {status.error_message}\n"
+                f"   Fix: {status.fix_instructions}"
+            )
+        elif status.fully_functional:
+            logger.info(
+                f"[v30.0] ✅ Yabai fully functional "
+                f"(check took {status.check_duration_ms:.1f}ms)"
+            )
+
+        # Cache result
+        _YABAI_PERMISSION_CACHE = status
+        _YABAI_PERMISSION_CACHE_TIME = datetime.now()
+
+        return status
+
+    except Exception as e:
+        logger.error(f"[v30.0] Permission check failed: {e}")
+        status.error_message = f"Permission check failed: {e}"
+        status.last_check = datetime.now()
+        status.check_duration_ms = (time.time() - start_time) * 1000
+        _YABAI_PERMISSION_CACHE = status
+        _YABAI_PERMISSION_CACHE_TIME = datetime.now()
+        return status
+
+
+def get_cached_permission_status() -> Optional[YabaiPermissionStatus]:
+    """Get cached permission status without blocking."""
+    return _YABAI_PERMISSION_CACHE
+
+
+def invalidate_permission_cache():
+    """Invalidate permission cache to force recheck."""
+    global _YABAI_PERMISSION_CACHE, _YABAI_PERMISSION_CACHE_TIME
+    _YABAI_PERMISSION_CACHE = None
+    _YABAI_PERMISSION_CACHE_TIME = None
+
+
+async def ensure_yabai_permissions(
+    auto_open_settings: bool = False,
+    narrate_issues: bool = True
+) -> Tuple[bool, Optional[str]]:
+    """
+    v30.0: Ensure yabai has all required permissions before operations.
+
+    This should be called BEFORE any God Mode / window control operations.
+    It provides early detection of permission issues with clear guidance.
+
+    Args:
+        auto_open_settings: If True, automatically open accessibility settings
+                           when permissions are missing
+        narrate_issues: If True, log detailed issue descriptions
+
+    Returns:
+        Tuple of (success, error_message)
+        - success: True if yabai is fully functional
+        - error_message: None if success, otherwise describes the issue
+    """
+    status = await check_yabai_permissions()
+
+    if status.fully_functional:
+        return True, None
+
+    if status.needs_accessibility_permission:
+        error_msg = (
+            "🚫 YABAI ACCESSIBILITY PERMISSION REQUIRED\n\n"
+            "Yabai can see windows but cannot control them.\n"
+            "macOS is blocking window management operations.\n\n"
+            "TO FIX:\n"
+            "1. Go to System Settings → Privacy & Security → Accessibility\n"
+            "2. Find 'yabai' and toggle it ON\n"
+            "3. If already ON, toggle OFF then ON again\n"
+            "4. Run: yabai --restart-service\n\n"
+            "This is required for window teleportation and space switching."
+        )
+
+        if narrate_issues:
+            logger.error(f"[v30.0] {error_msg}")
+
+        if auto_open_settings:
+            open_accessibility_settings()
+
+        return False, error_msg
+
+    if not status.yabai_running:
+        error_msg = (
+            "Yabai is not running.\n"
+            "Start it with: yabai --start-service"
+        )
+        if narrate_issues:
+            logger.error(f"[v30.0] {error_msg}")
+        return False, error_msg
+
+    if not status.scripting_addition_loaded and not status.can_switch_spaces:
+        error_msg = (
+            "Yabai scripting addition not loaded.\n"
+            "Space switching requires: sudo yabai --load-sa"
+        )
+        if narrate_issues:
+            logger.warning(f"[v30.0] {error_msg}")
+        # Return True but with warning - basic functionality may still work
+        return True, error_msg
+
+    # Generic error
+    return False, status.error_message
+
+
 # Export for convenient imports
 __all__ = [
     # Core classes
@@ -5300,4 +5748,10 @@ __all__ = [
     "open_accessibility_settings",
     "diagnose_yabai",
     "ensure_yabai_ready",
+    # v30.0 Permission Detection
+    "YabaiPermissionStatus",
+    "check_yabai_permissions",
+    "ensure_yabai_permissions",
+    "get_cached_permission_status",
+    "invalidate_permission_cache",
 ]
