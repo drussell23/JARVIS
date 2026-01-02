@@ -1421,8 +1421,78 @@ class VideoWatcher:
                     logger.info(f"🏎️  [Watcher {self.watcher_id}] Ferrari Engine started for window {self.config.window_id}")
                     # Start async frame loop for SCK
                     self._frame_loop_task = asyncio.create_task(self._sck_frame_loop())
-                    self.status = WatcherStatus.WATCHING
-                    return True
+
+                    # =====================================================================
+                    # v22.0.0: FRAME PRODUCTION VERIFICATION (Root Cause Fix)
+                    # =====================================================================
+                    # PROBLEM: SCK stream.start() returns True but no frames are produced.
+                    # This causes "no frames flowing" errors in God Mode verification.
+                    #
+                    # ROOT CAUSE: SCK may claim success even if:
+                    # - Window ID is invalid or stale
+                    # - Window is minimized or on another space
+                    # - Screen Recording permission is missing
+                    # - The stream is "running" but not producing frames
+                    #
+                    # SOLUTION: Wait briefly for first frame before claiming success.
+                    # If no frame within timeout, fall back to CGWindowListCreateImage.
+                    # =====================================================================
+                    first_frame_timeout = float(os.getenv('JARVIS_SCK_FIRST_FRAME_TIMEOUT', '2.0'))
+                    logger.debug(
+                        f"[Watcher {self.watcher_id}] Verifying SCK frame production "
+                        f"(timeout: {first_frame_timeout}s)..."
+                    )
+
+                    frame_received = False
+                    start_verify_time = time.time()
+
+                    while time.time() - start_verify_time < first_frame_timeout:
+                        # Check if any frames have been queued
+                        if not self.frame_queue.empty():
+                            frame_received = True
+                            logger.info(
+                                f"✅ [Watcher {self.watcher_id}] SCK frame verified - "
+                                f"Ferrari Engine confirmed working"
+                            )
+                            break
+
+                        # Also check frames_captured counter
+                        if self._frames_captured > 0:
+                            frame_received = True
+                            logger.info(
+                                f"✅ [Watcher {self.watcher_id}] SCK frames captured: "
+                                f"{self._frames_captured} - Ferrari Engine confirmed"
+                            )
+                            break
+
+                        # Yield to let frame loop execute
+                        await asyncio.sleep(0.1)
+
+                    if frame_received:
+                        self.status = WatcherStatus.WATCHING
+                        return True
+                    else:
+                        # SCK started but no frames - fall back to CGWindowListCreateImage
+                        logger.warning(
+                            f"[Watcher {self.watcher_id}] Ferrari Engine started but no frames "
+                            f"after {first_frame_timeout}s - falling back to CGWindowListCreateImage. "
+                            f"(Window may be hidden, minimized, or on another space)"
+                        )
+                        # Cancel the frame loop task
+                        if self._frame_loop_task and not self._frame_loop_task.done():
+                            self._frame_loop_task.cancel()
+                            try:
+                                await self._frame_loop_task
+                            except asyncio.CancelledError:
+                                pass
+                        # Stop SCK stream
+                        try:
+                            await self._sck_stream.stop()
+                        except Exception:
+                            pass
+                        self._sck_stream = None
+                        self._use_sck = False
+                        # Fall through to CGWindowListCreateImage fallback below
                 else:
                     logger.warning(f"[Watcher {self.watcher_id}] Ferrari Engine failed to start, falling back to CGWindowListCreateImage")
                     self._use_sck = False
@@ -1449,10 +1519,64 @@ class VideoWatcher:
             pass  # Priority setting not critical
 
         self._capture_thread.start()
-        self.status = WatcherStatus.WATCHING
 
-        logger.info(f"✅ Watcher {self.watcher_id} started (fallback method)")
-        return True
+        # =====================================================================
+        # v22.0.0: FRAME PRODUCTION VERIFICATION for CGWindowListCreateImage
+        # =====================================================================
+        # Same logic as SCK - verify frames are actually being produced
+        # before claiming success. This catches:
+        # - Invalid window IDs
+        # - Missing Screen Recording permission
+        # - Hidden/minimized windows that can't be captured
+        # =====================================================================
+        fallback_frame_timeout = float(os.getenv('JARVIS_FALLBACK_FIRST_FRAME_TIMEOUT', '3.0'))
+        logger.debug(
+            f"[Watcher {self.watcher_id}] Verifying CGWindowListCreateImage frame production "
+            f"(timeout: {fallback_frame_timeout}s)..."
+        )
+
+        fallback_frame_received = False
+        start_fallback_verify = time.time()
+
+        while time.time() - start_fallback_verify < fallback_frame_timeout:
+            # Check if capture thread is producing frames
+            if not self.frame_queue.empty():
+                fallback_frame_received = True
+                logger.info(
+                    f"✅ [Watcher {self.watcher_id}] CGWindowListCreateImage frame verified - "
+                    f"fallback capture working"
+                )
+                break
+
+            # Also check frames_captured counter (thread-safe read)
+            if self._frames_captured > 0:
+                fallback_frame_received = True
+                logger.info(
+                    f"✅ [Watcher {self.watcher_id}] CGWindowListCreateImage frames captured: "
+                    f"{self._frames_captured} - fallback confirmed"
+                )
+                break
+
+            # Yield to let capture thread execute
+            await asyncio.sleep(0.1)
+
+        if fallback_frame_received:
+            self.status = WatcherStatus.WATCHING
+            logger.info(f"✅ Watcher {self.watcher_id} started (fallback method, frame verified)")
+            return True
+        else:
+            # Fallback also failed - stop the thread and return failure
+            logger.error(
+                f"❌ [Watcher {self.watcher_id}] CGWindowListCreateImage also failed to produce frames "
+                f"after {fallback_frame_timeout}s. Possible causes:\n"
+                f"   1. Window ID {self.config.window_id} is invalid or window was closed\n"
+                f"   2. Screen Recording permission not granted (System Preferences → Privacy)\n"
+                f"   3. Window is hidden or minimized and cannot be captured"
+            )
+            # Signal stop and cleanup
+            self._stop_event.set()
+            self.status = WatcherStatus.ERROR
+            return False
 
     async def _safe_stop_stream(self):
         """

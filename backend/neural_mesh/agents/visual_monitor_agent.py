@@ -3659,12 +3659,17 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                 return None
 
             if not success:
-                error_msg = f"watcher.start() returned False for window {window_id}"
+                # v22.0.0: More specific error - start() now returns False only when
+                # frame production verification fails (both SCK and CGWindowListCreateImage)
+                error_msg = (
+                    f"window {window_id} cannot be captured - "
+                    f"window may be hidden, minimized, closed, or requires Screen Recording permission"
+                )
                 logger.error(f"❌ Ferrari Engine {error_msg}")
                 # v22.0.0: Update lifecycle with failure
                 self._watcher_lifecycle[watcher_id]['status'] = 'failed'
                 self._watcher_lifecycle[watcher_id]['error'] = error_msg
-                self._watcher_lifecycle[watcher_id]['verification_stage'] = 'start_failed'
+                self._watcher_lifecycle[watcher_id]['verification_stage'] = 'frame_production_failed'
                 return None
 
             # v22.0.0: Update lifecycle - start succeeded
