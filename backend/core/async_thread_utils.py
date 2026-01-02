@@ -129,7 +129,7 @@ class LazyAsyncLock:
         - Subsequent use: Uses cached asyncio.Lock
     """
 
-    __slots__ = ('_lock', '_sync_lock', '_initialized')
+    __slots__ = ('_lock', '_sync_lock', '_initialized', '__weakref__')
 
     def __init__(self):
         """Create a LazyAsyncLock. Safe to call from any thread."""

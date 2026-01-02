@@ -1563,9 +1563,110 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
             # BACKGROUND MODE: Return immediately, watchers run asynchronously
             logger.info(f"[God Mode] Background mode: {len(watcher_tasks)} watchers running asynchronously")
 
+            # =====================================================================
+            # ROOT CAUSE FIX v16.0: Verify Watchers Actually Start Before Returning
+            # =====================================================================
+            # PROBLEM: asyncio.create_task() only SCHEDULES tasks - they don't run
+            # until we yield control. We were returning "success" before tasks ran!
+            #
+            # SOLUTION:
+            # 1. Yield control to let watcher tasks start executing
+            # 2. Wait briefly for watchers to register in _active_video_watchers
+            # 3. Trigger purple indicator BEFORE returning (don't rely on tasks)
+            # 4. Return error if ALL watchers failed to start
+            # =====================================================================
+
+            # ===== STEP 3B.0: Wait for Watchers to Actually Start =====
+            watcher_startup_timeout = float(os.getenv('JARVIS_WATCHER_STARTUP_TIMEOUT', '10.0'))
+            startup_check_interval = 0.2  # Check every 200ms
+            initial_watcher_count = len(self._active_video_watchers)
+            expected_watchers = len(watcher_tasks)
+
+            logger.info(
+                f"[God Mode] Waiting up to {watcher_startup_timeout}s for {expected_watchers} "
+                f"watchers to start (current: {initial_watcher_count})..."
+            )
+
+            # Yield control and wait for watchers to register
+            start_wait_time = datetime.now()
+            new_watchers_started = 0
+
+            while (datetime.now() - start_wait_time).total_seconds() < watcher_startup_timeout:
+                # Yield to let tasks execute
+                await asyncio.sleep(startup_check_interval)
+
+                # Check how many new watchers registered
+                current_watcher_count = len(self._active_video_watchers)
+                new_watchers_started = current_watcher_count - initial_watcher_count
+
+                if new_watchers_started >= expected_watchers:
+                    # All watchers started
+                    logger.info(
+                        f"[God Mode] ✅ All {expected_watchers} watchers started "
+                        f"in {(datetime.now() - start_wait_time).total_seconds():.2f}s"
+                    )
+                    break
+
+                if new_watchers_started > 0 and (datetime.now() - start_wait_time).total_seconds() >= 3.0:
+                    # At least some watchers started and we've waited 3+ seconds
+                    # Don't wait for stragglers - proceed with what we have
+                    logger.info(
+                        f"[God Mode] ⚡ {new_watchers_started}/{expected_watchers} watchers started "
+                        f"after {(datetime.now() - start_wait_time).total_seconds():.2f}s - proceeding"
+                    )
+                    break
+
+            # ===== STEP 3B.0.1: Verify At Least One Watcher Started =====
+            if new_watchers_started == 0:
+                logger.error(
+                    f"[God Mode] ❌ No watchers started after {watcher_startup_timeout}s! "
+                    f"All {expected_watchers} tasks may have failed."
+                )
+
+                # Narrate error to user
+                if self.config.working_out_loud_enabled:
+                    try:
+                        await self._narrate_working_out_loud(
+                            message=f"I couldn't connect to any {app_name} windows. "
+                                    f"Please check if {app_name} is open and try again.",
+                            narration_type="error",
+                            watcher_id=f"startup_failed_{app_name}",
+                            priority="high"
+                        )
+                    except Exception as e:
+                        logger.warning(f"[God Mode] Error narration failed: {e}")
+
+                return {
+                    'success': False,
+                    'status': 'error',
+                    'error': f'No watchers started after {watcher_startup_timeout}s timeout',
+                    'total_watchers': 0,
+                    'expected_watchers': expected_watchers,
+                    'app_name': app_name,
+                    'trigger_text': trigger_text,
+                    'message': f"Failed to connect to any {app_name} windows"
+                }
+
+            # ===== STEP 3B.0.2: Ensure Purple Indicator Active =====
+            # Call directly here - don't rely on watcher tasks to trigger it
+            logger.info("[God Mode] 🟣 Ensuring purple indicator is active...")
+            try:
+                indicator_success = await self._ensure_purple_indicator()
+                if indicator_success:
+                    logger.info("[God Mode] 🟣 Purple recording indicator activated")
+                else:
+                    logger.warning("[God Mode] ⚠️ Purple indicator activation failed (non-critical)")
+            except Exception as e:
+                logger.warning(f"[God Mode] Purple indicator failed: {e} (non-critical)")
+
             # ===== STEP 3B: Non-Blocking Execution - Return Immediately =====
             # Create unique coordination task ID
             god_mode_task_id = f"god_mode_{app_name}_{int(datetime.now().timestamp() * 1000)}"
+
+            logger.info(
+                f"[God Mode] ✅ Background monitoring active: {new_watchers_started} watchers, "
+                f"watching for '{trigger_text}'"
+            )
 
             # =====================================================================
             # ROOT CAUSE FIX: Safety Harness for Background Tasks v5.0.0
@@ -1744,13 +1845,23 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                     import time
                     startup_state.monitoring_start_time = time.time()
 
-                    # Build confirmation message
-                    num_watchers = len(watcher_tasks)
-                    spaces_list = [meta['space_id'] for meta in watcher_metadata]
-                    if num_watchers == 1:
+                    # Build confirmation message - use ACTUAL watcher count, not expected
+                    actual_watchers = new_watchers_started
+                    spaces_list = [meta['space_id'] for meta in watcher_metadata[:actual_watchers]]
+
+                    if actual_watchers == 1:
                         startup_msg = f"I've connected to {app_name}. Monitoring for '{trigger_text}' now."
+                    elif actual_watchers < expected_watchers:
+                        # Partial success - some watchers didn't start
+                        startup_msg = (
+                            f"I've connected to {actual_watchers} of {expected_watchers} {app_name} windows. "
+                            f"Monitoring for '{trigger_text}'."
+                        )
                     else:
-                        startup_msg = f"I've connected to {num_watchers} {app_name} windows across spaces {', '.join(map(str, spaces_list))}. Monitoring for '{trigger_text}'."
+                        startup_msg = (
+                            f"I've connected to {actual_watchers} {app_name} windows across spaces "
+                            f"{', '.join(map(str, spaces_list))}. Monitoring for '{trigger_text}'."
+                        )
 
                     # Send startup confirmation via TTS
                     await self._narrate_working_out_loud(
@@ -1764,15 +1875,18 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                     logger.warning(f"[God Mode] Startup narration failed: {e}")
 
             # Return immediately with acknowledgment
+            # Use ACTUAL watcher count - not expected count
             return {
                 'success': True,
                 'status': 'monitoring',
                 'god_mode_task_id': god_mode_task_id,
-                'total_watchers': len(watcher_tasks),
+                'total_watchers': new_watchers_started,  # v16.0: Actual count
+                'expected_watchers': expected_watchers,  # v16.0: For transparency
                 'app_name': app_name,
                 'trigger_text': trigger_text,
-                'spaces_monitored': [meta['space_id'] for meta in watcher_metadata],
-                'message': f"Monitoring {len(watcher_tasks)} {app_name} windows across all spaces for '{trigger_text}'"
+                'spaces_monitored': [meta['space_id'] for meta in watcher_metadata[:new_watchers_started]],
+                'startup_time_seconds': (datetime.now() - start_wait_time).total_seconds(),
+                'message': f"Monitoring {new_watchers_started} {app_name} windows for '{trigger_text}'"
             }
 
     async def _coordinate_watchers(
