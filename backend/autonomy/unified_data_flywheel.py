@@ -251,6 +251,353 @@ class FlywheelResult:
 
 
 # =============================================================================
+# v10.0: Intelligent Schema Migration System
+# =============================================================================
+# ROOT CAUSE FIX: Database schema mismatch between sync and async initialization
+#
+# PROBLEM:
+# - Sync database init (sqlite3) created tables with OLD schema
+# - Async database init (aiosqlite) expected NEW schema with more columns
+# - CREATE TABLE IF NOT EXISTS doesn't update existing tables
+# - Result: "no such column: description" errors
+#
+# SOLUTION:
+# - Single source of truth for schema (UNIFIED_SCHEMA)
+# - Schema version tracking (flywheel_schema_version table)
+# - Automatic migration on database open
+# - Column existence checks before ALTER TABLE
+# - Works for both sync (sqlite3) and async (aiosqlite) connections
+# =============================================================================
+
+# Current schema version - increment when adding migrations
+SCHEMA_VERSION = 2
+
+# Unified schema definition - single source of truth
+UNIFIED_SCHEMA = """
+    -- Schema version tracking table
+    CREATE TABLE IF NOT EXISTS flywheel_schema_version (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        version INTEGER NOT NULL DEFAULT 1,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+
+    -- Experiences table: Records of JARVIS interactions
+    CREATE TABLE IF NOT EXISTS experiences (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp REAL NOT NULL,
+        source TEXT NOT NULL,
+        input_text TEXT NOT NULL,
+        output_text TEXT NOT NULL,
+        context TEXT,
+        quality_score REAL DEFAULT 0.5,
+        feedback TEXT,
+        correction TEXT,
+        used_in_training INTEGER DEFAULT 0,
+        training_run_id INTEGER,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+
+    -- Scraped content table: Web documentation
+    CREATE TABLE IF NOT EXISTS scraped_content (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        url TEXT UNIQUE NOT NULL,
+        title TEXT,
+        content TEXT NOT NULL,
+        content_type TEXT DEFAULT 'documentation',
+        topic TEXT,
+        language TEXT DEFAULT 'en',
+        quality_score REAL DEFAULT 0.5,
+        word_count INTEGER,
+        code_blocks INTEGER DEFAULT 0,
+        scraped_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        used_in_training INTEGER DEFAULT 0,
+        training_run_id INTEGER
+    );
+
+    -- Learning goals table: Topics to learn
+    CREATE TABLE IF NOT EXISTS learning_goals (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        topic TEXT UNIQUE NOT NULL,
+        description TEXT,
+        priority INTEGER DEFAULT 5,
+        source TEXT DEFAULT 'auto',
+        urls TEXT,
+        keywords TEXT,
+        discovered_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        started_at DATETIME,
+        completed INTEGER DEFAULT 0,
+        completed_at DATETIME,
+        experiences_count INTEGER DEFAULT 0,
+        pages_scraped INTEGER DEFAULT 0
+    );
+
+    -- Training runs table: Training history
+    CREATE TABLE IF NOT EXISTS training_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        started_at DATETIME NOT NULL,
+        completed_at DATETIME,
+        status TEXT DEFAULT 'running',
+        experiences_used INTEGER DEFAULT 0,
+        pages_used INTEGER DEFAULT 0,
+        training_steps INTEGER DEFAULT 0,
+        training_epochs INTEGER DEFAULT 0,
+        learning_rate REAL,
+        batch_size INTEGER,
+        final_loss REAL,
+        final_eval_loss REAL,
+        model_path TEXT,
+        gguf_path TEXT,
+        gguf_size_mb REAL,
+        gguf_checksum TEXT,
+        gcs_path TEXT,
+        deployed_to_local INTEGER DEFAULT 0,
+        deployed_to_cloud INTEGER DEFAULT 0,
+        error TEXT,
+        error_traceback TEXT,
+        config_json TEXT
+    );
+
+    -- Model deployments table
+    CREATE TABLE IF NOT EXISTS model_deployments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        training_run_id INTEGER,
+        model_name TEXT NOT NULL,
+        model_version TEXT,
+        model_path TEXT NOT NULL,
+        gguf_path TEXT,
+        checksum TEXT,
+        model_size_mb REAL,
+        deployed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        deployed_to TEXT,
+        gcs_path TEXT,
+        active INTEGER DEFAULT 1,
+        notes TEXT
+    );
+
+    -- Create indexes for performance
+    CREATE INDEX IF NOT EXISTS idx_experiences_timestamp ON experiences(timestamp);
+    CREATE INDEX IF NOT EXISTS idx_experiences_used ON experiences(used_in_training);
+    CREATE INDEX IF NOT EXISTS idx_scraped_url ON scraped_content(url);
+    CREATE INDEX IF NOT EXISTS idx_goals_priority ON learning_goals(priority DESC);
+    CREATE INDEX IF NOT EXISTS idx_training_status ON training_runs(status);
+"""
+
+# Schema migrations - each migration adds columns/indexes that may be missing
+# Format: (version, [(table, column, definition), ...])
+SCHEMA_MIGRATIONS = {
+    # Migration from version 1 to 2: Add missing columns from sync schema
+    2: [
+        # experiences table additions
+        ("experiences", "feedback", "TEXT"),
+        ("experiences", "correction", "TEXT"),
+        # scraped_content table additions
+        ("scraped_content", "content_type", "TEXT DEFAULT 'documentation'"),
+        ("scraped_content", "language", "TEXT DEFAULT 'en'"),
+        ("scraped_content", "word_count", "INTEGER"),
+        ("scraped_content", "code_blocks", "INTEGER DEFAULT 0"),
+        ("scraped_content", "training_run_id", "INTEGER"),
+        # learning_goals table additions
+        ("learning_goals", "description", "TEXT"),
+        ("learning_goals", "keywords", "TEXT"),
+        ("learning_goals", "started_at", "DATETIME"),
+        ("learning_goals", "completed_at", "DATETIME"),
+        ("learning_goals", "experiences_count", "INTEGER DEFAULT 0"),
+        ("learning_goals", "pages_scraped", "INTEGER DEFAULT 0"),
+        # training_runs table additions
+        ("training_runs", "training_epochs", "INTEGER DEFAULT 0"),
+        ("training_runs", "learning_rate", "REAL"),
+        ("training_runs", "batch_size", "INTEGER"),
+        ("training_runs", "final_eval_loss", "REAL"),
+        ("training_runs", "gguf_size_mb", "REAL"),
+        ("training_runs", "gguf_checksum", "TEXT"),
+        ("training_runs", "deployed_to_local", "INTEGER DEFAULT 0"),
+        ("training_runs", "deployed_to_cloud", "INTEGER DEFAULT 0"),
+        ("training_runs", "error_traceback", "TEXT"),
+        ("training_runs", "config_json", "TEXT"),
+    ],
+}
+
+
+def _get_table_columns_sync(cursor, table_name: str) -> set:
+    """Get existing columns for a table (sync version)."""
+    try:
+        cursor.execute(f"PRAGMA table_info({table_name})")
+        return {row[1] for row in cursor.fetchall()}
+    except Exception:
+        return set()
+
+
+def _get_current_schema_version_sync(cursor) -> int:
+    """Get current schema version (sync version)."""
+    try:
+        cursor.execute("SELECT version FROM flywheel_schema_version WHERE id = 1")
+        row = cursor.fetchone()
+        return row[0] if row else 0
+    except Exception:
+        return 0
+
+
+def _set_schema_version_sync(cursor, version: int) -> None:
+    """Set schema version (sync version)."""
+    try:
+        cursor.execute("""
+            INSERT OR REPLACE INTO flywheel_schema_version (id, version, updated_at)
+            VALUES (1, ?, CURRENT_TIMESTAMP)
+        """, (version,))
+    except Exception as e:
+        logger.warning(f"[Flywheel] Failed to set schema version: {e}")
+
+
+def run_schema_migrations_sync(conn, cursor) -> bool:
+    """
+    Run schema migrations on a sync SQLite connection.
+
+    Returns:
+        True if migrations were successful
+    """
+    try:
+        # First, create base schema (tables that don't exist)
+        cursor.executescript(UNIFIED_SCHEMA)
+        conn.commit()
+
+        # Get current version
+        current_version = _get_current_schema_version_sync(cursor)
+        logger.debug(f"[Flywheel] Current schema version: {current_version}")
+
+        if current_version >= SCHEMA_VERSION:
+            logger.debug("[Flywheel] Schema is up to date")
+            return True
+
+        # Run migrations
+        migrations_run = 0
+        for version in range(current_version + 1, SCHEMA_VERSION + 1):
+            if version not in SCHEMA_MIGRATIONS:
+                continue
+
+            logger.info(f"[Flywheel] Running migration to version {version}...")
+
+            for table, column, definition in SCHEMA_MIGRATIONS[version]:
+                existing_columns = _get_table_columns_sync(cursor, table)
+
+                if column not in existing_columns:
+                    try:
+                        alter_sql = f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
+                        cursor.execute(alter_sql)
+                        logger.debug(f"[Flywheel] Added column {table}.{column}")
+                        migrations_run += 1
+                    except Exception as e:
+                        # Column might already exist or table doesn't exist
+                        logger.debug(f"[Flywheel] Migration skipped {table}.{column}: {e}")
+
+            conn.commit()
+
+        # Update schema version
+        _set_schema_version_sync(cursor, SCHEMA_VERSION)
+        conn.commit()
+
+        if migrations_run > 0:
+            logger.info(f"[Flywheel] ✅ Schema migrated to version {SCHEMA_VERSION} ({migrations_run} columns added)")
+        else:
+            logger.debug(f"[Flywheel] Schema updated to version {SCHEMA_VERSION} (no new columns needed)")
+
+        return True
+
+    except Exception as e:
+        logger.error(f"[Flywheel] Schema migration failed: {e}")
+        return False
+
+
+async def _get_table_columns_async(conn, table_name: str) -> set:
+    """Get existing columns for a table (async version)."""
+    try:
+        async with conn.execute(f"PRAGMA table_info({table_name})") as cursor:
+            rows = await cursor.fetchall()
+            return {row[1] for row in rows}
+    except Exception:
+        return set()
+
+
+async def _get_current_schema_version_async(conn) -> int:
+    """Get current schema version (async version)."""
+    try:
+        async with conn.execute("SELECT version FROM flywheel_schema_version WHERE id = 1") as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else 0
+    except Exception:
+        return 0
+
+
+async def _set_schema_version_async(conn, version: int) -> None:
+    """Set schema version (async version)."""
+    try:
+        await conn.execute("""
+            INSERT OR REPLACE INTO flywheel_schema_version (id, version, updated_at)
+            VALUES (1, ?, CURRENT_TIMESTAMP)
+        """, (version,))
+    except Exception as e:
+        logger.warning(f"[Flywheel] Failed to set schema version: {e}")
+
+
+async def run_schema_migrations_async(conn) -> bool:
+    """
+    Run schema migrations on an async aiosqlite connection.
+
+    Returns:
+        True if migrations were successful
+    """
+    try:
+        # First, create base schema (tables that don't exist)
+        await conn.executescript(UNIFIED_SCHEMA)
+        await conn.commit()
+
+        # Get current version
+        current_version = await _get_current_schema_version_async(conn)
+        logger.debug(f"[Flywheel] Current schema version: {current_version}")
+
+        if current_version >= SCHEMA_VERSION:
+            logger.debug("[Flywheel] Schema is up to date")
+            return True
+
+        # Run migrations
+        migrations_run = 0
+        for version in range(current_version + 1, SCHEMA_VERSION + 1):
+            if version not in SCHEMA_MIGRATIONS:
+                continue
+
+            logger.info(f"[Flywheel] Running migration to version {version}...")
+
+            for table, column, definition in SCHEMA_MIGRATIONS[version]:
+                existing_columns = await _get_table_columns_async(conn, table)
+
+                if column not in existing_columns:
+                    try:
+                        alter_sql = f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
+                        await conn.execute(alter_sql)
+                        logger.debug(f"[Flywheel] Added column {table}.{column}")
+                        migrations_run += 1
+                    except Exception as e:
+                        # Column might already exist or table doesn't exist
+                        logger.debug(f"[Flywheel] Migration skipped {table}.{column}: {e}")
+
+            await conn.commit()
+
+        # Update schema version
+        await _set_schema_version_async(conn, SCHEMA_VERSION)
+        await conn.commit()
+
+        if migrations_run > 0:
+            logger.info(f"[Flywheel] ✅ Schema migrated to version {SCHEMA_VERSION} ({migrations_run} columns added)")
+        else:
+            logger.debug(f"[Flywheel] Schema updated to version {SCHEMA_VERSION} (no new columns needed)")
+
+        return True
+
+    except Exception as e:
+        logger.error(f"[Flywheel] Schema migration failed: {e}")
+        return False
+
+
+# =============================================================================
 # Unified Data Flywheel Orchestrator
 # =============================================================================
 
@@ -390,7 +737,7 @@ class UnifiedDataFlywheel:
 
     async def _init_training_database(self) -> None:
         """
-        v9.0: Initialize SQLite training database for experience storage.
+        v10.0: Initialize SQLite training database with intelligent schema migration.
 
         The training database stores:
         - Experiences from JARVIS interactions
@@ -398,6 +745,12 @@ class UnifiedDataFlywheel:
         - Learning goals and topics
         - Training run history
         - Model deployment records
+
+        v10.0 IMPROVEMENTS:
+        - Uses unified schema definition (single source of truth)
+        - Automatic schema migration for existing databases
+        - Column existence checks before ALTER TABLE
+        - Schema version tracking for reliable upgrades
         """
         import sqlite3
 
@@ -410,69 +763,15 @@ class UnifiedDataFlywheel:
             self._training_db_conn = sqlite3.connect(str(db_path))
             cursor = self._training_db_conn.cursor()
 
-            # Create tables if they don't exist
-            cursor.executescript("""
-                -- Experiences table: Records of JARVIS interactions
-                CREATE TABLE IF NOT EXISTS experiences (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp REAL NOT NULL,
-                    source TEXT NOT NULL,
-                    input_text TEXT NOT NULL,
-                    output_text TEXT NOT NULL,
-                    context TEXT,
-                    quality_score REAL DEFAULT 0.5,
-                    used_in_training INTEGER DEFAULT 0,
-                    training_run_id INTEGER,
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                );
+            # v10.0: Run schema migrations (creates tables + adds missing columns)
+            migration_success = run_schema_migrations_sync(
+                self._training_db_conn,
+                cursor
+            )
 
-                -- Scraped content table: Web documentation
-                CREATE TABLE IF NOT EXISTS scraped_content (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    url TEXT UNIQUE NOT NULL,
-                    title TEXT,
-                    content TEXT NOT NULL,
-                    topic TEXT,
-                    quality_score REAL DEFAULT 0.5,
-                    scraped_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    used_in_training INTEGER DEFAULT 0
-                );
+            if not migration_success:
+                logger.warning("[Flywheel] Schema migration had issues, database may be incomplete")
 
-                -- Learning goals table: Topics to learn
-                CREATE TABLE IF NOT EXISTS learning_goals (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    topic TEXT UNIQUE NOT NULL,
-                    priority INTEGER DEFAULT 5,
-                    source TEXT DEFAULT 'auto',
-                    urls TEXT,
-                    discovered_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    completed INTEGER DEFAULT 0
-                );
-
-                -- Training runs table: Training history
-                CREATE TABLE IF NOT EXISTS training_runs (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    started_at DATETIME NOT NULL,
-                    completed_at DATETIME,
-                    status TEXT DEFAULT 'running',
-                    experiences_used INTEGER DEFAULT 0,
-                    pages_used INTEGER DEFAULT 0,
-                    training_steps INTEGER DEFAULT 0,
-                    final_loss REAL,
-                    model_path TEXT,
-                    gguf_path TEXT,
-                    gcs_path TEXT,
-                    error TEXT
-                );
-
-                -- Create indexes for performance
-                CREATE INDEX IF NOT EXISTS idx_experiences_timestamp ON experiences(timestamp);
-                CREATE INDEX IF NOT EXISTS idx_experiences_used ON experiences(used_in_training);
-                CREATE INDEX IF NOT EXISTS idx_scraped_url ON scraped_content(url);
-                CREATE INDEX IF NOT EXISTS idx_goals_priority ON learning_goals(priority DESC);
-            """)
-
-            self._training_db_conn.commit()
             self._training_db = db_path
 
             # Get stats for logging
@@ -483,9 +782,13 @@ class UnifiedDataFlywheel:
             cursor.execute("SELECT COUNT(*) FROM learning_goals WHERE completed = 0")
             goals_count = cursor.fetchone()[0]
 
+            # Get schema version
+            schema_version = _get_current_schema_version_sync(cursor)
+
             logger.info(
                 f"[Flywheel] SQLite Training Database initialized: {db_path} "
-                f"(experiences: {exp_count}, scraped: {scraped_count}, pending goals: {goals_count})"
+                f"(schema v{schema_version}, experiences: {exp_count}, "
+                f"scraped: {scraped_count}, pending goals: {goals_count})"
             )
 
         except Exception as e:
@@ -663,7 +966,15 @@ class UnifiedDataFlywheel:
     # =========================================================================
 
     async def _get_async_db(self) -> Optional["aiosqlite.Connection"]:
-        """Get or create async database connection."""
+        """
+        Get or create async database connection with intelligent schema migration.
+
+        v10.0 IMPROVEMENTS:
+        - Uses unified schema definition (single source of truth)
+        - Automatic schema migration for existing databases
+        - Column existence checks before ALTER TABLE
+        - Schema version tracking for reliable upgrades
+        """
         if not AIOSQLITE_AVAILABLE:
             return None
 
@@ -675,97 +986,15 @@ class UnifiedDataFlywheel:
                 self._async_db_conn = await aiosqlite.connect(str(db_path))
                 self._async_db_conn.row_factory = aiosqlite.Row
 
-                # Initialize schema if needed
+                # v10.0: Run schema migrations (creates tables + adds missing columns)
+                migration_success = await run_schema_migrations_async(self._async_db_conn)
+
+                if not migration_success:
+                    logger.warning("[Flywheel] Async schema migration had issues")
+
+                # Create additional async-only tables and indexes
+                # (these are extras that may not be in the core schema)
                 await self._async_db_conn.executescript("""
-                    CREATE TABLE IF NOT EXISTS experiences (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        timestamp REAL NOT NULL,
-                        source TEXT NOT NULL,
-                        input_text TEXT NOT NULL,
-                        output_text TEXT NOT NULL,
-                        context TEXT,
-                        quality_score REAL DEFAULT 0.5,
-                        feedback TEXT,
-                        correction TEXT,
-                        used_in_training INTEGER DEFAULT 0,
-                        training_run_id INTEGER,
-                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                    );
-
-                    CREATE TABLE IF NOT EXISTS scraped_content (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        url TEXT UNIQUE NOT NULL,
-                        title TEXT,
-                        content TEXT NOT NULL,
-                        content_type TEXT DEFAULT 'documentation',
-                        topic TEXT,
-                        language TEXT DEFAULT 'en',
-                        quality_score REAL DEFAULT 0.5,
-                        word_count INTEGER,
-                        code_blocks INTEGER DEFAULT 0,
-                        scraped_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                        used_in_training INTEGER DEFAULT 0,
-                        training_run_id INTEGER
-                    );
-
-                    CREATE TABLE IF NOT EXISTS learning_goals (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        topic TEXT UNIQUE NOT NULL,
-                        description TEXT,
-                        priority INTEGER DEFAULT 5,
-                        source TEXT DEFAULT 'auto',
-                        urls TEXT,
-                        keywords TEXT,
-                        discovered_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                        started_at DATETIME,
-                        completed INTEGER DEFAULT 0,
-                        completed_at DATETIME,
-                        experiences_count INTEGER DEFAULT 0,
-                        pages_scraped INTEGER DEFAULT 0
-                    );
-
-                    CREATE TABLE IF NOT EXISTS training_runs (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        started_at DATETIME NOT NULL,
-                        completed_at DATETIME,
-                        status TEXT DEFAULT 'running',
-                        experiences_used INTEGER DEFAULT 0,
-                        pages_used INTEGER DEFAULT 0,
-                        training_steps INTEGER DEFAULT 0,
-                        training_epochs INTEGER DEFAULT 0,
-                        learning_rate REAL,
-                        batch_size INTEGER,
-                        final_loss REAL,
-                        final_eval_loss REAL,
-                        model_path TEXT,
-                        gguf_path TEXT,
-                        gguf_size_mb REAL,
-                        gguf_checksum TEXT,
-                        gcs_path TEXT,
-                        deployed_to_local INTEGER DEFAULT 0,
-                        deployed_to_cloud INTEGER DEFAULT 0,
-                        error TEXT,
-                        error_traceback TEXT,
-                        config_json TEXT
-                    );
-
-                    CREATE TABLE IF NOT EXISTS model_deployments (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        training_run_id INTEGER,
-                        model_name TEXT NOT NULL,
-                        model_version TEXT,
-                        model_path TEXT NOT NULL,
-                        gguf_path TEXT,
-                        checksum TEXT,
-                        model_size_mb REAL,
-                        deployed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                        deployed_to TEXT,
-                        gcs_path TEXT,
-                        active INTEGER DEFAULT 1,
-                        performance_score REAL,
-                        rollback_reason TEXT
-                    );
-
                     CREATE TABLE IF NOT EXISTS intelligence_insights (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         insight_type TEXT NOT NULL,
@@ -779,20 +1008,17 @@ class UnifiedDataFlywheel:
                         outcome TEXT
                     );
 
-                    CREATE INDEX IF NOT EXISTS idx_experiences_timestamp ON experiences(timestamp);
-                    CREATE INDEX IF NOT EXISTS idx_experiences_used ON experiences(used_in_training);
                     CREATE INDEX IF NOT EXISTS idx_experiences_quality ON experiences(quality_score DESC);
-                    CREATE INDEX IF NOT EXISTS idx_scraped_url ON scraped_content(url);
                     CREATE INDEX IF NOT EXISTS idx_scraped_topic ON scraped_content(topic);
                     CREATE INDEX IF NOT EXISTS idx_scraped_quality ON scraped_content(quality_score DESC);
-                    CREATE INDEX IF NOT EXISTS idx_goals_priority ON learning_goals(priority DESC);
                     CREATE INDEX IF NOT EXISTS idx_goals_completed ON learning_goals(completed);
-                    CREATE INDEX IF NOT EXISTS idx_runs_status ON training_runs(status);
                     CREATE INDEX IF NOT EXISTS idx_deployments_active ON model_deployments(active);
                 """)
                 await self._async_db_conn.commit()
 
-                logger.info(f"[Flywheel] Async SQLite connection established: {db_path}")
+                # Get schema version for logging
+                schema_version = await _get_current_schema_version_async(self._async_db_conn)
+                logger.info(f"[Flywheel] Async SQLite connection established: {db_path} (schema v{schema_version})")
 
             return self._async_db_conn
 

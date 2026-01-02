@@ -138,6 +138,18 @@ from .unified_data_flywheel import (
     get_flywheel_status,
 )
 
+# Intelligent Learning Goals Discovery
+from .intelligent_learning_goals_discovery import (
+    IntelligentLearningGoalsDiscovery,
+    GoalsDiscoveryConfig,
+    LearningGoal,
+    GoalSource,
+    GoalPriority,
+    GoalStatus,
+    get_goals_discovery,
+    get_goals_discovery_async,
+)
+
 __all__ = [
     # Original Decision Engine
     'AutonomousDecisionEngine',
@@ -258,4 +270,14 @@ __all__ = [
     'get_data_flywheel',
     'run_flywheel_cycle',
     'get_flywheel_status',
+
+    # Intelligent Learning Goals Discovery
+    'IntelligentLearningGoalsDiscovery',
+    'GoalsDiscoveryConfig',
+    'LearningGoal',
+    'GoalSource',
+    'GoalPriority',
+    'GoalStatus',
+    'get_goals_discovery',
+    'get_goals_discovery_async',
 ]
