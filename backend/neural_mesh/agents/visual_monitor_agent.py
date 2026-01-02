@@ -1775,6 +1775,15 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
         logger.info(f"✅ [v28.0] Validated {len(windows)} windows for '{app_name}'")
 
         # =====================================================================
+        # v28.0: WINDOW NORMALIZATION - Ensure Required Fields Exist
+        # =====================================================================
+        # ROOT CAUSE FIX: KeyError: 'confidence'
+        # PROBLEM: Different window discovery paths return different fields
+        # SOLUTION: Normalize all windows to have consistent required fields
+        # =====================================================================
+        windows = self._normalize_window_data(windows, app_name)
+
+        # =====================================================================
         # v22.0.0: AUTO-HANDOFF FIRST - Teleport Before Filter!
         # =====================================================================
         # CRITICAL ORDER OF OPERATIONS:
@@ -2208,7 +2217,10 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
 
         logger.info(f"✅ Found {len(windows)} {app_name} windows:")
         for w in windows:
-            logger.info(f"  - Window {w['window_id']} on Space {w['space_id']} ({w['confidence']}% match)")
+            # v28.0: Use defensive .get() access for optional fields
+            confidence = w.get('confidence', 'N/A')
+            confidence_str = f"{confidence}%" if isinstance(confidence, (int, float)) else confidence
+            logger.info(f"  - Window {w.get('window_id', '?')} on Space {w.get('space_id', '?')} ({confidence_str} match)")
 
         # Validate max watchers
         max_watchers = self.config.max_multi_space_watchers
@@ -4017,11 +4029,13 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                             )
                             for window in windows:
                                 if app_name.lower() in window.app_name.lower():
+                                    # v28.0: Always include confidence for consistent window data
                                     return {
                                         'found': True,
                                         'window_id': window.window_id,
                                         'space_id': target_space,
                                         'app_name': window.app_name,
+                                        'confidence': 85,  # Moderate confidence from combined method
                                         'method': 'spatial_awareness + ferrari'
                                     }
 
@@ -4034,14 +4048,95 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
         logger.warning(f"⚠️  Using legacy window estimation for '{app_name}'")
         window_id = self._estimate_window_id(app_name)
 
+        # v28.0: Always include confidence for consistent window data
         return {
             'found': True,  # Optimistic - may fail later
             'window_id': window_id,
             'space_id': space_id or 1,
             'app_name': app_name,
+            'confidence': 50,  # Low confidence for estimated windows
             'method': 'legacy_estimation',
             'warning': 'Using estimated window ID - may be inaccurate'
         }
+
+    def _normalize_window_data(
+        self,
+        windows: List[Dict[str, Any]],
+        app_name: str
+    ) -> List[Dict[str, Any]]:
+        """
+        v28.0: Normalize window data to ensure all required fields exist.
+
+        ROOT CAUSE FIX: KeyError: 'confidence'
+        Different window discovery paths (Ferrari, MultiSpace, SpatialAwareness, Legacy)
+        return different sets of fields. This normalizer ensures ALL windows have
+        consistent required fields with sensible defaults.
+
+        Required fields ensured:
+        - window_id: int (required, no default)
+        - space_id: int (default: 1)
+        - app_name: str (default: from parameter)
+        - confidence: int (default: 75)
+        - found: bool (default: True)
+        - method: str (default: 'unknown')
+
+        Args:
+            windows: List of window dictionaries to normalize
+            app_name: Application name to use as default
+
+        Returns:
+            List of normalized window dictionaries
+        """
+        normalized = []
+
+        for w in windows:
+            if not isinstance(w, dict):
+                logger.warning(f"[v28.0] Skipping non-dict window: {type(w)}")
+                continue
+
+            # Skip windows without window_id (can't monitor without it)
+            if not w.get('window_id'):
+                logger.warning(f"[v28.0] Skipping window without window_id: {w}")
+                continue
+
+            # Create normalized window with defaults for missing fields
+            normalized_window = {
+                # Required fields
+                'window_id': w['window_id'],
+                'space_id': w.get('space_id', 1),
+                'app_name': w.get('app_name', app_name),
+
+                # v28.0: Ensure confidence always exists (fixes KeyError)
+                'confidence': w.get('confidence', 75),  # Default moderate confidence
+
+                # Metadata
+                'found': w.get('found', True),
+                'method': w.get('method', 'unknown'),
+
+                # Optional fields - preserve if they exist
+                'window_title': w.get('window_title', ''),
+                'bounds': w.get('bounds', {}),
+                'is_visible': w.get('is_visible', True),
+                'width': w.get('width', 0),
+                'height': w.get('height', 0),
+            }
+
+            # Preserve any teleport-related fields
+            if w.get('teleported'):
+                normalized_window['teleported'] = True
+                normalized_window['original_space'] = w.get('original_space')
+                normalized_window['rescue_method'] = w.get('rescue_method')
+                normalized_window['rescue_strategy'] = w.get('rescue_strategy')
+                normalized_window['rescue_duration_ms'] = w.get('rescue_duration_ms')
+
+            # Preserve any warning
+            if w.get('warning'):
+                normalized_window['warning'] = w['warning']
+
+            normalized.append(normalized_window)
+
+        logger.debug(f"[v28.0] Normalized {len(normalized)} windows (from {len(windows)})")
+        return normalized
 
     def _fuzzy_match(self, term1: str, term2: str, threshold: float = 0.6) -> bool:
         """
