@@ -14,6 +14,8 @@
 #include <thread>
 #include <numeric>
 #include <algorithm>
+#include <memory>  // v29.0: For std::shared_ptr in DelegateSharedState
+#include <cstdlib>  // v29.0: For getenv() in configurable shutdown timeout
 
 #ifdef __APPLE__
 #import <Foundation/Foundation.h>
@@ -28,10 +30,54 @@
 // ===== Streaming Delegate =====
 
 /**
+ * v29.0: ROBUST DELEGATE LIFECYCLE MANAGEMENT
+ *
+ * Fixes SIGABRT crash caused by:
+ * 1. Race condition: Callbacks accessing dangling C++ pointers during shutdown
+ * 2. Missing synchronization: Delegate destroyed while callbacks still pending
+ * 3. No validity guard: No early-exit check before accessing shared state
+ *
+ * Solution:
+ * - Atomic `stopping` flag for immediate callback rejection
+ * - Atomic `activeCallbacks` counter to track in-flight callbacks
+ * - Proper synchronization barrier before destroying shared state
+ * - Comprehensive null/validity checks at every access point
+ */
+
+/**
+ * Shared state container - outlives the delegate
+ * This allows safe access even during shutdown transitions
+ */
+struct DelegateSharedState {
+    std::atomic<bool> stopping{false};          // Signal to stop accepting frames
+    std::atomic<int32_t> activeCallbacks{0};    // Count of in-flight callbacks
+    std::atomic<bool> isValid{true};            // Master validity flag
+
+    // Callback to wait for all active callbacks to drain
+    void waitForCallbacksDrain(std::chrono::milliseconds timeout = std::chrono::milliseconds(2000)) {
+        auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (activeCallbacks.load() > 0) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                // Timeout - force invalidate (callbacks will early-exit)
+                isValid.store(false);
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+};
+
+/**
  * Continuous streaming delegate for persistent SCStream
  * Receives frames at target FPS and buffers them
+ *
+ * v29.0: Now uses shared state for safe lifecycle management
  */
 @interface JARVISStreamingDelegate : NSObject <SCStreamDelegate, SCStreamOutput>
+// v29.0: Shared state for lifecycle management (shared_ptr so it outlives delegate)
+@property (nonatomic, assign) std::shared_ptr<DelegateSharedState>* sharedState;
+
+// Frame buffer and synchronization (guarded by sharedState validity)
 @property (nonatomic, assign) std::queue<jarvis::vision::StreamFrame>* frameBuffer;
 @property (nonatomic, assign) std::mutex* bufferMutex;
 @property (nonatomic, assign) std::condition_variable* bufferCV;
@@ -49,13 +95,57 @@
 
 @implementation JARVISStreamingDelegate
 
+/**
+ * v29.0: RAII guard for tracking active callbacks
+ * Ensures activeCallbacks is decremented even on early return or exception
+ */
+struct CallbackGuard {
+    std::shared_ptr<DelegateSharedState> state;
+    bool valid;
+
+    CallbackGuard(std::shared_ptr<DelegateSharedState>* statePtr)
+        : state(statePtr ? *statePtr : nullptr), valid(false) {
+        if (state && state->isValid.load() && !state->stopping.load()) {
+            state->activeCallbacks.fetch_add(1);
+            valid = true;
+        }
+    }
+
+    ~CallbackGuard() {
+        if (valid && state) {
+            state->activeCallbacks.fetch_sub(1);
+        }
+    }
+
+    bool isValid() const {
+        return valid && state && state->isValid.load() && !state->stopping.load();
+    }
+};
+
 - (void)stream:(SCStream *)stream
     didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
     ofType:(SCStreamOutputType)type {
 
     if (type != SCStreamOutputTypeScreen) return;
 
+    // v29.0: CRITICAL - Guard against accessing dangling pointers during shutdown
+    // This RAII guard tracks active callbacks and checks validity atomically
+    CallbackGuard guard(_sharedState);
+    if (!guard.isValid()) {
+        return;  // Delegate is shutting down or invalid - early exit
+    }
+
     @autoreleasepool {
+        // v29.0: Double-check validity before any C++ object access
+        if (!_sharedState || !(*_sharedState)->isValid.load()) {
+            return;
+        }
+
+        // v29.0: Null-check all pointers before use
+        if (!_frameBuffer || !_bufferMutex || !_bufferCV || !_frameCounter || !_droppedCounter) {
+            return;  // Invalid state - cannot process
+        }
+
         // Process frame
         jarvis::vision::StreamFrame frame = [self processSampleBuffer:sampleBuffer];
 
@@ -63,38 +153,76 @@
             return;  // Processing failed
         }
 
-        // Increment frame counter
-        frame.frame_number = ++(*_frameCounter);
+        // v29.0: Check validity again before modifying shared state
+        if (!guard.isValid()) {
+            return;
+        }
+
+        // Increment frame counter (atomic, safe even during shutdown)
+        frame.frame_number = _frameCounter->fetch_add(1) + 1;
 
         // Call user callback if set
         if (_frameCallback && *_frameCallback) {
-            (*_frameCallback)(frame);
+            try {
+                (*_frameCallback)(frame);
+            } catch (...) {
+                // v29.0: Don't let callback exceptions crash the stream
+            }
+        }
+
+        // v29.0: Final validity check before buffer modification
+        if (!guard.isValid()) {
+            return;
         }
 
         // Add to buffer
         {
             std::unique_lock<std::mutex> lock(*_bufferMutex);
 
+            // v29.0: Check validity after acquiring lock (shutdown might have occurred while waiting)
+            if (!guard.isValid()) {
+                return;
+            }
+
             // Check buffer capacity
             if (_maxBufferSize > 0 && _frameBuffer->size() >= _maxBufferSize) {
                 if (_dropOnOverflow) {
                     // Drop oldest frame
                     _frameBuffer->pop();
-                    ++(*_droppedCounter);
+                    _droppedCounter->fetch_add(1);
                 } else {
-                    // Wait for space (blocking)
+                    // Wait for space (with periodic validity check)
                     size_t maxSize = _maxBufferSize;
-                    _bufferCV->wait(lock, [&] {
-                        return _frameBuffer->size() < maxSize;
-                    });
+                    while (_frameBuffer->size() >= maxSize) {
+                        // v29.0: Use timed wait to check validity periodically
+                        auto status = _bufferCV->wait_for(lock, std::chrono::milliseconds(100));
+                        if (!guard.isValid()) {
+                            return;  // Shutdown during wait
+                        }
+                        if (status == std::cv_status::timeout) {
+                            // Check if we should continue waiting
+                            if (!guard.isValid()) {
+                                return;
+                            }
+                        }
+                    }
                 }
             }
 
-            _frameBuffer->push(std::move(frame));
+            // v29.0: Final check before push
+            if (guard.isValid()) {
+                _frameBuffer->push(std::move(frame));
+            }
         }
 
-        // Notify waiting consumers
-        _bufferCV->notify_one();
+        // Notify waiting consumers (safe even if CV is being destroyed)
+        if (guard.isValid() && _bufferCV) {
+            try {
+                _bufferCV->notify_one();
+            } catch (...) {
+                // v29.0: Ignore notification errors during shutdown
+            }
+        }
     }
 }
 
@@ -182,8 +310,17 @@
 }
 
 - (void)stream:(SCStream *)stream didStopWithError:(NSError *)error {
+    // v29.0: Check shared state validity before accessing callback
+    if (!_sharedState || !(*_sharedState)->isValid.load() || (*_sharedState)->stopping.load()) {
+        return;  // Shutting down - ignore error callback
+    }
+
     if (error && _errorCallback && *_errorCallback) {
-        (*_errorCallback)(std::string("Stream stopped: ") + error.localizedDescription.UTF8String);
+        try {
+            (*_errorCallback)(std::string("Stream stopped: ") + error.localizedDescription.UTF8String);
+        } catch (...) {
+            // v29.0: Don't let callback exceptions crash the stream
+        }
     }
 }
 
@@ -210,6 +347,9 @@ public:
     id<MTLDevice> metal_device = nil;
 #endif
 
+    // v29.0: Shared state for safe delegate lifecycle management
+    std::shared_ptr<DelegateSharedState> shared_state;
+
     // Frame buffer
     std::queue<StreamFrame> frame_buffer;
     mutable std::mutex buffer_mutex;
@@ -231,7 +371,8 @@ public:
 
     Impl(uint32_t wid, const StreamConfig& cfg)
         : window_id(wid), config(cfg), frame_callback(cfg.frame_callback),
-          error_callback(cfg.error_callback) {
+          error_callback(cfg.error_callback),
+          shared_state(std::make_shared<DelegateSharedState>()) {  // v29.0: Initialize shared state
 #ifdef __APPLE__
         // Initialize Metal if GPU acceleration enabled
         if (config.use_gpu_acceleration) {
@@ -254,8 +395,19 @@ public:
     ~Impl() {
         stop_stream();
 #ifdef __APPLE__
+        // v29.0: Ensure capture queue is fully drained before releasing
         if (capture_queue) {
+            // Synchronous barrier to ensure all pending work completes
+            dispatch_sync(capture_queue, ^{
+                // Empty block - just drains the queue
+            });
             dispatch_release(capture_queue);
+            capture_queue = nil;
+        }
+
+        // v29.0: Final invalidation of shared state (callbacks will early-exit)
+        if (shared_state) {
+            shared_state->isValid.store(false);
         }
 #endif
     }
@@ -333,8 +485,14 @@ public:
                 }
             }
 
+            // v29.0: Reset shared state for new stream (in case of restart)
+            shared_state->stopping.store(false);
+            shared_state->isValid.store(true);
+            shared_state->activeCallbacks.store(0);
+
             // Create delegate
             delegate = [[JARVISStreamingDelegate alloc] init];
+            delegate.sharedState = &shared_state;  // v29.0: Connect shared state
             delegate.frameBuffer = &frame_buffer;
             delegate.bufferMutex = &buffer_mutex;
             delegate.bufferCV = &buffer_cv;
@@ -406,14 +564,50 @@ public:
 #endif
     }
 
+    /**
+     * v29.0: ROBUST STREAM SHUTDOWN PROTOCOL
+     *
+     * The shutdown sequence is carefully ordered to prevent SIGABRT:
+     *
+     * 1. Signal stopping via shared_state (callbacks will early-exit)
+     * 2. Set active=false to stop external consumers
+     * 3. Wake up any waiting consumers (they'll see active=false)
+     * 4. Wait for all active callbacks to drain
+     * 5. Stop the SCStream capture
+     * 6. Release delegate (safe now - no callbacks in flight)
+     * 7. Clear the buffer
+     * 8. Invalidate shared state (final safety)
+     */
     void stop_stream() {
         if (!active.load()) {
             return;
         }
 
+        // v29.0: PHASE 1 - Signal shutdown to delegate callbacks FIRST
+        // This ensures any in-flight or pending callbacks will early-exit
+        if (shared_state) {
+            shared_state->stopping.store(true);
+        }
+
+        // v29.0: PHASE 2 - Signal to consumers that stream is stopping
         active.store(false);
 
+        // v29.0: PHASE 3 - Wake up any waiting consumers
+        // They'll check active flag and return
+        buffer_cv.notify_all();
+
 #ifdef __APPLE__
+        // v29.0: PHASE 4 - Wait for active callbacks to drain
+        // This is CRITICAL - ensures no callbacks are accessing C++ objects
+        if (shared_state) {
+            // Configurable timeout from environment
+            const char* timeout_env = getenv("JARVIS_STREAM_SHUTDOWN_TIMEOUT_MS");
+            int timeout_ms = timeout_env ? atoi(timeout_env) : 2000;
+
+            shared_state->waitForCallbacksDrain(std::chrono::milliseconds(timeout_ms));
+        }
+
+        // v29.0: PHASE 5 - Stop the SCStream
         if (stream) {
             __block bool stopped = false;
             dispatch_semaphore_t stop_sem = dispatch_semaphore_create(0);
@@ -423,20 +617,37 @@ public:
                 dispatch_semaphore_signal(stop_sem);
             }];
 
+            // Wait with timeout
             dispatch_semaphore_wait(stop_sem, dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC));
 
+            // v29.0: PHASE 6 - Drain capture queue before releasing delegate
+            // This ensures any final callbacks complete before delegate is nil'd
+            if (capture_queue) {
+                dispatch_sync(capture_queue, ^{
+                    // Barrier block - ensures queue is drained
+                });
+            }
+
+            // v29.0: Now safe to release - no callbacks can be in flight
             stream = nil;
             delegate = nil;
         }
 #endif
 
-        // Clear buffer
+        // v29.0: PHASE 7 - Clear buffer (safe now - no callbacks accessing it)
         {
             std::lock_guard<std::mutex> lock(buffer_mutex);
             while (!frame_buffer.empty()) {
                 frame_buffer.pop();
             }
         }
+
+        // v29.0: PHASE 8 - Final invalidation (extra safety)
+        if (shared_state) {
+            shared_state->isValid.store(false);
+        }
+
+        // Final notification for any remaining waiters
         buffer_cv.notify_all();
     }
 
