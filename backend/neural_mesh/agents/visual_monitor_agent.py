@@ -2616,7 +2616,7 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
             god_mode_task_id = f"god_mode_{app_name}_{int(datetime.now().timestamp() * 1000)}"
 
             logger.info(
-                f"[God Mode] ✅ Background monitoring active: {new_watchers_started} watchers, "
+                f"[God Mode] ✅ Background monitoring active: {new_watchers_active} watchers, "
                 f"watching for '{trigger_text}'"
             )
 
@@ -2853,7 +2853,7 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                     startup_state.monitoring_start_time = time.time()
 
                     # Build confirmation message - use ACTUAL watcher count, not expected
-                    actual_watchers = new_watchers_started
+                    actual_watchers = new_watchers_active
                     spaces_list = [meta['space_id'] for meta in watcher_metadata[:actual_watchers]]
 
                     if actual_watchers == 1:
@@ -2887,13 +2887,13 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                 'success': True,
                 'status': 'monitoring',
                 'god_mode_task_id': god_mode_task_id,
-                'total_watchers': new_watchers_started,  # v16.0: Actual count
+                'total_watchers': new_watchers_active,  # v16.0: Actual count
                 'expected_watchers': expected_watchers,  # v16.0: For transparency
                 'app_name': app_name,
                 'trigger_text': trigger_text,
-                'spaces_monitored': [meta['space_id'] for meta in watcher_metadata[:new_watchers_started]],
+                'spaces_monitored': [meta['space_id'] for meta in watcher_metadata[:new_watchers_active]],
                 'startup_time_seconds': (datetime.now() - start_wait_time).total_seconds(),
-                'message': f"Monitoring {new_watchers_started} {app_name} windows for '{trigger_text}'"
+                'message': f"Monitoring {new_watchers_active} {app_name} windows for '{trigger_text}'"
             }
 
     async def _coordinate_watchers(
