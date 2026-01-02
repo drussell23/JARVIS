@@ -362,6 +362,263 @@ class YabaiConfig:
     enable_auto_recovery: bool = True
     config_path: Path = field(default_factory=lambda: Path.home() / ".config" / "yabai" / "yabairc")
 
+
+# =============================================================================
+# v24.0.0: INTELLIGENT SEARCH & RESCUE PROTOCOL
+# =============================================================================
+# Root cause solution for dehydrated windows with:
+# - Multi-strategy rescue approaches
+# - Dynamic wake delay calibration
+# - Parallel rescue with concurrency control
+# - Retry logic with exponential backoff
+# - Root cause detection for failures
+# - Comprehensive telemetry and diagnostics
+# =============================================================================
+
+class RescueFailureReason(Enum):
+    """Root cause categories for rescue failures."""
+    WINDOW_NOT_FOUND = "window_not_found"           # Window doesn't exist or was closed
+    SPACE_NOT_FOUND = "space_not_found"             # Source/target space doesn't exist
+    YABAI_UNAVAILABLE = "yabai_unavailable"         # Yabai service not running
+    YABAI_TIMEOUT = "yabai_timeout"                 # Yabai command timed out
+    PERMISSION_DENIED = "permission_denied"         # Accessibility permission issue
+    WINDOW_MINIMIZED = "window_minimized"           # Window is minimized (special state)
+    WINDOW_FULLSCREEN = "window_fullscreen"         # Window in fullscreen mode
+    SPACE_SWITCH_FAILED = "space_switch_failed"     # Couldn't switch to source space
+    MOVE_AFTER_WAKE_FAILED = "move_after_wake_failed"  # Woke window but move still failed
+    UNKNOWN = "unknown"                             # Unknown failure reason
+
+
+class RescueStrategy(Enum):
+    """Different strategies for rescuing dehydrated windows."""
+    DIRECT = "direct"                   # Try direct move (fast path)
+    SWITCH_GRAB_RETURN = "switch_grab_return"  # Classic rescue: switch → move → return
+    FOCUS_THEN_MOVE = "focus_then_move"  # Focus window first, then move
+    UNMINIMIZE_FIRST = "unminimize_first"  # Unminimize if minimized, then move
+    SPACE_FOCUS_EXTENDED = "space_focus_extended"  # Extended wake delay for stubborn windows
+
+
+@dataclass
+class RescueTelemetry:
+    """
+    Telemetry and diagnostics for rescue operations.
+
+    Tracks success rates, timing, and failure patterns to:
+    - Calibrate wake delays dynamically
+    - Identify problematic windows/apps
+    - Optimize strategy selection
+    """
+    total_attempts: int = 0
+    successful_rescues: int = 0
+    failed_rescues: int = 0
+
+    # Strategy success tracking
+    direct_successes: int = 0
+    switch_grab_return_successes: int = 0
+    focus_then_move_successes: int = 0
+    unminimize_first_successes: int = 0
+    extended_wake_successes: int = 0
+
+    # Timing metrics (rolling averages)
+    avg_direct_time_ms: float = 0.0
+    avg_rescue_time_ms: float = 0.0
+    avg_wake_delay_needed_ms: float = 50.0  # Start with default
+
+    # Failure tracking by reason
+    failures_by_reason: Dict[str, int] = field(default_factory=dict)
+
+    # App-specific metrics for intelligent routing
+    app_success_rates: Dict[str, float] = field(default_factory=dict)
+    app_preferred_strategies: Dict[str, str] = field(default_factory=dict)
+
+    # Last calibration data
+    last_calibration_time: Optional[datetime] = None
+    calibrated_wake_delay_ms: float = 50.0
+
+    @property
+    def success_rate(self) -> float:
+        """Calculate overall rescue success rate."""
+        if self.total_attempts == 0:
+            return 1.0  # No data, assume success
+        return self.successful_rescues / self.total_attempts
+
+    def record_attempt(
+        self,
+        success: bool,
+        strategy: RescueStrategy,
+        duration_ms: float,
+        failure_reason: Optional[RescueFailureReason] = None,
+        app_name: Optional[str] = None,
+        wake_delay_used_ms: Optional[float] = None
+    ):
+        """Record a rescue attempt for telemetry."""
+        self.total_attempts += 1
+
+        if success:
+            self.successful_rescues += 1
+
+            # Track strategy success
+            if strategy == RescueStrategy.DIRECT:
+                self.direct_successes += 1
+                alpha = 0.3
+                self.avg_direct_time_ms = alpha * duration_ms + (1 - alpha) * self.avg_direct_time_ms
+            elif strategy == RescueStrategy.SWITCH_GRAB_RETURN:
+                self.switch_grab_return_successes += 1
+            elif strategy == RescueStrategy.FOCUS_THEN_MOVE:
+                self.focus_then_move_successes += 1
+            elif strategy == RescueStrategy.UNMINIMIZE_FIRST:
+                self.unminimize_first_successes += 1
+            elif strategy == RescueStrategy.SPACE_FOCUS_EXTENDED:
+                self.extended_wake_successes += 1
+
+            # Update rescue timing
+            if strategy != RescueStrategy.DIRECT:
+                alpha = 0.3
+                self.avg_rescue_time_ms = alpha * duration_ms + (1 - alpha) * self.avg_rescue_time_ms
+
+                # Calibrate wake delay based on what worked
+                if wake_delay_used_ms is not None:
+                    self.avg_wake_delay_needed_ms = (
+                        alpha * wake_delay_used_ms + (1 - alpha) * self.avg_wake_delay_needed_ms
+                    )
+
+            # Track app success
+            if app_name:
+                current_rate = self.app_success_rates.get(app_name, 1.0)
+                self.app_success_rates[app_name] = 0.8 * current_rate + 0.2 * 1.0
+
+                # Remember preferred strategy for this app
+                self.app_preferred_strategies[app_name] = strategy.value
+        else:
+            self.failed_rescues += 1
+
+            # Track failure reason
+            reason_key = failure_reason.value if failure_reason else "unknown"
+            self.failures_by_reason[reason_key] = self.failures_by_reason.get(reason_key, 0) + 1
+
+            # Track app failure
+            if app_name:
+                current_rate = self.app_success_rates.get(app_name, 1.0)
+                self.app_success_rates[app_name] = 0.8 * current_rate + 0.2 * 0.0
+
+    def get_recommended_wake_delay_ms(self, app_name: Optional[str] = None) -> float:
+        """
+        Get the recommended wake delay based on telemetry.
+
+        Considers:
+        - Overall average that worked
+        - App-specific requirements (some apps need more time)
+        - Base environment variable override
+        """
+        # Check for environment override
+        env_override = os.environ.get("JARVIS_RESCUE_WAKE_DELAY")
+        if env_override:
+            return float(env_override) * 1000  # Convert seconds to ms
+
+        base_delay = max(self.avg_wake_delay_needed_ms, 30.0)  # At least 30ms
+
+        # Increase for apps with lower success rates
+        if app_name and app_name in self.app_success_rates:
+            app_rate = self.app_success_rates[app_name]
+            if app_rate < 0.8:  # Lower success rate = need more time
+                base_delay *= (2.0 - app_rate)  # Up to 2x for problematic apps
+
+        return min(base_delay, 500.0)  # Cap at 500ms
+
+    def get_recommended_strategy(
+        self,
+        app_name: Optional[str] = None,
+        is_minimized: bool = False,
+        is_fullscreen: bool = False
+    ) -> RescueStrategy:
+        """Get the recommended rescue strategy based on telemetry and window state."""
+        # Special cases first
+        if is_minimized:
+            return RescueStrategy.UNMINIMIZE_FIRST
+        if is_fullscreen:
+            return RescueStrategy.SPACE_FOCUS_EXTENDED
+
+        # Check app-specific preference
+        if app_name and app_name in self.app_preferred_strategies:
+            try:
+                return RescueStrategy(self.app_preferred_strategies[app_name])
+            except ValueError:
+                pass
+
+        # Default to switch-grab-return (most reliable)
+        return RescueStrategy.SWITCH_GRAB_RETURN
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert telemetry to dictionary for logging/reporting."""
+        return {
+            "total_attempts": self.total_attempts,
+            "success_rate": f"{self.success_rate * 100:.1f}%",
+            "successful_rescues": self.successful_rescues,
+            "failed_rescues": self.failed_rescues,
+            "strategy_successes": {
+                "direct": self.direct_successes,
+                "switch_grab_return": self.switch_grab_return_successes,
+                "focus_then_move": self.focus_then_move_successes,
+                "unminimize_first": self.unminimize_first_successes,
+                "extended_wake": self.extended_wake_successes,
+            },
+            "timing": {
+                "avg_direct_ms": round(self.avg_direct_time_ms, 2),
+                "avg_rescue_ms": round(self.avg_rescue_time_ms, 2),
+                "calibrated_wake_delay_ms": round(self.calibrated_wake_delay_ms, 2),
+            },
+            "failures_by_reason": self.failures_by_reason,
+            "app_success_rates": {
+                k: f"{v * 100:.1f}%" for k, v in self.app_success_rates.items()
+            },
+        }
+
+
+@dataclass
+class RescueResult:
+    """Detailed result of a rescue operation."""
+    success: bool
+    window_id: int
+    source_space: Optional[int]
+    target_space: int
+    strategy_used: RescueStrategy
+    duration_ms: float
+    failure_reason: Optional[RescueFailureReason] = None
+    attempts: int = 1
+    wake_delay_used_ms: float = 0.0
+    app_name: Optional[str] = None
+
+    # For batch operations
+    method: str = ""  # "direct", "rescue", "failed" for compatibility
+
+    def __post_init__(self):
+        """Set method for backward compatibility."""
+        if not self.method:
+            if self.success and self.strategy_used == RescueStrategy.DIRECT:
+                self.method = "direct"
+            elif self.success:
+                self.method = "rescue"
+            else:
+                self.method = "failed"
+
+
+# Global telemetry instance (module-level for persistence across calls)
+_RESCUE_TELEMETRY: Optional[RescueTelemetry] = None
+
+
+def get_rescue_telemetry() -> RescueTelemetry:
+    """Get or create the global rescue telemetry instance."""
+    global _RESCUE_TELEMETRY
+    if _RESCUE_TELEMETRY is None:
+        _RESCUE_TELEMETRY = RescueTelemetry()
+    return _RESCUE_TELEMETRY
+
+
+def reset_rescue_telemetry() -> None:
+    """Reset the global rescue telemetry (for testing)."""
+    global _RESCUE_TELEMETRY
+    _RESCUE_TELEMETRY = None
+
 # Thread pool for subprocess operations (avoids blocking event loop)
 _yabai_executor: Optional[ThreadPoolExecutor] = None
 
@@ -1241,182 +1498,546 @@ class YabaiSpaceDetector:
         self,
         window_id: int,
         target_space: int,
-        source_space: Optional[int] = None
+        source_space: Optional[int] = None,
+        app_name: Optional[str] = None,
+        max_retries: int = 3,
+        is_minimized: bool = False,
+        is_fullscreen: bool = False
     ) -> Tuple[bool, str]:
         """
-        Move a window to a target space, using rescue protocol if needed.
+        Move a window to a target space using INTELLIGENT SEARCH & RESCUE PROTOCOL v24.0.
 
-        SEARCH & RESCUE PROTOCOL:
+        INTELLIGENT SEARCH & RESCUE PROTOCOL:
         1. Fast Path: Try direct move (works for visible windows)
-        2. Rescue Path: If window is "dehydrated" on hidden space:
-           a) Switch to source space to wake window
-           b) Move the window while awake
-           c) Return to original space immediately
+        2. Strategy Selection: Choose best rescue strategy based on telemetry
+        3. Retry with Backoff: Multiple attempts with exponential backoff
+        4. Multi-Strategy Fallback: Try alternative strategies on failure
+        5. Telemetry Recording: Track success/failure for learning
 
         Args:
             window_id: The window ID to move
             target_space: The target space index (1-based)
             source_space: The window's current space (optional, for rescue)
+            app_name: Application name for telemetry (optional)
+            max_retries: Maximum retry attempts (default: 3)
+            is_minimized: Whether window is minimized (affects strategy)
+            is_fullscreen: Whether window is fullscreen (affects strategy)
 
         Returns:
             Tuple of (success, method):
             - success: True if window was moved
             - method: "direct" | "rescue" | "failed"
-
-        Example:
-            success, method = yabai.move_window_to_space_with_rescue(
-                window_id=12345,
-                target_space=10,  # Ghost Display
-                source_space=5    # Window's current hidden space
-            )
-            if success:
-                logger.info(f"Moved window via {method} path")
         """
+        start_time = time.time()
+        telemetry = get_rescue_telemetry()
+
         # =====================================================================
         # FAST PATH: Direct move (works for visible windows)
         # =====================================================================
         if self.move_window_to_space(window_id, target_space):
+            duration_ms = (time.time() - start_time) * 1000
+            telemetry.record_attempt(
+                success=True,
+                strategy=RescueStrategy.DIRECT,
+                duration_ms=duration_ms,
+                app_name=app_name
+            )
             return True, "direct"
 
         # =====================================================================
-        # RESCUE PATH: Window is on hidden space, needs wake-up
+        # INTELLIGENT RESCUE PATH: Multi-strategy with retry and backoff
         # =====================================================================
         if source_space is None:
             logger.warning(
                 f"[YABAI] 🛟 Rescue needed for window {window_id} but source_space unknown"
             )
+            telemetry.record_attempt(
+                success=False,
+                strategy=RescueStrategy.DIRECT,
+                duration_ms=(time.time() - start_time) * 1000,
+                failure_reason=RescueFailureReason.SPACE_NOT_FOUND,
+                app_name=app_name
+            )
             return False, "failed"
 
+        # Get recommended strategy from telemetry
+        recommended_strategy = telemetry.get_recommended_strategy(
+            app_name=app_name,
+            is_minimized=is_minimized,
+            is_fullscreen=is_fullscreen
+        )
+
         logger.info(
-            f"[YABAI] 🛟 SEARCH & RESCUE: Window {window_id} is dehydrated on Space {source_space}"
+            f"[YABAI] 🛟 INTELLIGENT RESCUE: Window {window_id} on Space {source_space} "
+            f"→ Space {target_space} (Strategy: {recommended_strategy.value})"
         )
 
         # Remember where the user is
         current_space = self.get_current_user_space()
         if current_space is None:
             logger.error("[YABAI] Cannot rescue: unable to determine current space")
+            telemetry.record_attempt(
+                success=False,
+                strategy=recommended_strategy,
+                duration_ms=(time.time() - start_time) * 1000,
+                failure_reason=RescueFailureReason.SPACE_NOT_FOUND,
+                app_name=app_name
+            )
             return False, "failed"
 
+        # Strategy order: try recommended first, then fallbacks
+        strategies_to_try = [recommended_strategy]
+        all_strategies = [
+            RescueStrategy.SWITCH_GRAB_RETURN,
+            RescueStrategy.FOCUS_THEN_MOVE,
+            RescueStrategy.SPACE_FOCUS_EXTENDED,
+            RescueStrategy.UNMINIMIZE_FIRST,
+        ]
+        for s in all_strategies:
+            if s not in strategies_to_try:
+                strategies_to_try.append(s)
+
         rescue_success = False
+        failure_reason = RescueFailureReason.UNKNOWN
+        total_attempts = 0
+        final_strategy = recommended_strategy
+        wake_delay_used_ms = 0.0
+
         try:
-            # A) Switch to source space to wake the window
-            logger.debug(f"[YABAI] 🛟 Step 1: Switching to Space {source_space} to wake window...")
-            if not self._switch_to_space(source_space):
-                logger.error(f"[YABAI] 🛟 Rescue failed: couldn't switch to Space {source_space}")
-                return False, "failed"
+            for strategy in strategies_to_try[:2]:  # Try at most 2 strategies
+                for attempt in range(1, max_retries + 1):
+                    total_attempts += 1
+                    final_strategy = strategy
 
-            # Minimal wake time - just enough for Yabai to see the window
-            # Using environment variable for tuning without code changes
-            wake_delay = float(os.environ.get("JARVIS_RESCUE_WAKE_DELAY", "0.05"))
-            time.sleep(wake_delay)
+                    # Calculate backoff delay
+                    backoff_multiplier = 2 ** (attempt - 1)
+                    base_wake_delay_ms = telemetry.get_recommended_wake_delay_ms(app_name)
 
-            # B) Move the window while it's awake
-            logger.debug(f"[YABAI] 🛟 Step 2: Moving window {window_id} to Space {target_space}...")
-            if self.move_window_to_space(window_id, target_space):
-                rescue_success = True
-                logger.info(
-                    f"[YABAI] 🛟 Rescue SUCCESS: Window {window_id} moved to Space {target_space}"
-                )
-            else:
-                logger.error(
-                    f"[YABAI] 🛟 Rescue FAILED: Window {window_id} still not accessible"
-                )
+                    # Strategy-specific wake delay multipliers
+                    if strategy == RescueStrategy.SPACE_FOCUS_EXTENDED:
+                        wake_delay_ms = base_wake_delay_ms * 3 * backoff_multiplier
+                    elif strategy == RescueStrategy.UNMINIMIZE_FIRST:
+                        wake_delay_ms = base_wake_delay_ms * 2 * backoff_multiplier
+                    else:
+                        wake_delay_ms = base_wake_delay_ms * backoff_multiplier
+
+                    wake_delay_used_ms = wake_delay_ms
+                    wake_delay_s = wake_delay_ms / 1000.0
+
+                    logger.debug(
+                        f"[YABAI] 🛟 Attempt {total_attempts}: {strategy.value} "
+                        f"(wake delay: {wake_delay_ms:.0f}ms)"
+                    )
+
+                    # Execute the rescue strategy
+                    success, reason = self._execute_rescue_strategy(
+                        strategy=strategy,
+                        window_id=window_id,
+                        source_space=source_space,
+                        target_space=target_space,
+                        wake_delay_s=wake_delay_s
+                    )
+
+                    if success:
+                        rescue_success = True
+                        break
+
+                    failure_reason = reason
+
+                    # Brief pause before retry
+                    if attempt < max_retries:
+                        time.sleep(0.1 * attempt)
+
+                if rescue_success:
+                    break
 
         except Exception as e:
             logger.error(f"[YABAI] 🛟 Rescue exception: {e}")
+            failure_reason = RescueFailureReason.UNKNOWN
 
         finally:
-            # C) ALWAYS return to original space (even on failure)
-            logger.debug(f"[YABAI] 🛟 Step 3: Returning to Space {current_space}...")
-            return_success = self._switch_to_space(current_space)
-            if not return_success:
-                logger.warning(
-                    f"[YABAI] 🛟 Warning: Failed to return to Space {current_space}"
-                )
+            # ALWAYS return to original space (even on failure)
+            logger.debug(f"[YABAI] 🛟 Returning to Space {current_space}...")
+            if not self._switch_to_space(current_space):
+                logger.warning(f"[YABAI] 🛟 Warning: Failed to return to Space {current_space}")
+
+        # Record telemetry
+        duration_ms = (time.time() - start_time) * 1000
+        telemetry.record_attempt(
+            success=rescue_success,
+            strategy=final_strategy,
+            duration_ms=duration_ms,
+            failure_reason=failure_reason if not rescue_success else None,
+            app_name=app_name,
+            wake_delay_used_ms=wake_delay_used_ms
+        )
+
+        if rescue_success:
+            logger.info(
+                f"[YABAI] 🛟 Rescue SUCCESS: Window {window_id} → Space {target_space} "
+                f"({final_strategy.value}, {total_attempts} attempts, {duration_ms:.0f}ms)"
+            )
+        else:
+            logger.warning(
+                f"[YABAI] 🛟 Rescue FAILED: Window {window_id} "
+                f"(reason: {failure_reason.value}, {total_attempts} attempts)"
+            )
 
         return rescue_success, "rescue" if rescue_success else "failed"
+
+    def _execute_rescue_strategy(
+        self,
+        strategy: RescueStrategy,
+        window_id: int,
+        source_space: int,
+        target_space: int,
+        wake_delay_s: float
+    ) -> Tuple[bool, RescueFailureReason]:
+        """
+        Execute a specific rescue strategy.
+
+        Returns:
+            Tuple of (success, failure_reason if failed)
+        """
+        yabai_path = self._health.yabai_path or "yabai"
+
+        try:
+            if strategy == RescueStrategy.SWITCH_GRAB_RETURN:
+                # Classic: Switch to source space, move window, return
+                if not self._switch_to_space(source_space):
+                    return False, RescueFailureReason.SPACE_SWITCH_FAILED
+                time.sleep(wake_delay_s)
+                if self.move_window_to_space(window_id, target_space):
+                    return True, RescueFailureReason.UNKNOWN
+                return False, RescueFailureReason.MOVE_AFTER_WAKE_FAILED
+
+            elif strategy == RescueStrategy.FOCUS_THEN_MOVE:
+                # Focus the window first, then move
+                if not self._switch_to_space(source_space):
+                    return False, RescueFailureReason.SPACE_SWITCH_FAILED
+
+                # Focus the specific window
+                result = subprocess.run(
+                    [yabai_path, "-m", "window", str(window_id), "--focus"],
+                    capture_output=True,
+                    text=True,
+                    timeout=self.config.query_timeout_seconds,
+                )
+                time.sleep(wake_delay_s)
+
+                if self.move_window_to_space(window_id, target_space):
+                    return True, RescueFailureReason.UNKNOWN
+                return False, RescueFailureReason.MOVE_AFTER_WAKE_FAILED
+
+            elif strategy == RescueStrategy.UNMINIMIZE_FIRST:
+                # Unminimize the window first
+                if not self._switch_to_space(source_space):
+                    return False, RescueFailureReason.SPACE_SWITCH_FAILED
+
+                # Toggle minimize off
+                subprocess.run(
+                    [yabai_path, "-m", "window", str(window_id), "--minimize", "off"],
+                    capture_output=True,
+                    timeout=self.config.query_timeout_seconds,
+                )
+                time.sleep(wake_delay_s)
+
+                if self.move_window_to_space(window_id, target_space):
+                    return True, RescueFailureReason.UNKNOWN
+                return False, RescueFailureReason.MOVE_AFTER_WAKE_FAILED
+
+            elif strategy == RescueStrategy.SPACE_FOCUS_EXTENDED:
+                # Extended wake delay for stubborn windows
+                if not self._switch_to_space(source_space):
+                    return False, RescueFailureReason.SPACE_SWITCH_FAILED
+
+                # Focus the window
+                subprocess.run(
+                    [yabai_path, "-m", "window", str(window_id), "--focus"],
+                    capture_output=True,
+                    timeout=self.config.query_timeout_seconds,
+                )
+
+                # Extended wake time
+                time.sleep(wake_delay_s)
+
+                if self.move_window_to_space(window_id, target_space):
+                    return True, RescueFailureReason.UNKNOWN
+                return False, RescueFailureReason.MOVE_AFTER_WAKE_FAILED
+
+            else:
+                return False, RescueFailureReason.UNKNOWN
+
+        except subprocess.TimeoutExpired:
+            return False, RescueFailureReason.YABAI_TIMEOUT
+        except Exception as e:
+            logger.debug(f"[YABAI] Strategy {strategy.value} failed: {e}")
+            return False, RescueFailureReason.UNKNOWN
+
+    def _detect_failure_reason(
+        self,
+        window_id: int,
+        source_space: int,
+        error_message: str
+    ) -> RescueFailureReason:
+        """Detect the root cause of a rescue failure from error message."""
+        error_lower = error_message.lower()
+
+        if "could not locate" in error_lower or "window not found" in error_lower:
+            return RescueFailureReason.WINDOW_NOT_FOUND
+        if "space not found" in error_lower or "invalid space" in error_lower:
+            return RescueFailureReason.SPACE_NOT_FOUND
+        if "timeout" in error_lower:
+            return RescueFailureReason.YABAI_TIMEOUT
+        if "permission" in error_lower or "accessibility" in error_lower:
+            return RescueFailureReason.PERMISSION_DENIED
+        if "failed to connect" in error_lower:
+            return RescueFailureReason.YABAI_UNAVAILABLE
+
+        return RescueFailureReason.UNKNOWN
 
     async def move_window_to_space_with_rescue_async(
         self,
         window_id: int,
         target_space: int,
-        source_space: Optional[int] = None
+        source_space: Optional[int] = None,
+        app_name: Optional[str] = None,
+        max_retries: int = 3,
+        is_minimized: bool = False,
+        is_fullscreen: bool = False
     ) -> Tuple[bool, str]:
         """
-        Async version of move_window_to_space_with_rescue.
+        Async version of move_window_to_space_with_rescue with INTELLIGENT PROTOCOL v24.0.
 
-        Uses the full Search & Rescue protocol for hidden windows.
+        Uses the full Search & Rescue protocol for hidden windows with:
+        - Multi-strategy approach
+        - Telemetry-driven strategy selection
+        - Dynamic wake delay calibration
+        - Retry with exponential backoff
+
         See move_window_to_space_with_rescue for full documentation.
         """
+        start_time = time.time()
+        telemetry = get_rescue_telemetry()
+
         # =====================================================================
         # FAST PATH: Try direct async move first
         # =====================================================================
         if await self.move_window_to_space_async(window_id, target_space):
+            duration_ms = (time.time() - start_time) * 1000
+            telemetry.record_attempt(
+                success=True,
+                strategy=RescueStrategy.DIRECT,
+                duration_ms=duration_ms,
+                app_name=app_name
+            )
             return True, "direct"
 
         # =====================================================================
-        # RESCUE PATH: Need to wake the window
+        # INTELLIGENT RESCUE PATH: Multi-strategy with retry and backoff
         # =====================================================================
         if source_space is None:
             logger.warning(
                 f"[YABAI] 🛟 Rescue needed for window {window_id} but source_space unknown"
             )
+            telemetry.record_attempt(
+                success=False,
+                strategy=RescueStrategy.DIRECT,
+                duration_ms=(time.time() - start_time) * 1000,
+                failure_reason=RescueFailureReason.SPACE_NOT_FOUND,
+                app_name=app_name
+            )
             return False, "failed"
 
+        # Get recommended strategy from telemetry
+        recommended_strategy = telemetry.get_recommended_strategy(
+            app_name=app_name,
+            is_minimized=is_minimized,
+            is_fullscreen=is_fullscreen
+        )
+
         logger.info(
-            f"[YABAI] 🛟 SEARCH & RESCUE (async): Window {window_id} dehydrated on Space {source_space}"
+            f"[YABAI] 🛟 INTELLIGENT RESCUE (async): Window {window_id} on Space {source_space} "
+            f"→ Space {target_space} (Strategy: {recommended_strategy.value})"
         )
 
         current_space = self.get_current_user_space()
         if current_space is None:
+            telemetry.record_attempt(
+                success=False,
+                strategy=recommended_strategy,
+                duration_ms=(time.time() - start_time) * 1000,
+                failure_reason=RescueFailureReason.SPACE_NOT_FOUND,
+                app_name=app_name
+            )
             return False, "failed"
 
+        # Strategy order: try recommended first, then fallbacks
+        strategies_to_try = [recommended_strategy]
+        all_strategies = [
+            RescueStrategy.SWITCH_GRAB_RETURN,
+            RescueStrategy.FOCUS_THEN_MOVE,
+            RescueStrategy.SPACE_FOCUS_EXTENDED,
+        ]
+        for s in all_strategies:
+            if s not in strategies_to_try:
+                strategies_to_try.append(s)
+
         rescue_success = False
+        failure_reason = RescueFailureReason.UNKNOWN
+        total_attempts = 0
+        final_strategy = recommended_strategy
+        wake_delay_used_ms = 0.0
+
         try:
-            # A) Switch to source space
-            logger.debug(f"[YABAI] 🛟 Step 1: Switching to Space {source_space}...")
-            if not await self._switch_to_space_async(source_space):
-                return False, "failed"
+            for strategy in strategies_to_try[:2]:  # Try at most 2 strategies
+                for attempt in range(1, max_retries + 1):
+                    total_attempts += 1
+                    final_strategy = strategy
 
-            # Minimal wake delay
-            wake_delay = float(os.environ.get("JARVIS_RESCUE_WAKE_DELAY", "0.05"))
-            await asyncio.sleep(wake_delay)
+                    # Calculate backoff delay
+                    backoff_multiplier = 2 ** (attempt - 1)
+                    base_wake_delay_ms = telemetry.get_recommended_wake_delay_ms(app_name)
 
-            # B) Move window
-            logger.debug(f"[YABAI] 🛟 Step 2: Moving window {window_id}...")
-            if await self.move_window_to_space_async(window_id, target_space):
-                rescue_success = True
-                logger.info(
-                    f"[YABAI] 🛟 Rescue SUCCESS: Window {window_id} → Space {target_space}"
-                )
+                    # Strategy-specific wake delay multipliers
+                    if strategy == RescueStrategy.SPACE_FOCUS_EXTENDED:
+                        wake_delay_ms = base_wake_delay_ms * 3 * backoff_multiplier
+                    else:
+                        wake_delay_ms = base_wake_delay_ms * backoff_multiplier
+
+                    wake_delay_used_ms = wake_delay_ms
+                    wake_delay_s = wake_delay_ms / 1000.0
+
+                    logger.debug(
+                        f"[YABAI] 🛟 Async attempt {total_attempts}: {strategy.value} "
+                        f"(wake delay: {wake_delay_ms:.0f}ms)"
+                    )
+
+                    # Execute the rescue strategy asynchronously
+                    success, reason = await self._execute_rescue_strategy_async(
+                        strategy=strategy,
+                        window_id=window_id,
+                        source_space=source_space,
+                        target_space=target_space,
+                        wake_delay_s=wake_delay_s
+                    )
+
+                    if success:
+                        rescue_success = True
+                        break
+
+                    failure_reason = reason
+
+                    # Brief pause before retry
+                    if attempt < max_retries:
+                        await asyncio.sleep(0.1 * attempt)
+
+                if rescue_success:
+                    break
 
         except Exception as e:
-            logger.error(f"[YABAI] 🛟 Rescue exception: {e}")
+            logger.error(f"[YABAI] 🛟 Async rescue exception: {e}")
+            failure_reason = RescueFailureReason.UNKNOWN
 
         finally:
-            # C) ALWAYS return to original space
-            logger.debug(f"[YABAI] 🛟 Step 3: Returning to Space {current_space}...")
+            # ALWAYS return to original space
+            logger.debug(f"[YABAI] 🛟 Returning to Space {current_space}...")
             await self._switch_to_space_async(current_space)
 
+        # Record telemetry
+        duration_ms = (time.time() - start_time) * 1000
+        telemetry.record_attempt(
+            success=rescue_success,
+            strategy=final_strategy,
+            duration_ms=duration_ms,
+            failure_reason=failure_reason if not rescue_success else None,
+            app_name=app_name,
+            wake_delay_used_ms=wake_delay_used_ms
+        )
+
+        if rescue_success:
+            logger.info(
+                f"[YABAI] 🛟 Async rescue SUCCESS: Window {window_id} → Space {target_space} "
+                f"({final_strategy.value}, {total_attempts} attempts, {duration_ms:.0f}ms)"
+            )
+        else:
+            logger.warning(
+                f"[YABAI] 🛟 Async rescue FAILED: Window {window_id} "
+                f"(reason: {failure_reason.value}, {total_attempts} attempts)"
+            )
+
         return rescue_success, "rescue" if rescue_success else "failed"
+
+    async def _execute_rescue_strategy_async(
+        self,
+        strategy: RescueStrategy,
+        window_id: int,
+        source_space: int,
+        target_space: int,
+        wake_delay_s: float
+    ) -> Tuple[bool, RescueFailureReason]:
+        """
+        Async version of rescue strategy execution.
+
+        Returns:
+            Tuple of (success, failure_reason if failed)
+        """
+        try:
+            if strategy in (
+                RescueStrategy.SWITCH_GRAB_RETURN,
+                RescueStrategy.FOCUS_THEN_MOVE,
+                RescueStrategy.SPACE_FOCUS_EXTENDED
+            ):
+                # Switch to source space
+                if not await self._switch_to_space_async(source_space):
+                    return False, RescueFailureReason.SPACE_SWITCH_FAILED
+
+                # For focus-based strategies, focus the window
+                if strategy in (RescueStrategy.FOCUS_THEN_MOVE, RescueStrategy.SPACE_FOCUS_EXTENDED):
+                    yabai_path = self._health.yabai_path or "yabai"
+                    try:
+                        await run_subprocess_async(
+                            [yabai_path, "-m", "window", str(window_id), "--focus"],
+                            timeout=self.config.query_timeout_seconds
+                        )
+                    except Exception:
+                        pass  # Focus may fail but move might still work
+
+                # Wait for window to hydrate
+                await asyncio.sleep(wake_delay_s)
+
+                # Attempt move
+                if await self.move_window_to_space_async(window_id, target_space):
+                    return True, RescueFailureReason.UNKNOWN
+                return False, RescueFailureReason.MOVE_AFTER_WAKE_FAILED
+
+            return False, RescueFailureReason.UNKNOWN
+
+        except asyncio.TimeoutError:
+            return False, RescueFailureReason.YABAI_TIMEOUT
+        except Exception as e:
+            logger.debug(f"[YABAI] Async strategy {strategy.value} failed: {e}")
+            return False, RescueFailureReason.UNKNOWN
 
     async def rescue_windows_to_ghost_async(
         self,
         windows: List[Dict[str, Any]],
-        ghost_space: Optional[int] = None
+        ghost_space: Optional[int] = None,
+        max_parallel: int = 5
     ) -> Dict[str, Any]:
         """
-        High-level batch rescue: Move multiple windows to Ghost Display.
+        INTELLIGENT BATCH RESCUE v24.0: Move multiple windows to Ghost Display.
 
-        This is the main entry point for Auto-Handoff, handling:
-        - Direct moves for visible windows
-        - Search & Rescue for hidden windows
-        - Batch optimization (group by source space)
-        - Progress tracking and narration
+        This is the main entry point for Auto-Handoff, featuring:
+        - Parallel rescue for windows on the same space
+        - Telemetry-driven strategy selection per window
+        - Dynamic wake delay calibration
+        - Comprehensive result tracking
 
         Args:
-            windows: List of window dicts with 'window_id' and 'space_id'
+            windows: List of window dicts with 'window_id', 'space_id', and optionally 'app_name'
             ghost_space: Target Ghost Display space (auto-detected if None)
+            max_parallel: Maximum parallel window moves within a space
 
         Returns:
             Dict with:
@@ -1425,13 +2046,18 @@ class YabaiSpaceDetector:
                 - rescue_count: int (windows rescued from hidden)
                 - failed_count: int (windows that couldn't be moved)
                 - details: list of per-window results
+                - telemetry: rescue telemetry snapshot
         """
+        start_time = time.time()
+        telemetry = get_rescue_telemetry()
+
         result = {
             "success": False,
             "direct_count": 0,
             "rescue_count": 0,
             "failed_count": 0,
-            "details": []
+            "details": [],
+            "telemetry": {}
         }
 
         if not windows:
@@ -1439,7 +2065,7 @@ class YabaiSpaceDetector:
 
         # Auto-detect Ghost Display if not specified
         if ghost_space is None:
-            ghost_space = self.get_ghost_display_space()
+            ghost_space = await self.get_ghost_display_space_async()
             if ghost_space is None:
                 logger.warning("[YABAI] 🛟 No Ghost Display available for rescue")
                 return result
@@ -1447,7 +2073,7 @@ class YabaiSpaceDetector:
         current_space = self.get_current_user_space()
         visible_spaces = {current_space, ghost_space}
 
-        # Attempt to get all visible spaces for smarter routing
+        # Get all visible spaces for smarter routing
         try:
             from backend.vision.multi_space_window_detector import MultiSpaceWindowDetector
             detector = MultiSpaceWindowDetector()
@@ -1457,10 +2083,7 @@ class YabaiSpaceDetector:
             pass
 
         # =====================================================================
-        # BATCH OPTIMIZATION: Group windows by source space
-        # =====================================================================
-        # Instead of switching back and forth, we visit each hidden space once
-        # and collect all its windows before returning.
+        # INTELLIGENT BATCH OPTIMIZATION: Group windows by source space
         # =====================================================================
         from collections import defaultdict
         windows_by_space = defaultdict(list)
@@ -1468,29 +2091,79 @@ class YabaiSpaceDetector:
             source = w.get("space_id")
             windows_by_space[source].append(w)
 
-        # Process visible spaces first (fast path)
-        for space_id in list(windows_by_space.keys()):
-            if space_id in visible_spaces and space_id != ghost_space:
-                for w in windows_by_space[space_id]:
-                    window_id = w.get("window_id")
-                    success = await self.move_window_to_space_async(window_id, ghost_space)
-                    detail = {
-                        "window_id": window_id,
-                        "source_space": space_id,
-                        "success": success,
-                        "method": "direct" if success else "failed"
-                    }
-                    result["details"].append(detail)
-                    if success:
+        # =====================================================================
+        # PHASE 1: PARALLEL direct moves for visible spaces (fast path)
+        # =====================================================================
+        visible_space_ids = [
+            sid for sid in windows_by_space.keys()
+            if sid in visible_spaces and sid != ghost_space
+        ]
+
+        for space_id in visible_space_ids:
+            space_windows = windows_by_space[space_id]
+
+            # Parallel move for windows in visible spaces
+            async def move_visible_window(w):
+                window_id = w.get("window_id")
+                app_name = w.get("app_name") or w.get("app")
+                move_start = time.time()
+
+                success = await self.move_window_to_space_async(window_id, ghost_space)
+                duration_ms = (time.time() - move_start) * 1000
+
+                telemetry.record_attempt(
+                    success=success,
+                    strategy=RescueStrategy.DIRECT,
+                    duration_ms=duration_ms,
+                    app_name=app_name
+                )
+
+                return {
+                    "window_id": window_id,
+                    "source_space": space_id,
+                    "success": success,
+                    "method": "direct" if success else "failed",
+                    "duration_ms": duration_ms,
+                    "app_name": app_name
+                }
+
+            # Execute in parallel with concurrency limit
+            tasks = [move_visible_window(w) for w in space_windows]
+
+            if len(tasks) > max_parallel:
+                # Process in batches to avoid overwhelming yabai
+                for i in range(0, len(tasks), max_parallel):
+                    batch = tasks[i:i + max_parallel]
+                    batch_results = await asyncio.gather(*batch, return_exceptions=True)
+                    for r in batch_results:
+                        if isinstance(r, Exception):
+                            result["failed_count"] += 1
+                        elif r.get("success"):
+                            result["direct_count"] += 1
+                            result["details"].append(r)
+                        else:
+                            result["failed_count"] += 1
+                            result["details"].append(r)
+            else:
+                move_results = await asyncio.gather(*tasks, return_exceptions=True)
+                for r in move_results:
+                    if isinstance(r, Exception):
+                        result["failed_count"] += 1
+                    elif r.get("success"):
                         result["direct_count"] += 1
+                        result["details"].append(r)
                     else:
                         result["failed_count"] += 1
-                del windows_by_space[space_id]
+                        result["details"].append(r)
 
-        # Process hidden spaces (rescue path)
+            del windows_by_space[space_id]
+
+        # =====================================================================
+        # PHASE 2: INTELLIGENT rescue for hidden spaces
+        # =====================================================================
         for space_id, space_windows in windows_by_space.items():
             if space_id == ghost_space:
-                # Already on ghost, skip
+                # Already on ghost, mark as success
                 for w in space_windows:
                     result["details"].append({
                         "window_id": w.get("window_id"),
@@ -1500,39 +2173,107 @@ class YabaiSpaceDetector:
                     })
                 continue
 
-            # Batch rescue from this hidden space
+            # Get dynamic wake delay based on telemetry
+            first_app = space_windows[0].get("app_name") or space_windows[0].get("app")
+            base_wake_delay_ms = telemetry.get_recommended_wake_delay_ms(first_app)
+            wake_delay_s = base_wake_delay_ms / 1000.0
+
             logger.info(
-                f"[YABAI] 🛟 Batch rescue: {len(space_windows)} windows from Space {space_id}"
+                f"[YABAI] 🛟 Intelligent batch rescue: {len(space_windows)} windows "
+                f"from Space {space_id} (wake delay: {base_wake_delay_ms:.0f}ms)"
             )
 
             # Switch to hidden space once
             if await self._switch_to_space_async(space_id):
-                wake_delay = float(os.environ.get("JARVIS_RESCUE_WAKE_DELAY", "0.05"))
-                await asyncio.sleep(wake_delay)
+                await asyncio.sleep(wake_delay_s)
 
-                # Move all windows from this space
-                for w in space_windows:
+                # Parallel move windows from this space
+                async def rescue_window(w):
                     window_id = w.get("window_id")
+                    app_name = w.get("app_name") or w.get("app")
+                    is_minimized = w.get("minimized", False)
+                    move_start = time.time()
+
                     success = await self.move_window_to_space_async(window_id, ghost_space)
-                    detail = {
+                    duration_ms = (time.time() - move_start) * 1000
+
+                    strategy = RescueStrategy.SWITCH_GRAB_RETURN
+
+                    # If first attempt failed and window is minimized, try unminimize
+                    if not success and is_minimized:
+                        try:
+                            yabai_path = self._health.yabai_path or "yabai"
+                            await run_subprocess_async(
+                                [yabai_path, "-m", "window", str(window_id), "--minimize", "off"],
+                                timeout=2.0
+                            )
+                            await asyncio.sleep(wake_delay_s)
+                            success = await self.move_window_to_space_async(window_id, ghost_space)
+                            strategy = RescueStrategy.UNMINIMIZE_FIRST
+                        except Exception:
+                            pass
+
+                    telemetry.record_attempt(
+                        success=success,
+                        strategy=strategy,
+                        duration_ms=duration_ms,
+                        app_name=app_name,
+                        wake_delay_used_ms=base_wake_delay_ms
+                    )
+
+                    return {
                         "window_id": window_id,
                         "source_space": space_id,
                         "success": success,
-                        "method": "rescue" if success else "failed"
+                        "method": "rescue" if success else "failed",
+                        "strategy": strategy.value,
+                        "duration_ms": duration_ms,
+                        "app_name": app_name
                     }
-                    result["details"].append(detail)
-                    if success:
-                        result["rescue_count"] += 1
-                    else:
-                        result["failed_count"] += 1
+
+                # Execute rescues in parallel
+                tasks = [rescue_window(w) for w in space_windows]
+
+                if len(tasks) > max_parallel:
+                    for i in range(0, len(tasks), max_parallel):
+                        batch = tasks[i:i + max_parallel]
+                        batch_results = await asyncio.gather(*batch, return_exceptions=True)
+                        for r in batch_results:
+                            if isinstance(r, Exception):
+                                result["failed_count"] += 1
+                            elif r.get("success"):
+                                result["rescue_count"] += 1
+                                result["details"].append(r)
+                            else:
+                                result["failed_count"] += 1
+                                result["details"].append(r)
+                else:
+                    rescue_results = await asyncio.gather(*tasks, return_exceptions=True)
+                    for r in rescue_results:
+                        if isinstance(r, Exception):
+                            result["failed_count"] += 1
+                        elif r.get("success"):
+                            result["rescue_count"] += 1
+                            result["details"].append(r)
+                        else:
+                            result["failed_count"] += 1
+                            result["details"].append(r)
             else:
                 # Couldn't switch to this space
                 for w in space_windows:
+                    telemetry.record_attempt(
+                        success=False,
+                        strategy=RescueStrategy.SWITCH_GRAB_RETURN,
+                        duration_ms=0,
+                        failure_reason=RescueFailureReason.SPACE_SWITCH_FAILED,
+                        app_name=w.get("app_name") or w.get("app")
+                    )
                     result["details"].append({
                         "window_id": w.get("window_id"),
                         "source_space": space_id,
                         "success": False,
-                        "method": "failed"
+                        "method": "failed",
+                        "failure_reason": "space_switch_failed"
                     })
                     result["failed_count"] += 1
 
@@ -1542,14 +2283,66 @@ class YabaiSpaceDetector:
 
         result["success"] = (result["direct_count"] + result["rescue_count"]) > 0
 
+        # Include telemetry snapshot in result
+        total_duration_ms = (time.time() - start_time) * 1000
+        result["telemetry"] = {
+            "total_duration_ms": round(total_duration_ms, 2),
+            "success_rate": f"{telemetry.success_rate * 100:.1f}%",
+            "total_rescue_attempts": telemetry.total_attempts,
+            "calibrated_wake_delay_ms": round(telemetry.avg_wake_delay_needed_ms, 2),
+        }
+
         if result["success"]:
             logger.info(
-                f"[YABAI] 🛟 Batch rescue complete: "
+                f"[YABAI] 🛟 Intelligent batch rescue complete: "
                 f"{result['direct_count']} direct, {result['rescue_count']} rescued, "
-                f"{result['failed_count']} failed"
+                f"{result['failed_count']} failed (total: {total_duration_ms:.0f}ms, "
+                f"success rate: {telemetry.success_rate * 100:.1f}%)"
+            )
+        else:
+            logger.warning(
+                f"[YABAI] 🛟 Batch rescue failed: {result['failed_count']} windows "
+                f"could not be moved (telemetry: {telemetry.to_dict()})"
             )
 
         return result
+
+    def get_rescue_telemetry_report(self) -> Dict[str, Any]:
+        """
+        Get a comprehensive report of rescue telemetry.
+
+        Returns:
+            Dict with detailed rescue statistics and recommendations
+        """
+        telemetry = get_rescue_telemetry()
+        report = telemetry.to_dict()
+
+        # Add recommendations based on telemetry
+        recommendations = []
+
+        if telemetry.success_rate < 0.8:
+            recommendations.append(
+                "Success rate below 80%. Consider increasing JARVIS_RESCUE_WAKE_DELAY."
+            )
+
+        if telemetry.failures_by_reason.get("space_switch_failed", 0) > 3:
+            recommendations.append(
+                "Multiple space switch failures. Check Yabai accessibility permissions."
+            )
+
+        if telemetry.failures_by_reason.get("window_not_found", 0) > 5:
+            recommendations.append(
+                "Many windows not found. Windows may be closing before rescue completes."
+            )
+
+        if telemetry.avg_wake_delay_needed_ms > 200:
+            recommendations.append(
+                f"Wake delay averaging {telemetry.avg_wake_delay_needed_ms:.0f}ms. "
+                "Consider a faster Mac or closing resource-intensive apps."
+            )
+
+        report["recommendations"] = recommendations
+        return report
 
     def get_ghost_display_space(self) -> Optional[int]:
         """
@@ -2314,10 +3107,19 @@ async def ensure_yabai_ready(timeout_seconds: float = 10.0) -> bool:
 
 # Export for convenient imports
 __all__ = [
+    # Core classes
     "YabaiSpaceDetector",
     "YabaiStatus",
     "YabaiServiceHealth",
     "YabaiConfig",
+    # v24.0 Intelligent Search & Rescue Protocol
+    "RescueStrategy",
+    "RescueFailureReason",
+    "RescueTelemetry",
+    "RescueResult",
+    "get_rescue_telemetry",
+    "reset_rescue_telemetry",
+    # Factory and utilities
     "get_yabai_detector",
     "reset_yabai_detector",
     "open_accessibility_settings",

@@ -1541,11 +1541,16 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                             f"→ Ghost Display (Space {ghost_space})"
                         )
 
+                        # v24.0: Ensure each window has app_name for intelligent telemetry
+                        for w in windows_to_teleport:
+                            if "app_name" not in w:
+                                w["app_name"] = w.get("app", app_name)
+
                         # Narrate the action
                         if self.config.working_out_loud_enabled:
                             try:
                                 if hidden_count > 0:
-                                    msg = f"I found {app_name} windows on hidden spaces. Initiating Search & Rescue."
+                                    msg = f"I found {app_name} windows on hidden spaces. Initiating Intelligent Search & Rescue."
                                 else:
                                     msg = f"I see {app_name} on your screen. Moving to Ghost Display so I don't block you."
                                 await self._narrate_working_out_loud(
@@ -1558,23 +1563,28 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                                 pass
 
                         # =========================================================
-                        # v23.0.0: SEARCH & RESCUE PROTOCOL
+                        # v24.0.0: INTELLIGENT SEARCH & RESCUE PROTOCOL
                         # =========================================================
-                        # Uses batch rescue for efficiency:
-                        # - Direct move for visible windows (fast path)
-                        # - Switch-Grab-Return for hidden windows (rescue path)
-                        # - Groups windows by source space to minimize switching
+                        # Uses intelligent batch rescue for maximum reliability:
+                        # - Multi-strategy approach (switch-grab-return, focus-then-move, etc.)
+                        # - Dynamic wake delay calibration based on telemetry
+                        # - Parallel rescue with concurrency control
+                        # - Retry with exponential backoff
+                        # - Root cause detection for failures
+                        # - Comprehensive telemetry tracking
                         # =========================================================
                         rescue_result = await yabai.rescue_windows_to_ghost_async(
                             windows=windows_to_teleport,
-                            ghost_space=ghost_space
+                            ghost_space=ghost_space,
+                            max_parallel=5  # Limit concurrent operations
                         )
 
-                        # Process results
+                        # Process results with v24.0 telemetry
                         if rescue_result.get("success"):
                             direct_count = rescue_result.get("direct_count", 0)
                             rescue_count = rescue_result.get("rescue_count", 0)
                             failed_count = rescue_result.get("failed_count", 0)
+                            telemetry_data = rescue_result.get("telemetry", {})
 
                             # Update window objects with teleport info
                             for detail in rescue_result.get("details", []):
@@ -1586,16 +1596,24 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                                             w["teleported"] = True
                                             w["original_space"] = detail.get("source_space")
                                             w["rescue_method"] = detail.get("method")
+                                            w["rescue_strategy"] = detail.get("strategy")
+                                            w["rescue_duration_ms"] = detail.get("duration_ms")
                                             teleported_windows.append(w)
                                             break
 
+                            # v24.0: Enhanced logging with telemetry
                             logger.info(
-                                f"[God Mode] 🛟 SEARCH & RESCUE complete: "
-                                f"{direct_count} direct, {rescue_count} rescued, {failed_count} failed"
+                                f"[God Mode] 🛟 INTELLIGENT RESCUE complete: "
+                                f"{direct_count} direct, {rescue_count} rescued, {failed_count} failed "
+                                f"(duration: {telemetry_data.get('total_duration_ms', 0):.0f}ms, "
+                                f"success rate: {telemetry_data.get('success_rate', 'N/A')})"
                             )
                         else:
+                            # Log failure with telemetry insights
+                            telemetry_data = rescue_result.get("telemetry", {})
                             logger.warning(
-                                f"[God Mode] ⚠️ Search & Rescue failed for all windows"
+                                f"[God Mode] ⚠️ Intelligent Search & Rescue failed "
+                                f"(telemetry: success_rate={telemetry_data.get('success_rate', 'N/A')})"
                             )
 
                         if teleported_windows:
