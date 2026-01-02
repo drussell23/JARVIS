@@ -49,6 +49,17 @@ try:
 except ImportError:
     PSUTIL_AVAILABLE = False
 
+# v11.1: Import IntelligentPortManager for async, parallel port coordination
+try:
+    from backend.core.supervisor.intelligent_port_manager import (
+        IntelligentPortManager,
+        ProcessInfo as PortProcessInfo,
+        ProcessType,
+    )
+    INTELLIGENT_PORT_MANAGER_AVAILABLE = True
+except ImportError:
+    INTELLIGENT_PORT_MANAGER_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 
@@ -157,6 +168,39 @@ class JarvisPrimeConfig:
         default_factory=lambda: os.getenv("JARVIS_PRIME_DOCKER_CPUS", "4")
     )
     docker_volumes: Dict[str, str] = field(default_factory=dict)  # host:container mappings
+
+    # v11.0: Intelligent Instance Adoption - reuse existing healthy instances
+    adopt_existing_instances: bool = field(
+        default_factory=lambda: os.getenv("JARVIS_PRIME_ADOPT_EXISTING", "true").lower() == "true"
+    )
+    adoption_health_timeout_seconds: float = field(
+        default_factory=lambda: float(os.getenv("JARVIS_PRIME_ADOPT_TIMEOUT", "5.0"))
+    )
+    require_model_match_for_adoption: bool = field(
+        default_factory=lambda: os.getenv("JARVIS_PRIME_ADOPT_MODEL_MATCH", "false").lower() == "true"
+    )
+
+    # v11.0: Dynamic Port Fallback - try alternative ports if primary is unavailable
+    enable_port_fallback: bool = field(
+        default_factory=lambda: os.getenv("JARVIS_PRIME_PORT_FALLBACK", "true").lower() == "true"
+    )
+    fallback_port_range_start: int = field(
+        default_factory=lambda: int(os.getenv("JARVIS_PRIME_FALLBACK_PORT_START", "8003"))
+    )
+    fallback_port_range_end: int = field(
+        default_factory=lambda: int(os.getenv("JARVIS_PRIME_FALLBACK_PORT_END", "8010"))
+    )
+    max_port_fallback_attempts: int = field(
+        default_factory=lambda: int(os.getenv("JARVIS_PRIME_MAX_PORT_ATTEMPTS", "5"))
+    )
+
+    # v11.0: Instance Ownership Tracking
+    instance_ownership_file: Path = field(
+        default_factory=lambda: Path(os.getenv(
+            "JARVIS_PRIME_OWNERSHIP_FILE",
+            str(Path.home() / ".jarvis" / "prime_instance.json")
+        ))
+    )
 
     @property
     def server_url(self) -> str:
@@ -297,6 +341,26 @@ class JarvisPrimeOrchestrator:
         self._startup_complete_time: Optional[datetime] = None
         self._last_failure_reason: Optional[str] = None
         self._health_check_interval_multiplier: float = 1.0  # Dynamically adjusted
+
+        # v11.0: Instance Adoption & Port Fallback State
+        self._adopted_instance: bool = False  # True if we adopted an existing instance
+        self._effective_port: int = self.config.port  # May differ from config if using fallback
+        self._adoption_info: Optional[Dict[str, Any]] = None  # Info about adopted instance
+        self._original_port: int = self.config.port  # Remember original port for logging
+
+        # v11.1: Intelligent Port Manager - parallel, async port coordination
+        self._port_manager: Optional[IntelligentPortManager] = None
+        if INTELLIGENT_PORT_MANAGER_AVAILABLE:
+            self._port_manager = IntelligentPortManager(
+                host=self.config.host,
+                primary_port=self.config.port,
+                fallback_port_start=self.config.fallback_port_range_start,
+                fallback_port_end=self.config.fallback_port_range_end,
+                max_cleanup_time_seconds=float(os.getenv("JARVIS_PRIME_CLEANUP_TIMEOUT", "10.0")),
+                adopt_existing_instances=self.config.adopt_existing_instances,
+                health_probe_timeout=self.config.adoption_health_timeout_seconds,
+            )
+            logger.info("[JarvisPrime] v11.1 IntelligentPortManager initialized")
 
         logger.info(
             f"[JarvisPrime] Orchestrator initialized "
@@ -784,25 +848,318 @@ class JarvisPrimeOrchestrator:
         return True
 
     # =========================================================================
-    # Port Management (v10.4) - Process-hierarchy aware
+    # v11.0: Intelligent Instance Adoption & Port Fallback
+    # =========================================================================
+
+    async def _try_adopt_existing_instance(self, port: int, pid: int) -> bool:
+        """
+        Attempt to adopt an existing JARVIS Prime instance on the given port.
+
+        This is the ROOT CAUSE FIX for port conflicts: instead of killing a healthy
+        instance, we adopt it and reuse it. This is more efficient (no model reload)
+        and prevents unnecessary conflicts.
+
+        Args:
+            port: Port where the instance is running
+            pid: PID of the process on that port
+
+        Returns:
+            True if instance was successfully adopted, False otherwise
+        """
+        if not self.config.adopt_existing_instances:
+            logger.debug(f"[JarvisPrime] Instance adoption disabled by config")
+            return False
+
+        logger.info(
+            f"[JarvisPrime] 🔍 Checking if PID {pid} on port {port} is an adoptable JARVIS Prime instance..."
+        )
+
+        try:
+            # Step 1: Verify it's a JARVIS Prime instance via health endpoint
+            health_info = await self._probe_instance_health(port)
+
+            if health_info is None:
+                logger.debug(f"[JarvisPrime] Instance on port {port} did not respond to health check")
+                return False
+
+            # Step 2: Check model compatibility if required
+            if self.config.require_model_match_for_adoption:
+                expected_model = self.config.initial_model
+                actual_model = health_info.get("model", health_info.get("model_name"))
+
+                if expected_model and actual_model:
+                    # Compare just the filename/basename for flexibility
+                    expected_name = Path(expected_model).name if expected_model else None
+                    actual_name = Path(actual_model).name if actual_model else None
+
+                    if expected_name != actual_name:
+                        logger.warning(
+                            f"[JarvisPrime] Model mismatch: expected '{expected_name}', "
+                            f"found '{actual_name}'. Skipping adoption."
+                        )
+                        return False
+
+            # Step 3: Create adoption wrapper
+            logger.info(
+                f"[JarvisPrime] ✅ Adopting healthy JARVIS Prime instance on port {port} (PID {pid})"
+            )
+
+            # Create a mock process wrapper for the adopted instance
+            class AdoptedProcess:
+                """Wrapper for an adopted external process."""
+
+                def __init__(self, process_pid: int, process_port: int):
+                    self.pid = process_pid
+                    self.port = process_port
+                    self.returncode = None
+                    self._terminated = False
+
+                def terminate(self):
+                    """Terminate the adopted process gracefully."""
+                    if self._terminated:
+                        return
+                    try:
+                        os.kill(self.pid, signal.SIGTERM)
+                        self._terminated = True
+                    except (ProcessLookupError, PermissionError):
+                        pass
+
+                def kill(self):
+                    """Force kill the adopted process."""
+                    if self._terminated:
+                        return
+                    try:
+                        os.kill(self.pid, signal.SIGKILL)
+                        self._terminated = True
+                    except (ProcessLookupError, PermissionError):
+                        pass
+
+                async def wait(self):
+                    """Wait for process to exit."""
+                    max_wait = 10
+                    waited = 0
+                    while waited < max_wait:
+                        try:
+                            os.kill(self.pid, 0)  # Check if process exists
+                            await asyncio.sleep(0.1)
+                            waited += 0.1
+                        except ProcessLookupError:
+                            self.returncode = 0
+                            return
+                        except PermissionError:
+                            # Process exists but we can't signal it
+                            await asyncio.sleep(0.1)
+                            waited += 0.1
+                    self.returncode = -1  # Timeout
+
+            # Store adoption info
+            self._process = AdoptedProcess(pid, port)
+            self._adopted_instance = True
+            self._effective_port = port
+            self._adoption_info = {
+                "pid": pid,
+                "port": port,
+                "health": health_info,
+                "adopted_at": datetime.now().isoformat(),
+                "original_owner": "external",
+            }
+
+            # Update health status
+            self._health = PrimeHealth(
+                status=PrimeStatus.RUNNING,
+                pid=pid,
+                model_loaded=health_info.get("model_loaded", True),
+                model_name=health_info.get("model", health_info.get("model_name")),
+                last_health_check=datetime.now(),
+            )
+            self._start_time = datetime.now()
+            self._started = True
+
+            # Save ownership info
+            await self._save_instance_ownership(port, pid, adopted=True)
+
+            logger.info(
+                f"[JarvisPrime] 🎉 Successfully adopted JARVIS Prime instance: "
+                f"PID={pid}, Port={port}, Model={health_info.get('model', 'unknown')}"
+            )
+
+            return True
+
+        except Exception as e:
+            logger.debug(f"[JarvisPrime] Instance adoption failed: {e}")
+            return False
+
+    async def _probe_instance_health(self, port: int) -> Optional[Dict[str, Any]]:
+        """
+        Probe an instance's health endpoint to verify it's a JARVIS Prime server.
+
+        Args:
+            port: Port to probe
+
+        Returns:
+            Health info dict if healthy JARVIS Prime, None otherwise
+        """
+        health_url = f"http://{self.config.host}:{port}/health"
+        timeout = aiohttp.ClientTimeout(total=self.config.adoption_health_timeout_seconds)
+
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(health_url) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+
+                        # Verify it looks like a JARVIS Prime response
+                        # JARVIS Prime health endpoint typically returns:
+                        # {"status": "ok", "model": "...", "model_loaded": true, ...}
+                        if isinstance(data, dict):
+                            status = data.get("status", "").lower()
+                            if status in ("ok", "healthy", "running"):
+                                logger.debug(
+                                    f"[JarvisPrime] Health probe on port {port} succeeded: {data}"
+                                )
+                                return data
+
+                        logger.debug(
+                            f"[JarvisPrime] Health probe response not recognized as JARVIS Prime: {data}"
+                        )
+                        return None
+
+                    logger.debug(f"[JarvisPrime] Health probe returned status {resp.status}")
+                    return None
+
+        except aiohttp.ClientConnectorError:
+            logger.debug(f"[JarvisPrime] No HTTP server responding on port {port}")
+            return None
+        except asyncio.TimeoutError:
+            logger.debug(f"[JarvisPrime] Health probe timed out on port {port}")
+            return None
+        except Exception as e:
+            logger.debug(f"[JarvisPrime] Health probe failed: {e}")
+            return None
+
+    async def _find_available_fallback_port(self) -> Optional[int]:
+        """
+        Find an available port in the fallback range.
+
+        Returns:
+            Available port number, or None if no port available
+        """
+        if not self.config.enable_port_fallback:
+            return None
+
+        logger.info(
+            f"[JarvisPrime] 🔍 Searching for available port in range "
+            f"{self.config.fallback_port_range_start}-{self.config.fallback_port_range_end}..."
+        )
+
+        import socket
+
+        for port in range(
+            self.config.fallback_port_range_start,
+            self.config.fallback_port_range_end + 1
+        ):
+            # Check if port is in use
+            pid = await self._get_pid_on_port(port)
+            if pid is None:
+                # Double-check with socket bind
+                try:
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    sock.bind((self.config.host, port))
+                    sock.close()
+                    logger.info(f"[JarvisPrime] ✅ Found available fallback port: {port}")
+                    return port
+                except OSError:
+                    continue
+
+        logger.warning(f"[JarvisPrime] No available ports in fallback range")
+        return None
+
+    async def _save_instance_ownership(
+        self,
+        port: int,
+        pid: int,
+        adopted: bool = False
+    ):
+        """
+        Save instance ownership information for cross-session coordination.
+
+        Args:
+            port: Port the instance is running on
+            pid: Process ID
+            adopted: Whether this is an adopted instance
+        """
+        import json
+
+        ownership_file = self.config.instance_ownership_file
+
+        try:
+            ownership_file.parent.mkdir(parents=True, exist_ok=True)
+
+            ownership_data = {
+                "port": port,
+                "pid": pid,
+                "adopted": adopted,
+                "supervisor_pid": os.getpid(),
+                "started_at": datetime.now().isoformat(),
+                "host": self.config.host,
+            }
+
+            ownership_file.write_text(json.dumps(ownership_data, indent=2))
+            logger.debug(f"[JarvisPrime] Saved ownership info to {ownership_file}")
+
+        except Exception as e:
+            logger.debug(f"[JarvisPrime] Could not save ownership info: {e}")
+
+    async def _load_instance_ownership(self) -> Optional[Dict[str, Any]]:
+        """
+        Load instance ownership information from previous session.
+
+        Returns:
+            Ownership data dict if available, None otherwise
+        """
+        import json
+
+        ownership_file = self.config.instance_ownership_file
+
+        try:
+            if ownership_file.exists():
+                data = json.loads(ownership_file.read_text())
+                logger.debug(f"[JarvisPrime] Loaded ownership info: {data}")
+                return data
+        except Exception as e:
+            logger.debug(f"[JarvisPrime] Could not load ownership info: {e}")
+
+        return None
+
+    async def _clear_instance_ownership(self):
+        """Clear instance ownership information."""
+        try:
+            if self.config.instance_ownership_file.exists():
+                self.config.instance_ownership_file.unlink()
+        except Exception:
+            pass
+
+    # =========================================================================
+    # Port Management (v10.4 → v11.0) - Process-hierarchy aware with adoption
     # =========================================================================
 
     async def _ensure_port_available(self) -> bool:
         """
         Intelligent port coordination system - ensures port is available before starting.
 
-        Strategy (v10.5 - Enhanced with zombie detection):
-        1. Check if port is in use
-        2. If by our own managed process, trust it
-        3. Check for zombie/defunct processes and clean immediately
-        4. If by related process (parent/child/sibling), coordinate shutdown
-        5. If by old JARVIS Prime instance, graceful shutdown with retries
-        6. If by unrelated process, force cleanup
-        7. Wait with exponential backoff (up to 45s total for stubborn processes)
-        8. ONLY return when port is truly available OR raise exception
+        Strategy (v11.1 - Enhanced with IntelligentPortManager):
+        1. Use IntelligentPortManager for fast, parallel port coordination
+        2. Classifies processes BEFORE attempting cleanup (no wasted time)
+        3. Runs cleanup strategies in PARALLEL with first-success wins
+        4. Switches to fallback port IMMEDIATELY when process is unkillable
+        5. Falls back to legacy implementation if IntelligentPortManager unavailable
 
-        This prevents the "address already in use" error by NEVER proceeding
-        until the port is guaranteed to be free.
+        Key improvements over v11.0:
+        - 10 second max cleanup instead of 21+ seconds
+        - Parallel signal cascade instead of sequential
+        - Early detection of unkillable processes
+        - Immediate fallback without waiting for all cleanup to fail
 
         Raises:
             RuntimeError: If port cannot be freed within timeout
@@ -810,11 +1167,127 @@ class JarvisPrimeOrchestrator:
         Returns:
             bool: True if reused existing process, False if port is available for new process
         """
+        # v11.1: Use IntelligentPortManager when available
+        if self._port_manager is not None:
+            return await self._ensure_port_available_v11_1()
+
+        # Fallback to legacy implementation
+        return await self._ensure_port_available_legacy()
+
+    async def _ensure_port_available_v11_1(self) -> bool:
+        """
+        v11.1: Use IntelligentPortManager for fast, parallel port coordination.
+
+        This is ~2x faster than the legacy implementation because:
+        1. Process classification happens in < 500ms
+        2. Cleanup strategies run in parallel
+        3. Fallback is used immediately for unkillable processes
+        """
+        try:
+            port, adopted_info = await self._port_manager.ensure_port_available()
+
+            # Update effective port
+            self._effective_port = port
+            if port != self._original_port:
+                self.config.port = port
+                logger.info(
+                    f"[JarvisPrime] v11.1 Using port {port} instead of {self._original_port}"
+                )
+
+            # Handle adoption
+            if adopted_info is not None and adopted_info.should_adopt:
+                logger.info(
+                    f"[JarvisPrime] v11.1 Adopting existing JARVIS Prime "
+                    f"(PID {adopted_info.pid} on port {port})"
+                )
+
+                # Create adoption wrapper for the existing process
+                self._adopted_instance = True
+                self._adoption_info = {
+                    "pid": adopted_info.pid,
+                    "port": port,
+                    "adopted_at": datetime.now().isoformat(),
+                    "process_type": adopted_info.process_type.value,
+                }
+
+                # Create mock process wrapper
+                class AdoptedProcessWrapper:
+                    def __init__(self, process_pid: int, process_port: int):
+                        self.pid = process_pid
+                        self.port = process_port
+                        self.returncode = None
+                        self._terminated = False
+
+                    def terminate(self):
+                        if self._terminated:
+                            return
+                        try:
+                            os.kill(self.pid, signal.SIGTERM)
+                            self._terminated = True
+                        except (ProcessLookupError, PermissionError):
+                            pass
+
+                    def kill(self):
+                        if self._terminated:
+                            return
+                        try:
+                            os.kill(self.pid, signal.SIGKILL)
+                            self._terminated = True
+                        except (ProcessLookupError, PermissionError):
+                            pass
+
+                    async def wait(self):
+                        max_wait = 10
+                        waited = 0
+                        while waited < max_wait:
+                            try:
+                                os.kill(self.pid, 0)
+                                await asyncio.sleep(0.1)
+                                waited += 0.1
+                            except ProcessLookupError:
+                                self.returncode = 0
+                                return
+                            except PermissionError:
+                                await asyncio.sleep(0.1)
+                                waited += 0.1
+                        self.returncode = -1
+
+                self._process = AdoptedProcessWrapper(adopted_info.pid, port)
+
+                # Update health status
+                self._health = PrimeHealth(
+                    status=PrimeStatus.RUNNING,
+                    pid=adopted_info.pid,
+                    model_loaded=adopted_info.is_healthy,
+                    last_health_check=datetime.now(),
+                )
+                self._start_time = datetime.now()
+                self._started = True
+
+                # Save ownership info
+                await self._save_instance_ownership(port, adopted_info.pid, adopted=True)
+
+                return True  # Adopted existing instance
+
+            # Port is available (either freed or fallback)
+            return False
+
+        except RuntimeError as e:
+            # Port manager couldn't find any available port
+            logger.error(f"[JarvisPrime] v11.1 Port management failed: {e}")
+            self._health.error_message = str(e)
+            raise
+
+    async def _ensure_port_available_legacy(self) -> bool:
+        """
+        Legacy port coordination (v11.0) - used as fallback when IntelligentPortManager unavailable.
+        """
         port = self.config.port
+        self._effective_port = port  # Track effective port
         max_wait_time = 45.0  # Increased from 30s to handle stubborn processes
         start_time = time.time()
 
-        logger.info(f"[JarvisPrime] Ensuring port {port} is available for startup...")
+        logger.info(f"[JarvisPrime] Ensuring port {port} is available for startup (legacy mode)...")
 
         # Initial check
         pid = await self._get_pid_on_port(port)
@@ -826,6 +1299,31 @@ class JarvisPrimeOrchestrator:
         if self._process and self._process.pid == pid:
             logger.debug(f"[JarvisPrime] Port {port} is used by our own managed process (PID {pid})")
             return True  # Already have this process, reusing
+
+        # =========================================================================
+        # v11.0: TRY INSTANCE ADOPTION FIRST (ROOT CAUSE FIX)
+        # =========================================================================
+        # Before trying to kill anything, check if the existing instance is a
+        # healthy JARVIS Prime that we can simply adopt. This is MORE efficient
+        # than killing and restarting!
+
+        if self.config.adopt_existing_instances:
+            logger.info(
+                f"[JarvisPrime] 🔄 Port {port} is in use by PID {pid}. "
+                f"Attempting to adopt existing instance..."
+            )
+
+            if await self._try_adopt_existing_instance(port, pid):
+                logger.info(
+                    f"[JarvisPrime] ✅ Successfully adopted existing JARVIS Prime instance! "
+                    f"Skipping spawn - using PID {pid} on port {port}"
+                )
+                return True  # Adopted existing instance, no need to spawn
+
+            logger.info(
+                f"[JarvisPrime] Instance on port {port} is not adoptable. "
+                f"Proceeding with cleanup..."
+            )
 
         # v10.7: ENHANCED FIX - Check if port is used by current supervisor process
         # This happens during restart scenarios where supervisor is restarting Prime
@@ -1083,7 +1581,44 @@ class JarvisPrimeOrchestrator:
             logger.info(f"[JarvisPrime] Port {port} is now available (took {elapsed:.1f}s)")
             return False  # Port freed
 
-        # CRITICAL: Port is STILL occupied - cannot proceed!
+        # =========================================================================
+        # v11.0: PORT FALLBACK - Try alternative port if primary is occupied
+        # =========================================================================
+        # Before giving up completely, try to find an alternative port
+
+        if self.config.enable_port_fallback:
+            logger.warning(
+                f"[JarvisPrime] ⚠️ Primary port {port} unavailable after {elapsed:.1f}s. "
+                f"Searching for fallback port..."
+            )
+
+            fallback_port = await self._find_available_fallback_port()
+
+            if fallback_port is not None:
+                logger.info(
+                    f"[JarvisPrime] 🔄 Switching to fallback port {fallback_port} "
+                    f"(primary port {port} occupied by PID {pid})"
+                )
+
+                # Update effective port
+                self._effective_port = fallback_port
+
+                # Also update the config port for this session
+                # (Note: this is a runtime override, not persisted)
+                self.config.port = fallback_port
+
+                logger.info(
+                    f"[JarvisPrime] ✅ Port fallback successful: will use port {fallback_port} "
+                    f"instead of {self._original_port}"
+                )
+                return False  # Port available (fallback), proceed with spawn
+
+            logger.error(
+                f"[JarvisPrime] ❌ No fallback ports available in range "
+                f"{self.config.fallback_port_range_start}-{self.config.fallback_port_range_end}"
+            )
+
+        # CRITICAL: Port is STILL occupied AND no fallback available - cannot proceed!
         error_msg = (
             f"Port {port} is still in use by PID {pid} after {elapsed:.1f}s of cleanup attempts. "
             f"Process: {process_info.get('name', 'unknown')}. "
