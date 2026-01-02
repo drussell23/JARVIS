@@ -1545,7 +1545,7 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                         if self.config.working_out_loud_enabled:
                             try:
                                 if hidden_count > 0:
-                                    msg = f"I found {app_name} windows on hidden spaces. Teleporting them to my Ghost Display."
+                                    msg = f"I found {app_name} windows on hidden spaces. Initiating Search & Rescue."
                                 else:
                                     msg = f"I see {app_name} on your screen. Moving to Ghost Display so I don't block you."
                                 await self._narrate_working_out_loud(
@@ -1557,27 +1557,46 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                             except Exception:
                                 pass
 
-                        # Teleport each window
-                        for w in windows_to_teleport:
-                            window_id = w.get('window_id')
-                            original_space = w.get('space_id')
+                        # =========================================================
+                        # v23.0.0: SEARCH & RESCUE PROTOCOL
+                        # =========================================================
+                        # Uses batch rescue for efficiency:
+                        # - Direct move for visible windows (fast path)
+                        # - Switch-Grab-Return for hidden windows (rescue path)
+                        # - Groups windows by source space to minimize switching
+                        # =========================================================
+                        rescue_result = await yabai.rescue_windows_to_ghost_async(
+                            windows=windows_to_teleport,
+                            ghost_space=ghost_space
+                        )
 
-                            if window_id:
-                                success = await yabai.move_window_to_space_async(window_id, ghost_space)
-                                if success:
-                                    w['space_id'] = ghost_space
-                                    w['teleported'] = True
-                                    w['original_space'] = original_space
-                                    teleported_windows.append(w)
-                                    logger.info(
-                                        f"[God Mode] 👻 Teleported window {window_id}: "
-                                        f"Space {original_space} → Ghost (Space {ghost_space})"
-                                    )
-                                else:
-                                    logger.warning(
-                                        f"[God Mode] ⚠️ Failed to teleport window {window_id} "
-                                        f"(Space {original_space}) - Yabai may not see it"
-                                    )
+                        # Process results
+                        if rescue_result.get("success"):
+                            direct_count = rescue_result.get("direct_count", 0)
+                            rescue_count = rescue_result.get("rescue_count", 0)
+                            failed_count = rescue_result.get("failed_count", 0)
+
+                            # Update window objects with teleport info
+                            for detail in rescue_result.get("details", []):
+                                if detail.get("success"):
+                                    # Find the original window and update it
+                                    for w in windows_to_teleport:
+                                        if w.get("window_id") == detail.get("window_id"):
+                                            w["space_id"] = ghost_space
+                                            w["teleported"] = True
+                                            w["original_space"] = detail.get("source_space")
+                                            w["rescue_method"] = detail.get("method")
+                                            teleported_windows.append(w)
+                                            break
+
+                            logger.info(
+                                f"[God Mode] 🛟 SEARCH & RESCUE complete: "
+                                f"{direct_count} direct, {rescue_count} rescued, {failed_count} failed"
+                            )
+                        else:
+                            logger.warning(
+                                f"[God Mode] ⚠️ Search & Rescue failed for all windows"
+                            )
 
                         if teleported_windows:
                             logger.info(
@@ -1585,12 +1604,27 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                                 f"{len(teleported_windows)}/{len(windows_to_teleport)} windows moved to Ghost Display"
                             )
 
-                            # Narrate success
+                            # Narrate success with rescue stats
                             if self.config.working_out_loud_enabled:
                                 try:
+                                    # Build informative message based on rescue method
+                                    rescued_count = sum(
+                                        1 for w in teleported_windows
+                                        if w.get("rescue_method") == "rescue"
+                                    )
+                                    if rescued_count > 0:
+                                        narration_msg = (
+                                            f"Search & Rescue complete! I rescued {rescued_count} {app_name} windows "
+                                            f"from hidden spaces and moved them to my Ghost Display."
+                                        )
+                                    else:
+                                        narration_msg = (
+                                            f"Done! I've moved {len(teleported_windows)} {app_name} windows "
+                                            f"to my Ghost Display. Starting monitoring now."
+                                        )
+
                                     await self._narrate_working_out_loud(
-                                        message=f"Done! I've moved {len(teleported_windows)} {app_name} windows "
-                                                f"to my Ghost Display. Starting monitoring now.",
+                                        message=narration_msg,
                                         narration_type="success",
                                         watcher_id=f"teleport_done_{app_name}",
                                         priority="medium"

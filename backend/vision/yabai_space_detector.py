@@ -1172,6 +1172,385 @@ class YabaiSpaceDetector:
             lambda: self.move_window_to_space(window_id, target_space, follow)
         )
 
+    # =========================================================================
+    # SEARCH & RESCUE PROTOCOL v23.0.0
+    # =========================================================================
+    # ROOT CAUSE: Yabai cannot act on "dehydrated" windows on hidden spaces.
+    # macOS puts windows on hidden spaces into a frozen state where Yabai
+    # loses track of them ("could not locate the window to act on!").
+    #
+    # SOLUTION: Switch-Grab-Return protocol
+    # 1. Try direct move (fast path - works for visible windows)
+    # 2. If fails, "wake" the window by switching to its space
+    # 3. Move the window while it's awake
+    # 4. Immediately return to the user's original space
+    #
+    # This creates a brief screen flash but successfully rescues windows
+    # from hidden spaces that would otherwise be inaccessible.
+    # =========================================================================
+
+    def _switch_to_space(self, space_id: int) -> bool:
+        """
+        Switch focus to a specific space.
+
+        This is a low-level helper for the rescue protocol. It briefly
+        changes the active space to "wake up" dehydrated windows.
+
+        Args:
+            space_id: The space index to switch to (1-based)
+
+        Returns:
+            True if successful, False otherwise
+        """
+        if not self.is_available():
+            return False
+
+        try:
+            yabai_path = self._health.yabai_path or "yabai"
+
+            result = subprocess.run(
+                [yabai_path, "-m", "space", "--focus", str(space_id)],
+                capture_output=True,
+                text=True,
+                timeout=self.config.query_timeout_seconds,
+            )
+
+            if result.returncode != 0:
+                error_msg = result.stderr.strip() if result.stderr else "Unknown error"
+                logger.debug(f"[YABAI] Space switch to {space_id} failed: {error_msg}")
+                return False
+
+            return True
+
+        except subprocess.TimeoutExpired:
+            logger.warning(f"[YABAI] Space switch timed out for space {space_id}")
+            return False
+        except Exception as e:
+            logger.warning(f"[YABAI] Space switch failed: {e}")
+            return False
+
+    async def _switch_to_space_async(self, space_id: int) -> bool:
+        """Async version of _switch_to_space."""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: self._switch_to_space(space_id)
+        )
+
+    def move_window_to_space_with_rescue(
+        self,
+        window_id: int,
+        target_space: int,
+        source_space: Optional[int] = None
+    ) -> Tuple[bool, str]:
+        """
+        Move a window to a target space, using rescue protocol if needed.
+
+        SEARCH & RESCUE PROTOCOL:
+        1. Fast Path: Try direct move (works for visible windows)
+        2. Rescue Path: If window is "dehydrated" on hidden space:
+           a) Switch to source space to wake window
+           b) Move the window while awake
+           c) Return to original space immediately
+
+        Args:
+            window_id: The window ID to move
+            target_space: The target space index (1-based)
+            source_space: The window's current space (optional, for rescue)
+
+        Returns:
+            Tuple of (success, method):
+            - success: True if window was moved
+            - method: "direct" | "rescue" | "failed"
+
+        Example:
+            success, method = yabai.move_window_to_space_with_rescue(
+                window_id=12345,
+                target_space=10,  # Ghost Display
+                source_space=5    # Window's current hidden space
+            )
+            if success:
+                logger.info(f"Moved window via {method} path")
+        """
+        # =====================================================================
+        # FAST PATH: Direct move (works for visible windows)
+        # =====================================================================
+        if self.move_window_to_space(window_id, target_space):
+            return True, "direct"
+
+        # =====================================================================
+        # RESCUE PATH: Window is on hidden space, needs wake-up
+        # =====================================================================
+        if source_space is None:
+            logger.warning(
+                f"[YABAI] 🛟 Rescue needed for window {window_id} but source_space unknown"
+            )
+            return False, "failed"
+
+        logger.info(
+            f"[YABAI] 🛟 SEARCH & RESCUE: Window {window_id} is dehydrated on Space {source_space}"
+        )
+
+        # Remember where the user is
+        current_space = self.get_current_user_space()
+        if current_space is None:
+            logger.error("[YABAI] Cannot rescue: unable to determine current space")
+            return False, "failed"
+
+        rescue_success = False
+        try:
+            # A) Switch to source space to wake the window
+            logger.debug(f"[YABAI] 🛟 Step 1: Switching to Space {source_space} to wake window...")
+            if not self._switch_to_space(source_space):
+                logger.error(f"[YABAI] 🛟 Rescue failed: couldn't switch to Space {source_space}")
+                return False, "failed"
+
+            # Minimal wake time - just enough for Yabai to see the window
+            # Using environment variable for tuning without code changes
+            wake_delay = float(os.environ.get("JARVIS_RESCUE_WAKE_DELAY", "0.05"))
+            time.sleep(wake_delay)
+
+            # B) Move the window while it's awake
+            logger.debug(f"[YABAI] 🛟 Step 2: Moving window {window_id} to Space {target_space}...")
+            if self.move_window_to_space(window_id, target_space):
+                rescue_success = True
+                logger.info(
+                    f"[YABAI] 🛟 Rescue SUCCESS: Window {window_id} moved to Space {target_space}"
+                )
+            else:
+                logger.error(
+                    f"[YABAI] 🛟 Rescue FAILED: Window {window_id} still not accessible"
+                )
+
+        except Exception as e:
+            logger.error(f"[YABAI] 🛟 Rescue exception: {e}")
+
+        finally:
+            # C) ALWAYS return to original space (even on failure)
+            logger.debug(f"[YABAI] 🛟 Step 3: Returning to Space {current_space}...")
+            return_success = self._switch_to_space(current_space)
+            if not return_success:
+                logger.warning(
+                    f"[YABAI] 🛟 Warning: Failed to return to Space {current_space}"
+                )
+
+        return rescue_success, "rescue" if rescue_success else "failed"
+
+    async def move_window_to_space_with_rescue_async(
+        self,
+        window_id: int,
+        target_space: int,
+        source_space: Optional[int] = None
+    ) -> Tuple[bool, str]:
+        """
+        Async version of move_window_to_space_with_rescue.
+
+        Uses the full Search & Rescue protocol for hidden windows.
+        See move_window_to_space_with_rescue for full documentation.
+        """
+        # =====================================================================
+        # FAST PATH: Try direct async move first
+        # =====================================================================
+        if await self.move_window_to_space_async(window_id, target_space):
+            return True, "direct"
+
+        # =====================================================================
+        # RESCUE PATH: Need to wake the window
+        # =====================================================================
+        if source_space is None:
+            logger.warning(
+                f"[YABAI] 🛟 Rescue needed for window {window_id} but source_space unknown"
+            )
+            return False, "failed"
+
+        logger.info(
+            f"[YABAI] 🛟 SEARCH & RESCUE (async): Window {window_id} dehydrated on Space {source_space}"
+        )
+
+        current_space = self.get_current_user_space()
+        if current_space is None:
+            return False, "failed"
+
+        rescue_success = False
+        try:
+            # A) Switch to source space
+            logger.debug(f"[YABAI] 🛟 Step 1: Switching to Space {source_space}...")
+            if not await self._switch_to_space_async(source_space):
+                return False, "failed"
+
+            # Minimal wake delay
+            wake_delay = float(os.environ.get("JARVIS_RESCUE_WAKE_DELAY", "0.05"))
+            await asyncio.sleep(wake_delay)
+
+            # B) Move window
+            logger.debug(f"[YABAI] 🛟 Step 2: Moving window {window_id}...")
+            if await self.move_window_to_space_async(window_id, target_space):
+                rescue_success = True
+                logger.info(
+                    f"[YABAI] 🛟 Rescue SUCCESS: Window {window_id} → Space {target_space}"
+                )
+
+        except Exception as e:
+            logger.error(f"[YABAI] 🛟 Rescue exception: {e}")
+
+        finally:
+            # C) ALWAYS return to original space
+            logger.debug(f"[YABAI] 🛟 Step 3: Returning to Space {current_space}...")
+            await self._switch_to_space_async(current_space)
+
+        return rescue_success, "rescue" if rescue_success else "failed"
+
+    async def rescue_windows_to_ghost_async(
+        self,
+        windows: List[Dict[str, Any]],
+        ghost_space: Optional[int] = None
+    ) -> Dict[str, Any]:
+        """
+        High-level batch rescue: Move multiple windows to Ghost Display.
+
+        This is the main entry point for Auto-Handoff, handling:
+        - Direct moves for visible windows
+        - Search & Rescue for hidden windows
+        - Batch optimization (group by source space)
+        - Progress tracking and narration
+
+        Args:
+            windows: List of window dicts with 'window_id' and 'space_id'
+            ghost_space: Target Ghost Display space (auto-detected if None)
+
+        Returns:
+            Dict with:
+                - success: bool (any windows moved)
+                - direct_count: int (windows moved directly)
+                - rescue_count: int (windows rescued from hidden)
+                - failed_count: int (windows that couldn't be moved)
+                - details: list of per-window results
+        """
+        result = {
+            "success": False,
+            "direct_count": 0,
+            "rescue_count": 0,
+            "failed_count": 0,
+            "details": []
+        }
+
+        if not windows:
+            return result
+
+        # Auto-detect Ghost Display if not specified
+        if ghost_space is None:
+            ghost_space = self.get_ghost_display_space()
+            if ghost_space is None:
+                logger.warning("[YABAI] 🛟 No Ghost Display available for rescue")
+                return result
+
+        current_space = self.get_current_user_space()
+        visible_spaces = {current_space, ghost_space}
+
+        # Attempt to get all visible spaces for smarter routing
+        try:
+            from backend.vision.multi_space_window_detector import MultiSpaceWindowDetector
+            detector = MultiSpaceWindowDetector()
+            all_visible = await detector.get_all_visible_spaces()
+            visible_spaces.update(all_visible)
+        except Exception:
+            pass
+
+        # =====================================================================
+        # BATCH OPTIMIZATION: Group windows by source space
+        # =====================================================================
+        # Instead of switching back and forth, we visit each hidden space once
+        # and collect all its windows before returning.
+        # =====================================================================
+        from collections import defaultdict
+        windows_by_space = defaultdict(list)
+        for w in windows:
+            source = w.get("space_id")
+            windows_by_space[source].append(w)
+
+        # Process visible spaces first (fast path)
+        for space_id in list(windows_by_space.keys()):
+            if space_id in visible_spaces and space_id != ghost_space:
+                for w in windows_by_space[space_id]:
+                    window_id = w.get("window_id")
+                    success = await self.move_window_to_space_async(window_id, ghost_space)
+                    detail = {
+                        "window_id": window_id,
+                        "source_space": space_id,
+                        "success": success,
+                        "method": "direct" if success else "failed"
+                    }
+                    result["details"].append(detail)
+                    if success:
+                        result["direct_count"] += 1
+                    else:
+                        result["failed_count"] += 1
+                del windows_by_space[space_id]
+
+        # Process hidden spaces (rescue path)
+        for space_id, space_windows in windows_by_space.items():
+            if space_id == ghost_space:
+                # Already on ghost, skip
+                for w in space_windows:
+                    result["details"].append({
+                        "window_id": w.get("window_id"),
+                        "source_space": space_id,
+                        "success": True,
+                        "method": "already_on_ghost"
+                    })
+                continue
+
+            # Batch rescue from this hidden space
+            logger.info(
+                f"[YABAI] 🛟 Batch rescue: {len(space_windows)} windows from Space {space_id}"
+            )
+
+            # Switch to hidden space once
+            if await self._switch_to_space_async(space_id):
+                wake_delay = float(os.environ.get("JARVIS_RESCUE_WAKE_DELAY", "0.05"))
+                await asyncio.sleep(wake_delay)
+
+                # Move all windows from this space
+                for w in space_windows:
+                    window_id = w.get("window_id")
+                    success = await self.move_window_to_space_async(window_id, ghost_space)
+                    detail = {
+                        "window_id": window_id,
+                        "source_space": space_id,
+                        "success": success,
+                        "method": "rescue" if success else "failed"
+                    }
+                    result["details"].append(detail)
+                    if success:
+                        result["rescue_count"] += 1
+                    else:
+                        result["failed_count"] += 1
+            else:
+                # Couldn't switch to this space
+                for w in space_windows:
+                    result["details"].append({
+                        "window_id": w.get("window_id"),
+                        "source_space": space_id,
+                        "success": False,
+                        "method": "failed"
+                    })
+                    result["failed_count"] += 1
+
+        # Return to original space
+        if current_space:
+            await self._switch_to_space_async(current_space)
+
+        result["success"] = (result["direct_count"] + result["rescue_count"]) > 0
+
+        if result["success"]:
+            logger.info(
+                f"[YABAI] 🛟 Batch rescue complete: "
+                f"{result['direct_count']} direct, {result['rescue_count']} rescued, "
+                f"{result['failed_count']} failed"
+            )
+
+        return result
+
     def get_ghost_display_space(self) -> Optional[int]:
         """
         Find the Ghost Display space (virtual display for background monitoring).
