@@ -72,6 +72,62 @@ ModelT = TypeVar("ModelT")
 
 
 # =============================================================================
+# Thread-Safe Event Loop Utilities
+# =============================================================================
+
+# Store event loops created for threads to avoid creating multiple
+_thread_event_loops: Dict[int, asyncio.AbstractEventLoop] = {}
+_thread_loop_lock = threading.Lock()
+
+
+def get_or_create_event_loop() -> asyncio.AbstractEventLoop:
+    """
+    Get the current event loop or create one for the current thread.
+
+    This is thread-safe and handles the case where code runs in a
+    ThreadPoolExecutor thread that doesn't have an event loop.
+
+    Returns:
+        An asyncio event loop for the current thread
+    """
+    # First try to get the running loop (Python 3.10+ recommended way)
+    try:
+        return asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+
+    # Try to get an existing event loop for this thread
+    thread_id = threading.get_ident()
+
+    with _thread_loop_lock:
+        if thread_id in _thread_event_loops:
+            loop = _thread_event_loops[thread_id]
+            if not loop.is_closed():
+                return loop
+            # Loop was closed, remove it
+            del _thread_event_loops[thread_id]
+
+        # Create a new event loop for this thread
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        _thread_event_loops[thread_id] = loop
+        logger.debug(f"[AI] Created new event loop for thread {thread_id}")
+        return loop
+
+
+def cleanup_thread_event_loops():
+    """Clean up event loops created for threads (call on shutdown)."""
+    with _thread_loop_lock:
+        for thread_id, loop in list(_thread_event_loops.items()):
+            if not loop.is_closed():
+                try:
+                    loop.close()
+                except Exception:
+                    pass
+            del _thread_event_loops[thread_id]
+
+
+# =============================================================================
 # Configuration - Environment-Driven, Zero Hardcoding
 # =============================================================================
 
@@ -316,8 +372,8 @@ class GhostModelProxy(Generic[ModelT]):
         self._metrics.calls_while_warming += 1
         logger.info(f"[GHOST] Queuing call to {self._name} (warming up)")
 
-        # Create future for the caller to await
-        loop = asyncio.get_event_loop()
+        # Create future for the caller to await - use thread-safe loop getter
+        loop = get_or_create_event_loop()
         future = loop.create_future()
 
         request = PendingRequest(
@@ -1303,7 +1359,8 @@ class AsyncModelManager:
         logger.info(f"[AI] Loading {name} (priority={priority.name})...")
 
         try:
-            loop = asyncio.get_event_loop()
+            # Use thread-safe event loop getter for cross-thread compatibility
+            loop = get_or_create_event_loop()
 
             # Run in thread pool (PyTorch releases GIL during heavy ops)
             model = await loop.run_in_executor(self._executor, loader_func)

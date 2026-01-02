@@ -838,9 +838,9 @@ class ParallelInitializer:
                 """Heavy loader for voice unlock classifier."""
                 try:
                     from voice_unlock.intelligent_voice_unlock_service import (
-                        get_voice_unlock_service,
+                        get_intelligent_unlock_service,
                     )
-                    service = get_voice_unlock_service()
+                    service = get_intelligent_unlock_service()
                     logger.info("   [BACKGROUND] Voice unlock classifier loaded")
                     return service
                 except Exception as e:
@@ -981,7 +981,8 @@ class ParallelInitializer:
             def load_claude_vision():
                 """Heavy loader for Claude Vision Analyzer."""
                 try:
-                    from vision.claude_vision_analyzer import ClaudeVisionAnalyzer
+                    # Use the correct module path - main file is claude_vision_analyzer_main.py
+                    from vision.claude_vision_analyzer_main import ClaudeVisionAnalyzer
                     if api_key:
                         analyzer = ClaudeVisionAnalyzer(api_key)
                         logger.info("   [BACKGROUND] Claude Vision Analyzer loaded")
@@ -1012,8 +1013,9 @@ class ParallelInitializer:
             def load_display_monitor():
                 """Heavy loader for Display Monitor."""
                 try:
-                    from vision.display_monitor import DisplayMonitor
-                    monitor = DisplayMonitor()
+                    # Use the correct module path - display monitor is in display/ not vision/
+                    from display.display_monitor_service import DisplayMonitorService
+                    monitor = DisplayMonitorService()
                     logger.info("   [BACKGROUND] Display Monitor loaded")
                     return monitor
                 except Exception as e:
@@ -2079,7 +2081,8 @@ class ParallelInitializer:
                 logger.info("   Vision analyzer skipped (no API key)")
                 return
 
-            from vision.claude_vision_analyzer import ClaudeVisionAnalyzer
+            # Use the correct module path - main file is claude_vision_analyzer_main.py
+            from vision.claude_vision_analyzer_main import ClaudeVisionAnalyzer
 
             analyzer = ClaudeVisionAnalyzer(api_key)
             self.app.state.vision_analyzer = analyzer

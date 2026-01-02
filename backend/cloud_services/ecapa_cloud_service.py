@@ -53,6 +53,7 @@ import hashlib
 import json
 import logging
 import os
+import threading
 import sys
 import time
 from collections import OrderedDict
@@ -571,15 +572,25 @@ class TTLCache:
         self.ttl = ttl
         self.cache: OrderedDict = OrderedDict()
         self.timestamps: Dict[str, float] = {}
-        self._lock = asyncio.Lock()
+        # Lazy lock initialization - avoids "no event loop in thread" errors
+        self._lock: Optional[asyncio.Lock] = None
+        self._thread_lock = threading.Lock()  # For sync lock initialization
 
         # Stats
         self.hits = 0
         self.misses = 0
 
+    def _get_lock(self) -> asyncio.Lock:
+        """Get or create the async lock (lazy initialization)."""
+        if self._lock is None:
+            with self._thread_lock:
+                if self._lock is None:
+                    self._lock = asyncio.Lock()
+        return self._lock
+
     async def get(self, key: str) -> Optional[Any]:
         """Get item from cache if exists and not expired."""
-        async with self._lock:
+        async with self._get_lock():
             if key not in self.cache:
                 self.misses += 1
                 return None
@@ -598,7 +609,7 @@ class TTLCache:
 
     async def set(self, key: str, value: Any):
         """Set item in cache with TTL."""
-        async with self._lock:
+        async with self._get_lock():
             if key in self.cache:
                 self.cache.move_to_end(key)
             else:
@@ -1125,7 +1136,9 @@ class ECAPAModelManager:
         self.cache_dir = CloudECAPAConfig.CACHE_DIR
 
         self._loading = False
-        self._load_lock = asyncio.Lock()
+        # Lazy lock initialization - avoids "no event loop in thread" errors
+        self._load_lock: Optional[asyncio.Lock] = None
+        self._load_lock_sync = threading.Lock()  # For thread-safe lazy init
         self._ready = False
         self._error: Optional[str] = None
         self._init_start_time: Optional[float] = None
@@ -1168,6 +1181,14 @@ class ECAPAModelManager:
             return 0.0
         return self.total_inference_time_ms / self.inference_count
 
+    def _get_load_lock(self) -> asyncio.Lock:
+        """Get or create the async load lock (lazy initialization for thread safety)."""
+        if self._load_lock is None:
+            with self._load_lock_sync:
+                if self._load_lock is None:
+                    self._load_lock = asyncio.Lock()
+        return self._load_lock
+
     async def initialize(self) -> bool:
         """
         Initialize and load the ECAPA model with manifest-based INSTANT verification.
@@ -1178,7 +1199,7 @@ class ECAPAModelManager:
         - Fast-fail if strict offline mode and no valid cache
         - Parallel loading with proper async patterns
         """
-        async with self._load_lock:
+        async with self._get_load_lock():
             if self._ready:
                 return True
 

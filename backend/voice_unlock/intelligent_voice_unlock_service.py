@@ -26,6 +26,8 @@ import hashlib
 import logging
 import os
 import subprocess
+import threading
+import time
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from collections import defaultdict
@@ -3818,7 +3820,19 @@ class RobustUnlockStage(Enum):
 # GLOBAL CACHED ECAPA CLASSIFIER - Avoids 12s cold start on each request
 # =============================================================================
 _cached_ecapa_classifier = None
-_ecapa_classifier_lock = asyncio.Lock()
+# Lazy initialization to avoid "no event loop in thread" errors during module import
+_ecapa_classifier_lock: Optional[asyncio.Lock] = None
+_ecapa_classifier_lock_sync = threading.Lock()  # For thread-safe lazy init
+
+
+def _get_ecapa_lock() -> asyncio.Lock:
+    """Get or create the ECAPA classifier lock (lazy initialization)."""
+    global _ecapa_classifier_lock
+    if _ecapa_classifier_lock is None:
+        with _ecapa_classifier_lock_sync:
+            if _ecapa_classifier_lock is None:
+                _ecapa_classifier_lock = asyncio.Lock()
+    return _ecapa_classifier_lock
 
 
 async def get_cached_ecapa_classifier():
@@ -3828,7 +3842,7 @@ async def get_cached_ecapa_classifier():
     if _cached_ecapa_classifier is not None:
         return _cached_ecapa_classifier
 
-    async with _ecapa_classifier_lock:
+    async with _get_ecapa_lock():
         # Double-check after acquiring lock
         if _cached_ecapa_classifier is not None:
             return _cached_ecapa_classifier
@@ -3843,7 +3857,12 @@ async def get_cached_ecapa_classifier():
                 savedir=os.path.expanduser("~/.cache/speechbrain/spkrec-ecapa-voxceleb")
             )
 
-        loop = asyncio.get_event_loop()
+        # Use thread-safe event loop getter
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
         _cached_ecapa_classifier = await loop.run_in_executor(None, _load_model)
 
         elapsed = time.time() - start

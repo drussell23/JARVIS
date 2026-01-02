@@ -15,6 +15,7 @@ import base64
 import io
 import hashlib
 import asyncio
+import threading
 import time
 import gc
 import os
@@ -665,11 +666,21 @@ class MemoryAwareCache:
         self.max_entries = config.cache_max_entries
         self.cache: OrderedDict[str, CacheEntry] = OrderedDict()
         self.current_size_bytes = 0
-        self._lock = asyncio.Lock()
+        # Lazy lock initialization to avoid "no event loop in thread" errors
+        self._lock: Optional[asyncio.Lock] = None
+        self._lock_sync = threading.Lock()
+
+    def _get_lock(self) -> asyncio.Lock:
+        """Get or create the async lock (lazy initialization)."""
+        if self._lock is None:
+            with self._lock_sync:
+                if self._lock is None:
+                    self._lock = asyncio.Lock()
+        return self._lock
 
     async def get(self, key: str) -> Optional[CacheEntry]:
         """Get item from cache with LRU update"""
-        async with self._lock:
+        async with self._get_lock():
             if key in self.cache:
                 # Move to end (most recently used)
                 entry = self.cache.pop(key)
@@ -680,7 +691,7 @@ class MemoryAwareCache:
 
     async def put(self, key: str, entry: CacheEntry):
         """Add item to cache with memory management"""
-        async with self._lock:
+        async with self._get_lock():
             # Calculate entry size
             entry.size_bytes = len(json.dumps(entry.result).encode())
 
