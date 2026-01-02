@@ -526,6 +526,19 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
         self._active_video_watchers: Dict[str, Any] = {}  # watcher_id -> VideoWatcher instance
         self._fast_capture_engine = None  # For window discovery
 
+        # v22.0.0: Watcher Lifecycle Tracking for Early Registration
+        # =====================================================================
+        # PROBLEM: Watchers only registered AFTER all verification passes.
+        # If ANY check fails, watcher is never registered - God Mode sees 0 watchers.
+        #
+        # SOLUTION: Track watcher lifecycle states EARLY:
+        # - "starting": Watcher created, verification in progress
+        # - "verifying": start() succeeded, checking status/frames
+        # - "active": Fully verified and working
+        # - "failed": Verification failed (stores failure reason)
+        # =====================================================================
+        self._watcher_lifecycle: Dict[str, Dict[str, Any]] = {}  # watcher_id -> lifecycle state
+
         # Lazy-loaded components - Action Execution (v11.0)
         self._computer_use_connector = None  # For executing actions
         self._agentic_task_runner = None  # For complex workflows
@@ -1407,6 +1420,11 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
         """
         logger.info(f"🚀 God Mode: Initiating parallel watch for '{app_name}' - '{trigger_text}'")
 
+        # v22.0.0: Clear lifecycle tracker for new session
+        # Ensures we track only watchers from THIS God Mode invocation
+        self._watcher_lifecycle.clear()
+        logger.debug("[God Mode] Cleared watcher lifecycle tracker for new session")
+
         # =====================================================================
         # ROOT CAUSE FIX: Timeout Protection for God Mode Window Discovery v6.0.0
         # =====================================================================
@@ -1576,30 +1594,46 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
             # 4. Return error if ALL watchers failed to start
             # =====================================================================
 
-            # ===== STEP 3B.0: Wait for Watchers to Actually Start =====
+            # ===== STEP 3B.0: Wait for Watchers to Actually Start (v22.0.0) =====
+            # Enhanced with lifecycle tracking for better error reporting
             watcher_startup_timeout = float(os.getenv('JARVIS_WATCHER_STARTUP_TIMEOUT', '10.0'))
             startup_check_interval = 0.2  # Check every 200ms
-            initial_watcher_count = len(self._active_video_watchers)
+            initial_active_count = len(self._active_video_watchers)
             expected_watchers = len(watcher_tasks)
 
             logger.info(
                 f"[God Mode] Waiting up to {watcher_startup_timeout}s for {expected_watchers} "
-                f"watchers to start (current: {initial_watcher_count})..."
+                f"watchers to start (current active: {initial_active_count})..."
             )
 
             # Yield control and wait for watchers to register
             start_wait_time = datetime.now()
-            new_watchers_started = 0
+            new_watchers_active = 0
 
             while (datetime.now() - start_wait_time).total_seconds() < watcher_startup_timeout:
                 # Yield to let tasks execute
                 await asyncio.sleep(startup_check_interval)
 
-                # Check how many new watchers registered
-                current_watcher_count = len(self._active_video_watchers)
-                new_watchers_started = current_watcher_count - initial_watcher_count
+                # v22.0.0: Check lifecycle for detailed status
+                lifecycle_counts = {'starting': 0, 'verifying': 0, 'active': 0, 'failed': 0}
+                for lc_id, lc_info in self._watcher_lifecycle.items():
+                    status = lc_info.get('status', 'unknown')
+                    if status in lifecycle_counts:
+                        lifecycle_counts[status] += 1
 
-                if new_watchers_started >= expected_watchers:
+                # Count new active watchers (fully verified)
+                current_active_count = len(self._active_video_watchers)
+                new_watchers_active = current_active_count - initial_active_count
+
+                # Log progress with lifecycle details
+                in_progress = lifecycle_counts['starting'] + lifecycle_counts['verifying']
+                if in_progress > 0 or lifecycle_counts['failed'] > 0:
+                    logger.debug(
+                        f"[God Mode] Lifecycle: {lifecycle_counts['active']} active, "
+                        f"{in_progress} in progress, {lifecycle_counts['failed']} failed"
+                    )
+
+                if new_watchers_active >= expected_watchers:
                     # All watchers started
                     logger.info(
                         f"[God Mode] ✅ All {expected_watchers} watchers started "
@@ -1607,28 +1641,70 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                     )
                     break
 
-                if new_watchers_started > 0 and (datetime.now() - start_wait_time).total_seconds() >= 3.0:
-                    # At least some watchers started and we've waited 3+ seconds
-                    # Don't wait for stragglers - proceed with what we have
+                # Check if all watchers have finished (active or failed)
+                total_finished = lifecycle_counts['active'] + lifecycle_counts['failed']
+                if total_finished >= expected_watchers:
                     logger.info(
-                        f"[God Mode] ⚡ {new_watchers_started}/{expected_watchers} watchers started "
+                        f"[God Mode] All watchers finished: {lifecycle_counts['active']} active, "
+                        f"{lifecycle_counts['failed']} failed"
+                    )
+                    break
+
+                if new_watchers_active > 0 and (datetime.now() - start_wait_time).total_seconds() >= 3.0:
+                    # At least some watchers started and we've waited 3+ seconds
+                    logger.info(
+                        f"[God Mode] ⚡ {new_watchers_active}/{expected_watchers} watchers active "
                         f"after {(datetime.now() - start_wait_time).total_seconds():.2f}s - proceeding"
                     )
                     break
 
-            # ===== STEP 3B.0.1: Verify At Least One Watcher Started =====
-            if new_watchers_started == 0:
+            # ===== STEP 3B.0.1: Analyze Watcher Results (v22.0.0) =====
+            # Collect final lifecycle status for detailed error reporting
+            failed_watchers = []
+            still_starting = []
+            for lc_id, lc_info in self._watcher_lifecycle.items():
+                status = lc_info.get('status', 'unknown')
+                if status == 'failed':
+                    failed_watchers.append({
+                        'id': lc_id,
+                        'error': lc_info.get('error', 'unknown error'),
+                        'stage': lc_info.get('verification_stage', 'unknown'),
+                        'window_id': lc_info.get('window_id'),
+                        'app_name': lc_info.get('app_name')
+                    })
+                elif status in ('starting', 'verifying'):
+                    still_starting.append(lc_id)
+
+            if new_watchers_active == 0:
+                # Build detailed error message
+                error_details = []
+                if failed_watchers:
+                    for fw in failed_watchers:
+                        error_details.append(
+                            f"Window {fw['window_id']}: {fw['error']} (stage: {fw['stage']})"
+                        )
+                    error_msg = f"All {len(failed_watchers)} watchers failed: " + "; ".join(error_details[:3])
+                    if len(error_details) > 3:
+                        error_msg += f" (and {len(error_details) - 3} more)"
+                else:
+                    error_msg = f'No watchers started after {watcher_startup_timeout}s timeout'
+
                 logger.error(
-                    f"[God Mode] ❌ No watchers started after {watcher_startup_timeout}s! "
-                    f"All {expected_watchers} tasks may have failed."
+                    f"[God Mode] ❌ {error_msg}\n"
+                    f"   Failed: {len(failed_watchers)}, Still starting: {len(still_starting)}"
                 )
 
-                # Narrate error to user
+                # Narrate specific error to user
                 if self.config.working_out_loud_enabled:
                     try:
+                        if failed_watchers:
+                            # Use first failure reason for user message
+                            first_error = failed_watchers[0]['error']
+                            user_msg = f"I couldn't watch {app_name} windows: {first_error}"
+                        else:
+                            user_msg = f"I couldn't connect to any {app_name} windows. Please check if {app_name} is open."
                         await self._narrate_working_out_loud(
-                            message=f"I couldn't connect to any {app_name} windows. "
-                                    f"Please check if {app_name} is open and try again.",
+                            message=user_msg,
                             narration_type="error",
                             watcher_id=f"startup_failed_{app_name}",
                             priority="high"
@@ -1639,9 +1715,10 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                 return {
                     'success': False,
                     'status': 'error',
-                    'error': f'No watchers started after {watcher_startup_timeout}s timeout',
+                    'error': error_msg,
                     'total_watchers': 0,
                     'expected_watchers': expected_watchers,
+                    'failed_watchers': failed_watchers,
                     'app_name': app_name,
                     'trigger_text': trigger_text,
                     'message': f"Failed to connect to any {app_name} windows"
@@ -2435,6 +2512,10 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                     logger.error(f"❌ Error stopping watcher {watcher_id}: {e}")
 
             self._active_video_watchers.clear()
+
+        # v22.0.0: Also clear lifecycle tracker
+        if hasattr(self, '_watcher_lifecycle'):
+            self._watcher_lifecycle.clear()
 
         logger.info("✅ All watchers stopped")
 
@@ -3518,6 +3599,28 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
 
             # Create VideoWatcher (will auto-select Ferrari Engine if available)
             watcher = VideoWatcher(watcher_config)
+            watcher_id = watcher.watcher_id
+
+            # =====================================================================
+            # v22.0.0: EARLY REGISTRATION - Register in lifecycle tracker IMMEDIATELY
+            # =====================================================================
+            # WHY: God Mode checks for registered watchers. If we only register
+            # AFTER verification, failures are silent and God Mode sees 0 watchers.
+            # SOLUTION: Register EARLY with "starting" status, update as we progress.
+            # =====================================================================
+            self._watcher_lifecycle[watcher_id] = {
+                'status': 'starting',
+                'watcher': watcher,
+                'window_id': window_id,
+                'app_name': app_name,
+                'space_id': space_id,
+                'fps': fps,
+                'started_at': datetime.now().isoformat(),
+                'config': watcher_config,
+                'error': None,
+                'verification_stage': 'created'
+            }
+            logger.debug(f"[{watcher_id}] 📝 Registered in lifecycle (status: starting)")
 
             # =====================================================================
             # ROOT CAUSE FIX: Timeout Protection for watcher.start() v6.0.1
@@ -3539,11 +3642,15 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                     timeout=watcher_start_timeout
                 )
             except asyncio.TimeoutError:
-                logger.error(
-                    f"❌ Ferrari Engine watcher.start() timed out after {watcher_start_timeout}s "
-                    f"for window {window_id} ({app_name}). "
-                    f"Possible causes: permission dialog, invalid window, GPU hang."
+                error_msg = (
+                    f"watcher.start() timed out after {watcher_start_timeout}s "
+                    f"(possible causes: permission dialog, invalid window, GPU hang)"
                 )
+                logger.error(f"❌ Ferrari Engine {error_msg}")
+                # v22.0.0: Update lifecycle with failure
+                self._watcher_lifecycle[watcher_id]['status'] = 'failed'
+                self._watcher_lifecycle[watcher_id]['error'] = error_msg
+                self._watcher_lifecycle[watcher_id]['verification_stage'] = 'start_timeout'
                 # Try to clean up the watcher
                 try:
                     await watcher.stop()
@@ -3552,8 +3659,17 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                 return None
 
             if not success:
-                logger.error(f"❌ Ferrari Engine watcher failed to start for window {window_id}")
+                error_msg = f"watcher.start() returned False for window {window_id}"
+                logger.error(f"❌ Ferrari Engine {error_msg}")
+                # v22.0.0: Update lifecycle with failure
+                self._watcher_lifecycle[watcher_id]['status'] = 'failed'
+                self._watcher_lifecycle[watcher_id]['error'] = error_msg
+                self._watcher_lifecycle[watcher_id]['verification_stage'] = 'start_failed'
                 return None
+
+            # v22.0.0: Update lifecycle - start succeeded
+            self._watcher_lifecycle[watcher_id]['status'] = 'verifying'
+            self._watcher_lifecycle[watcher_id]['verification_stage'] = 'started'
 
             # =====================================================================
             # ROOT CAUSE FIX v17.0: Post-Start Health Verification
@@ -3600,12 +3716,20 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                 watcher_is_healthy = True
 
             if not watcher_is_healthy:
-                logger.error(f"❌ Ferrari Engine watcher status check failed for window {window_id}")
+                error_msg = f"watcher status check failed (status: {getattr(watcher, 'status', 'unknown')})"
+                logger.error(f"❌ Ferrari Engine {error_msg} for window {window_id}")
+                # v22.0.0: Update lifecycle with failure
+                self._watcher_lifecycle[watcher_id]['status'] = 'failed'
+                self._watcher_lifecycle[watcher_id]['error'] = error_msg
+                self._watcher_lifecycle[watcher_id]['verification_stage'] = 'status_check_failed'
                 try:
                     await watcher.stop()
                 except Exception:
                     pass
                 return None
+
+            # v22.0.0: Update lifecycle - status verified
+            self._watcher_lifecycle[watcher_id]['verification_stage'] = 'status_verified'
 
             # Stage 2: Verify frame flow (wait for first frame)
             frame_flow_timeout = float(os.getenv('JARVIS_FIRST_FRAME_TIMEOUT', '5.0'))
@@ -3658,15 +3782,20 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
 
             if not first_frame_received:
                 # No frame flow - watcher is not actually working
-                logger.error(
-                    f"❌ Ferrari Engine watcher started but no frames flowing "
-                    f"for window {window_id} ({app_name})"
-                )
+                error_msg = f"watcher started but no frames flowing (window may be hidden or invalid)"
+                logger.error(f"❌ Ferrari Engine {error_msg} for {window_id} ({app_name})")
+                # v22.0.0: Update lifecycle with failure
+                self._watcher_lifecycle[watcher_id]['status'] = 'failed'
+                self._watcher_lifecycle[watcher_id]['error'] = error_msg
+                self._watcher_lifecycle[watcher_id]['verification_stage'] = 'no_frames'
                 try:
                     await watcher.stop()
                 except Exception:
                     pass
                 return None
+
+            # v22.0.0: Update lifecycle - frame flow verified
+            self._watcher_lifecycle[watcher_id]['verification_stage'] = 'frames_verified'
 
             # =====================================================================
             # v6.1.0: Activate Purple Indicator for Visual Confirmation
@@ -3677,8 +3806,7 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
             # =====================================================================
             await self._ensure_purple_indicator()
 
-            # Store watcher info with health tracking metadata
-            watcher_id = watcher.watcher_id
+            # v22.0.0: Mark lifecycle as ACTIVE (fully verified)
             self._active_video_watchers[watcher_id] = {
                 'watcher': watcher,
                 'window_id': window_id,
@@ -3696,6 +3824,11 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                 }
             }
 
+            # v22.0.0: Update lifecycle to ACTIVE
+            self._watcher_lifecycle[watcher_id]['status'] = 'active'
+            self._watcher_lifecycle[watcher_id]['verification_stage'] = 'complete'
+            self._watcher_lifecycle[watcher_id]['activated_at'] = datetime.now().isoformat()
+
             logger.info(
                 f"✅ Ferrari Engine watcher started and verified: {watcher_id} "
                 f"(Window {window_id}, {app_name}, Frame flow: ✓)"
@@ -3704,8 +3837,10 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
             return watcher
 
         except ImportError as e:
-            logger.error(f"❌ Ferrari Engine not available: {e}")
+            error_msg = f"Ferrari Engine not available: {e}"
+            logger.error(f"❌ {error_msg}")
             logger.error("   VideoWatcher/WatcherConfig import failed")
+            # Note: Can't update lifecycle here as watcher was never created
             return None
         except Exception as e:
             logger.exception(f"❌ Failed to spawn Ferrari Engine watcher: {e}")
