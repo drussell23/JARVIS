@@ -161,6 +161,14 @@ class BaseAgentConfig:
 class NeuralMeshConfig:
     """Master configuration for the entire Neural Mesh system."""
 
+    # Identity - used by integration.py for coordinator naming
+    name: str = "JARVIS-Neural-Mesh"
+
+    # Feature flags - used by integration.py for selective initialization
+    enable_monitoring: bool = True
+    enable_knowledge_graph: bool = True
+    enable_communication_bus: bool = True
+
     # Component configs
     communication_bus: CommunicationBusConfig = field(default_factory=CommunicationBusConfig)
     knowledge_graph: KnowledgeGraphConfig = field(default_factory=KnowledgeGraphConfig)
@@ -226,6 +234,16 @@ class NeuralMeshConfig:
     def from_dict(cls, data: Dict[str, Any]) -> "NeuralMeshConfig":
         """Create configuration from a dictionary."""
         config = cls()
+
+        # Update identity and feature flags
+        if "name" in data:
+            config.name = data["name"]
+        if "enable_monitoring" in data:
+            config.enable_monitoring = data["enable_monitoring"]
+        if "enable_knowledge_graph" in data:
+            config.enable_knowledge_graph = data["enable_knowledge_graph"]
+        if "enable_communication_bus" in data:
+            config.enable_communication_bus = data["enable_communication_bus"]
 
         # Update global settings
         if "data_directory" in data:

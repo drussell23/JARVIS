@@ -84,7 +84,11 @@ async def initialize_neural_mesh(
         _neural_mesh_coordinator = NeuralMeshCoordinator(coordinator_config)
         components_loaded.append("coordinator")
 
-        # Start coordinator
+        # Initialize coordinator (creates all components)
+        await _neural_mesh_coordinator.initialize()
+        logger.info("  ✓ Neural Mesh Coordinator initialized")
+
+        # Start coordinator (starts all component services)
         await _neural_mesh_coordinator.start()
         logger.info("  ✓ Neural Mesh Coordinator started")
 

@@ -1633,7 +1633,7 @@ class MLEngineRegistry:
                     # Activate cloud backend
                     if self._startup_decision:
                         result = await startup_manager.activate_cloud_ml_backend()
-                        if result.get("success"):
+                        if result.get("success") and result.get("ip"):
                             # Note: No /api/ml suffix - service routes are at root level
                             self._cloud_endpoint = f"http://{result.get('ip')}:8010"
                             logger.info(f"   Cloud backend activated: {self._cloud_endpoint}")
@@ -1641,7 +1641,8 @@ class MLEngineRegistry:
                 logger.debug("MemoryAwareStartup not available")
 
             # Fallback: Use environment variable or default GCP endpoint
-            if not self._cloud_endpoint:
+            # Also check for invalid endpoints like "http://None:8010"
+            if not self._cloud_endpoint or "None" in str(self._cloud_endpoint):
                 # Cloud Run URLs - dynamically discovered from environment
                 # Updated 2024-12 to new Cloud Run URL format
                 self._cloud_endpoint = os.getenv(
