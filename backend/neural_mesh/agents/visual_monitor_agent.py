@@ -1714,6 +1714,7 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
             from backend.vision.yabai_space_detector import (
                 ensure_yabai_permissions,
                 check_yabai_permissions,
+                open_accessibility_settings,
             )
 
             # Check permissions with timeout wrapper
@@ -1736,16 +1737,36 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                 # Log the detailed error
                 logger.error(f"[God Mode v30.0] ❌ YABAI PERMISSION ISSUE:\n{perm_error}")
 
+                # v30.2: AUTO-OPEN ACCESSIBILITY SETTINGS
+                # Instead of just telling the user, proactively open the settings for them
+                settings_opened = False
+                try:
+                    settings_opened = open_accessibility_settings()
+                    if settings_opened:
+                        logger.info("[God Mode v30.2] ✅ Auto-opened Accessibility settings for user")
+                    else:
+                        logger.warning("[God Mode v30.2] ⚠️ Could not auto-open Accessibility settings")
+                except Exception as e:
+                    logger.warning(f"[God Mode v30.2] Failed to auto-open settings: {e}")
+
                 # Narrate to user if enabled
                 if self.config.working_out_loud_enabled:
                     try:
-                        # Simplified message for voice
-                        voice_msg = (
-                            "I can't control windows right now. "
-                            "Yabai needs accessibility permission. "
-                            "Please check System Settings, Privacy and Security, Accessibility, "
-                            "and enable yabai."
-                        )
+                        # v30.2: Updated message to reflect auto-opening
+                        if settings_opened:
+                            voice_msg = (
+                                "I can't control windows right now because yabai needs accessibility permission. "
+                                "I've opened the Accessibility settings for you. "
+                                "Please find yabai in the list and toggle it on. "
+                                "Then say 'try again' or repeat your command."
+                            )
+                        else:
+                            voice_msg = (
+                                "I can't control windows right now. "
+                                "Yabai needs accessibility permission. "
+                                "Please open System Settings, go to Privacy and Security, then Accessibility, "
+                                "and enable yabai."
+                            )
                         await self._narrate_working_out_loud(
                             message=voice_msg,
                             narration_type="error",
@@ -1761,7 +1782,13 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                     'status': 'error',
                     'error': 'yabai_permission_denied',
                     'error_message': perm_error,
+                    'settings_auto_opened': settings_opened,
                     'fix_instructions': (
+                        "1. Accessibility Settings should now be open\n"
+                        "2. Find 'yabai' in the list and toggle it ON\n"
+                        "3. Run: yabai --restart-service\n"
+                        "4. Then retry your command"
+                    ) if settings_opened else (
                         "1. Open System Settings → Privacy & Security → Accessibility\n"
                         "2. Find 'yabai' and toggle it ON\n"
                         "3. Run: yabai --restart-service"
@@ -1769,7 +1796,11 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                     'total_watchers': 0,
                     'app_name': app_name,
                     'trigger_text': trigger_text,
-                    'message': "Yabai lacks accessibility permissions - cannot control windows"
+                    'message': (
+                        "Yabai lacks accessibility permissions - I've opened the settings for you"
+                        if settings_opened else
+                        "Yabai lacks accessibility permissions - cannot control windows"
+                    )
                 }
 
             logger.info("[God Mode v30.0] ✅ Yabai permissions verified")
