@@ -428,6 +428,7 @@ class ProgressiveStartupManager:
         self._ready_count = 0
         self._failed_count = 0
         self._lock = asyncio.Lock()
+        self._progress_callback: Optional[callable] = None  # v31.0: Progress narration
 
     def calculate_dynamic_timeout(self, window_count: int) -> float:
         """
@@ -454,6 +455,14 @@ class ProgressiveStartupManager:
         ratio = self.config.progressive_startup_min_active_ratio
         return max(1, int(total * ratio))
 
+    def set_progress_callback(self, callback: Optional[callable]) -> None:
+        """
+        v31.0: Set callback for progress narration.
+        
+        Callback signature: async def callback(ready: int, total: int, message: str)
+        """
+        self._progress_callback = callback
+
     async def register_watcher_ready(
         self,
         watcher_id: str,
@@ -464,6 +473,7 @@ class ProgressiveStartupManager:
         Called by watchers when they're ready (or failed).
 
         This is the EVENT-BASED alternative to polling.
+        v31.0: Added progress narration at key milestones.
         """
         async with self._lock:
             self._startup_results[watcher_id] = {
@@ -501,6 +511,38 @@ class ProgressiveStartupManager:
                 f"({self._ready_count}/{self._expected_count} active, "
                 f"{self._failed_count} failed)"
             )
+
+            # v31.0: PROGRESSIVE NARRATION - Keep user informed at milestones
+            # Only narrate at key points to avoid spam (25%, 50%, 75%, first, min_required)
+            if hasattr(self, '_progress_callback') and self._progress_callback and success:
+                should_narrate = False
+                message = ""
+                
+                if self._ready_count == 1:
+                    # First watcher ready
+                    should_narrate = True
+                    message = f"First eye online. {self._expected_count - 1} more initializing."
+                elif self._ready_count == min_required and self._expected_count > 3:
+                    # Minimum threshold reached
+                    should_narrate = True
+                    message = f"{self._ready_count} of {self._expected_count} ready. Enough to proceed."
+                elif self._expected_count >= 4:
+                    # Milestones for larger batches
+                    percent = (self._ready_count / self._expected_count) * 100
+                    prev_percent = ((self._ready_count - 1) / self._expected_count) * 100
+                    
+                    if percent >= 50 and prev_percent < 50:
+                        should_narrate = True
+                        message = f"Halfway there. {self._ready_count} of {self._expected_count} eyes online."
+                    elif percent >= 75 and prev_percent < 75:
+                        should_narrate = True
+                        message = f"Almost ready. {self._ready_count} of {self._expected_count} eyes online."
+                
+                if should_narrate:
+                    try:
+                        await self._progress_callback(self._ready_count, self._expected_count, message)
+                    except Exception as e:
+                        logger.debug(f"[ProgressiveStartup] Progress callback failed: {e}")
 
     async def wait_for_startup(
         self,
@@ -1872,6 +1914,19 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
         # ===== STEP 1: Discover All Windows Across All Spaces (with timeout) =====
         logger.info(f"🔍 Discovering all {app_name} windows across spaces...")
 
+        # v31.0: TRANSPARENT PROGRESS NARRATION - Keep user informed during startup
+        # Users should never be left wondering "is it working?"
+        if self.config.working_out_loud_enabled:
+            try:
+                await self._narrate_working_out_loud(
+                    message=f"Searching for {app_name} windows across all your spaces.",
+                    narration_type="progress",
+                    watcher_id=f"discovery_start_{app_name}",
+                    priority="normal"
+                )
+            except Exception:
+                pass  # Don't fail on narration errors
+
         find_window_timeout = float(os.getenv("JARVIS_FIND_WINDOW_TIMEOUT", "5"))
 
         try:
@@ -1954,6 +2009,23 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
             }
 
         logger.info(f"✅ [v28.0] Validated {len(windows)} windows for '{app_name}'")
+
+        # v31.0: NARRATE DISCOVERY SUCCESS - User knows we found windows
+        if self.config.working_out_loud_enabled:
+            try:
+                window_count = len(windows)
+                if window_count == 1:
+                    msg = f"Found one {app_name} window. Preparing surveillance."
+                else:
+                    msg = f"Found {window_count} {app_name} windows. Preparing parallel surveillance."
+                await self._narrate_working_out_loud(
+                    message=msg,
+                    narration_type="progress",
+                    watcher_id=f"discovery_complete_{app_name}",
+                    priority="normal"
+                )
+            except Exception:
+                pass
 
         # =====================================================================
         # v28.0: WINDOW NORMALIZATION - Ensure Required Fields Exist
@@ -2568,6 +2640,23 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
 
         logger.info(f"🚀 Spawned {len(watcher_tasks)} parallel Ferrari Engine watchers")
 
+        # v31.0: NARRATE WATCHER SPAWNING - User knows initialization started
+        if self.config.working_out_loud_enabled:
+            try:
+                watcher_count = len(watcher_tasks)
+                if watcher_count == 1:
+                    msg = f"Starting video capture for {app_name}."
+                else:
+                    msg = f"Starting video capture for {watcher_count} windows. This may take a moment."
+                await self._narrate_working_out_loud(
+                    message=msg,
+                    narration_type="progress",
+                    watcher_id=f"spawn_start_{app_name}",
+                    priority="normal"
+                )
+            except Exception:
+                pass
+
         # =====================================================================
         # ROOT CAUSE FIX: Non-Blocking Execution v2.0.0
         # =====================================================================
@@ -2638,6 +2727,21 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                 self._progressive_startup_manager = ProgressiveStartupManager(self.config)
             else:
                 self._progressive_startup_manager.reset()
+
+            # v31.0: Wire up progress callback for real-time narration
+            if self.config.working_out_loud_enabled:
+                async def _progress_narration(ready: int, total: int, message: str):
+                    """Callback for progressive narration during startup."""
+                    try:
+                        await self._narrate_working_out_loud(
+                            message=message,
+                            narration_type="progress",
+                            watcher_id=f"startup_progress_{app_name}",
+                            priority="normal"
+                        )
+                    except Exception:
+                        pass
+                self._progressive_startup_manager.set_progress_callback(_progress_narration)
 
             # Calculate dynamic timeout
             dynamic_timeout = self._progressive_startup_manager.calculate_dynamic_timeout(expected_watchers)
@@ -2779,6 +2883,24 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                 f"[God Mode] ✅ Background monitoring active: {new_watchers_active} watchers, "
                 f"watching for '{trigger_text}'"
             )
+
+            # v31.0: NARRATE SUCCESSFUL STARTUP - User knows monitoring is live
+            if self.config.working_out_loud_enabled:
+                try:
+                    if new_watchers_active == 1:
+                        msg = f"Eye is online. Watching for {trigger_text}."
+                    elif new_watchers_active == expected_watchers:
+                        msg = f"All {new_watchers_active} eyes are online. Watching for {trigger_text}."
+                    else:
+                        msg = f"{new_watchers_active} eyes online. Watching for {trigger_text}. I'll alert you when I see it."
+                    await self._narrate_working_out_loud(
+                        message=msg,
+                        narration_type="success",
+                        watcher_id=f"startup_complete_{app_name}",
+                        priority="high"
+                    )
+                except Exception:
+                    pass
 
             # =====================================================================
             # ROOT CAUSE FIX: Safety Harness for Background Tasks v5.0.0
