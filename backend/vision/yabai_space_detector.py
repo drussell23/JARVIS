@@ -284,6 +284,281 @@ def invalidate_yabai_cache():
 
 
 # =============================================================================
+# v34.0: DISPLAY-AWARE ROUTER - Intelligent Cross-Display Window Management
+# =============================================================================
+# ROOT CAUSE FIX: The --space command silently fails for cross-display moves
+# without Scripting Additions. The --display command works natively.
+#
+# This router provides:
+# - Cached display-space mapping for O(1) lookups
+# - Parallel async queries for display detection
+# - Intelligent routing: --display for cross-display, --space for same-display
+# - Virtual/Ghost display awareness
+# =============================================================================
+
+class DisplayAwareRouter:
+    """
+    v34.0: Intelligent display-aware window routing.
+
+    Solves the silent failure of cross-display moves by automatically
+    using --display instead of --space when moving between displays.
+
+    Features:
+    - Cached display-space mapping (TTL-based)
+    - Parallel async display detection
+    - Automatic cross-display detection
+    - Virtual display support
+    """
+
+    # Class-level cache for display-space mapping
+    _display_space_cache: Dict[str, Any] = {
+        "spaces_by_display": {},      # {display_id: [space_ids]}
+        "display_by_space": {},       # {space_id: display_id}
+        "display_count": 0,
+        "space_count": 0,
+        "last_update": None,
+        "ttl_seconds": 10.0,          # Cache valid for 10 seconds
+    }
+
+    _lock = None  # Will be initialized per-instance for thread safety
+
+    def __init__(self, yabai_path: str = "yabai"):
+        self.yabai_path = yabai_path
+        self._lock = asyncio.Lock()
+
+    @classmethod
+    def _is_cache_valid(cls) -> bool:
+        """Check if display-space cache is still valid."""
+        last_update = cls._display_space_cache.get("last_update")
+        if last_update is None:
+            return False
+        age = (datetime.now() - last_update).total_seconds()
+        return age < cls._display_space_cache["ttl_seconds"]
+
+    @classmethod
+    def invalidate_cache(cls):
+        """Force cache refresh on next query."""
+        cls._display_space_cache["last_update"] = None
+
+    async def refresh_display_mapping(self) -> bool:
+        """
+        Refresh the display-space mapping cache.
+
+        Returns True if successful, False otherwise.
+        """
+        async with self._lock:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    self.yabai_path, "-m", "query", "--spaces",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+
+                if proc.returncode != 0 or not stdout:
+                    return False
+
+                spaces = json.loads(stdout.decode())
+
+                # Build mapping
+                spaces_by_display: Dict[int, List[int]] = {}
+                display_by_space: Dict[int, int] = {}
+
+                for space in spaces:
+                    space_id = space.get("index")
+                    display_id = space.get("display")
+
+                    if space_id and display_id:
+                        display_by_space[space_id] = display_id
+                        if display_id not in spaces_by_display:
+                            spaces_by_display[display_id] = []
+                        spaces_by_display[display_id].append(space_id)
+
+                # Update cache
+                self._display_space_cache["spaces_by_display"] = spaces_by_display
+                self._display_space_cache["display_by_space"] = display_by_space
+                self._display_space_cache["display_count"] = len(spaces_by_display)
+                self._display_space_cache["space_count"] = len(display_by_space)
+                self._display_space_cache["last_update"] = datetime.now()
+
+                logger.debug(
+                    f"[DisplayRouter] Refreshed mapping: {len(spaces_by_display)} displays, "
+                    f"{len(display_by_space)} spaces"
+                )
+                return True
+
+            except Exception as e:
+                logger.debug(f"[DisplayRouter] Failed to refresh mapping: {e}")
+                return False
+
+    async def get_display_for_space(self, space_id: int) -> Optional[int]:
+        """Get the display ID for a given space (cached)."""
+        if not self._is_cache_valid():
+            await self.refresh_display_mapping()
+        return self._display_space_cache["display_by_space"].get(space_id)
+
+    async def get_spaces_for_display(self, display_id: int) -> List[int]:
+        """Get all space IDs for a given display (cached)."""
+        if not self._is_cache_valid():
+            await self.refresh_display_mapping()
+        return self._display_space_cache["spaces_by_display"].get(display_id, [])
+
+    async def get_window_display(self, window_id: int) -> Optional[int]:
+        """Get the current display of a window."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                self.yabai_path, "-m", "query", "--windows", "--window", str(window_id),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+
+            if proc.returncode == 0 and stdout:
+                data = json.loads(stdout.decode())
+                return data.get("display")
+        except Exception as e:
+            logger.debug(f"[DisplayRouter] Failed to get window display: {e}")
+        return None
+
+    async def get_window_space(self, window_id: int) -> Optional[int]:
+        """Get the current space of a window."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                self.yabai_path, "-m", "query", "--windows", "--window", str(window_id),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+
+            if proc.returncode == 0 and stdout:
+                data = json.loads(stdout.decode())
+                return data.get("space")
+        except Exception as e:
+            logger.debug(f"[DisplayRouter] Failed to get window space: {e}")
+        return None
+
+    async def detect_cross_display_move(
+        self,
+        window_id: int,
+        target_space: int
+    ) -> Tuple[bool, Optional[int], Optional[int]]:
+        """
+        Detect if a move is cross-display.
+
+        Returns:
+            (is_cross_display, current_display, target_display)
+        """
+        # Parallel queries for speed
+        current_display_task = asyncio.create_task(self.get_window_display(window_id))
+        target_display_task = asyncio.create_task(self.get_display_for_space(target_space))
+
+        current_display, target_display = await asyncio.gather(
+            current_display_task, target_display_task
+        )
+
+        is_cross_display = (
+            current_display is not None and
+            target_display is not None and
+            current_display != target_display
+        )
+
+        return is_cross_display, current_display, target_display
+
+    async def get_optimal_move_command(
+        self,
+        window_id: int,
+        target_space: int
+    ) -> Tuple[List[str], str]:
+        """
+        Get the optimal yabai command for moving a window.
+
+        Returns:
+            (command_args, strategy_name)
+
+        For cross-display moves: Uses --display (bypasses SA requirement)
+        For same-display moves: Uses --space (standard behavior)
+        """
+        is_cross_display, current_display, target_display = await self.detect_cross_display_move(
+            window_id, target_space
+        )
+
+        if is_cross_display and target_display is not None:
+            # CROSS-DISPLAY: Use --display command
+            logger.info(
+                f"[DisplayRouter] 🌐 CROSS-DISPLAY: Window {window_id} "
+                f"Display {current_display} → Display {target_display}"
+            )
+            return (
+                [self.yabai_path, "-m", "window", str(window_id), "--display", str(target_display)],
+                "display_handoff"
+            )
+        else:
+            # SAME-DISPLAY: Use --space command
+            logger.debug(
+                f"[DisplayRouter] Same-display: Window {window_id} → Space {target_space}"
+            )
+            return (
+                [self.yabai_path, "-m", "window", str(window_id), "--space", str(target_space)],
+                "space_move"
+            )
+
+    async def move_window_optimally(
+        self,
+        window_id: int,
+        target_space: int,
+        timeout: float = 5.0
+    ) -> Tuple[bool, str]:
+        """
+        Move a window using the optimal strategy.
+
+        Returns:
+            (success, error_message)
+        """
+        command, strategy = await self.get_optimal_move_command(window_id, target_space)
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+
+            if proc.returncode != 0:
+                error_msg = stderr.decode().strip() if stderr else "Unknown error"
+                return False, error_msg
+
+            logger.info(f"[DisplayRouter] ✅ Move successful (strategy: {strategy})")
+            return True, ""
+
+        except asyncio.TimeoutError:
+            return False, "Command timed out"
+        except Exception as e:
+            return False, str(e)
+
+    def get_cache_stats(self) -> Dict[str, Any]:
+        """Get cache statistics for debugging."""
+        return {
+            "display_count": self._display_space_cache["display_count"],
+            "space_count": self._display_space_cache["space_count"],
+            "cache_valid": self._is_cache_valid(),
+            "last_update": self._display_space_cache["last_update"],
+            "ttl_seconds": self._display_space_cache["ttl_seconds"],
+        }
+
+
+# Global router instance for easy access
+_display_router: Optional[DisplayAwareRouter] = None
+
+def get_display_router(yabai_path: str = "yabai") -> DisplayAwareRouter:
+    """Get or create the global DisplayAwareRouter instance."""
+    global _display_router
+    if _display_router is None:
+        _display_router = DisplayAwareRouter(yabai_path)
+    return _display_router
+
+
+# =============================================================================
 # SERVICE STATE & HEALTH TRACKING
 # =============================================================================
 

@@ -48,6 +48,15 @@ def _lazy_import_managers():
     except ImportError:
         return None, None, None, None
 
+
+def _lazy_import_display_router():
+    """Lazy import DisplayAwareRouter to avoid circular imports"""
+    try:
+        from backend.vision.yabai_space_detector import get_display_router
+        return get_display_router
+    except ImportError:
+        return None
+
 logger = logging.getLogger(__name__)
 
 
@@ -224,7 +233,12 @@ class ActionExecutor:
             )
 
     async def _execute_yabai(self, step: "ExecutionStep") -> StepResult:
-        """Execute a yabai command"""
+        """
+        Execute a yabai command with Display Handoff support.
+
+        v34.0: For window move commands, automatically uses --display instead of
+        --space when moving across displays to bypass Scripting Addition requirements.
+        """
         if self.dry_run:
             logger.info(f"[ACTION-EXECUTOR] [DRY-RUN] Would execute yabai: {step.command}")
             return StepResult(
@@ -282,6 +296,90 @@ class ActionExecutor:
                     logger.info(f"[ACTION-EXECUTOR] Space stabilized after transition")
 
         try:
+            # ═══════════════════════════════════════════════════════════════
+            # v34.0: DISPLAY HANDOFF - Intelligent cross-display routing
+            # ═══════════════════════════════════════════════════════════════
+            # Detect window move commands and use DisplayAwareRouter for
+            # automatic --display vs --space routing.
+            # ═══════════════════════════════════════════════════════════════
+
+            window_move_match = re.match(
+                r'yabai\s+-m\s+window\s+(\d+)\s+--space\s+(\d+)',
+                step.command
+            )
+
+            # Also match: yabai -m window --space N (focused window)
+            focused_window_move = re.match(
+                r'yabai\s+-m\s+window\s+--space\s+(\d+)',
+                step.command
+            )
+
+            if window_move_match:
+                # Window ID specified: use DisplayAwareRouter
+                window_id = int(window_move_match.group(1))
+                target_space = int(window_move_match.group(2))
+
+                get_router = _lazy_import_display_router()
+                if get_router:
+                    router = get_router()
+                    logger.info(
+                        f"[ACTION-EXECUTOR] 🌐 Using DisplayAwareRouter for window {window_id} → space {target_space}"
+                    )
+                    success, error_msg = await router.move_window_optimally(
+                        window_id, target_space, timeout=self.timeout_seconds
+                    )
+                    return StepResult(
+                        step_id=step.step_id,
+                        success=success,
+                        output="" if success else None,
+                        error=error_msg if not success else None,
+                        metadata={"strategy": "display_aware_router"}
+                    )
+
+            elif focused_window_move:
+                # Focused window: get focused window ID first, then use router
+                target_space = int(focused_window_move.group(1))
+
+                get_router = _lazy_import_display_router()
+                if get_router:
+                    router = get_router()
+
+                    # Get focused window ID
+                    try:
+                        proc = await asyncio.create_subprocess_exec(
+                            "yabai", "-m", "query", "--windows", "--window",
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE
+                        )
+                        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+
+                        if proc.returncode == 0 and stdout:
+                            import json
+                            window_data = json.loads(stdout.decode())
+                            window_id = window_data.get("id")
+
+                            if window_id:
+                                logger.info(
+                                    f"[ACTION-EXECUTOR] 🌐 Using DisplayAwareRouter for focused window {window_id} → space {target_space}"
+                                )
+                                success, error_msg = await router.move_window_optimally(
+                                    window_id, target_space, timeout=self.timeout_seconds
+                                )
+                                return StepResult(
+                                    step_id=step.step_id,
+                                    success=success,
+                                    output="" if success else None,
+                                    error=error_msg if not success else None,
+                                    metadata={"strategy": "display_aware_router", "window_id": window_id}
+                                )
+                    except Exception as e:
+                        logger.debug(f"[ACTION-EXECUTOR] Could not get focused window: {e}")
+                        # Fall through to standard execution
+
+            # ═══════════════════════════════════════════════════════════════
+            # Standard yabai execution for non-window-move commands
+            # ═══════════════════════════════════════════════════════════════
+
             process = await asyncio.create_subprocess_shell(
                 step.command,
                 stdout=asyncio.subprocess.PIPE,
