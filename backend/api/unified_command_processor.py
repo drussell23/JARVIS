@@ -1292,18 +1292,25 @@ class UnifiedCommandProcessor:
                 logger.info("[SURVEILLANCE] Initializing IntelligentCommandHandler...")
                 intelligent_handler = IntelligentCommandHandler()
 
-                # Execute with timeout protection
-                handler_timeout = float(os.getenv("JARVIS_HANDLER_TIMEOUT", "30"))
+                # v31.0: Execute with DYNAMIC timeout for surveillance
+                # Surveillance commands may need to:
+                # - Find windows across 9+ spaces
+                # - Teleport windows to Ghost Display
+                # - Initialize 11+ video capture watchers
+                # Fixed 30s was too short - use 60s default for surveillance
+                surveillance_timeout = float(os.getenv("JARVIS_SURVEILLANCE_HANDLER_TIMEOUT", "60"))
+                logger.info(f"[SURVEILLANCE] Using {surveillance_timeout}s timeout for handler")
+                
                 try:
                     result = await asyncio.wait_for(
                         intelligent_handler.handle_command(command_text),
-                        timeout=handler_timeout
+                        timeout=surveillance_timeout
                     )
                 except asyncio.TimeoutError:
-                    logger.error(f"[SURVEILLANCE] Timeout after {handler_timeout}s")
+                    logger.error(f"[SURVEILLANCE] Timeout after {surveillance_timeout}s")
                     return {
                         "success": False,
-                        "response": f"I'm having trouble processing that surveillance command. The system is taking longer than expected.",
+                        "response": f"Surveillance setup timed out after {surveillance_timeout:.0f} seconds. The system may be initializing multiple windows. Please try again.",
                         "command_type": "surveillance",
                         "error": "handler_timeout",
                     }
@@ -3314,11 +3321,13 @@ class UnifiedCommandProcessor:
                 intelligent_handler = IntelligentCommandHandler()
                 logger.info("[SOVEREIGN] ✅ Local surveillance handler loaded")
 
-                # 3c. ASYNC EXECUTION WITH TIMEOUT
-                handler_timeout = float(os.getenv("JARVIS_HANDLER_TIMEOUT", "30"))
+                # 3c. ASYNC EXECUTION WITH DYNAMIC TIMEOUT (v31.0)
+                # Surveillance needs more time for multi-window initialization
+                surveillance_timeout = float(os.getenv("JARVIS_SURVEILLANCE_HANDLER_TIMEOUT", "60"))
+                logger.info(f"[SOVEREIGN] Using {surveillance_timeout}s timeout for surveillance")
                 result = await asyncio.wait_for(
                     intelligent_handler.handle_command(command_text),
-                    timeout=handler_timeout
+                    timeout=surveillance_timeout
                 )
 
                 # 3d. NORMALIZE RESPONSE
@@ -3619,10 +3628,15 @@ class UnifiedCommandProcessor:
                         intelligent_handler = IntelligentCommandHandler()
 
                         # =====================================================================
-                        # Async Safety: Timeout protection for handle_command
+                        # v31.0: Dynamic Timeout Based on Command Type
                         # =====================================================================
-                        # Prevent voice thread hang if handler gets stuck
-                        handler_timeout = float(os.getenv("JARVIS_HANDLER_TIMEOUT", "30"))
+                        # Surveillance commands need more time for multi-window setup
+                        # Regular commands use standard timeout
+                        if command_type == CommandType.SURVEILLANCE:
+                            handler_timeout = float(os.getenv("JARVIS_SURVEILLANCE_HANDLER_TIMEOUT", "60"))
+                            logger.info(f"[UNIFIED] Using extended {handler_timeout}s timeout for surveillance")
+                        else:
+                            handler_timeout = float(os.getenv("JARVIS_HANDLER_TIMEOUT", "30"))
 
                         try:
                             result = await asyncio.wait_for(
@@ -3633,9 +3647,15 @@ class UnifiedCommandProcessor:
                             logger.error(
                                 f"[UNIFIED] IntelligentCommandHandler timed out after {handler_timeout}s"
                             )
+                            timeout_msg = (
+                                f"Surveillance setup timed out after {handler_timeout:.0f} seconds. "
+                                "The system may be initializing multiple windows. Please try again."
+                                if command_type == CommandType.SURVEILLANCE
+                                else f"I'm having trouble processing that command, {self.user_name}. The system is taking longer than expected."
+                            )
                             return {
                                 "success": False,
-                                "response": f"I'm having trouble processing that command, {self.user_name}. The system is taking longer than expected.",
+                                "response": timeout_msg,
                                 "command_type": command_type.value,
                                 "error": "handler_timeout",
                             }

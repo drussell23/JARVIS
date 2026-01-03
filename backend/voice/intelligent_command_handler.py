@@ -1742,14 +1742,41 @@ class IntelligentCommandHandler:
             }
 
             # =====================================================================
-            # ROOT CAUSE FIX: Non-Blocking Execution v2.0.0
+            # ROOT CAUSE FIX: Dynamic Timeout Based on Window Count v31.0
             # =====================================================================
-            # CRITICAL: Pass wait_for_completion=False to return IMMEDIATELY
-            # Detection notifications will happen async via TTS (already implemented)
+            # PROBLEM: Fixed 15s timeout was too short for 11 windows
+            # The ProgressiveStartupManager calculates: base + (count × per_window)
+            # For 11 windows: 5 + (11 × 2) = 27 seconds minimum
+            #
+            # FIX: Calculate dynamic timeout BEFORE calling agent.watch()
+            # This ensures the caller's timeout >= internal startup timeout
             # =====================================================================
 
-            # Start background monitoring with timeout protection
-            watch_timeout = float(os.getenv("JARVIS_WATCH_START_TIMEOUT", "15"))
+            # v31.0: Calculate dynamic timeout based on expected window count
+            # First, estimate window count (if we can't get exact, use reasonable default)
+            estimated_window_count = 5  # Default for single-space
+            if all_spaces:
+                # For "all spaces" mode, expect more windows (typical: 5-15)
+                estimated_window_count = 12  # Reasonable estimate for multi-space
+
+            # Dynamic timeout formula: base + (count × per_window) + buffer
+            # - base: 5 seconds for initial setup
+            # - per_window: 3 seconds per window (capture init + validation)
+            # - buffer: 10 seconds for teleportation and rescue operations
+            TIMEOUT_BASE = float(os.getenv("JARVIS_WATCH_TIMEOUT_BASE", "5"))
+            TIMEOUT_PER_WINDOW = float(os.getenv("JARVIS_WATCH_TIMEOUT_PER_WINDOW", "3"))
+            TIMEOUT_BUFFER = float(os.getenv("JARVIS_WATCH_TIMEOUT_BUFFER", "15"))
+            TIMEOUT_MIN = float(os.getenv("JARVIS_WATCH_TIMEOUT_MIN", "15"))
+            TIMEOUT_MAX = float(os.getenv("JARVIS_WATCH_TIMEOUT_MAX", "90"))
+
+            dynamic_timeout = TIMEOUT_BASE + (estimated_window_count * TIMEOUT_PER_WINDOW) + TIMEOUT_BUFFER
+            watch_timeout = max(TIMEOUT_MIN, min(dynamic_timeout, TIMEOUT_MAX))
+
+            logger.info(
+                f"[v31.0] Dynamic timeout: {watch_timeout:.1f}s "
+                f"(base={TIMEOUT_BASE}, windows≈{estimated_window_count}, "
+                f"per_window={TIMEOUT_PER_WINDOW}, buffer={TIMEOUT_BUFFER})"
+            )
 
             try:
                 result = await asyncio.wait_for(
@@ -1759,15 +1786,18 @@ class IntelligentCommandHandler:
                         all_spaces=all_spaces,
                         action_config=action_config,
                         max_duration=max_duration,
-                        wait_for_completion=False  # ✅ ROOT CAUSE FIX: Don't block!
+                        wait_for_completion=False  # ✅ Don't block - return immediately
                     ),
                     timeout=watch_timeout
                 )
             except asyncio.TimeoutError:
-                logger.error(f"Watch start timed out after {watch_timeout}s")
+                logger.error(f"[v31.0] Watch start timed out after {watch_timeout:.1f}s")
+                # v31.0: More helpful error message with diagnostic info
                 return (f"{initial_msg}\n\n"
-                       f"However, it's taking longer than expected to start monitoring. "
-                       f"The system may be under heavy load. Please try again.")
+                       f"However, initialization timed out after {watch_timeout:.0f} seconds. "
+                       f"This could be due to many windows requiring validation, "
+                       f"window teleportation delays, or system load. "
+                       f"Please try again - the system is now warmed up.")
 
             # =====================================================================
             # Return IMMEDIATELY with acknowledgment

@@ -1892,9 +1892,16 @@ class JARVISVoiceAPI:
                 try:
                     from .unified_command_processor import UnifiedCommandProcessor
                     processor = UnifiedCommandProcessor()
+                    
+                    # v31.0: Dynamic timeout for multi-window surveillance
+                    # Fixed 30s was too short for 11+ windows with teleportation
+                    # Formula: base(10) + per_window(3) × estimated_windows(12) + buffer(20) = 66s
+                    surveillance_timeout = float(os.getenv("JARVIS_SURVEILLANCE_TIMEOUT", "60"))
+                    logger.info(f"[JARVIS API] Using {surveillance_timeout}s timeout for surveillance")
+                    
                     result = await asyncio.wait_for(
                         processor.process_command(command.text),
-                        timeout=30.0
+                        timeout=surveillance_timeout
                     )
 
                     if result and result.get('response'):
@@ -1916,9 +1923,9 @@ class JARVISVoiceAPI:
                         }
 
                 except asyncio.TimeoutError:
-                    logger.error("[JARVIS API] Surveillance setup timed out")
+                    logger.error(f"[JARVIS API] Surveillance setup timed out after {surveillance_timeout}s")
                     return {
-                        "response": "The monitoring setup is taking longer than expected. Please try again.",
+                        "response": f"Monitoring setup timed out after {surveillance_timeout:.0f} seconds. The system may be initializing many windows. Please try again.",
                         "status": "error",
                         "command_type": "surveillance",
                         "success": False,
