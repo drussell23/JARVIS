@@ -4447,119 +4447,129 @@ class YabaiSpaceDetector:
                 f"from Space {space_id} (wake delay: {base_wake_delay_ms:.0f}ms)"
             )
 
-            # Switch to hidden space once
-            if await self._switch_to_space_async(space_id):
+            # =====================================================================
+            # v31.1: DIRECT MOVE PROTOCOL (No Space Switch Required)
+            # =====================================================================
+            # ROOT CAUSE FIX: Space switching requires yabai scripting addition (SA),
+            # which requires SIP to be partially disabled. Most users don't have SA.
+            #
+            # SOLUTION: Use DIRECT MOVE approach:
+            # 1. Exit fullscreen if needed (can be done without SA)
+            # 2. Re-query ghost space index (it changes dynamically!)
+            # 3. Move window directly (works without SA)
+            # 4. Only fall back to space switch if direct move fails
+            # =====================================================================
+
+            # Try space switch (may fail without SA - that's OK!)
+            space_switch_success = await self._switch_to_space_async(space_id)
+            if space_switch_success:
                 await asyncio.sleep(wake_delay_s)
+                logger.debug(f"[YABAI] Space switch to {space_id} succeeded")
+            else:
+                logger.info(
+                    f"[YABAI] 🔄 Space switch failed (normal without SA) - using Direct Move Protocol"
+                )
 
-                # Parallel move windows from this space
-                async def rescue_window(w):
-                    window_id = w.get("window_id")
-                    app_name = w.get("app_name") or w.get("app")
-                    is_minimized = w.get("minimized", False) or w.get("is-minimized", False)
-                    is_fullscreen = w.get("is_fullscreen", False) or w.get("is-native-fullscreen", False)
-                    move_start = time.time()
+            # Parallel move windows from this space (works with or without space switch)
+            async def rescue_window(w):
+                window_id = w.get("window_id")
+                app_name = w.get("app_name") or w.get("app")
+                is_minimized = w.get("minimized", False) or w.get("is-minimized", False)
+                is_fullscreen = w.get("is_fullscreen", False) or w.get("is-native-fullscreen", False)
+                move_start = time.time()
 
-                    strategy = RescueStrategy.SWITCH_GRAB_RETURN
+                strategy = RescueStrategy.DIRECT  # v31.1: Default to direct move
 
-                    # =========================================================
-                    # v31.0: EXIT FULLSCREEN FIRST
-                    # =========================================================
-                    # ROOT CAUSE FIX: macOS prevents moving fullscreen windows.
-                    # We MUST exit fullscreen before attempting to move.
-                    # =========================================================
-                    if is_fullscreen:
-                        logger.info(
-                            f"[YABAI] 🖥️ Window {window_id} is in fullscreen - exiting first"
-                        )
-                        try:
-                            yabai_path = self._health.yabai_path or "yabai"
-                            
-                            # Focus the window (required for fullscreen toggle)
-                            await run_subprocess_async(
-                                [yabai_path, "-m", "window", str(window_id), "--focus"],
-                                timeout=2.0
-                            )
-                            await asyncio.sleep(0.2)
-                            
-                            # Exit fullscreen
-                            await run_subprocess_async(
-                                [yabai_path, "-m", "window", str(window_id), "--toggle", "native-fullscreen"],
-                                timeout=3.0
-                            )
-                            
-                            # Wait for fullscreen animation (~1 second on macOS)
-                            await asyncio.sleep(1.2)
-                            strategy = RescueStrategy.EXIT_FULLSCREEN_FIRST
-                            
-                            logger.debug(f"[YABAI] Exited fullscreen for window {window_id}")
-                        except Exception as e:
-                            logger.warning(f"[YABAI] Failed to exit fullscreen: {e}")
-
-                    success = await self.move_window_to_space_async(window_id, ghost_space)
-                    duration_ms = (time.time() - move_start) * 1000
-
-                    # If first attempt failed and window is minimized, try unminimize
-                    if not success and is_minimized:
-                        try:
-                            yabai_path = self._health.yabai_path or "yabai"
-                            await run_subprocess_async(
-                                [yabai_path, "-m", "window", str(window_id), "--minimize", "off"],
-                                timeout=2.0
-                            )
-                            await asyncio.sleep(wake_delay_s)
-                            success = await self.move_window_to_space_async(window_id, ghost_space)
-                            strategy = RescueStrategy.UNMINIMIZE_FIRST
-                        except Exception:
-                            pass
-
-                    # If still failed and was fullscreen, maybe animation wasn't complete
-                    if not success and is_fullscreen:
-                        logger.debug(f"[YABAI] Retry after fullscreen exit for window {window_id}")
-                        try:
-                            # Wait a bit more and retry
-                            await asyncio.sleep(0.5)
-                            success = await self.move_window_to_space_async(window_id, ghost_space)
-                        except Exception:
-                            pass
-
-                    telemetry.record_attempt(
-                        success=success,
-                        strategy=strategy,
-                        duration_ms=duration_ms,
-                        app_name=app_name,
-                        wake_delay_used_ms=base_wake_delay_ms
+                # =========================================================
+                # v31.0: EXIT FULLSCREEN FIRST
+                # =========================================================
+                # ROOT CAUSE FIX: macOS prevents moving fullscreen windows.
+                # We MUST exit fullscreen before attempting to move.
+                # This works WITHOUT the scripting addition!
+                # =========================================================
+                if is_fullscreen:
+                    logger.info(
+                        f"[YABAI] 🖥️ Window {window_id} is in fullscreen - exiting first"
                     )
+                    try:
+                        yabai_path = self._health.yabai_path or "yabai"
+                        
+                        # Toggle fullscreen (works without SA!)
+                        await run_subprocess_async(
+                            [yabai_path, "-m", "window", str(window_id), "--toggle", "native-fullscreen"],
+                            timeout=3.0
+                        )
+                        
+                        # Wait for fullscreen animation (~1 second on macOS)
+                        await asyncio.sleep(1.2)
+                        strategy = RescueStrategy.EXIT_FULLSCREEN_FIRST
+                        
+                        logger.debug(f"[YABAI] Exited fullscreen for window {window_id}")
+                    except Exception as e:
+                        logger.warning(f"[YABAI] Failed to exit fullscreen: {e}")
 
-                    return {
-                        "window_id": window_id,
-                        "source_space": space_id,
-                        "success": success,
-                        "method": "rescue" if success else "failed",
-                        "strategy": strategy.value,
-                        "duration_ms": duration_ms,
-                        "app_name": app_name,
-                        "was_fullscreen": is_fullscreen
-                    }
+                # v31.1: RE-QUERY ghost space index before each move
+                # Space indices are DYNAMIC and can change after fullscreen exit!
+                current_ghost_space = self.get_ghost_display_space()
+                if current_ghost_space is None:
+                    current_ghost_space = ghost_space  # Fallback to original
+                    logger.warning(f"[YABAI] Could not re-query ghost space, using {ghost_space}")
 
-                # Execute rescues in parallel
-                tasks = [rescue_window(w) for w in space_windows]
+                success = await self.move_window_to_space_async(window_id, current_ghost_space)
+                duration_ms = (time.time() - move_start) * 1000
 
-                if len(tasks) > max_parallel:
-                    for i in range(0, len(tasks), max_parallel):
-                        batch = tasks[i:i + max_parallel]
-                        batch_results = await asyncio.gather(*batch, return_exceptions=True)
-                        for r in batch_results:
-                            if isinstance(r, Exception):
-                                result["failed_count"] += 1
-                            elif r.get("success"):
-                                result["rescue_count"] += 1
-                                result["details"].append(r)
-                            else:
-                                result["failed_count"] += 1
-                                result["details"].append(r)
-                else:
-                    rescue_results = await asyncio.gather(*tasks, return_exceptions=True)
-                    for r in rescue_results:
+                # If first attempt failed and window is minimized, try unminimize
+                if not success and is_minimized:
+                    try:
+                        yabai_path = self._health.yabai_path or "yabai"
+                        await run_subprocess_async(
+                            [yabai_path, "-m", "window", str(window_id), "--minimize", "off"],
+                            timeout=2.0
+                        )
+                        await asyncio.sleep(wake_delay_s)
+                        success = await self.move_window_to_space_async(window_id, current_ghost_space)
+                        strategy = RescueStrategy.UNMINIMIZE_FIRST
+                    except Exception:
+                        pass
+
+                # If still failed and was fullscreen, maybe animation wasn't complete
+                if not success and is_fullscreen:
+                    logger.debug(f"[YABAI] Retry after fullscreen exit for window {window_id}")
+                    try:
+                        # Wait a bit more and retry with fresh ghost space index
+                        await asyncio.sleep(0.5)
+                        retry_ghost_space = self.get_ghost_display_space() or current_ghost_space
+                        success = await self.move_window_to_space_async(window_id, retry_ghost_space)
+                    except Exception:
+                        pass
+
+                telemetry.record_attempt(
+                    success=success,
+                    strategy=strategy,
+                    duration_ms=duration_ms,
+                    app_name=app_name,
+                    wake_delay_used_ms=base_wake_delay_ms
+                )
+
+                return {
+                    "window_id": window_id,
+                    "source_space": space_id,
+                    "success": success,
+                    "method": "rescue" if success else "failed",
+                    "strategy": strategy.value,
+                    "duration_ms": duration_ms,
+                    "app_name": app_name,
+                    "was_fullscreen": is_fullscreen
+                }
+
+            # Execute rescues in parallel (OUTSIDE rescue_window function)
+            tasks = [rescue_window(w) for w in space_windows]
+
+            if len(tasks) > max_parallel:
+                for i in range(0, len(tasks), max_parallel):
+                    batch = tasks[i:i + max_parallel]
+                    batch_results = await asyncio.gather(*batch, return_exceptions=True)
+                    for r in batch_results:
                         if isinstance(r, Exception):
                             result["failed_count"] += 1
                         elif r.get("success"):
@@ -4569,25 +4579,18 @@ class YabaiSpaceDetector:
                             result["failed_count"] += 1
                             result["details"].append(r)
             else:
-                # Couldn't switch to this space
-                for w in space_windows:
-                    telemetry.record_attempt(
-                        success=False,
-                        strategy=RescueStrategy.SWITCH_GRAB_RETURN,
-                        duration_ms=0,
-                        failure_reason=RescueFailureReason.SPACE_SWITCH_FAILED,
-                        app_name=w.get("app_name") or w.get("app")
-                    )
-                    result["details"].append({
-                        "window_id": w.get("window_id"),
-                        "source_space": space_id,
-                        "success": False,
-                        "method": "failed",
-                        "failure_reason": "space_switch_failed"
-                    })
-                    result["failed_count"] += 1
+                rescue_results = await asyncio.gather(*tasks, return_exceptions=True)
+                for r in rescue_results:
+                    if isinstance(r, Exception):
+                        result["failed_count"] += 1
+                    elif r.get("success"):
+                        result["rescue_count"] += 1
+                        result["details"].append(r)
+                    else:
+                        result["failed_count"] += 1
+                        result["details"].append(r)
 
-        # Return to original space
+        # Return to original space (may fail without SA - that's OK)
         if current_space:
             await self._switch_to_space_async(current_space)
 
