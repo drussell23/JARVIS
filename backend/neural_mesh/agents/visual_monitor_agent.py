@@ -125,6 +125,25 @@ except ImportError as e:
     WEBSOCKET_MANAGER_AVAILABLE = False
     logger.warning(f"[VisualMonitor] WebSocket Manager not available: {e}")
 
+# v32.0: Real-time surveillance progress streaming to UI
+try:
+    from backend.core.surveillance_progress_stream import (
+        SurveillanceStage,
+        emit_surveillance_progress,
+        emit_discovery_start,
+        emit_discovery_complete,
+        emit_teleport_progress,
+        emit_watcher_spawned,
+        emit_monitoring_active,
+        emit_detection,
+        emit_error,
+    )
+    PROGRESS_STREAM_AVAILABLE = True
+    logger.info("[VisualMonitor] ✅ SurveillanceProgressStream available for real-time UI updates")
+except ImportError as e:
+    PROGRESS_STREAM_AVAILABLE = False
+    logger.warning(f"[VisualMonitor] SurveillanceProgressStream not available: {e}")
+
 # Multi-space window detection for "God Mode" parallel watching
 try:
     from backend.vision.multi_space_window_detector import MultiSpaceWindowDetector
@@ -2010,6 +2029,24 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
 
         logger.info(f"✅ [v28.0] Validated {len(windows)} windows for '{app_name}'")
 
+        # v32.0: Emit discovery complete to UI progress stream
+        # Generate correlation ID for this surveillance session
+        _surveillance_correlation_id = f"surv_{app_name}_{int(datetime.now().timestamp())}"
+        
+        if PROGRESS_STREAM_AVAILABLE:
+            try:
+                # Count unique spaces
+                unique_spaces = set(w.get('space_id') for w in windows if w.get('space_id'))
+                await emit_discovery_complete(
+                    app_name=app_name,
+                    window_count=len(windows),
+                    space_count=len(unique_spaces),
+                    trigger_text=trigger_text,
+                    correlation_id=_surveillance_correlation_id
+                )
+            except Exception as e:
+                logger.debug(f"[v32.0] Progress stream emit failed: {e}")
+
         # v31.0: NARRATE DISCOVERY SUCCESS - User knows we found windows
         if self.config.working_out_loud_enabled:
             try:
@@ -2230,6 +2267,26 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                             except Exception:
                                 pass
 
+                        # v32.0: Emit teleport start to UI progress stream
+                        if PROGRESS_STREAM_AVAILABLE:
+                            try:
+                                await emit_surveillance_progress(
+                                    stage=SurveillanceStage.TELEPORT_START,
+                                    message=f"👻 Moving {len(windows_to_teleport)} windows to Ghost Display...",
+                                    progress_current=0,
+                                    progress_total=len(windows_to_teleport),
+                                    app_name=app_name,
+                                    trigger_text=trigger_text,
+                                    details={
+                                        "hidden_count": hidden_count,
+                                        "user_space_count": user_space_count,
+                                        "ghost_space": ghost_space
+                                    },
+                                    correlation_id=_surveillance_correlation_id
+                                )
+                            except Exception as e:
+                                logger.debug(f"[v32.0] Progress stream emit failed: {e}")
+
                         # =========================================================
                         # v24.0.0: INTELLIGENT SEARCH & RESCUE PROTOCOL
                         # =========================================================
@@ -2303,6 +2360,27 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                                 f"[God Mode] ✅ AUTO-HANDOFF complete: "
                                 f"{len(teleported_windows)}/{len(windows_to_teleport)} windows moved to Ghost Display"
                             )
+
+                            # v32.0: Emit teleport complete to UI progress stream
+                            if PROGRESS_STREAM_AVAILABLE:
+                                try:
+                                    await emit_surveillance_progress(
+                                        stage=SurveillanceStage.TELEPORT_COMPLETE,
+                                        message=f"✅ {len(teleported_windows)} windows moved to Ghost Display",
+                                        progress_current=len(teleported_windows),
+                                        progress_total=len(windows_to_teleport),
+                                        app_name=app_name,
+                                        trigger_text=trigger_text,
+                                        space_id=ghost_space,
+                                        details={
+                                            "teleported_count": len(teleported_windows),
+                                            "failed_count": len(windows_to_teleport) - len(teleported_windows),
+                                            "ghost_space": ghost_space
+                                        },
+                                        correlation_id=_surveillance_correlation_id
+                                    )
+                                except Exception as e:
+                                    logger.debug(f"[v32.0] Progress stream emit failed: {e}")
 
                             # =========================================================
                             # v25.0: TRACK TELEPORTED WINDOWS & APPLY LAYOUT
@@ -2883,6 +2961,18 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                 f"[God Mode] ✅ Background monitoring active: {new_watchers_active} watchers, "
                 f"watching for '{trigger_text}'"
             )
+
+            # v32.0: Emit monitoring active to UI progress stream - THIS IS THE KEY EVENT!
+            if PROGRESS_STREAM_AVAILABLE:
+                try:
+                    await emit_monitoring_active(
+                        watcher_count=new_watchers_active,
+                        app_name=app_name,
+                        trigger_text=trigger_text,
+                        correlation_id=_surveillance_correlation_id
+                    )
+                except Exception as e:
+                    logger.debug(f"[v32.0] Progress stream emit failed: {e}")
 
             # v31.0: NARRATE SUCCESSFUL STARTUP - User knows monitoring is live
             if self.config.working_out_loud_enabled:

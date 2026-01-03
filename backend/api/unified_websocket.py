@@ -1425,32 +1425,71 @@ class UnifiedWebSocketManager:
                                     # Surveillance needs slower progress (more stages, longer waits)
                                     update_interval = 3.0 if is_surveillance_command else 2.0
                                     
-                                    while not progress_cancelled.is_set():
-                                        if stage_index < len(progress_stages):
-                                            stage = progress_stages[stage_index]
-                                        else:
-                                            stage = progress_stages[-1]  # Stay on last stage
-
-                                        await websocket.send_json({
-                                            "type": "processing_progress",
-                                            "stage": stage["stage"],
-                                            "message": stage["message"],
-                                            "stage_index": min(stage_index, len(progress_stages) - 1),
-                                            "total_stages": len(progress_stages),
-                                            "is_surveillance": is_surveillance_command,
-                                            "timeout_seconds": base_timeout,
-                                            "timestamp": time.time(),
-                                        })
-
-                                        # Wait between updates, or until cancelled
+                                    # v32.0: For surveillance commands, subscribe to real progress stream
+                                    surveillance_subscriber_id = None
+                                    if is_surveillance_command:
                                         try:
-                                            await asyncio.wait_for(
-                                                progress_cancelled.wait(),
-                                                timeout=update_interval
-                                            )
-                                            break  # Cancelled
-                                        except asyncio.TimeoutError:
-                                            stage_index += 1
+                                            from backend.core.surveillance_progress_stream import get_progress_stream
+                                            progress_stream = get_progress_stream()
+                                            surveillance_subscriber_id = await progress_stream.subscribe()
+                                            logger.info(f"[WS] 👁️ Subscribed to surveillance progress stream: {surveillance_subscriber_id}")
+                                        except ImportError as e:
+                                            logger.debug(f"[WS] Surveillance progress stream not available: {e}")
+                                        except Exception as e:
+                                            logger.debug(f"[WS] Failed to subscribe to progress stream: {e}")
+                                    
+                                    try:
+                                        while not progress_cancelled.is_set():
+                                            # v32.0: For surveillance, prefer real progress events
+                                            if surveillance_subscriber_id and is_surveillance_command:
+                                                try:
+                                                    # Check for real surveillance progress events (non-blocking)
+                                                    progress_stream = get_progress_stream()
+                                                    queue = progress_stream._subscribers.get(surveillance_subscriber_id)
+                                                    if queue and not queue.empty():
+                                                        # Send all queued real progress events
+                                                        while not queue.empty():
+                                                            real_event = await asyncio.wait_for(queue.get(), timeout=0.1)
+                                                            await websocket.send_json(real_event)
+                                                            logger.debug(f"[WS] 📡 Sent surveillance progress: {real_event.get('stage')}")
+                                                except Exception as e:
+                                                    logger.debug(f"[WS] Error reading progress queue: {e}")
+                                            
+                                            # Fallback: Send generic progress if no real events
+                                            if stage_index < len(progress_stages):
+                                                stage = progress_stages[stage_index]
+                                            else:
+                                                stage = progress_stages[-1]  # Stay on last stage
+
+                                            await websocket.send_json({
+                                                "type": "processing_progress",
+                                                "stage": stage["stage"],
+                                                "message": stage["message"],
+                                                "stage_index": min(stage_index, len(progress_stages) - 1),
+                                                "total_stages": len(progress_stages),
+                                                "is_surveillance": is_surveillance_command,
+                                                "timeout_seconds": base_timeout,
+                                                "timestamp": time.time(),
+                                            })
+
+                                            # Wait between updates, or until cancelled
+                                            try:
+                                                await asyncio.wait_for(
+                                                    progress_cancelled.wait(),
+                                                    timeout=update_interval
+                                                )
+                                                break  # Cancelled
+                                            except asyncio.TimeoutError:
+                                                stage_index += 1
+                                    finally:
+                                        # v32.0: Cleanup surveillance subscription
+                                        if surveillance_subscriber_id:
+                                            try:
+                                                progress_stream = get_progress_stream()
+                                                await progress_stream.unsubscribe(surveillance_subscriber_id)
+                                                logger.debug(f"[WS] Unsubscribed from surveillance progress: {surveillance_subscriber_id}")
+                                            except Exception:
+                                                pass
                                 except Exception as e:
                                     logger.debug(f"[WS] Progress update task ended: {e}")
 
