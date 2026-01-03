@@ -81,12 +81,26 @@ import asyncio
 import json
 import logging
 import os
+import re
 import subprocess
 from dataclasses import dataclass, asdict, field
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
+
+# v32.3: Rapidfuzz for intelligent fuzzy text matching
+# - 100x faster than fuzzywuzzy (C++ implementation)
+# - Zero RAM overhead (lazy loaded)
+# - Better matching for "bouncing" → "BOUNCE"
+try:
+    from rapidfuzz import fuzz as rapidfuzz_fuzz
+    from rapidfuzz import process as rapidfuzz_process
+    RAPIDFUZZ_AVAILABLE = True
+except ImportError:
+    RAPIDFUZZ_AVAILABLE = False
+    rapidfuzz_fuzz = None
+    rapidfuzz_process = None
 
 from ..base.base_neural_mesh_agent import BaseNeuralMeshAgent
 from ..data_models import (
@@ -5908,8 +5922,8 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                 if frame_count % check_interval == 0:
                     ocr_checks += 1
 
-                    # Run OCR detection with extended results for near-miss detection
-                    detected, confidence, detected_text = await self._ocr_detect(
+                    # v32.3: Run OCR detection with intelligent fuzzy matching and context extraction
+                    detected, confidence, detected_text, ocr_context = await self._ocr_detect(
                         frame=frame,
                         trigger_text=trigger_text
                     )
@@ -5919,24 +5933,46 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
 
                     if detected:
                         detection_time = time.time() - start_time
+                        
+                        # v32.3: Enhanced logging with match method and context
+                        match_method = ocr_context.get('match_method', 'unknown') if ocr_context else 'unknown'
+                        match_tier = ocr_context.get('match_tier', 'unknown') if ocr_context else 'unknown'
+                        extracted_number = ocr_context.get('extracted_number', 'N/A') if ocr_context else 'N/A'
+                        
                         logger.info(
                             f"[Ferrari Detection] ✅ FOUND '{trigger_text}'! "
+                            f"Matched: '{detected_text}' via {match_tier} ({match_method}) | "
                             f"Time: {detection_time:.2f}s, Confidence: {confidence:.2f}, "
-                            f"Frames: {frame_count}, OCR checks: {ocr_checks}"
+                            f"Frames: {frame_count}, OCR checks: {ocr_checks} | "
+                            f"Context: {extracted_number}"
                         )
 
                         # v14.0: Cleanup narration state
                         self._cleanup_narration_state(watcher_id)
 
-                        return {
+                        # v32.3: Include rich context in detection result
+                        detection_result = {
                             'detected': True,
                             'confidence': confidence,
                             'trigger': detected_text,
                             'detection_time': detection_time,
                             'frames_checked': frame_count,
                             'ocr_checks': ocr_checks,
-                            'method': frame_data.get('method', 'screencapturekit')
+                            'method': frame_data.get('method', 'screencapturekit'),
+                            # v32.3: New fields for intelligent detection
+                            'match_tier': match_tier,
+                            'match_method': match_method,
                         }
+                        
+                        # Add context if available
+                        if ocr_context:
+                            detection_result['context'] = ocr_context
+                            if 'extracted_number' in ocr_context:
+                                detection_result['extracted_value'] = ocr_context['extracted_number']
+                            if 'surrounding_text' in ocr_context:
+                                detection_result['surrounding_text'] = ocr_context['surrounding_text']
+                        
+                        return detection_result
 
                     # v14.0: Near-miss detection - found interesting text but not the trigger
                     if self.config.working_out_loud_enabled and all_text:
@@ -6148,23 +6184,38 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
         self,
         frame: Any,
         trigger_text: str
-    ) -> tuple[bool, float, Optional[str]]:
+    ) -> tuple[bool, float, Optional[str], Optional[Dict[str, Any]]]:
         """
-        Run OCR on frame and check for trigger text.
+        v32.3: INTELLIGENT OCR DETECTION with Semantic Fuzzy Matching
+        
+        Run OCR on frame and check for trigger text using multi-tier matching:
+        
+        TIER 1: Exact substring match (fastest, 100% confidence)
+        TIER 2: Word stemming match ("bouncing" → "bounc" matches "BOUNCE" → "bounc")
+        TIER 3: Rapidfuzz partial_ratio (80+ threshold, handles typos/variations)
+        TIER 4: Rapidfuzz token_set_ratio (word reordering, 75+ threshold)
+        
+        Also extracts context values (numbers like bounce counts) from detected text.
 
         Args:
             frame: Numpy array (RGB)
             trigger_text: Text to search for
 
         Returns:
-            (detected, confidence, detected_text)
+            (detected, confidence, detected_text, context_dict)
+            - detected: True if trigger text found
+            - confidence: Match confidence (0.0-1.0)
+            - detected_text: Actual text that matched
+            - context_dict: Extracted context (numbers, surrounding text, etc.)
         """
+        context: Dict[str, Any] = {}
+        
         try:
             if not self._detector:
-                # No detector available - fallback to simple presence check
-                return False, 0.0, None
+                # No detector available - fallback
+                return False, 0.0, None, None
 
-            # Run OCR detection via visual event detector (async method)
+            # STEP 1: Run OCR to extract all text from frame
             result = await self._detector.detect_text(
                 frame=frame,
                 target_text=trigger_text,
@@ -6172,14 +6223,286 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                 fuzzy=True
             )
 
+            # Get full OCR text for context extraction and fallback matching
+            full_ocr_text = ""
+            if hasattr(self._detector, 'last_ocr_text'):
+                full_ocr_text = self._detector.last_ocr_text or ""
+            elif result and isinstance(result, dict):
+                full_ocr_text = result.get('raw_text', result.get('text', ''))
+            
+            # TIER 1: Check if detector already found a match
             if result and result.get('found', False):
-                return True, result.get('confidence', 0.9), result.get('text', trigger_text)
+                confidence = result.get('confidence', 0.9)
+                matched_text = result.get('text', trigger_text)
+                
+                # Extract context (numbers, values)
+                context = self._extract_ocr_context(full_ocr_text, trigger_text, matched_text)
+                context['match_tier'] = 'exact'
+                context['match_method'] = 'detector_exact_match'
+                
+                logger.info(
+                    f"✅ [OCR v32.3] TIER 1 MATCH: '{trigger_text}' found as '{matched_text}' "
+                    f"(confidence: {confidence:.1%}) | Context: {context.get('extracted_number', 'N/A')}"
+                )
+                return True, confidence, matched_text, context
 
-            return False, 0.0, None
+            # If detector didn't find it, try advanced matching on full OCR text
+            if not full_ocr_text:
+                # Try to get full text directly
+                try:
+                    all_text_result = await self._ocr_get_all_text(frame)
+                    full_ocr_text = all_text_result if all_text_result else ""
+                except Exception:
+                    pass
+            
+            if not full_ocr_text:
+                return False, 0.0, None, None
+            
+            # Normalize texts for comparison
+            trigger_lower = trigger_text.lower().strip()
+            ocr_lower = full_ocr_text.lower()
+            
+            # TIER 2: Word stemming match (handles "bouncing" → "BOUNCE")
+            stem_match, stem_confidence, stem_matched = self._stem_match(trigger_lower, ocr_lower)
+            if stem_match:
+                context = self._extract_ocr_context(full_ocr_text, trigger_text, stem_matched)
+                context['match_tier'] = 'stem'
+                context['match_method'] = f'word_stemming ({stem_matched})'
+                
+                logger.info(
+                    f"✅ [OCR v32.3] TIER 2 STEM MATCH: '{trigger_text}' matched via stemming "
+                    f"to '{stem_matched}' (confidence: {stem_confidence:.1%}) | "
+                    f"Context: {context.get('extracted_number', 'N/A')}"
+                )
+                return True, stem_confidence, stem_matched, context
+            
+            # TIER 3 & 4: Rapidfuzz fuzzy matching
+            if RAPIDFUZZ_AVAILABLE:
+                # TIER 3: Partial ratio (substring matching)
+                partial_score = rapidfuzz_fuzz.partial_ratio(trigger_lower, ocr_lower) / 100.0
+                
+                if partial_score >= 0.80:
+                    # Find the best matching substring
+                    matched_text = self._find_best_fuzzy_match(trigger_text, full_ocr_text)
+                    context = self._extract_ocr_context(full_ocr_text, trigger_text, matched_text)
+                    context['match_tier'] = 'fuzzy_partial'
+                    context['match_method'] = f'rapidfuzz_partial_ratio (score: {partial_score:.0%})'
+                    context['fuzzy_score'] = partial_score
+                    
+                    logger.info(
+                        f"✅ [OCR v32.3] TIER 3 FUZZY MATCH: '{trigger_text}' matched to '{matched_text}' "
+                        f"(partial_ratio: {partial_score:.0%}) | Context: {context.get('extracted_number', 'N/A')}"
+                    )
+                    return True, partial_score, matched_text, context
+                
+                # TIER 4: Token set ratio (word order independent)
+                token_score = rapidfuzz_fuzz.token_set_ratio(trigger_lower, ocr_lower) / 100.0
+                
+                if token_score >= 0.75:
+                    matched_text = self._find_best_fuzzy_match(trigger_text, full_ocr_text)
+                    context = self._extract_ocr_context(full_ocr_text, trigger_text, matched_text)
+                    context['match_tier'] = 'fuzzy_token_set'
+                    context['match_method'] = f'rapidfuzz_token_set_ratio (score: {token_score:.0%})'
+                    context['fuzzy_score'] = token_score
+                    
+                    logger.info(
+                        f"✅ [OCR v32.3] TIER 4 TOKEN SET MATCH: '{trigger_text}' matched to '{matched_text}' "
+                        f"(token_set_ratio: {token_score:.0%}) | Context: {context.get('extracted_number', 'N/A')}"
+                    )
+                    return True, token_score * 0.95, matched_text, context  # Slightly lower confidence
+            
+            # TIER 5: Last resort - check for any significant word overlap
+            trigger_words = set(trigger_lower.split())
+            ocr_words = set(ocr_lower.split())
+            common_words = trigger_words & ocr_words
+            
+            if len(common_words) >= 1 and len(common_words) / len(trigger_words) >= 0.5:
+                # At least half the trigger words are present
+                matched_text = ' '.join(common_words)
+                overlap_confidence = len(common_words) / len(trigger_words) * 0.8
+                
+                context = self._extract_ocr_context(full_ocr_text, trigger_text, matched_text)
+                context['match_tier'] = 'word_overlap'
+                context['match_method'] = f'word_overlap ({len(common_words)}/{len(trigger_words)} words)'
+                context['matched_words'] = list(common_words)
+                
+                logger.info(
+                    f"✅ [OCR v32.3] TIER 5 WORD OVERLAP: '{trigger_text}' partially matched "
+                    f"({len(common_words)}/{len(trigger_words)} words: {common_words}) | "
+                    f"Context: {context.get('extracted_number', 'N/A')}"
+                )
+                return True, overlap_confidence, matched_text, context
+            
+            # No match found
+            logger.debug(
+                f"❌ [OCR v32.3] No match for '{trigger_text}' in OCR text. "
+                f"First 200 chars: '{full_ocr_text[:200]}...'"
+            )
+            return False, 0.0, None, None
 
         except Exception as e:
             logger.debug(f"[OCR] Detection error: {e}")
-            return False, 0.0, None
+            return False, 0.0, None, None
+
+    def _stem_match(
+        self,
+        trigger_lower: str,
+        ocr_lower: str
+    ) -> tuple[bool, float, str]:
+        """
+        v32.3: Word stemming match for handling verb conjugations.
+        
+        Converts "bouncing" → "bounc", "BOUNCE" → "bounc" for matching.
+        This handles cases like "bouncing ball" matching "BOUNCE COUNT".
+        
+        Args:
+            trigger_lower: Lowercase trigger text
+            ocr_lower: Lowercase OCR text
+            
+        Returns:
+            (matched, confidence, matched_text)
+        """
+        def simple_stem(word: str) -> str:
+            """Enhanced stemmer for common English suffixes.
+            
+            Handles: bouncing → bounc, bounce → bounc, running → runn, etc.
+            """
+            word = word.lower()
+            # Remove common suffixes in order from longest to shortest
+            # The 'e' at the end handles "bounce" → "bounc"
+            suffixes = ['tion', 'sion', 'ness', 'ment', 'able', 'ible', 
+                        'ful', 'less', 'ing', 'ed', 'er', 'est', 'ly', 
+                        'ity', 'es', 's', 'e']
+            for suffix in suffixes:
+                if word.endswith(suffix) and len(word) > len(suffix) + 2:
+                    return word[:-len(suffix)]
+            return word
+        
+        # Stem all trigger words
+        trigger_words = trigger_lower.split()
+        trigger_stems = set(simple_stem(w) for w in trigger_words if len(w) > 2)
+        
+        # Stem all OCR words
+        ocr_words = ocr_lower.split()
+        ocr_stems = {simple_stem(w): w for w in ocr_words if len(w) > 2}
+        
+        # Find matching stems
+        matching_stems = trigger_stems & set(ocr_stems.keys())
+        
+        if matching_stems:
+            # Calculate confidence based on how many stems matched
+            match_ratio = len(matching_stems) / len(trigger_stems) if trigger_stems else 0
+            confidence = 0.75 + (match_ratio * 0.2)  # 75-95% based on match ratio
+            
+            # Build matched text from original OCR words
+            matched_words = [ocr_stems[stem] for stem in matching_stems if stem in ocr_stems]
+            matched_text = ' '.join(matched_words).upper()
+            
+            return True, confidence, matched_text
+        
+        return False, 0.0, ""
+
+    def _find_best_fuzzy_match(
+        self,
+        trigger_text: str,
+        full_text: str
+    ) -> str:
+        """
+        v32.3: Find the best matching substring from OCR text.
+        
+        Uses sliding window approach with rapidfuzz to find the substring
+        that best matches the trigger text.
+        
+        Args:
+            trigger_text: The text we're looking for
+            full_text: The full OCR text
+            
+        Returns:
+            Best matching substring
+        """
+        if not RAPIDFUZZ_AVAILABLE or not full_text:
+            return trigger_text
+        
+        trigger_lower = trigger_text.lower()
+        words = full_text.split()
+        trigger_word_count = len(trigger_text.split())
+        
+        # Try different window sizes
+        best_match = trigger_text
+        best_score = 0
+        
+        for window_size in range(1, min(trigger_word_count + 3, len(words) + 1)):
+            for i in range(len(words) - window_size + 1):
+                candidate = ' '.join(words[i:i + window_size])
+                score = rapidfuzz_fuzz.ratio(trigger_lower, candidate.lower()) / 100.0
+                
+                if score > best_score:
+                    best_score = score
+                    best_match = candidate
+        
+        return best_match
+
+    def _extract_ocr_context(
+        self,
+        full_text: str,
+        trigger_text: str,
+        matched_text: str
+    ) -> Dict[str, Any]:
+        """
+        v32.3: Extract contextual information from OCR text.
+        
+        Extracts:
+        - Large numbers (e.g., bounce count: 24554)
+        - Percentages
+        - Status keywords
+        - Surrounding text
+        
+        Args:
+            full_text: Full OCR text
+            trigger_text: Original trigger text
+            matched_text: Text that matched
+            
+        Returns:
+            Dict with extracted context
+        """
+        context: Dict[str, Any] = {
+            'raw_ocr_length': len(full_text),
+            'trigger_text': trigger_text,
+            'matched_text': matched_text,
+        }
+        
+        # Extract large numbers (3+ digits) - likely counters, IDs, etc.
+        numbers = re.findall(r'\b(\d{3,})\b', full_text)
+        if numbers:
+            # Get the largest number (likely a counter)
+            largest_number = max(int(n) for n in numbers)
+            context['extracted_number'] = largest_number
+            context['all_numbers'] = [int(n) for n in numbers]
+            
+        # Extract percentages
+        percentages = re.findall(r'(\d+(?:\.\d+)?)\s*%', full_text)
+        if percentages:
+            context['percentages'] = [float(p) for p in percentages]
+        
+        # Extract status keywords
+        status_keywords = ['success', 'complete', 'error', 'failed', 'running', 'pending', 'active']
+        found_status = []
+        for keyword in status_keywords:
+            if keyword in full_text.lower():
+                found_status.append(keyword)
+        if found_status:
+            context['status_keywords'] = found_status
+        
+        # Extract surrounding context (words near the match)
+        if matched_text:
+            match_idx = full_text.lower().find(matched_text.lower())
+            if match_idx >= 0:
+                # Get 50 chars before and after
+                start = max(0, match_idx - 50)
+                end = min(len(full_text), match_idx + len(matched_text) + 50)
+                context['surrounding_text'] = full_text[start:end].strip()
+        
+        return context
 
     async def _spawn_ferrari_watcher(
         self,
@@ -6577,6 +6900,7 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
 
                 # =====================================================================
                 # ROOT CAUSE FIX: Robust Multi-Channel Detection Notification v2.0.0
+                # v32.3: Enhanced with context extraction (numbers, match method, etc.)
                 # =====================================================================
                 # Send notifications via ALL available channels:
                 # 1. TTS Voice (UnifiedVoiceOrchestrator)
@@ -6588,7 +6912,8 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                     app_name=app_name,
                     space_id=space_id,
                     confidence=detection_confidence,
-                    window_id=watcher.window_id if hasattr(watcher, 'window_id') else None
+                    window_id=watcher.window_id if hasattr(watcher, 'window_id') else None,
+                    detection_context=result.get('context')  # v32.3: Pass context for rich notification
                 )
 
                 # Send alert
@@ -6737,10 +7062,12 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
         app_name: str,
         space_id: int,
         confidence: float,
-        window_id: Optional[int] = None
+        window_id: Optional[int] = None,
+        detection_context: Optional[Dict[str, Any]] = None
     ):
         """
         ROOT CAUSE FIX: Robust Multi-Channel Detection Notification v2.0.0
+        v32.3: Enhanced with context extraction (numbers, match method, etc.)
 
         Sends real-time notifications through ALL available channels:
         1. TTS Voice (UnifiedVoiceOrchestrator) - primary
@@ -6752,10 +7079,23 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
         - Async parallel delivery
         - Graceful degradation
         - Rich detection metadata
+        - v32.3: Context extraction (bounce counts, percentages, status)
         """
+        # v32.3: Build enhanced log message with context
+        context_info = ""
+        if detection_context:
+            match_method = detection_context.get('match_method', '')
+            extracted_num = detection_context.get('extracted_number')
+            match_tier = detection_context.get('match_tier', '')
+            
+            if match_method:
+                context_info += f" | Match: {match_tier}"
+            if extracted_num:
+                context_info += f" | Value: {extracted_num}"
+        
         logger.info(
             f"[Detection] 📢 Notifying user: '{trigger_text}' detected in {app_name} "
-            f"(Space {space_id}, confidence: {confidence:.2%})"
+            f"(Space {space_id}, confidence: {confidence:.2%}){context_info}"
         )
 
         # =====================================================================
@@ -6793,6 +7133,25 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                     space_id=space_id,
                     confidence=f"{confidence:.0%}"
                 )
+                
+                # v32.3: Add context information to TTS if available
+                if detection_context:
+                    extracted_num = detection_context.get('extracted_number')
+                    matched_text = detection_context.get('matched_text', '')
+                    
+                    # Add context details to make the announcement more informative
+                    if extracted_num and 'count' in trigger_text.lower():
+                        # For count-related detections, announce the count
+                        tts_message += f". The count is {extracted_num}."
+                    elif extracted_num:
+                        # For other number detections
+                        tts_message += f". Value: {extracted_num}."
+                    
+                    # If matched text is different from trigger, mention it
+                    if matched_text and matched_text.lower() != trigger_text.lower():
+                        tts_message = f"I found '{matched_text}' in {app_name}, matching your search for '{trigger_text}'"
+                        if extracted_num:
+                            tts_message += f". Count: {extracted_num}."
 
                 # Get voice orchestrator and speak
                 orchestrator = get_voice_orchestrator()
