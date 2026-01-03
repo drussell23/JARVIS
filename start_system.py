@@ -16640,8 +16640,19 @@ async def ensure_docker_daemon_running(
 # =============================================================================
 
 
-async def ensure_docker_ecapa_service(force_rebuild: bool = False) -> dict:
+async def ensure_docker_ecapa_service(
+    force_rebuild: bool = False,
+    quick_mode: bool = False
+) -> dict:
     """
+    Ensure Docker ECAPA service is running.
+
+    Args:
+        force_rebuild: Force rebuild of Docker image
+        quick_mode: Use shorter timeouts for fail-fast behavior (v20.0.0)
+                   - Docker daemon timeout: 15s (vs 120s)
+                   - Max retries: 1 (vs 3)
+                   - Health check timeout: 20s (vs 90s)
 
     Returns:
         dict with status information
@@ -16655,12 +16666,23 @@ async def ensure_docker_ecapa_service(force_rebuild: bool = False) -> dict:
         "endpoint": None,
         "error": None,
         "docker_daemon_status": None,
+        "quick_mode": quick_mode,
     }
 
-    print(f"\n{Colors.CYAN}🐳 Docker ECAPA Service Setup{Colors.ENDC}")
+    # v20.0.0: Dynamic timeouts based on mode
+    daemon_timeout = 15.0 if quick_mode else 120.0
+    daemon_retries = 1 if quick_mode else 3
+    health_check_seconds = 20 if quick_mode else 90
+
+    mode_label = " (quick mode)" if quick_mode else ""
+    print(f"\n{Colors.CYAN}🐳 Docker ECAPA Service Setup{mode_label}{Colors.ENDC}")
 
     # Use the robust Docker daemon manager with auto-start capability
-    docker_status = await ensure_docker_daemon_running(auto_start=True)
+    docker_status = await ensure_docker_daemon_running(
+        auto_start=True,
+        timeout=daemon_timeout,
+        max_retries=daemon_retries
+    )
     result["docker_daemon_status"] = docker_status
 
     if not docker_status.get("installed", False):
@@ -16757,10 +16779,11 @@ async def ensure_docker_ecapa_service(force_rebuild: bool = False) -> dict:
 
         print(f"  {Colors.GREEN}✓ Container started{Colors.ENDC}")
 
-        # Wait for container to be healthy
-        print(f"  {Colors.CYAN}→ Waiting for container health check (up to 90s)...{Colors.ENDC}")
+        # Wait for container to be healthy (v20.0.0: dynamic timeout)
+        health_iterations = health_check_seconds // 5
+        print(f"  {Colors.CYAN}→ Waiting for container health check (up to {health_check_seconds}s)...{Colors.ENDC}")
 
-        for i in range(18):  # 18 * 5 = 90 seconds max
+        for i in range(health_iterations):
             await asyncio.sleep(5)
 
             try:
@@ -18045,53 +18068,114 @@ async def main():
             decision_reason = f"Docker requested but unavailable: {docker_probe.get('error')}"
     else:
         # ═══════════════════════════════════════════════════════════════════════
-        # v19.8.0: INTELLIGENT BACKEND SELECTION - CLOUD FIRST, NO BLOCKING
+        # v20.0.0: ZERO-BLOCKING INTELLIGENT BACKEND SELECTION
         # ═══════════════════════════════════════════════════════════════════════
-        # Priority (optimized for fast startup):
-        # 1. Docker (if already running and healthy) - lowest latency
-        # 2. Cloud Run (if healthy) - no startup cost, always available
-        # 3. Docker (start only if Cloud Run is UNAVAILABLE) - last resort
-        # 4. Local - emergency fallback
+        # Priority (optimized for INSTANT startup - no blocking ever):
         #
-        # KEY CHANGE: Don't auto-start Docker if Cloud Run is healthy!
-        # This prevents 15-120 second blocking for Docker startup.
+        # 1. Docker ALREADY RUNNING → use it (lowest latency, no startup cost)
+        # 2. Cloud Run HEALTHY → use it (always available, no startup cost)
+        # 3. Local ECAPA READY → use it immediately (no startup cost!)
+        # 4. Docker needs startup → start in BACKGROUND, use Local ECAPA now
+        # 5. Nothing immediately available → try Docker as last resort
+        #
+        # KEY CHANGES in v20.0.0:
+        # - Local ECAPA promoted from "emergency fallback" to PRIMARY OPTION
+        # - Docker startup is NEVER blocking - always background with instant fallback
+        # - If ANY backend is immediately ready, use it - don't wait for "better" options
         # ═══════════════════════════════════════════════════════════════════════
+
+        # Track available-NOW backends for intelligent selection
+        available_now = {}
 
         if docker_probe.get("healthy"):
-            # Docker is running and healthy - use it (lowest latency)
-            selected_backend = "docker"
-            selected_endpoint = docker_probe.get("endpoint")
-            decision_reason = f"Docker healthy with {docker_probe.get('latency_ms', 0):.0f}ms latency (best performance)"
+            available_now["docker"] = {
+                "endpoint": docker_probe.get("endpoint"),
+                "latency_ms": docker_probe.get("latency_ms", 0),
+                "priority": 1  # Highest priority if already running
+            }
 
-        elif cloud_probe.get("healthy"):
-            # ═══════════════════════════════════════════════════════════════════
-            # v19.8.0: Cloud Run healthy - USE IT! Don't start Docker.
-            # This is the key optimization: Cloud Run is always-on, no startup cost.
-            # ═══════════════════════════════════════════════════════════════════
-            selected_backend = "cloud_run"
-            selected_endpoint = cloud_probe.get("endpoint")
-            decision_reason = f"Cloud Run healthy with {cloud_probe.get('latency_ms', 0):.0f}ms latency (instant, no Docker wait)"
+        if cloud_probe.get("healthy"):
+            available_now["cloud_run"] = {
+                "endpoint": cloud_probe.get("endpoint"),
+                "latency_ms": cloud_probe.get("latency_ms", 0),
+                "priority": 2
+            }
 
-        elif docker_probe.get("available") and not skip_docker:
-            # ═══════════════════════════════════════════════════════════════════
-            # v19.8.0: Only start Docker if Cloud Run is UNAVAILABLE
-            # This is the fallback path - Cloud Run failed, try Docker
-            # ═══════════════════════════════════════════════════════════════════
-            print(f"   {Colors.YELLOW}⚠️  Cloud Run unavailable, attempting Docker fallback...{Colors.ENDC}")
-            docker_result = await ensure_docker_ecapa_service(force_rebuild=docker_rebuild)
-            if docker_result.get("success"):
-                selected_backend = "docker"
-                selected_endpoint = docker_result.get("endpoint")
-                decision_reason = "Cloud Run unavailable, Docker started as fallback"
-                ecapa_backend_status["docker"]["healthy"] = True
-                ecapa_backend_status["docker"]["endpoint"] = selected_endpoint
+        if local_probe.get("available") and local_probe.get("memory_ok"):
+            available_now["local"] = {
+                "endpoint": None,
+                "latency_ms": local_probe.get("latency_ms", 50),  # Local is fast
+                "priority": 3  # Promoted from emergency fallback!
+            }
+
+        # ───────────────────────────────────────────────────────────────────────
+        # INSTANT SELECTION: Pick best available-NOW backend (no blocking!)
+        # ───────────────────────────────────────────────────────────────────────
+        if available_now:
+            # Sort by priority (lower is better)
+            best_backend = min(available_now.items(), key=lambda x: x[1]["priority"])
+            backend_name, backend_info = best_backend
+
+            selected_backend = backend_name
+            selected_endpoint = backend_info.get("endpoint")
+            latency = backend_info.get("latency_ms", 0)
+
+            # Build informative decision reason
+            available_list = ", ".join(available_now.keys())
+            decision_reason = (
+                f"{backend_name.replace('_', ' ').title()} selected instantly "
+                f"({latency:.0f}ms latency) - Available backends: [{available_list}]"
+            )
+
+            # ───────────────────────────────────────────────────────────────────
+            # v20.0.0: NON-BLOCKING DOCKER BACKGROUND STARTUP
+            # If we selected Local but Docker is available, start Docker in
+            # background so it's ready for future requests (better latency).
+            # This is purely opportunistic - never blocks startup!
+            # ───────────────────────────────────────────────────────────────────
+            if selected_backend == "local" and docker_probe.get("available") and not skip_docker:
+                print(f"   {Colors.CYAN}→ Starting Docker ECAPA in background (non-blocking)...{Colors.ENDC}")
+
+                async def background_docker_startup():
+                    """Start Docker in background - never blocks main startup."""
+                    try:
+                        result = await ensure_docker_ecapa_service(force_rebuild=docker_rebuild)
+                        if result.get("success"):
+                            # Update status but don't switch active backend mid-session
+                            ecapa_backend_status["docker"]["healthy"] = True
+                            ecapa_backend_status["docker"]["endpoint"] = result.get("endpoint")
+                            print(f"   {Colors.GREEN}→ Background: Docker ECAPA now ready for future requests{Colors.ENDC}")
+                    except Exception as e:
+                        # Background failure is fine - we have Local ECAPA working
+                        pass
+
+                # Fire and forget - don't await, don't block
+                asyncio.create_task(background_docker_startup())
+
+        else:
+            # ───────────────────────────────────────────────────────────────────
+            # NO IMMEDIATE BACKENDS: Last resort - try Docker startup
+            # This is the ONLY case where we might block, and only briefly.
+            # ───────────────────────────────────────────────────────────────────
+            if docker_probe.get("available") and not skip_docker:
+                print(f"   {Colors.YELLOW}⚠️  No backends immediately available{Colors.ENDC}")
+                print(f"   {Colors.YELLOW}→ Attempting Docker startup (reduced timeout)...{Colors.ENDC}")
+
+                # Use shorter timeout for this case - fail fast
+                docker_result = await ensure_docker_ecapa_service(
+                    force_rebuild=docker_rebuild,
+                    quick_mode=True  # Signal to use shorter timeouts
+                )
+                if docker_result.get("success"):
+                    selected_backend = "docker"
+                    selected_endpoint = docker_result.get("endpoint")
+                    decision_reason = "Docker started as last resort (no immediate backends)"
+                    ecapa_backend_status["docker"]["healthy"] = True
+                    ecapa_backend_status["docker"]["endpoint"] = selected_endpoint
+                else:
+                    decision_reason = f"No backends available - Docker failed: {docker_result.get('error')}"
             else:
-                decision_reason = f"Cloud Run unavailable, Docker failed: {docker_result.get('error')}"
-
-        # Final fallback to local if nothing else works
-        if not selected_backend and local_probe.get("available") and local_probe.get("memory_ok"):
-            selected_backend = "local"
-            decision_reason = "Using local ECAPA as emergency fallback"
+                decision_reason = "No ECAPA backends available (Docker skipped or unavailable)"
 
     ecapa_backend_status["selected_backend"] = selected_backend
     ecapa_backend_status["decision_reason"] = decision_reason
