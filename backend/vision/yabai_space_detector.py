@@ -406,6 +406,7 @@ class RescueStrategy(Enum):
     FOCUS_THEN_MOVE = "focus_then_move"  # Focus window first, then move
     UNMINIMIZE_FIRST = "unminimize_first"  # Unminimize if minimized, then move
     SPACE_FOCUS_EXTENDED = "space_focus_extended"  # Extended wake delay for stubborn windows
+    EXIT_FULLSCREEN_FIRST = "exit_fullscreen_first"  # v31.0: Exit fullscreen before move
 
 
 @dataclass
@@ -546,7 +547,8 @@ class RescueTelemetry:
         if is_minimized:
             return RescueStrategy.UNMINIMIZE_FIRST
         if is_fullscreen:
-            return RescueStrategy.SPACE_FOCUS_EXTENDED
+            # v31.0: Fullscreen windows CANNOT be moved - must exit fullscreen first
+            return RescueStrategy.EXIT_FULLSCREEN_FIRST
 
         # Check app-specific preference
         if app_name and app_name in self.app_preferred_strategies:
@@ -3388,8 +3390,12 @@ class YabaiSpaceDetector:
                             "app": w.get("app", "Unknown"),
                             "title": w.get("title", ""),
                             "id": w.get("id"),
-                            "minimized": w.get("minimized", False),
-                            "hidden": w.get("hidden", False),
+                            "minimized": w.get("is-minimized", False),
+                            "hidden": w.get("is-hidden", False),
+                            # v31.0: Include fullscreen status for teleportation handling
+                            "is-native-fullscreen": w.get("is-native-fullscreen", False),
+                            "is_fullscreen": w.get("is-native-fullscreen", False),
+                            "can-move": w.get("can-move", True),
                         }
                         for w in space_windows
                     ],
@@ -3758,6 +3764,7 @@ class YabaiSpaceDetector:
             RescueStrategy.FOCUS_THEN_MOVE,
             RescueStrategy.SPACE_FOCUS_EXTENDED,
             RescueStrategy.UNMINIMIZE_FIRST,
+            RescueStrategy.EXIT_FULLSCREEN_FIRST,  # v31.0: Handle fullscreen windows
         ]
         for s in all_strategies:
             if s not in strategies_to_try:
@@ -3931,6 +3938,96 @@ class YabaiSpaceDetector:
                     return True, RescueFailureReason.UNKNOWN
                 return False, RescueFailureReason.MOVE_AFTER_WAKE_FAILED
 
+            elif strategy == RescueStrategy.EXIT_FULLSCREEN_FIRST:
+                # v31.0: FULLSCREEN WINDOW RESCUE
+                # =================================================================
+                # ROOT CAUSE FIX: macOS prevents moving fullscreen windows.
+                # Property "can-move": false when "is-native-fullscreen": true
+                #
+                # SOLUTION:
+                # 1. Switch to the window's space (required for fullscreen toggle)
+                # 2. Exit fullscreen using --toggle native-fullscreen
+                # 3. Wait for the fullscreen animation to complete (~0.5-1.0s)
+                # 4. Move the window to target space
+                # 5. Optionally re-enter fullscreen on target
+                # =================================================================
+                logger.info(
+                    f"[YABAI] 🖥️ EXIT_FULLSCREEN_FIRST: Window {window_id} "
+                    f"is in native fullscreen - exiting first"
+                )
+
+                # Step 1: Switch to the window's space
+                if not self._switch_to_space(source_space):
+                    logger.warning(f"[YABAI] Failed to switch to space {source_space}")
+                    return False, RescueFailureReason.SPACE_SWITCH_FAILED
+
+                # Step 2: Focus the window (required for fullscreen toggle)
+                subprocess.run(
+                    [yabai_path, "-m", "window", str(window_id), "--focus"],
+                    capture_output=True,
+                    timeout=self.config.query_timeout_seconds,
+                )
+                time.sleep(0.2)  # Brief pause for focus
+
+                # Step 3: Exit fullscreen
+                result = subprocess.run(
+                    [yabai_path, "-m", "window", str(window_id), "--toggle", "native-fullscreen"],
+                    capture_output=True,
+                    text=True,
+                    timeout=self.config.query_timeout_seconds,
+                )
+
+                if result.returncode != 0:
+                    logger.warning(
+                        f"[YABAI] Failed to exit fullscreen: {result.stderr}"
+                    )
+                    # Try alternative approach: toggle zoom-fullscreen
+                    subprocess.run(
+                        [yabai_path, "-m", "window", str(window_id), "--toggle", "zoom-fullscreen"],
+                        capture_output=True,
+                        timeout=self.config.query_timeout_seconds,
+                    )
+
+                # Step 4: Wait for fullscreen animation to complete
+                # macOS fullscreen animation takes ~0.7-1.0 seconds
+                fullscreen_animation_delay = max(wake_delay_s, 1.0)
+                logger.debug(
+                    f"[YABAI] Waiting {fullscreen_animation_delay:.1f}s for fullscreen exit animation"
+                )
+                time.sleep(fullscreen_animation_delay)
+
+                # Step 5: Verify window is no longer fullscreen
+                try:
+                    verify_result = subprocess.run(
+                        [yabai_path, "-m", "query", "--windows", "--window", str(window_id)],
+                        capture_output=True,
+                        text=True,
+                        timeout=self.config.query_timeout_seconds,
+                    )
+                    if verify_result.returncode == 0:
+                        import json
+                        window_info = json.loads(verify_result.stdout)
+                        if window_info.get("is-native-fullscreen", False):
+                            logger.warning(
+                                f"[YABAI] Window {window_id} still in fullscreen after toggle"
+                            )
+                            # Try one more time with longer delay
+                            time.sleep(1.0)
+                except Exception as e:
+                    logger.debug(f"[YABAI] Fullscreen verify failed: {e}")
+
+                # Step 6: Now move the window
+                if self.move_window_to_space(window_id, target_space):
+                    logger.info(
+                        f"[YABAI] ✅ Successfully moved window {window_id} after exiting fullscreen"
+                    )
+                    return True, RescueFailureReason.UNKNOWN
+
+                logger.warning(
+                    f"[YABAI] Move failed after exiting fullscreen"
+                )
+                return False, RescueFailureReason.MOVE_AFTER_WAKE_FAILED
+
             else:
                 return False, RescueFailureReason.UNKNOWN
 
@@ -4044,6 +4141,7 @@ class YabaiSpaceDetector:
             RescueStrategy.SWITCH_GRAB_RETURN,
             RescueStrategy.FOCUS_THEN_MOVE,
             RescueStrategy.SPACE_FOCUS_EXTENDED,
+            RescueStrategy.EXIT_FULLSCREEN_FIRST,  # v31.0: Handle fullscreen windows
         ]
         for s in all_strategies:
             if s not in strategies_to_try:
@@ -4357,13 +4455,48 @@ class YabaiSpaceDetector:
                 async def rescue_window(w):
                     window_id = w.get("window_id")
                     app_name = w.get("app_name") or w.get("app")
-                    is_minimized = w.get("minimized", False)
+                    is_minimized = w.get("minimized", False) or w.get("is-minimized", False)
+                    is_fullscreen = w.get("is_fullscreen", False) or w.get("is-native-fullscreen", False)
                     move_start = time.time()
+
+                    strategy = RescueStrategy.SWITCH_GRAB_RETURN
+
+                    # =========================================================
+                    # v31.0: EXIT FULLSCREEN FIRST
+                    # =========================================================
+                    # ROOT CAUSE FIX: macOS prevents moving fullscreen windows.
+                    # We MUST exit fullscreen before attempting to move.
+                    # =========================================================
+                    if is_fullscreen:
+                        logger.info(
+                            f"[YABAI] 🖥️ Window {window_id} is in fullscreen - exiting first"
+                        )
+                        try:
+                            yabai_path = self._health.yabai_path or "yabai"
+                            
+                            # Focus the window (required for fullscreen toggle)
+                            await run_subprocess_async(
+                                [yabai_path, "-m", "window", str(window_id), "--focus"],
+                                timeout=2.0
+                            )
+                            await asyncio.sleep(0.2)
+                            
+                            # Exit fullscreen
+                            await run_subprocess_async(
+                                [yabai_path, "-m", "window", str(window_id), "--toggle", "native-fullscreen"],
+                                timeout=3.0
+                            )
+                            
+                            # Wait for fullscreen animation (~1 second on macOS)
+                            await asyncio.sleep(1.2)
+                            strategy = RescueStrategy.EXIT_FULLSCREEN_FIRST
+                            
+                            logger.debug(f"[YABAI] Exited fullscreen for window {window_id}")
+                        except Exception as e:
+                            logger.warning(f"[YABAI] Failed to exit fullscreen: {e}")
 
                     success = await self.move_window_to_space_async(window_id, ghost_space)
                     duration_ms = (time.time() - move_start) * 1000
-
-                    strategy = RescueStrategy.SWITCH_GRAB_RETURN
 
                     # If first attempt failed and window is minimized, try unminimize
                     if not success and is_minimized:
@@ -4376,6 +4509,16 @@ class YabaiSpaceDetector:
                             await asyncio.sleep(wake_delay_s)
                             success = await self.move_window_to_space_async(window_id, ghost_space)
                             strategy = RescueStrategy.UNMINIMIZE_FIRST
+                        except Exception:
+                            pass
+
+                    # If still failed and was fullscreen, maybe animation wasn't complete
+                    if not success and is_fullscreen:
+                        logger.debug(f"[YABAI] Retry after fullscreen exit for window {window_id}")
+                        try:
+                            # Wait a bit more and retry
+                            await asyncio.sleep(0.5)
+                            success = await self.move_window_to_space_async(window_id, ghost_space)
                         except Exception:
                             pass
 
@@ -4394,7 +4537,8 @@ class YabaiSpaceDetector:
                         "method": "rescue" if success else "failed",
                         "strategy": strategy.value,
                         "duration_ms": duration_ms,
-                        "app_name": app_name
+                        "app_name": app_name,
+                        "was_fullscreen": is_fullscreen
                     }
 
                 # Execute rescues in parallel
@@ -4868,8 +5012,12 @@ class YabaiSpaceDetector:
                             "app": w.get("app", "Unknown"),
                             "title": w.get("title", ""),
                             "id": w.get("id"),
-                            "minimized": w.get("minimized", False),
-                            "hidden": w.get("hidden", False),
+                            "minimized": w.get("is-minimized", False),
+                            "hidden": w.get("is-hidden", False),
+                            # v31.0: Include fullscreen status for teleportation handling
+                            "is-native-fullscreen": w.get("is-native-fullscreen", False),
+                            "is_fullscreen": w.get("is-native-fullscreen", False),
+                            "can-move": w.get("can-move", True),
                         }
                         for w in space_windows
                     ],
