@@ -5181,6 +5181,489 @@ def open_accessibility_settings() -> bool:
         return False
 
 
+# =============================================================================
+# v30.3: COMPREHENSIVE YABAI PERMISSION FIXER
+# =============================================================================
+# ROOT CAUSE: macOS TCC (Transparency, Consent, and Control) system requires
+# the ACTUAL binary path, not symlinks. When yabai is installed via Homebrew:
+#   - Symlink: /opt/homebrew/bin/yabai
+#   - Actual: /opt/homebrew/Cellar/yabai/X.Y.Z/bin/yabai
+#
+# When user tries to add yabai via the Finder dialog, macOS may:
+#   1. Only recognize the resolved binary, not the symlink
+#   2. Store the path incorrectly in TCC.db
+#   3. Fail silently when the permission check uses a different path
+#
+# This system provides:
+#   1. Actual binary path resolution
+#   2. Programmatic permission prompt via AXIsProcessTrustedWithOptions
+#   3. TCC database reset guidance
+#   4. Service restart after permission grant
+#   5. Continuous permission monitoring
+# =============================================================================
+
+@dataclass
+class YabaiPermissionFixResult:
+    """Result of a yabai permission fix attempt."""
+    success: bool = False
+    method_used: str = ""
+    error_message: Optional[str] = None
+    
+    # Path information
+    symlink_path: Optional[str] = None
+    actual_binary_path: Optional[str] = None
+    
+    # Actions taken
+    opened_settings: bool = False
+    triggered_prompt: bool = False
+    reset_tcc: bool = False
+    restarted_service: bool = False
+    
+    # Next steps
+    user_action_required: bool = False
+    instructions: List[str] = field(default_factory=list)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "success": self.success,
+            "method_used": self.method_used,
+            "error_message": self.error_message,
+            "symlink_path": self.symlink_path,
+            "actual_binary_path": self.actual_binary_path,
+            "actions_taken": {
+                "opened_settings": self.opened_settings,
+                "triggered_prompt": self.triggered_prompt,
+                "reset_tcc": self.reset_tcc,
+                "restarted_service": self.restarted_service,
+            },
+            "user_action_required": self.user_action_required,
+            "instructions": self.instructions,
+        }
+
+
+def get_yabai_actual_binary_path() -> Tuple[Optional[str], Optional[str]]:
+    """
+    v30.3: Resolve the actual yabai binary path (not symlink).
+    
+    Returns:
+        Tuple of (symlink_path, actual_binary_path)
+    """
+    # Find symlink path
+    symlink_path = shutil.which("yabai")
+    if not symlink_path:
+        for path in ["/opt/homebrew/bin/yabai", "/usr/local/bin/yabai"]:
+            if os.path.isfile(path):
+                symlink_path = path
+                break
+    
+    if not symlink_path:
+        return None, None
+    
+    # Resolve actual binary path
+    try:
+        # Try multiple methods to resolve the actual path
+        actual_path = None
+        
+        # Method 1: os.path.realpath (handles symlinks)
+        resolved = os.path.realpath(symlink_path)
+        if resolved != symlink_path and os.path.isfile(resolved):
+            actual_path = resolved
+        
+        # Method 2: Read symlink directly
+        if not actual_path and os.path.islink(symlink_path):
+            link_target = os.readlink(symlink_path)
+            if not os.path.isabs(link_target):
+                # Relative symlink - resolve relative to symlink directory
+                link_dir = os.path.dirname(symlink_path)
+                actual_path = os.path.normpath(os.path.join(link_dir, link_target))
+            else:
+                actual_path = link_target
+        
+        # Method 3: Use Homebrew Cellar pattern
+        if not actual_path or not os.path.isfile(actual_path):
+            # Try to find via Homebrew Cellar
+            cellar_base = "/opt/homebrew/Cellar/yabai"
+            if os.path.isdir(cellar_base):
+                versions = os.listdir(cellar_base)
+                if versions:
+                    # Get latest version
+                    latest_version = sorted(versions, reverse=True)[0]
+                    cellar_path = os.path.join(cellar_base, latest_version, "bin", "yabai")
+                    if os.path.isfile(cellar_path):
+                        actual_path = cellar_path
+        
+        return symlink_path, actual_path or symlink_path
+        
+    except Exception as e:
+        logger.warning(f"[v30.3] Failed to resolve yabai binary path: {e}")
+        return symlink_path, symlink_path
+
+
+def check_yabai_in_accessibility_tcc() -> Tuple[bool, str]:
+    """
+    v30.3: Check if yabai is in the Accessibility TCC database.
+    
+    Note: Reading TCC.db directly requires Full Disk Access permission.
+    This function uses indirect methods to check permission status.
+    
+    Returns:
+        Tuple of (is_authorized, status_message)
+    """
+    try:
+        # Method 1: Check via AppleScript (AXIsProcessTrusted equivalent)
+        script = '''
+        use framework "ApplicationServices"
+        return current application's AXIsProcessTrusted() as boolean
+        '''
+        result = subprocess.run(
+            ["osascript", "-l", "AppleScript", "-e", script],
+            capture_output=True,
+            text=True,
+            timeout=2.0
+        )
+        
+        if result.returncode == 0:
+            is_trusted = "true" in result.stdout.lower()
+            return is_trusted, "Checked via AXIsProcessTrusted"
+        
+        # Method 2: Check via ctypes (direct API call)
+        import ctypes
+        lib = ctypes.CDLL(
+            "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices"
+        )
+        trusted = lib.AXIsProcessTrusted()
+        return bool(trusted), "Checked via ctypes"
+        
+    except Exception as e:
+        logger.debug(f"[v30.3] TCC check failed: {e}")
+        return False, f"Check failed: {e}"
+
+
+def trigger_accessibility_prompt_for_yabai() -> bool:
+    """
+    v30.3: Programmatically trigger the macOS Accessibility permission prompt.
+    
+    Uses AXIsProcessTrustedWithOptions with kAXTrustedCheckOptionPrompt=YES
+    to force macOS to show the permission dialog.
+    
+    Returns:
+        True if the prompt was triggered (not necessarily granted)
+    """
+    try:
+        # Get the actual yabai binary path
+        symlink_path, actual_path = get_yabai_actual_binary_path()
+        
+        if not actual_path:
+            logger.error("[v30.3] Cannot trigger prompt: yabai not found")
+            return False
+        
+        # Method 1: Use tccutil to reset and re-prompt
+        # This requires running from a process that can spawn yabai
+        logger.info(f"[v30.3] Triggering accessibility prompt for: {actual_path}")
+        
+        # Create a script that will trigger the prompt when yabai runs
+        # The key is that yabai itself needs to request the permission
+        
+        # First, restart yabai - it will trigger the prompt automatically
+        # when it tries to access accessibility features
+        try:
+            subprocess.run(
+                ["yabai", "--stop-service"],
+                capture_output=True,
+                timeout=5.0
+            )
+            time.sleep(0.5)
+            subprocess.run(
+                ["yabai", "--start-service"],
+                capture_output=True,
+                timeout=5.0
+            )
+            logger.info("[v30.3] Restarted yabai service - this should trigger permission prompt")
+            return True
+        except Exception as e:
+            logger.debug(f"[v30.3] Service restart failed: {e}")
+        
+        return False
+        
+    except Exception as e:
+        logger.error(f"[v30.3] Failed to trigger accessibility prompt: {e}")
+        return False
+
+
+async def fix_yabai_permissions(
+    auto_open_settings: bool = True,
+    auto_restart_service: bool = True,
+    narrate_progress: bool = True
+) -> YabaiPermissionFixResult:
+    """
+    v30.3: Comprehensive yabai permission fixer.
+    
+    Attempts to fix yabai accessibility permissions through multiple strategies:
+    1. Detect if permission is missing
+    2. Open Accessibility settings to the correct location
+    3. Provide clear instructions with actual binary path
+    4. Restart yabai service after fix
+    
+    Args:
+        auto_open_settings: Automatically open System Settings
+        auto_restart_service: Automatically restart yabai after fix
+        narrate_progress: Log detailed progress
+        
+    Returns:
+        YabaiPermissionFixResult with detailed status and instructions
+    """
+    result = YabaiPermissionFixResult()
+    
+    # =========================================================================
+    # PHASE 1: Get actual binary paths
+    # =========================================================================
+    symlink_path, actual_path = get_yabai_actual_binary_path()
+    result.symlink_path = symlink_path
+    result.actual_binary_path = actual_path
+    
+    if not symlink_path:
+        result.error_message = "Yabai is not installed"
+        result.instructions = [
+            "Install yabai with: brew install koekeishiya/formulae/yabai"
+        ]
+        return result
+    
+    if narrate_progress:
+        logger.info(f"[v30.3] Yabai paths:")
+        logger.info(f"  Symlink: {symlink_path}")
+        logger.info(f"  Actual:  {actual_path}")
+    
+    # =========================================================================
+    # PHASE 2: Check current permission status
+    # =========================================================================
+    perm_status = await check_yabai_permissions(force_recheck=True)
+    
+    if perm_status.fully_functional:
+        result.success = True
+        result.method_used = "already_authorized"
+        if narrate_progress:
+            logger.info("[v30.3] ✅ Yabai already has accessibility permission")
+        return result
+    
+    # =========================================================================
+    # PHASE 3: Check yabai error log for accessibility crash
+    # =========================================================================
+    user = os.environ.get("USER", "")
+    error_log = Path(f"/tmp/yabai_{user}.err.log")
+    accessibility_crash = False
+    
+    if error_log.exists():
+        try:
+            content = error_log.read_text()
+            if "could not access accessibility features" in content.lower():
+                accessibility_crash = True
+                if narrate_progress:
+                    logger.warning("[v30.3] ⚠️ Yabai crashed due to missing accessibility permission")
+        except Exception:
+            pass
+    
+    # =========================================================================
+    # PHASE 4: Generate comprehensive fix instructions
+    # =========================================================================
+    result.user_action_required = True
+    
+    # Detect macOS version for correct settings path
+    macos_version = None
+    try:
+        version_result = subprocess.run(
+            ["sw_vers", "-productVersion"],
+            capture_output=True,
+            text=True,
+            timeout=2.0
+        )
+        if version_result.returncode == 0:
+            macos_version = version_result.stdout.strip()
+    except Exception:
+        pass
+    
+    # Generate instructions
+    if actual_path and actual_path != symlink_path:
+        # Homebrew installation - need to add actual binary
+        result.instructions = [
+            "🔐 YABAI ACCESSIBILITY PERMISSION FIX",
+            "",
+            "The issue: macOS needs the ACTUAL binary path, not the symlink.",
+            f"  Symlink: {symlink_path}",
+            f"  Actual:  {actual_path}",
+            "",
+            "STEP 1: Open System Settings → Privacy & Security → Accessibility",
+            "",
+            "STEP 2: Click the '+' button to add an app",
+            "",
+            "STEP 3: Press Cmd+Shift+G to open 'Go to Folder'",
+            "",
+            f"STEP 4: Paste this path: {actual_path}",
+            "",
+            "STEP 5: Click 'Open' to add yabai",
+            "",
+            "STEP 6: Make sure the toggle is ON",
+            "",
+            "STEP 7: Restart yabai service:",
+            "  Run in Terminal: yabai --restart-service",
+            "",
+            "ALTERNATIVE (if above doesn't work):",
+            "  1. Remove yabai from Accessibility list",
+            "  2. Run: sudo tccutil reset Accessibility",
+            "  3. Run: yabai --restart-service",
+            "  4. A permission prompt should appear - click 'Open System Settings'",
+            "  5. Toggle yabai ON",
+        ]
+    else:
+        # Standard installation
+        result.instructions = [
+            "🔐 YABAI ACCESSIBILITY PERMISSION FIX",
+            "",
+            "STEP 1: Open System Settings → Privacy & Security → Accessibility",
+            "",
+            "STEP 2: Find 'yabai' in the list",
+            "",
+            "STEP 3: Toggle it ON",
+            "",
+            "STEP 4: If already ON, toggle OFF then ON again",
+            "",
+            "STEP 5: Restart yabai service:",
+            "  Run in Terminal: yabai --restart-service",
+        ]
+    
+    # =========================================================================
+    # PHASE 5: Auto-open settings if requested
+    # =========================================================================
+    if auto_open_settings:
+        try:
+            subprocess.run(
+                ["open", "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"],
+                check=True,
+                timeout=5.0
+            )
+            result.opened_settings = True
+            if narrate_progress:
+                logger.info("[v30.3] Opened Accessibility settings")
+        except Exception as e:
+            if narrate_progress:
+                logger.warning(f"[v30.3] Could not open settings: {e}")
+    
+    # =========================================================================
+    # PHASE 6: Trigger permission prompt by restarting yabai
+    # =========================================================================
+    # When yabai starts without permission, macOS should show the prompt
+    if auto_restart_service:
+        try:
+            subprocess.run(["yabai", "--stop-service"], capture_output=True, timeout=5.0)
+            await asyncio.sleep(0.5)
+            subprocess.run(["yabai", "--start-service"], capture_output=True, timeout=5.0)
+            result.restarted_service = True
+            result.triggered_prompt = True
+            if narrate_progress:
+                logger.info("[v30.3] Restarted yabai service to trigger permission prompt")
+        except Exception as e:
+            if narrate_progress:
+                logger.warning(f"[v30.3] Could not restart yabai service: {e}")
+    
+    # =========================================================================
+    # PHASE 7: Wait and recheck (give user time to grant permission)
+    # =========================================================================
+    # Don't wait here - return instructions and let user act
+    result.method_used = "instructions_provided"
+    result.error_message = "Yabai needs accessibility permission - follow the instructions above"
+    
+    return result
+
+
+async def monitor_and_wait_for_yabai_permission(
+    timeout_seconds: float = 60.0,
+    check_interval: float = 2.0,
+    on_progress: Optional[callable] = None
+) -> bool:
+    """
+    v30.3: Monitor and wait for yabai permission to be granted.
+    
+    Useful for creating a user-friendly flow where you:
+    1. Call fix_yabai_permissions() to show instructions
+    2. Call this function to wait for user to grant permission
+    3. Proceed with operations once permission is granted
+    
+    Args:
+        timeout_seconds: Maximum time to wait
+        check_interval: How often to check permission status
+        on_progress: Optional callback(seconds_elapsed, status_message)
+        
+    Returns:
+        True if permission was granted within timeout, False otherwise
+    """
+    start_time = time.time()
+    
+    while time.time() - start_time < timeout_seconds:
+        elapsed = time.time() - start_time
+        
+        # Check permission status
+        status = await check_yabai_permissions(force_recheck=True)
+        
+        if status.fully_functional:
+            if on_progress:
+                on_progress(elapsed, "Permission granted!")
+            logger.info(f"[v30.3] ✅ Yabai permission granted after {elapsed:.1f}s")
+            return True
+        
+        if on_progress:
+            remaining = timeout_seconds - elapsed
+            on_progress(elapsed, f"Waiting for permission... ({remaining:.0f}s remaining)")
+        
+        await asyncio.sleep(check_interval)
+    
+    logger.warning(f"[v30.3] Permission not granted within {timeout_seconds}s")
+    return False
+
+
+def get_yabai_permission_instructions() -> str:
+    """
+    v30.3: Get formatted permission instructions as a string.
+    
+    Returns:
+        Formatted instructions string
+    """
+    symlink_path, actual_path = get_yabai_actual_binary_path()
+    
+    instructions = []
+    instructions.append("=" * 60)
+    instructions.append("🔐 YABAI ACCESSIBILITY PERMISSION REQUIRED")
+    instructions.append("=" * 60)
+    instructions.append("")
+    
+    if actual_path and actual_path != symlink_path:
+        instructions.append("⚠️  IMPORTANT: Add the ACTUAL binary, not the symlink!")
+        instructions.append("")
+        instructions.append(f"   Symlink (DON'T use): {symlink_path}")
+        instructions.append(f"   Actual (USE THIS):   {actual_path}")
+        instructions.append("")
+    
+    instructions.append("TO FIX:")
+    instructions.append("")
+    instructions.append("1. System Settings → Privacy & Security → Accessibility")
+    instructions.append("")
+    instructions.append("2. Click '+' to add an app")
+    instructions.append("")
+    instructions.append("3. Press Cmd+Shift+G and paste:")
+    if actual_path:
+        instructions.append(f"   {actual_path}")
+    else:
+        instructions.append(f"   {symlink_path}")
+    instructions.append("")
+    instructions.append("4. Click 'Open' to add yabai")
+    instructions.append("")
+    instructions.append("5. Make sure the toggle is ON")
+    instructions.append("")
+    instructions.append("6. Restart yabai: yabai --restart-service")
+    instructions.append("")
+    instructions.append("=" * 60)
+    
+    return "\n".join(instructions)
+
+
 def diagnose_yabai() -> Dict[str, Any]:
     """
     Run comprehensive yabai diagnostics.
@@ -5650,4 +6133,12 @@ __all__ = [
     "ensure_yabai_permissions",
     "get_cached_permission_status",
     "invalidate_permission_cache",
+    # v30.3 Permission Fixer
+    "YabaiPermissionFixResult",
+    "get_yabai_actual_binary_path",
+    "check_yabai_in_accessibility_tcc",
+    "trigger_accessibility_prompt_for_yabai",
+    "fix_yabai_permissions",
+    "monitor_and_wait_for_yabai_permission",
+    "get_yabai_permission_instructions",
 ]

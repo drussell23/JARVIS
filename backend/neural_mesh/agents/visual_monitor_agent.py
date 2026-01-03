@@ -1699,29 +1699,35 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
         logger.debug("[God Mode] Cleared watcher lifecycle tracker for new session")
 
         # =====================================================================
-        # v30.1: FAST PROACTIVE YABAI PERMISSION CHECK
+        # v30.3: COMPREHENSIVE YABAI PERMISSION CHECK & FIX
         # =====================================================================
-        # ROOT CAUSE FIX: Detect missing accessibility permissions BEFORE
-        # attempting any window operations. This is the "smoking gun" behind
-        # silent failures - yabai can query but not control windows.
+        # ROOT CAUSE FIX: macOS TCC requires the ACTUAL binary path, not symlinks.
+        # When yabai is installed via Homebrew:
+        #   - Symlink: /opt/homebrew/bin/yabai
+        #   - Actual: /opt/homebrew/Cellar/yabai/X.Y.Z/bin/yabai
         #
-        # v30.1 CRITICAL: Check MUST complete in <2 seconds to avoid
-        # "Processing..." hang. Uses timeout wrapper for safety.
+        # v30.3 provides:
+        #   1. Actual binary path resolution
+        #   2. Comprehensive fix instructions with correct path
+        #   3. Auto-open settings with context
+        #   4. Service restart triggering permission prompt
         # =====================================================================
-        PERMISSION_CHECK_TIMEOUT = 2.0  # Maximum time for permission check
+        PERMISSION_CHECK_TIMEOUT = 3.0  # Slightly longer for comprehensive check
 
         try:
             from backend.vision.yabai_space_detector import (
                 ensure_yabai_permissions,
                 check_yabai_permissions,
-                open_accessibility_settings,
+                fix_yabai_permissions,
+                get_yabai_actual_binary_path,
+                get_yabai_permission_instructions,
             )
 
             # Check permissions with timeout wrapper
             try:
                 perm_ok, perm_error = await asyncio.wait_for(
                     ensure_yabai_permissions(
-                        auto_open_settings=False,  # Don't auto-open, just detect
+                        auto_open_settings=False,  # Don't auto-open yet, just detect
                         narrate_issues=True
                     ),
                     timeout=PERMISSION_CHECK_TIMEOUT
@@ -1729,43 +1735,87 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
             except asyncio.TimeoutError:
                 # Permission check timed out - log warning but continue
                 logger.warning(
-                    f"[God Mode v30.1] Permission check timed out after {PERMISSION_CHECK_TIMEOUT}s - continuing"
+                    f"[God Mode v30.3] Permission check timed out after {PERMISSION_CHECK_TIMEOUT}s - continuing"
                 )
                 perm_ok, perm_error = True, None  # Assume OK and let operations fail naturally
 
             if not perm_ok and perm_error:
                 # Log the detailed error
-                logger.error(f"[God Mode v30.0] ❌ YABAI PERMISSION ISSUE:\n{perm_error}")
+                logger.error(f"[God Mode v30.3] ❌ YABAI PERMISSION ISSUE:\n{perm_error}")
 
-                # v30.2: AUTO-OPEN ACCESSIBILITY SETTINGS
-                # Instead of just telling the user, proactively open the settings for them
-                settings_opened = False
+                # v30.3: COMPREHENSIVE PERMISSION FIX
+                # Use the new fix_yabai_permissions which:
+                # - Detects actual binary path (not symlink)
+                # - Opens settings
+                # - Restarts service to trigger permission prompt
+                # - Provides step-by-step instructions
+                fix_result = None
                 try:
-                    settings_opened = open_accessibility_settings()
-                    if settings_opened:
-                        logger.info("[God Mode v30.2] ✅ Auto-opened Accessibility settings for user")
-                    else:
-                        logger.warning("[God Mode v30.2] ⚠️ Could not auto-open Accessibility settings")
+                    fix_result = await asyncio.wait_for(
+                        fix_yabai_permissions(
+                            auto_open_settings=True,
+                            auto_restart_service=True,
+                            narrate_progress=True
+                        ),
+                        timeout=10.0  # Generous timeout for fix attempt
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning("[God Mode v30.3] Permission fix timed out")
                 except Exception as e:
-                    logger.warning(f"[God Mode v30.2] Failed to auto-open settings: {e}")
+                    logger.warning(f"[God Mode v30.3] Permission fix failed: {e}")
+
+                # Get the actual binary path for accurate instructions
+                symlink_path, actual_path = get_yabai_actual_binary_path()
+                
+                # Build comprehensive fix instructions
+                if actual_path and actual_path != symlink_path:
+                    # Homebrew installation - emphasize correct path
+                    fix_instructions = (
+                        "🔐 IMPORTANT: Add the ACTUAL binary, not the symlink!\n\n"
+                        f"   ❌ Symlink (don't use): {symlink_path}\n"
+                        f"   ✅ Actual (use this):   {actual_path}\n\n"
+                        "Steps:\n"
+                        "1. In Accessibility Settings, click '+' to add an app\n"
+                        "2. Press Cmd+Shift+G to open 'Go to Folder'\n"
+                        f"3. Paste this path: {actual_path}\n"
+                        "4. Click 'Open' to add yabai\n"
+                        "5. Make sure the toggle is ON\n"
+                        "6. Run in Terminal: yabai --restart-service\n"
+                        "7. Then retry your command"
+                    )
+                else:
+                    fix_instructions = (
+                        "Steps to fix:\n"
+                        "1. Accessibility Settings should now be open\n"
+                        "2. Find 'yabai' in the list and toggle it ON\n"
+                        "3. Run in Terminal: yabai --restart-service\n"
+                        "4. Then retry your command"
+                    )
 
                 # Narrate to user if enabled
                 if self.config.working_out_loud_enabled:
                     try:
-                        # v30.2: Updated message to reflect auto-opening
-                        if settings_opened:
-                            voice_msg = (
-                                "I can't control windows right now because yabai needs accessibility permission. "
-                                "I've opened the Accessibility settings for you. "
-                                "Please find yabai in the list and toggle it on. "
-                                "Then say 'try again' or repeat your command."
-                            )
+                        # v30.3: Enhanced message with actual path info
+                        if fix_result and fix_result.opened_settings:
+                            if actual_path and actual_path != symlink_path:
+                                voice_msg = (
+                                    "I opened the Accessibility settings. "
+                                    "Important: you need to add the actual yabai binary, not the symlink. "
+                                    "Click the plus button, press Command Shift G, "
+                                    f"and paste the path from the instructions. "
+                                    "Then toggle yabai on and run yabai restart service in terminal."
+                                )
+                            else:
+                                voice_msg = (
+                                    "I opened the Accessibility settings for you. "
+                                    "Find yabai in the list and toggle it on. "
+                                    "Then run yabai restart service in terminal."
+                                )
                         else:
                             voice_msg = (
-                                "I can't control windows right now. "
-                                "Yabai needs accessibility permission. "
-                                "Please open System Settings, go to Privacy and Security, then Accessibility, "
-                                "and enable yabai."
+                                "I can't control windows because yabai needs accessibility permission. "
+                                "Open System Settings, go to Privacy and Security, then Accessibility, "
+                                "and add yabai."
                             )
                         await self._narrate_working_out_loud(
                             message=voice_msg,
@@ -1774,43 +1824,39 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                             priority="high"
                         )
                     except Exception as e:
-                        logger.warning(f"[God Mode] Narration failed: {e}")
+                        logger.warning(f"[God Mode v30.3] Narration failed: {e}")
 
-                # Return error with fix instructions
+                # Return error with comprehensive fix instructions
                 return {
                     'success': False,
                     'status': 'error',
                     'error': 'yabai_permission_denied',
                     'error_message': perm_error,
-                    'settings_auto_opened': settings_opened,
-                    'fix_instructions': (
-                        "1. Accessibility Settings should now be open\n"
-                        "2. Find 'yabai' in the list and toggle it ON\n"
-                        "3. Run: yabai --restart-service\n"
-                        "4. Then retry your command"
-                    ) if settings_opened else (
-                        "1. Open System Settings → Privacy & Security → Accessibility\n"
-                        "2. Find 'yabai' and toggle it ON\n"
-                        "3. Run: yabai --restart-service"
-                    ),
+                    'settings_auto_opened': fix_result.opened_settings if fix_result else False,
+                    'service_restarted': fix_result.restarted_service if fix_result else False,
+                    'symlink_path': symlink_path,
+                    'actual_binary_path': actual_path,
+                    'fix_instructions': fix_instructions,
                     'total_watchers': 0,
                     'app_name': app_name,
                     'trigger_text': trigger_text,
                     'message': (
-                        "Yabai lacks accessibility permissions - I've opened the settings for you"
-                        if settings_opened else
-                        "Yabai lacks accessibility permissions - cannot control windows"
+                        f"Yabai needs accessibility permission. I've opened the settings. "
+                        f"IMPORTANT: Add the actual binary at {actual_path}"
+                        if (fix_result and fix_result.opened_settings and actual_path != symlink_path)
+                        else
+                        "Yabai lacks accessibility permissions - see instructions to fix"
                     )
                 }
 
-            logger.info("[God Mode v30.0] ✅ Yabai permissions verified")
+            logger.info("[God Mode v30.3] ✅ Yabai permissions verified")
 
         except ImportError:
             # Module not available - continue without check
-            logger.debug("[God Mode v30.0] Permission check module not available - skipping")
+            logger.debug("[God Mode v30.3] Permission check module not available - skipping")
         except Exception as e:
             # Don't fail on permission check errors - log and continue
-            logger.warning(f"[God Mode v30.0] Permission check failed: {e} - continuing anyway")
+            logger.warning(f"[God Mode v30.3] Permission check failed: {e} - continuing anyway")
 
         # =====================================================================
         # ROOT CAUSE FIX: Timeout Protection for God Mode Window Discovery v6.0.0
