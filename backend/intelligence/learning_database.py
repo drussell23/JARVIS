@@ -6641,15 +6641,19 @@ class JARVISLearningDatabase:
                         continue
 
                     if has_acoustic:
-                        logger.info(f"✅ Profile '{profile['speaker_name']}' has BEAST MODE acoustic features")
+                        logger.debug(f"✅ Profile '{profile['speaker_name']}' has enhanced acoustic features")
                     else:
-                        # Only warn for valid profiles (with embeddings) that are missing acoustic features
-                        # For "unknown" or placeholder profiles, use debug level
+                        # Acoustic features are optional enhancements - only log at debug level
+                        # The voiceprint embedding is the primary authentication method
+                        # Acoustic features (pitch, formants, spectral) add extra verification
                         speaker_name_lower = profile['speaker_name'].lower()
-                        if speaker_name_lower in ('unknown', 'test', 'placeholder', ''):
-                            logger.debug(f"⏭️  Profile '{profile['speaker_name']}' is a placeholder - missing acoustic features (expected)")
-                        else:
-                            logger.warning(f"⚠️  Profile '{profile['speaker_name']}' missing acoustic features - consider re-enrollment")
+                        if speaker_name_lower not in ('unknown', 'test', 'placeholder', ''):
+                            # Log at INFO level (not WARNING) since profile is still functional
+                            # Acoustic features enhance accuracy but aren't required
+                            logger.debug(
+                                f"ℹ️  Profile '{profile['speaker_name']}' uses voiceprint authentication "
+                                f"(acoustic features available after next enrollment)"
+                            )
 
                     profiles.append(profile)
 
