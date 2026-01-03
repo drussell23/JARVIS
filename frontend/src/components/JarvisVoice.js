@@ -702,6 +702,17 @@ const JarvisVoice = () => {
   // { stage, message, originalCommand, continuationIntent, progress, status }
   const proactiveUnlockTimeoutRef = useRef(null);
 
+  // ═══════════════════════════════════════════════════════════════════
+  // v32.0: SURVEILLANCE PROGRESS STATE - Real-time God Mode tracking
+  // ═══════════════════════════════════════════════════════════════════
+  // Shows visual progress when JARVIS watches windows for targets
+  // e.g., "watch all Chrome windows for bouncing ball"
+  // ═══════════════════════════════════════════════════════════════════
+  const [surveillanceProgress, setSurveillanceProgress] = useState(null);
+  // { stage, message, progress: { current, total, percent }, context, details }
+  const [surveillanceHistory, setSurveillanceHistory] = useState([]);
+  const surveillanceTimeoutRef = useRef(null);
+
   const typingTimeoutRef = useRef(null);
 
   const wsRef = useRef(null);
@@ -2236,6 +2247,129 @@ const JarvisVoice = () => {
         setError(data.message);
         setIsProcessing(false);
         break;
+
+      // ═══════════════════════════════════════════════════════════════════
+      // v32.0: SURVEILLANCE PROGRESS - Real-time God Mode tracking
+      // ═══════════════════════════════════════════════════════════════════
+      case 'surveillance_progress':
+      case 'processing_progress': {
+        // Handle real-time surveillance/processing progress updates
+        const stage = data.stage || 'processing';
+        const message = data.message || '';
+        const progress = data.progress || { current: 0, total: 0, percent: 0 };
+        const context = data.context || {};
+        const isSurveillance = data.is_surveillance || data.type === 'surveillance_progress';
+        
+        console.log('%c[Surveillance Progress]', 'color: #00ff88; font-weight: bold',
+          `${stage} - ${message} (${progress.percent || 0}%)`);
+
+        // Get stage icon based on stage
+        const getSurveillanceIcon = (stage) => {
+          const icons = {
+            'starting': '⚙️',
+            'discovery': '🔍',
+            'teleport_start': '👻',
+            'teleport_progress': '👻',
+            'teleport_complete': '✅',
+            'watcher_start': '👁️',
+            'watcher_progress': '👁️',
+            'watcher_ready': '✓',
+            'watcher_failed': '❌',
+            'validation': '🔄',
+            'monitoring_active': '🎯',
+            'detection': '🎉',
+            'error': '❌',
+            'complete': '✅',
+            'processing': '⚙️',
+          };
+          return icons[stage] || '🔧';
+        };
+
+        // Update surveillance progress state
+        setSurveillanceProgress({
+          stage,
+          stageIcon: getSurveillanceIcon(stage),
+          message,
+          progress: {
+            current: progress.current || 0,
+            total: progress.total || 0,
+            percent: progress.percent || 0,
+          },
+          context: {
+            appName: context.app_name || data.app_name || '',
+            triggerText: context.trigger_text || data.trigger_text || '',
+            windowId: context.window_id || data.window_id,
+            spaceId: context.space_id || data.space_id,
+            watcherId: context.watcher_id || data.watcher_id,
+          },
+          details: data.details || {},
+          timestamp: data.timestamp || Date.now(),
+          isSurveillance,
+        });
+
+        // Update response to show progress (keep user informed)
+        if (message && stage !== 'complete') {
+          setResponse(message);
+        }
+
+        // Add significant stages to history
+        const significantStages = ['discovery', 'teleport_complete', 'watcher_ready', 'monitoring_active', 'detection', 'error'];
+        if (significantStages.includes(stage)) {
+          setSurveillanceHistory(prev => {
+            // Avoid duplicates
+            if (prev.some(s => s.stage === stage && s.message === message)) {
+              return prev;
+            }
+            return [...prev.slice(-9), { // Keep last 10 entries
+              stage,
+              stageIcon: getSurveillanceIcon(stage),
+              message,
+              progress,
+              timestamp: Date.now(),
+            }];
+          });
+        }
+
+        // Handle detection success - this is a major event!
+        if (stage === 'detection') {
+          // Show detection in response area prominently
+          const detectionMessage = message || `Detected in ${context.app_name || 'window'}!`;
+          setResponse(detectionMessage);
+          
+          // Auto-clear progress after detection
+          if (surveillanceTimeoutRef.current) {
+            clearTimeout(surveillanceTimeoutRef.current);
+          }
+          surveillanceTimeoutRef.current = setTimeout(() => {
+            setSurveillanceProgress(null);
+            setSurveillanceHistory([]);
+          }, 10000); // Keep visible longer for detection
+        }
+
+        // Handle completion/error - auto-clear after delay
+        if (stage === 'complete' || stage === 'error') {
+          if (surveillanceTimeoutRef.current) {
+            clearTimeout(surveillanceTimeoutRef.current);
+          }
+          surveillanceTimeoutRef.current = setTimeout(() => {
+            setSurveillanceProgress(null);
+            // Keep history for error review
+            if (stage === 'complete') {
+              setSurveillanceHistory([]);
+            }
+          }, 5000);
+        }
+        break;
+      }
+
+      // Also handle generic 'surveillance_heartbeat' to show system is alive
+      case 'surveillance_heartbeat': {
+        console.log('%c[Surveillance Heartbeat]', 'color: #888',
+          `Stage: ${data.stage}, Active: ${data.active}`);
+        // Don't update UI for heartbeats, just log
+        break;
+      }
+
       case 'debug_log':
         // Display debug logs in console with styling
         const logStyle = data.level === 'error'
@@ -5440,6 +5574,123 @@ const JarvisVoice = () => {
             >
               🎤 Retry Microphone Access
             </button>
+          )}
+        </div>
+      )}
+
+      {/* ═══════════════════════════════════════════════════════════════════ */}
+      {/* v32.0: SURVEILLANCE PROGRESS DISPLAY - Real-time God Mode tracking */}
+      {/* ═══════════════════════════════════════════════════════════════════ */}
+      {surveillanceProgress && (
+        <div className="surveillance-progress-container" style={{
+          background: 'linear-gradient(135deg, rgba(0, 50, 30, 0.95), rgba(0, 30, 20, 0.95))',
+          border: '1px solid rgba(0, 255, 100, 0.3)',
+          borderRadius: '8px',
+          padding: '12px 16px',
+          margin: '10px 0',
+          color: '#00ff65',
+          fontFamily: 'monospace',
+        }}>
+          {/* Header with stage icon and message */}
+          <div className="surveillance-header" style={{ 
+            display: 'flex', 
+            alignItems: 'center', 
+            gap: '10px',
+            marginBottom: '8px',
+          }}>
+            <span style={{ fontSize: '1.3em' }}>{surveillanceProgress.stageIcon}</span>
+            <span style={{ 
+              fontWeight: 'bold', 
+              fontSize: '0.95em',
+              textTransform: 'uppercase',
+              letterSpacing: '0.5px',
+            }}>
+              {surveillanceProgress.stage.replace(/_/g, ' ')}
+            </span>
+            {surveillanceProgress.progress?.percent > 0 && (
+              <span style={{ 
+                marginLeft: 'auto', 
+                color: '#00ff88',
+                fontWeight: 'bold',
+              }}>
+                {surveillanceProgress.progress.percent.toFixed(0)}%
+              </span>
+            )}
+          </div>
+
+          {/* Progress bar */}
+          {surveillanceProgress.progress?.total > 0 && (
+            <div style={{
+              background: 'rgba(0, 0, 0, 0.3)',
+              borderRadius: '4px',
+              height: '6px',
+              marginBottom: '8px',
+              overflow: 'hidden',
+            }}>
+              <div style={{
+                background: surveillanceProgress.stage === 'error' 
+                  ? 'linear-gradient(90deg, #ff4444, #ff6666)'
+                  : surveillanceProgress.stage === 'detection'
+                  ? 'linear-gradient(90deg, #00ff88, #44ffaa)'
+                  : 'linear-gradient(90deg, #00ff65, #00cc55)',
+                height: '100%',
+                width: `${surveillanceProgress.progress.percent}%`,
+                transition: 'width 0.3s ease',
+                borderRadius: '4px',
+              }} />
+            </div>
+          )}
+
+          {/* Message */}
+          <div style={{ 
+            fontSize: '0.9em', 
+            opacity: 0.9,
+            lineHeight: 1.4,
+          }}>
+            {surveillanceProgress.message}
+          </div>
+
+          {/* Context info */}
+          {surveillanceProgress.context?.appName && (
+            <div style={{ 
+              fontSize: '0.8em', 
+              opacity: 0.7, 
+              marginTop: '6px',
+              display: 'flex',
+              gap: '15px',
+              flexWrap: 'wrap',
+            }}>
+              <span>📱 {surveillanceProgress.context.appName}</span>
+              {surveillanceProgress.context.triggerText && (
+                <span>🎯 "{surveillanceProgress.context.triggerText}"</span>
+              )}
+              {surveillanceProgress.context.spaceId && (
+                <span>🖥️ Space {surveillanceProgress.context.spaceId}</span>
+              )}
+            </div>
+          )}
+
+          {/* History trail for significant events */}
+          {surveillanceHistory.length > 0 && (
+            <div style={{ 
+              marginTop: '10px', 
+              paddingTop: '8px', 
+              borderTop: '1px solid rgba(0, 255, 100, 0.2)',
+              fontSize: '0.75em',
+              opacity: 0.7,
+            }}>
+              {surveillanceHistory.slice(-3).map((event, idx) => (
+                <div key={idx} style={{ 
+                  display: 'flex', 
+                  alignItems: 'center', 
+                  gap: '6px',
+                  marginBottom: '2px',
+                }}>
+                  <span>{event.stageIcon}</span>
+                  <span>{event.message}</span>
+                </div>
+              ))}
+            </div>
           )}
         </div>
       )}
