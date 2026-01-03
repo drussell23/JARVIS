@@ -1292,13 +1292,15 @@ class UnifiedCommandProcessor:
                 logger.info("[SURVEILLANCE] Initializing IntelligentCommandHandler...")
                 intelligent_handler = IntelligentCommandHandler()
 
-                # v31.0: Execute with DYNAMIC timeout for surveillance
+                # v32.0: Execute with DYNAMIC timeout for surveillance
                 # Surveillance commands may need to:
                 # - Find windows across 9+ spaces
-                # - Teleport windows to Ghost Display
-                # - Initialize 11+ video capture watchers
-                # Fixed 30s was too short - use 60s default for surveillance
-                surveillance_timeout = float(os.getenv("JARVIS_SURVEILLANCE_HANDLER_TIMEOUT", "60"))
+                # - Teleport windows to Ghost Display (may exit fullscreen first)
+                # - Initialize 6+ video capture watchers with validation
+                # - Retry failed operations with exponential backoff
+                # Timeout chain: WebSocket(90s) → jarvis_voice_api(85s) → here(80s)
+                # This ensures clean timeout propagation at each layer
+                surveillance_timeout = float(os.getenv("JARVIS_SURVEILLANCE_HANDLER_TIMEOUT", "80"))
                 logger.info(f"[SURVEILLANCE] Using {surveillance_timeout}s timeout for handler")
                 
                 try:

@@ -1360,21 +1360,71 @@ class UnifiedWebSocketManager:
                             logger.info(f"[WS] Processing command via jarvis_api: {command_text}")
 
                             # ===========================================================
+                            # v32.0: DYNAMIC TIMEOUT SYSTEM FOR SURVEILLANCE COMMANDS
+                            # ===========================================================
+                            # PROBLEM: Surveillance commands need 60-90s to:
+                            #   1. Discover windows across spaces
+                            #   2. Teleport windows to Ghost Display
+                            #   3. Spawn watchers for each window
+                            # The old fixed 45s timeout was killing these before completion.
+                            #
+                            # SOLUTION: Detect surveillance intent early and use dynamic timeout
+                            # ===========================================================
+                            cmd_lower = command_text.lower() if command_text else ""
+                            
+                            # Surveillance detection (mirrors jarvis_voice_api.py detection)
+                            surveillance_keywords = ["watch", "monitor", "scan", "look for", "find", "track", "observe"]
+                            surveillance_structures = ["for", "when", "until", "if", "whenever", "while"]
+                            multi_targets = ["all", "every", "each", "any"]
+                            
+                            has_surveillance_keyword = any(kw in cmd_lower for kw in surveillance_keywords)
+                            has_surveillance_structure = any(p in cmd_lower for p in surveillance_structures)
+                            has_multi_target = any(t in cmd_lower for t in multi_targets)
+                            
+                            is_surveillance_command = (
+                                has_surveillance_keyword and (has_surveillance_structure or has_multi_target)
+                            )
+                            
+                            # Dynamic timeout based on command type
+                            if is_surveillance_command:
+                                # Surveillance needs more time for window discovery + teleportation + watcher spawn
+                                base_timeout = float(os.getenv("WS_SURVEILLANCE_TIMEOUT", "90.0"))
+                                logger.info(f"[WS] 👁️ Surveillance command detected - using {base_timeout}s timeout")
+                            else:
+                                # Standard commands use shorter timeout
+                                base_timeout = float(os.getenv("WS_COMMAND_TIMEOUT", "45.0"))
+                            
+                            # ===========================================================
                             # PROGRESS CALLBACK SYSTEM - Real-time frontend updates
                             # ===========================================================
                             progress_cancelled = asyncio.Event()
-                            progress_stages = [
-                                {"stage": "analyzing", "message": "🧠 Analyzing your request..."},
-                                {"stage": "processing", "message": "⚙️ Processing command..."},
-                                {"stage": "vision_init", "message": "👁️ Initializing vision..."},
-                                {"stage": "api_call", "message": "📡 Connecting to AI..."},
-                                {"stage": "generating", "message": "✨ Generating response..."},
-                            ]
+                            
+                            # Different progress stages for surveillance vs regular commands
+                            if is_surveillance_command:
+                                progress_stages = [
+                                    {"stage": "analyzing", "message": "🧠 Analyzing surveillance request..."},
+                                    {"stage": "discovery", "message": "🔍 Discovering windows across spaces..."},
+                                    {"stage": "teleport", "message": "👻 Moving windows to Ghost Display..."},
+                                    {"stage": "watchers", "message": "👁️ Spawning parallel watchers..."},
+                                    {"stage": "validation", "message": "✅ Validating capture streams..."},
+                                    {"stage": "monitoring", "message": "🎯 Starting surveillance..."},
+                                ]
+                            else:
+                                progress_stages = [
+                                    {"stage": "analyzing", "message": "🧠 Analyzing your request..."},
+                                    {"stage": "processing", "message": "⚙️ Processing command..."},
+                                    {"stage": "vision_init", "message": "👁️ Initializing vision..."},
+                                    {"stage": "api_call", "message": "📡 Connecting to AI..."},
+                                    {"stage": "generating", "message": "✨ Generating response..."},
+                                ]
 
                             async def send_progress_updates():
                                 """Send periodic progress updates to keep frontend informed"""
                                 try:
                                     stage_index = 0
+                                    # Surveillance needs slower progress (more stages, longer waits)
+                                    update_interval = 3.0 if is_surveillance_command else 2.0
+                                    
                                     while not progress_cancelled.is_set():
                                         if stage_index < len(progress_stages):
                                             stage = progress_stages[stage_index]
@@ -1387,14 +1437,16 @@ class UnifiedWebSocketManager:
                                             "message": stage["message"],
                                             "stage_index": min(stage_index, len(progress_stages) - 1),
                                             "total_stages": len(progress_stages),
+                                            "is_surveillance": is_surveillance_command,
+                                            "timeout_seconds": base_timeout,
                                             "timestamp": time.time(),
                                         })
 
-                                        # Wait 2 seconds between updates, or until cancelled
+                                        # Wait between updates, or until cancelled
                                         try:
                                             await asyncio.wait_for(
                                                 progress_cancelled.wait(),
-                                                timeout=2.0
+                                                timeout=update_interval
                                             )
                                             break  # Cancelled
                                         except asyncio.TimeoutError:
@@ -1406,19 +1458,26 @@ class UnifiedWebSocketManager:
                             progress_task = asyncio.create_task(send_progress_updates())
 
                             # ===========================================================
-                            # PROCESS COMMAND WITH TIMEOUT - 45 SECOND MAX
+                            # v32.0: PROCESS COMMAND WITH DYNAMIC TIMEOUT
                             # ===========================================================
                             try:
                                 jarvis_result = await asyncio.wait_for(
                                     jarvis_api.process_command(command_obj),
-                                    timeout=45.0
+                                    timeout=base_timeout
                                 )
                             except asyncio.TimeoutError:
-                                logger.error(f"[WS] Command processing timed out after 45s: {command_text}")
+                                timeout_msg = (
+                                    f"Surveillance setup timed out after {base_timeout:.0f}s. "
+                                    "The system may be initializing many windows."
+                                    if is_surveillance_command else
+                                    "I apologize, but processing took too long. Please try again with a simpler request."
+                                )
+                                logger.error(f"[WS] Command processing timed out after {base_timeout}s: {command_text}")
                                 jarvis_result = {
-                                    "response": "I apologize, but processing took too long. Please try again with a simpler request.",
+                                    "response": timeout_msg,
                                     "status": "timeout",
                                     "success": False,
+                                    "command_type": "surveillance" if is_surveillance_command else "unknown",
                                 }
                             finally:
                                 # Cancel progress updates

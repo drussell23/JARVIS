@@ -1759,15 +1759,17 @@ class IntelligentCommandHandler:
                 # For "all spaces" mode, expect more windows (typical: 5-15)
                 estimated_window_count = 12  # Reasonable estimate for multi-space
 
-            # Dynamic timeout formula: base + (count × per_window) + buffer
+            # v32.0: Dynamic timeout formula: base + (count × per_window) + buffer
+            # Timeout chain: WebSocket(90s) → API(85s) → Processor(80s) → HERE(75s max)
             # - base: 5 seconds for initial setup
             # - per_window: 3 seconds per window (capture init + validation)
-            # - buffer: 10 seconds for teleportation and rescue operations
+            # - buffer: 15 seconds for teleportation and rescue operations
             TIMEOUT_BASE = float(os.getenv("JARVIS_WATCH_TIMEOUT_BASE", "5"))
             TIMEOUT_PER_WINDOW = float(os.getenv("JARVIS_WATCH_TIMEOUT_PER_WINDOW", "3"))
             TIMEOUT_BUFFER = float(os.getenv("JARVIS_WATCH_TIMEOUT_BUFFER", "15"))
             TIMEOUT_MIN = float(os.getenv("JARVIS_WATCH_TIMEOUT_MIN", "15"))
-            TIMEOUT_MAX = float(os.getenv("JARVIS_WATCH_TIMEOUT_MAX", "90"))
+            # v32.0: Reduced MAX from 90 to 75 to fit inside parent timeout chain
+            TIMEOUT_MAX = float(os.getenv("JARVIS_WATCH_TIMEOUT_MAX", "75"))
 
             dynamic_timeout = TIMEOUT_BASE + (estimated_window_count * TIMEOUT_PER_WINDOW) + TIMEOUT_BUFFER
             watch_timeout = max(TIMEOUT_MIN, min(dynamic_timeout, TIMEOUT_MAX))

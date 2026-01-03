@@ -1893,10 +1893,15 @@ class JARVISVoiceAPI:
                     from .unified_command_processor import UnifiedCommandProcessor
                     processor = UnifiedCommandProcessor()
                     
-                    # v31.0: Dynamic timeout for multi-window surveillance
-                    # Fixed 30s was too short for 11+ windows with teleportation
-                    # Formula: base(10) + per_window(3) × estimated_windows(12) + buffer(20) = 66s
-                    surveillance_timeout = float(os.getenv("JARVIS_SURVEILLANCE_TIMEOUT", "60"))
+                    # v32.0: Dynamic timeout for multi-window surveillance
+                    # WebSocket outer timeout is 90s, so inner timeout must be less
+                    # Timeline for 6+ windows:
+                    #   - Window discovery: ~5s
+                    #   - Teleportation to Ghost Display: ~15s (may need to exit fullscreen)
+                    #   - Watcher spawning: ~20s (parallel but with validation)
+                    #   - Buffer for retries: ~10s
+                    # Total: ~50s typical, 85s max to leave headroom for WebSocket
+                    surveillance_timeout = float(os.getenv("JARVIS_SURVEILLANCE_TIMEOUT", "85"))
                     logger.info(f"[JARVIS API] Using {surveillance_timeout}s timeout for surveillance")
                     
                     result = await asyncio.wait_for(
