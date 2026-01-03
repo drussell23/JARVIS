@@ -1550,16 +1550,16 @@ class UnifiedWebSocketManager:
                                             # POLL INTERVAL: Fast for real-time, slow for fallback
                                             # ═══════════════════════════════════════════════════
                                             poll_interval = 0.1 if is_surveillance_command else 0.5
-                                            
-                                        try:
-                                            await asyncio.wait_for(
-                                                progress_cancelled.wait(),
+
+                                            try:
+                                                await asyncio.wait_for(
+                                                    progress_cancelled.wait(),
                                                     timeout=poll_interval
-                                            )
-                                            break  # Cancelled
-                                        except asyncio.TimeoutError:
+                                                )
+                                                break  # Cancelled
+                                            except asyncio.TimeoutError:
                                                 pass  # Continue polling
-                                                
+
                                     finally:
                                         # v32.1: Cleanup surveillance subscription
                                         if surveillance_subscriber_id and progress_stream:

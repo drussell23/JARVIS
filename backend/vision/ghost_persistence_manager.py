@@ -503,22 +503,90 @@ class GhostPersistenceManager:
         width: int,
         height: int,
     ) -> bool:
-        """Move a window to a specific space and restore geometry."""
+        """
+        v34.0: Move a window to a specific space with Display Handoff support.
+
+        For cross-display moves, uses --display instead of --space to bypass
+        Scripting Addition requirements.
+        """
         try:
-            # Move to space
-            proc = await asyncio.create_subprocess_exec(
-                "yabai", "-m", "window", str(window_id),
-                "--space", str(space),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+            # ═══════════════════════════════════════════════════════════════
+            # v34.0: DETECT CROSS-DISPLAY MOVE
+            # ═══════════════════════════════════════════════════════════════
+
+            current_display = None
+            target_display = None
+
+            # Get window's current display
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "yabai", "-m", "query", "--windows", "--window", str(window_id),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+                if proc.returncode == 0 and stdout:
+                    win_data = json.loads(stdout.decode())
+                    current_display = win_data.get("display")
+            except Exception:
+                pass
+
+            # Get target space's display
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "yabai", "-m", "query", "--spaces",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+                if proc.returncode == 0 and stdout:
+                    spaces = json.loads(stdout.decode())
+                    for s in spaces:
+                        if s.get("index") == space:
+                            target_display = s.get("display")
+                            break
+            except Exception:
+                pass
+
+            # Determine if cross-display move
+            is_cross_display = (
+                current_display is not None and
+                target_display is not None and
+                current_display != target_display
             )
+
+            # ═══════════════════════════════════════════════════════════════
+            # v34.0: EXECUTE MOVE WITH DISPLAY HANDOFF
+            # ═══════════════════════════════════════════════════════════════
+
+            if is_cross_display:
+                # CROSS-DISPLAY: Use --display command (bypasses SA requirement)
+                logger.info(
+                    f"[GhostPersistence] 🌐 DISPLAY HANDOFF: Window {window_id} "
+                    f"from Display {current_display} → Display {target_display}"
+                )
+                proc = await asyncio.create_subprocess_exec(
+                    "yabai", "-m", "window", str(window_id),
+                    "--display", str(target_display),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+            else:
+                # SAME-DISPLAY: Use standard --space command
+                proc = await asyncio.create_subprocess_exec(
+                    "yabai", "-m", "window", str(window_id),
+                    "--space", str(space),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+
             await asyncio.wait_for(proc.communicate(), timeout=5.0)
 
             if proc.returncode != 0:
                 return False
 
-            # Small delay for space switch
-            await asyncio.sleep(0.3)
+            # Small delay for space switch / texture rehydration
+            await asyncio.sleep(0.5 if is_cross_display else 0.3)
 
             # Restore geometry
             proc = await asyncio.create_subprocess_exec(

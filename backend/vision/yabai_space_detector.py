@@ -3531,7 +3531,10 @@ class YabaiSpaceDetector:
         follow: bool = False
     ) -> bool:
         """
-        Teleport a window to a different space using Yabai.
+        v34.0: Teleport a window to a different space with Display Handoff support.
+
+        ROOT CAUSE FIX: For cross-display moves, uses --display instead of --space
+        to bypass Scripting Addition requirements.
 
         Args:
             window_id: The window ID to move
@@ -3552,20 +3555,81 @@ class YabaiSpaceDetector:
         try:
             yabai_path = self._health.yabai_path or "yabai"
 
-            # Execute the window move command
-            result = subprocess.run(
-                [yabai_path, "-m", "window", str(window_id), "--space", str(target_space)],
-                capture_output=True,
-                text=True,
-                timeout=self.config.query_timeout_seconds,
+            # ═══════════════════════════════════════════════════════════════
+            # v34.0: DETECT CROSS-DISPLAY MOVE
+            # ═══════════════════════════════════════════════════════════════
+
+            current_display = None
+            target_display = None
+
+            # Get window's current display
+            try:
+                win_result = subprocess.run(
+                    [yabai_path, "-m", "query", "--windows", "--window", str(window_id)],
+                    capture_output=True, text=True, timeout=5.0
+                )
+                if win_result.returncode == 0:
+                    win_data = json.loads(win_result.stdout)
+                    current_display = win_data.get("display")
+            except Exception as e:
+                logger.debug(f"[YABAI] Could not query window display: {e}")
+
+            # Get target space's display
+            try:
+                space_result = subprocess.run(
+                    [yabai_path, "-m", "query", "--spaces"],
+                    capture_output=True, text=True, timeout=5.0
+                )
+                if space_result.returncode == 0:
+                    spaces = json.loads(space_result.stdout)
+                    for space in spaces:
+                        if space.get("index") == target_space:
+                            target_display = space.get("display")
+                            break
+            except Exception as e:
+                logger.debug(f"[YABAI] Could not query space display: {e}")
+
+            # Determine if cross-display move
+            is_cross_display = (
+                current_display is not None and
+                target_display is not None and
+                current_display != target_display
             )
+
+            # ═══════════════════════════════════════════════════════════════
+            # v34.0: EXECUTE MOVE WITH DISPLAY HANDOFF
+            # ═══════════════════════════════════════════════════════════════
+
+            if is_cross_display:
+                # CROSS-DISPLAY: Use --display command (bypasses SA requirement)
+                logger.info(
+                    f"[YABAI] 🌐 DISPLAY HANDOFF: Moving window {window_id} "
+                    f"from Display {current_display} → Display {target_display}"
+                )
+                result = subprocess.run(
+                    [yabai_path, "-m", "window", str(window_id), "--display", str(target_display)],
+                    capture_output=True,
+                    text=True,
+                    timeout=self.config.query_timeout_seconds,
+                )
+            else:
+                # SAME-DISPLAY: Use standard --space command
+                result = subprocess.run(
+                    [yabai_path, "-m", "window", str(window_id), "--space", str(target_space)],
+                    capture_output=True,
+                    text=True,
+                    timeout=self.config.query_timeout_seconds,
+                )
 
             if result.returncode != 0:
                 error_msg = result.stderr.strip() if result.stderr else "Unknown error"
                 logger.error(f"[YABAI] Failed to move window {window_id}: {error_msg}")
                 return False
 
-            logger.info(f"[YABAI] ✅ Teleported window {window_id} to Space {target_space}")
+            if is_cross_display:
+                logger.info(f"[YABAI] ✅ DISPLAY HANDOFF: Window {window_id} → Display {target_display}")
+            else:
+                logger.info(f"[YABAI] ✅ Teleported window {window_id} to Space {target_space}")
 
             # Optionally follow the window
             if follow:
@@ -3596,24 +3660,30 @@ class YabaiSpaceDetector:
         max_retries: int = 3
     ) -> bool:
         """
-        v33.0 FIRE AND CONFIRM PROTOCOL: Async move with progressive verification.
+        v34.0 DISPLAY HANDOFF PROTOCOL: Intelligent cross-display window management.
 
-        ROOT CAUSE FIX: Strategy 1 (Direct Move) was failing because:
-        1. Premature Verification: Checking at 0.3s when hydration takes 500ms-2000ms
-        2. Silent Failure: Not checking yabai's exit code/stderr
-        3. Race Condition: Validation started before physics completed
+        ROOT CAUSE FIX: The --space command silently fails when moving windows
+        across displays without Scripting Additions. macOS blocks cross-GPU
+        texture transfers via space commands for security reasons.
 
-        SOLUTION: Fire and Confirm Protocol
-        1. FIRE: Execute move command, check exit code immediately
-        2. WAIT: Progressive hydration delays (0.3s → 0.8s → 1.5s → 2.5s)
-        3. CONFIRM: Verify window actually moved at each checkpoint
-        4. RETRY: Use different strategy only after physics has had time to work
+        SOLUTION: Display Handoff Protocol
+        1. DETECT: Check if source and target are on different displays
+        2. HANDOFF: Use --display command for cross-display moves (bypasses SA requirement)
+        3. FIRE: Execute move command, check exit code immediately
+        4. WAIT: Progressive hydration delays for texture rehydration
+        5. CONFIRM: Verify window actually moved at each checkpoint
+        6. RETRY: Use different strategy only after physics has had time to work
 
         Strategies (tried in order):
-        1. Direct move with progressive verification (now patient!)
-        2. Wake space first (AppleScript), then direct move
+        1. Display Handoff (NEW) - Use --display for cross-display moves (most reliable)
+        2. Direct move with progressive verification
         3. Focus window first, then move
-        4. Full switch-grab-return with space switching
+        4. Wake space first (AppleScript), then direct move
+        5. Full switch-grab-return with space switching
+
+        The key insight: `yabai -m window --display N` uses a simpler "Move to Monitor"
+        instruction that macOS allows natively, while `--space` requires complex
+        GPU context management that often fails silently.
         """
         import asyncio
 
@@ -3623,17 +3693,20 @@ class YabaiSpaceDetector:
 
         yabai_path = self._health.yabai_path or "yabai"
 
-        # v33.0: Configurable hydration timing
-        # These values are based on macOS Window Server behavior analysis
+        # v34.0: Configurable hydration timing
         hydration_checkpoints = [
             float(x) for x in os.getenv(
-                'JARVIS_HYDRATION_CHECKPOINTS', '0.3,0.8,1.5,2.5'
+                'JARVIS_HYDRATION_CHECKPOINTS', '0.2,0.5,1.0,1.5'
             ).split(',')
         ]
         max_hydration_time = float(os.getenv('JARVIS_MAX_HYDRATION_TIME', '3.0'))
 
-        # Helper to check current window space
-        async def get_window_space() -> Optional[int]:
+        # ═══════════════════════════════════════════════════════════════════
+        # v34.0: INTELLIGENT DISPLAY/SPACE RESOLUTION HELPERS
+        # ═══════════════════════════════════════════════════════════════════
+
+        async def get_window_info_async() -> Optional[Dict[str, Any]]:
+            """Get full window info including display and space."""
             try:
                 proc = await asyncio.create_subprocess_exec(
                     yabai_path, "-m", "query", "--windows", "--window", str(window_id),
@@ -3642,12 +3715,79 @@ class YabaiSpaceDetector:
                 )
                 stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
                 if proc.returncode == 0 and stdout:
-                    import json
-                    data = json.loads(stdout.decode())
-                    return data.get("space")
+                    return json.loads(stdout.decode())
             except Exception as e:
-                logger.debug(f"[YABAI] Could not query window space: {e}")
+                logger.debug(f"[YABAI] Could not query window info: {e}")
             return None
+
+        async def get_window_space() -> Optional[int]:
+            """Get current space of the window."""
+            info = await get_window_info_async()
+            return info.get("space") if info else None
+
+        async def get_window_display() -> Optional[int]:
+            """Get current display of the window."""
+            info = await get_window_info_async()
+            return info.get("display") if info else None
+
+        async def get_space_display(space_id: int) -> Optional[int]:
+            """Get which display a space belongs to."""
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    yabai_path, "-m", "query", "--spaces",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+                if proc.returncode == 0 and stdout:
+                    spaces = json.loads(stdout.decode())
+                    for space in spaces:
+                        if space.get("index") == space_id:
+                            return space.get("display")
+            except Exception as e:
+                logger.debug(f"[YABAI] Could not query space display: {e}")
+            return None
+
+        async def get_all_spaces_on_display(display_id: int) -> List[int]:
+            """Get all space IDs on a specific display."""
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    yabai_path, "-m", "query", "--spaces",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+                if proc.returncode == 0 and stdout:
+                    spaces = json.loads(stdout.decode())
+                    return [s.get("index") for s in spaces if s.get("display") == display_id]
+            except Exception as e:
+                logger.debug(f"[YABAI] Could not query spaces on display: {e}")
+            return []
+
+        # ═══════════════════════════════════════════════════════════════════
+        # v34.0: CROSS-DISPLAY DETECTION
+        # ═══════════════════════════════════════════════════════════════════
+
+        # Get source and target display info for intelligent routing
+        current_display = await get_window_display()
+        target_display = await get_space_display(target_space)
+
+        is_cross_display_move = (
+            current_display is not None and
+            target_display is not None and
+            current_display != target_display
+        )
+
+        if is_cross_display_move:
+            logger.info(
+                f"[YABAI] 🌐 CROSS-DISPLAY MOVE DETECTED: Window {window_id} "
+                f"from Display {current_display} → Display {target_display} (Space {target_space})"
+            )
+        else:
+            logger.debug(
+                f"[YABAI] Same-display move: Window {window_id} → Space {target_space} "
+                f"(Display {current_display or '?'})"
+            )
 
         # v33.0: Progressive verification with hydration-aware timing
         async def verify_move_with_patience(expected_space: int, strategy_name: str) -> bool:
@@ -3706,10 +3846,48 @@ class YabaiSpaceDetector:
             )
             return False
 
-        # v33.0: Execute yabai command with exit code checking
-        async def execute_yabai_move(window_id: int, target_space: int) -> Tuple[bool, str]:
+        # ═══════════════════════════════════════════════════════════════════
+        # v34.0: INTELLIGENT MOVE COMMAND EXECUTION WITH DISPLAY HANDOFF
+        # ═══════════════════════════════════════════════════════════════════
+
+        async def execute_display_handoff(window_id: int, display_id: int) -> Tuple[bool, str]:
             """
-            Execute move command and check exit code immediately.
+            v34.0: DISPLAY HANDOFF - Move window to a display (not space).
+
+            This is the KEY FIX for cross-display moves without Scripting Additions.
+            The --display command uses a simpler "Move to Monitor" instruction that
+            macOS allows natively, bypassing the complex GPU context management
+            that causes --space to fail silently.
+
+            Returns (success, error_message)
+            """
+            try:
+                logger.info(
+                    f"[YABAI] 🚀 DISPLAY HANDOFF: Moving window {window_id} → Display {display_id}"
+                )
+                proc = await asyncio.create_subprocess_exec(
+                    yabai_path, "-m", "window", str(window_id), "--display", str(display_id),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+
+                if proc.returncode != 0:
+                    error_msg = stderr.decode().strip() if stderr else "Unknown error"
+                    logger.warning(f"[YABAI] Display handoff command failed: {error_msg}")
+                    return False, error_msg
+
+                logger.info(f"[YABAI] ✅ Display handoff command accepted")
+                return True, ""
+
+            except asyncio.TimeoutError:
+                return False, "Display handoff command timed out"
+            except Exception as e:
+                return False, str(e)
+
+        async def execute_space_move(window_id: int, target_space: int) -> Tuple[bool, str]:
+            """
+            Execute standard --space move command.
 
             Returns (success, error_message)
             - success=True: Command accepted by yabai (may still need hydration)
@@ -3734,6 +3912,22 @@ class YabaiSpaceDetector:
             except Exception as e:
                 return False, str(e)
 
+        async def execute_yabai_move(window_id: int, target_space: int) -> Tuple[bool, str]:
+            """
+            v34.0: INTELLIGENT MOVE - Automatically chooses --display or --space.
+
+            For cross-display moves: Use --display (bypasses SA requirement)
+            For same-display moves: Use --space (standard behavior)
+
+            Returns (success, error_message)
+            """
+            if is_cross_display_move and target_display is not None:
+                # CROSS-DISPLAY: Use Display Handoff (the fix!)
+                return await execute_display_handoff(window_id, target_display)
+            else:
+                # SAME-DISPLAY: Use standard --space command
+                return await execute_space_move(window_id, target_space)
+
         # Check initial state
         initial_space = await get_window_space()
         if initial_space == target_space:
@@ -3742,13 +3936,29 @@ class YabaiSpaceDetector:
 
         original_user_space = self.get_current_user_space()
 
-        # v33.0: Strategy definitions with progressive fallback
-        strategies = [
-            ("direct_fire_confirm", "Direct move with progressive verification"),
-            ("wake_then_move", "Wake space via AppleScript, then direct move"),
-            ("focus_first", "Focus window first, then move"),
-            ("switch_grab_return", "Full space switch, focus, move, return"),
-        ]
+        # ═══════════════════════════════════════════════════════════════════
+        # v34.0: STRATEGY DEFINITIONS WITH DISPLAY HANDOFF PRIORITY
+        # ═══════════════════════════════════════════════════════════════════
+        # For cross-display moves, display_handoff is tried FIRST
+        # For same-display moves, standard strategies are used
+        # ═══════════════════════════════════════════════════════════════════
+
+        if is_cross_display_move:
+            # Cross-display: Prioritize Display Handoff
+            strategies = [
+                ("display_handoff", "Display Handoff (cross-display native)"),
+                ("display_then_space", "Display Handoff + Space refinement"),
+                ("focus_first", "Focus window first, then move"),
+                ("switch_grab_return", "Full space switch, focus, move, return"),
+            ]
+        else:
+            # Same-display: Use standard strategies
+            strategies = [
+                ("direct_fire_confirm", "Direct move with progressive verification"),
+                ("focus_first", "Focus window first, then move"),
+                ("wake_then_move", "Wake space via AppleScript, then direct move"),
+                ("switch_grab_return", "Full space switch, focus, move, return"),
+            ]
 
         for attempt, (strategy, description) in enumerate(strategies[:max_retries]):
             logger.info(
@@ -3757,7 +3967,76 @@ class YabaiSpaceDetector:
             )
 
             try:
-                if strategy == "direct_fire_confirm":
+                if strategy == "display_handoff":
+                    # =============================================================
+                    # v34.0 STRATEGY: DISPLAY HANDOFF (Cross-Display Native)
+                    # =============================================================
+                    # THE ROOT FIX: Use --display instead of --space for cross-display moves.
+                    # macOS allows "Move to Monitor" natively without Scripting Additions,
+                    # while --space requires complex GPU context management that fails silently.
+                    # =============================================================
+                    if target_display is None:
+                        logger.warning("[YABAI] Display handoff skipped - target display unknown")
+                        continue
+
+                    cmd_success, error_msg = await execute_display_handoff(window_id, target_display)
+
+                    if not cmd_success:
+                        logger.warning(f"[YABAI] ❌ Display Handoff REJECTED: {error_msg}")
+                        continue
+
+                    # Command ACCEPTED - verify window is now on target display
+                    if verify:
+                        if await verify_move_with_patience(target_space, strategy):
+                            self._health.record_success(0)
+                            return True
+                        else:
+                            # Window might be on display but wrong space - try space refinement
+                            logger.info("[YABAI] Display handoff partial - window on display but may need space refinement")
+                    else:
+                        self._health.record_success(0)
+                        return True
+
+                elif strategy == "display_then_space":
+                    # =============================================================
+                    # v34.0 STRATEGY: DISPLAY HANDOFF + SPACE REFINEMENT
+                    # =============================================================
+                    # Two-step approach:
+                    # 1. Move window to target display using --display (reliable)
+                    # 2. Move window to specific space using --space (now same-display)
+                    # =============================================================
+                    if target_display is None:
+                        logger.warning("[YABAI] Display+Space strategy skipped - target display unknown")
+                        continue
+
+                    # Step 1: Move to target display
+                    logger.info(f"[YABAI] 📍 Step 1: Moving to Display {target_display}...")
+                    display_success, error_msg = await execute_display_handoff(window_id, target_display)
+
+                    if not display_success:
+                        logger.warning(f"[YABAI] Display step failed: {error_msg}")
+                        continue
+
+                    # Wait for display transfer to complete
+                    await asyncio.sleep(0.5)
+
+                    # Verify window is now on target display
+                    new_display = await get_window_display()
+                    if new_display != target_display:
+                        logger.warning(f"[YABAI] Window still on Display {new_display}, expected {target_display}")
+                        continue
+
+                    logger.info(f"[YABAI] ✅ Window on Display {target_display}, refining to Space {target_space}...")
+
+                    # Step 2: Now that window is on same display, use --space for precision
+                    space_success, error_msg = await execute_space_move(window_id, target_space)
+
+                    if space_success and verify:
+                        if await verify_move_with_patience(target_space, strategy):
+                            self._health.record_success(0)
+                            return True
+
+                elif strategy == "direct_fire_confirm":
                     # =============================================================
                     # STRATEGY 1: FIRE AND CONFIRM (Patient Direct Move)
                     # =============================================================
@@ -3821,19 +4100,40 @@ class YabaiSpaceDetector:
 
                 elif strategy == "focus_first":
                     # =============================================================
-                    # STRATEGY 3: FOCUS WINDOW FIRST, THEN MOVE
+                    # STRATEGY 2 (v33.1): FOCUS WINDOW FIRST, THEN MOVE
                     # =============================================================
-                    # Focusing a window can wake it and make it movable
+                    # Focusing a window brings user to its space and wakes it up
+                    # This works WITHOUT yabai Scripting Addition
                     # =============================================================
+                    logger.info(f"[YABAI] 🎯 Focusing window {window_id} to wake it...")
                     proc = await asyncio.create_subprocess_exec(
                         yabai_path, "-m", "window", "--focus", str(window_id),
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE
                     )
-                    await asyncio.wait_for(proc.communicate(), timeout=3.0)
-                    await asyncio.sleep(0.3)  # Let focus complete
+                    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=3.0)
+
+                    if proc.returncode != 0:
+                        error_msg = stderr.decode().strip() if stderr else "Unknown error"
+                        logger.warning(f"[YABAI] Focus command failed: {error_msg}")
+                    else:
+                        logger.info(f"[YABAI] ✅ Window {window_id} focused (now on active space)")
+
+                    await asyncio.sleep(0.8)  # v33.1: Increased to 0.8s for full hydration
+
+                    # v33.1: Check window state before attempting move
+                    current_space_after_focus = await get_window_space()
+                    logger.info(
+                        f"[YABAI] 📍 After focus: Window {window_id} now on space {current_space_after_focus} "
+                        f"(target: {target_space})"
+                    )
 
                     cmd_success, error_msg = await execute_yabai_move(window_id, target_space)
+
+                    if not cmd_success:
+                        logger.warning(f"[YABAI] Move after focus failed: {error_msg}")
+                    else:
+                        logger.info(f"[YABAI] ✅ Move command accepted (window {window_id} → space {target_space})")
 
                     if cmd_success and verify:
                         if await verify_move_with_patience(target_space, strategy):
@@ -3951,13 +4251,99 @@ class YabaiSpaceDetector:
             logger.warning(f"[YABAI] Space switch failed: {e}")
             return False
 
+    def _switch_to_space_applescript(self, space_id: int) -> bool:
+        """
+        Switch to a space using AppleScript Control+Number keyboard shortcut.
+
+        v33.0 FIX: This method works WITHOUT yabai Scripting Addition (SA).
+        Most users don't have SA enabled because it requires SIP to be disabled.
+
+        The approach uses Control+<number> keyboard shortcuts which are the
+        default macOS shortcuts for switching between spaces.
+
+        Args:
+            space_id: The space index to switch to (1-10)
+
+        Returns:
+            True if successful, False otherwise
+        """
+        if space_id < 1 or space_id > 10:
+            logger.warning(f"[YABAI] AppleScript space switch only supports spaces 1-10, got {space_id}")
+            return False
+
+        # macOS key codes for numbers 1-0 (0 is keycode 29)
+        # These are the physical key codes for the number row
+        key_codes = {
+            1: 18,   # 1
+            2: 19,   # 2
+            3: 20,   # 3
+            4: 21,   # 4
+            5: 23,   # 5
+            6: 22,   # 6
+            7: 26,   # 7
+            8: 28,   # 8
+            9: 25,   # 9
+            10: 29,  # 0
+        }
+
+        key_code = key_codes.get(space_id)
+        if key_code is None:
+            return False
+
+        applescript = f'''
+        tell application "System Events"
+            key code {key_code} using control down
+        end tell
+        '''
+
+        try:
+            result = subprocess.run(
+                ['osascript', '-e', applescript],
+                capture_output=True,
+                text=True,
+                timeout=3.0
+            )
+
+            if result.returncode == 0:
+                # Give Mission Control time to animate
+                time.sleep(0.5)
+                logger.debug(f"[YABAI] AppleScript space switch to {space_id} succeeded")
+                return True
+            else:
+                error_msg = result.stderr.strip() if result.stderr else "Unknown error"
+                logger.debug(f"[YABAI] AppleScript space switch failed: {error_msg}")
+                return False
+
+        except subprocess.TimeoutExpired:
+            logger.warning(f"[YABAI] AppleScript space switch timed out for space {space_id}")
+            return False
+        except Exception as e:
+            logger.warning(f"[YABAI] AppleScript space switch failed: {e}")
+            return False
+
     async def _switch_to_space_async(self, space_id: int) -> bool:
-        """Async version of _switch_to_space."""
+        """
+        Async version of space switching with multi-strategy fallback.
+
+        v33.0: Tries yabai first, falls back to AppleScript if yabai fails.
+        """
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
+
+        # Strategy 1: Try yabai (requires SA)
+        yabai_success = await loop.run_in_executor(
             None,
             lambda: self._switch_to_space(space_id)
         )
+        if yabai_success:
+            return True
+
+        # Strategy 2: Fall back to AppleScript (works without SA)
+        logger.debug(f"[YABAI] Yabai space switch failed, trying AppleScript...")
+        applescript_success = await loop.run_in_executor(
+            None,
+            lambda: self._switch_to_space_applescript(space_id)
+        )
+        return applescript_success
 
     def move_window_to_space_with_rescue(
         self,
