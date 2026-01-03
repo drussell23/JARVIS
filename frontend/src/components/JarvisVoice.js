@@ -2319,6 +2319,48 @@ const JarvisVoice = () => {
         };
 
         // ═══════════════════════════════════════════════════════════════════
+        // v32.2: STAGE ORDERING - Prevents older stages from overwriting newer ones
+        // ═══════════════════════════════════════════════════════════════════
+        const stageOrder = {
+          // Early stages (low order = can be overwritten)
+          'starting': 1,
+          'permission_check': 2,
+          'analyzing': 3,
+          'discovery': 4,
+          'discovery_start': 4,
+          'discovery_complete': 5,
+          
+          // Mid stages
+          'teleport_start': 6,
+          'teleport': 6,
+          'teleport_progress': 7,
+          'teleport_complete': 8,
+          
+          // Watcher stages
+          'watcher_start': 9,
+          'watchers': 9,
+          'watcher_progress': 10,
+          'watcher_ready': 11,
+          'watcher_failed': 11,
+          
+          // Validation (fallback stage from WebSocket)
+          'validation': 12,
+          
+          // Final stages (high order = never overwritten by lower)
+          'monitoring': 15,
+          'monitoring_active': 15,
+          'detection': 20,
+          'complete': 25,
+          'error': 25,
+          
+          // Generic fallback
+          'processing': 0,
+          'vision_init': 3,
+          'api_call': 4,
+          'generating': 5,
+        };
+
+        // ═══════════════════════════════════════════════════════════════════
         // PROGRESS CALCULATION - Estimate progress for stages without explicit values
         // ═══════════════════════════════════════════════════════════════════
         const stageWeights = {
@@ -2351,11 +2393,38 @@ const JarvisVoice = () => {
         };
 
         // ═══════════════════════════════════════════════════════════════════
-        // STATE UPDATE - Only update if this is meaningful data
+        // v32.2: STATE UPDATE - Intelligent stage management with regression prevention
         // ═══════════════════════════════════════════════════════════════════
-        // Skip fallback events if we've received a real event recently
-        const shouldUpdate = isRealEvent || !surveillanceProgress || 
-          (Date.now() - (surveillanceProgress?.timestamp || 0)) > 2000;
+        
+        // Get current and incoming stage orders
+        const currentStageOrder = surveillanceProgress 
+          ? (stageOrder[surveillanceProgress.stage] || 0) 
+          : -1;
+        const incomingStageOrder = stageOrder[stage] || 0;
+        
+        // Determine if we should update
+        // Rules:
+        // 1. ALWAYS update for real events (they're authoritative)
+        // 2. NEVER allow fallback to regress to an earlier stage
+        // 3. Allow fallback if no current progress exists
+        // 4. Allow fallback if moving FORWARD in stage order
+        const isStageRegression = !isRealEvent && incomingStageOrder < currentStageOrder;
+        
+        const shouldUpdate = (
+          isRealEvent ||                    // Real events always update
+          !surveillanceProgress ||          // No current progress - update
+          (!isStageRegression && (          // Not a regression AND:
+            incomingStageOrder > currentStageOrder ||  // Moving forward
+            (Date.now() - (surveillanceProgress?.timestamp || 0)) > 5000  // OR stale (5s)
+          ))
+        );
+        
+        // Debug logging for stage management
+        if (!shouldUpdate && !isRealEvent) {
+          console.log('%c[Stage Blocked]', 'color: #ff8800',
+            `Blocked fallback "${stage}" (order ${incomingStageOrder}) - ` +
+            `current is "${surveillanceProgress?.stage}" (order ${currentStageOrder})`);
+        }
         
         if (shouldUpdate) {
           setSurveillanceProgress({
@@ -2374,6 +2443,7 @@ const JarvisVoice = () => {
             timestamp: Date.now(),
             isSurveillance,
             isRealEvent,
+            stageOrderValue: incomingStageOrder,  // Track for debugging
             correlationId: data.correlation_id || '',
           });
 

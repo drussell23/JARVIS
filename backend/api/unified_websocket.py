@@ -1420,17 +1420,29 @@ class UnifiedWebSocketManager:
 
                             async def send_progress_updates():
                                 """
-                                v32.1: REAL-TIME SURVEILLANCE PROGRESS STREAMING
+                                v32.2: REAL-TIME SURVEILLANCE PROGRESS STREAMING
                                 
                                 Architecture:
                                 - For surveillance: Use event-driven stream (100ms polling)
                                 - For regular commands: Use fallback stages (2s interval)
-                                - Only send fallback if no real events received recently
+                                - v32.2: Stop fallback once monitoring_active is reached
+                                - Prevent stage regression in UI
                                 """
                                 try:
                                     stage_index = 0
                                     last_real_event_time = 0
                                     events_sent = 0
+                                    highest_stage_order = 0  # v32.2: Track highest stage reached
+                                    monitoring_active_reached = False  # v32.2: Stop fallback once active
+                                    
+                                    # v32.2: Stage ordering to prevent regression
+                                    stage_order = {
+                                        'starting': 1, 'analyzing': 2, 'discovery': 4,
+                                        'teleport_start': 6, 'teleport': 6, 'teleport_progress': 7, 'teleport_complete': 8,
+                                        'watcher_start': 9, 'watchers': 9, 'watcher_progress': 10, 'watcher_ready': 11,
+                                        'validation': 12, 'monitoring': 15, 'monitoring_active': 15,
+                                        'detection': 20, 'complete': 25, 'error': 25,
+                                    }
                                     
                                     # v32.1: For surveillance commands, subscribe to real progress stream
                                     surveillance_subscriber_id = None
@@ -1452,7 +1464,8 @@ class UnifiedWebSocketManager:
                                             sent_real_event = False
                                             
                                             # ═══════════════════════════════════════════════════
-                                            # v32.1: REAL-TIME EVENT STREAMING (100ms polling)
+                                            # v32.2: REAL-TIME EVENT STREAMING (100ms polling)
+                                            # Track highest stage reached to prevent UI regression
                                             # ═══════════════════════════════════════════════════
                                             if surveillance_subscriber_id and progress_stream:
                                                 try:
@@ -1468,7 +1481,18 @@ class UnifiedWebSocketManager:
                                                                 sent_real_event = True
                                                                 
                                                                 stage_name = real_event.get('stage', 'unknown')
-                                                                logger.info(f"[WS] 📡 Real-time progress: {stage_name} ({events_sent} events sent)")
+                                                                
+                                                                # v32.2: Track highest stage reached
+                                                                event_stage_order = stage_order.get(stage_name, 0)
+                                                                if event_stage_order > highest_stage_order:
+                                                                    highest_stage_order = event_stage_order
+                                                                
+                                                                # v32.2: Check if monitoring is now active
+                                                                if stage_name in ('monitoring', 'monitoring_active', 'detection'):
+                                                                    monitoring_active_reached = True
+                                                                    logger.info(f"[WS] 🎯 Monitoring ACTIVE - stopping fallback events")
+                                                                
+                                                                logger.info(f"[WS] 📡 Real-time progress: {stage_name} (order {event_stage_order}, {events_sent} events sent)")
                                                             except asyncio.QueueEmpty:
                                                                 break
                                                             except Exception as e:
@@ -1477,29 +1501,37 @@ class UnifiedWebSocketManager:
                                                     logger.debug(f"[WS] Error reading progress queue: {e}")
                                             
                                             # ═══════════════════════════════════════════════════
-                                            # FALLBACK: Only send if no real events recently
+                                            # v32.2: FALLBACK with stage regression prevention
                                             # ═══════════════════════════════════════════════════
                                             time_since_real_event = time.time() - last_real_event_time
                                             
-                                            # Only send fallback if:
-                                            # 1. No real event was sent this iteration, AND
-                                            # 2. No real events in the last 3 seconds (for surveillance) or 2 seconds (regular)
+                                            # Determine the fallback stage we would send
+                                            if stage_index < len(progress_stages):
+                                                fallback_stage = progress_stages[stage_index]
+                                            else:
+                                                fallback_stage = progress_stages[-1]
+                                            
+                                            fallback_stage_order = stage_order.get(fallback_stage["stage"], 0)
+                                            
+                                            # v32.2: Only send fallback if:
+                                            # 1. Monitoring is NOT yet active (once active, no more fallback)
+                                            # 2. No real event was sent this iteration
+                                            # 3. No real events in the last 3 seconds
+                                            # 4. Fallback stage is AHEAD of highest real stage (no regression)
                                             fallback_interval = 3.0 if is_surveillance_command else 2.0
+                                            
                                             should_send_fallback = (
+                                                not monitoring_active_reached and  # v32.2: Stop once monitoring active
                                                 not sent_real_event and 
-                                                (last_real_event_time == 0 or time_since_real_event > fallback_interval)
+                                                (last_real_event_time == 0 or time_since_real_event > fallback_interval) and
+                                                fallback_stage_order >= highest_stage_order  # v32.2: No regression
                                             )
                                             
                                             if should_send_fallback:
-                                                if stage_index < len(progress_stages):
-                                                    stage = progress_stages[stage_index]
-                                                else:
-                                                    stage = progress_stages[-1]
-
                                                 await websocket.send_json({
                                                     "type": "processing_progress",
-                                                    "stage": stage["stage"],
-                                                    "message": stage["message"],
+                                                    "stage": fallback_stage["stage"],
+                                                    "message": fallback_stage["message"],
                                                     "stage_index": min(stage_index, len(progress_stages) - 1),
                                                     "total_stages": len(progress_stages),
                                                     "is_surveillance": is_surveillance_command,
@@ -1508,7 +1540,11 @@ class UnifiedWebSocketManager:
                                                     "is_fallback": True,  # Signal this is synthetic
                                                 })
                                                 stage_index += 1
+                                                highest_stage_order = max(highest_stage_order, fallback_stage_order)
                                                 last_real_event_time = time.time()  # Reset to avoid rapid fallbacks
+                                            elif monitoring_active_reached:
+                                                # v32.2: Log that we're skipping fallback
+                                                logger.debug(f"[WS] Skipping fallback - monitoring already active")
 
                                             # ═══════════════════════════════════════════════════
                                             # POLL INTERVAL: Fast for real-time, slow for fallback
