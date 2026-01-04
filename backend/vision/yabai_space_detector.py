@@ -4047,22 +4047,58 @@ class YabaiSpaceDetector:
                 logger.debug(f"[YABAI] Window query failed: {e}")
                 return False, True  # Assume not fullscreen, proceed
 
-        # Check if window is in native fullscreen
+        # ═══════════════════════════════════════════════════════════════════
+        # v36.0: COMPREHENSIVE FULLSCREEN DETECTION
+        # ═══════════════════════════════════════════════════════════════════
+        # macOS has multiple fullscreen modes that block window movement:
+        # 1. Native Fullscreen (is-native-fullscreen) - Creates separate Space
+        # 2. Zoom Fullscreen (has-fullscreen-zoom) - Chrome/Electron presentation mode
+        # 3. Floating fullscreen (large window covering screen) - Usually movable
+        #
+        # Chrome specifically uses "zoom-fullscreen" for presentation mode,
+        # which doesn't create a Space but still blocks some operations.
+        # ═══════════════════════════════════════════════════════════════════
+
         is_native_fullscreen = window_info.get("is-native-fullscreen", False)
-
-        if not is_native_fullscreen:
-            # Not fullscreen - nothing to do
-            return False, True
-
-        # ═══════════════════════════════════════════════════════════════════
-        # FULLSCREEN DETECTED - Must unpack before moving
-        # ═══════════════════════════════════════════════════════════════════
+        is_zoom_fullscreen = window_info.get("has-fullscreen-zoom", False)
         app_name = window_info.get("app", "Unknown")
         window_title = window_info.get("title", "")[:50]
 
+        # Check for Chrome/Electron-specific presentation mode
+        is_chrome_like = app_name.lower() in [
+            "google chrome", "chrome", "chromium", "brave browser",
+            "microsoft edge", "electron", "slack", "discord", "spotify",
+            "visual studio code", "code", "figma"
+        ]
+
+        # Determine which fullscreen mode we're dealing with
+        fullscreen_mode = None
+        if is_native_fullscreen:
+            fullscreen_mode = "native"
+        elif is_zoom_fullscreen:
+            fullscreen_mode = "zoom"
+        elif is_chrome_like:
+            # Chrome-like apps may have presentation mode that yabai doesn't detect
+            # Check if window is suspiciously large (covering most of screen)
+            frame = window_info.get("frame", {})
+            width = frame.get("w", 0)
+            height = frame.get("h", 0)
+            # If window is very large and has no titlebar decorations, it might be presentation mode
+            has_border = window_info.get("has-border", True)
+            if width > 1800 and height > 1000 and not has_border:
+                fullscreen_mode = "presentation_suspected"
+                logger.debug(
+                    f"[YABAI] 🔍 Suspected presentation mode: {app_name} window {window_id} "
+                    f"is {width}x{height} with no border"
+                )
+
+        if fullscreen_mode is None:
+            # Not in any fullscreen mode - nothing to do
+            return False, True
+
         logger.info(
-            f"[YABAI] 📦 UNPACKING FULLSCREEN: Window {window_id} ({app_name}: {window_title}) "
-            f"is in native fullscreen mode - must exit before teleportation"
+            f"[YABAI] 📦 UNPACKING FULLSCREEN ({fullscreen_mode.upper()}): "
+            f"Window {window_id} ({app_name}: {window_title}) - must exit before teleportation"
         )
 
         # ═══════════════════════════════════════════════════════════════════
@@ -4078,12 +4114,30 @@ class YabaiSpaceDetector:
             try:
                 # Step 1: Get dynamic animation delay based on system settings
                 animation_delay = await self._get_system_animation_delay()
-                logger.debug(f"[YABAI] ⏱️ Using animation delay: {animation_delay}s")
 
-                # Step 2: Toggle native fullscreen OFF
-                logger.info(f"[YABAI] 🔄 Exiting fullscreen for window {window_id}...")
+                # v36.0: Adjust delay based on fullscreen mode
+                # Zoom fullscreen has faster animation than native fullscreen
+                if fullscreen_mode == "zoom":
+                    animation_delay = min(animation_delay, 0.8)  # Zoom is faster
+                elif fullscreen_mode == "presentation_suspected":
+                    animation_delay = 0.3  # No real animation, just window resize
+                logger.debug(f"[YABAI] ⏱️ Using animation delay: {animation_delay}s (mode: {fullscreen_mode})")
+
+                # ═══════════════════════════════════════════════════════════════
+                # v36.0: MODE-SPECIFIC TOGGLE COMMAND
+                # ═══════════════════════════════════════════════════════════════
+                # Different fullscreen modes require different toggle commands:
+                # - Native: --toggle native-fullscreen (destroys Space)
+                # - Zoom: --toggle zoom-fullscreen (no Space destruction)
+                # - Presentation: Try zoom first, then native as fallback
+                # ═══════════════════════════════════════════════════════════════
+
+                primary_toggle = "native-fullscreen" if fullscreen_mode == "native" else "zoom-fullscreen"
+                fallback_toggle = "zoom-fullscreen" if fullscreen_mode == "native" else "native-fullscreen"
+
+                logger.info(f"[YABAI] 🔄 Exiting {fullscreen_mode} fullscreen for window {window_id}...")
                 proc = await asyncio.create_subprocess_exec(
-                    yabai_path, "-m", "window", str(window_id), "--toggle", "native-fullscreen",
+                    yabai_path, "-m", "window", str(window_id), "--toggle", primary_toggle,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE
                 )
@@ -4091,12 +4145,12 @@ class YabaiSpaceDetector:
 
                 if proc.returncode != 0:
                     error_msg = stderr.decode().strip() if stderr else "Unknown error"
-                    logger.warning(f"[YABAI] ⚠️ Fullscreen toggle failed: {error_msg}")
+                    logger.warning(f"[YABAI] ⚠️ {primary_toggle} toggle failed: {error_msg}")
 
-                    # Try alternative: zoom-fullscreen (for windows using that mode instead)
-                    logger.debug(f"[YABAI] Trying zoom-fullscreen toggle as fallback...")
+                    # Try fallback toggle
+                    logger.debug(f"[YABAI] Trying {fallback_toggle} toggle as fallback...")
                     proc2 = await asyncio.create_subprocess_exec(
-                        yabai_path, "-m", "window", str(window_id), "--toggle", "zoom-fullscreen",
+                        yabai_path, "-m", "window", str(window_id), "--toggle", fallback_toggle,
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE
                     )
@@ -4110,18 +4164,24 @@ class YabaiSpaceDetector:
                 await asyncio.sleep(animation_delay)
 
                 # ═══════════════════════════════════════════════════════════════
-                # v35.5: INVALIDATE SPACE TOPOLOGY CACHE
+                # v36.0: SMART TOPOLOGY INVALIDATION
                 # ═══════════════════════════════════════════════════════════════
-                # CRITICAL: When a window exits fullscreen, macOS DESTROYS that
-                # Space. All space indices shift! Ghost Display that was Space 9
-                # might now be Space 8. We MUST re-query topology.
+                # CRITICAL: ONLY native fullscreen destroys Spaces!
+                # - Native fullscreen: Creates/destroys a Space → INVALIDATE
+                # - Zoom fullscreen: Just resizes window → NO invalidation needed
+                # - Presentation: Just overlays → NO invalidation needed
                 # ═══════════════════════════════════════════════════════════════
-                self._space_topology_valid = False
-                self._last_topology_refresh = None
-                logger.info(
-                    f"[YABAI] ⚠️ TOPOLOGY INVALIDATED: Space indices may have shifted "
-                    f"after fullscreen exit - will re-query before move"
-                )
+                if fullscreen_mode == "native":
+                    self._space_topology_valid = False
+                    self._last_topology_refresh = None
+                    logger.info(
+                        f"[YABAI] ⚠️ TOPOLOGY INVALIDATED: Space indices may have shifted "
+                        f"after native fullscreen exit - will re-query before move"
+                    )
+                else:
+                    logger.debug(
+                        f"[YABAI] ✓ Topology still valid ({fullscreen_mode} mode doesn't destroy Spaces)"
+                    )
 
                 # Step 4: Verify fullscreen exit succeeded
                 proc_verify = await asyncio.create_subprocess_exec(
@@ -4329,10 +4389,51 @@ class YabaiSpaceDetector:
                 self._health.record_failure("Fullscreen unpack failed")
                 return False
 
-            # Window was just unpacked - need fresh info for display/space detection
-            # (fullscreen exit may have changed the window's space)
+            # ═══════════════════════════════════════════════════════════════
+            # v36.0: WINDOW STATE RE-VALIDATION AFTER UNPACK
+            # ═══════════════════════════════════════════════════════════════
+            # After unpacking, the window may have changed state:
+            # - Became minimized (macOS behavior)
+            # - Changed spaces (macOS auto-reorganization)
+            # - Lost focus and became "dehydrated"
+            # - Re-entered fullscreen (double-toggle bug)
+            # We MUST re-validate before proceeding.
+            # ═══════════════════════════════════════════════════════════════
+            await asyncio.sleep(0.2)  # Brief hydration wait
             logger.debug(f"[YABAI] Refreshing window info after fullscreen unpack...")
             window_info = await get_window_info_async()
+
+            if window_info is None:
+                logger.error(
+                    f"[YABAI] ❌ Window {window_id} disappeared after unpacking"
+                )
+                self._health.record_failure("Window disappeared after unpack")
+                return False
+
+            # Check for problematic states after unpack
+            if window_info.get("is-minimized", False):
+                logger.warning(
+                    f"[YABAI] ⚠️ Window {window_id} became minimized after unpacking - unminimizing..."
+                )
+                # Try to unminimize
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        yabai_path, "-m", "window", str(window_id), "--deminimize",
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    )
+                    await asyncio.wait_for(proc.communicate(), timeout=3.0)
+                    await asyncio.sleep(0.3)  # Wait for unminimize animation
+                    window_info = await get_window_info_async()
+                except Exception as e:
+                    logger.warning(f"[YABAI] Failed to unminimize: {e}")
+
+            if window_info and window_info.get("is-native-fullscreen", False):
+                logger.error(
+                    f"[YABAI] ❌ Window {window_id} re-entered fullscreen after unpacking (double-toggle bug!)"
+                )
+                self._health.record_failure("Window re-entered fullscreen")
+                return False
 
             # ═══════════════════════════════════════════════════════════════
             # v35.5: TOPOLOGY REFRESH - Re-calculate target after unpack
@@ -5706,7 +5807,59 @@ class YabaiSpaceDetector:
             ghost_space = await self.get_ghost_display_space_async()
             if ghost_space is None:
                 logger.warning("[YABAI] 🛟 No Ghost Display available for rescue")
+                result["error"] = "ghost_display_unavailable"
                 return result
+
+        # ═══════════════════════════════════════════════════════════════════
+        # v36.0: GHOST DISPLAY AVAILABILITY VERIFICATION
+        # ═══════════════════════════════════════════════════════════════════
+        # Before starting batch teleportation, verify Ghost Display is:
+        # 1. Still available (not disconnected)
+        # 2. Not full (has capacity for more windows)
+        # 3. Responsive (can receive commands)
+        # ═══════════════════════════════════════════════════════════════════
+        try:
+            yabai_path = self._health.yabai_path or "yabai"
+            proc = await asyncio.create_subprocess_exec(
+                yabai_path, "-m", "query", "--spaces", "--space", str(ghost_space),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=3.0)
+
+            if proc.returncode != 0 or not stdout:
+                error_msg = stderr.decode().strip() if stderr else "Unknown error"
+                logger.error(
+                    f"[YABAI] ❌ Ghost Display (Space {ghost_space}) is UNAVAILABLE: {error_msg}"
+                )
+                result["error"] = "ghost_display_unavailable"
+                result["error_detail"] = error_msg
+                return result
+
+            # Check number of windows already on Ghost Display
+            import json
+            space_info = json.loads(stdout.decode())
+            existing_windows = len(space_info.get("windows", []))
+            incoming_windows = len(windows)
+
+            # Warn if Ghost Display is getting crowded (arbitrary threshold)
+            if existing_windows + incoming_windows > 50:
+                logger.warning(
+                    f"[YABAI] ⚠️ Ghost Display crowded: {existing_windows} existing + "
+                    f"{incoming_windows} incoming = {existing_windows + incoming_windows} windows"
+                )
+
+            logger.info(
+                f"[YABAI] ✅ Ghost Display (Space {ghost_space}) verified: "
+                f"{existing_windows} existing windows, adding {incoming_windows}"
+            )
+
+        except asyncio.TimeoutError:
+            logger.error(f"[YABAI] ❌ Ghost Display query timed out")
+            result["error"] = "ghost_display_timeout"
+            return result
+        except Exception as e:
+            logger.warning(f"[YABAI] ⚠️ Could not verify Ghost Display: {e} - proceeding anyway")
 
         current_space = self.get_current_user_space()
         visible_spaces = {current_space, ghost_space}
@@ -5746,7 +5899,25 @@ class YabaiSpaceDetector:
                 app_name = w.get("app_name") or w.get("app")
                 move_start = time.time()
 
-                success = await self.move_window_to_space_async(window_id, ghost_space, silent=silent)
+                # ═══════════════════════════════════════════════════════════════
+                # v36.0: RE-QUERY GHOST SPACE BEFORE EACH MOVE
+                # ═══════════════════════════════════════════════════════════════
+                # If topology was invalidated (e.g., another window unpacked
+                # fullscreen and destroyed a Space), ghost_space might be stale.
+                # Re-query to ensure we target the correct Space index.
+                # ═══════════════════════════════════════════════════════════════
+                current_ghost_space = ghost_space  # Default to captured value
+                if not self._space_topology_valid:
+                    new_ghost = self.get_ghost_display_space()
+                    if new_ghost is not None:
+                        if new_ghost != ghost_space:
+                            logger.info(
+                                f"[YABAI] 🔄 Ghost space shifted: {ghost_space} → {new_ghost} "
+                                f"(detected before moving window {window_id})"
+                            )
+                        current_ghost_space = new_ghost
+
+                success = await self.move_window_to_space_async(window_id, current_ghost_space, silent=silent)
                 duration_ms = (time.time() - move_start) * 1000
 
                 telemetry.record_attempt(
