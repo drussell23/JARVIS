@@ -165,6 +165,1067 @@ except ImportError as e:
 logger = logging.getLogger(__name__)
 
 
+# =============================================================================
+# v45.0.0: EDGE CASE RESILIENCE MANAGER
+# =============================================================================
+# Comprehensive handling for all identified edge cases:
+# 1. Permission Popups - Proactive detection & user guidance
+# 2. Chrome/YouTube Fullscreen - Intelligent detection with recovery
+# 3. Display Disconnect - Continuous monitoring with auto-recovery
+# 4. Black Screen - Cause analysis and adaptive thresholds
+# 5. System Load - GPU-aware adaptive timeouts
+# =============================================================================
+
+@dataclass
+class EdgeCaseConfig:
+    """Configuration for edge case resilience (all configurable via env vars)"""
+    # Permission monitoring
+    permission_check_interval: float = field(
+        default_factory=lambda: float(os.getenv("JARVIS_PERMISSION_CHECK_INTERVAL", "30.0"))
+    )
+    permission_popup_detection_enabled: bool = field(
+        default_factory=lambda: os.getenv("JARVIS_PERMISSION_POPUP_DETECTION", "true").lower() == "true"
+    )
+
+    # Fullscreen handling
+    fullscreen_check_interval: float = field(
+        default_factory=lambda: float(os.getenv("JARVIS_FULLSCREEN_CHECK_INTERVAL", "2.0"))
+    )
+    fullscreen_exit_wait: float = field(
+        default_factory=lambda: float(os.getenv("JARVIS_FULLSCREEN_EXIT_WAIT", "0.5"))
+    )
+    chrome_fullscreen_f11_detection: bool = field(
+        default_factory=lambda: os.getenv("JARVIS_CHROME_F11_DETECTION", "true").lower() == "true"
+    )
+    video_player_detection_enabled: bool = field(
+        default_factory=lambda: os.getenv("JARVIS_VIDEO_PLAYER_DETECTION", "true").lower() == "true"
+    )
+
+    # Display health monitoring
+    display_health_check_interval: float = field(
+        default_factory=lambda: float(os.getenv("JARVIS_DISPLAY_HEALTH_INTERVAL", "5.0"))
+    )
+    display_disconnect_recovery_enabled: bool = field(
+        default_factory=lambda: os.getenv("JARVIS_DISPLAY_RECOVERY", "true").lower() == "true"
+    )
+    display_wake_retry_count: int = field(
+        default_factory=lambda: int(os.getenv("JARVIS_DISPLAY_WAKE_RETRIES", "3"))
+    )
+
+    # Black screen detection (adaptive thresholds)
+    black_screen_brightness_threshold: float = field(
+        default_factory=lambda: float(os.getenv("JARVIS_BLACK_SCREEN_BRIGHTNESS", "0.02"))
+    )
+    black_screen_variance_threshold: float = field(
+        default_factory=lambda: float(os.getenv("JARVIS_BLACK_SCREEN_VARIANCE", "0.001"))
+    )
+    black_screen_adaptive_enabled: bool = field(
+        default_factory=lambda: os.getenv("JARVIS_BLACK_SCREEN_ADAPTIVE", "true").lower() == "true"
+    )
+    black_screen_sample_count: int = field(
+        default_factory=lambda: int(os.getenv("JARVIS_BLACK_SCREEN_SAMPLES", "10"))
+    )
+
+    # System load & GPU monitoring
+    gpu_monitoring_enabled: bool = field(
+        default_factory=lambda: os.getenv("JARVIS_GPU_MONITORING", "true").lower() == "true"
+    )
+    gpu_memory_warning_percent: float = field(
+        default_factory=lambda: float(os.getenv("JARVIS_GPU_MEM_WARNING", "80.0"))
+    )
+    gpu_utilization_warning_percent: float = field(
+        default_factory=lambda: float(os.getenv("JARVIS_GPU_UTIL_WARNING", "85.0"))
+    )
+    load_prediction_enabled: bool = field(
+        default_factory=lambda: os.getenv("JARVIS_LOAD_PREDICTION", "true").lower() == "true"
+    )
+    load_history_window: int = field(
+        default_factory=lambda: int(os.getenv("JARVIS_LOAD_HISTORY_WINDOW", "30"))
+    )
+
+    # Adaptive timeouts
+    timeout_base_multiplier: float = field(
+        default_factory=lambda: float(os.getenv("JARVIS_TIMEOUT_BASE_MULTIPLIER", "1.0"))
+    )
+    timeout_max_multiplier: float = field(
+        default_factory=lambda: float(os.getenv("JARVIS_TIMEOUT_MAX_MULTIPLIER", "3.0"))
+    )
+    timeout_progressive_backoff: bool = field(
+        default_factory=lambda: os.getenv("JARVIS_TIMEOUT_PROGRESSIVE", "true").lower() == "true"
+    )
+
+
+class EdgeCaseType(Enum):
+    """Types of edge cases that can be detected"""
+    PERMISSION_POPUP = "permission_popup"
+    PERMISSION_DENIED = "permission_denied"
+    CHROME_F11_FULLSCREEN = "chrome_f11_fullscreen"
+    YOUTUBE_FULLSCREEN = "youtube_fullscreen"
+    VIDEO_PLAYER_FULLSCREEN = "video_player_fullscreen"
+    DISPLAY_DISCONNECTED = "display_disconnected"
+    DISPLAY_SLEEPING = "display_sleeping"
+    BLACK_SCREEN_DISPLAY_OFF = "black_screen_display_off"
+    BLACK_SCREEN_SCREENSAVER = "black_screen_screensaver"
+    BLACK_SCREEN_VIDEO_CONTENT = "black_screen_video_content"
+    BLACK_SCREEN_TRANSITION = "black_screen_transition"
+    SYSTEM_HEAVY_LOAD = "system_heavy_load"
+    GPU_MEMORY_PRESSURE = "gpu_memory_pressure"
+    NETWORK_LATENCY = "network_latency"
+
+
+@dataclass
+class EdgeCaseEvent:
+    """Represents a detected edge case event"""
+    edge_case_type: EdgeCaseType
+    timestamp: datetime
+    severity: str  # "low", "medium", "high", "critical"
+    details: Dict[str, Any]
+    recovery_action: Optional[str] = None
+    auto_recovered: bool = False
+
+
+class EdgeCaseResilienceManager:
+    """
+    v45.0.0: Comprehensive edge case handler with proactive detection and recovery.
+
+    This manager continuously monitors for edge cases and implements intelligent
+    recovery strategies without blocking the main event loop.
+
+    Features:
+    - Proactive permission popup detection
+    - Chrome F11 / YouTube fullscreen detection with recovery
+    - Display disconnect monitoring with auto-wake
+    - Adaptive black screen detection with cause analysis
+    - GPU-aware adaptive timeout system
+    - Load prediction for proactive throttling
+    """
+
+    _instance: Optional["EdgeCaseResilienceManager"] = None
+    _lock = threading.Lock()
+
+    def __new__(cls, *args, **kwargs):
+        """Singleton pattern for global edge case management"""
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = super().__new__(cls)
+                cls._instance._initialized = False
+            return cls._instance
+
+    def __init__(self, config: Optional[EdgeCaseConfig] = None):
+        if self._initialized:
+            return
+        self._initialized = True
+
+        self.config = config or EdgeCaseConfig()
+        self._monitoring_active = False
+        self._monitoring_task: Optional[asyncio.Task] = None
+
+        # State tracking
+        self._permission_state: Dict[str, bool] = {}
+        self._fullscreen_state: Dict[str, Dict[str, Any]] = {}
+        self._display_state: Dict[int, Dict[str, Any]] = {}
+        self._brightness_history: List[float] = []
+        self._load_history: List[Dict[str, float]] = []
+
+        # Event log (circular buffer)
+        self._event_log: List[EdgeCaseEvent] = []
+        self._max_events = 100
+
+        # Recovery callbacks
+        self._recovery_callbacks: Dict[EdgeCaseType, List[Callable]] = {}
+
+        # Adaptive thresholds
+        self._adaptive_brightness_threshold = self.config.black_screen_brightness_threshold
+        self._adaptive_variance_threshold = self.config.black_screen_variance_threshold
+        self._current_timeout_multiplier = self.config.timeout_base_multiplier
+
+        logger.info("[EDGE-CASE] v45.0.0 EdgeCaseResilienceManager initialized")
+
+    # =========================================================================
+    # PERMISSION POPUP DETECTION & HANDLING
+    # =========================================================================
+
+    async def check_permissions_proactively(self) -> Dict[str, Any]:
+        """
+        Proactively check all required permissions and detect pending popups.
+
+        Returns:
+            Dict with permission status and any detected issues
+        """
+        result = {
+            "all_granted": True,
+            "permissions": {},
+            "pending_popups": [],
+            "recommendations": []
+        }
+
+        try:
+            # Check Screen Recording permission
+            screen_recording = await self._check_screen_recording_permission()
+            result["permissions"]["screen_recording"] = screen_recording
+            if not screen_recording["granted"]:
+                result["all_granted"] = False
+                if screen_recording.get("popup_pending"):
+                    result["pending_popups"].append("Screen Recording")
+                result["recommendations"].append(
+                    "Grant Screen Recording: System Settings → Privacy & Security → Screen Recording"
+                )
+
+            # Check Accessibility permission (for yabai)
+            accessibility = await self._check_accessibility_permission()
+            result["permissions"]["accessibility"] = accessibility
+            if not accessibility["granted"]:
+                result["all_granted"] = False
+                if accessibility.get("popup_pending"):
+                    result["pending_popups"].append("Accessibility")
+                result["recommendations"].append(
+                    "Grant Accessibility: System Settings → Privacy & Security → Accessibility"
+                )
+
+            # Check Automation permission (for AppleScript)
+            automation = await self._check_automation_permission()
+            result["permissions"]["automation"] = automation
+            if not automation["granted"]:
+                # Automation is less critical - just a warning
+                result["recommendations"].append(
+                    "Grant Automation: Allow JARVIS to control other apps when prompted"
+                )
+
+            # Log any pending popups
+            if result["pending_popups"]:
+                self._log_edge_case(
+                    EdgeCaseType.PERMISSION_POPUP,
+                    "high",
+                    {"pending": result["pending_popups"]},
+                    "User action required"
+                )
+
+        except Exception as e:
+            logger.error(f"[EDGE-CASE] Permission check failed: {e}")
+            result["error"] = str(e)
+
+        return result
+
+    async def _check_screen_recording_permission(self) -> Dict[str, Any]:
+        """Check if screen recording permission is granted."""
+        try:
+            import Quartz
+
+            # Try to capture a tiny screenshot - will fail if not permitted
+            rect = Quartz.CGRectMake(0, 0, 1, 1)
+            image = Quartz.CGWindowListCreateImage(
+                rect,
+                Quartz.kCGWindowListOptionOnScreenOnly,
+                Quartz.kCGNullWindowID,
+                Quartz.kCGWindowImageDefault
+            )
+
+            if image is None:
+                # Check if there's a pending popup by looking for system dialogs
+                popup_pending = await self._detect_permission_popup("Screen Recording")
+                return {
+                    "granted": False,
+                    "popup_pending": popup_pending,
+                    "check_method": "CGWindowListCreateImage"
+                }
+
+            return {"granted": True, "check_method": "CGWindowListCreateImage"}
+
+        except Exception as e:
+            return {"granted": False, "error": str(e)}
+
+    async def _check_accessibility_permission(self) -> Dict[str, Any]:
+        """Check if accessibility permission is granted."""
+        try:
+            import Quartz
+
+            # AXIsProcessTrusted returns True if accessibility is granted
+            is_trusted = Quartz.AXIsProcessTrusted()
+
+            if not is_trusted:
+                popup_pending = await self._detect_permission_popup("Accessibility")
+                return {
+                    "granted": False,
+                    "popup_pending": popup_pending,
+                    "check_method": "AXIsProcessTrusted"
+                }
+
+            return {"granted": True, "check_method": "AXIsProcessTrusted"}
+
+        except Exception as e:
+            return {"granted": False, "error": str(e)}
+
+    async def _check_automation_permission(self) -> Dict[str, Any]:
+        """Check if automation permission is granted."""
+        try:
+            # Try a simple AppleScript to check System Events access
+            proc = await asyncio.create_subprocess_exec(
+                "osascript", "-e",
+                'tell application "System Events" to return name of first process',
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=2.0)
+
+            if proc.returncode != 0 or b"not allowed" in stderr.lower():
+                return {"granted": False, "check_method": "osascript"}
+
+            return {"granted": True, "check_method": "osascript"}
+
+        except asyncio.TimeoutError:
+            return {"granted": False, "error": "timeout"}
+        except Exception as e:
+            return {"granted": False, "error": str(e)}
+
+    async def _detect_permission_popup(self, permission_type: str) -> bool:
+        """Detect if a permission popup is currently visible."""
+        try:
+            # Use osascript to check for System Preferences dialogs
+            script = '''
+            tell application "System Events"
+                set dialogWindows to every window of every process whose subrole is "AXSystemDialog"
+                return count of dialogWindows
+            end tell
+            '''
+            proc = await asyncio.create_subprocess_exec(
+                "osascript", "-e", script,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=2.0)
+
+            dialog_count = int(stdout.decode().strip()) if stdout else 0
+            return dialog_count > 0
+
+        except Exception:
+            return False  # Can't detect, assume no popup
+
+    # =========================================================================
+    # FULLSCREEN DETECTION & HANDLING
+    # =========================================================================
+
+    async def detect_fullscreen_state(self, app_name: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Detect fullscreen state for all apps or a specific app.
+
+        Handles:
+        - Chrome F11 fullscreen (different from native macOS fullscreen)
+        - YouTube fullscreen player
+        - Native macOS fullscreen
+        """
+        result = {
+            "any_fullscreen": False,
+            "fullscreen_apps": [],
+            "video_fullscreen": False,
+            "details": {}
+        }
+
+        try:
+            # Get window list with bounds
+            windows_data = await self._get_all_windows_async()
+
+            for window in windows_data:
+                window_app = window.get("app", "")
+                is_fullscreen = window.get("is-native-fullscreen", False)
+                bounds = window.get("bounds", {})
+
+                # Check for F11-style fullscreen (fills screen but not native fullscreen)
+                is_f11_fullscreen = await self._detect_f11_fullscreen(window, bounds)
+
+                # Check for video player fullscreen
+                is_video_fullscreen = await self._detect_video_player_fullscreen(window)
+
+                if is_fullscreen or is_f11_fullscreen or is_video_fullscreen:
+                    result["any_fullscreen"] = True
+                    fullscreen_info = {
+                        "app": window_app,
+                        "window_id": window.get("id"),
+                        "type": "native" if is_fullscreen else ("f11" if is_f11_fullscreen else "video"),
+                        "can_recover": True
+                    }
+                    result["fullscreen_apps"].append(fullscreen_info)
+                    result["details"][window_app] = fullscreen_info
+
+                    if is_video_fullscreen:
+                        result["video_fullscreen"] = True
+
+                # Filter by app if specified
+                if app_name and window_app.lower() != app_name.lower():
+                    continue
+
+            # Log if Chrome F11 detected
+            chrome_f11 = [a for a in result["fullscreen_apps"] if a["app"] == "Google Chrome" and a["type"] == "f11"]
+            if chrome_f11:
+                self._log_edge_case(
+                    EdgeCaseType.CHROME_F11_FULLSCREEN,
+                    "medium",
+                    {"windows": chrome_f11},
+                    "Will exit F11 before capture"
+                )
+
+        except Exception as e:
+            logger.error(f"[EDGE-CASE] Fullscreen detection failed: {e}")
+            result["error"] = str(e)
+
+        return result
+
+    async def _detect_f11_fullscreen(self, window: Dict, bounds: Dict) -> bool:
+        """
+        Detect F11-style fullscreen (fills screen but not native fullscreen).
+
+        Chrome F11 fullscreen:
+        - Window fills entire screen
+        - is-native-fullscreen = False
+        - No title bar or menu bar
+        """
+        if window.get("is-native-fullscreen", False):
+            return False  # Native fullscreen, not F11
+
+        try:
+            import Quartz
+
+            # Get main screen size
+            main_display = Quartz.CGMainDisplayID()
+            screen_bounds = Quartz.CGDisplayBounds(main_display)
+            screen_width = screen_bounds.size.width
+            screen_height = screen_bounds.size.height
+
+            # Check if window fills screen (within 5% tolerance)
+            window_width = bounds.get("w", 0) or bounds.get("width", 0)
+            window_height = bounds.get("h", 0) or bounds.get("height", 0)
+
+            width_fill = window_width / screen_width if screen_width > 0 else 0
+            height_fill = window_height / screen_height if screen_height > 0 else 0
+
+            # F11 fullscreen fills > 95% of screen
+            if width_fill >= 0.95 and height_fill >= 0.95:
+                # Also check if window is at (0,0) or near it
+                x = bounds.get("x", 0)
+                y = bounds.get("y", 0)
+                if abs(x) < 10 and abs(y) < 50:  # Allow for menu bar offset
+                    return True
+
+        except Exception as e:
+            logger.debug(f"[EDGE-CASE] F11 detection error: {e}")
+
+        return False
+
+    async def _detect_video_player_fullscreen(self, window: Dict) -> bool:
+        """Detect if a video player is in fullscreen mode."""
+        app_name = window.get("app", "").lower()
+        title = window.get("title", "").lower()
+
+        # Known video player indicators
+        video_apps = ["youtube", "netflix", "hulu", "disney+", "prime video", "vlc", "iina", "quicktime"]
+        video_titles = ["youtube", "netflix", "hulu", "disney+", "prime video", "watching", "playing"]
+
+        # Check app name
+        for video_app in video_apps:
+            if video_app in app_name:
+                # Check if fullscreen
+                if window.get("is-native-fullscreen", False):
+                    return True
+
+        # Check title for video indicators in browsers
+        if app_name in ["google chrome", "safari", "firefox", "arc"]:
+            for video_title in video_titles:
+                if video_title in title:
+                    # Could be a video - check if fullscreen
+                    if window.get("is-native-fullscreen", False):
+                        return True
+
+        return False
+
+    async def exit_fullscreen_safely(self, window_id: int, app_name: str) -> bool:
+        """
+        Safely exit fullscreen with proper wait time for render.
+
+        Args:
+            window_id: ID of the window to exit fullscreen
+            app_name: Name of the application
+
+        Returns:
+            True if successfully exited fullscreen
+        """
+        try:
+            # Use AppleScript to exit fullscreen
+            script = f'''
+            tell application "{app_name}"
+                activate
+            end tell
+
+            delay 0.2
+
+            tell application "System Events"
+                tell process "{app_name}"
+                    set frontmost to true
+                    -- Try Escape first (for F11 fullscreen)
+                    key code 53
+                    delay 0.3
+                    -- If still fullscreen, try Cmd+Ctrl+F (native fullscreen toggle)
+                    if exists (first window whose value of attribute "AXFullScreen" is true) then
+                        keystroke "f" using {{command down, control down}}
+                    end if
+                end tell
+            end tell
+            '''
+
+            proc = await asyncio.create_subprocess_exec(
+                "osascript", "-e", script,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            await asyncio.wait_for(proc.communicate(), timeout=5.0)
+
+            # Wait for fullscreen exit animation
+            await asyncio.sleep(self.config.fullscreen_exit_wait)
+
+            logger.info(f"[EDGE-CASE] Exited fullscreen for {app_name}")
+            return True
+
+        except Exception as e:
+            logger.error(f"[EDGE-CASE] Failed to exit fullscreen for {app_name}: {e}")
+            return False
+
+    # =========================================================================
+    # DISPLAY DISCONNECT DETECTION & RECOVERY
+    # =========================================================================
+
+    async def monitor_display_health(self) -> Dict[str, Any]:
+        """
+        Continuously monitor display health and detect disconnects.
+
+        Returns:
+            Dict with display health status for all displays
+        """
+        result = {
+            "displays": {},
+            "any_disconnected": False,
+            "any_sleeping": False,
+            "recovery_attempted": False
+        }
+
+        try:
+            import Quartz
+
+            # Get active displays using PyObjC-compatible call
+            # CGGetActiveDisplayList returns (error, display_ids, count)
+            max_displays = 16
+            error, display_ids, display_count = Quartz.CGGetActiveDisplayList(max_displays, None, None)
+
+            if error != 0 or display_ids is None:
+                logger.warning(f"[EDGE-CASE] CGGetActiveDisplayList failed with error {error}")
+                return result
+
+            active_display_ids = set(display_ids)
+
+            # Check each known display
+            for display_id, state in list(self._display_state.items()):
+                if display_id not in active_display_ids:
+                    # Display disconnected
+                    result["displays"][display_id] = {
+                        "status": "disconnected",
+                        "last_seen": state.get("last_seen"),
+                        "name": state.get("name", f"Display {display_id}")
+                    }
+                    result["any_disconnected"] = True
+
+                    self._log_edge_case(
+                        EdgeCaseType.DISPLAY_DISCONNECTED,
+                        "high",
+                        {"display_id": display_id, "name": state.get("name")},
+                        "Attempting reconnection"
+                    )
+
+            # Update state for active displays
+            for display_id in display_ids:
+                bounds = Quartz.CGDisplayBounds(display_id)
+                is_main = Quartz.CGDisplayIsMain(display_id)
+                is_sleeping = not Quartz.CGDisplayIsActive(display_id)
+
+                self._display_state[display_id] = {
+                    "last_seen": datetime.now(),
+                    "is_main": is_main,
+                    "is_sleeping": is_sleeping,
+                    "width": bounds.size.width,
+                    "height": bounds.size.height,
+                    "name": f"Display {display_id}" + (" (Main)" if is_main else "")
+                }
+
+                result["displays"][display_id] = {
+                    "status": "sleeping" if is_sleeping else "active",
+                    "is_main": is_main,
+                    "resolution": f"{int(bounds.size.width)}x{int(bounds.size.height)}"
+                }
+
+                if is_sleeping:
+                    result["any_sleeping"] = True
+
+            # Attempt recovery if needed
+            if result["any_sleeping"] and self.config.display_disconnect_recovery_enabled:
+                recovered = await self._attempt_display_recovery()
+                result["recovery_attempted"] = True
+                result["recovery_success"] = recovered
+
+        except Exception as e:
+            logger.error(f"[EDGE-CASE] Display health check failed: {e}")
+            result["error"] = str(e)
+
+        return result
+
+    async def _attempt_display_recovery(self) -> bool:
+        """Attempt to wake sleeping displays."""
+        for attempt in range(self.config.display_wake_retry_count):
+            try:
+                # Method 1: caffeinate user activity assertion
+                proc = await asyncio.create_subprocess_exec(
+                    "caffeinate", "-u", "-t", "1",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                await asyncio.wait_for(proc.communicate(), timeout=2.0)
+
+                await asyncio.sleep(0.5)
+
+                # Check if display woke up
+                import Quartz
+                main_display = Quartz.CGMainDisplayID()
+                if Quartz.CGDisplayIsActive(main_display):
+                    logger.info(f"[EDGE-CASE] Display woken on attempt {attempt + 1}")
+                    return True
+
+                # Method 2: Send key event (fallback)
+                proc = await asyncio.create_subprocess_exec(
+                    "osascript", "-e",
+                    'tell application "System Events" to key code 124',  # Right arrow
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                await asyncio.wait_for(proc.communicate(), timeout=2.0)
+
+                await asyncio.sleep(0.5)
+
+                if Quartz.CGDisplayIsActive(main_display):
+                    logger.info(f"[EDGE-CASE] Display woken via key event on attempt {attempt + 1}")
+                    return True
+
+            except Exception as e:
+                logger.warning(f"[EDGE-CASE] Display wake attempt {attempt + 1} failed: {e}")
+
+        return False
+
+    # =========================================================================
+    # BLACK SCREEN DETECTION WITH CAUSE ANALYSIS
+    # =========================================================================
+
+    async def analyze_black_screen(self, frame: np.ndarray) -> Dict[str, Any]:
+        """
+        Analyze a frame to detect black screen and determine cause.
+
+        Uses adaptive thresholds and historical brightness data.
+
+        Returns:
+            Dict with black screen analysis including cause
+        """
+        result = {
+            "is_black_screen": False,
+            "cause": None,
+            "confidence": 0.0,
+            "brightness": 0.0,
+            "variance": 0.0,
+            "recovery_action": None
+        }
+
+        try:
+            # Convert to grayscale if needed
+            if len(frame.shape) == 3:
+                gray = np.mean(frame, axis=2)
+            else:
+                gray = frame
+
+            # Calculate brightness (0-1 scale)
+            brightness = np.mean(gray) / 255.0
+            variance = np.var(gray) / (255.0 * 255.0)
+
+            result["brightness"] = brightness
+            result["variance"] = variance
+
+            # Update brightness history for adaptive threshold
+            self._brightness_history.append(brightness)
+            if len(self._brightness_history) > self.config.black_screen_sample_count:
+                self._brightness_history.pop(0)
+
+            # Adapt thresholds based on history
+            if self.config.black_screen_adaptive_enabled and len(self._brightness_history) >= 5:
+                self._update_adaptive_thresholds()
+
+            # Check against thresholds
+            if brightness < self._adaptive_brightness_threshold and variance < self._adaptive_variance_threshold:
+                result["is_black_screen"] = True
+
+                # Determine cause
+                cause, confidence, action = await self._determine_black_screen_cause(brightness, variance)
+                result["cause"] = cause
+                result["confidence"] = confidence
+                result["recovery_action"] = action
+
+                # Map cause string to EdgeCaseType safely
+                cause_to_type = {
+                    "display_sleeping": EdgeCaseType.DISPLAY_SLEEPING,
+                    "display_disconnected": EdgeCaseType.DISPLAY_DISCONNECTED,
+                    "screensaver_active": EdgeCaseType.BLACK_SCREEN_SCREENSAVER,
+                    "video_fullscreen": EdgeCaseType.BLACK_SCREEN_VIDEO_CONTENT,
+                    "fullscreen_transition": EdgeCaseType.BLACK_SCREEN_TRANSITION,
+                    "unknown": EdgeCaseType.BLACK_SCREEN_DISPLAY_OFF,
+                }
+                edge_type = cause_to_type.get(cause, EdgeCaseType.BLACK_SCREEN_DISPLAY_OFF)
+
+                self._log_edge_case(
+                    edge_type,
+                    "medium" if confidence < 0.8 else "high",
+                    {"brightness": brightness, "variance": variance, "cause": cause},
+                    action
+                )
+
+        except Exception as e:
+            logger.error(f"[EDGE-CASE] Black screen analysis failed: {e}")
+            result["error"] = str(e)
+
+        return result
+
+    def _update_adaptive_thresholds(self):
+        """Update thresholds based on brightness history."""
+        if not self._brightness_history:
+            return
+
+        # Calculate baseline from non-black frames
+        non_black = [b for b in self._brightness_history if b > 0.05]
+
+        if len(non_black) >= 3:
+            avg_brightness = sum(non_black) / len(non_black)
+            # Set threshold to 10% of average brightness or default, whichever is lower
+            self._adaptive_brightness_threshold = min(
+                avg_brightness * 0.1,
+                self.config.black_screen_brightness_threshold
+            )
+
+    async def _determine_black_screen_cause(
+        self, brightness: float, variance: float
+    ) -> Tuple[str, float, str]:
+        """
+        Determine the cause of a black screen.
+
+        Returns:
+            Tuple of (cause, confidence, recovery_action)
+        """
+        # Check display state
+        display_health = await self.monitor_display_health()
+
+        if display_health.get("any_sleeping"):
+            return ("display_sleeping", 0.95, "Wake display with caffeinate")
+
+        if display_health.get("any_disconnected"):
+            return ("display_disconnected", 0.90, "Reconnect display or use fallback")
+
+        # Check for screensaver
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "osascript", "-e",
+                'tell application "System Events" to return (running of screen saver preferences)',
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=2.0)
+            if b"true" in stdout.lower():
+                return ("screensaver_active", 0.85, "Dismiss screensaver with key event")
+        except Exception:
+            pass
+
+        # Check for fullscreen video
+        fullscreen_state = await self.detect_fullscreen_state()
+        if fullscreen_state.get("video_fullscreen"):
+            return ("video_fullscreen", 0.80, "Black frame from video content")
+
+        # Check for fullscreen transition
+        if variance < 0.0001:  # Perfectly uniform = likely transition
+            return ("fullscreen_transition", 0.70, "Wait for transition to complete")
+
+        # Default: unknown cause
+        return ("unknown", 0.50, "Retry capture or use fallback method")
+
+    # =========================================================================
+    # SYSTEM LOAD & GPU-AWARE ADAPTIVE TIMEOUTS
+    # =========================================================================
+
+    async def get_system_load_status(self) -> Dict[str, Any]:
+        """
+        Get comprehensive system load including GPU metrics.
+
+        Returns:
+            Dict with CPU, memory, GPU status and recommended timeout multiplier
+        """
+        result = {
+            "cpu_percent": 0.0,
+            "memory_percent": 0.0,
+            "gpu_utilization": None,
+            "gpu_memory_percent": None,
+            "load_level": "normal",
+            "timeout_multiplier": 1.0,
+            "predicted_load": None
+        }
+
+        try:
+            # CPU load
+            cpu_percent = psutil.cpu_percent(interval=0.1)
+            result["cpu_percent"] = cpu_percent
+
+            # Memory load
+            memory = psutil.virtual_memory()
+            result["memory_percent"] = memory.percent
+
+            # GPU metrics (macOS-specific)
+            if self.config.gpu_monitoring_enabled:
+                gpu_metrics = await self._get_gpu_metrics()
+                result["gpu_utilization"] = gpu_metrics.get("utilization")
+                result["gpu_memory_percent"] = gpu_metrics.get("memory_percent")
+
+            # Record in history for prediction
+            self._load_history.append({
+                "timestamp": datetime.now(),
+                "cpu": cpu_percent,
+                "memory": memory.percent,
+                "gpu": result.get("gpu_utilization", 0)
+            })
+            if len(self._load_history) > self.config.load_history_window:
+                self._load_history.pop(0)
+
+            # Determine load level
+            max_load = max(
+                cpu_percent,
+                memory.percent,
+                result.get("gpu_utilization") or 0
+            )
+
+            if max_load >= 95:
+                result["load_level"] = "critical"
+                result["timeout_multiplier"] = self.config.timeout_max_multiplier
+            elif max_load >= 85:
+                result["load_level"] = "heavy"
+                result["timeout_multiplier"] = 2.0
+            elif max_load >= 70:
+                result["load_level"] = "moderate"
+                result["timeout_multiplier"] = 1.5
+            elif max_load >= 50:
+                result["load_level"] = "light"
+                result["timeout_multiplier"] = 1.2
+            else:
+                result["load_level"] = "normal"
+                result["timeout_multiplier"] = 1.0
+
+            # Predict future load if enabled
+            if self.config.load_prediction_enabled and len(self._load_history) >= 5:
+                result["predicted_load"] = self._predict_load_trend()
+
+            # Update global timeout multiplier
+            self._current_timeout_multiplier = result["timeout_multiplier"]
+
+            # Log if high load detected
+            if result["load_level"] in ["heavy", "critical"]:
+                self._log_edge_case(
+                    EdgeCaseType.SYSTEM_HEAVY_LOAD,
+                    "high" if result["load_level"] == "critical" else "medium",
+                    {"cpu": cpu_percent, "memory": memory.percent, "gpu": result.get("gpu_utilization")},
+                    f"Timeout multiplier increased to {result['timeout_multiplier']}x"
+                )
+
+        except Exception as e:
+            logger.error(f"[EDGE-CASE] System load check failed: {e}")
+            result["error"] = str(e)
+
+        return result
+
+    async def _get_gpu_metrics(self) -> Dict[str, float]:
+        """Get GPU utilization and memory on macOS."""
+        result = {}
+
+        try:
+            # Use powermetrics for GPU info (requires sudo, may not be available)
+            # Fallback: Use ioreg for basic GPU info
+            proc = await asyncio.create_subprocess_exec(
+                "ioreg", "-r", "-c", "IOAccelerator",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=2.0)
+
+            output = stdout.decode()
+
+            # Parse GPU utilization (approximate from device utilization)
+            if "Device Utilization" in output:
+                # Extract percentage (format varies)
+                import re
+                match = re.search(r'"Device Utilization[^"]*"[^0-9]*(\d+)', output)
+                if match:
+                    result["utilization"] = float(match.group(1))
+
+            # Parse VRAM usage
+            if "VRAM" in output or "In Use" in output:
+                match = re.search(r'(?:VRAM|In Use)[^0-9]*(\d+)', output)
+                if match:
+                    # Assume VRAM total and calculate percent
+                    vram_used = int(match.group(1))
+                    # Approximate VRAM total (can be refined with actual device query)
+                    vram_total = 8192  # Default 8GB, adjust based on device
+                    result["memory_percent"] = (vram_used / vram_total) * 100
+
+        except Exception as e:
+            logger.debug(f"[EDGE-CASE] GPU metrics unavailable: {e}")
+
+        return result
+
+    def _predict_load_trend(self) -> str:
+        """Predict if load is trending up, down, or stable."""
+        if len(self._load_history) < 5:
+            return "unknown"
+
+        recent = self._load_history[-5:]
+        cpu_trend = recent[-1]["cpu"] - recent[0]["cpu"]
+
+        if cpu_trend > 10:
+            return "increasing"
+        elif cpu_trend < -10:
+            return "decreasing"
+        else:
+            return "stable"
+
+    def get_adaptive_timeout(self, base_timeout: float) -> float:
+        """
+        Get an adaptive timeout based on current system load.
+
+        Args:
+            base_timeout: Base timeout value in seconds
+
+        Returns:
+            Adjusted timeout value
+        """
+        if self.config.timeout_progressive_backoff:
+            return base_timeout * self._current_timeout_multiplier
+        return base_timeout
+
+    # =========================================================================
+    # HELPER METHODS
+    # =========================================================================
+
+    async def _get_all_windows_async(self) -> List[Dict]:
+        """Get all windows asynchronously via yabai."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "yabai", "-m", "query", "--windows",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=2.0)
+
+            if proc.returncode == 0:
+                return json.loads(stdout.decode())
+
+        except Exception as e:
+            logger.debug(f"[EDGE-CASE] Window query failed: {e}")
+
+        return []
+
+    def _log_edge_case(
+        self,
+        edge_case_type: EdgeCaseType,
+        severity: str,
+        details: Dict[str, Any],
+        recovery_action: Optional[str] = None
+    ):
+        """Log an edge case event."""
+        event = EdgeCaseEvent(
+            edge_case_type=edge_case_type,
+            timestamp=datetime.now(),
+            severity=severity,
+            details=details,
+            recovery_action=recovery_action
+        )
+
+        self._event_log.append(event)
+        if len(self._event_log) > self._max_events:
+            self._event_log.pop(0)
+
+        logger.info(
+            f"[EDGE-CASE] {edge_case_type.value} ({severity}): "
+            f"{details} → {recovery_action or 'no action'}"
+        )
+
+    def get_recent_events(self, count: int = 10) -> List[Dict[str, Any]]:
+        """Get recent edge case events."""
+        return [
+            {
+                "type": e.edge_case_type.value,
+                "timestamp": e.timestamp.isoformat(),
+                "severity": e.severity,
+                "details": e.details,
+                "recovery": e.recovery_action,
+                "auto_recovered": e.auto_recovered
+            }
+            for e in self._event_log[-count:]
+        ]
+
+    # =========================================================================
+    # BACKGROUND MONITORING
+    # =========================================================================
+
+    async def start_monitoring(self):
+        """Start background edge case monitoring."""
+        if self._monitoring_active:
+            return
+
+        self._monitoring_active = True
+        self._monitoring_task = asyncio.create_task(self._monitoring_loop())
+        logger.info("[EDGE-CASE] Background monitoring started")
+
+    async def stop_monitoring(self):
+        """Stop background edge case monitoring."""
+        self._monitoring_active = False
+        if self._monitoring_task:
+            self._monitoring_task.cancel()
+            try:
+                await self._monitoring_task
+            except asyncio.CancelledError:
+                pass
+        logger.info("[EDGE-CASE] Background monitoring stopped")
+
+    async def _monitoring_loop(self):
+        """Background loop for continuous edge case monitoring."""
+        while self._monitoring_active:
+            try:
+                # Check permissions periodically
+                if self.config.permission_popup_detection_enabled:
+                    await self.check_permissions_proactively()
+
+                # Check display health
+                await self.monitor_display_health()
+
+                # Check system load
+                await self.get_system_load_status()
+
+                # Sleep until next check
+                await asyncio.sleep(self.config.display_health_check_interval)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"[EDGE-CASE] Monitoring loop error: {e}")
+                await asyncio.sleep(5.0)
+
+
+def get_edge_case_manager() -> EdgeCaseResilienceManager:
+    """Get the singleton EdgeCaseResilienceManager instance."""
+    return EdgeCaseResilienceManager()
+
+
 class CaptureMethod(Enum):
     """Available capture methods in priority order"""
     SCREENCAPTUREKIT = "screencapturekit"  # For VideoWatcher window-specific capture (Ferrari Engine)
