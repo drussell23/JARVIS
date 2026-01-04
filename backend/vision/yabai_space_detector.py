@@ -4517,15 +4517,50 @@ class YabaiSpaceDetector:
                     f"[YABAI v44.0] 🎯 STATE CONVERGENCE COMPLETE: "
                     f"Window {window_id} is stable and ready for teleportation"
                 )
-                # Store the converged info for the caller to use
+                # v44.1: Use per-window dictionary to avoid race conditions
+                # Multiple windows can be processed in parallel
+                if not hasattr(self, '_converged_window_states'):
+                    self._converged_window_states = {}
+                self._converged_window_states[window_id] = converged_window_info
+                # Keep legacy for backwards compatibility
                 self._last_converged_window_info = converged_window_info
             else:
+                # v44.1: GRACEFUL DEGRADATION - Even on timeout, query FRESH state
+                # The window might have converged but we missed the exact moment
                 logger.warning(
                     f"[YABAI v44.0] ⚠️ CONVERGENCE TIMEOUT: Window {window_id} did not settle "
                     f"after 2.0s. Drift detected: {drift_detected}. "
-                    f"Proceeding with caution (window may still be animating)."
+                    f"Querying final state for graceful degradation..."
                 )
-                self._last_converged_window_info = None
+                
+                # v44.1: One more query to get best-effort current state
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        yabai_path, "-m", "query", "--windows", "--window", str(window_id),
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    )
+                    stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=2.0)
+                    if proc.returncode == 0 and stdout:
+                        final_state = json.loads(stdout.decode())
+                        final_space = final_state.get('space')
+                        final_fullscreen = final_state.get('is-native-fullscreen', False)
+                        
+                        logger.info(
+                            f"[YABAI v44.1] 📍 GRACEFUL STATE: Window {window_id} on Space {final_space}, "
+                            f"fullscreen={final_fullscreen}"
+                        )
+                        
+                        # Store even partial info - better than nothing
+                        if not hasattr(self, '_converged_window_states'):
+                            self._converged_window_states = {}
+                        self._converged_window_states[window_id] = final_state
+                        self._last_converged_window_info = final_state
+                    else:
+                        self._last_converged_window_info = None
+                except Exception as e:
+                    logger.debug(f"[YABAI v44.1] Graceful state query failed: {e}")
+                    self._last_converged_window_info = None
         
         # Always return True - we never want to block the move operation
         # Even if convergence wasn't perfect, the window might still be movable
@@ -5565,36 +5600,63 @@ class YabaiSpaceDetector:
                 await asyncio.sleep(0.3)
         
         # ═══════════════════════════════════════════════════════════════════════
-        # v44.0: STATE CONVERGENCE RECOVERY (Replaces Nuclear Fallback)
+        # v44.1: STATE CONVERGENCE RECOVERY (Enhanced)
         # ═══════════════════════════════════════════════════════════════════════
         # We don't brute force. We ANALYZE.
         # 
-        # If all strategies failed, check if we have converged window info.
-        # The State Convergence Protocol may have detected topology drift.
-        # If so, the window is now on a DIFFERENT space than we originally thought.
-        # Issue one final move using the CORRECT current coordinates.
+        # ENHANCEMENTS (v44.1):
+        # - Per-window state tracking to avoid race conditions
+        # - Re-query Ghost Display after topology drift (indices can shift!)
+        # - Graceful fallback if no converged state available
         # ═══════════════════════════════════════════════════════════════════════
         
-        converged_info = getattr(self, '_last_converged_window_info', None)
+        # v44.1: Use per-window state dictionary (race-condition safe)
+        converged_states = getattr(self, '_converged_window_states', {})
+        converged_info = converged_states.get(window_id) or getattr(self, '_last_converged_window_info', None)
         
         if converged_info:
             converged_space = converged_info.get('space')
             converged_display = converged_info.get('display')
             
+            # v44.1: RE-QUERY GHOST DISPLAY - Topology may have shifted!
+            # After fullscreen exit, space indices change. Our original target_space
+            # and target_display may now be incorrect.
             logger.info(
-                f"[YABAI v44.0] 🔄 STATE CONVERGENCE RECOVERY: Window {window_id} "
+                f"[YABAI v44.1] 🔄 STATE CONVERGENCE RECOVERY: Window {window_id} "
                 f"drifted to Space {converged_space} (Display {converged_display}). "
-                f"Re-attempting move from NEW coordinates..."
+                f"Re-querying Ghost Display (topology may have shifted)..."
             )
             
+            # Re-query the Ghost Display to get FRESH target coordinates
+            fresh_target_display = None
+            fresh_target_space = None
+            try:
+                fresh_ghost_space = self.get_ghost_display_space()
+                if fresh_ghost_space:
+                    fresh_target_space = fresh_ghost_space
+                    fresh_target_display = await get_space_display(fresh_ghost_space)
+                    if fresh_target_space != target_space:
+                        logger.info(
+                            f"[YABAI v44.1] 🌊 TOPOLOGY SHIFT DETECTED: Ghost Display moved "
+                            f"Space {target_space} → {fresh_target_space}"
+                        )
+            except Exception as e:
+                logger.debug(f"[YABAI v44.1] Ghost Display re-query failed: {e}")
+            
+            # Use fresh targets if available, otherwise fall back to original
+            recovery_target_space = fresh_target_space or target_space
+            recovery_target_display = fresh_target_display or target_display
+            
             # Only retry if the window is NOT already on target
-            if converged_space != target_space:
+            if converged_space != recovery_target_space:
                 try:
-                    # Use Display Handoff with the CORRECT current display info
-                    if converged_display != target_display and target_display is not None:
-                        # Cross-display from current position
+                    # Use Display Handoff with the CORRECT (fresh) target
+                    if converged_display != recovery_target_display and recovery_target_display is not None:
+                        logger.info(
+                            f"[YABAI v44.1] 🚀 Recovery move: Window {window_id} → Display {recovery_target_display}"
+                        )
                         proc = await asyncio.create_subprocess_exec(
-                            yabai_path, "-m", "window", str(window_id), "--display", str(target_display),
+                            yabai_path, "-m", "window", str(window_id), "--display", str(recovery_target_display),
                             stdout=asyncio.subprocess.PIPE,
                             stderr=asyncio.subprocess.PIPE
                         )
@@ -5608,31 +5670,37 @@ class YabaiSpaceDetector:
                             final_space = await get_window_space()
                             final_display = await get_window_display()
                             
-                            if final_display == target_display:
+                            if final_display == recovery_target_display:
                                 logger.info(
-                                    f"[YABAI v44.0] ✅ CONVERGENCE RECOVERY SUCCESS: "
-                                    f"Window {window_id} → Display {target_display} (Space {final_space})"
+                                    f"[YABAI v44.1] ✅ CONVERGENCE RECOVERY SUCCESS: "
+                                    f"Window {window_id} → Display {recovery_target_display} (Space {final_space})"
                                 )
+                                # Clean up per-window state
+                                if window_id in converged_states:
+                                    del converged_states[window_id]
                                 self._health.record_success(0)
                                 return True
                             else:
                                 logger.warning(
-                                    f"[YABAI v44.0] Convergence recovery move accepted but "
+                                    f"[YABAI v44.1] Convergence recovery move accepted but "
                                     f"window still on Display {final_display}"
                                 )
                         else:
                             error_msg = stderr.decode().strip() if stderr else "Unknown"
-                            logger.warning(f"[YABAI v44.0] Convergence recovery move rejected: {error_msg}")
+                            logger.warning(f"[YABAI v44.1] Convergence recovery move rejected: {error_msg}")
                             
                 except asyncio.TimeoutError:
-                    logger.warning("[YABAI v44.0] Convergence recovery timed out")
+                    logger.warning("[YABAI v44.1] Convergence recovery timed out")
                 except Exception as e:
-                    logger.warning(f"[YABAI v44.0] Convergence recovery error: {e}")
+                    logger.warning(f"[YABAI v44.1] Convergence recovery error: {e}")
             else:
                 # Window already on target!
                 logger.info(
-                    f"[YABAI v44.0] ✅ CONVERGENCE: Window {window_id} already on target Space {target_space}"
+                    f"[YABAI v44.1] ✅ CONVERGENCE: Window {window_id} already on target Space {recovery_target_space}"
                 )
+                # Clean up per-window state
+                if window_id in converged_states:
+                    del converged_states[window_id]
                 return True
         else:
             logger.warning(
