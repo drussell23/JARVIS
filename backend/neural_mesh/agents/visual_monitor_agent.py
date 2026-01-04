@@ -2586,18 +2586,50 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                 logger.warning(f"[God Mode] Auto-handoff failed: {e} - continuing with visibility filter")
 
         # =====================================================================
-        # v22.0.0: VISIBILITY FILTER (runs AFTER teleportation)
+        # v22.0.0 + v41.0: VISIBILITY FILTER (runs AFTER teleportation)
         # =====================================================================
         # Now that windows have been teleported to Ghost Display, filter to
-        # ensure we only watch windows on visible spaces.
+        # ensure we only watch windows on visible/capturable spaces.
+        #
+        # v41.0 FIX: GHOST DISPLAY SPACE INCLUSION
+        # =========================================
+        # ROOT CAUSE: Ghost Display space may NOT be reported as "is_visible=True"
+        # by yabai, even though it IS capturable. This was causing windows that
+        # were successfully teleported to Ghost Display to be filtered out.
+        #
+        # SOLUTION: Query Ghost Display space and ALWAYS include it in visible_space_ids
         # =====================================================================
         skipped_windows = []  # Track windows filtered out (for error messaging)
 
         if windows and MULTI_SPACE_AVAILABLE:
             try:
                 from backend.vision.multi_space_window_detector import MultiSpaceWindowDetector
+                from backend.vision.yabai_space_detector import get_yabai_detector
+                
                 detector = MultiSpaceWindowDetector()
                 visible_space_ids = await detector.get_all_visible_spaces()
+                
+                # v41.0: CRITICAL - Always include Ghost Display space
+                # The Ghost Display is specifically designed for background capture,
+                # so windows there are ALWAYS capturable even if yabai doesn't 
+                # report the space as "visible"
+                try:
+                    yabai_detector = get_yabai_detector()
+                    yabai_timeout = float(os.getenv('JARVIS_YABAI_OPERATION_TIMEOUT', '3.0'))
+                    ghost_display_space = await asyncio.wait_for(
+                        asyncio.get_event_loop().run_in_executor(
+                            None, yabai_detector.get_ghost_display_space
+                        ),
+                        timeout=yabai_timeout
+                    )
+                    if ghost_display_space and ghost_display_space not in visible_space_ids:
+                        visible_space_ids.append(ghost_display_space)
+                        logger.info(
+                            f"[God Mode v41.0] 👻 Added Ghost Display space {ghost_display_space} "
+                            f"to visible spaces (capturable for surveillance)"
+                        )
+                except Exception as e:
+                    logger.debug(f"[God Mode v41.0] Could not get Ghost Display space: {e}")
 
                 if visible_space_ids:
                     original_count = len(windows)

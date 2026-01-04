@@ -7136,13 +7136,70 @@ async def _async_yabai_query(args: List[str], timeout: float) -> Optional[str]:
 
 
 def _build_workspace_summary(spaces_data: List[Dict], windows_data: List[Dict]) -> Dict[str, Any]:
-    """Build workspace summary from raw yabai data."""
+    """
+    Build workspace summary from raw yabai data.
+    
+    v41.0: ORPHANED WINDOW RECOVERY
+    ================================
+    ROOT CAUSE FIX: Windows on dehydrated/hidden spaces can have:
+    - Invalid `space` values (null, 0, or mismatched)
+    - These windows were DROPPED entirely, causing "only 1 Chrome window found"
+    
+    SOLUTION: Two-pass window association
+    1. PASS 1: Associate by window's `space` field (standard method)
+    2. PASS 2: Rescue orphaned windows using space's `windows` array
+    3. PASS 3: Any remaining orphans get added to current space as fallback
+    """
     spaces = []
     current_space = None
+    current_space_id = None
+    
+    # =========================================================================
+    # PASS 1: Build window ID → window data lookup
+    # =========================================================================
+    windows_by_id = {w.get("id"): w for w in windows_data if w.get("id")}
+    assigned_window_ids = set()  # Track which windows we've assigned to spaces
+    
+    # Build space index lookup for orphan recovery
+    space_window_ids_map = {}  # space_id → list of window IDs from space's `windows` array
+    for space in spaces_data:
+        space_id = space.get("index", 1)
+        space_window_ids_map[space_id] = space.get("windows", [])
+        if space.get("has-focus"):
+            current_space_id = space_id
 
     for space in spaces_data:
         space_id = space.get("index", 1)
+        
+        # =====================================================================
+        # METHOD 1: Standard - match by window's `space` field
+        # =====================================================================
         space_windows = [w for w in windows_data if w.get("space") == space_id]
+        
+        # =====================================================================
+        # METHOD 2: ORPHAN RECOVERY - use space's `windows` array
+        # =====================================================================
+        # If a window is listed in the space's `windows` array but wasn't
+        # matched by METHOD 1, it means the window has an invalid `space` field.
+        # This commonly happens with dehydrated windows on hidden spaces.
+        # =====================================================================
+        space_window_ids_from_space = space.get("windows", [])
+        matched_ids = {w.get("id") for w in space_windows}
+        
+        for win_id in space_window_ids_from_space:
+            if win_id not in matched_ids and win_id in windows_by_id:
+                # Found an orphaned window! Rescue it.
+                orphan = windows_by_id[win_id]
+                logger.debug(
+                    f"[v41.0] 🔍 ORPHAN RECOVERY: Window {win_id} "
+                    f"(space field: {orphan.get('space')}) rescued → Space {space_id}"
+                )
+                space_windows.append(orphan)
+        
+        # Track assigned windows
+        for w in space_windows:
+            assigned_window_ids.add(w.get("id"))
+        
         applications = list(set(w.get("app", "Unknown") for w in space_windows))
 
         if not space_windows:
@@ -7175,6 +7232,8 @@ def _build_workspace_summary(spaces_data: List[Dict], windows_data: List[Dict]) 
                     "is-native-fullscreen": w.get("is-native-fullscreen", False),
                     "is_fullscreen": w.get("is-native-fullscreen", False),
                     "can-move": w.get("can-move", True),
+                    # v41.0: Include original space field for debugging
+                    "original_space": w.get("space"),
                 }
                 for w in space_windows
             ],
@@ -7183,6 +7242,47 @@ def _build_workspace_summary(spaces_data: List[Dict], windows_data: List[Dict]) 
 
         if space.get("has-focus"):
             current_space = space_info
+
+    # =========================================================================
+    # PASS 3: FINAL ORPHAN SWEEP - catch any windows not in ANY space
+    # =========================================================================
+    # These are windows with invalid `space` fields that ALSO weren't listed
+    # in any space's `windows` array. Add them to current space as fallback.
+    # =========================================================================
+    all_window_ids = set(windows_by_id.keys())
+    remaining_orphans = all_window_ids - assigned_window_ids
+    
+    if remaining_orphans:
+        logger.warning(
+            f"[v41.0] ⚠️ FINAL ORPHAN SWEEP: {len(remaining_orphans)} windows "
+            f"not assigned to any space: {list(remaining_orphans)[:5]}..."
+        )
+        
+        # Add to current space (or first space if no current)
+        target_space = current_space or (spaces[0] if spaces else None)
+        if target_space:
+            orphan_windows = [windows_by_id[wid] for wid in remaining_orphans if wid in windows_by_id]
+            for orphan in orphan_windows:
+                target_space["windows"].append({
+                    "app": orphan.get("app", "Unknown"),
+                    "title": orphan.get("title", ""),
+                    "id": orphan.get("id"),
+                    "minimized": orphan.get("is-minimized", False),
+                    "hidden": orphan.get("is-hidden", False),
+                    "is-native-fullscreen": orphan.get("is-native-fullscreen", False),
+                    "is_fullscreen": orphan.get("is-native-fullscreen", False),
+                    "can-move": orphan.get("can-move", True),
+                    "original_space": orphan.get("space"),
+                    "orphan_recovered": True,  # v41.0: Mark as recovered orphan
+                })
+                target_space["applications"] = list(set(
+                    target_space["applications"] + [orphan.get("app", "Unknown")]
+                ))
+            target_space["window_count"] = len(target_space["windows"])
+            logger.info(
+                f"[v41.0] ✅ Added {len(orphan_windows)} orphaned windows to "
+                f"Space {target_space['space_id']}"
+            )
 
     # Calculate totals
     total_windows = sum(s.get("window_count", 0) for s in spaces)
@@ -7196,6 +7296,13 @@ def _build_workspace_summary(spaces_data: List[Dict], windows_data: List[Dict]) 
         for app in s.get("applications", []):
             app_counts[app] = app_counts.get(app, 0) + 1
     primary_app = max(app_counts.keys(), key=app_counts.get) if app_counts else "Empty"
+    
+    # v41.0: Log summary for debugging
+    if total_windows > 0:
+        logger.info(
+            f"[v41.0] 📊 Workspace summary: {len(spaces)} spaces, {total_windows} windows, "
+            f"{len(all_apps)} apps"
+        )
 
     return {
         "total_spaces": len(spaces),
