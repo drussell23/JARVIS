@@ -5115,6 +5115,34 @@ class YabaiSpaceDetector:
         )
 
         # ═══════════════════════════════════════════════════════════════════
+        # v55.0: NEURO-REGENERATIVE PRE-CHECK - Ensure Window is Actionable
+        # ═══════════════════════════════════════════════════════════════════
+        # Before doing ANYTHING, check if the window is in zombie state.
+        # If so, repair it first. This prevents all downstream failures.
+        # ═══════════════════════════════════════════════════════════════════
+        actionable, repaired_id, repaired_info = await self._ensure_window_is_actionable_async(
+            window_id=window_id,
+            window_info=None,
+            app_name=app_name,
+            pid=pid,
+            max_repair_attempts=2
+        )
+
+        if not actionable:
+            logger.error(
+                f"[YABAI v55.0] ❌ Cannot exile window {window_id} - ZOMBIE state "
+                f"unrecoverable (AX: false after repair attempts)"
+            )
+            return False, "zombie_unrecoverable"
+
+        # Use the possibly-updated window ID and info
+        if repaired_id != window_id:
+            logger.info(
+                f"[YABAI v55.0] 🔥 Window ID updated: {window_id} → {repaired_id}"
+            )
+            window_id = repaired_id
+
+        # ═══════════════════════════════════════════════════════════════════
         # PHASE 1: DETECT - Is window fullscreen? Is it on a phantom space?
         # ═══════════════════════════════════════════════════════════════════
         is_fullscreen = False
@@ -5637,16 +5665,18 @@ class YabaiSpaceDetector:
         target_title: str,
         old_id: int,
         pid: Optional[int] = None,
-        fuzzy_threshold: float = 0.6
+        fuzzy_threshold: float = 0.6,
+        require_ax_reference: bool = False
     ) -> Optional[int]:
         """
-        v54.0: PHOENIX PROTOCOL - Find the new window ID after ID death.
+        v54.0 + v55.0: PHOENIX PROTOCOL - Find the new window ID after ID death.
 
         When a window ID "dies" (window destroyed and recreated), this method
         scans all windows to find the new one matching by:
         1. App name (exact match)
         2. PID (exact match if available)
         3. Title (fuzzy match)
+        4. v55.0: AX reference state (prioritize actionable windows)
 
         Args:
             app_name: App name to match (e.g., "Google Chrome")
@@ -5654,6 +5684,7 @@ class YabaiSpaceDetector:
             old_id: The dead window ID we're replacing
             pid: Process ID (for disambiguation)
             fuzzy_threshold: Minimum title similarity ratio (0.0-1.0)
+            require_ax_reference: v55.0 - If True, prioritize windows with has-ax-reference: true
 
         Returns:
             New window ID if found, None otherwise
@@ -5700,11 +5731,36 @@ class YabaiSpaceDetector:
                 logger.warning(f"[YABAI v54.0] No new candidates found after filtering")
                 return None
 
-            # If no title to match, just return the first candidate
+            # ═══════════════════════════════════════════════════════════════
+            # v55.0: PRIORITIZE ACTIONABLE WINDOWS (AX: true)
+            # ═══════════════════════════════════════════════════════════════
+            # When require_ax_reference is True, we MUST return a window that
+            # has AX reference (is actionable). This prevents Phoenix from
+            # returning a zombie window that can't be moved.
+            # ═══════════════════════════════════════════════════════════════
+            if require_ax_reference:
+                actionable_candidates = [
+                    w for w in candidates if w.get("has-ax-reference", False)
+                ]
+                if actionable_candidates:
+                    logger.info(
+                        f"[YABAI v55.0] 🎯 Phoenix: {len(actionable_candidates)} of "
+                        f"{len(candidates)} candidates are ACTIONABLE (AX: true)"
+                    )
+                    candidates = actionable_candidates
+                else:
+                    logger.warning(
+                        f"[YABAI v55.0] ⚠️ Phoenix: No candidates have AX: true - "
+                        f"returning best match anyway (may need Lazarus)"
+                    )
+
+            # If no title to match, return the first (preferably actionable) candidate
             if not target_title:
                 new_id = candidates[0].get("id")
+                has_ax = candidates[0].get("has-ax-reference", False)
                 logger.info(
-                    f"[YABAI v54.0] 🔥 Phoenix: Re-bonded (no title) {old_id} → {new_id}"
+                    f"[YABAI v54.0] 🔥 Phoenix: Re-bonded (no title) {old_id} → {new_id} "
+                    f"(AX: {has_ax})"
                 )
                 return new_id
 
@@ -5905,6 +5961,532 @@ class YabaiSpaceDetector:
         except Exception as e:
             logger.warning(f"[YABAI v54.1] Lazarus Trigger exception: {e}")
             return False
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # v55.0: NEURO-REGENERATIVE PROTOCOL - State Repair Before Action
+    # ═══════════════════════════════════════════════════════════════════════════
+    # ROOT CAUSE FIX: Windows with `has-ax-reference: false` (Zombie State) cannot
+    # be moved by any yabai command. Instead of blindly failing, we surgically
+    # diagnose, repair, and then execute.
+    #
+    # PHILOSOPHY: Detect → Repair → Execute (not "try, fail, retry")
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    async def _ensure_window_is_actionable_async(
+        self,
+        window_id: int,
+        window_info: Optional[Dict[str, Any]] = None,
+        app_name: Optional[str] = None,
+        pid: Optional[int] = None,
+        max_repair_attempts: int = 2
+    ) -> Tuple[bool, int, Optional[Dict[str, Any]]]:
+        """
+        v55.0: NEURO-REGENERATIVE PROTOCOL - Ensure window is actionable before operations.
+
+        DIAGNOSE: Check if window has AX reference (actionable state)
+        REPAIR: If zombie state (AX: false), trigger Lazarus to restore AX reference
+        VERIFY: Re-query to confirm repair and return fresh window info
+
+        Args:
+            window_id: The window ID to check/repair
+            window_info: Optional existing window info (avoids extra query)
+            app_name: App name for Lazarus Trigger
+            pid: Process ID for targeted repair
+            max_repair_attempts: Maximum repair attempts before giving up
+
+        Returns:
+            Tuple of:
+                - success: Whether window is now actionable
+                - final_window_id: The (possibly new) window ID after repair
+                - fresh_info: Updated window info dict (or None if failed)
+        """
+        yabai_path = self._health.yabai_path or os.getenv("YABAI_PATH", "/opt/homebrew/bin/yabai")
+
+        logger.info(
+            f"[YABAI v55.0] 🧠 NEURO-REGENERATIVE: Checking actionability for window {window_id}"
+        )
+
+        async def query_window_info(wid: int) -> Optional[Dict[str, Any]]:
+            """Query fresh window info."""
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    yabai_path, "-m", "query", "--windows", "--window", str(wid),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+                if proc.returncode == 0 and stdout:
+                    return json.loads(stdout.decode())
+            except Exception as e:
+                logger.debug(f"[YABAI v55.0] Query failed for window {wid}: {e}")
+            return None
+
+        async def query_all_windows_for_id(wid: int) -> Optional[Dict[str, Any]]:
+            """Fallback: query all windows and filter for the ID."""
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    yabai_path, "-m", "query", "--windows",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+                if proc.returncode == 0 and stdout:
+                    all_windows = json.loads(stdout.decode())
+                    for w in all_windows:
+                        if w.get("id") == wid:
+                            return w
+            except Exception:
+                pass
+            return None
+
+        # ═══════════════════════════════════════════════════════════════════
+        # PHASE 1: DIAGNOSE - Get current window state
+        # ═══════════════════════════════════════════════════════════════════
+        current_id = window_id
+        info = window_info
+
+        if not info:
+            # Try direct query first
+            info = await query_window_info(current_id)
+
+            # Fallback to full query if direct query fails
+            if not info:
+                info = await query_all_windows_for_id(current_id)
+
+            if not info:
+                logger.warning(
+                    f"[YABAI v55.0] ❌ Window {current_id} not found - may need Phoenix Protocol"
+                )
+                return False, current_id, None
+
+        # Extract metadata for repair
+        has_ax_reference = info.get("has-ax-reference", True)
+        detected_app = info.get("app", app_name or "Unknown")
+        detected_pid = info.get("pid", pid)
+        window_title = info.get("title", "")
+
+        # ═══════════════════════════════════════════════════════════════════
+        # PHASE 2: EVALUATE - Is repair needed?
+        # ═══════════════════════════════════════════════════════════════════
+        if has_ax_reference:
+            logger.info(
+                f"[YABAI v55.0] ✅ Window {current_id} is ACTIONABLE (AX: true)"
+            )
+            return True, current_id, info
+
+        # ═══════════════════════════════════════════════════════════════════
+        # PHASE 3: REPAIR - Window is in Zombie State (AX: false)
+        # ═══════════════════════════════════════════════════════════════════
+        logger.warning(
+            f"[YABAI v55.0] 🧟 ZOMBIE DETECTED: Window {current_id} has AX: false "
+            f"(app={detected_app}, pid={detected_pid})"
+        )
+
+        for attempt in range(1, max_repair_attempts + 1):
+            logger.info(
+                f"[YABAI v55.0] 🔧 REPAIR ATTEMPT {attempt}/{max_repair_attempts}..."
+            )
+
+            # -----------------------------------------------------------------
+            # Step 3a: SOFT WAKE - Try AppleScript activation first
+            # -----------------------------------------------------------------
+            if detected_pid:
+                try:
+                    soft_wake_script = f'''
+                    tell application "System Events"
+                        set targetProc to first process whose unix id is {detected_pid}
+                        set frontmost of targetProc to true
+                        delay 0.5
+                    end tell
+                    '''
+                    proc = await asyncio.create_subprocess_exec(
+                        "osascript", "-e", soft_wake_script,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    )
+                    await asyncio.wait_for(proc.communicate(), timeout=5.0)
+                    await asyncio.sleep(0.5)
+
+                    # Check if soft wake fixed it
+                    fresh_info = await query_window_info(current_id)
+                    if not fresh_info:
+                        fresh_info = await query_all_windows_for_id(current_id)
+
+                    if fresh_info and fresh_info.get("has-ax-reference", False):
+                        logger.info(
+                            f"[YABAI v55.0] ✅ SOFT WAKE SUCCESS: Window {current_id} "
+                            f"is now ACTIONABLE"
+                        )
+                        return True, current_id, fresh_info
+
+                except Exception as e:
+                    logger.debug(f"[YABAI v55.0] Soft wake exception: {e}")
+
+            # -----------------------------------------------------------------
+            # Step 3b: HARD RESET - Use Lazarus Trigger (Hide/Unhide)
+            # -----------------------------------------------------------------
+            logger.info(
+                f"[YABAI v55.0] 💀→🧟→✨ HARD RESET: Invoking Lazarus Trigger for {detected_app}..."
+            )
+
+            lazarus_success = await self._reflash_ax_reference_async(
+                app_name=detected_app,
+                pid=detected_pid,
+                window_id=current_id
+            )
+
+            if not lazarus_success:
+                logger.warning(
+                    f"[YABAI v55.0] Lazarus Trigger failed on attempt {attempt}"
+                )
+                await asyncio.sleep(0.5)
+                continue
+
+            # -----------------------------------------------------------------
+            # Step 3c: VERIFICATION - Re-query with possible ID regeneration
+            # -----------------------------------------------------------------
+            await asyncio.sleep(0.5)
+
+            # First try to find the original ID
+            fresh_info = await query_window_info(current_id)
+            if not fresh_info:
+                fresh_info = await query_all_windows_for_id(current_id)
+
+            if fresh_info:
+                if fresh_info.get("has-ax-reference", False):
+                    logger.info(
+                        f"[YABAI v55.0] ✅ HARD RESET SUCCESS: Window {current_id} "
+                        f"is now ACTIONABLE"
+                    )
+                    return True, current_id, fresh_info
+                else:
+                    logger.warning(
+                        f"[YABAI v55.0] Window {current_id} still has AX: false after Lazarus"
+                    )
+            else:
+                # Window ID might have changed - use Phoenix Protocol
+                logger.info(
+                    f"[YABAI v55.0] 🔥 Window {current_id} not found - invoking Phoenix..."
+                )
+                new_id = await self._regenerate_window_id_async(
+                    app_name=detected_app,
+                    target_title=window_title,
+                    old_id=current_id,
+                    pid=detected_pid,
+                    fuzzy_threshold=0.3,
+                    require_ax_reference=True  # v55.0: Prioritize AX:true windows
+                )
+
+                if new_id and new_id != current_id:
+                    # Verify the new window is actionable
+                    new_info = await query_window_info(new_id)
+                    if not new_info:
+                        new_info = await query_all_windows_for_id(new_id)
+
+                    if new_info and new_info.get("has-ax-reference", False):
+                        logger.info(
+                            f"[YABAI v55.0] 🔥✅ PHOENIX + REPAIR SUCCESS: "
+                            f"Window {current_id} → {new_id} (now ACTIONABLE)"
+                        )
+                        return True, new_id, new_info
+                    else:
+                        # New ID also has AX: false, update current_id and continue
+                        logger.warning(
+                            f"[YABAI v55.0] New ID {new_id} also has AX: false, continuing repair..."
+                        )
+                        current_id = new_id
+                        info = new_info
+
+        # ═══════════════════════════════════════════════════════════════════
+        # PHASE 4: v56.0 REAPER PROTOCOL - Verify if window is real or ghost
+        # ═══════════════════════════════════════════════════════════════════
+        # If Lazarus failed, the window might be a stale reference (ghost).
+        # Cross-reference with the Kernel to determine if it's real.
+        # ═══════════════════════════════════════════════════════════════════
+        if detected_pid:
+            logger.info(
+                f"[YABAI v56.0] 💀 REAPER: Lazarus failed - verifying window {current_id} "
+                f"existence against Kernel..."
+            )
+
+            exists, kernel_count, diagnostic = await self._verify_window_existence_via_kernel(
+                pid=detected_pid,
+                window_id=current_id,
+                app_name=detected_app
+            )
+
+            # Check for window count mismatch (yabai thinks more windows exist than kernel)
+            if exists and kernel_count is not None and kernel_count >= 0:
+                # Get yabai's window count for this PID
+                try:
+                    yabai_path = self._health.yabai_path or os.getenv("YABAI_PATH", "/opt/homebrew/bin/yabai")
+                    proc = await asyncio.create_subprocess_exec(
+                        yabai_path, "-m", "query", "--windows",
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    )
+                    stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+                    if proc.returncode == 0 and stdout:
+                        all_windows = json.loads(stdout.decode())
+                        yabai_count = len([w for w in all_windows if w.get("pid") == detected_pid])
+
+                        if yabai_count > kernel_count:
+                            # STALE WINDOW DETECTED!
+                            logger.warning(
+                                f"[YABAI v56.0] 💀 REAPER: STALE WINDOW DETECTED! "
+                                f"Yabai reports {yabai_count} windows but Kernel reports {kernel_count} "
+                                f"for PID {detected_pid}. Window {current_id} is likely a ghost."
+                            )
+
+                            # Find a replacement window
+                            replacement = await self._reaper_find_replacement_window(
+                                app_name=detected_app,
+                                pid=detected_pid,
+                                dead_window_id=current_id,
+                                window_title=window_title
+                            )
+
+                            if replacement:
+                                new_id, new_info = replacement
+                                logger.info(
+                                    f"[YABAI v56.0] 💀✅ REAPER SUCCESS: Purged ghost {current_id}, "
+                                    f"found replacement {new_id} (AX: true)"
+                                )
+                                return True, new_id, new_info
+                            else:
+                                logger.warning(
+                                    f"[YABAI v56.0] 💀 REAPER: No replacement found for ghost {current_id}. "
+                                    f"Window is truly orphaned."
+                                )
+                                # Return failure but mark as ghost for upstream handling
+                                if info:
+                                    info["_is_ghost"] = True
+                                return False, current_id, info
+                except Exception as e:
+                    logger.debug(f"[YABAI v56.0] Reaper count check failed: {e}")
+
+            elif not exists:
+                # Process has no windows - definitely a ghost
+                logger.warning(
+                    f"[YABAI v56.0] 💀 REAPER: PID {detected_pid} has NO windows in Kernel. "
+                    f"Window {current_id} is a ghost. Diagnostic: {diagnostic}"
+                )
+                if info:
+                    info["_is_ghost"] = True
+                return False, current_id, info
+
+        # ═══════════════════════════════════════════════════════════════════
+        # PHASE 5: FAILURE - All repair attempts exhausted, not a ghost
+        # ═══════════════════════════════════════════════════════════════════
+        logger.error(
+            f"[YABAI v55.0] ❌ NEURO-REGENERATIVE FAILED: Window {window_id} remains "
+            f"in ZOMBIE state after {max_repair_attempts} repair attempts. "
+            f"Consider in-place capture as last resort."
+        )
+
+        # Return the last known info even on failure
+        return False, current_id, info
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # v56.0: REAPER PROTOCOL - State Reconciliation Against Kernel
+    # ═══════════════════════════════════════════════════════════════════════════
+    # ROOT CAUSE FIX: Yabai's window database can become stale - it may report
+    # windows that no longer exist in the macOS WindowServer. When Lazarus fails,
+    # we verify against the Kernel (via System Events) to determine if we're
+    # chasing a ghost or dealing with a true zombie.
+    #
+    # PHILOSOPHY: Yabai is "Hearsay", System Events is "Testimony"
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    async def _verify_window_existence_via_kernel(
+        self,
+        pid: int,
+        window_id: Optional[int] = None,
+        app_name: Optional[str] = None
+    ) -> Tuple[bool, Optional[int], Optional[str]]:
+        """
+        v56.0: REAPER PROTOCOL - Verify window existence directly against macOS Kernel.
+
+        Cross-references Yabai's window data with the WindowServer's actual state
+        via System Events (AppleScript). This detects stale/ghost windows that
+        Yabai thinks exist but the OS has already deleted.
+
+        Args:
+            pid: Process ID to check windows for
+            window_id: Optional specific window ID to verify
+            app_name: Optional app name for targeted check
+
+        Returns:
+            Tuple of:
+                - exists: Whether the window truly exists in the kernel
+                - real_window_count: Number of actual windows for this PID
+                - diagnostic: Human-readable diagnosis
+        """
+        logger.info(
+            f"[YABAI v56.0] 💀 REAPER: Cross-referencing window {window_id} (PID {pid}) "
+            f"against Kernel..."
+        )
+
+        try:
+            # Query System Events for the true window count
+            # This goes directly to the WindowServer, bypassing yabai's cache
+            verify_script = f'''
+            tell application "System Events"
+                try
+                    set targetProc to first process whose unix id is {pid}
+                    set windowCount to count of windows of targetProc
+                    set windowIDs to {{}}
+                    repeat with w in windows of targetProc
+                        -- Get the window's position (proves it exists)
+                        try
+                            set pos to position of w
+                            set end of windowIDs to "exists"
+                        end try
+                    end repeat
+                    return "WINDOWS:" & windowCount & ":VERIFIED:" & (count of windowIDs)
+                on error errMsg
+                    return "ERROR:" & errMsg
+                end try
+            end tell
+            '''
+
+            proc = await asyncio.create_subprocess_exec(
+                "osascript", "-e", verify_script,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10.0)
+
+            result = stdout.decode().strip() if stdout else ""
+
+            if result.startswith("WINDOWS:"):
+                # Parse: WINDOWS:3:VERIFIED:3
+                parts = result.split(":")
+                if len(parts) >= 4:
+                    kernel_window_count = int(parts[1])
+                    verified_count = int(parts[3])
+
+                    logger.info(
+                        f"[YABAI v56.0] 💀 REAPER: Kernel reports {kernel_window_count} windows "
+                        f"for PID {pid} ({verified_count} verified)"
+                    )
+
+                    # Now check if our specific window_id is real
+                    # We need to cross-reference with yabai to see if counts match
+                    if kernel_window_count == 0:
+                        return False, 0, "process_has_no_windows"
+
+                    return True, kernel_window_count, "windows_exist"
+
+            elif result.startswith("ERROR:"):
+                error_msg = result[6:]
+                if "process" in error_msg.lower():
+                    logger.warning(
+                        f"[YABAI v56.0] 💀 REAPER: PID {pid} not found in System Events - "
+                        f"process may have terminated"
+                    )
+                    return False, 0, "process_not_found"
+
+            logger.warning(
+                f"[YABAI v56.0] 💀 REAPER: Unexpected result: {result}"
+            )
+            return True, -1, "verification_inconclusive"
+
+        except Exception as e:
+            logger.warning(f"[YABAI v56.0] 💀 REAPER exception: {e}")
+            return True, -1, "verification_error"
+
+    async def _reaper_find_replacement_window(
+        self,
+        app_name: str,
+        pid: int,
+        dead_window_id: int,
+        window_title: str = ""
+    ) -> Optional[Tuple[int, Dict[str, Any]]]:
+        """
+        v56.0: REAPER - Find replacement window after purging a ghost.
+
+        After determining a window ID is stale (doesn't exist in kernel),
+        scan for the replacement window that the app likely created.
+
+        Args:
+            app_name: App name to search for
+            pid: Process ID to match
+            dead_window_id: The stale window ID to exclude
+            window_title: Original title for fuzzy matching
+
+        Returns:
+            Tuple of (new_window_id, window_info) if found, None otherwise
+        """
+        yabai_path = self._health.yabai_path or os.getenv("YABAI_PATH", "/opt/homebrew/bin/yabai")
+
+        logger.info(
+            f"[YABAI v56.0] 💀 REAPER: Searching for replacement window for dead ID {dead_window_id}..."
+        )
+
+        try:
+            # Query all windows fresh
+            proc = await asyncio.create_subprocess_exec(
+                yabai_path, "-m", "query", "--windows",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+
+            if proc.returncode != 0 or not stdout:
+                return None
+
+            all_windows = json.loads(stdout.decode())
+
+            # Find candidates: same app, same PID, different ID, HAS AX reference
+            candidates = []
+            for w in all_windows:
+                if w.get("app") != app_name:
+                    continue
+                if w.get("id") == dead_window_id:
+                    continue  # Skip the dead one
+                if w.get("pid") != pid:
+                    continue  # Must be same PID
+                if not w.get("has-ax-reference", False):
+                    continue  # Must be actionable
+
+                candidates.append(w)
+
+            if not candidates:
+                logger.warning(
+                    f"[YABAI v56.0] 💀 REAPER: No replacement candidates found for "
+                    f"dead window {dead_window_id}"
+                )
+                return None
+
+            # If we have a title, try to match it
+            if window_title:
+                for c in candidates:
+                    c_title = c.get("title", "")
+                    if window_title == c_title:
+                        logger.info(
+                            f"[YABAI v56.0] 💀✅ REAPER: Found exact title match: "
+                            f"{dead_window_id} → {c['id']}"
+                        )
+                        return c["id"], c
+                    if window_title in c_title or c_title in window_title:
+                        logger.info(
+                            f"[YABAI v56.0] 💀✅ REAPER: Found partial title match: "
+                            f"{dead_window_id} → {c['id']}"
+                        )
+                        return c["id"], c
+
+            # No title match - return the first actionable candidate
+            best = candidates[0]
+            logger.info(
+                f"[YABAI v56.0] 💀✅ REAPER: Using first actionable candidate: "
+                f"{dead_window_id} → {best['id']} (AX: true)"
+            )
+            return best["id"], best
+
+        except Exception as e:
+            logger.warning(f"[YABAI v56.0] 💀 REAPER find replacement exception: {e}")
+            return None
 
     async def _maximize_window_async(self, window_id: int) -> bool:
         """Maximize window to fill its current display using yabai grid."""
@@ -7107,6 +7689,37 @@ class YabaiSpaceDetector:
             return False
 
         yabai_path = self._health.yabai_path or "yabai"
+
+        # ═══════════════════════════════════════════════════════════════════
+        # v55.0: NEURO-REGENERATIVE PROTOCOL - REPAIR BEFORE MOVE
+        # ═══════════════════════════════════════════════════════════════════
+        # ROOT CAUSE FIX: Before attempting ANY move, ensure the window is
+        # actionable (has AX reference). If not, repair it first.
+        # This prevents wasted cycles on zombie windows.
+        # ═══════════════════════════════════════════════════════════════════
+        actionable, repaired_id, repaired_info = await self._ensure_window_is_actionable_async(
+            window_id=window_id,
+            window_info=None,  # Will query fresh
+            app_name=None,  # Will detect from window
+            pid=None,  # Will detect from window
+            max_repair_attempts=2
+        )
+
+        if not actionable:
+            if not silent:
+                logger.warning(
+                    f"[YABAI v55.0] ❌ Cannot move window {window_id} - ZOMBIE state "
+                    f"unrecoverable (AX: false after repair attempts)"
+                )
+            return False
+
+        # Use the possibly-updated window ID (Phoenix may have regenerated it)
+        if repaired_id != window_id:
+            if not silent:
+                logger.info(
+                    f"[YABAI v55.0] 🔥 Window ID updated: {window_id} → {repaired_id}"
+                )
+            window_id = repaired_id
 
         # v34.0: Configurable hydration timing
         hydration_checkpoints = [
