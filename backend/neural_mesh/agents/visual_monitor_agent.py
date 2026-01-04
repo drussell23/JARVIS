@@ -3152,6 +3152,22 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
             for window in windows
         )
 
+        # v61.0 DEBUG: Log Ghost Display detection details
+        for w in windows:
+            logger.info(
+                f"[v61.0 DEBUG] Window {w.get('window_id')}: "
+                f"display_id={w.get('display_id', 'MISSING')}, "
+                f"is_on_ghost_display={w.get('is_on_ghost_display', 'MISSING')}, "
+                f"space_id={w.get('space_id')}"
+            )
+
+        logger.info(
+            f"[v61.0 RETINA] Ghost check: any_on_ghost_display={any_on_ghost_display}, "
+            f"mosaic_enabled={self.config.mosaic_mode_enabled}, "
+            f"min_windows={self.config.mosaic_mode_min_windows}, "
+            f"window_count={len(windows)}"
+        )
+
         use_mosaic_mode = (
             self.config.mosaic_mode_enabled and
             (len(windows) >= self.config.mosaic_mode_min_windows or any_on_ghost_display)
@@ -3176,6 +3192,24 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
             if hasattr(self._spatial_agent, '_ghost_manager') and self._spatial_agent._ghost_manager:
                 mosaic_config = self._spatial_agent._ghost_manager.get_mosaic_config()
 
+            # ===================================================================
+            # v61.1 RETINA FOCUS: Fallback to detected ghost_display_index
+            # ===================================================================
+            # If _ghost_manager isn't available but we detected Ghost Display
+            # windows, use the ghost_display_index directly. This ensures Mosaic
+            # mode works even without full Ghost Manager infrastructure.
+            # ===================================================================
+            if not mosaic_config or not mosaic_config.get('display_id'):
+                if any_on_ghost_display:
+                    logger.info(
+                        f"[v61.1 RETINA FOCUS] 🔭 Using detected ghost display index: {ghost_display_index}"
+                    )
+                    mosaic_config = {
+                        'display_id': ghost_display_index,
+                        'display_width': int(os.getenv('JARVIS_GHOST_WIDTH', '1920')),
+                        'display_height': int(os.getenv('JARVIS_GHOST_HEIGHT', '1080'))
+                    }
+
             if mosaic_config and mosaic_config.get('display_id'):
                 try:
                     from backend.vision.macos_video_capture_advanced import (
@@ -3186,8 +3220,15 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
 
                     # Build window tile info for spatial intelligence
                     window_tiles = []
-                    if self.config.mosaic_spatial_intelligence:
+                    # v61.2 FIX: Safely access _ghost_manager with full null-check chain
+                    ghost_manager = None
+                    if (self.config.mosaic_spatial_intelligence and
+                        hasattr(self, '_spatial_agent') and
+                        self._spatial_agent is not None and
+                        hasattr(self._spatial_agent, '_ghost_manager')):
                         ghost_manager = self._spatial_agent._ghost_manager
+
+                    if ghost_manager:
                         for window in windows:
                             window_id = window.get('window_id')
                             geometry = ghost_manager.get_preserved_geometry(window_id)
@@ -6487,6 +6528,10 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                 'is_visible': w.get('is_visible', True),
                 'width': w.get('width', 0),
                 'height': w.get('height', 0),
+
+                # v60.0 PANOPTICON: Preserve Ghost Display info for Mosaic mode detection
+                'display_id': w.get('display_id', 1),
+                'is_on_ghost_display': w.get('is_on_ghost_display', False),
             }
 
             # Preserve any teleport-related fields

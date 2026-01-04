@@ -2270,6 +2270,10 @@ class WatcherConfig:
     timeout: float = field(default_factory=lambda: float(os.getenv('JARVIS_WATCHER_TIMEOUT', '300.0')))
     max_buffer_size: int = field(default_factory=lambda: int(os.getenv('JARVIS_WATCHER_BUFFER_SIZE', '10')))
 
+    # v61.1 RETINA FOCUS: Target specific hardware display
+    # 1 = Main Display, 2+ = Secondary/Virtual Display (Ghost Display)
+    display_id: int = 1
+
     # Visual detection settings
     enable_ocr: bool = field(default_factory=lambda: os.getenv('JARVIS_WATCHER_OCR', 'true').lower() == 'true')
     enable_element_detection: bool = field(default_factory=lambda: os.getenv('JARVIS_WATCHER_ELEMENTS', 'true').lower() == 'true')
