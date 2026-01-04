@@ -2222,6 +2222,123 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                 except asyncio.TimeoutError:
                     logger.warning(f"[God Mode] ⚠️ get_ghost_display_space timed out after {yabai_timeout}s")
                     ghost_space = None
+                
+                # ==========================================================
+                # v42.0: AGGRESSIVE RESCUE PROTOCOL
+                # ==========================================================
+                # ROOT CAUSE FIX: get_ghost_display_space() returns None when
+                # yabai doesn't report a "visible" space on the secondary display.
+                # This causes hidden windows to be ABANDONED instead of RESCUED.
+                #
+                # SOLUTION: If ghost_space is None, use DISPLAY-BASED DETECTION
+                # to find ANY space on Display 2+ and use that as the rescue target.
+                # The v34.0 Display Handoff will handle the actual window move.
+                # ==========================================================
+                if ghost_space is None:
+                    logger.info("[God Mode v42.0] ⚡ Ghost space not found via standard lookup - trying Aggressive Rescue")
+                    
+                    try:
+                        # Refresh topology first - space IDs might be stale
+                        # Use invalidate_cache if available to force fresh data
+                        if hasattr(yabai, 'invalidate_cache'):
+                            yabai.invalidate_cache()
+                            logger.debug("[God Mode v42.0] Cache invalidated for fresh topology")
+                        
+                        # ==========================================================
+                        # v42.0: STRATEGY 1 - Direct Yabai Display Query
+                        # ==========================================================
+                        # Most reliable: Query yabai directly for display list
+                        # ==========================================================
+                        import subprocess
+                        try:
+                            displays_result = subprocess.run(
+                                ['yabai', '-m', 'query', '--displays'],
+                                capture_output=True, text=True, timeout=3.0
+                            )
+                            if displays_result.returncode == 0:
+                                displays = json.loads(displays_result.stdout)
+                                logger.info(f"[God Mode v42.0] 📺 Direct display query: Found {len(displays)} display(s)")
+                                
+                                # Find secondary display (index > 1 or id != main)
+                                secondary_displays = [d for d in displays if d.get('index', 1) > 1]
+                                
+                                if secondary_displays:
+                                    # Get the first space on the secondary display
+                                    secondary_display_index = secondary_displays[0].get('index', 2)
+                                    spaces_on_secondary = secondary_displays[0].get('spaces', [])
+                                    
+                                    if spaces_on_secondary:
+                                        ghost_space = spaces_on_secondary[0]  # First space on secondary display
+                                        logger.info(
+                                            f"[God Mode v42.0] 🚀 AGGRESSIVE RESCUE (Direct): "
+                                            f"Found Space {ghost_space} on Display {secondary_display_index}"
+                                        )
+                                else:
+                                    logger.warning(f"[God Mode v42.0] ⚠️ No secondary display found in direct query")
+                        except (subprocess.TimeoutExpired, json.JSONDecodeError, FileNotFoundError) as e:
+                            logger.debug(f"[God Mode v42.0] Direct display query failed: {e}")
+                        
+                        # ==========================================================
+                        # v42.0: STRATEGY 2 - Fallback to Space Enumeration
+                        # ==========================================================
+                        if ghost_space is None:
+                            # Get all spaces with display info
+                            all_spaces = await asyncio.wait_for(
+                                asyncio.get_event_loop().run_in_executor(
+                                    None, lambda: yabai.enumerate_all_spaces(include_display_info=True)
+                                ),
+                                timeout=yabai_timeout
+                            )
+                            
+                            if all_spaces:
+                                logger.debug(f"[God Mode v42.0] Space enumeration returned {len(all_spaces)} spaces")
+                                
+                                # Log space info for debugging
+                                for s in all_spaces:
+                                    logger.debug(
+                                        f"[God Mode v42.0]   Space {s.get('space_id')}: "
+                                        f"display={s.get('display')}, visible={s.get('is_visible')}, "
+                                        f"current={s.get('is_current')}"
+                                    )
+                                
+                                # Find ANY space on Display 2+ (secondary displays)
+                                secondary_display_spaces = [
+                                    s for s in all_spaces 
+                                    if s.get('display', 1) > 1
+                                ]
+                                
+                                if secondary_display_spaces:
+                                    # Prefer spaces with fewer windows
+                                    secondary_display_spaces.sort(
+                                        key=lambda x: x.get('window_count', 0)
+                                    )
+                                    ghost_space = secondary_display_spaces[0].get('space_id')
+                                    
+                                    logger.info(
+                                        f"[God Mode v42.0] 🚀 AGGRESSIVE RESCUE (Enum): Found Space {ghost_space} "
+                                        f"on Display {secondary_display_spaces[0].get('display')}"
+                                    )
+                                else:
+                                    # No secondary display? Check display count directly
+                                    display_count = len(set(s.get('display', 1) for s in all_spaces))
+                                    logger.warning(
+                                        f"[God Mode v42.0] ⚠️ No secondary display spaces found "
+                                        f"({display_count} display(s) detected)"
+                                    )
+                        
+                    except asyncio.TimeoutError:
+                        logger.warning("[God Mode v42.0] Aggressive Rescue display lookup timed out")
+                    except Exception as e:
+                        logger.warning(f"[God Mode v42.0] Aggressive Rescue failed: {e}")
+                    
+                    # v42.0: Summary log after Aggressive Rescue
+                    if ghost_space is not None:
+                        logger.info(f"[God Mode v42.0] ✅ AGGRESSIVE RESCUE SUCCESS: ghost_space={ghost_space}")
+                    else:
+                        logger.warning(
+                            "[God Mode v42.0] ❌ AGGRESSIVE RESCUE FAILED: No secondary display found. "
+                            "Please ensure BetterDisplay or a virtual monitor is configured."
+                        )
 
                 try:
                     current_user_space = await asyncio.wait_for(
@@ -2755,14 +2872,29 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
             all_on_hidden_spaces = len(skipped_windows) > 0
 
             if all_on_hidden_spaces:
+                # v42.0: Enhanced error message with rescue status
                 logger.warning(
                     f"⚠️  Found {len(skipped_windows)} {app_name} windows but ALL are on hidden spaces! "
-                    f"Move a window to a visible space or add a virtual monitor."
+                    f"Ghost Display auto-rescue failed. Check if BetterDisplay is running."
                 )
-                error_msg = (
-                    f"All {len(skipped_windows)} {app_name} windows are on hidden spaces. "
-                    f"Move one to your current space or use a virtual monitor (BetterDisplay)."
-                )
+                
+                # v42.0: More actionable error message
+                # Check if ghost_space was ever found (it would have been set during auto-handoff)
+                rescue_attempted = 'ghost_space' in dir() and ghost_space is not None
+                
+                if rescue_attempted:
+                    error_msg = (
+                        f"I found {len(skipped_windows)} {app_name} windows on hidden spaces. "
+                        f"Auto-rescue was attempted but the windows didn't move successfully. "
+                        f"Try manually moving a window to a visible desktop first."
+                    )
+                else:
+                    error_msg = (
+                        f"All {len(skipped_windows)} {app_name} windows are on hidden spaces. "
+                        f"No Ghost Display available for auto-rescue. "
+                        f"Please install BetterDisplay or create a virtual monitor, "
+                        f"or manually move a window to your current space."
+                    )
             else:
                 logger.warning(f"⚠️  No windows found for {app_name}")
                 error_msg = f"I don't see any {app_name} windows open. Please open {app_name} and try again."
