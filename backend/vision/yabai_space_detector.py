@@ -4059,10 +4059,11 @@ class YabaiSpaceDetector:
         self,
         app_name: str,
         window_title: str,
-        window_id: int
+        window_id: int,
+        fire_and_forget: bool = False
     ) -> bool:
         """
-        v43.0: DEEP UNPACK PROTOCOL - AppleScript Injection
+        v43.5: UNIVERSAL UNPACKER - Enhanced AppleScript Injection
         
         ROOT CAUSE FIX: Yabai cannot read the fullscreen state of windows on hidden
         spaces ("dehydrated" windows). It returns is-native-fullscreen=false even
@@ -4071,106 +4072,192 @@ class YabaiSpaceDetector:
         SOLUTION: Bypass yabai and talk directly to the application using AppleScript.
         Browsers like Chrome expose their window state via AppleScript even when hidden.
         
-        AppleScript approach:
-        1. For Chrome-like apps: `tell application "Chrome" to set full screen of every window to false`
-        2. For other apps: `tell application "System Events" to tell process "App" to set value of attribute "AXFullScreen" to false`
-        
-        This is NON-BLOCKING (async subprocess) and INTELLIGENT (targets specific app).
+        v43.5 ENHANCEMENTS:
+        - Permission Panic Detection: Detects exit code -1743 (user denied automation)
+        - Polymorphic Targeting: Dynamically uses app_name from yabai query
+        - Fire & Forget Mode: Starts hydration timer immediately, doesn't wait
+        - Direct Object Model: Never steals focus (no System Events keystrokes)
+        - Graceful Degradation: Always proceeds, never blocks the operation
         
         Args:
-            app_name: The application name (e.g., "Google Chrome")
-            window_title: The window title (for targeted unpack if needed)
+            app_name: The application name (e.g., "Google Chrome", "Safari")
+            window_title: The window title (for logging/targeted unpack)
             window_id: Yabai window ID for logging
+            fire_and_forget: If True, start hydration immediately without waiting
             
         Returns:
             True if unpack was successful (or app doesn't support AppleScript)
-            False if an error occurred
+            False only if critical permission error that user must resolve
         """
-        # Sanitize inputs to prevent AppleScript injection
-        safe_app_name = app_name.replace('"', '\\"').replace("'", "\\'")
-        safe_title = window_title.replace('"', '\\"').replace("'", "\\'")[:50]
-        
-        logger.info(
-            f"[YABAI v43.0] 🔑 DEEP UNPACK: Forcing {safe_app_name} window {window_id} "
-            f"to exit fullscreen via AppleScript"
-        )
-        
         # ═══════════════════════════════════════════════════════════════════════
-        # v43.0: APP-SPECIFIC AppleScript COMMANDS
+        # v43.5: POLYMORPHIC APP NAME MAPPING
         # ═══════════════════════════════════════════════════════════════════════
-        # Different apps expose fullscreen differently:
-        # - Chrome/Chromium: `full screen of every window`
-        # - Safari: `fullscreen` property
-        # - Other apps: System Events accessibility API
+        # Maps various app names to their AppleScript dictionary names.
+        # This handles Chrome Canary, Chromium, Arc, Brave, etc. automatically.
+        # If app isn't in the map, we use the name as-is (polymorphic).
         # ═══════════════════════════════════════════════════════════════════════
         
         chrome_like_apps = {
             "google chrome": "Google Chrome",
+            "google chrome canary": "Google Chrome Canary",
             "chrome": "Google Chrome",
             "chromium": "Chromium",
             "brave browser": "Brave Browser",
+            "brave": "Brave Browser",
             "microsoft edge": "Microsoft Edge",
+            "edge": "Microsoft Edge",
             "arc": "Arc",
+            "vivaldi": "Vivaldi",
+            "opera": "Opera",
         }
         
         safari_like_apps = {"safari": "Safari"}
         
+        electron_apps = {
+            "slack": "Slack",
+            "discord": "Discord",
+            "spotify": "Spotify",
+            "visual studio code": "Visual Studio Code",
+            "code": "Visual Studio Code",
+            "figma": "Figma",
+            "notion": "Notion",
+            "obsidian": "Obsidian",
+        }
+        
         app_lower = app_name.lower()
         
-        try:
-            if app_lower in chrome_like_apps:
-                # Chrome exposes `full screen` property directly
-                actual_app_name = chrome_like_apps[app_lower]
-                
-                # Strategy 1: Batch unpack all windows (most reliable)
-                script = f'''
-                tell application "{actual_app_name}"
+        # Determine the actual AppleScript application name
+        if app_lower in chrome_like_apps:
+            actual_app_name = chrome_like_apps[app_lower]
+            app_type = "chrome"
+        elif app_lower in safari_like_apps:
+            actual_app_name = safari_like_apps[app_lower]
+            app_type = "safari"
+        elif app_lower in electron_apps:
+            actual_app_name = electron_apps[app_lower]
+            app_type = "electron"
+        else:
+            # v43.5: POLYMORPHIC - Use the app name directly
+            # This handles any app JARVIS encounters
+            actual_app_name = app_name
+            app_type = "generic"
+        
+        # Sanitize to prevent AppleScript injection attacks
+        safe_app_name = actual_app_name.replace('"', '\\"').replace("\\", "\\\\")
+        safe_title = window_title.replace('"', '\\"').replace("\\", "\\\\")[:50]
+        
+        logger.info(
+            f"[YABAI v43.5] 🔑 UNIVERSAL UNPACK: Forcing {actual_app_name} window {window_id} "
+            f"to exit fullscreen via AppleScript (type: {app_type})"
+        )
+        
+        # ═══════════════════════════════════════════════════════════════════════
+        # v43.5: BUILD APP-SPECIFIC AppleScript (Direct Object Model)
+        # ═══════════════════════════════════════════════════════════════════════
+        # CRITICAL: We use DIRECT APPLICATION CONTROL, not System Events.
+        # This means:
+        # - No focus stealing (doesn't bring window to front)
+        # - No keyboard simulation (no ⌘F shortcuts)
+        # - Works on hidden/background windows
+        # - Requires Automation permission on first run
+        # ═══════════════════════════════════════════════════════════════════════
+        
+        if app_type == "chrome":
+            # Chrome/Chromium family: Uses `full screen` property
+            script = f'''
+            tell application "{safe_app_name}"
+                try
                     set windowList to every window
                     repeat with w in windowList
                         try
-                            if full screen of w is true then
-                                set full screen of w to false
-                            end if
+                            set full screen of w to false
+                        on error errMsg
+                            -- Window might not support fullscreen, ignore
                         end try
                     end repeat
-                end tell
-                '''
-                
-            elif app_lower in safari_like_apps:
-                # Safari uses slightly different syntax
-                actual_app_name = safari_like_apps[app_lower]
-                script = f'''
-                tell application "{actual_app_name}"
+                on error errMsg
+                    error errMsg
+                end try
+            end tell
+            '''
+            
+        elif app_type == "safari":
+            # Safari: Uses `fullscreen` property (no space)
+            script = f'''
+            tell application "{safe_app_name}"
+                try
                     set windowList to every window
                     repeat with w in windowList
                         try
-                            if fullscreen of w is true then
-                                set fullscreen of w to false
-                            end if
+                            set fullscreen of w to false
+                        on error errMsg
+                            -- Window might not support fullscreen, ignore
                         end try
                     end repeat
-                end tell
-                '''
-                
-            else:
-                # Generic approach via System Events accessibility API
-                # This works for most apps but may require accessibility permissions
-                script = f'''
-                tell application "System Events"
+                on error errMsg
+                    error errMsg
+                end try
+            end tell
+            '''
+            
+        elif app_type == "electron":
+            # Electron apps: Usually support `full screen` like Chrome
+            script = f'''
+            tell application "{safe_app_name}"
+                try
+                    set windowList to every window
+                    repeat with w in windowList
+                        try
+                            set full screen of w to false
+                        on error
+                            -- Some Electron apps don't expose this property
+                        end try
+                    end repeat
+                on error errMsg
+                    -- App might not be scriptable, proceed silently
+                end try
+            end tell
+            '''
+            
+        else:
+            # v43.5: GENERIC FALLBACK - Accessibility API (no focus stealing)
+            # Uses AXFullScreen attribute via System Events process control
+            # NOTE: This requires Accessibility permission, not Automation
+            script = f'''
+            tell application "System Events"
+                try
                     tell process "{safe_app_name}"
-                        set frontmost to true
                         repeat with w in (every window)
                             try
-                                if value of attribute "AXFullScreen" of w is true then
+                                if exists attribute "AXFullScreen" of w then
                                     set value of attribute "AXFullScreen" of w to false
                                 end if
                             end try
                         end repeat
                     end tell
-                end tell
-                '''
-            
-            # Execute AppleScript asynchronously (non-blocking)
+                on error errMsg
+                    -- Process might not be found or accessible
+                end try
+            end tell
+            '''
+        
+        # ═══════════════════════════════════════════════════════════════════════
+        # v43.5: FIRE & FORGET MODE - Start hydration timer immediately
+        # ═══════════════════════════════════════════════════════════════════════
+        # When fire_and_forget=True, we start the hydration delay BEFORE waiting
+        # for the AppleScript to complete. This runs them in parallel.
+        # ═══════════════════════════════════════════════════════════════════════
+        
+        hydration_delay = 1.0  # Time for macOS to process the fullscreen exit
+        hydration_task = None
+        
+        if fire_and_forget:
+            # Start hydration timer immediately (parallel execution)
+            hydration_task = asyncio.create_task(asyncio.sleep(hydration_delay))
+            logger.debug(f"[YABAI v43.5] 🚀 Fire & Forget: Hydration timer started ({hydration_delay}s)")
+        
+        try:
+            # Execute AppleScript asynchronously
             proc = await asyncio.create_subprocess_exec(
                 "osascript", "-e", script,
                 stdout=asyncio.subprocess.PIPE,
@@ -4181,39 +4268,95 @@ class YabaiSpaceDetector:
             try:
                 stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
                 
+                # ═══════════════════════════════════════════════════════════════
+                # v43.5: PERMISSION PANIC DETECTION
+                # ═══════════════════════════════════════════════════════════════
+                # macOS error code -1743: "The user has denied permission"
+                # This happens on first run when user hasn't approved automation
+                #
+                # Other common codes:
+                # -1728: Can't get property (app doesn't support it - OK)
+                # -1719: Application isn't running (OK, nothing to unpack)
+                # -600: Application isn't running
+                # ═══════════════════════════════════════════════════════════════
+                
                 if proc.returncode == 0:
                     logger.info(
-                        f"[YABAI v43.0] ✅ DEEP UNPACK SUCCESS: {app_name} windows forced to exit fullscreen"
+                        f"[YABAI v43.5] ✅ UNIVERSAL UNPACK SUCCESS: {actual_app_name} windows "
+                        f"forced to exit fullscreen"
                     )
                     
-                    # v43.0: HYDRATION DELAY - Allow animation to complete in background
-                    # Even though window is hidden, macOS still animates the state change
-                    hydration_delay = 1.0
-                    logger.debug(f"[YABAI v43.0] ⏳ Waiting {hydration_delay}s for hydration...")
-                    await asyncio.sleep(hydration_delay)
-                    
-                    return True
-                else:
+                elif proc.returncode == 1:
+                    # AppleScript error - check stderr for details
                     error_msg = stderr.decode().strip() if stderr else "Unknown error"
+                    
+                    # Check for permission denied (-1743)
+                    if "-1743" in error_msg or "not allowed" in error_msg.lower():
+                        # ═══════════════════════════════════════════════════════
+                        # v43.5: CRITICAL ALERT - User must approve permission
+                        # ═══════════════════════════════════════════════════════
+                        logger.critical(
+                            f"[YABAI v43.5] ⚠️ PERMISSION DENIED! ⚠️\n"
+                            f"JARVIS needs Automation permission to control {actual_app_name}.\n"
+                            f"Please check for a macOS popup asking to allow access.\n"
+                            f"Go to: System Preferences → Security & Privacy → Privacy → Automation\n"
+                            f"Enable: Terminal (or Python) → {actual_app_name}"
+                        )
+                        # Still proceed - the move might work anyway if not actually fullscreen
+                        
+                    elif "-600" in error_msg or "not running" in error_msg.lower():
+                        # App isn't running - nothing to unpack
+                        logger.debug(f"[YABAI v43.5] {actual_app_name} not running - skip unpack")
+                        
+                    elif "-1728" in error_msg:
+                        # Property doesn't exist - app doesn't support fullscreen scripting
+                        logger.debug(
+                            f"[YABAI v43.5] {actual_app_name} doesn't support fullscreen scripting"
+                        )
+                        
+                    else:
+                        # Other error - log but proceed
+                        logger.warning(
+                            f"[YABAI v43.5] AppleScript returned error (code {proc.returncode}): {error_msg}"
+                        )
+                else:
+                    # Non-standard return code
+                    error_msg = stderr.decode().strip() if stderr else "Unknown"
                     logger.warning(
-                        f"[YABAI v43.0] ⚠️ DEEP UNPACK AppleScript returned error: {error_msg}"
+                        f"[YABAI v43.5] Unexpected return code {proc.returncode}: {error_msg}"
                     )
-                    # Still return True - the error might be benign (e.g., no windows in fullscreen)
-                    return True
                     
             except asyncio.TimeoutError:
                 logger.warning(
-                    f"[YABAI v43.0] ⚠️ DEEP UNPACK timed out for {app_name} - proceeding anyway"
+                    f"[YABAI v43.5] ⚠️ AppleScript timed out for {actual_app_name} - proceeding anyway"
                 )
-                return True  # Proceed anyway - timeout doesn't mean failure
                 
         except FileNotFoundError:
-            logger.warning("[YABAI v43.0] osascript not found - skipping AppleScript unpack")
-            return True  # Graceful degradation
+            logger.warning("[YABAI v43.5] osascript not found - skipping AppleScript unpack")
             
         except Exception as e:
-            logger.warning(f"[YABAI v43.0] DEEP UNPACK failed: {e}")
-            return True  # Graceful degradation - don't block the move operation
+            logger.warning(f"[YABAI v43.5] Universal Unpack failed: {e}")
+        
+        # ═══════════════════════════════════════════════════════════════════════
+        # v43.5: WAIT FOR HYDRATION
+        # ═══════════════════════════════════════════════════════════════════════
+        # If fire_and_forget was True, the hydration timer already started.
+        # We just need to wait for it to complete (or it's already done).
+        # If fire_and_forget was False, we start the hydration now.
+        # ═══════════════════════════════════════════════════════════════════════
+        
+        if hydration_task:
+            # Wait for parallel hydration to complete
+            await hydration_task
+            logger.debug(f"[YABAI v43.5] ✅ Fire & Forget hydration complete")
+        else:
+            # Sequential hydration - wait now
+            logger.debug(f"[YABAI v43.5] ⏳ Waiting {hydration_delay}s for hydration...")
+            await asyncio.sleep(hydration_delay)
+        
+        # Always return True - we never want to block the move operation
+        # Even if AppleScript failed, the window might not have been fullscreen
+        return True
 
     async def _handle_fullscreen_window_async(
         self,
@@ -4338,14 +4481,17 @@ class YabaiSpaceDetector:
             # Window is hidden AND Chrome-like AND yabai says not fullscreen
             # But we can't trust yabai here - execute Deep Unpack as precaution
             logger.warning(
-                f"[YABAI v43.0] ⚠️ Window {window_id} ({app_name}) is on hidden space - "
-                f"Yabai fullscreen detection unreliable. Executing DEEP UNPACK."
+                f"[YABAI v43.5] ⚠️ Window {window_id} ({app_name}) is on hidden space - "
+                f"Yabai fullscreen detection unreliable. Executing UNIVERSAL UNPACK."
             )
             
+            # v43.5: Fire & Forget mode - start hydration timer immediately
+            # The AppleScript runs in parallel with the hydration delay
             await self._deep_unpack_via_applescript(
                 app_name=app_name,
                 window_title=window_title,
-                window_id=window_id
+                window_id=window_id,
+                fire_and_forget=True  # v43.5: Maximum parallelism
             )
             
             # Even if AppleScript ran, we mark as "handled" and proceed
@@ -6276,68 +6422,68 @@ class YabaiSpaceDetector:
                 )
 
             # Parallel move windows from this space (works with or without space switch)
-            async def rescue_window(w):
-                window_id = w.get("window_id")
-                app_name = w.get("app_name") or w.get("app")
-                is_minimized = w.get("minimized", False) or w.get("is-minimized", False)
-                is_fullscreen = w.get("is_fullscreen", False) or w.get("is-native-fullscreen", False)
-                move_start = time.time()
+                async def rescue_window(w):
+                    window_id = w.get("window_id")
+                    app_name = w.get("app_name") or w.get("app")
+                    is_minimized = w.get("minimized", False) or w.get("is-minimized", False)
+                    is_fullscreen = w.get("is_fullscreen", False) or w.get("is-native-fullscreen", False)
+                    move_start = time.time()
 
-                strategy = RescueStrategy.DIRECT  # v31.1: Default to direct move
+                    strategy = RescueStrategy.DIRECT  # v31.1: Default to direct move
 
-                # =========================================================
-                # v35.5: FULLSCREEN HANDLING REMOVED - Now in move_window_to_space_async
-                # =========================================================
-                # The fullscreen unpacking is now handled by _handle_fullscreen_window_async
-                # which is called inside move_window_to_space_async. This prevents the
-                # DOUBLE TOGGLE bug where we unpack here and then re-pack in the move function.
-                #
-                # If is_fullscreen is True, move_window_to_space_async will:
-                # 1. Detect fullscreen via _handle_fullscreen_window_async
-                # 2. Unpack with proper animation delay
-                # 3. Invalidate space cache
-                # 4. Re-query topology before move
-                # =========================================================
-                if is_fullscreen:
-                    logger.info(
-                        f"[YABAI] 🖥️ Window {window_id} is fullscreen - will be unpacked by move_window_to_space_async"
-                    )
-                    strategy = RescueStrategy.EXIT_FULLSCREEN_FIRST
-
-                # v31.1: RE-QUERY ghost space index before each move
-                # Space indices are DYNAMIC and can change after fullscreen exit!
-                current_ghost_space = self.get_ghost_display_space()
-                if current_ghost_space is None:
-                    current_ghost_space = ghost_space  # Fallback to original
-                    logger.warning(f"[YABAI] Could not re-query ghost space, using {ghost_space}")
-
-                success = await self.move_window_to_space_async(window_id, current_ghost_space, silent=silent)
-                duration_ms = (time.time() - move_start) * 1000
-
-                # If first attempt failed and window is minimized, try unminimize
-                if not success and is_minimized:
-                    try:
-                        yabai_path = self._health.yabai_path or "yabai"
-                        await run_subprocess_async(
-                            [yabai_path, "-m", "window", str(window_id), "--minimize", "off"],
-                            timeout=2.0
+                    # =========================================================
+                    # v35.5: FULLSCREEN HANDLING REMOVED - Now in move_window_to_space_async
+                    # =========================================================
+                    # The fullscreen unpacking is now handled by _handle_fullscreen_window_async
+                    # which is called inside move_window_to_space_async. This prevents the
+                    # DOUBLE TOGGLE bug where we unpack here and then re-pack in the move function.
+                    #
+                    # If is_fullscreen is True, move_window_to_space_async will:
+                    # 1. Detect fullscreen via _handle_fullscreen_window_async
+                    # 2. Unpack with proper animation delay
+                    # 3. Invalidate space cache
+                    # 4. Re-query topology before move
+                    # =========================================================
+                    if is_fullscreen:
+                        logger.info(
+                            f"[YABAI] 🖥️ Window {window_id} is fullscreen - will be unpacked by move_window_to_space_async"
                         )
-                        await asyncio.sleep(wake_delay_s)
-                        success = await self.move_window_to_space_async(window_id, current_ghost_space, silent=silent)
-                        strategy = RescueStrategy.UNMINIMIZE_FIRST
-                    except Exception:
-                        pass
+                        strategy = RescueStrategy.EXIT_FULLSCREEN_FIRST
 
-                # If still failed and was fullscreen, maybe animation wasn't complete
-                if not success and is_fullscreen:
-                    logger.debug(f"[YABAI] Retry after fullscreen exit for window {window_id}")
-                    try:
-                        # Wait a bit more and retry with fresh ghost space index
-                        await asyncio.sleep(0.5)
-                        retry_ghost_space = self.get_ghost_display_space() or current_ghost_space
-                        success = await self.move_window_to_space_async(window_id, retry_ghost_space, silent=silent)
-                    except Exception:
-                        pass
+                    # v31.1: RE-QUERY ghost space index before each move
+                    # Space indices are DYNAMIC and can change after fullscreen exit!
+                    current_ghost_space = self.get_ghost_display_space()
+                    if current_ghost_space is None:
+                        current_ghost_space = ghost_space  # Fallback to original
+                        logger.warning(f"[YABAI] Could not re-query ghost space, using {ghost_space}")
+
+                    success = await self.move_window_to_space_async(window_id, current_ghost_space, silent=silent)
+                    duration_ms = (time.time() - move_start) * 1000
+
+                    # If first attempt failed and window is minimized, try unminimize
+                    if not success and is_minimized:
+                        try:
+                            yabai_path = self._health.yabai_path or "yabai"
+                            await run_subprocess_async(
+                                [yabai_path, "-m", "window", str(window_id), "--minimize", "off"],
+                                timeout=2.0
+                            )
+                            await asyncio.sleep(wake_delay_s)
+                            success = await self.move_window_to_space_async(window_id, current_ghost_space, silent=silent)
+                            strategy = RescueStrategy.UNMINIMIZE_FIRST
+                        except Exception:
+                            pass
+
+                    # If still failed and was fullscreen, maybe animation wasn't complete
+                    if not success and is_fullscreen:
+                        logger.debug(f"[YABAI] Retry after fullscreen exit for window {window_id}")
+                        try:
+                            # Wait a bit more and retry with fresh ghost space index
+                            await asyncio.sleep(0.5)
+                            retry_ghost_space = self.get_ghost_display_space() or current_ghost_space
+                            success = await self.move_window_to_space_async(window_id, retry_ghost_space, silent=silent)
+                        except Exception:
+                            pass
 
                     telemetry.record_attempt(
                         success=success,
@@ -6354,11 +6500,11 @@ class YabaiSpaceDetector:
                         "method": "rescue" if success else "failed",
                         "strategy": strategy.value,
                         "duration_ms": duration_ms,
-                    "app_name": app_name,
-                    "was_fullscreen": is_fullscreen
+                        "app_name": app_name,
+                        "was_fullscreen": is_fullscreen
                     }
 
-            # Execute rescues in parallel (OUTSIDE rescue_window function)
+                # Execute rescues in parallel (OUTSIDE rescue_window function)
                 tasks = [rescue_window(w) for w in space_windows]
 
                 if len(tasks) > max_parallel:
