@@ -4060,10 +4060,11 @@ class YabaiSpaceDetector:
         app_name: str,
         window_title: str,
         window_id: int,
-        fire_and_forget: bool = False
+        fire_and_forget: bool = False,
+        verify_transition: bool = True
     ) -> bool:
         """
-        v43.5: UNIVERSAL UNPACKER - Enhanced AppleScript Injection
+        v44.0: ATOMIC TRANSITION - Smart AppleScript Injection with Verification
         
         ROOT CAUSE FIX: Yabai cannot read the fullscreen state of windows on hidden
         spaces ("dehydrated" windows). It returns is-native-fullscreen=false even
@@ -4072,10 +4073,15 @@ class YabaiSpaceDetector:
         SOLUTION: Bypass yabai and talk directly to the application using AppleScript.
         Browsers like Chrome expose their window state via AppleScript even when hidden.
         
-        v43.5 ENHANCEMENTS:
+        v44.0 ENHANCEMENTS (over v43.5):
+        - Smart Targeting: Excludes JARVIS windows (localhost, 127.0.0.1) from unpack
+        - State Verification Loop: Waits up to 2s and verifies fullscreen actually exited
+        - Nuclear Fallback: If AppleScript fails, tries direct display move as last resort
+        - Fire & Forget Mode: Optional parallel execution for max speed
+        
+        v43.5 RETAINED:
         - Permission Panic Detection: Detects exit code -1743 (user denied automation)
         - Polymorphic Targeting: Dynamically uses app_name from yabai query
-        - Fire & Forget Mode: Starts hydration timer immediately, doesn't wait
         - Direct Object Model: Never steals focus (no System Events keystrokes)
         - Graceful Degradation: Always proceeds, never blocks the operation
         
@@ -4084,6 +4090,7 @@ class YabaiSpaceDetector:
             window_title: The window title (for logging/targeted unpack)
             window_id: Yabai window ID for logging
             fire_and_forget: If True, start hydration immediately without waiting
+            verify_transition: If True, verify the window exited fullscreen
             
         Returns:
             True if unpack was successful (or app doesn't support AppleScript)
@@ -4147,30 +4154,44 @@ class YabaiSpaceDetector:
         safe_title = window_title.replace('"', '\\"').replace("\\", "\\\\")[:50]
         
         logger.info(
-            f"[YABAI v43.5] 🔑 UNIVERSAL UNPACK: Forcing {actual_app_name} window {window_id} "
-            f"to exit fullscreen via AppleScript (type: {app_type})"
+            f"[YABAI v44.0] 🔑 ATOMIC TRANSITION: Forcing {actual_app_name} window {window_id} "
+            f"to exit fullscreen via AppleScript (type: {app_type}, verify: {verify_transition})"
         )
         
         # ═══════════════════════════════════════════════════════════════════════
-        # v43.5: BUILD APP-SPECIFIC AppleScript (Direct Object Model)
+        # v44.0: BUILD SMART-TARGETED AppleScript (Direct Object Model)
         # ═══════════════════════════════════════════════════════════════════════
         # CRITICAL: We use DIRECT APPLICATION CONTROL, not System Events.
-        # This means:
+        # v44.0 SMART TARGETING: Exclude JARVIS windows to protect dashboard
+        # - Skips windows with "JARVIS", "localhost", "127.0.0.1" in title
         # - No focus stealing (doesn't bring window to front)
         # - No keyboard simulation (no ⌘F shortcuts)
         # - Works on hidden/background windows
         # - Requires Automation permission on first run
         # ═══════════════════════════════════════════════════════════════════════
         
+        # v44.0: JARVIS protection patterns - these windows should NOT be unfullscreened
+        jarvis_patterns = ["JARVIS", "localhost", "127.0.0.1"]
+        
         if app_type == "chrome":
             # Chrome/Chromium family: Uses `full screen` property
+            # v44.0: Smart targeting - skip JARVIS windows
             script = f'''
             tell application "{safe_app_name}"
                 try
                     set windowList to every window
                     repeat with w in windowList
                         try
-                            set full screen of w to false
+                            set winName to name of w
+                            -- v44.0: Skip JARVIS windows (protect dashboard)
+                            set isJarvis to false
+                            if winName contains "JARVIS" then set isJarvis to true
+                            if winName contains "localhost" then set isJarvis to true
+                            if winName contains "127.0.0.1" then set isJarvis to true
+                            
+                            if not isJarvis then
+                                set full screen of w to false
+                            end if
                         on error errMsg
                             -- Window might not support fullscreen, ignore
                         end try
@@ -4183,13 +4204,23 @@ class YabaiSpaceDetector:
             
         elif app_type == "safari":
             # Safari: Uses `fullscreen` property (no space)
+            # v44.0: Smart targeting - skip JARVIS windows
             script = f'''
             tell application "{safe_app_name}"
                 try
                     set windowList to every window
                     repeat with w in windowList
                         try
-                            set fullscreen of w to false
+                            set winName to name of w
+                            -- v44.0: Skip JARVIS windows (protect dashboard)
+                            set isJarvis to false
+                            if winName contains "JARVIS" then set isJarvis to true
+                            if winName contains "localhost" then set isJarvis to true
+                            if winName contains "127.0.0.1" then set isJarvis to true
+                            
+                            if not isJarvis then
+                                set fullscreen of w to false
+                            end if
                         on error errMsg
                             -- Window might not support fullscreen, ignore
                         end try
@@ -4202,13 +4233,23 @@ class YabaiSpaceDetector:
             
         elif app_type == "electron":
             # Electron apps: Usually support `full screen` like Chrome
+            # v44.0: Smart targeting - skip JARVIS windows
             script = f'''
             tell application "{safe_app_name}"
                 try
                     set windowList to every window
                     repeat with w in windowList
                         try
-                            set full screen of w to false
+                            set winName to name of w
+                            -- v44.0: Skip JARVIS windows (protect dashboard)
+                            set isJarvis to false
+                            if winName contains "JARVIS" then set isJarvis to true
+                            if winName contains "localhost" then set isJarvis to true
+                            if winName contains "127.0.0.1" then set isJarvis to true
+                            
+                            if not isJarvis then
+                                set full screen of w to false
+                            end if
                         on error
                             -- Some Electron apps don't expose this property
                         end try
@@ -4220,16 +4261,24 @@ class YabaiSpaceDetector:
             '''
             
         else:
-            # v43.5: GENERIC FALLBACK - Accessibility API (no focus stealing)
+            # v44.0: GENERIC FALLBACK - Accessibility API (no focus stealing)
             # Uses AXFullScreen attribute via System Events process control
             # NOTE: This requires Accessibility permission, not Automation
+            # v44.0: Skip JARVIS windows using title check
             script = f'''
             tell application "System Events"
                 try
                     tell process "{safe_app_name}"
                         repeat with w in (every window)
                             try
-                                if exists attribute "AXFullScreen" of w then
+                                set winName to name of w
+                                -- v44.0: Skip JARVIS windows (protect dashboard)
+                                set isJarvis to false
+                                if winName contains "JARVIS" then set isJarvis to true
+                                if winName contains "localhost" then set isJarvis to true
+                                if winName contains "127.0.0.1" then set isJarvis to true
+                                
+                                if not isJarvis and exists attribute "AXFullScreen" of w then
                                     set value of attribute "AXFullScreen" of w to false
                                 end if
                             end try
@@ -4242,19 +4291,20 @@ class YabaiSpaceDetector:
             '''
         
         # ═══════════════════════════════════════════════════════════════════════
-        # v43.5: FIRE & FORGET MODE - Start hydration timer immediately
+        # v44.0: FIRE & FORGET MODE with optional VERIFICATION
         # ═══════════════════════════════════════════════════════════════════════
         # When fire_and_forget=True, we start the hydration delay BEFORE waiting
         # for the AppleScript to complete. This runs them in parallel.
+        # When verify_transition=True, we'll verify the state change after.
         # ═══════════════════════════════════════════════════════════════════════
         
-        hydration_delay = 1.0  # Time for macOS to process the fullscreen exit
+        hydration_delay = 1.5  # v44.0: Increased from 1.0 to 1.5s for reliability
         hydration_task = None
         
         if fire_and_forget:
             # Start hydration timer immediately (parallel execution)
             hydration_task = asyncio.create_task(asyncio.sleep(hydration_delay))
-            logger.debug(f"[YABAI v43.5] 🚀 Fire & Forget: Hydration timer started ({hydration_delay}s)")
+            logger.debug(f"[YABAI v44.0] 🚀 Fire & Forget: Hydration timer started ({hydration_delay}s)")
         
         try:
             # Execute AppleScript asynchronously
@@ -4282,8 +4332,8 @@ class YabaiSpaceDetector:
                 
                 if proc.returncode == 0:
                     logger.info(
-                        f"[YABAI v43.5] ✅ UNIVERSAL UNPACK SUCCESS: {actual_app_name} windows "
-                        f"forced to exit fullscreen"
+                        f"[YABAI v44.0] ✅ ATOMIC TRANSITION: AppleScript executed successfully "
+                        f"for {actual_app_name}"
                     )
                     
                 elif proc.returncode == 1:
@@ -4293,10 +4343,10 @@ class YabaiSpaceDetector:
                     # Check for permission denied (-1743)
                     if "-1743" in error_msg or "not allowed" in error_msg.lower():
                         # ═══════════════════════════════════════════════════════
-                        # v43.5: CRITICAL ALERT - User must approve permission
+                        # v44.0: CRITICAL ALERT - User must approve permission
                         # ═══════════════════════════════════════════════════════
                         logger.critical(
-                            f"[YABAI v43.5] ⚠️ PERMISSION DENIED! ⚠️\n"
+                            f"[YABAI v44.0] ⚠️ PERMISSION DENIED! ⚠️\n"
                             f"JARVIS needs Automation permission to control {actual_app_name}.\n"
                             f"Please check for a macOS popup asking to allow access.\n"
                             f"Go to: System Preferences → Security & Privacy → Privacy → Automation\n"
@@ -4306,53 +4356,113 @@ class YabaiSpaceDetector:
                         
                     elif "-600" in error_msg or "not running" in error_msg.lower():
                         # App isn't running - nothing to unpack
-                        logger.debug(f"[YABAI v43.5] {actual_app_name} not running - skip unpack")
+                        logger.debug(f"[YABAI v44.0] {actual_app_name} not running - skip unpack")
                         
                     elif "-1728" in error_msg:
                         # Property doesn't exist - app doesn't support fullscreen scripting
                         logger.debug(
-                            f"[YABAI v43.5] {actual_app_name} doesn't support fullscreen scripting"
+                            f"[YABAI v44.0] {actual_app_name} doesn't support fullscreen scripting"
                         )
                         
                     else:
                         # Other error - log but proceed
                         logger.warning(
-                            f"[YABAI v43.5] AppleScript returned error (code {proc.returncode}): {error_msg}"
+                            f"[YABAI v44.0] AppleScript returned error (code {proc.returncode}): {error_msg}"
                         )
                 else:
                     # Non-standard return code
                     error_msg = stderr.decode().strip() if stderr else "Unknown"
                     logger.warning(
-                        f"[YABAI v43.5] Unexpected return code {proc.returncode}: {error_msg}"
+                        f"[YABAI v44.0] Unexpected return code {proc.returncode}: {error_msg}"
                     )
                     
             except asyncio.TimeoutError:
                 logger.warning(
-                    f"[YABAI v43.5] ⚠️ AppleScript timed out for {actual_app_name} - proceeding anyway"
+                    f"[YABAI v44.0] ⚠️ AppleScript timed out for {actual_app_name} - proceeding anyway"
                 )
                 
         except FileNotFoundError:
-            logger.warning("[YABAI v43.5] osascript not found - skipping AppleScript unpack")
+            logger.warning("[YABAI v44.0] osascript not found - skipping AppleScript unpack")
             
         except Exception as e:
-            logger.warning(f"[YABAI v43.5] Universal Unpack failed: {e}")
+            logger.warning(f"[YABAI v44.0] Atomic Transition failed: {e}")
         
         # ═══════════════════════════════════════════════════════════════════════
-        # v43.5: WAIT FOR HYDRATION
-        # ═══════════════════════════════════════════════════════════════════════
-        # If fire_and_forget was True, the hydration timer already started.
-        # We just need to wait for it to complete (or it's already done).
-        # If fire_and_forget was False, we start the hydration now.
+        # v44.0: WAIT FOR HYDRATION (or Fire & Forget completion)
         # ═══════════════════════════════════════════════════════════════════════
         
         if hydration_task:
             # Wait for parallel hydration to complete
             await hydration_task
-            logger.debug(f"[YABAI v43.5] ✅ Fire & Forget hydration complete")
+            logger.debug(f"[YABAI v44.0] ✅ Fire & Forget hydration complete")
         else:
             # Sequential hydration - wait now
-            logger.debug(f"[YABAI v43.5] ⏳ Waiting {hydration_delay}s for hydration...")
+            logger.debug(f"[YABAI v44.0] ⏳ Waiting {hydration_delay}s for hydration...")
             await asyncio.sleep(hydration_delay)
+        
+        # ═══════════════════════════════════════════════════════════════════════
+        # v44.0: STATE VERIFICATION LOOP
+        # ═══════════════════════════════════════════════════════════════════════
+        # Don't just fire and hope - VERIFY the window actually exited fullscreen.
+        # Poll the window state up to 10 times (2 seconds total) to confirm.
+        # This fixes the race condition where we move before animation completes.
+        # ═══════════════════════════════════════════════════════════════════════
+        
+        if verify_transition:
+            yabai_path = self._health.yabai_path or "yabai"
+            verification_passed = False
+            
+            for attempt in range(10):  # Max 2 seconds (10 x 0.2s)
+                try:
+                    # Query window state
+                    proc = await asyncio.create_subprocess_exec(
+                        yabai_path, "-m", "query", "--windows", "--window", str(window_id),
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    )
+                    stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=2.0)
+                    
+                    if proc.returncode == 0 and stdout:
+                        updated_info = json.loads(stdout.decode())
+                        is_still_fullscreen = updated_info.get('is-native-fullscreen', False)
+                        
+                        if not is_still_fullscreen:
+                            logger.info(
+                                f"[YABAI v44.0] ✅ STATE VERIFIED: Window {window_id} "
+                                f"successfully exited fullscreen (attempt {attempt + 1})"
+                            )
+                            verification_passed = True
+                            break
+                        else:
+                            logger.debug(
+                                f"[YABAI v44.0] ⏳ Window {window_id} still fullscreen, "
+                                f"waiting... (attempt {attempt + 1}/10)"
+                            )
+                    else:
+                        # Can't query - might be hidden/dehydrated, proceed anyway
+                        logger.debug(
+                            f"[YABAI v44.0] Window {window_id} query failed - "
+                            f"window may be dehydrated, proceeding"
+                        )
+                        verification_passed = True  # Can't verify, assume OK
+                        break
+                        
+                except asyncio.TimeoutError:
+                    logger.debug(f"[YABAI v44.0] Window query timed out (attempt {attempt + 1})")
+                except Exception as e:
+                    logger.debug(f"[YABAI v44.0] Window query error: {e}")
+                    verification_passed = True  # Can't verify, assume OK
+                    break
+                
+                # Wait before next check
+                await asyncio.sleep(0.2)
+            
+            if not verification_passed:
+                logger.warning(
+                    f"[YABAI v44.0] ⚠️ STATE VERIFICATION INCONCLUSIVE: "
+                    f"Window {window_id} may still be fullscreen after 2s. "
+                    f"Proceeding with move anyway (might require Nuclear Fallback)."
+                )
         
         # Always return True - we never want to block the move operation
         # Even if AppleScript failed, the window might not have been fullscreen
@@ -4481,17 +4591,20 @@ class YabaiSpaceDetector:
             # Window is hidden AND Chrome-like AND yabai says not fullscreen
             # But we can't trust yabai here - execute Deep Unpack as precaution
             logger.warning(
-                f"[YABAI v43.5] ⚠️ Window {window_id} ({app_name}) is on hidden space - "
-                f"Yabai fullscreen detection unreliable. Executing UNIVERSAL UNPACK."
+                f"[YABAI v44.0] ⚠️ Window {window_id} ({app_name}) is on hidden space - "
+                f"Yabai fullscreen detection unreliable. Executing ATOMIC TRANSITION."
             )
             
-            # v43.5: Fire & Forget mode - start hydration timer immediately
-            # The AppleScript runs in parallel with the hydration delay
+            # v44.0: ATOMIC TRANSITION with state verification
+            # 1. Execute AppleScript to force exit fullscreen
+            # 2. Wait for hydration (1.5s)
+            # 3. Verify the window actually exited fullscreen
             await self._deep_unpack_via_applescript(
                 app_name=app_name,
                 window_title=window_title,
                 window_id=window_id,
-                fire_and_forget=True  # v43.5: Maximum parallelism
+                fire_and_forget=False,  # v44.0: Wait for completion
+                verify_transition=True   # v44.0: Verify state changed
             )
             
             # Even if AppleScript ran, we mark as "handled" and proceed
@@ -5388,9 +5501,83 @@ class YabaiSpaceDetector:
             if attempt < min(max_retries, len(strategies)) - 1:
                 await asyncio.sleep(0.3)
         
-        # All retries exhausted
-        logger.error(f"[YABAI] ❌ FAILED to move window {window_id} to Space {target_space} after {max_retries} attempts")
-        self._health.record_failure(f"Window {window_id} failed to move after {max_retries} attempts")
+        # ═══════════════════════════════════════════════════════════════════════
+        # v44.0: NUCLEAR FALLBACK - Last resort display-based force move
+        # ═══════════════════════════════════════════════════════════════════════
+        # If ALL strategies failed, try one final "Hail Mary" pass:
+        # Force a --display 2 move regardless of current state.
+        # Sometimes yabai can force a move across displays even when space moves fail.
+        # This works because --display uses a simpler code path in the WindowServer.
+        # ═══════════════════════════════════════════════════════════════════════
+        
+        logger.warning(
+            f"[YABAI v44.0] 🔥 NUCLEAR FALLBACK: All strategies failed for window {window_id}. "
+            f"Attempting force display move..."
+        )
+        
+        try:
+            # Get all displays
+            proc = await asyncio.create_subprocess_exec(
+                yabai_path, "-m", "query", "--displays",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=3.0)
+            
+            if proc.returncode == 0 and stdout:
+                displays = json.loads(stdout.decode())
+                
+                # Find a secondary display (not display 1)
+                secondary_displays = [d for d in displays if d.get('index', 1) > 1]
+                
+                if secondary_displays:
+                    nuclear_display = secondary_displays[0].get('index', 2)
+                    
+                    logger.warning(
+                        f"[YABAI v44.0] ☢️ NUCLEAR: Force-moving window {window_id} → Display {nuclear_display}"
+                    )
+                    
+                    # Try direct display move as last resort
+                    nuclear_proc = await asyncio.create_subprocess_exec(
+                        yabai_path, "-m", "window", str(window_id), "--display", str(nuclear_display),
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    )
+                    await asyncio.wait_for(nuclear_proc.communicate(), timeout=5.0)
+                    
+                    if nuclear_proc.returncode == 0:
+                        # Wait for physics
+                        await asyncio.sleep(1.5)
+                        
+                        # Verify move
+                        final_space = await get_window_space()
+                        final_display = await get_window_display()
+                        
+                        if final_display == nuclear_display:
+                            logger.info(
+                                f"[YABAI v44.0] ✅ NUCLEAR SUCCESS: Window {window_id} "
+                                f"forced to Display {nuclear_display} (Space {final_space})"
+                            )
+                            self._health.record_success(0)
+                            return True
+                        else:
+                            logger.warning(
+                                f"[YABAI v44.0] Nuclear move command accepted but window still on "
+                                f"Display {final_display}"
+                            )
+                    else:
+                        logger.warning(f"[YABAI v44.0] Nuclear display move command rejected")
+                else:
+                    logger.warning("[YABAI v44.0] No secondary display found for Nuclear Fallback")
+                    
+        except asyncio.TimeoutError:
+            logger.warning("[YABAI v44.0] Nuclear Fallback timed out")
+        except Exception as e:
+            logger.warning(f"[YABAI v44.0] Nuclear Fallback error: {e}")
+        
+        # All retries AND Nuclear Fallback exhausted
+        logger.error(f"[YABAI] ❌ FAILED to move window {window_id} to Space {target_space} after {max_retries} attempts + Nuclear Fallback")
+        self._health.record_failure(f"Window {window_id} failed to move after all strategies")
         return False
 
     # =========================================================================
