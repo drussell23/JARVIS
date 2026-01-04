@@ -6488,6 +6488,545 @@ class YabaiSpaceDetector:
             logger.warning(f"[YABAI v56.0] 💀 REAPER find replacement exception: {e}")
             return None
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # v57.0: SUMMON PROTOCOL - Bi-Directional Teleportation
+    # ═══════════════════════════════════════════════════════════════════════════
+    # ROOT CAUSE FIX: Windows exiled to the Shadow Realm (Ghost Display) need
+    # a way to return to the user's active display. This completes the teleportation
+    # lifecycle: Exile → Watch → Summon
+    #
+    # PHILOSOPHY: No hardcoding. Detect the user's active display dynamically.
+    # Sanitize the window state before transport (exit fullscreen, repair AX).
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    async def _get_active_display_index_async(self) -> int:
+        """
+        v57.0: Get the index of the display the user is currently focused on.
+
+        Uses yabai to query the focused display, avoiding any hardcoding.
+        Falls back to Display 1 if query fails.
+
+        Returns:
+            Display index (1-based) of the active display
+        """
+        yabai_path = self._health.yabai_path or os.getenv("YABAI_PATH", "/opt/homebrew/bin/yabai")
+
+        try:
+            # Query the focused display
+            proc = await asyncio.create_subprocess_exec(
+                yabai_path, "-m", "query", "--displays", "--display",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+
+            if proc.returncode == 0 and stdout:
+                display_info = json.loads(stdout.decode())
+                display_index = display_info.get("index", 1)
+                logger.debug(f"[YABAI v57.0] Active display: {display_index}")
+                return display_index
+
+        except Exception as e:
+            logger.warning(f"[YABAI v57.0] Could not query active display: {e}")
+
+        # Fallback to Display 1
+        return 1
+
+    async def _get_active_space_index_async(self) -> int:
+        """
+        v57.0: Get the index of the space the user is currently on.
+
+        Returns:
+            Space index of the active space (falls back to 1)
+        """
+        yabai_path = self._health.yabai_path or os.getenv("YABAI_PATH", "/opt/homebrew/bin/yabai")
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                yabai_path, "-m", "query", "--spaces", "--space",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+
+            if proc.returncode == 0 and stdout:
+                space_info = json.loads(stdout.decode())
+                space_index = space_info.get("index", 1)
+                logger.debug(f"[YABAI v57.0] Active space: {space_index}")
+                return space_index
+
+        except Exception as e:
+            logger.warning(f"[YABAI v57.0] Could not query active space: {e}")
+
+        return 1
+
+    async def summon_window_from_shadow_realm_async(
+        self,
+        window_id: Optional[int] = None,
+        app_name: Optional[str] = None,
+        window_title: Optional[str] = None,
+        pid: Optional[int] = None,
+        focus_after_summon: bool = True,
+        maximize_after_summon: bool = False
+    ) -> Tuple[bool, str, Optional[int]]:
+        """
+        v57.0: SUMMON PROTOCOL - Bring a window back from the Shadow Realm.
+
+        Completes the bi-directional teleportation cycle:
+        - Exile: Window → Ghost Display (for JARVIS to watch)
+        - Summon: Window → User's Active Display (for user to interact)
+
+        Handles all edge cases:
+        1. LOCATE: Find window (by ID, app, title, or PID) using Phoenix/Reaper
+        2. SANITIZE: Ensure AX reference is valid (v55.0), exit fullscreen if needed
+        3. TARGET: Dynamically detect user's active display (no hardcoding)
+        4. MOVE: Transport window to active display
+        5. FOCUS: Bring window to front
+
+        Args:
+            window_id: Specific window ID to summon (optional)
+            app_name: App name to find window by (optional)
+            window_title: Window title for matching (optional)
+            pid: Process ID for targeted search (optional)
+            focus_after_summon: Whether to focus the window after summoning
+            maximize_after_summon: Whether to maximize the window after summoning
+
+        Returns:
+            Tuple of:
+                - success: Whether the summon was successful
+                - method: Description of what happened
+                - final_window_id: The window ID that was summoned (may differ from input)
+        """
+        yabai_path = self._health.yabai_path or os.getenv("YABAI_PATH", "/opt/homebrew/bin/yabai")
+        shadow_display = int(os.getenv("JARVIS_SHADOW_DISPLAY", "2"))
+
+        logger.info(
+            f"[YABAI v57.0] ✨ SUMMON PROTOCOL: Retrieving window from Shadow Realm "
+            f"(window_id={window_id}, app={app_name}, title={window_title[:30] if window_title else 'None'})"
+        )
+
+        # ═══════════════════════════════════════════════════════════════════
+        # PHASE 1: LOCATE - Find the window on the Shadow Realm
+        # ═══════════════════════════════════════════════════════════════════
+        target_window_id = window_id
+        window_info = None
+
+        if not target_window_id:
+            # Need to find the window by app/title/pid
+            logger.info(f"[YABAI v57.0] 🔍 LOCATE: Searching for window...")
+
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    yabai_path, "-m", "query", "--windows",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+
+                if proc.returncode == 0 and stdout:
+                    all_windows = json.loads(stdout.decode())
+
+                    # Filter by criteria
+                    candidates = []
+                    for w in all_windows:
+                        # Must be on Shadow Realm
+                        if w.get("display") != shadow_display:
+                            continue
+
+                        # Filter by app name
+                        if app_name and w.get("app") != app_name:
+                            continue
+
+                        # Filter by PID
+                        if pid and w.get("pid") != pid:
+                            continue
+
+                        # Filter by title (fuzzy)
+                        if window_title:
+                            w_title = w.get("title", "")
+                            if window_title not in w_title and w_title not in window_title:
+                                if window_title.lower() not in w_title.lower():
+                                    continue
+
+                        candidates.append(w)
+
+                    if candidates:
+                        # Prefer windows with AX reference
+                        actionable = [c for c in candidates if c.get("has-ax-reference", False)]
+                        if actionable:
+                            window_info = actionable[0]
+                        else:
+                            window_info = candidates[0]
+
+                        target_window_id = window_info.get("id")
+                        logger.info(
+                            f"[YABAI v57.0] 🔍 LOCATE: Found window {target_window_id} "
+                            f"(app={window_info.get('app')}, title={window_info.get('title', '')[:30]})"
+                        )
+                    else:
+                        logger.warning(
+                            f"[YABAI v57.0] 🔍 LOCATE: No matching windows found on Shadow Realm"
+                        )
+                        return False, "window_not_found_on_shadow_realm", None
+
+            except Exception as e:
+                logger.warning(f"[YABAI v57.0] LOCATE failed: {e}")
+                return False, f"locate_error_{e}", None
+
+        # ═══════════════════════════════════════════════════════════════════
+        # PHASE 2: SANITIZE - Ensure window is actionable and not fullscreen
+        # ═══════════════════════════════════════════════════════════════════
+        logger.info(f"[YABAI v57.0] 🧹 SANITIZE: Preparing window {target_window_id} for transport...")
+
+        # Get window info if we don't have it
+        if not window_info:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    yabai_path, "-m", "query", "--windows", "--window", str(target_window_id),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+                if proc.returncode == 0 and stdout:
+                    window_info = json.loads(stdout.decode())
+            except Exception:
+                pass
+
+        # v55.0: Ensure window is actionable
+        actionable, repaired_id, repaired_info = await self._ensure_window_is_actionable_async(
+            window_id=target_window_id,
+            window_info=window_info,
+            app_name=app_name or (window_info.get("app") if window_info else None),
+            pid=pid or (window_info.get("pid") if window_info else None),
+            max_repair_attempts=2
+        )
+
+        if not actionable:
+            logger.warning(
+                f"[YABAI v57.0] 🧹 SANITIZE: Window {target_window_id} is not actionable "
+                f"(zombie/ghost state). Cannot summon."
+            )
+            return False, "window_not_actionable", target_window_id
+
+        # Update window ID if it changed during repair
+        if repaired_id != target_window_id:
+            logger.info(f"[YABAI v57.0] 🧹 Window ID updated: {target_window_id} → {repaired_id}")
+            target_window_id = repaired_id
+            window_info = repaired_info
+
+        # Check if window is fullscreen - need to exit before transport
+        is_fullscreen = window_info.get("is-native-fullscreen", False) if window_info else False
+
+        if is_fullscreen:
+            logger.info(
+                f"[YABAI v57.0] 🧹 SANITIZE: Window {target_window_id} is fullscreen - "
+                f"exiting fullscreen before transport..."
+            )
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    yabai_path, "-m", "window", str(target_window_id), "--toggle", "native-fullscreen",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                await asyncio.wait_for(proc.communicate(), timeout=5.0)
+                # Wait for fullscreen animation
+                await asyncio.sleep(1.5)
+            except Exception as e:
+                logger.warning(f"[YABAI v57.0] Failed to exit fullscreen: {e}")
+
+        # ═══════════════════════════════════════════════════════════════════
+        # PHASE 3: TARGET - Get user's active display (no hardcoding)
+        # ═══════════════════════════════════════════════════════════════════
+        dest_display = await self._get_active_display_index_async()
+        dest_space = await self._get_active_space_index_async()
+
+        # v57.1: Check if target space is fullscreen (can't move windows there)
+        target_is_fullscreen = False
+        fallback_space = None
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                yabai_path, "-m", "query", "--spaces",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+
+            if proc.returncode == 0 and stdout:
+                all_spaces = json.loads(stdout.decode())
+
+                # Check if target space is fullscreen
+                for s in all_spaces:
+                    if s.get("index") == dest_space:
+                        if s.get("is-native-fullscreen", False):
+                            target_is_fullscreen = True
+                            logger.info(
+                                f"[YABAI v57.0] ⚠️ Target space {dest_space} is fullscreen - "
+                                f"finding alternative space on Display {dest_display}"
+                            )
+                        break
+
+                # If fullscreen, find a non-fullscreen space on the same display
+                if target_is_fullscreen:
+                    for s in all_spaces:
+                        if (s.get("display") == dest_display and
+                            not s.get("is-native-fullscreen", False)):
+                            fallback_space = s.get("index")
+                            logger.info(
+                                f"[YABAI v57.0] 🎯 Found fallback space {fallback_space} "
+                                f"on Display {dest_display}"
+                            )
+                            break
+
+        except Exception as e:
+            logger.debug(f"[YABAI v57.0] Fullscreen check failed: {e}")
+
+        # Use fallback space if target is fullscreen
+        if target_is_fullscreen and fallback_space:
+            dest_space = fallback_space
+
+        logger.info(
+            f"[YABAI v57.0] 🎯 TARGET: Summoning to Display {dest_display}, Space {dest_space}"
+            f"{' (fallback from fullscreen)' if target_is_fullscreen else ''}"
+        )
+
+        # ═══════════════════════════════════════════════════════════════════
+        # v57.1: INTELLIGENT LANDING - Switch user to safe space first
+        # ═══════════════════════════════════════════════════════════════════
+        # If we're diverting to a fallback space, bring the user there first
+        # so they can see the window arrive
+        # ═══════════════════════════════════════════════════════════════════
+        if target_is_fullscreen and fallback_space:
+            logger.info(
+                f"[YABAI v57.1] 🛬 INTELLIGENT LANDING: Switching user to Safe Harbor (Space {fallback_space})..."
+            )
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    yabai_path, "-m", "space", "--focus", str(fallback_space),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                await asyncio.wait_for(proc.communicate(), timeout=5.0)
+                # Wait for space switch animation
+                await asyncio.sleep(0.3)
+            except Exception as e:
+                logger.debug(f"[YABAI v57.1] Space switch failed: {e}")
+
+        # ═══════════════════════════════════════════════════════════════════
+        # PHASE 4: MOVE - Transport window to active display
+        # ═══════════════════════════════════════════════════════════════════
+        move_success = False
+
+        # Try display-based move first (most reliable)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                yabai_path, "-m", "window", str(target_window_id), "--display", str(dest_display),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+
+            if proc.returncode == 0:
+                move_success = True
+                logger.info(
+                    f"[YABAI v57.0] 🚀 MOVE: Window {target_window_id} → Display {dest_display} SUCCESS"
+                )
+            else:
+                error_msg = stderr.decode().strip() if stderr else "Unknown"
+                logger.warning(f"[YABAI v57.0] Display move failed: {error_msg}")
+
+                # v57.1: If display move failed due to fullscreen, try space move with fallback
+                if "fullscreen" in error_msg.lower() and fallback_space:
+                    logger.info(
+                        f"[YABAI v57.0] Retrying with fallback space {fallback_space}..."
+                    )
+                    proc = await asyncio.create_subprocess_exec(
+                        yabai_path, "-m", "window", str(target_window_id), "--space", str(fallback_space),
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    )
+                    _, stderr2 = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+                    if proc.returncode == 0:
+                        move_success = True
+                        logger.info(
+                            f"[YABAI v57.0] 🚀 MOVE: Window {target_window_id} → Space {fallback_space} SUCCESS (fallback)"
+                        )
+
+        except Exception as e:
+            logger.warning(f"[YABAI v57.0] Display move exception: {e}")
+
+        # Fallback: Try space-based move
+        if not move_success:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    yabai_path, "-m", "window", str(target_window_id), "--space", str(dest_space),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                _, stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+
+                if proc.returncode == 0:
+                    move_success = True
+                    logger.info(
+                        f"[YABAI v57.0] 🚀 MOVE: Window {target_window_id} → Space {dest_space} SUCCESS"
+                    )
+
+            except Exception as e:
+                logger.warning(f"[YABAI v57.0] Space move exception: {e}")
+
+        if not move_success:
+            logger.error(f"[YABAI v57.0] ❌ MOVE FAILED: Could not summon window {target_window_id}")
+            return False, "move_failed", target_window_id
+
+        # Wait for move to complete
+        await asyncio.sleep(0.5)
+
+        # ═══════════════════════════════════════════════════════════════════
+        # PHASE 5: DEMINIMIZE + FOCUS - Bring window to front
+        # ═══════════════════════════════════════════════════════════════════
+        # v57.1: If window was minimized on Ghost Display, deminimize first
+        # ═══════════════════════════════════════════════════════════════════
+        if focus_after_summon:
+            logger.info(f"[YABAI v57.0] 👁️ FOCUS: Bringing window {target_window_id} to front...")
+
+            # v57.1: Deminimize first (handles minimized windows)
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    yabai_path, "-m", "window", str(target_window_id), "--deminimize",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                await asyncio.wait_for(proc.communicate(), timeout=5.0)
+            except Exception as e:
+                logger.debug(f"[YABAI v57.1] Deminimize command failed (may not be minimized): {e}")
+
+            # Now focus the window
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    yabai_path, "-m", "window", str(target_window_id), "--focus",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                await asyncio.wait_for(proc.communicate(), timeout=5.0)
+            except Exception as e:
+                logger.debug(f"[YABAI v57.0] Focus command failed: {e}")
+
+            # Also activate via AppleScript for reliability
+            if window_info and window_info.get("pid"):
+                try:
+                    activate_script = f'''
+                    tell application "System Events"
+                        set frontmost of (first process whose unix id is {window_info["pid"]}) to true
+                    end tell
+                    '''
+                    proc = await asyncio.create_subprocess_exec(
+                        "osascript", "-e", activate_script,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    )
+                    await asyncio.wait_for(proc.communicate(), timeout=5.0)
+                except Exception:
+                    pass
+
+        # ═══════════════════════════════════════════════════════════════════
+        # PHASE 6: MAXIMIZE (optional)
+        # ═══════════════════════════════════════════════════════════════════
+        if maximize_after_summon:
+            await self._maximize_window_async(target_window_id)
+
+        # ═══════════════════════════════════════════════════════════════════
+        # SUCCESS
+        # ═══════════════════════════════════════════════════════════════════
+        logger.info(
+            f"[YABAI v57.0] ✅ SUMMON SUCCESS: Window {target_window_id} retrieved from Shadow Realm "
+            f"→ Display {dest_display}, Space {dest_space}"
+        )
+
+        return True, "summon_success", target_window_id
+
+    async def summon_all_windows_from_shadow_realm_async(
+        self,
+        app_name: Optional[str] = None,
+        focus_last: bool = True
+    ) -> Tuple[bool, str, List[int]]:
+        """
+        v57.0: Summon ALL windows from the Shadow Realm back to the active display.
+
+        Useful for "bring back all Chrome windows" type commands.
+
+        Args:
+            app_name: Optional filter by app name
+            focus_last: Whether to focus the last summoned window
+
+        Returns:
+            Tuple of (success, method, list of summoned window IDs)
+        """
+        yabai_path = self._health.yabai_path or os.getenv("YABAI_PATH", "/opt/homebrew/bin/yabai")
+        shadow_display = int(os.getenv("JARVIS_SHADOW_DISPLAY", "2"))
+
+        logger.info(
+            f"[YABAI v57.0] ✨ MASS SUMMON: Retrieving all windows from Shadow Realm "
+            f"(app_filter={app_name or 'all'})"
+        )
+
+        try:
+            # Query all windows on Shadow Realm
+            proc = await asyncio.create_subprocess_exec(
+                yabai_path, "-m", "query", "--windows",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+
+            if proc.returncode != 0 or not stdout:
+                return False, "query_failed", []
+
+            all_windows = json.loads(stdout.decode())
+
+            # Filter to windows on Shadow Realm
+            shadow_windows = [
+                w for w in all_windows
+                if w.get("display") == shadow_display
+                and (not app_name or w.get("app") == app_name)
+                and w.get("has-ax-reference", False)  # Only actionable windows
+            ]
+
+            if not shadow_windows:
+                logger.info(f"[YABAI v57.0] No windows found on Shadow Realm")
+                return True, "no_windows_to_summon", []
+
+            logger.info(f"[YABAI v57.0] Found {len(shadow_windows)} windows to summon")
+
+            # Summon each window
+            summoned_ids = []
+            for i, w in enumerate(shadow_windows):
+                is_last = (i == len(shadow_windows) - 1)
+
+                success, method, final_id = await self.summon_window_from_shadow_realm_async(
+                    window_id=w.get("id"),
+                    app_name=w.get("app"),
+                    focus_after_summon=focus_last and is_last,
+                    maximize_after_summon=False
+                )
+
+                if success and final_id:
+                    summoned_ids.append(final_id)
+
+                # Small delay between summons
+                if not is_last:
+                    await asyncio.sleep(0.3)
+
+            logger.info(
+                f"[YABAI v57.0] ✅ MASS SUMMON: {len(summoned_ids)}/{len(shadow_windows)} "
+                f"windows successfully retrieved"
+            )
+
+            return len(summoned_ids) > 0, f"summoned_{len(summoned_ids)}_windows", summoned_ids
+
+        except Exception as e:
+            logger.error(f"[YABAI v57.0] Mass summon exception: {e}")
+            return False, f"exception_{e}", []
+
     async def _maximize_window_async(self, window_id: int) -> bool:
         """Maximize window to fill its current display using yabai grid."""
         yabai_path = self._health.yabai_path or os.getenv("YABAI_PATH", "/opt/homebrew/bin/yabai")
