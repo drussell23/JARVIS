@@ -4752,6 +4752,151 @@ class YabaiSpaceDetector:
         # Even if convergence wasn't perfect, the window might still be movable
         return True
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # v49.0: SPACE-BASED TRUTH PROTOCOL
+    # ═══════════════════════════════════════════════════════════════════════════
+    # THE PROBLEM: Window queries LIE about fullscreen status.
+    #   - `yabai -m query --windows --window 1404` says is-native-fullscreen: false
+    #   - But the window IS in fullscreen (on a fullscreen Space)
+    #
+    # THE SOLUTION: Ask the SPACE, not the Window.
+    #   - `yabai -m query --spaces --space 4` says is-native-fullscreen: true
+    #   - The Space CANNOT lie - if it's a fullscreen space, the window IS locked.
+    #
+    # This fixes PWA apps (Google Gemini, etc.) that don't respond to AppleScript.
+    # We use yabai's native --toggle which works on ANY window type.
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    async def _is_space_native_fullscreen_async(
+        self,
+        space_index: int
+    ) -> Tuple[bool, Optional[Dict[str, Any]]]:
+        """
+        v49.0: Query the SPACE to determine if it's a native fullscreen space.
+
+        The Space metadata tells the TRUTH about fullscreen status, even when
+        the Window query lies (common with PWAs and non-scriptable apps).
+
+        Args:
+            space_index: The space index to query
+
+        Returns:
+            Tuple of (is_fullscreen: bool, space_info: Optional[Dict]):
+            - is_fullscreen: True if Space is native fullscreen
+            - space_info: Full space metadata (for logging/debugging)
+        """
+        if space_index <= 0:
+            return False, None
+
+        yabai_path = self._health.yabai_path or os.getenv("YABAI_PATH", "/opt/homebrew/bin/yabai")
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                yabai_path, "-m", "query", "--spaces", "--space", str(space_index),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+
+            if proc.returncode != 0 or not stdout:
+                # Space might not exist or yabai error
+                logger.debug(
+                    f"[YABAI v49.0] Space {space_index} query failed: "
+                    f"{stderr.decode().strip() if stderr else 'no output'}"
+                )
+                return False, None
+
+            space_info = json.loads(stdout.decode())
+
+            # THE TRUTH: Space's is-native-fullscreen flag
+            is_fullscreen = space_info.get("is-native-fullscreen", False)
+            space_type = space_info.get("type", "unknown")
+
+            if is_fullscreen:
+                logger.info(
+                    f"[YABAI v49.0] 🔮 SPACE TRUTH: Space {space_index} (type={space_type}) "
+                    f"IS a native fullscreen space - Window query was LYING!"
+                )
+            else:
+                logger.debug(
+                    f"[YABAI v49.0] Space {space_index} (type={space_type}) "
+                    f"is NOT native fullscreen"
+                )
+
+            return is_fullscreen, space_info
+
+        except asyncio.TimeoutError:
+            logger.warning(f"[YABAI v49.0] Space {space_index} query timed out")
+            return False, None
+        except json.JSONDecodeError as e:
+            logger.warning(f"[YABAI v49.0] Space {space_index} query returned invalid JSON: {e}")
+            return False, None
+        except Exception as e:
+            logger.warning(f"[YABAI v49.0] Space {space_index} query error: {e}")
+            return False, None
+
+    async def _unpack_via_yabai_toggle_async(
+        self,
+        window_id: int,
+        app_name: str = "Unknown",
+        window_title: str = ""
+    ) -> bool:
+        """
+        v49.0: Unpack fullscreen using yabai's native toggle command.
+
+        This is more robust than AppleScript because:
+        1. Works on ANY window (PWAs, Electron apps, games)
+        2. Doesn't require app-specific scripting dictionaries
+        3. Uses the Window Manager directly
+
+        Args:
+            window_id: The window to unpack
+            app_name: App name (for logging)
+            window_title: Window title (for logging)
+
+        Returns:
+            True if successfully unpacked, False otherwise
+        """
+        yabai_path = self._health.yabai_path or os.getenv("YABAI_PATH", "/opt/homebrew/bin/yabai")
+
+        logger.info(
+            f"[YABAI v49.0] 🔄 YABAI TOGGLE: Unpacking window {window_id} "
+            f"({app_name}: {window_title[:40]}) via native-fullscreen toggle"
+        )
+
+        try:
+            # Execute yabai toggle
+            proc = await asyncio.create_subprocess_exec(
+                yabai_path, "-m", "window", str(window_id), "--toggle", "native-fullscreen",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10.0)
+
+            if proc.returncode == 0:
+                logger.info(
+                    f"[YABAI v49.0] ✅ Yabai toggle SUCCESS for window {window_id}"
+                )
+
+                # Wait for macOS animation to complete
+                animation_delay = await self._get_system_animation_delay()
+                await asyncio.sleep(animation_delay)
+
+                return True
+            else:
+                error_msg = stderr.decode().strip() if stderr else "Unknown error"
+                logger.warning(
+                    f"[YABAI v49.0] ⚠️ Yabai toggle FAILED for window {window_id}: {error_msg}"
+                )
+                return False
+
+        except asyncio.TimeoutError:
+            logger.warning(f"[YABAI v49.0] ⚠️ Yabai toggle timed out for window {window_id}")
+            return False
+        except Exception as e:
+            logger.warning(f"[YABAI v49.0] ⚠️ Yabai toggle error for window {window_id}: {e}")
+            return False
+
     async def _handle_fullscreen_window_async(
         self,
         window_id: int,
@@ -4799,21 +4944,42 @@ class YabaiSpaceDetector:
                 return False, True  # Assume not fullscreen, proceed
 
         # ═══════════════════════════════════════════════════════════════════
-        # v36.0: COMPREHENSIVE FULLSCREEN DETECTION
+        # v49.0: SPACE-BASED TRUTH PROTOCOL (REPLACES v36.0)
         # ═══════════════════════════════════════════════════════════════════
-        # macOS has multiple fullscreen modes that block window movement:
-        # 1. Native Fullscreen (is-native-fullscreen) - Creates separate Space
-        # 2. Zoom Fullscreen (has-fullscreen-zoom) - Chrome/Electron presentation mode
-        # 3. Floating fullscreen (large window covering screen) - Usually movable
+        # THE PROBLEM: Window queries LIE about fullscreen status!
+        #   - Window says: is-native-fullscreen: false (THE LIE)
+        #   - Space says: is-native-fullscreen: true (THE TRUTH)
         #
-        # Chrome specifically uses "zoom-fullscreen" for presentation mode,
-        # which doesn't create a Space but still blocks some operations.
+        # THE SOLUTION: Query the SPACE first, not the Window.
+        # If Space says it's fullscreen, we KNOW the window is locked.
+        #
+        # FALLBACK CHAIN:
+        #   1. Yabai Toggle (works on PWAs, Electron, ANY window)
+        #   2. AppleScript (for minimized windows or yabai failure)
         # ═══════════════════════════════════════════════════════════════════
 
-        is_native_fullscreen = window_info.get("is-native-fullscreen", False)
-        is_zoom_fullscreen = window_info.get("has-fullscreen-zoom", False)
         app_name = window_info.get("app", "Unknown")
         window_title = window_info.get("title", "")[:50]
+        window_space_id = window_info.get("space", -1)
+
+        # v49.0: ASK THE SPACE FOR THE TRUTH
+        space_is_fullscreen, space_info = await self._is_space_native_fullscreen_async(window_space_id)
+
+        # Window's claim (which may be a lie)
+        window_claims_fullscreen = window_info.get("is-native-fullscreen", False)
+        is_zoom_fullscreen = window_info.get("has-fullscreen-zoom", False)
+
+        # v49.0: TRUTH TABLE
+        # Space says fullscreen -> Window IS fullscreen (trust Space)
+        # Window says fullscreen -> Window might be fullscreen (check Space to confirm)
+        # Neither says fullscreen -> Window is NOT fullscreen
+        is_native_fullscreen = space_is_fullscreen or window_claims_fullscreen
+
+        if space_is_fullscreen and not window_claims_fullscreen:
+            logger.warning(
+                f"[YABAI v49.0] 🔮 LYING WINDOW DETECTED: Window {window_id} ({app_name}) "
+                f"claims is-native-fullscreen=false, but Space {window_space_id} says TRUE!"
+            )
 
         # Check for Chrome/Electron-specific presentation mode
         is_chrome_like = app_name.lower() in [
@@ -4953,43 +5119,72 @@ class YabaiSpaceDetector:
                 f"Normal spaces: {visible_spaces}"
             )
         
-        # v46.0: ALWAYS run Deep Unpack for Chrome-like windows on hidden/phantom spaces
-        # This respects LAW 1 (Topology Drift) - we don't trust Yabai's state report
-        if is_on_hidden_space and is_chrome_like:
+        # ═══════════════════════════════════════════════════════════════════════
+        # v49.0: SPACE-BASED UNPACK PROTOCOL
+        # ═══════════════════════════════════════════════════════════════════════
+        # If Space tells us the window is in fullscreen (space_is_fullscreen=True),
+        # OR window is on hidden/phantom space, we need to unpack.
+        #
+        # UNPACK CHAIN:
+        #   1. Yabai Toggle (works on PWAs like Google Gemini, Electron apps, games)
+        #   2. AppleScript (fallback for minimized windows or special cases)
+        # ═══════════════════════════════════════════════════════════════════════
+
+        needs_unpack = (
+            space_is_fullscreen or  # v49.0: Trust the Space
+            (is_on_hidden_space and is_chrome_like) or  # Legacy hidden space check
+            is_in_phantom_space  # Phantom space always needs unpack
+        )
+
+        if needs_unpack:
             logger.warning(
-                f"[YABAI v46.0] ⚓ DROPPING REALITY ANCHOR: Window {window_id} ({app_name}) "
-                f"exists in {'PHANTOM SPACE' if is_in_phantom_space else 'hidden space'} {window_space_id} - "
-                f"forcing RE-MATERIALIZATION via AppleScript"
+                f"[YABAI v49.0] ⚓ UNPACK REQUIRED: Window {window_id} ({app_name}) "
+                f"in {'FULLSCREEN SPACE' if space_is_fullscreen else 'PHANTOM SPACE'} {window_space_id} - "
+                f"engaging YABAI TOGGLE first (universal unpack)"
             )
-            
+
             # ═══════════════════════════════════════════════════════════════════
-            # v44.2: ATOMIC TRANSITION with State Convergence
+            # v49.0: YABAI TOGGLE FIRST (Universal - works on ANY window type)
             # ═══════════════════════════════════════════════════════════════════
-            # Respects LAW 2 (Eventual Consistency):
-            # 1. Execute AppleScript to force exit fullscreen
-            # 2. State Convergence Protocol waits for topology to stabilize
-            # 3. Verify the window landed on a valid space
-            # ═══════════════════════════════════════════════════════════════════
-            await self._deep_unpack_via_applescript(
-                app_name=app_name,
-                window_title=window_title,
+            yabai_toggle_success = await self._unpack_via_yabai_toggle_async(
                 window_id=window_id,
-                fire_and_forget=False,  # v44.0: Wait for completion
-                verify_transition=True   # v44.0: Verify state changed (State Convergence)
+                app_name=app_name,
+                window_title=window_title
             )
-            
-            # v44.2: TOPOLOGY INVALIDATION - Respects LAW 1 (Topology Drift)
-            # After unpacking a hidden fullscreen window, space indices WILL shift.
-            # Mark topology as invalid so subsequent operations re-query.
+
+            if yabai_toggle_success:
+                logger.info(
+                    f"[YABAI v49.0] ✅ YABAI TOGGLE SUCCESS: Window {window_id} unpacked "
+                    f"via native toggle (no AppleScript needed)"
+                )
+            else:
+                # ═══════════════════════════════════════════════════════════════
+                # v49.0: FALLBACK TO APPLESCRIPT
+                # ═══════════════════════════════════════════════════════════════
+                # Yabai toggle failed - try AppleScript as backup.
+                # This handles minimized windows or cases where toggle doesn't work.
+                # ═══════════════════════════════════════════════════════════════
+                logger.warning(
+                    f"[YABAI v49.0] ⚠️ Yabai toggle failed, falling back to AppleScript "
+                    f"for window {window_id}"
+                )
+                await self._deep_unpack_via_applescript(
+                    app_name=app_name,
+                    window_title=window_title,
+                    window_id=window_id,
+                    fire_and_forget=False,
+                    verify_transition=True
+                )
+
+            # v49.0: TOPOLOGY INVALIDATION - Space indices WILL shift after unpack
             self._space_topology_valid = False
             logger.info(
-                f"[YABAI v44.2] 🌊 TOPOLOGY INVALIDATED: Space indices may have shifted "
+                f"[YABAI v49.0] 🌊 TOPOLOGY INVALIDATED: Space indices may have shifted "
                 f"after unpacking window {window_id}"
             )
-            
-            # Even if AppleScript ran, we mark as "handled" and proceed
-            # The Deep Unpack will have forced any fullscreen windows to exit
-            return False, True
+
+            # Mark as handled and proceed
+            return True, True  # Changed: was_fullscreen=True, success=True
         
         if fullscreen_mode is None:
             # Not in any fullscreen mode - nothing to do
