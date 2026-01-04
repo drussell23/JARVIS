@@ -5219,7 +5219,8 @@ class YabaiSpaceDetector:
         self,
         pid: int,
         window_id: int,
-        app_name: str = "Unknown"
+        app_name: str = "Unknown",
+        silent: bool = False
     ) -> bool:
         """
         v51.0: AX API "Universal Solvent" - Unpack fullscreen by targeting PID directly.
@@ -5232,10 +5233,15 @@ class YabaiSpaceDetector:
         - Chrome profiles that spawn separate processes
         - Any window type that refuses to move via normal methods
 
+        v51.2: Added silent mode support
+        - In silent mode, only tries AXFullScreen flip (no keyboard events)
+        - This prevents hijacking the user's screen during background operations
+
         Args:
             pid: Process ID (DNA) of the window's process
             window_id: Window ID (for logging)
             app_name: App name (for logging)
+            silent: If True, skip keyboard-based methods that would hijack user's screen
 
         Returns:
             True if AX API successfully flipped AXFullScreen, False otherwise
@@ -5244,76 +5250,146 @@ class YabaiSpaceDetector:
             logger.warning(f"[YABAI v51.0] AX API: Invalid PID {pid}")
             return False
 
+        mode_str = "SILENT" if silent else "NORMAL"
         logger.info(
-            f"[YABAI v51.0] ☢️ AX API NUCLEAR OPTION: Targeting PID {pid} "
+            f"[YABAI v51.2] ☢️ AX API NUCLEAR OPTION ({mode_str}): Targeting PID {pid} "
             f"({app_name}) to force-flip AXFullScreen attribute"
         )
 
-        # AX API AppleScript that targets process by PID
-        # v51.1: Enhanced to handle presentation mode (AXFullScreen=false on fullscreen space)
-        ax_script = f'''
-        tell application "System Events"
-            try
-                -- Target process by PID (DNA) - bypasses app name entirely
-                set targetProc to first process whose unix id is {pid}
-                set didFlipAny to false
-                set allAlreadyFalse to true
+        # v51.2: Choose script based on silent mode
+        if silent:
+            # SILENT MODE: Only try AXFullScreen flip, NO keyboard events
+            # This prevents hijacking the user's screen during background operations
+            ax_script = f'''
+            tell application "System Events"
+                try
+                    -- Target process by PID (DNA) - bypasses app name entirely
+                    set targetProc to first process whose unix id is {pid}
+                    set didFlipAny to false
 
-                tell targetProc
-                    -- Wake up from App Nap if sleeping
-                    set visible to true
+                    tell targetProc
+                        -- Wake up from App Nap if sleeping (doesn't bring to front)
+                        set visible to true
+                        -- NOTE: NOT setting frontmost in silent mode!
 
-                    -- Get all windows (PWAs typically have one main window)
-                    set allWindows to every window
+                        -- Get all windows
+                        set allWindows to every window
 
-                    if (count of allWindows) > 0 then
-                        repeat with targetWin in allWindows
-                            -- Check if AXFullScreen attribute exists
-                            if (exists attribute "AXFullScreen" of targetWin) then
-                                set currentFullscreen to value of attribute "AXFullScreen" of targetWin
+                        if (count of allWindows) > 0 then
+                            repeat with currentWin in allWindows
+                                -- Check if AXFullScreen attribute exists
+                                if (exists attribute "AXFullScreen" of currentWin) then
+                                    set currentFullscreen to value of attribute "AXFullScreen" of currentWin
 
-                                if currentFullscreen is true then
-                                    -- FLIP THE SWITCH - Force exit fullscreen at OS level
-                                    set value of attribute "AXFullScreen" of targetWin to false
-                                    set didFlipAny to true
-                                    set allAlreadyFalse to false
-                                    delay 0.5
+                                    if currentFullscreen is true then
+                                        -- FLIP THE SWITCH - Force exit fullscreen at OS level
+                                        set value of attribute "AXFullScreen" of currentWin to false
+                                        set didFlipAny to true
+                                        delay 0.5
+                                    end if
                                 end if
+                            end repeat
+
+                            if didFlipAny then
+                                return "FLIPPED"
+                            else
+                                -- In silent mode, don't try keyboard events
+                                -- Return SILENT_SKIP so Hardware Bypass can take over
+                                return "SILENT_SKIP"
                             end if
-                        end repeat
-
-                        if didFlipAny then
-                            return "FLIPPED"
-                        else if allAlreadyFalse then
-                            -- v51.1: PRESENTATION MODE FIX
-                            -- Window claims NOT fullscreen but Space IS fullscreen.
-                            -- This happens with PWAs in "presentation mode" or "kiosk mode".
-                            -- Try sending Escape key to exit presentation mode.
-                            tell application "System Events"
-                                key code 53 -- Escape key
-                            end tell
-                            delay 0.3
-
-                            -- Also try Ctrl+Cmd+F (macOS fullscreen toggle)
-                            tell application "System Events"
-                                keystroke "f" using {{control down, command down}}
-                            end tell
-                            delay 0.5
-
-                            return "ESCAPED"
                         else
-                            return "NO_ACTION"
+                            return "ERROR: No windows found for PID"
                         end if
-                    else
-                        return "ERROR: No windows found for PID"
-                    end if
-                end tell
+                    end tell
 
-            on error errMsg
-                return "ERROR: " & errMsg
-            end try
-        end tell
-        '''
+                on error errMsg
+                    return "ERROR: " & errMsg
+                end try
+            end tell
+            '''
+        else:
+            # NORMAL MODE: Full AX API with keyboard events
+            ax_script = f'''
+            tell application "System Events"
+                try
+                    -- Target process by PID (DNA) - bypasses app name entirely
+                    set targetProc to first process whose unix id is {pid}
+                    set didFlipAny to false
+                    set allAlreadyFalse to true
+                    set procName to name of targetProc
+
+                    tell targetProc
+                        -- Wake up from App Nap if sleeping
+                        set visible to true
+                        set frontmost to true  -- v51.2: BRING TO FRONT!
+
+                        -- Get all windows (PWAs typically have one main window)
+                        set allWindows to every window
+
+                        if (count of allWindows) > 0 then
+                            -- v51.2: Focus the FIRST window specifically
+                            set targetWin to item 1 of allWindows
+
+                            -- Try to perform click to ensure window has focus
+                            try
+                                perform action "AXRaise" of targetWin
+                            end try
+
+                            repeat with currentWin in allWindows
+                                -- Check if AXFullScreen attribute exists
+                                if (exists attribute "AXFullScreen" of currentWin) then
+                                    set currentFullscreen to value of attribute "AXFullScreen" of currentWin
+
+                                    if currentFullscreen is true then
+                                        -- FLIP THE SWITCH - Force exit fullscreen at OS level
+                                        set value of attribute "AXFullScreen" of currentWin to false
+                                        set didFlipAny to true
+                                        set allAlreadyFalse to false
+                                        delay 0.5
+                                    end if
+                                end if
+                            end repeat
+
+                            if didFlipAny then
+                                return "FLIPPED"
+                            else if allAlreadyFalse then
+                                -- v51.2: PRESENTATION MODE / WEB FULLSCREEN FIX
+                                -- Window claims NOT fullscreen but Space IS fullscreen.
+                                -- This happens with PWAs using web fullscreen API.
+                                --
+                                -- CRITICAL: Send keystrokes TO THE TARGET PROCESS!
+                                -- Previously we were sending to System Events globally (BUG!)
+
+                                -- First, ensure process is frontmost
+                                set frontmost to true
+                                delay 0.2
+
+                                -- v51.2: Send Escape key TO THIS PROCESS
+                                -- This exits web fullscreen (element.requestFullscreen())
+                                key code 53  -- Escape key
+
+                                delay 0.5
+
+                                -- v51.2: Also try Ctrl+Cmd+F TO THIS PROCESS
+                                -- This exits macOS native fullscreen if somehow in that state
+                                keystroke "f" using {{control down, command down}}
+
+                                delay 0.5
+
+                                return "ESCAPED"
+                            else
+                                return "NO_ACTION"
+                            end if
+                        else
+                            return "ERROR: No windows found for PID"
+                        end if
+                    end tell
+
+                on error errMsg
+                    return "ERROR: " & errMsg
+                end try
+            end tell
+            '''
 
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -5326,10 +5402,10 @@ class YabaiSpaceDetector:
             result = stdout.decode().strip() if stdout else ""
             error = stderr.decode().strip() if stderr else ""
 
-            # v51.1: Handle different result types
+            # v51.2: Handle different result types
             if "FLIPPED" in result:
                 logger.info(
-                    f"[YABAI v51.1] ☢️ AX API FLIPPED: Successfully flipped AXFullScreen for PID {pid}"
+                    f"[YABAI v51.2] ☢️ AX API FLIPPED: Successfully flipped AXFullScreen for PID {pid}"
                 )
                 # Wait for macOS to process the state change
                 sip_delay = float(os.getenv("JARVIS_SIP_CONVERGENCE_DELAY", "3.0"))
@@ -5337,21 +5413,29 @@ class YabaiSpaceDetector:
                 return True
             elif "ESCAPED" in result:
                 logger.info(
-                    f"[YABAI v51.1] ☢️ AX API ESCAPED: Sent Escape/Ctrl+Cmd+F to exit presentation mode "
+                    f"[YABAI v51.2] ☢️ AX API ESCAPED: Sent Escape/Ctrl+Cmd+F to exit presentation mode "
                     f"for PID {pid} (AXFullScreen was already false)"
                 )
                 # Wait for macOS to process the state change
                 sip_delay = float(os.getenv("JARVIS_SIP_CONVERGENCE_DELAY", "3.0"))
                 await asyncio.sleep(sip_delay)
                 return True
+            elif "SILENT_SKIP" in result:
+                # v51.2: In silent mode, AXFullScreen was already false
+                # Return False to let Hardware Bypass take over
+                logger.info(
+                    f"[YABAI v51.2] 🔇 AX API SILENT_SKIP: AXFullScreen already false for PID {pid}. "
+                    f"Deferring to Hardware Bypass (won't hijack user's screen in silent mode)"
+                )
+                return False
             elif "NO_ACTION" in result:
                 logger.warning(
-                    f"[YABAI v51.1] AX API NO_ACTION: No fullscreen windows found for PID {pid}"
+                    f"[YABAI v51.2] AX API NO_ACTION: No fullscreen windows found for PID {pid}"
                 )
                 return False
             else:
                 logger.warning(
-                    f"[YABAI v51.1] AX API result for PID {pid}: {result or error}"
+                    f"[YABAI v51.2] AX API result for PID {pid}: {result or error}"
                 )
                 return False
 
@@ -5465,7 +5549,8 @@ class YabaiSpaceDetector:
     async def _handle_fullscreen_window_async(
         self,
         window_id: int,
-        window_info: Optional[Dict[str, Any]] = None
+        window_info: Optional[Dict[str, Any]] = None,
+        silent: bool = False
     ) -> Tuple[bool, bool]:
         """
         v35.5 FULLSCREEN UNPACKING PROTOCOL: Serialize and unpack fullscreen windows.
@@ -5479,9 +5564,14 @@ class YabaiSpaceDetector:
         - Invalidates space topology cache after unpack (space indices shift!)
         - Proper error handling for WindowServer congestion
 
+        v51.2 IMPROVEMENTS:
+        - Added silent flag to control keyboard-based unpack methods
+        - In silent mode, skip methods that would hijack user's screen
+
         Args:
             window_id: The window ID to check and potentially unpack
             window_info: Optional pre-fetched window info (avoids extra query)
+            silent: If True, skip methods that would bring window to frontmost
 
         Returns:
             Tuple of (was_fullscreen, unpack_success):
@@ -5750,7 +5840,8 @@ class YabaiSpaceDetector:
                     ax_api_success = await self._unpack_via_ax_pid_async(
                         pid=window_pid,
                         window_id=window_id,
-                        app_name=app_name
+                        app_name=app_name,
+                        silent=silent  # v51.2: Pass silent flag to control keyboard events
                     )
 
                     if ax_api_success:
@@ -6332,7 +6423,7 @@ class YabaiSpaceDetector:
         original_window_id = window_id  # Save for re-bonding
 
         was_fullscreen, unpack_success = await self._handle_fullscreen_window_async(
-            window_id, window_info
+            window_id, window_info, silent=silent
         )
 
         if was_fullscreen:
