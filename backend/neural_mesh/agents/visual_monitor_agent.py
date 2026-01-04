@@ -1769,7 +1769,8 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
         action_config: Optional[Dict[str, Any]] = None,
         alert_config: Optional[Dict[str, Any]] = None,
         max_duration: Optional[float] = None,
-        wait_for_completion: bool = False
+        wait_for_completion: bool = False,
+        background_mode: bool = False
     ) -> Dict[str, Any]:
         """
         God Mode: Watch ALL instances of an app across ALL macOS spaces simultaneously.
@@ -1777,6 +1778,11 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
         Spawns parallel Ferrari Engine watchers for every matching window.
         When ANY watcher detects trigger, automatically switches to that space
         and executes action.
+
+        v65.0 ASYNC-AWARENESS PROTOCOL:
+        If background_mode=True, this function returns IMMEDIATELY with status='initiating'
+        and spawns the heavy setup work in a background task. This prevents HTTP timeouts
+        and provides instant user feedback. Progress is streamed via WebSocket.
 
         Args:
             app_name: Application to monitor (e.g., "Terminal", "Safari")
@@ -1786,15 +1792,18 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
             max_duration: Max monitoring time in seconds (None = indefinite)
             wait_for_completion: If True, wait for event detection (blocking)
                                 If False, return immediately after starting watchers (default)
+            background_mode: v65.0 - If True, return INSTANTLY and setup in background.
+                            This prevents timeout on complex multi-window surveillance.
 
         Returns:
             {
-                'status': 'triggered' | 'timeout' | 'error',
+                'status': 'triggered' | 'timeout' | 'error' | 'initiating',
                 'triggered_window': {...},  # Which window detected
                 'triggered_space': int,     # Which space
                 'detection_time': float,
                 'total_watchers': int,
-                'results': {...}
+                'results': {...},
+                'background_task_id': str   # v65.0: Task ID for background mode
             }
 
         Example:
@@ -1809,6 +1818,147 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
             )
         """
         logger.info(f"🚀 God Mode: Initiating parallel watch for '{app_name}' - '{trigger_text}'")
+
+        # =====================================================================
+        # v65.0: ASYNC-AWARENESS PROTOCOL - Instant Reply with Background Setup
+        # =====================================================================
+        # ROOT CAUSE FIX for "Surveillance setup timed out":
+        # - Previously: All setup (discovery, teleport, watchers) ran BEFORE returning
+        # - This caused 60-80s delays, exceeding HTTP timeouts
+        #
+        # SOLUTION: If background_mode=True:
+        # 1. Return IMMEDIATELY with status='initiating' and acknowledgment message
+        # 2. Spawn the heavy setup work as a background asyncio.Task
+        # 3. Progress is streamed via SurveillanceProgressStream to WebSocket
+        # 4. User sees instant response, watchers start silently in background
+        # =====================================================================
+        if background_mode:
+            # Generate unique task ID for tracking
+            _background_task_id = f"godmode_{app_name}_{int(datetime.now().timestamp())}"
+            logger.info(f"[v65.0] 🚀 ASYNC-AWARENESS: Spawning background task {_background_task_id}")
+
+            # Create the background setup coroutine
+            async def _background_surveillance_setup():
+                """Background task for heavy surveillance setup."""
+                try:
+                    # Call self recursively with background_mode=False to do actual work
+                    result = await self.watch_app_across_all_spaces(
+                        app_name=app_name,
+                        trigger_text=trigger_text,
+                        action_config=action_config,
+                        alert_config=alert_config,
+                        max_duration=max_duration,
+                        wait_for_completion=wait_for_completion,
+                        background_mode=False  # IMPORTANT: Prevent infinite recursion
+                    )
+
+                    # Log completion
+                    status = result.get('status', 'unknown')
+                    watchers = result.get('total_watchers', 0)
+                    logger.info(
+                        f"[v65.0] ✅ Background surveillance setup complete: "
+                        f"status={status}, watchers={watchers}"
+                    )
+
+                    # Emit completion progress event
+                    if PROGRESS_STREAM_AVAILABLE:
+                        try:
+                            await emit_monitoring_active(
+                                watcher_count=watchers,
+                                app_name=app_name,
+                                trigger_text=trigger_text,
+                                correlation_id=_background_task_id
+                            )
+                        except Exception as e:
+                            logger.debug(f"[v65.0] Progress emit failed: {e}")
+
+                    # v65.0: Narrate that surveillance is now active
+                    if self.config.working_out_loud_enabled and watchers > 0:
+                        try:
+                            await self._narrate_working_out_loud(
+                                message=f"Surveillance active. I'm now watching {watchers} {app_name} "
+                                        f"windows on my Ghost Display for '{trigger_text}'.",
+                                narration_type="success",
+                                watcher_id=f"bg_complete_{app_name}",
+                                priority="high"
+                            )
+                        except Exception:
+                            pass
+
+                    return result
+
+                except Exception as e:
+                    logger.error(f"[v65.0] ❌ Background surveillance setup failed: {e}", exc_info=True)
+
+                    # Emit error progress event
+                    if PROGRESS_STREAM_AVAILABLE:
+                        try:
+                            await emit_error(
+                                message=f"Background setup failed: {str(e)}",
+                                app_name=app_name,
+                                trigger_text=trigger_text,
+                                correlation_id=_background_task_id
+                            )
+                        except Exception:
+                            pass
+
+                    # Narrate failure
+                    if self.config.working_out_loud_enabled:
+                        try:
+                            await self._narrate_working_out_loud(
+                                message=f"I encountered a problem setting up surveillance for {app_name}. "
+                                        f"Please try again.",
+                                narration_type="error",
+                                watcher_id=f"bg_error_{app_name}",
+                                priority="high"
+                            )
+                        except Exception:
+                            pass
+
+                    return {'status': 'error', 'error': str(e), 'background_task_id': _background_task_id}
+
+            # Spawn background task
+            background_task = asyncio.create_task(
+                _background_surveillance_setup(),
+                name=_background_task_id
+            )
+
+            # Store reference for potential cancellation
+            if not hasattr(self, '_background_surveillance_tasks'):
+                self._background_surveillance_tasks: Dict[str, asyncio.Task] = {}
+            self._background_surveillance_tasks[_background_task_id] = background_task
+
+            # Emit initial progress event
+            if PROGRESS_STREAM_AVAILABLE:
+                try:
+                    await emit_surveillance_progress(
+                        stage=SurveillanceStage.STARTING,
+                        message=f"🚀 Surveillance initiated for {app_name}. Setting up in background...",
+                        app_name=app_name,
+                        trigger_text=trigger_text,
+                        correlation_id=_background_task_id
+                    )
+                except Exception as e:
+                    logger.debug(f"[v65.0] Initial progress emit failed: {e}")
+
+            # Return IMMEDIATELY with acknowledgment
+            logger.info(f"[v65.0] 🎯 Returning instant acknowledgment, task {_background_task_id} running")
+            return {
+                'status': 'initiating',
+                'success': True,
+                'message': f"I'm on it! Setting up surveillance for {app_name}. "
+                          f"I'll let you know when I find '{trigger_text}'.",
+                'background_task_id': _background_task_id,
+                'app_name': app_name,
+                'trigger_text': trigger_text,
+                'instant_reply': True,
+                'total_watchers': 0,  # Will be updated by background task
+                'expected_behavior': 'Background setup in progress. Progress streamed via WebSocket.'
+            }
+
+        # =====================================================================
+        # STANDARD MODE: Synchronous setup (used when background_mode=False)
+        # =====================================================================
 
         # v22.0.0: Clear lifecycle tracker for new session
         # Ensures we track only watchers from THIS God Mode invocation
@@ -4661,16 +4811,21 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
         app_name: str,
         trigger_text: str,
         all_spaces: bool = False,
+        background_mode: bool = True,
         **kwargs
     ) -> Dict[str, Any]:
         """
         Unified watch interface with mode selection.
+
+        v65.0: background_mode defaults to True for instant user feedback.
 
         Args:
             app_name: Application to monitor
             trigger_text: Text to watch for
             all_spaces: If True, watch ALL instances across ALL spaces (God Mode)
                        If False, watch only current/first window (legacy single-window mode)
+            background_mode: v65.0 - If True (default), return instantly and setup in background.
+                            This provides instant user feedback and prevents HTTP timeouts.
             **kwargs: Additional config (action_config, alert_config, space_id, max_duration)
 
         Returns:
@@ -4680,7 +4835,7 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
             # Single window mode (legacy)
             await agent.watch("Terminal", "DONE")
 
-            # God Mode - All spaces
+            # God Mode - All spaces (instant reply, background setup)
             await agent.watch("Terminal", "DONE", all_spaces=True)
 
             # God Mode with action
@@ -4690,6 +4845,9 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                 all_spaces=True,
                 action_config={'type': 'notification', 'message': 'Build done on Space {space_id}'}
             )
+
+            # Blocking mode (wait for full setup - use with caution)
+            await agent.watch("Terminal", "DONE", all_spaces=True, background_mode=False)
         """
         if all_spaces and self.config.multi_space_enabled:
             logger.info(f"🌌 God Mode: Watching ALL {app_name} windows across all spaces")
@@ -4697,8 +4855,31 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
             result = await self.watch_app_across_all_spaces(
                 app_name=app_name,
                 trigger_text=trigger_text,
+                background_mode=background_mode,
                 **kwargs
             )
+
+            # =====================================================================
+            # v65.0: Handle Background Mode "initiating" Status
+            # =====================================================================
+            # If background_mode=True, we get status='initiating' which means
+            # the setup is running in a background task. Pass through immediately.
+            # =====================================================================
+            if result.get('status') == 'initiating':
+                logger.info(
+                    f"[v65.0] 🚀 Background mode: Returning instant acknowledgment for {app_name}"
+                )
+                return {
+                    'success': True,
+                    'status': 'initiating',
+                    'message': result.get('message', f"Setting up surveillance for {app_name}..."),
+                    'background_task_id': result.get('background_task_id'),
+                    'app_name': app_name,
+                    'trigger_text': trigger_text,
+                    'instant_reply': True,
+                    'total_watchers': 0,  # Will be determined by background task
+                    'expected_behavior': 'Watchers starting in background. Progress via WebSocket.'
+                }
 
             # =====================================================================
             # ROOT CAUSE FIX v16.1: Verify God Mode Result Before Returning
@@ -8471,19 +8652,42 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                 # =====================================================================
                 # ROOT CAUSE FIX: Robust Multi-Channel Detection Notification v2.0.0
                 # v32.3: Enhanced with context extraction (numbers, match method, etc.)
+                # v65.0: Ghost Display awareness - detect if window is on Shadow Realm
                 # =====================================================================
                 # Send notifications via ALL available channels:
                 # 1. TTS Voice (UnifiedVoiceOrchestrator)
                 # 2. WebSocket (real-time frontend updates)
                 # 3. Legacy TTS callback (fallback compatibility)
                 # =====================================================================
+
+                # v65.0: Determine if detection occurred on Ghost Display
+                is_on_ghost_display = False
+                ghost_display_space = None
+                try:
+                    # Check if watcher has ghost display info (set during teleportation)
+                    if hasattr(watcher, 'is_on_ghost_display'):
+                        is_on_ghost_display = watcher.is_on_ghost_display
+                        ghost_display_space = getattr(watcher, 'ghost_display_space', space_id)
+                    else:
+                        # Dynamic detection: Check if this space is a Ghost Display space
+                        from backend.vision.yabai_space_detector import get_yabai_detector
+                        yabai = get_yabai_detector()
+                        current_ghost_space = yabai.get_ghost_display_space()
+                        if current_ghost_space is not None and space_id == current_ghost_space:
+                            is_on_ghost_display = True
+                            ghost_display_space = current_ghost_space
+                except Exception as ghost_check_err:
+                    logger.debug(f"[v65.0] Ghost display check failed: {ghost_check_err}")
+
                 await self._send_detection_notification(
                     trigger_text=trigger_text,
                     app_name=app_name,
                     space_id=space_id,
                     confidence=detection_confidence,
                     window_id=watcher.window_id if hasattr(watcher, 'window_id') else None,
-                    detection_context=result.get('context')  # v32.3: Pass context for rich notification
+                    detection_context=result.get('context'),  # v32.3: Pass context for rich notification
+                    is_on_ghost_display=is_on_ghost_display,  # v65.0: Ghost Display awareness
+                    ghost_display_space=ghost_display_space   # v65.0: Which space is Ghost
                 )
 
                 # Send alert
@@ -8664,11 +8868,14 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
         space_id: int,
         confidence: float,
         window_id: Optional[int] = None,
-        detection_context: Optional[Dict[str, Any]] = None
+        detection_context: Optional[Dict[str, Any]] = None,
+        is_on_ghost_display: bool = False,
+        ghost_display_space: Optional[int] = None
     ):
         """
         ROOT CAUSE FIX: Robust Multi-Channel Detection Notification v2.0.0
         v32.3: Enhanced with context extraction (numbers, match method, etc.)
+        v65.0: GHOST DISPLAY AWARENESS - Tells user WHERE the window is found
 
         Sends real-time notifications through ALL available channels:
         1. TTS Voice (UnifiedVoiceOrchestrator) - primary
@@ -8681,6 +8888,7 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
         - Graceful degradation
         - Rich detection metadata
         - v32.3: Context extraction (bounce counts, percentages, status)
+        - v65.0: Ghost Display contextual awareness - prompts "bring it back"
         """
         # v32.3: Build enhanced log message with context
         context_info = ""
@@ -8757,7 +8965,7 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                 if detection_context:
                     extracted_num = detection_context.get('extracted_number')
                     matched_text = detection_context.get('matched_text', '')
-                    
+
                     # Add context details to make the announcement more informative
                     if extracted_num and 'count' in trigger_text.lower():
                         # For count-related detections, announce the count
@@ -8765,12 +8973,31 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                     elif extracted_num:
                         # For other number detections
                         tts_message += f". Value: {extracted_num}."
-                    
+
                     # If matched text is different from trigger, mention it
                     if matched_text and matched_text.lower() != trigger_text.lower():
                         tts_message = f"I found '{matched_text}' in {app_name}, matching your search for '{trigger_text}'"
                         if extracted_num:
                             tts_message += f". Count: {extracted_num}."
+
+                # =====================================================================
+                # v65.0: GHOST DISPLAY CONTEXTUAL AWARENESS
+                # =====================================================================
+                # If the detection occurred on the Ghost Display, inform the user:
+                # 1. The window is on the Ghost Display (invisible to them)
+                # 2. Offer to bring it back with a voice command
+                # This prevents user confusion: "I found it but I can't see it!"
+                # =====================================================================
+                if is_on_ghost_display:
+                    ghost_context_msg = (
+                        f" Note: I found this on my Ghost Display, which means you can't see it. "
+                        f"Say 'bring back my windows' or 'bring back {app_name}' if you want to see it."
+                    )
+                    tts_message += ghost_context_msg
+                    logger.info(
+                        f"[v65.0] 👻 Detection on Ghost Display (Space {ghost_display_space}): "
+                        f"Added contextual guidance for user"
+                    )
 
                 # Get voice orchestrator and speak
                 orchestrator = get_voice_orchestrator()
@@ -8811,6 +9038,7 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                 ws_manager = get_ws_manager()
 
                 # Create rich detection payload
+                # v65.0: Include Ghost Display context for UI awareness
                 detection_payload = {
                     "type": "visual_detection",
                     "event": "detection_found",
@@ -8826,6 +9054,13 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                             "tts": VOICE_ORCHESTRATOR_AVAILABLE,
                             "websocket": True,
                             "legacy_callback": self._tts_callback is not None
+                        },
+                        # v65.0: Ghost Display awareness
+                        "ghost_display": {
+                            "is_on_ghost_display": is_on_ghost_display,
+                            "ghost_display_space": ghost_display_space,
+                            "user_action_required": is_on_ghost_display,
+                            "suggested_command": f"bring back {app_name} windows" if is_on_ghost_display else None
                         }
                     }
                 }
