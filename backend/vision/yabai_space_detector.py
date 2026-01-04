@@ -3926,6 +3926,221 @@ class YabaiSpaceDetector:
             self._health.record_failure(str(e))
             return False
 
+    # =========================================================================
+    # v35.0: FULLSCREEN UNPACKING PROTOCOL
+    # =========================================================================
+    # macOS treats fullscreen windows as separate Spaces. You cannot move a
+    # Space inside another Space (the Ghost Display). We must "unpack" the
+    # window (exit fullscreen) before attempting any move.
+    # =========================================================================
+
+    async def _get_system_animation_delay(self) -> float:
+        """
+        v35.0: Get dynamic animation delay based on system settings.
+
+        Checks macOS "Reduce Motion" accessibility setting to determine
+        the appropriate delay. When Reduce Motion is enabled, animations
+        are faster and we can use a shorter delay.
+
+        Returns:
+            float: Animation delay in seconds (0.5-1.5s depending on settings)
+        """
+        try:
+            # Check if "Reduce Motion" is enabled via defaults
+            proc = await asyncio.create_subprocess_exec(
+                "defaults", "read", "com.apple.universalaccess", "reduceMotion",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=2.0)
+
+            if proc.returncode == 0:
+                reduce_motion = stdout.decode().strip() == "1"
+                if reduce_motion:
+                    logger.debug("[YABAI] 🏃 Reduce Motion enabled - using shorter animation delay")
+                    return 0.5  # Much faster animation
+
+            # Check window animation speed setting
+            proc2 = await asyncio.create_subprocess_exec(
+                "defaults", "read", "NSGlobalDomain", "NSWindowResizeTime",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout2, _ = await asyncio.wait_for(proc2.communicate(), timeout=2.0)
+
+            if proc2.returncode == 0:
+                try:
+                    resize_time = float(stdout2.decode().strip())
+                    # Scale delay based on animation speed (default is 0.2)
+                    # Slower animations (higher value) need more delay
+                    scaled_delay = max(0.5, min(2.0, resize_time * 7.5))
+                    logger.debug(f"[YABAI] ⏱️ Animation speed factor: {resize_time} → delay: {scaled_delay}s")
+                    return scaled_delay
+                except ValueError:
+                    pass
+
+        except Exception as e:
+            logger.debug(f"[YABAI] Could not query animation settings: {e}")
+
+        # Default: Standard macOS animation takes ~1.5s for fullscreen toggle
+        return 1.5
+
+    async def _handle_fullscreen_window_async(
+        self,
+        window_id: int,
+        window_info: Optional[Dict[str, Any]] = None
+    ) -> Tuple[bool, bool]:
+        """
+        v35.0 FULLSCREEN UNPACKING PROTOCOL: Unpack fullscreen windows before moving.
+
+        macOS native fullscreen windows are separate Spaces. You cannot move a
+        Space into another Space. This method "unpacks" the window by exiting
+        fullscreen, waiting for the animation, and returning it to a normal state.
+
+        Args:
+            window_id: The window ID to check and potentially unpack
+            window_info: Optional pre-fetched window info (avoids extra query)
+
+        Returns:
+            Tuple of (was_fullscreen, unpack_success):
+            - was_fullscreen: True if window was in native fullscreen
+            - unpack_success: True if we successfully exited fullscreen (or wasn't fullscreen)
+        """
+        yabai_path = self._health.yabai_path or "yabai"
+
+        # Get window info if not provided
+        if window_info is None:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    yabai_path, "-m", "query", "--windows", "--window", str(window_id),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+                if proc.returncode == 0 and stdout:
+                    window_info = json.loads(stdout.decode())
+                else:
+                    logger.warning(f"[YABAI] Could not query window {window_id} for fullscreen check")
+                    return False, True  # Assume not fullscreen, proceed
+            except Exception as e:
+                logger.debug(f"[YABAI] Window query failed: {e}")
+                return False, True  # Assume not fullscreen, proceed
+
+        # Check if window is in native fullscreen
+        is_native_fullscreen = window_info.get("is-native-fullscreen", False)
+
+        if not is_native_fullscreen:
+            # Not fullscreen - nothing to do
+            return False, True
+
+        # ═══════════════════════════════════════════════════════════════════
+        # FULLSCREEN DETECTED - Must unpack before moving
+        # ═══════════════════════════════════════════════════════════════════
+        app_name = window_info.get("app", "Unknown")
+        window_title = window_info.get("title", "")[:50]
+
+        logger.info(
+            f"[YABAI] 📦 UNPACKING FULLSCREEN: Window {window_id} ({app_name}: {window_title}) "
+            f"is in native fullscreen mode - must exit before teleportation"
+        )
+
+        try:
+            # Step 1: Get dynamic animation delay based on system settings
+            animation_delay = await self._get_system_animation_delay()
+            logger.debug(f"[YABAI] ⏱️ Using animation delay: {animation_delay}s")
+
+            # Step 2: Toggle native fullscreen OFF
+            logger.info(f"[YABAI] 🔄 Exiting fullscreen for window {window_id}...")
+            proc = await asyncio.create_subprocess_exec(
+                yabai_path, "-m", "window", str(window_id), "--toggle", "native-fullscreen",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+
+            if proc.returncode != 0:
+                error_msg = stderr.decode().strip() if stderr else "Unknown error"
+                logger.warning(f"[YABAI] ⚠️ Fullscreen toggle failed: {error_msg}")
+
+                # Try alternative: zoom-fullscreen (for windows using that mode instead)
+                logger.debug(f"[YABAI] Trying zoom-fullscreen toggle as fallback...")
+                proc2 = await asyncio.create_subprocess_exec(
+                    yabai_path, "-m", "window", str(window_id), "--toggle", "zoom-fullscreen",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                await asyncio.wait_for(proc2.communicate(), timeout=3.0)
+
+            # Step 3: CRITICAL - Wait for macOS animation to complete
+            # This is essential! Moving too soon causes crashes/failures.
+            logger.info(
+                f"[YABAI] ⏳ Waiting {animation_delay}s for fullscreen exit animation..."
+            )
+            await asyncio.sleep(animation_delay)
+
+            # Step 4: Verify fullscreen exit succeeded
+            proc_verify = await asyncio.create_subprocess_exec(
+                yabai_path, "-m", "query", "--windows", "--window", str(window_id),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, _ = await asyncio.wait_for(proc_verify.communicate(), timeout=5.0)
+
+            if proc_verify.returncode == 0 and stdout:
+                updated_info = json.loads(stdout.decode())
+                still_fullscreen = updated_info.get("is-native-fullscreen", False)
+
+                if still_fullscreen:
+                    # First attempt failed - try one more time with longer delay
+                    logger.warning(
+                        f"[YABAI] ⚠️ Window {window_id} still fullscreen after first toggle. "
+                        f"Retrying with extended delay..."
+                    )
+
+                    proc_retry = await asyncio.create_subprocess_exec(
+                        yabai_path, "-m", "window", str(window_id), "--toggle", "native-fullscreen",
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    )
+                    await asyncio.wait_for(proc_retry.communicate(), timeout=5.0)
+
+                    # Extended delay for stubborn windows
+                    await asyncio.sleep(animation_delay * 1.5)
+
+                    # Final verification
+                    proc_final = await asyncio.create_subprocess_exec(
+                        yabai_path, "-m", "query", "--windows", "--window", str(window_id),
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    )
+                    stdout_final, _ = await asyncio.wait_for(proc_final.communicate(), timeout=5.0)
+
+                    if proc_final.returncode == 0 and stdout_final:
+                        final_info = json.loads(stdout_final.decode())
+                        if final_info.get("is-native-fullscreen", False):
+                            logger.error(
+                                f"[YABAI] ❌ UNPACK FAILED: Window {window_id} stuck in fullscreen "
+                                f"after multiple attempts"
+                            )
+                            return True, False
+
+                logger.info(
+                    f"[YABAI] ✅ UNPACKED: Window {window_id} ({app_name}) exited fullscreen - "
+                    f"ready for teleportation"
+                )
+                return True, True
+
+            # Could not verify - assume success and proceed
+            logger.debug(f"[YABAI] Could not verify fullscreen exit, assuming success")
+            return True, True
+
+        except asyncio.TimeoutError:
+            logger.warning(f"[YABAI] ⚠️ Fullscreen toggle timed out for window {window_id}")
+            return True, False
+        except Exception as e:
+            logger.error(f"[YABAI] ❌ Fullscreen unpack error: {e}")
+            return True, False
+
     async def move_window_to_space_async(
         self,
         window_id: int,
@@ -4047,11 +4262,37 @@ class YabaiSpaceDetector:
             return []
 
         # ═══════════════════════════════════════════════════════════════════
+        # v35.0: FULLSCREEN UNPACKING PROTOCOL
+        # ═══════════════════════════════════════════════════════════════════
+        # macOS treats fullscreen windows as separate Spaces. You cannot move
+        # a Space inside another Space. Check and unpack BEFORE any move.
+        # ═══════════════════════════════════════════════════════════════════
+
+        window_info = await get_window_info_async()
+        was_fullscreen, unpack_success = await self._handle_fullscreen_window_async(
+            window_id, window_info
+        )
+
+        if was_fullscreen:
+            if not unpack_success:
+                logger.error(
+                    f"[YABAI] ❌ Cannot move window {window_id}: stuck in fullscreen mode"
+                )
+                self._health.record_failure("Fullscreen unpack failed")
+                return False
+
+            # Window was just unpacked - need fresh info for display/space detection
+            # (fullscreen exit may have changed the window's space)
+            logger.debug(f"[YABAI] Refreshing window info after fullscreen unpack...")
+            window_info = await get_window_info_async()
+
+        # ═══════════════════════════════════════════════════════════════════
         # v34.0: CROSS-DISPLAY DETECTION
         # ═══════════════════════════════════════════════════════════════════
 
         # Get source and target display info for intelligent routing
-        current_display = await get_window_display()
+        # Use cached window_info if available for efficiency
+        current_display = window_info.get("display") if window_info else await get_window_display()
         target_display = await get_space_display(target_space)
 
         is_cross_display_move = (
