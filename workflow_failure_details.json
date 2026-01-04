@@ -1,12 +1,12 @@
 {
   "workflow_name": "PR Automation & Validation",
-  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/20698554502",
-  "branch": "cursor/ghost-monitor-protocol-update-1470",
-  "commit_sha": "cf147fb",
-  "run_number": 1233,
+  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/20698577038",
+  "branch": "fix/ci/pr-automation-validation-run1233-20260104-201852",
+  "commit_sha": "0f00fc1",
+  "run_number": 1236,
   "failed_count": 1,
-  "fix_branch": "fix/ci/pr-automation-validation-run1233-20260104-201852",
-  "pr_title": "\ud83d\udea8 Fix CI/CD: PR Automation & Validation (Run #1233)",
+  "fix_branch": "fix/ci/pr-automation-validation-run1236-20260104-202024",
+  "pr_title": "\ud83d\udea8 Fix CI/CD: PR Automation & Validation (Run #1236)",
   "analyses": [
     {
       "error_patterns": [
@@ -15,13 +15,13 @@
           "matches": [
             {
               "line_number": 27,
-              "content": "2026-01-04T20:17:31.3952048Z   subjectPatternError: The PR title must start with a capital letter.",
+              "content": "2026-01-04T20:19:21.5688800Z   subjectPatternError: The PR title must start with a capital letter.",
               "severity": "high",
               "emoji": "\u274c"
             },
             {
               "line_number": 39,
-              "content": "2026-01-04T20:17:32.5548758Z ##[error]No release type found in pull request title \"Ghost monitor protocol update\". Add a prefix to indicate what kind of release this pull request corresponds to. For reference, see https://www.conventionalcommits.org/",
+              "content": "2026-01-04T20:19:22.0506909Z ##[error]No release type found in pull request title \"\ud83d\udea8 Fix CI/CD: PR Automation & Validation (Run #1233)\". Add a prefix to indicate what kind of release this pull request corresponds to. For reference, see https://www.conventionalcommits.org/",
               "severity": "high",
               "emoji": "\u274c"
             }
@@ -50,5 +50,5 @@
       "similar_failures": []
     }
   ],
-  "timestamp": "2026-01-04T20:18:52.224607"
+  "timestamp": "2026-01-04T20:20:24.605787"
 }

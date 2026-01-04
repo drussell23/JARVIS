@@ -3,13 +3,13 @@
 ## Executive Summary
 
 - **Workflow**: PR Automation & Validation
-- **Run Number**: #1233
-- **Branch**: `cursor/ghost-monitor-protocol-update-1470`
-- **Commit**: `cf147fbc420c648c1633969f267193fa9d46dd3e`
+- **Run Number**: #1236
+- **Branch**: `fix/ci/pr-automation-validation-run1233-20260104-201852`
+- **Commit**: `0f00fc1baf54068a0afaf9f882708774b9a89c29`
 - **Status**: ❌ FAILED
-- **Timestamp**: 2026-01-04T20:17:14Z
-- **Triggered By**: @drussell23
-- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/20698554502)
+- **Timestamp**: 2026-01-04T20:19:16Z
+- **Triggered By**: @cubic-dev-ai[bot]
+- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/20698577038)
 
 ## Failure Overview
 
@@ -17,7 +17,7 @@ Total Failed Jobs: **1**
 
 | # | Job Name | Category | Severity | Duration |
 |---|----------|----------|----------|----------|
-| 1 | Validate PR Title | timeout | high | 3s |
+| 1 | Validate PR Title | timeout | high | 4s |
 
 ## Detailed Analysis
 
@@ -26,10 +26,10 @@ Total Failed Jobs: **1**
 **Status**: ❌ failure
 **Category**: Timeout
 **Severity**: HIGH
-**Started**: 2026-01-04T20:17:30Z
-**Completed**: 2026-01-04T20:17:33Z
-**Duration**: 3 seconds
-**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/20698554502/job/59417425895)
+**Started**: 2026-01-04T20:19:19Z
+**Completed**: 2026-01-04T20:19:23Z
+**Duration**: 4 seconds
+**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/20698577038/job/59417480279)
 
 #### Failed Steps
 
@@ -42,8 +42,8 @@ Total Failed Jobs: **1**
 - Pattern: `ERROR|Error|error`
   - Occurrences: 2
   - Sample matches:
-    - Line 27: `2026-01-04T20:17:31.3952048Z   subjectPatternError: The PR title must start with a capital letter.`
-    - Line 39: `2026-01-04T20:17:32.5548758Z ##[error]No release type found in pull request title "Ghost monitor pro`
+    - Line 27: `2026-01-04T20:19:21.5688800Z   subjectPatternError: The PR title must start with a capital letter.`
+    - Line 39: `2026-01-04T20:19:22.0506909Z ##[error]No release type found in pull request title "🚨 Fix CI/CD: PR A`
 
 - Pattern: `timeout|timed out`
   - Occurrences: 1
@@ -73,5 +73,5 @@ Total Failed Jobs: **1**
 
 ---
 
-📊 *Report generated on 2026-01-04T20:18:52.224504*
+📊 *Report generated on 2026-01-04T20:20:24.605670*
 🤖 *JARVIS CI/CD Auto-PR Manager*
