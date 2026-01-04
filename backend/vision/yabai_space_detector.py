@@ -7167,39 +7167,116 @@ class YabaiSpaceDetector:
                 await asyncio.sleep(0.3)
 
         # ═══════════════════════════════════════════════════════════════════════
-        # v51.2: LAST RESORT - Focus-based strategies when silent mode fails
+        # v51.3: LAST RESORT - AppleScript + Focus-based strategies
         # ═══════════════════════════════════════════════════════════════════════
         # ROOT CAUSE FIX: Windows on phantom fullscreen spaces CANNOT be moved
-        # using silent strategies because yabai has limited power over windows
-        # that aren't on the active space.
+        # using silent strategies OR yabai focus because:
+        # - yabai has limited power over windows not on the active space
+        # - yabai --focus fails for windows on phantom spaces
         #
-        # When ALL silent strategies fail, we MUST use focus-based strategies
-        # as a LAST RESORT. Yes, this briefly shows the window to the user,
-        # but it's better than failing completely.
-        #
-        # This enables the "watch all Chrome windows" to actually work with
-        # PWAs that are stuck in fullscreen mode.
+        # SOLUTION: Use AppleScript to activate the process by PID FIRST, then
+        # use yabai to move. AppleScript operates at a higher level than yabai
+        # and can activate apps even when their windows are on hidden spaces.
         # ═══════════════════════════════════════════════════════════════════════
         if silent:
             logger.warning(
-                f"[YABAI v51.2] 🚨 LAST RESORT: All silent strategies failed for window {window_id}. "
-                f"Attempting focus-based rescue (will briefly show window to user)..."
+                f"[YABAI v51.3] 🚨 LAST RESORT: All silent strategies failed for window {window_id}. "
+                f"Attempting AppleScript + focus-based rescue..."
             )
 
+            # Get PID for AppleScript activation
+            window_pid = None
+            if window_info:
+                window_pid = window_info.get("pid")
+            if not window_pid:
+                # Re-query to get PID
+                try:
+                    refresh_info = await get_window_info_async()
+                    if refresh_info:
+                        window_pid = refresh_info.get("pid")
+                except:
+                    pass
+
             last_resort_strategies = [
-                ("focus_first", "Focus window first, then move"),
-                ("switch_grab_return", "Full space switch, focus, move, return"),
+                ("applescript_activate", "AppleScript PID activation + move"),
+                ("focus_first", "Yabai focus + move"),
+                ("switch_grab_return", "Space switch + focus + move"),
             ]
 
             for lr_attempt, (strategy, description) in enumerate(last_resort_strategies):
                 logger.info(
-                    f"[YABAI v51.2] 🆘 Last Resort {lr_attempt + 1}/{len(last_resort_strategies)}: {description}"
+                    f"[YABAI v51.3] 🆘 Last Resort {lr_attempt + 1}/{len(last_resort_strategies)}: {description}"
                 )
 
                 try:
-                    if strategy == "focus_first":
+                    if strategy == "applescript_activate" and window_pid:
+                        # v51.3: Use AppleScript to activate by PID (higher level than yabai)
+                        logger.info(f"[YABAI v51.3] 🎯 AppleScript activation for PID {window_pid}...")
+
+                        activate_script = f'''
+                        tell application "System Events"
+                            try
+                                set targetProc to first process whose unix id is {window_pid}
+                                set frontmost of targetProc to true
+                                set visible of targetProc to true
+
+                                -- Try to exit fullscreen via keyboard
+                                delay 0.5
+                                key code 53 -- Escape
+                                delay 0.3
+                                keystroke "f" using {{control down, command down}}
+                                delay 0.5
+
+                                return "ACTIVATED"
+                            on error errMsg
+                                return "ERROR: " & errMsg
+                            end try
+                        end tell
+                        '''
+
+                        proc = await asyncio.create_subprocess_exec(
+                            "osascript", "-e", activate_script,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE
+                        )
+                        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10.0)
+                        result = stdout.decode().strip() if stdout else ""
+
+                        if "ACTIVATED" in result:
+                            logger.info(f"[YABAI v51.3] ✅ Process {window_pid} activated via AppleScript")
+                            await asyncio.sleep(1.5)  # Wait for fullscreen exit animation
+
+                            # Now try to move - window should be on active space
+                            cmd_success, error_msg = await execute_yabai_move(window_id, target_space)
+
+                            if cmd_success:
+                                if await verify_move_with_patience(target_space, "last_resort_applescript"):
+                                    # Return user to original space
+                                    if original_user_space and original_user_space != target_space:
+                                        self._switch_to_space_applescript(original_user_space)
+                                    self._health.record_success(0)
+                                    logger.info(f"[YABAI v51.3] ✅ LAST RESORT SUCCESS via AppleScript activation")
+                                    return True
+                            else:
+                                # AppleScript worked but yabai move failed - try display move
+                                logger.info(f"[YABAI v51.3] Space move failed, trying display move...")
+                                ghost_display = await self._get_ghost_display_index_async()
+                                if ghost_display:
+                                    display_success = await self._move_window_to_display_async(
+                                        window_id, ghost_display, sip_convergence_delay=2.0
+                                    )
+                                    if display_success:
+                                        if original_user_space:
+                                            self._switch_to_space_applescript(original_user_space)
+                                        self._health.record_success(0)
+                                        logger.info(f"[YABAI v51.3] ✅ LAST RESORT SUCCESS via AppleScript + display move")
+                                        return True
+                        else:
+                            logger.warning(f"[YABAI v51.3] AppleScript activation failed: {result or stderr.decode()}")
+
+                    elif strategy == "focus_first":
                         # Focus the window to bring it to the current space
-                        logger.info(f"[YABAI v51.2] 🎯 Focusing window {window_id} to wake it...")
+                        logger.info(f"[YABAI v51.3] 🎯 Focusing window {window_id} via yabai...")
                         proc = await asyncio.create_subprocess_exec(
                             yabai_path, "-m", "window", "--focus", str(window_id),
                             stdout=asyncio.subprocess.PIPE,
@@ -7208,36 +7285,31 @@ class YabaiSpaceDetector:
                         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
 
                         if proc.returncode == 0:
-                            logger.info(f"[YABAI v51.2] ✅ Window {window_id} focused (now on active space)")
-                            await asyncio.sleep(1.0)  # Wait for focus transition
+                            logger.info(f"[YABAI v51.3] ✅ Window {window_id} focused")
+                            await asyncio.sleep(1.0)
 
-                            # Now try to move it
                             cmd_success, error_msg = await execute_yabai_move(window_id, target_space)
 
                             if cmd_success:
                                 if await verify_move_with_patience(target_space, "last_resort_focus"):
-                                    # Return user to original space
                                     if original_user_space and original_user_space != target_space:
                                         self._switch_to_space_applescript(original_user_space)
                                     self._health.record_success(0)
-                                    logger.info(f"[YABAI v51.2] ✅ LAST RESORT SUCCESS via focus_first")
+                                    logger.info(f"[YABAI v51.3] ✅ LAST RESORT SUCCESS via focus_first")
                                     return True
                         else:
                             error_msg = stderr.decode().strip() if stderr else "Unknown"
-                            logger.warning(f"[YABAI v51.2] Focus failed: {error_msg}")
+                            logger.warning(f"[YABAI v51.3] Yabai focus failed: {error_msg}")
 
                     elif strategy == "switch_grab_return":
-                        # Full space switch approach
                         source_space = await get_window_space()
                         if source_space and source_space > 0:
-                            logger.info(f"[YABAI v51.2] 🔄 Switching to Space {source_space} to grab window...")
+                            logger.info(f"[YABAI v51.3] 🔄 Switching to Space {source_space}...")
 
-                            # Try AppleScript space switch
                             switch_success = self._switch_to_space_applescript(source_space)
                             if switch_success:
-                                await asyncio.sleep(0.8)  # Wait for space switch
+                                await asyncio.sleep(0.8)
 
-                                # Focus the window
                                 proc = await asyncio.create_subprocess_exec(
                                     yabai_path, "-m", "window", "--focus", str(window_id),
                                     stdout=asyncio.subprocess.PIPE,
@@ -7246,27 +7318,25 @@ class YabaiSpaceDetector:
                                 await asyncio.wait_for(proc.communicate(), timeout=3.0)
                                 await asyncio.sleep(0.5)
 
-                                # Move to target
                                 cmd_success, error_msg = await execute_yabai_move(window_id, target_space)
 
                                 if cmd_success:
                                     if await verify_move_with_patience(target_space, "last_resort_switch"):
-                                        # Return user to original space
                                         if original_user_space and original_user_space != source_space:
                                             self._switch_to_space_applescript(original_user_space)
                                         self._health.record_success(0)
-                                        logger.info(f"[YABAI v51.2] ✅ LAST RESORT SUCCESS via switch_grab_return")
+                                        logger.info(f"[YABAI v51.3] ✅ LAST RESORT SUCCESS via switch_grab_return")
                                         return True
 
                 except asyncio.TimeoutError:
-                    logger.warning(f"[YABAI v51.2] Last resort {strategy} timed out")
+                    logger.warning(f"[YABAI v51.3] Last resort {strategy} timed out")
                 except Exception as e:
-                    logger.warning(f"[YABAI v51.2] Last resort {strategy} error: {e}")
+                    logger.warning(f"[YABAI v51.3] Last resort {strategy} error: {e}")
 
                 await asyncio.sleep(0.3)
 
             logger.warning(
-                f"[YABAI v51.2] ❌ LAST RESORT FAILED: Even focus-based strategies couldn't move window {window_id}"
+                f"[YABAI v51.3] ❌ LAST RESORT FAILED: All strategies exhausted for window {window_id}"
             )
 
         # ═══════════════════════════════════════════════════════════════════════

@@ -2907,16 +2907,53 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
             all_on_hidden_spaces = len(skipped_windows) > 0
 
             if all_on_hidden_spaces:
+                # ═══════════════════════════════════════════════════════════════
+                # v51.3: IN-PLACE CAPTURE FALLBACK
+                # ═══════════════════════════════════════════════════════════════
+                # ROOT CAUSE FIX: Even when rescue fails, ScreenCaptureKit can
+                # sometimes capture windows on hidden spaces. Instead of giving
+                # up completely, we try to capture them in-place.
+                #
+                # This is a last resort - the capture might not work, but it's
+                # better than failing completely without trying.
+                # ═══════════════════════════════════════════════════════════════
+                logger.warning(
+                    f"[God Mode v51.3] 🆘 IN-PLACE CAPTURE FALLBACK: Rescue failed for "
+                    f"{len(skipped_windows)} windows. Attempting to capture in-place..."
+                )
+
+                # Try to use skipped_windows for capture anyway
+                # ScreenCaptureKit might be able to capture them even on hidden spaces
+                in_place_capture_enabled = bool(os.getenv('JARVIS_IN_PLACE_CAPTURE', '1') == '1')
+
+                if in_place_capture_enabled and skipped_windows:
+                    logger.info(
+                        f"[God Mode v51.3] 🎯 Proceeding with {len(skipped_windows)} windows "
+                        f"for in-place capture (may require screen recording permission)"
+                    )
+                    # Use skipped_windows as our window list - they might still be capturable
+                    windows = skipped_windows
+                    skipped_windows = []  # Clear so we don't show error
+
+                    # Mark these windows for in-place capture
+                    for w in windows:
+                        w['in_place_capture'] = True
+                        w['original_space'] = w.get('space_id')
+
+            # Re-check after in-place fallback
+            all_on_hidden_spaces = len(skipped_windows) > 0
+
+            if all_on_hidden_spaces:
                 # v42.0: Enhanced error message with rescue status
                 logger.warning(
                     f"⚠️  Found {len(skipped_windows)} {app_name} windows but ALL are on hidden spaces! "
                     f"Ghost Display auto-rescue failed. Check if BetterDisplay is running."
                 )
-                
+
                 # v42.0: More actionable error message
                 # Check if ghost_space was ever found (it would have been set during auto-handoff)
                 rescue_attempted = 'ghost_space' in dir() and ghost_space is not None
-                
+
                 if rescue_attempted:
                     error_msg = (
                         f"I found {len(skipped_windows)} {app_name} windows on hidden spaces. "
