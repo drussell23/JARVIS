@@ -1,12 +1,12 @@
 {
-  "workflow_name": "Validate Configuration",
-  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/20698554501",
-  "branch": "cursor/ghost-monitor-protocol-update-1470",
-  "commit_sha": "cf147fb",
-  "run_number": 998,
+  "workflow_name": "PR Automation & Validation",
+  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/20698578311",
+  "branch": "fix/ci/validate-configuration-run998-20260104-201902",
+  "commit_sha": "435f62c",
+  "run_number": 1239,
   "failed_count": 1,
-  "fix_branch": "fix/ci/validate-configuration-run998-20260104-201902",
-  "pr_title": "\ud83d\udea8 Fix CI/CD: Validate Configuration (Run #998)",
+  "fix_branch": "fix/ci/pr-automation-validation-run1239-20260104-202044",
+  "pr_title": "\ud83d\udea8 Fix CI/CD: PR Automation & Validation (Run #1239)",
   "analyses": [
     {
       "error_patterns": [
@@ -14,70 +14,41 @@
           "pattern": "ERROR|Error|error",
           "matches": [
             {
-              "line_number": 87,
-              "content": "2026-01-04T20:17:29.5376220Z ##[error]Process completed with exit code 1.",
+              "line_number": 27,
+              "content": "2026-01-04T20:19:30.2646954Z   subjectPatternError: The PR title must start with a capital letter.",
               "severity": "high",
               "emoji": "\u274c"
-            }
-          ],
-          "count": 1
-        },
-        {
-          "pattern": "FAIL|Failed|failed",
-          "matches": [
-            {
-              "line_number": 70,
-              "content": "2026-01-04T20:17:29.5318267Z \u274c VALIDATION FAILED",
-              "severity": "high",
-              "emoji": "\ud83d\udca5"
             },
             {
-              "line_number": 97,
-              "content": "2026-01-04T20:17:29.6696022Z ##[warning]The process '/usr/bin/git' failed with exit code 128",
+              "line_number": 39,
+              "content": "2026-01-04T20:19:30.7903687Z ##[error]No release type found in pull request title \"\ud83d\udea8 Fix CI/CD: Validate Configuration (Run #998)\". Add a prefix to indicate what kind of release this pull request corresponds to. For reference, see https://www.conventionalcommits.org/",
               "severity": "high",
-              "emoji": "\ud83d\udca5"
+              "emoji": "\u274c"
             }
           ],
           "count": 2
         },
         {
-          "pattern": "WARN|Warning|warning",
+          "pattern": "timeout|timed out",
           "matches": [
             {
-              "line_number": 34,
-              "content": "2026-01-04T20:17:25.7686034Z (node:2119) [DEP0040] DeprecationWarning: The `punycode` module is deprecated. Please use a userland alternative instead.",
+              "line_number": 31,
+              "content": "- fix: Resolve database connection timeout",
               "severity": "medium",
-              "emoji": "\u26a0\ufe0f"
-            },
-            {
-              "line_number": 35,
-              "content": "2026-01-04T20:17:25.7686893Z (Use `node --trace-deprecation ...` to show where the warning was created)",
-              "severity": "medium",
-              "emoji": "\u26a0\ufe0f"
-            },
-            {
-              "line_number": 75,
-              "content": "2026-01-04T20:17:29.5319600Z \u26a0\ufe0f  WARNINGS",
-              "severity": "medium",
-              "emoji": "\u26a0\ufe0f"
-            },
-            {
-              "line_number": 97,
-              "content": "2026-01-04T20:17:29.6696022Z ##[warning]The process '/usr/bin/git' failed with exit code 128",
-              "severity": "medium",
-              "emoji": "\u26a0\ufe0f"
+              "emoji": "\u23f1\ufe0f"
             }
           ],
-          "count": 4
+          "count": 1
         }
       ],
       "suggested_fixes": [
-        "Review the logs above for specific error messages"
+        "Consider increasing timeout values or optimizing slow operations",
+        "Check service availability and network connectivity"
       ],
       "severity": "high",
-      "category": "permission_error",
+      "category": "timeout",
       "similar_failures": []
     }
   ],
-  "timestamp": "2026-01-04T20:19:02.738043"
+  "timestamp": "2026-01-04T20:20:44.022894"
 }
