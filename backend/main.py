@@ -4642,7 +4642,7 @@ async def health_ready():
         critical_services_failed.append("ghost_proxies")
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # DETERMINE OVERALL READINESS (Progressive Model v3.0 - Ghost-Aware)
+    # DETERMINE OVERALL READINESS (Progressive Model v3.1 - Ghost-Aware + Graceful Degradation)
     # ═══════════════════════════════════════════════════════════════════════════
     # Progressive readiness levels:
     # 1. ghosts_ready → Ghost Proxies (Voice + Vision) are materialized
@@ -4651,9 +4651,41 @@ async def health_ready():
     # 4. voice_operational → voice features work
     # 5. ml_ready → full ML capabilities
     #
-    # CRITICAL: The frontend MUST wait for Ghost Proxies to be ready!
-    # Without this, the loading page redirects before AI models are usable.
+    # v3.1: GRACEFUL DEGRADATION - Don't block forever on failed Ghost Proxies!
+    # After STARTUP_GRACE_PERIOD seconds, allow degraded mode startup.
+    # This prevents infinite "warming_up" loops when AI models fail to load.
     # ═══════════════════════════════════════════════════════════════════════════
+
+    # v3.1: Calculate startup elapsed time for graceful degradation
+    STARTUP_GRACE_PERIOD = float(os.getenv("JARVIS_STARTUP_GRACE_PERIOD", "45.0"))
+    startup_time = getattr(app.state, '_startup_time', None)
+    if startup_time is None:
+        # Track startup time on first health check
+        app.state._startup_time = time.time()
+        startup_time = app.state._startup_time
+
+    startup_elapsed = time.time() - startup_time
+    grace_period_exceeded = startup_elapsed > STARTUP_GRACE_PERIOD
+
+    # v3.1: Check if we should force degraded mode due to grace period
+    # This prevents blocking forever on failed Ghost Proxies
+    if grace_period_exceeded and not ghosts_ready:
+        # Only LOADING ghosts should block - FAILED ghosts are accepted in degraded mode
+        still_loading = ghost_stats.get("loading", 0)
+        if still_loading == 0:
+            # No ghosts loading, just failed ones - accept degraded mode
+            ghosts_ready = True  # Override for degraded mode
+            details["grace_period_degraded"] = True
+            details["grace_period_reason"] = "No Ghost Proxies actively loading, accepting failed models"
+        elif startup_elapsed > STARTUP_GRACE_PERIOD * 2:
+            # Double grace period exceeded - force accept even with loading
+            ghosts_ready = True
+            details["grace_period_forced"] = True
+            details["grace_period_reason"] = f"Force accept after {startup_elapsed:.0f}s (>2x grace period)"
+
+    details["startup_elapsed"] = round(startup_elapsed, 1)
+    details["grace_period"] = STARTUP_GRACE_PERIOD
+    details["grace_period_exceeded"] = grace_period_exceeded
 
     voice_operational = ml_ready or speaker_service_ready or voice_ready
 
