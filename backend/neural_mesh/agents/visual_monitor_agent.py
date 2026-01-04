@@ -5249,9 +5249,10 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                                 validation_details['actual_space'] = current_space
                                 # Mark as passed but note the location mismatch
                                 validation_details['checks_passed'].append('on_visible_space_soft')
-
-                        if 'on_visible_space_soft' not in validation_details.get('checks_passed', []):
-                            validation_details['checks_passed'].append('on_visible_space')
+                            else:
+                                # Window is on the expected ghost space
+                                if 'on_visible_space_soft' not in validation_details.get('checks_passed', []):
+                                    validation_details['checks_passed'].append('on_visible_space')
                     else:
                         # v28.2: Yabai doesn't know this window, skip minimized/space checks
                         validation_details['skipped_checks'] = ['not_minimized', 'on_visible_space']
@@ -6869,10 +6870,13 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
         # v38.5: Operational stability counters
         last_health_check = start_time
         last_layout_refresh = start_time
+        last_status_report = start_time  # v42.0: Periodic status reporting
         health_check_interval = float(os.getenv('JARVIS_MOSAIC_HEALTH_INTERVAL', '10.0'))
         layout_refresh_interval = float(os.getenv('JARVIS_MOSAIC_LAYOUT_INTERVAL', '30.0'))
+        status_report_interval = float(os.getenv('JARVIS_STATUS_REPORT_INTERVAL', '30.0'))  # v42.0
         black_screen_count = 0
         max_black_screen_retries = int(os.getenv('JARVIS_MOSAIC_BLACK_RETRIES', '5'))
+        last_ocr_sample = ""  # v42.0: Track last OCR result for status reporting
 
         watcher_id = getattr(watcher, 'watcher_id', f"mosaic_{id(watcher)}")
         window_count = len(windows)
@@ -6998,6 +7002,65 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                             await watcher.refresh_window_layout()
                         except Exception:
                             pass
+                
+                # ==========================================================
+                # v42.0: PERIODIC STATUS REPORTING
+                # ==========================================================
+                # ROOT CAUSE FIX: Users feel left in the dark during monitoring.
+                # JARVIS should periodically report what it's seeing so the user
+                # knows the system is actively working.
+                #
+                # CONFIGURABLE: Set JARVIS_STATUS_REPORT_INTERVAL to control
+                # how often JARVIS announces status (default: 30 seconds)
+                # ==========================================================
+                if current_time - last_status_report > status_report_interval:
+                    last_status_report = current_time
+                    elapsed_minutes = int(elapsed / 60)
+                    elapsed_seconds = int(elapsed % 60)
+                    
+                    # Build status message
+                    time_str = f"{elapsed_minutes} minute{'s' if elapsed_minutes != 1 else ''}" if elapsed_minutes > 0 else f"{elapsed_seconds} seconds"
+                    
+                    if self.config.working_out_loud_enabled:
+                        try:
+                            # Sample what we're seeing (last OCR result or generic status)
+                            status_detail = ""
+                            if last_ocr_sample:
+                                # Report a snippet of what we see on screen
+                                sample_preview = last_ocr_sample[:50] + "..." if len(last_ocr_sample) > 50 else last_ocr_sample
+                                status_detail = f" I can see text including '{sample_preview}'."
+                            
+                            await self._narrate_working_out_loud(
+                                message=f"Still watching {window_count} {app_name} windows for '{trigger_text}'. "
+                                        f"Monitoring for {time_str} now. {frame_count} frames scanned.{status_detail}",
+                                narration_type="progress",
+                                watcher_id=f"status_{watcher_id}",
+                                priority="low"
+                            )
+                        except Exception:
+                            pass
+                    
+                    # Also emit WebSocket status for frontend
+                    if WEBSOCKET_MANAGER_AVAILABLE:
+                        try:
+                            ws_manager = get_ws_manager()
+                            await ws_manager.broadcast_to_all({
+                                "type": "visual_detection",
+                                "event": "monitoring_status",
+                                "data": {
+                                    "app_name": app_name,
+                                    "trigger_text": trigger_text,
+                                    "window_count": window_count,
+                                    "elapsed_seconds": elapsed,
+                                    "frames_scanned": frame_count,
+                                    "ocr_checks": ocr_checks,
+                                    "mode": "mosaic",
+                                    "status": "scanning",
+                                    "timestamp": datetime.now().isoformat()
+                                }
+                            })
+                        except Exception:
+                            pass
 
                 # =========================================================
                 # v38.5: DYNAMIC SCALING FACTOR
@@ -7041,6 +7104,13 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                     mosaic_mode=True,  # v38.5: Enable spatial intelligence
                     frame_scale_factor=frame_scale_factor  # v38.5: Dynamic Retina scaling
                 )
+                
+                # v42.0: Update last OCR sample for status reporting
+                # This lets us report what JARVIS is "seeing" to the user
+                if ocr_context and ocr_context.get('full_text'):
+                    last_ocr_sample = ocr_context.get('full_text', '')[:200]  # Limit to 200 chars
+                elif detected_text:
+                    last_ocr_sample = detected_text
 
                 if detected:
                     detection_time = time.time() - start_time
@@ -8070,6 +8140,37 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                     confidence=detection_confidence,
                     detection_time=result.get('detection_time', 0.0)
                 )
+                
+                # ==========================================================
+                # v42.0: AUTOMATIC WINDOW RETURN AFTER DETECTION
+                # ==========================================================
+                # ROOT CAUSE FIX: User should see the windows after detection
+                # is complete. JARVIS brings windows back from Ghost Display
+                # to the main workspace so the user can see what was detected.
+                #
+                # This is the "mission complete" action - JARVIS autonomously:
+                # 1. Monitored windows in the background (Ghost Display)
+                # 2. Detected the trigger text
+                # 3. Notified the user
+                # 4. NOW: Returns windows so user can see the result
+                # ==========================================================
+                auto_return_enabled = os.getenv('JARVIS_AUTO_RETURN_AFTER_DETECTION', '1') == '1'
+                
+                if auto_return_enabled:
+                    try:
+                        return_result = await self._return_windows_after_detection(
+                            app_name=app_name,
+                            trigger_text=trigger_text,
+                            detection_context=result.get('context')
+                        )
+                        
+                        if return_result and return_result.get('returned_count', 0) > 0:
+                            logger.info(
+                                f"[v42.0] ✅ Returned {return_result['returned_count']} windows "
+                                f"to main workspace after detection"
+                            )
+                    except Exception as e:
+                        logger.warning(f"[v42.0] Window return after detection failed: {e}")
 
                 # v11.0: EXECUTE ACTION if configured!
                 if action_config and self.config.enable_action_execution:
@@ -8406,6 +8507,159 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
         }
 
         logger.info(f"[Detection] Event logged: {json.dumps(detection_event, indent=2)}")
+
+    # =========================================================================
+    # v42.0: WINDOW RETURN AFTER DETECTION
+    # =========================================================================
+
+    async def _return_windows_after_detection(
+        self,
+        app_name: str,
+        trigger_text: str,
+        detection_context: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """
+        v42.0: Return windows from Ghost Display to main workspace after detection.
+        
+        This is the "mission complete" action that brings windows back so the user
+        can see what was detected. JARVIS narrates the entire process.
+        
+        Args:
+            app_name: Application name (e.g., "Chrome")
+            trigger_text: What was detected (e.g., "bouncing ball")
+            detection_context: Optional context from detection (numbers, etc.)
+            
+        Returns:
+            Dict with returned_count and details
+        """
+        result = {
+            "returned_count": 0,
+            "windows_returned": [],
+            "narrated": False
+        }
+        
+        if not GHOST_MANAGER_AVAILABLE:
+            logger.debug("[v42.0] Ghost Manager not available for window return")
+            return result
+            
+        if not hasattr(self, '_ghost_managers') or not app_name:
+            return result
+            
+        try:
+            ghost_manager = self._ghost_managers.get(app_name)
+            if not ghost_manager:
+                logger.debug(f"[v42.0] No Ghost Manager for {app_name}")
+                return result
+                
+            from backend.vision.yabai_space_detector import get_yabai_detector
+            yabai = get_yabai_detector()
+            
+            # Step 1: Narrate that we're bringing windows back
+            if self.config.working_out_loud_enabled:
+                # Build context-aware message
+                context_msg = ""
+                if detection_context:
+                    extracted_num = detection_context.get('extracted_number')
+                    if extracted_num:
+                        context_msg = f" The current value is {extracted_num}."
+                
+                await self._narrate_working_out_loud(
+                    message=f"I found '{trigger_text}' in {app_name}.{context_msg} "
+                            f"Now bringing the windows back to your screen so you can see them.",
+                    narration_type="success",
+                    watcher_id=f"return_announce_{app_name}",
+                    priority="high"
+                )
+                result["narrated"] = True
+            
+            # Step 2: Return all windows to their original positions
+            logger.info(f"[v42.0] 🏠 Returning {app_name} windows to main workspace...")
+            
+            return_result = await ghost_manager.return_all_windows(
+                yabai_detector=yabai,
+                restore_geometry=ghost_manager.config.preserve_geometry_on_return
+            )
+            
+            returned_windows = return_result.get("returned", [])
+            result["returned_count"] = len(returned_windows)
+            result["windows_returned"] = returned_windows
+            
+            # Step 3: Narrate completion
+            if self.config.working_out_loud_enabled and result["returned_count"] > 0:
+                window_word = "window" if result["returned_count"] == 1 else "windows"
+                await self._narrate_working_out_loud(
+                    message=f"Done! I've returned {result['returned_count']} {app_name} {window_word} "
+                            f"to your main display. You can now see what I detected.",
+                    narration_type="success",
+                    watcher_id=f"return_complete_{app_name}",
+                    priority="medium"
+                )
+            
+            # Step 4: Send WebSocket event for frontend UI update
+            if WEBSOCKET_MANAGER_AVAILABLE:
+                try:
+                    ws_manager = get_ws_manager()
+                    await ws_manager.broadcast_to_all({
+                        "type": "visual_detection",
+                        "event": "windows_returned",
+                        "data": {
+                            "app_name": app_name,
+                            "returned_count": result["returned_count"],
+                            "trigger_text": trigger_text,
+                            "timestamp": datetime.now().isoformat(),
+                            "message": f"Returned {result['returned_count']} windows from Ghost Display"
+                        }
+                    })
+                except Exception as e:
+                    logger.debug(f"[v42.0] WebSocket window return event failed: {e}")
+            
+            # Step 5: Send progress stream event
+            if PROGRESS_STREAM_AVAILABLE:
+                try:
+                    from backend.core.surveillance_progress_stream import emit_surveillance_progress, SurveillanceStage
+                    await emit_surveillance_progress(
+                        stage=SurveillanceStage.COMPLETE,
+                        message=f"✅ Detection complete! Returned {result['returned_count']} windows",
+                        progress_current=100,
+                        progress_total=100,
+                        app_name=app_name,
+                        trigger_text=trigger_text,
+                        details={
+                            "detection_complete": True,
+                            "windows_returned": result["returned_count"],
+                            "detection_context": detection_context
+                        }
+                    )
+                except Exception as e:
+                    logger.debug(f"[v42.0] Progress stream event failed: {e}")
+            
+            # Step 6: Stop health monitoring and cleanup
+            await ghost_manager.stop_health_monitoring()
+            
+            logger.info(
+                f"[v42.0] ✅ Window return complete: {result['returned_count']} windows "
+                f"returned to main workspace"
+            )
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"[v42.0] Window return failed: {e}", exc_info=True)
+            
+            # Narrate failure if possible
+            if self.config.working_out_loud_enabled:
+                try:
+                    await self._narrate_working_out_loud(
+                        message=f"I found what you were looking for, but I couldn't bring the windows back. "
+                                f"You may need to switch to the other display manually.",
+                        narration_type="error",
+                        watcher_id=f"return_error_{app_name}",
+                        priority="high"
+                    )
+                except Exception:
+                    pass
+                    
+            return result
 
     # =========================================================================
     # v14.0: "Working Out Loud" - Narration Methods
