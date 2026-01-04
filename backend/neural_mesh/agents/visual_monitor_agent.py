@@ -2849,8 +2849,14 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                 
                 # v41.0: CRITICAL - Always include Ghost Display space
                 # The Ghost Display is specifically designed for background capture,
-                # so windows there are ALWAYS capturable even if yabai doesn't 
+                # so windows there are ALWAYS capturable even if yabai doesn't
                 # report the space as "visible"
+                #
+                # v53.0: SHADOW REALM - Also recognize Display 2 as capturable
+                # Windows exiled to Shadow Realm (BetterDisplay) should always be
+                # considered capturable regardless of their space_id
+                shadow_display = int(os.getenv("JARVIS_SHADOW_DISPLAY", "2"))
+
                 try:
                     yabai_detector = get_yabai_detector()
                     yabai_timeout = float(os.getenv('JARVIS_YABAI_OPERATION_TIMEOUT', '3.0'))
@@ -2875,13 +2881,24 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
 
                     for w in windows:
                         window_space = w.get('space_id')
-                        if window_space in visible_space_ids:
+                        window_display = w.get('display_id') or w.get('display')
+
+                        # v53.0: SHADOW REALM - Windows on Display 2 are ALWAYS capturable
+                        # This bypasses the space visibility check entirely
+                        is_on_shadow_realm = window_display == shadow_display
+
+                        if window_space in visible_space_ids or is_on_shadow_realm:
+                            if is_on_shadow_realm and window_space not in visible_space_ids:
+                                logger.info(
+                                    f"[God Mode v53.0] 🌑 Window {w['window_id']} on Shadow Realm "
+                                    f"(Display {shadow_display}) - capturable via Hardware Targeting"
+                                )
                             capturable_windows.append(w)
                         else:
                             skipped_windows.append(w)
                             logger.debug(
-                                f"⚠️  Window {w['window_id']} (Space {window_space}) still not visible "
-                                f"after teleport attempt - skipping"
+                                f"⚠️  Window {w['window_id']} (Space {window_space}, Display {window_display}) "
+                                f"still not visible after teleport attempt - skipping"
                             )
 
                     # Log the filtering results
