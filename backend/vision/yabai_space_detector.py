@@ -7165,7 +7165,110 @@ class YabaiSpaceDetector:
             # Brief pause before trying next strategy
             if attempt < min(max_retries, len(strategies)) - 1:
                 await asyncio.sleep(0.3)
-        
+
+        # ═══════════════════════════════════════════════════════════════════════
+        # v51.2: LAST RESORT - Focus-based strategies when silent mode fails
+        # ═══════════════════════════════════════════════════════════════════════
+        # ROOT CAUSE FIX: Windows on phantom fullscreen spaces CANNOT be moved
+        # using silent strategies because yabai has limited power over windows
+        # that aren't on the active space.
+        #
+        # When ALL silent strategies fail, we MUST use focus-based strategies
+        # as a LAST RESORT. Yes, this briefly shows the window to the user,
+        # but it's better than failing completely.
+        #
+        # This enables the "watch all Chrome windows" to actually work with
+        # PWAs that are stuck in fullscreen mode.
+        # ═══════════════════════════════════════════════════════════════════════
+        if silent:
+            logger.warning(
+                f"[YABAI v51.2] 🚨 LAST RESORT: All silent strategies failed for window {window_id}. "
+                f"Attempting focus-based rescue (will briefly show window to user)..."
+            )
+
+            last_resort_strategies = [
+                ("focus_first", "Focus window first, then move"),
+                ("switch_grab_return", "Full space switch, focus, move, return"),
+            ]
+
+            for lr_attempt, (strategy, description) in enumerate(last_resort_strategies):
+                logger.info(
+                    f"[YABAI v51.2] 🆘 Last Resort {lr_attempt + 1}/{len(last_resort_strategies)}: {description}"
+                )
+
+                try:
+                    if strategy == "focus_first":
+                        # Focus the window to bring it to the current space
+                        logger.info(f"[YABAI v51.2] 🎯 Focusing window {window_id} to wake it...")
+                        proc = await asyncio.create_subprocess_exec(
+                            yabai_path, "-m", "window", "--focus", str(window_id),
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE
+                        )
+                        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+
+                        if proc.returncode == 0:
+                            logger.info(f"[YABAI v51.2] ✅ Window {window_id} focused (now on active space)")
+                            await asyncio.sleep(1.0)  # Wait for focus transition
+
+                            # Now try to move it
+                            cmd_success, error_msg = await execute_yabai_move(window_id, target_space)
+
+                            if cmd_success:
+                                if await verify_move_with_patience(target_space, "last_resort_focus"):
+                                    # Return user to original space
+                                    if original_user_space and original_user_space != target_space:
+                                        self._switch_to_space_applescript(original_user_space)
+                                    self._health.record_success(0)
+                                    logger.info(f"[YABAI v51.2] ✅ LAST RESORT SUCCESS via focus_first")
+                                    return True
+                        else:
+                            error_msg = stderr.decode().strip() if stderr else "Unknown"
+                            logger.warning(f"[YABAI v51.2] Focus failed: {error_msg}")
+
+                    elif strategy == "switch_grab_return":
+                        # Full space switch approach
+                        source_space = await get_window_space()
+                        if source_space and source_space > 0:
+                            logger.info(f"[YABAI v51.2] 🔄 Switching to Space {source_space} to grab window...")
+
+                            # Try AppleScript space switch
+                            switch_success = self._switch_to_space_applescript(source_space)
+                            if switch_success:
+                                await asyncio.sleep(0.8)  # Wait for space switch
+
+                                # Focus the window
+                                proc = await asyncio.create_subprocess_exec(
+                                    yabai_path, "-m", "window", "--focus", str(window_id),
+                                    stdout=asyncio.subprocess.PIPE,
+                                    stderr=asyncio.subprocess.PIPE
+                                )
+                                await asyncio.wait_for(proc.communicate(), timeout=3.0)
+                                await asyncio.sleep(0.5)
+
+                                # Move to target
+                                cmd_success, error_msg = await execute_yabai_move(window_id, target_space)
+
+                                if cmd_success:
+                                    if await verify_move_with_patience(target_space, "last_resort_switch"):
+                                        # Return user to original space
+                                        if original_user_space and original_user_space != source_space:
+                                            self._switch_to_space_applescript(original_user_space)
+                                        self._health.record_success(0)
+                                        logger.info(f"[YABAI v51.2] ✅ LAST RESORT SUCCESS via switch_grab_return")
+                                        return True
+
+                except asyncio.TimeoutError:
+                    logger.warning(f"[YABAI v51.2] Last resort {strategy} timed out")
+                except Exception as e:
+                    logger.warning(f"[YABAI v51.2] Last resort {strategy} error: {e}")
+
+                await asyncio.sleep(0.3)
+
+            logger.warning(
+                f"[YABAI v51.2] ❌ LAST RESORT FAILED: Even focus-based strategies couldn't move window {window_id}"
+            )
+
         # ═══════════════════════════════════════════════════════════════════════
         # v44.1: STATE CONVERGENCE RECOVERY (Enhanced)
         # ═══════════════════════════════════════════════════════════════════════
