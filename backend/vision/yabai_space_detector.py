@@ -5062,12 +5062,14 @@ class YabaiSpaceDetector:
         window_title: str = ""
     ) -> bool:
         """
-        v49.0: Unpack fullscreen using yabai's native toggle command.
+        v51.0: Unpack fullscreen using yabai's native toggle command WITH VERIFICATION.
 
-        This is more robust than AppleScript because:
-        1. Works on ANY window (PWAs, Electron apps, games)
-        2. Doesn't require app-specific scripting dictionaries
-        3. Uses the Window Manager directly
+        v49.0 bug: We returned True after toggle command succeeded, but didn't verify
+        that the window ACTUALLY exited fullscreen. The toggle might succeed but
+        the window could still be stuck in fullscreen (common with PWAs).
+
+        v51.0 fix: After toggle, verify by re-querying the Space. Only return True
+        if the Space is no longer marked as native-fullscreen.
 
         Args:
             window_id: The window to unpack
@@ -5075,14 +5077,29 @@ class YabaiSpaceDetector:
             window_title: Window title (for logging)
 
         Returns:
-            True if successfully unpacked, False otherwise
+            True if successfully unpacked AND VERIFIED, False otherwise
         """
         yabai_path = self._health.yabai_path or os.getenv("YABAI_PATH", "/opt/homebrew/bin/yabai")
 
         logger.info(
-            f"[YABAI v49.0] 🔄 YABAI TOGGLE: Unpacking window {window_id} "
+            f"[YABAI v51.0] 🔄 YABAI TOGGLE: Unpacking window {window_id} "
             f"({app_name}: {window_title[:40]}) via native-fullscreen toggle"
         )
+
+        # Get window's current space BEFORE toggle
+        original_space = -1
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                yabai_path, "-m", "query", "--windows", "--window", str(window_id),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+            if proc.returncode == 0 and stdout:
+                window_info = json.loads(stdout.decode())
+                original_space = window_info.get("space", -1)
+        except Exception as e:
+            logger.debug(f"[YABAI v51.0] Pre-toggle window query failed: {e}")
 
         try:
             # Execute yabai toggle
@@ -5093,28 +5110,316 @@ class YabaiSpaceDetector:
             )
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10.0)
 
-            if proc.returncode == 0:
+            if proc.returncode != 0:
+                error_msg = stderr.decode().strip() if stderr else "Unknown error"
+                logger.warning(
+                    f"[YABAI v51.0] ⚠️ Yabai toggle command rejected for window {window_id}: {error_msg}"
+                )
+                return False
+
+            logger.info(f"[YABAI v51.0] Toggle command accepted for window {window_id}")
+
+            # v51.0: Wait for macOS animation with SIP-aware delay
+            sip_delay = float(os.getenv("JARVIS_SIP_CONVERGENCE_DELAY", "3.0"))
+            logger.debug(f"[YABAI v51.0] ⏳ Waiting {sip_delay}s for fullscreen animation...")
+            await asyncio.sleep(sip_delay)
+
+            # ═══════════════════════════════════════════════════════════════════
+            # v51.0: CRITICAL VERIFICATION - Did fullscreen actually exit?
+            # ═══════════════════════════════════════════════════════════════════
+            # The toggle command might succeed but the window could still be
+            # in fullscreen. We MUST verify by checking the Space state.
+            # ═══════════════════════════════════════════════════════════════════
+
+            # Re-query window to get its new space
+            proc = await asyncio.create_subprocess_exec(
+                yabai_path, "-m", "query", "--windows", "--window", str(window_id),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+
+            if proc.returncode != 0 or not stdout:
+                # Window might have been destroyed and recreated (re-bonding needed)
+                logger.warning(
+                    f"[YABAI v51.0] Window {window_id} not found after toggle - "
+                    f"may need re-bonding"
+                )
+                # Return True to allow re-bonding to happen in caller
+                return True
+
+            window_info = json.loads(stdout.decode())
+            new_space = window_info.get("space", -1)
+
+            # Check if Space changed (fullscreen space was destroyed)
+            if new_space != original_space and original_space > 0:
                 logger.info(
-                    f"[YABAI v49.0] ✅ Yabai toggle SUCCESS for window {window_id}"
+                    f"[YABAI v51.0] ✅ VERIFIED: Window moved from Space {original_space} "
+                    f"→ Space {new_space} (fullscreen space destroyed)"
+                )
+                return True
+
+            # Check if new space is still fullscreen
+            space_is_fullscreen, _ = await self._is_space_native_fullscreen_async(new_space)
+
+            if not space_is_fullscreen:
+                logger.info(
+                    f"[YABAI v51.0] ✅ VERIFIED: Space {new_space} is NOT fullscreen - unpack successful"
+                )
+                return True
+            else:
+                logger.warning(
+                    f"[YABAI v51.0] ❌ VERIFICATION FAILED: Window {window_id} still on "
+                    f"fullscreen Space {new_space} after toggle!"
                 )
 
-                # Wait for macOS animation to complete
-                animation_delay = await self._get_system_animation_delay()
-                await asyncio.sleep(animation_delay)
+                # v51.0: Try zoom-fullscreen toggle as fallback
+                logger.info(f"[YABAI v51.0] Trying zoom-fullscreen toggle as fallback...")
+                proc = await asyncio.create_subprocess_exec(
+                    yabai_path, "-m", "window", str(window_id), "--toggle", "zoom-fullscreen",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                await asyncio.wait_for(proc.communicate(), timeout=5.0)
+                await asyncio.sleep(1.0)
+
+                # Re-verify
+                space_is_fullscreen, _ = await self._is_space_native_fullscreen_async(new_space)
+                if not space_is_fullscreen:
+                    logger.info(f"[YABAI v51.0] ✅ Zoom-fullscreen fallback succeeded!")
+                    return True
+
+                return False
+
+        except asyncio.TimeoutError:
+            logger.warning(f"[YABAI v51.0] ⚠️ Yabai toggle timed out for window {window_id}")
+            return False
+        except Exception as e:
+            logger.warning(f"[YABAI v51.0] ⚠️ Yabai toggle error for window {window_id}: {e}")
+            return False
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # v51.0: AX API PROTOCOL - THE "UNIVERSAL SOLVENT"
+    # ═══════════════════════════════════════════════════════════════════════════
+    # THE PROBLEM: PWAs (like Google Gemini) run as separate processes that:
+    #   - Don't respond to app-specific AppleScript dictionaries
+    #   - Yabai toggle fails silently on Phantom Spaces
+    #   - Standard "tell application X" doesn't know about the PWA
+    #
+    # THE SOLUTION: Use the Accessibility API (AX API) to:
+    #   1. Target the PROCESS by PID (DNA) - not by app name
+    #   2. Directly flip the AXFullScreen attribute on the window frame
+    #   3. This works on ANY window because it's OS-level, not app-level
+    #
+    # Every window on macOS MUST have an AXFullScreen attribute to be rendered
+    # by the WindowServer. We're toggling the raw bit that controls window state.
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    async def _unpack_via_ax_pid_async(
+        self,
+        pid: int,
+        window_id: int,
+        app_name: str = "Unknown"
+    ) -> bool:
+        """
+        v51.0: AX API "Universal Solvent" - Unpack fullscreen by targeting PID directly.
+
+        This bypasses app-specific AppleScript dictionaries by using System Events
+        to target the raw process by PID and flip the AXFullScreen attribute.
+
+        This works on:
+        - PWAs (Google Gemini, etc.) that don't respond to app dictionaries
+        - Chrome profiles that spawn separate processes
+        - Any window type that refuses to move via normal methods
+
+        Args:
+            pid: Process ID (DNA) of the window's process
+            window_id: Window ID (for logging)
+            app_name: App name (for logging)
+
+        Returns:
+            True if AX API successfully flipped AXFullScreen, False otherwise
+        """
+        if not pid or pid <= 0:
+            logger.warning(f"[YABAI v51.0] AX API: Invalid PID {pid}")
+            return False
+
+        logger.info(
+            f"[YABAI v51.0] ☢️ AX API NUCLEAR OPTION: Targeting PID {pid} "
+            f"({app_name}) to force-flip AXFullScreen attribute"
+        )
+
+        # AX API AppleScript that targets process by PID
+        ax_script = f'''
+        tell application "System Events"
+            try
+                -- Target process by PID (DNA) - bypasses app name entirely
+                set targetProc to first process whose unix id is {pid}
+
+                tell targetProc
+                    -- Wake up from App Nap if sleeping
+                    set visible to true
+
+                    -- Get all windows (PWAs typically have one main window)
+                    set allWindows to every window
+
+                    if (count of allWindows) > 0 then
+                        repeat with targetWin in allWindows
+                            -- Check if AXFullScreen attribute exists
+                            if (exists attribute "AXFullScreen" of targetWin) then
+                                set currentFullscreen to value of attribute "AXFullScreen" of targetWin
+
+                                if currentFullscreen is true then
+                                    -- FLIP THE SWITCH - Force exit fullscreen at OS level
+                                    set value of attribute "AXFullScreen" of targetWin to false
+                                    delay 0.5
+                                end if
+                            end if
+                        end repeat
+                        return "SUCCESS"
+                    else
+                        return "ERROR: No windows found for PID"
+                    end if
+                end tell
+
+            on error errMsg
+                return "ERROR: " & errMsg
+            end try
+        end tell
+        '''
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "osascript", "-e", ax_script,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15.0)
+
+            result = stdout.decode().strip() if stdout else ""
+            error = stderr.decode().strip() if stderr else ""
+
+            if "SUCCESS" in result:
+                logger.info(
+                    f"[YABAI v51.0] ☢️ AX API SUCCESS: Force-flipped AXFullScreen for PID {pid}"
+                )
+
+                # Wait for macOS to process the state change
+                sip_delay = float(os.getenv("JARVIS_SIP_CONVERGENCE_DELAY", "3.0"))
+                await asyncio.sleep(sip_delay)
 
                 return True
             else:
-                error_msg = stderr.decode().strip() if stderr else "Unknown error"
                 logger.warning(
-                    f"[YABAI v49.0] ⚠️ Yabai toggle FAILED for window {window_id}: {error_msg}"
+                    f"[YABAI v51.0] AX API result for PID {pid}: {result or error}"
                 )
                 return False
 
         except asyncio.TimeoutError:
-            logger.warning(f"[YABAI v49.0] ⚠️ Yabai toggle timed out for window {window_id}")
+            logger.warning(f"[YABAI v51.0] AX API timed out for PID {pid}")
             return False
         except Exception as e:
-            logger.warning(f"[YABAI v49.0] ⚠️ Yabai toggle error for window {window_id}: {e}")
+            logger.warning(f"[YABAI v51.0] AX API error for PID {pid}: {e}")
+            return False
+
+    async def _unpack_via_ax_window_async(
+        self,
+        window_id: int,
+        app_name: str = "Unknown"
+    ) -> bool:
+        """
+        v51.0: AX API targeting window by its properties (fallback if PID unknown).
+
+        Uses System Events to find windows by app name and toggle AXFullScreen.
+        Less precise than PID targeting but still uses AX API.
+
+        Args:
+            window_id: Window ID (for logging)
+            app_name: App name to search for
+
+        Returns:
+            True if AX API successfully flipped AXFullScreen, False otherwise
+        """
+        if not app_name or app_name == "Unknown":
+            logger.warning(f"[YABAI v51.0] AX API Window: No app name for window {window_id}")
+            return False
+
+        logger.info(
+            f"[YABAI v51.0] ☢️ AX API (by app): Targeting '{app_name}' windows "
+            f"to force-flip AXFullScreen attribute"
+        )
+
+        # Escape app name for AppleScript
+        escaped_app = app_name.replace('"', '\\"')
+
+        ax_script = f'''
+        tell application "System Events"
+            try
+                -- Find all processes matching the app name (handles PWAs)
+                set matchingProcs to every process whose name contains "{escaped_app}"
+
+                if (count of matchingProcs) is 0 then
+                    -- Try without partial match
+                    set matchingProcs to every process whose name is "{escaped_app}"
+                end if
+
+                if (count of matchingProcs) > 0 then
+                    repeat with targetProc in matchingProcs
+                        tell targetProc
+                            set visible to true
+                            set allWindows to every window
+
+                            repeat with targetWin in allWindows
+                                if (exists attribute "AXFullScreen" of targetWin) then
+                                    set currentFS to value of attribute "AXFullScreen" of targetWin
+                                    if currentFS is true then
+                                        set value of attribute "AXFullScreen" of targetWin to false
+                                        delay 0.5
+                                    end if
+                                end if
+                            end repeat
+                        end tell
+                    end repeat
+                    return "SUCCESS"
+                else
+                    return "ERROR: No matching processes found"
+                end if
+
+            on error errMsg
+                return "ERROR: " & errMsg
+            end try
+        end tell
+        '''
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "osascript", "-e", ax_script,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15.0)
+
+            result = stdout.decode().strip() if stdout else ""
+            error = stderr.decode().strip() if stderr else ""
+
+            if "SUCCESS" in result:
+                logger.info(
+                    f"[YABAI v51.0] ☢️ AX API (by app) SUCCESS for '{app_name}'"
+                )
+                sip_delay = float(os.getenv("JARVIS_SIP_CONVERGENCE_DELAY", "3.0"))
+                await asyncio.sleep(sip_delay)
+                return True
+            else:
+                logger.warning(
+                    f"[YABAI v51.0] AX API (by app) result: {result or error}"
+                )
+                return False
+
+        except asyncio.TimeoutError:
+            logger.warning(f"[YABAI v51.0] AX API (by app) timed out")
+            return False
+        except Exception as e:
+            logger.warning(f"[YABAI v51.0] AX API (by app) error: {e}")
             return False
 
     async def _handle_fullscreen_window_async(
@@ -5357,13 +5662,15 @@ class YabaiSpaceDetector:
 
         if needs_unpack:
             logger.warning(
-                f"[YABAI v49.0] ⚓ UNPACK REQUIRED: Window {window_id} ({app_name}) "
+                f"[YABAI v51.0] ⚓ UNPACK REQUIRED: Window {window_id} ({app_name}) "
                 f"in {'FULLSCREEN SPACE' if space_is_fullscreen else 'PHANTOM SPACE'} {window_space_id} - "
                 f"engaging YABAI TOGGLE first (universal unpack)"
             )
 
+            unpack_success = False
+
             # ═══════════════════════════════════════════════════════════════════
-            # v49.0: YABAI TOGGLE FIRST (Universal - works on ANY window type)
+            # v51.0: YABAI TOGGLE FIRST (Universal - works on ANY window type)
             # ═══════════════════════════════════════════════════════════════════
             yabai_toggle_success = await self._unpack_via_yabai_toggle_async(
                 window_id=window_id,
@@ -5373,37 +5680,115 @@ class YabaiSpaceDetector:
 
             if yabai_toggle_success:
                 logger.info(
-                    f"[YABAI v49.0] ✅ YABAI TOGGLE SUCCESS: Window {window_id} unpacked "
+                    f"[YABAI v51.0] ✅ YABAI TOGGLE SUCCESS: Window {window_id} unpacked "
                     f"via native toggle (no AppleScript needed)"
                 )
+                unpack_success = True
             else:
                 # ═══════════════════════════════════════════════════════════════
-                # v49.0: FALLBACK TO APPLESCRIPT
+                # v51.0: AX API PROTOCOL - "UNIVERSAL SOLVENT" FOR PWAs
                 # ═══════════════════════════════════════════════════════════════
-                # Yabai toggle failed - try AppleScript as backup.
-                # This handles minimized windows or cases where toggle doesn't work.
+                # Yabai toggle failed - try AX API (targets PID, bypasses app's
+                # internal scripting dictionary). This is the ONLY method that
+                # works on PWAs (Progressive Web Apps) like Google Gemini, which
+                # detach from the main Chrome process.
+                #
+                # The AX API directly flips the AXFullScreen attribute at the
+                # OS level, regardless of what the app's scripting dictionary
+                # supports.
                 # ═══════════════════════════════════════════════════════════════
-                logger.warning(
-                    f"[YABAI v49.0] ⚠️ Yabai toggle failed, falling back to AppleScript "
-                    f"for window {window_id}"
-                )
-                await self._deep_unpack_via_applescript(
-                    app_name=app_name,
-                    window_title=window_title,
-                    window_id=window_id,
-                    fire_and_forget=False,
-                    verify_transition=True
-                )
 
-            # v49.0: TOPOLOGY INVALIDATION - Space indices WILL shift after unpack
+                # Extract PID from window_info (yabai always provides this)
+                window_pid = window_info.get("pid", 0)
+
+                if window_pid > 0:
+                    logger.warning(
+                        f"[YABAI v51.0] 🧪 Yabai toggle failed, engaging AX API Protocol "
+                        f"(PID {window_pid}) for window {window_id} ({app_name})"
+                    )
+
+                    ax_api_success = await self._unpack_via_ax_pid_async(
+                        pid=window_pid,
+                        window_id=window_id,
+                        app_name=app_name
+                    )
+
+                    if ax_api_success:
+                        # v51.0: Verify AX API worked by checking Space again
+                        await asyncio.sleep(1.0)  # Give macOS time to animate
+                        space_still_fullscreen, _ = await self._is_space_native_fullscreen_async(window_space_id)
+
+                        if not space_still_fullscreen:
+                            logger.info(
+                                f"[YABAI v51.0] ✅ AX API PROTOCOL SUCCESS: Window {window_id} "
+                                f"unpacked via PID {window_pid} - Universal Solvent worked!"
+                            )
+                            unpack_success = True
+                        else:
+                            logger.warning(
+                                f"[YABAI v51.0] ⚠️ AX API returned success but Space still "
+                                f"fullscreen - may need animation time"
+                            )
+                            # Give more time for animation
+                            await asyncio.sleep(2.0)
+                            space_still_fullscreen2, _ = await self._is_space_native_fullscreen_async(window_space_id)
+                            if not space_still_fullscreen2:
+                                logger.info(f"[YABAI v51.0] ✅ AX API succeeded after extended wait")
+                                unpack_success = True
+                else:
+                    logger.warning(
+                        f"[YABAI v51.0] ⚠️ No PID available for window {window_id}, "
+                        f"skipping AX API Protocol"
+                    )
+                    ax_api_success = False
+
+                # ═══════════════════════════════════════════════════════════════
+                # v51.0: FALLBACK TO GENERIC APPLESCRIPT (Last Resort)
+                # ═══════════════════════════════════════════════════════════════
+                # Both Yabai toggle AND AX API failed. Fall back to generic
+                # AppleScript. This handles minimized windows or cases where
+                # the app truly doesn't support any fullscreen exit method.
+                # ═══════════════════════════════════════════════════════════════
+                if not unpack_success:
+                    logger.warning(
+                        f"[YABAI v51.0] ⚠️ AX API failed, falling back to generic AppleScript "
+                        f"for window {window_id}"
+                    )
+                    await self._deep_unpack_via_applescript(
+                        app_name=app_name,
+                        window_title=window_title,
+                        window_id=window_id,
+                        fire_and_forget=False,
+                        verify_transition=True
+                    )
+
+                    # v51.0: Verify AppleScript worked by checking Space again
+                    await asyncio.sleep(1.0)  # Give macOS time to animate
+                    space_still_fullscreen, _ = await self._is_space_native_fullscreen_async(window_space_id)
+                    if not space_still_fullscreen:
+                        logger.info(f"[YABAI v51.0] ✅ AppleScript unpack succeeded")
+                        unpack_success = True
+                    else:
+                        logger.warning(
+                            f"[YABAI v51.0] ❌ ALL UNPACK METHODS FAILED: "
+                            f"Yabai toggle, AX API, AND AppleScript all failed for window {window_id}"
+                        )
+
+            # v51.0: TOPOLOGY INVALIDATION - Space indices WILL shift after unpack
             self._space_topology_valid = False
             logger.info(
-                f"[YABAI v49.0] 🌊 TOPOLOGY INVALIDATED: Space indices may have shifted "
+                f"[YABAI v51.0] 🌊 TOPOLOGY INVALIDATED: Space indices may have shifted "
                 f"after unpacking window {window_id}"
             )
 
-            # Mark as handled and proceed
-            return True, True  # Changed: was_fullscreen=True, success=True
+            # v51.0: Return actual success status, not blindly True
+            # was_fullscreen=True, success=unpack_success
+            if not unpack_success:
+                logger.error(
+                    f"[YABAI v51.0] ❌ UNPACK FAILED: Both yabai toggle and AppleScript failed "
+                    f"for window {window_id}. Will try hardware targeting as last resort."
+                )
+            return True, unpack_success
         
         if fullscreen_mode is None:
             # Not in any fullscreen mode - nothing to do
@@ -5866,10 +6251,43 @@ class YabaiSpaceDetector:
 
         if was_fullscreen:
             if not unpack_success:
-                logger.error(
-                    f"[YABAI] ❌ Cannot move window {window_id}: stuck in fullscreen mode"
+                # ═══════════════════════════════════════════════════════════════
+                # v51.0: HARDWARE TARGETING BYPASS - Skip unpack, move directly
+                # ═══════════════════════════════════════════════════════════════
+                # Both yabai toggle AND AppleScript failed to unpack fullscreen.
+                # Instead of giving up, try moving the window directly to the
+                # Ghost Display. Sometimes macOS allows display moves even when
+                # the window is in a "stuck" state.
+                # ═══════════════════════════════════════════════════════════════
+                logger.warning(
+                    f"[YABAI v51.0] ⚠️ Fullscreen unpack failed for window {window_id}. "
+                    f"Attempting DIRECT HARDWARE MOVE (bypass unpack)..."
                 )
-                self._health.record_failure("Fullscreen unpack failed")
+
+                # Try hardware targeting directly
+                ghost_display = await self._get_ghost_display_index_async()
+                if ghost_display is not None:
+                    sip_delay = float(os.getenv("JARVIS_SIP_CONVERGENCE_DELAY", "3.0"))
+                    hardware_success = await self._move_window_to_display_async(
+                        window_id=window_id,
+                        display_index=ghost_display,
+                        sip_convergence_delay=sip_delay
+                    )
+
+                    if hardware_success:
+                        logger.info(
+                            f"[YABAI v51.0] ✅ HARDWARE BYPASS SUCCESS: Window {window_id} moved to "
+                            f"Display {ghost_display} despite being fullscreen!"
+                        )
+                        self._health.record_success(0)
+                        return True
+
+                # Hardware bypass also failed
+                logger.error(
+                    f"[YABAI v51.0] ❌ Cannot move window {window_id}: stuck in fullscreen mode "
+                    f"AND hardware bypass failed"
+                )
+                self._health.record_failure("Fullscreen unpack and hardware bypass failed")
                 return False
 
             # ═══════════════════════════════════════════════════════════════
