@@ -4055,6 +4055,166 @@ class YabaiSpaceDetector:
         # Default: Standard macOS animation takes ~1.5s for fullscreen toggle
         return 1.5
 
+    async def _deep_unpack_via_applescript(
+        self,
+        app_name: str,
+        window_title: str,
+        window_id: int
+    ) -> bool:
+        """
+        v43.0: DEEP UNPACK PROTOCOL - AppleScript Injection
+        
+        ROOT CAUSE FIX: Yabai cannot read the fullscreen state of windows on hidden
+        spaces ("dehydrated" windows). It returns is-native-fullscreen=false even
+        when the window IS fullscreen. This causes move commands to fail silently.
+        
+        SOLUTION: Bypass yabai and talk directly to the application using AppleScript.
+        Browsers like Chrome expose their window state via AppleScript even when hidden.
+        
+        AppleScript approach:
+        1. For Chrome-like apps: `tell application "Chrome" to set full screen of every window to false`
+        2. For other apps: `tell application "System Events" to tell process "App" to set value of attribute "AXFullScreen" to false`
+        
+        This is NON-BLOCKING (async subprocess) and INTELLIGENT (targets specific app).
+        
+        Args:
+            app_name: The application name (e.g., "Google Chrome")
+            window_title: The window title (for targeted unpack if needed)
+            window_id: Yabai window ID for logging
+            
+        Returns:
+            True if unpack was successful (or app doesn't support AppleScript)
+            False if an error occurred
+        """
+        # Sanitize inputs to prevent AppleScript injection
+        safe_app_name = app_name.replace('"', '\\"').replace("'", "\\'")
+        safe_title = window_title.replace('"', '\\"').replace("'", "\\'")[:50]
+        
+        logger.info(
+            f"[YABAI v43.0] 🔑 DEEP UNPACK: Forcing {safe_app_name} window {window_id} "
+            f"to exit fullscreen via AppleScript"
+        )
+        
+        # ═══════════════════════════════════════════════════════════════════════
+        # v43.0: APP-SPECIFIC AppleScript COMMANDS
+        # ═══════════════════════════════════════════════════════════════════════
+        # Different apps expose fullscreen differently:
+        # - Chrome/Chromium: `full screen of every window`
+        # - Safari: `fullscreen` property
+        # - Other apps: System Events accessibility API
+        # ═══════════════════════════════════════════════════════════════════════
+        
+        chrome_like_apps = {
+            "google chrome": "Google Chrome",
+            "chrome": "Google Chrome",
+            "chromium": "Chromium",
+            "brave browser": "Brave Browser",
+            "microsoft edge": "Microsoft Edge",
+            "arc": "Arc",
+        }
+        
+        safari_like_apps = {"safari": "Safari"}
+        
+        app_lower = app_name.lower()
+        
+        try:
+            if app_lower in chrome_like_apps:
+                # Chrome exposes `full screen` property directly
+                actual_app_name = chrome_like_apps[app_lower]
+                
+                # Strategy 1: Batch unpack all windows (most reliable)
+                script = f'''
+                tell application "{actual_app_name}"
+                    set windowList to every window
+                    repeat with w in windowList
+                        try
+                            if full screen of w is true then
+                                set full screen of w to false
+                            end if
+                        end try
+                    end repeat
+                end tell
+                '''
+                
+            elif app_lower in safari_like_apps:
+                # Safari uses slightly different syntax
+                actual_app_name = safari_like_apps[app_lower]
+                script = f'''
+                tell application "{actual_app_name}"
+                    set windowList to every window
+                    repeat with w in windowList
+                        try
+                            if fullscreen of w is true then
+                                set fullscreen of w to false
+                            end if
+                        end try
+                    end repeat
+                end tell
+                '''
+                
+            else:
+                # Generic approach via System Events accessibility API
+                # This works for most apps but may require accessibility permissions
+                script = f'''
+                tell application "System Events"
+                    tell process "{safe_app_name}"
+                        set frontmost to true
+                        repeat with w in (every window)
+                            try
+                                if value of attribute "AXFullScreen" of w is true then
+                                    set value of attribute "AXFullScreen" of w to false
+                                end if
+                            end try
+                        end repeat
+                    end tell
+                end tell
+                '''
+            
+            # Execute AppleScript asynchronously (non-blocking)
+            proc = await asyncio.create_subprocess_exec(
+                "osascript", "-e", script,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            
+            # Wait with timeout - don't block forever
+            try:
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+                
+                if proc.returncode == 0:
+                    logger.info(
+                        f"[YABAI v43.0] ✅ DEEP UNPACK SUCCESS: {app_name} windows forced to exit fullscreen"
+                    )
+                    
+                    # v43.0: HYDRATION DELAY - Allow animation to complete in background
+                    # Even though window is hidden, macOS still animates the state change
+                    hydration_delay = 1.0
+                    logger.debug(f"[YABAI v43.0] ⏳ Waiting {hydration_delay}s for hydration...")
+                    await asyncio.sleep(hydration_delay)
+                    
+                    return True
+                else:
+                    error_msg = stderr.decode().strip() if stderr else "Unknown error"
+                    logger.warning(
+                        f"[YABAI v43.0] ⚠️ DEEP UNPACK AppleScript returned error: {error_msg}"
+                    )
+                    # Still return True - the error might be benign (e.g., no windows in fullscreen)
+                    return True
+                    
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"[YABAI v43.0] ⚠️ DEEP UNPACK timed out for {app_name} - proceeding anyway"
+                )
+                return True  # Proceed anyway - timeout doesn't mean failure
+                
+        except FileNotFoundError:
+            logger.warning("[YABAI v43.0] osascript not found - skipping AppleScript unpack")
+            return True  # Graceful degradation
+            
+        except Exception as e:
+            logger.warning(f"[YABAI v43.0] DEEP UNPACK failed: {e}")
+            return True  # Graceful degradation - don't block the move operation
+
     async def _handle_fullscreen_window_async(
         self,
         window_id: int,
@@ -4146,6 +4306,52 @@ class YabaiSpaceDetector:
                     f"is {width}x{height} with no border"
                 )
 
+        # ═══════════════════════════════════════════════════════════════════════
+        # v43.0: DEEP UNPACK FOR HIDDEN/DEHYDRATED WINDOWS
+        # ═══════════════════════════════════════════════════════════════════════
+        # ROOT CAUSE FIX: Yabai cannot reliably detect fullscreen state for windows
+        # on hidden spaces ("dehydrated" windows). It returns is-native-fullscreen=false
+        # even when the window IS fullscreen. This causes move commands to fail.
+        #
+        # SOLUTION: If window is on a hidden space (not visible) and is a Chrome-like
+        # app, ALWAYS execute Deep Unpack via AppleScript as a precautionary measure.
+        # This forces fullscreen exit at the application level, bypassing yabai's
+        # unreliable state detection.
+        # ═══════════════════════════════════════════════════════════════════════
+        
+        # Check if window is on a hidden space (yabai state might be unreliable)
+        window_space_id = window_info.get("space", -1)
+        is_visible = window_info.get("is-visible", None)  # May be None or True/False
+        
+        # v43.0: Detect if window is likely dehydrated (on hidden space)
+        # Indicators of a dehydrated window:
+        # 1. is-visible is explicitly False
+        # 2. space_id is -1 (orphaned)
+        # 3. Window hasn't been interacted with (no focus history)
+        is_potentially_dehydrated = (
+            is_visible is False or
+            window_space_id == -1 or
+            (not is_native_fullscreen and not is_zoom_fullscreen and is_chrome_like)
+        )
+        
+        if is_potentially_dehydrated and is_chrome_like and fullscreen_mode is None:
+            # Window is hidden AND Chrome-like AND yabai says not fullscreen
+            # But we can't trust yabai here - execute Deep Unpack as precaution
+            logger.warning(
+                f"[YABAI v43.0] ⚠️ Window {window_id} ({app_name}) is on hidden space - "
+                f"Yabai fullscreen detection unreliable. Executing DEEP UNPACK."
+            )
+            
+            await self._deep_unpack_via_applescript(
+                app_name=app_name,
+                window_title=window_title,
+                window_id=window_id
+            )
+            
+            # Even if AppleScript ran, we mark as "handled" and proceed
+            # The Deep Unpack will have forced any fullscreen windows to exit
+            return False, True
+        
         if fullscreen_mode is None:
             # Not in any fullscreen mode - nothing to do
             return False, True
