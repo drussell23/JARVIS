@@ -4149,9 +4149,55 @@ class YabaiSpaceDetector:
             actual_app_name = app_name
             app_type = "generic"
         
-        # Sanitize to prevent AppleScript injection attacks
-        safe_app_name = actual_app_name.replace('"', '\\"').replace("\\", "\\\\")
-        safe_title = window_title.replace('"', '\\"').replace("\\", "\\\\")[:50]
+        # ═══════════════════════════════════════════════════════════════════════
+        # v44.3: ROBUST SANITIZATION - Prevent AppleScript Injection Attacks
+        # ═══════════════════════════════════════════════════════════════════════
+        # Window titles can contain ANY characters including:
+        # - Double quotes: "My "Favorite" Website"
+        # - Backslashes: "C:\Users\Data"
+        # - Newlines, tabs, special Unicode
+        #
+        # AppleScript uses DOUBLED QUOTES for escaping, not backslash:
+        # "Hello "World"" → prints: Hello "World"
+        #
+        # Order matters:
+        # 1. First escape backslashes (\ → \\)
+        # 2. Then escape quotes (" → \")  -- for osascript -e
+        # 3. Remove control characters that break scripts
+        # ═══════════════════════════════════════════════════════════════════════
+        
+        def sanitize_for_applescript(text: str, max_length: int = 100) -> str:
+            """
+            Sanitize a string for safe use in AppleScript via osascript -e.
+            
+            Args:
+                text: The raw text to sanitize
+                max_length: Maximum length (prevents script bloat)
+                
+            Returns:
+                Sanitized string safe for AppleScript injection
+            """
+            if not text:
+                return ""
+            
+            # Truncate first to avoid processing huge strings
+            result = text[:max_length]
+            
+            # Remove control characters (newlines, tabs, etc.) that break scripts
+            result = ''.join(char for char in result if ord(char) >= 32 or char in '\t')
+            
+            # Replace problematic characters
+            # Order matters: backslash first, then quotes
+            result = result.replace('\\', '\\\\')  # Escape backslashes
+            result = result.replace('"', '\\"')    # Escape double quotes for shell
+            result = result.replace("'", "\\'")    # Escape single quotes
+            result = result.replace('`', '\\`')    # Escape backticks
+            result = result.replace('$', '\\$')    # Escape dollar signs (shell expansion)
+            
+            return result
+        
+        safe_app_name = sanitize_for_applescript(actual_app_name, max_length=50)
+        safe_title = sanitize_for_applescript(window_title, max_length=50)
         
         logger.info(
             f"[YABAI v44.0] 🔑 ATOMIC TRANSITION: Forcing {actual_app_name} window {window_id} "
