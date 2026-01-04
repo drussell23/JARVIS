@@ -71,6 +71,34 @@ except ImportError:
     except ImportError:
         get_app_library = None
 
+# v68.0: Import PhantomHardwareManager for software-defined Ghost Display
+# Creates virtual displays via BetterDisplay - no HDMI dummy plug needed
+_HAS_PHANTOM_HARDWARE = False
+get_phantom_manager = None
+try:
+    from system.phantom_hardware_manager import get_phantom_manager
+    _HAS_PHANTOM_HARDWARE = True
+except ImportError:
+    try:
+        from backend.system.phantom_hardware_manager import get_phantom_manager
+        _HAS_PHANTOM_HARDWARE = True
+    except ImportError:
+        pass
+
+# v69.0: Import CryostasisManager for process freezing
+# Freezes apps on Ghost Display to reduce GPU/CPU usage
+_HAS_CRYOSTASIS = False
+get_cryostasis_manager = None
+try:
+    from system.cryostasis_manager import get_cryostasis_manager
+    _HAS_CRYOSTASIS = True
+except ImportError:
+    try:
+        from backend.system.cryostasis_manager import get_cryostasis_manager
+        _HAS_CRYOSTASIS = True
+    except ImportError:
+        pass
+
 logger = logging.getLogger(__name__)
 
 
@@ -12054,15 +12082,54 @@ class YabaiSpaceDetector:
 
     async def teleport_window_to_ghost_async(
         self,
-        window_id: int
+        window_id: int,
+        auto_create_display: bool = True
     ) -> Tuple[bool, Optional[int]]:
-        """Async version of teleport_window_to_ghost."""
-        import asyncio
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
+        """
+        v68.0: Async version of teleport_window_to_ghost with Phantom Hardware support.
+
+        If no Ghost Display exists and auto_create_display=True, this will
+        attempt to create a virtual display using BetterDisplay (v68.0 Phantom Hardware).
+        """
+        ghost_space = await self.get_ghost_display_space_async()
+
+        # =================================================================
+        # v68.0: PHANTOM HARDWARE - Auto-create Ghost Display if needed
+        # =================================================================
+        if ghost_space is None and auto_create_display and _HAS_PHANTOM_HARDWARE:
+            try:
+                phantom = get_phantom_manager()
+                logger.info("[v68.0] 👻 No Ghost Display - attempting Phantom Hardware creation...")
+
+                success, error = await phantom.ensure_ghost_display_exists_async()
+
+                if success:
+                    # Re-query for Ghost Display space
+                    ghost_space = await self.get_ghost_display_space_async()
+                    if ghost_space:
+                        logger.info(f"[v68.0] ✅ Phantom Hardware created Ghost Display (Space {ghost_space})")
+                    else:
+                        logger.warning("[v68.0] Phantom Hardware succeeded but yabai can't see display yet")
+                else:
+                    logger.warning(f"[v68.0] Phantom Hardware failed: {error}")
+
+            except Exception as e:
+                logger.warning(f"[v68.0] Phantom Hardware error: {e}")
+
+        if ghost_space is None:
+            logger.warning(
+                "[YABAI] 👻 No Ghost Display available - "
+                "install BetterDisplay or use a physical HDMI dummy plug"
+            )
+            return False, None
+
+        # Move window to Ghost Display
+        success = await asyncio.get_event_loop().run_in_executor(
             None,
-            lambda: self.teleport_window_to_ghost(window_id)
+            lambda: self.move_window_to_space(window_id, ghost_space)
         )
+
+        return success, ghost_space if success else None
 
     def teleport_windows_to_ghost(
         self,

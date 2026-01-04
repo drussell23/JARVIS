@@ -143,6 +143,20 @@ except ImportError:
     except ImportError as e:
         logger.warning(f"AppLibrary (v67.0 Cerebro) not available: {e}")
 
+# v69.0: Import CryostasisManager for process freezing/thawing
+# Required for thaw-before-operations integration
+CRYOSTASIS_AVAILABLE = False
+get_cryostasis_manager = None
+try:
+    from system.cryostasis_manager import get_cryostasis_manager
+    CRYOSTASIS_AVAILABLE = True
+except ImportError:
+    try:
+        from backend.system.cryostasis_manager import get_cryostasis_manager
+        CRYOSTASIS_AVAILABLE = True
+    except ImportError as e:
+        logger.debug(f"CryostasisManager (v69.0) not available: {e}")
+
 class ResponseStyle(Enum):
     """
     Response style variations based on time of day and context.
@@ -1262,6 +1276,42 @@ class IntelligentCommandHandler:
                         resolved_app_name,
                         cerebro_result.get('path')
                     )
+
+        # =====================================================================
+        # v69.0: CRYOSTASIS THAW-BEFORE-OPERATIONS (Critical for frozen apps)
+        # =====================================================================
+        # Apps on Ghost Display may be frozen via SIGSTOP. We MUST thaw them
+        # BEFORE attempting any window operations, or the operations will fail.
+        # =====================================================================
+        if CRYOSTASIS_AVAILABLE and get_cryostasis_manager:
+            try:
+                cryo = get_cryostasis_manager()
+                thaw_target = resolved_app_name or app_name
+
+                if thaw_target and cryo.is_frozen(thaw_target):
+                    logger.info(f"[v69.0] 🔥 THAW-BEFORE-OPERATIONS: Thawing {thaw_target}...")
+                    thaw_result = await cryo.thaw_app_async(thaw_target, wait_after_thaw=True)
+
+                    if thaw_result.get('success'):
+                        freeze_duration = thaw_result.get('freeze_duration_seconds', 0)
+                        logger.info(
+                            f"[v69.0] ✅ Thawed {thaw_target} after {freeze_duration:.1f}s freeze"
+                        )
+                    else:
+                        logger.warning(f"[v69.0] Failed to thaw {thaw_target}: {thaw_result}")
+
+                elif not thaw_target:
+                    # No specific app - thaw ALL frozen apps for "bring back all"
+                    frozen_apps = cryo.get_frozen_app_names()
+                    if frozen_apps:
+                        logger.info(f"[v69.0] 🔥 THAW-BEFORE-OPERATIONS: Thawing {len(frozen_apps)} apps...")
+                        for frozen_app in frozen_apps:
+                            await cryo.thaw_app_async(frozen_app, wait_after_thaw=False)
+                        # Single wait after all thaws
+                        await asyncio.sleep(0.5)
+
+            except Exception as e:
+                logger.warning(f"[v69.0] Cryostasis thaw error (non-fatal): {e}")
 
         # =====================================================================
         # STRATEGY 1: v63 BOOMERANG PROTOCOL (Primary - async, parallel, smart)
