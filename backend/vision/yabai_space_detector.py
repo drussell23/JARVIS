@@ -4134,6 +4134,139 @@ class YabaiSpaceDetector:
         return []
 
     # =========================================================================
+    # v70.0: ASYNC WINDOW DISCOVERY - Required for "Bring Back" Command
+    # =========================================================================
+
+    async def find_windows_on_space_async(self, space_id: int) -> List[Dict[str, Any]]:
+        """
+        v70.0: Async method to find all windows on a specific space.
+        
+        ROOT CAUSE FIX: This method was MISSING, causing "Bring back Chrome"
+        to return 0 windows because Strategy 3 (Direct Query) couldn't execute.
+        
+        This method queries yabai directly for the freshest window topology,
+        rather than relying on cached space info.
+        
+        Args:
+            space_id: The space ID to query
+            
+        Returns:
+            List of window dictionaries with id, app, title, frame, etc.
+        """
+        yabai_path = self._health.yabai_path or os.getenv("YABAI_PATH", "/opt/homebrew/bin/yabai")
+        
+        try:
+            # Query all windows
+            proc = await asyncio.create_subprocess_exec(
+                yabai_path, "-m", "query", "--windows",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10.0)
+            
+            if proc.returncode != 0:
+                error_msg = stderr.decode().strip() if stderr else "Unknown error"
+                logger.warning(f"[YABAI v70.0] Window query failed: {error_msg}")
+                return []
+            
+            all_windows = json.loads(stdout.decode())
+            
+            # Filter for windows on the target space
+            windows_on_space = [
+                {
+                    "id": w.get("id"),
+                    "window_id": w.get("id"),  # Alias for compatibility
+                    "app": w.get("app", "Unknown"),
+                    "title": w.get("title", ""),
+                    "space": w.get("space"),
+                    "display": w.get("display"),
+                    "frame": w.get("frame", {}),
+                    "is_fullscreen": w.get("is-native-fullscreen", False),
+                    "is_minimized": w.get("is-minimized", False),
+                    "is_visible": w.get("is-visible", True),
+                    "has_focus": w.get("has-focus", False),
+                    "pid": w.get("pid")
+                }
+                for w in all_windows
+                if w.get("space") == space_id
+            ]
+            
+            logger.info(
+                f"[YABAI v70.0] 🔍 Found {len(windows_on_space)} windows on Space {space_id}"
+            )
+            
+            return windows_on_space
+            
+        except asyncio.TimeoutError:
+            logger.error(f"[YABAI v70.0] Window query timed out for space {space_id}")
+            return []
+        except json.JSONDecodeError as e:
+            logger.error(f"[YABAI v70.0] Failed to parse window data: {e}")
+            return []
+        except Exception as e:
+            logger.error(f"[YABAI v70.0] Unexpected error querying windows: {e}")
+            return []
+
+    async def find_windows_on_display_async(self, display_id: int) -> List[Dict[str, Any]]:
+        """
+        v70.0: Async method to find all windows on a specific display.
+        
+        This is useful for Ghost Display (Display 2) operations where windows
+        may span multiple spaces on the same display.
+        
+        Args:
+            display_id: The display ID to query (1=main, 2=Ghost Display typically)
+            
+        Returns:
+            List of window dictionaries
+        """
+        yabai_path = self._health.yabai_path or os.getenv("YABAI_PATH", "/opt/homebrew/bin/yabai")
+        
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                yabai_path, "-m", "query", "--windows",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10.0)
+            
+            if proc.returncode != 0:
+                logger.warning(f"[YABAI v70.0] Window query failed for display {display_id}")
+                return []
+            
+            all_windows = json.loads(stdout.decode())
+            
+            # Filter for windows on the target display
+            windows_on_display = [
+                {
+                    "id": w.get("id"),
+                    "window_id": w.get("id"),
+                    "app": w.get("app", "Unknown"),
+                    "title": w.get("title", ""),
+                    "space": w.get("space"),
+                    "display": w.get("display"),
+                    "frame": w.get("frame", {}),
+                    "is_fullscreen": w.get("is-native-fullscreen", False),
+                    "is_minimized": w.get("is-minimized", False),
+                    "is_visible": w.get("is-visible", True),
+                    "has_focus": w.get("has-focus", False),
+                    "pid": w.get("pid")
+                }
+                for w in all_windows
+                if w.get("display") == display_id
+            ]
+            
+            logger.info(
+                f"[YABAI v70.0] 🔍 Found {len(windows_on_display)} windows on Display {display_id}"
+            )
+            
+            return windows_on_display
+            
+        except Exception as e:
+            logger.error(f"[YABAI v70.0] Error querying windows on display: {e}")
+            return []
+
+    # =========================================================================
     # v22.0.0: WINDOW TELEPORTATION - Autonomous Window Management
     # =========================================================================
     # These methods enable JARVIS to move windows between spaces automatically.
@@ -5808,6 +5941,38 @@ class YabaiSpaceDetector:
         # ═══════════════════════════════════════════════════════════════════
         if maximize_after_exile:
             await self._maximize_window_async(window_id)
+
+        # ═══════════════════════════════════════════════════════════════════
+        # PHASE 4.5: v70.0 BOOMERANG REGISTRATION - Track for "Bring Back"
+        # ═══════════════════════════════════════════════════════════════════
+        # ROOT CAUSE FIX: Windows were never registered with Boomerang during
+        # exile, causing "Bring back Chrome" to return 0 windows.
+        # We register the window NOW so it can be summoned back later.
+        # ═══════════════════════════════════════════════════════════════════
+        try:
+            # Determine original space/display for return journey
+            # Use captured values from PHASE 1, or defaults
+            return_space = original_space if original_space and original_space > 0 else window_space
+            return_display = window_display if window_display > 0 else 1  # Default to main display
+            
+            # Register with Boomerang Protocol for "bring back" commands
+            await self.boomerang_register_exile_async(
+                window_id=window_id,
+                app_name=app_name,
+                original_space=return_space if return_space > 0 else 1,
+                original_display=return_display,
+                window_title=window_title,
+                auto_return_timeout=None,  # Manual return via voice command
+                return_on_detection=True,  # Return when surveillance finds target
+                return_on_app_activate=True  # Return when user clicks app in Dock
+            )
+            logger.info(
+                f"[YABAI v70.0] 🪃 BOOMERANG REGISTERED: Window {window_id} ({app_name}) "
+                f"→ Return to Space {return_space}, Display {return_display}"
+            )
+        except Exception as e:
+            # Non-fatal - Boomerang registration is best-effort
+            logger.warning(f"[YABAI v70.0] ⚠️ Boomerang registration failed: {e}")
 
         # ═══════════════════════════════════════════════════════════════════
         # PHASE 5: VERIFY - Confirm window is on Shadow Realm

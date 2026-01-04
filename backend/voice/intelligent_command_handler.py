@@ -1395,14 +1395,24 @@ class IntelligentCommandHandler:
 
             # Find Ghost Display space
             ghost_space = yabai.get_ghost_display_space()
-            if ghost_space is None:
-                return (
-                    f"I don't have a Ghost Display configured right now, {self.user_name}. "
-                    f"There are no windows to bring back."
-                )
-
-            # Find windows on Ghost Display
-            windows_on_ghost = await yabai.find_windows_on_space_async(ghost_space)
+            windows_on_ghost = []
+            
+            # v70.0: Try space-based query first
+            if ghost_space is not None:
+                windows_on_ghost = await yabai.find_windows_on_space_async(ghost_space)
+                logger.info(f"[v70.0] Space-based query (Space {ghost_space}): {len(windows_on_ghost)} windows")
+            
+            # v70.0: Fallback to display-based query (Display 2 = Ghost Display)
+            # This is more reliable because it doesn't depend on space ID accuracy
+            if not windows_on_ghost:
+                ghost_display_id = int(os.environ.get("JARVIS_SHADOW_DISPLAY", "2"))
+                logger.info(f"[v70.0] 🔍 Space query empty - trying display-based query (Display {ghost_display_id})")
+                
+                try:
+                    windows_on_ghost = await yabai.find_windows_on_display_async(ghost_display_id)
+                    logger.info(f"[v70.0] Display-based query (Display {ghost_display_id}): {len(windows_on_ghost)} windows")
+                except Exception as e:
+                    logger.debug(f"[v70.0] Display-based query failed: {e}")
 
             if not windows_on_ghost:
                 return random.choice([
