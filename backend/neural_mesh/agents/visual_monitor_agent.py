@@ -2587,14 +2587,25 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                         # - Comprehensive telemetry tracking
                         #
                         # v19.0: Added timeout protection to prevent "Processing..." hang
+                        # v44.2: QUANTUM MECHANICS - Pass None to force fresh topology query
                         # =========================================================
                         rescue_timeout = float(os.getenv('JARVIS_RESCUE_TIMEOUT', '15.0'))
+
+                        # v44.2: TOPOLOGY INTEGRITY CHECK
+                        # Pass ghost_space=None to force rescue_windows_to_ghost_async to
+                        # re-query the Ghost Display at the START of rescue.
+                        # This respects LAW 1 (Topology Drift) - we don't trust stale IDs.
+                        # The rescue function will auto-detect the fresh Ghost Display.
+                        logger.info(
+                            f"[God Mode v44.2] 🔬 QUANTUM TOPOLOGY: Forcing fresh Ghost Display "
+                            f"query (stale value: Space {ghost_space})"
+                        )
 
                         try:
                             rescue_result = await asyncio.wait_for(
                                 yabai.rescue_windows_to_ghost_async(
                                     windows=windows_to_teleport,
-                                    ghost_space=ghost_space,
+                                    ghost_space=None,  # v44.2: Force fresh re-query
                                     max_parallel=5  # Limit concurrent operations
                                 ),
                                 timeout=rescue_timeout
@@ -2613,6 +2624,30 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                             failed_count = rescue_result.get("failed_count", 0)
                             telemetry_data = rescue_result.get("telemetry", {})
 
+                            # v44.2: QUANTUM TOPOLOGY SYNC - Re-query Ghost Display after rescue
+                            # The actual ghost_space used by rescue may differ from our original
+                            # due to LAW 1 (Topology Drift) during the rescue operation.
+                            actual_ghost_space = ghost_space  # Fallback to original
+                            try:
+                                fresh_ghost = await asyncio.wait_for(
+                                    asyncio.get_event_loop().run_in_executor(
+                                        None, yabai.get_ghost_display_space
+                                    ),
+                                    timeout=3.0
+                                )
+                                if fresh_ghost is not None:
+                                    if fresh_ghost != ghost_space:
+                                        logger.info(
+                                            f"[God Mode v44.2] 🌊 POST-RESCUE TOPOLOGY SYNC: "
+                                            f"Ghost Display shifted Space {ghost_space} → {fresh_ghost}"
+                                        )
+                                    actual_ghost_space = fresh_ghost
+                                    # Update the main ghost_space variable for visibility filter
+                                    ghost_space = fresh_ghost
+                                    teleported_ghost_space = fresh_ghost
+                            except Exception as e:
+                                logger.debug(f"[God Mode v44.2] Post-rescue Ghost query failed: {e}")
+
                             # Update window objects with teleport info
                             teleport_progress_idx = 0
                             total_details = len(rescue_result.get("details", []))
@@ -2622,7 +2657,7 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                                     # Find the original window and update it
                                     for w in windows_to_teleport:
                                         if w.get("window_id") == detail.get("window_id"):
-                                            w["space_id"] = ghost_space
+                                            w["space_id"] = actual_ghost_space  # v44.2: Use fresh topology
                                             w["teleported"] = True
                                             w["original_space"] = detail.get("source_space")
                                             w["rescue_method"] = detail.get("method")
@@ -2638,7 +2673,7 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                                                         total=total_details,
                                                         window_id=w.get("window_id"),
                                                         from_space=detail.get("source_space", 0),
-                                                        to_space=ghost_space,
+                                                        to_space=actual_ghost_space,  # v44.2: Use fresh topology
                                                         app_name=app_name,
                                                         correlation_id=_surveillance_correlation_id
                                                     )

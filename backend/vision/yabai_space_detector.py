@@ -4658,51 +4658,100 @@ class YabaiSpaceDetector:
                 )
 
         # ═══════════════════════════════════════════════════════════════════════
-        # v43.0: DEEP UNPACK FOR HIDDEN/DEHYDRATED WINDOWS
+        # v44.2: QUANTUM MECHANICS PROTOCOL - Respects Three Laws of OS Physics
         # ═══════════════════════════════════════════════════════════════════════
-        # ROOT CAUSE FIX: Yabai cannot reliably detect fullscreen state for windows
-        # on hidden spaces ("dehydrated" windows). It returns is-native-fullscreen=false
-        # even when the window IS fullscreen. This causes move commands to fail.
+        # 
+        # LAW 1: TOPOLOGY DRIFT - Space indices change after fullscreen exit
+        # LAW 2: EVENTUAL CONSISTENCY - Must wait for state to converge
+        # LAW 3: ATOMICITY - Treat operation as indivisible transaction
         #
-        # SOLUTION: If window is on a hidden space (not visible) and is a Chrome-like
-        # app, ALWAYS execute Deep Unpack via AppleScript as a precautionary measure.
-        # This forces fullscreen exit at the application level, bypassing yabai's
-        # unreliable state detection.
+        # ROOT CAUSE: Yabai reports FALSE for is-native-fullscreen on hidden windows.
+        # The window IS fullscreen, but Yabai can't see into the hidden Space.
+        # This causes moves to fail silently because macOS blocks moving fullscreen windows.
+        #
+        # SOLUTION: Check if window's space is in the VISIBLE SPACES set.
+        # If NOT visible, ALWAYS run Deep Unpack as precautionary measure.
         # ═══════════════════════════════════════════════════════════════════════
         
         # Check if window is on a hidden space (yabai state might be unreliable)
         window_space_id = window_info.get("space", -1)
-        is_visible = window_info.get("is-visible", None)  # May be None or True/False
+        is_visible_flag = window_info.get("is-visible", None)  # May be None or True/False
         
-        # v43.0: Detect if window is likely dehydrated (on hidden space)
-        # Indicators of a dehydrated window:
-        # 1. is-visible is explicitly False
-        # 2. space_id is -1 (orphaned)
-        # 3. Window hasn't been interacted with (no focus history)
-        is_potentially_dehydrated = (
-            is_visible is False or
+        # v44.2: Query ACTUAL visible spaces from yabai (not just the flag)
+        visible_spaces = set()
+        try:
+            # Get current visible spaces
+            proc = await asyncio.create_subprocess_exec(
+                yabai_path, "-m", "query", "--spaces",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=3.0)
+            if proc.returncode == 0 and stdout:
+                spaces_data = json.loads(stdout.decode())
+                for space in spaces_data:
+                    # A space is "visible" if it's the active space on its display
+                    if space.get("is-visible", False) or space.get("has-focus", False):
+                        visible_spaces.add(space.get("index"))
+                logger.debug(f"[YABAI v44.2] Visible spaces: {visible_spaces}")
+        except Exception as e:
+            logger.debug(f"[YABAI v44.2] Could not query visible spaces: {e}")
+            # Fallback: include current user space
+            current_space = self.get_current_user_space()
+            if current_space:
+                visible_spaces.add(current_space)
+        
+        # v44.2: DEFINITIVE hidden space detection
+        # Window is on hidden space if:
+        # 1. space_id is NOT in visible_spaces set, OR
+        # 2. space_id is -1 (orphaned), OR
+        # 3. is-visible flag is explicitly False
+        is_on_hidden_space = (
+            (window_space_id != -1 and window_space_id not in visible_spaces) or
             window_space_id == -1 or
-            (not is_native_fullscreen and not is_zoom_fullscreen and is_chrome_like)
+            is_visible_flag is False
         )
         
-        if is_potentially_dehydrated and is_chrome_like and fullscreen_mode is None:
-            # Window is hidden AND Chrome-like AND yabai says not fullscreen
-            # But we can't trust yabai here - execute Deep Unpack as precaution
+        # v44.2: Log the physics state for debugging
+        if is_on_hidden_space:
+            logger.info(
+                f"[YABAI v44.2] 🔬 QUANTUM STATE: Window {window_id} ({app_name}) is on "
+                f"HIDDEN Space {window_space_id} (visible spaces: {visible_spaces}). "
+                f"Yabai fullscreen={is_native_fullscreen} (UNTRUSTED for hidden windows)"
+            )
+        
+        # v44.2: ALWAYS run Deep Unpack for Chrome-like windows on hidden spaces
+        # This respects LAW 1 (Topology Drift) - we don't trust Yabai's state report
+        if is_on_hidden_space and is_chrome_like:
             logger.warning(
-                f"[YABAI v44.0] ⚠️ Window {window_id} ({app_name}) is on hidden space - "
-                f"Yabai fullscreen detection unreliable. Executing ATOMIC TRANSITION."
+                f"[YABAI v44.2] ⚠️ QUANTUM MECHANICS: Window {window_id} ({app_name}) "
+                f"exists on hidden Space {window_space_id} - executing ATOMIC TRANSITION "
+                f"(Yabai state unreliable, forcing precautionary unpack)"
             )
             
-            # v44.0: ATOMIC TRANSITION with state verification
+            # ═══════════════════════════════════════════════════════════════════
+            # v44.2: ATOMIC TRANSITION with State Convergence
+            # ═══════════════════════════════════════════════════════════════════
+            # Respects LAW 2 (Eventual Consistency):
             # 1. Execute AppleScript to force exit fullscreen
-            # 2. Wait for hydration (1.5s)
-            # 3. Verify the window actually exited fullscreen
+            # 2. State Convergence Protocol waits for topology to stabilize
+            # 3. Verify the window landed on a valid space
+            # ═══════════════════════════════════════════════════════════════════
             await self._deep_unpack_via_applescript(
                 app_name=app_name,
                 window_title=window_title,
                 window_id=window_id,
                 fire_and_forget=False,  # v44.0: Wait for completion
-                verify_transition=True   # v44.0: Verify state changed
+                verify_transition=True   # v44.0: Verify state changed (State Convergence)
+            )
+            
+            # v44.2: TOPOLOGY INVALIDATION - Respects LAW 1 (Topology Drift)
+            # After unpacking a hidden fullscreen window, space indices WILL shift.
+            # Mark topology as invalid so subsequent operations re-query.
+            self._space_topology_valid = False
+            logger.info(
+                f"[YABAI v44.2] 🌊 TOPOLOGY INVALIDATED: Space indices may have shifted "
+                f"after unpacking window {window_id}"
             )
             
             # Even if AppleScript ran, we mark as "handled" and proceed
@@ -5083,6 +5132,37 @@ class YabaiSpaceDetector:
                 # Mark topology as refreshed
                 self._space_topology_valid = True
                 self._last_topology_refresh = time.time()
+
+        # ═══════════════════════════════════════════════════════════════════════
+        # v44.2: UNCONDITIONAL TOPOLOGY CHECK - Respects LAW 1 (Topology Drift)
+        # ═══════════════════════════════════════════════════════════════════════
+        # Even if was_fullscreen is False, Deep Unpack may have run for hidden
+        # windows and invalidated topology. ALWAYS check if topology needs refresh.
+        # ═══════════════════════════════════════════════════════════════════════
+        if not self._space_topology_valid:
+            logger.info(
+                f"[YABAI v44.2] 🔄 QUANTUM TOPOLOGY CHECK: Topology was invalidated, "
+                f"re-querying Ghost Display..."
+            )
+            old_target = target_space
+            
+            # Re-query ghost display space
+            new_ghost_space = self.get_ghost_display_space()
+            if new_ghost_space is not None:
+                if old_target != new_ghost_space:
+                    logger.warning(
+                        f"[YABAI v44.2] 🌊 TOPOLOGY DRIFT CONFIRMED: Ghost Display shifted "
+                        f"Space {old_target} → {new_ghost_space}"
+                    )
+                target_space = new_ghost_space
+            else:
+                logger.warning(
+                    f"[YABAI v44.2] ⚠️ Could not re-query Ghost Display, using original: {old_target}"
+                )
+            
+            # Mark topology as refreshed
+            self._space_topology_valid = True
+            self._last_topology_refresh = time.time()
 
         # ═══════════════════════════════════════════════════════════════════
         # v34.0: CROSS-DISPLAY DETECTION
