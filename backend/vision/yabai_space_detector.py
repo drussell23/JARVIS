@@ -7357,6 +7357,561 @@ class YabaiSpaceDetector:
             logger.debug(f"[YABAI v53.0] Maximize failed: {e}")
             return False
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # v63.0: BOOMERANG PROTOCOL - Intelligent Auto-Summon via OS Signals
+    # ═══════════════════════════════════════════════════════════════════════════
+    # ROOT CAUSE FIX: Windows exiled to Shadow Realm need an INTELLIGENT way to
+    # return automatically. The Boomerang Protocol listens for OS-level signals
+    # and user intent indicators to trigger summons autonomously.
+    #
+    # TRIGGERS:
+    # 1. Surveillance session completion (detection found or timeout)
+    # 2. App activation via Dock/Spotlight (user explicitly requests app)
+    # 3. Display configuration changes (Shadow Realm display disconnected)
+    # 4. User voice command ("bring back my windows")
+    # 5. Time-based auto-return (configurable timeout)
+    # 6. Space navigation to Shadow Realm (user manually switches)
+    #
+    # PATENT CLAIM: The Boomerang Protocol uses a combination of:
+    # - NSWorkspace notifications for app state changes
+    # - CGDisplayNotification for display topology changes
+    # - Yabai window queries for state verification
+    # - Async event-driven architecture for non-blocking operation
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    # Boomerang tracking state
+    _boomerang_exiled_windows: Dict[int, Dict[str, Any]] = {}
+    _boomerang_listeners_active: bool = False
+    _boomerang_auto_return_tasks: Dict[str, asyncio.Task] = {}
+
+    async def boomerang_register_exile_async(
+        self,
+        window_id: int,
+        app_name: str,
+        original_space: int,
+        original_display: int,
+        window_title: str = "",
+        auto_return_timeout: Optional[float] = None,
+        return_on_detection: bool = True,
+        return_on_app_activate: bool = True
+    ) -> bool:
+        """
+        v63.0: BOOMERANG REGISTRATION - Track an exiled window for auto-return.
+
+        When a window is exiled to the Shadow Realm, register it with Boomerang
+        so it can be automatically summoned back when conditions are met.
+
+        Args:
+            window_id: The window being exiled
+            app_name: Application name (for Dock/Spotlight activation detection)
+            original_space: Space to return to (0 for auto-detect)
+            original_display: Display to return to (0 for user's active display)
+            window_title: Window title (for matching after ID changes)
+            auto_return_timeout: Optional timeout in seconds for auto-return
+            return_on_detection: Return when surveillance detects target
+            return_on_app_activate: Return when user activates app via Dock
+
+        Returns:
+            True if registered successfully
+        """
+        logger.info(
+            f"[YABAI v63.0] 🪃 BOOMERANG REGISTER: Window {window_id} ({app_name}) "
+            f"→ Original: Space {original_space}, Display {original_display}"
+        )
+
+        # Store exile metadata
+        exile_record = {
+            "window_id": window_id,
+            "app_name": app_name,
+            "original_space": original_space,
+            "original_display": original_display,
+            "window_title": window_title,
+            "exile_timestamp": asyncio.get_event_loop().time(),
+            "auto_return_timeout": auto_return_timeout,
+            "return_on_detection": return_on_detection,
+            "return_on_app_activate": return_on_app_activate,
+            "status": "exiled"
+        }
+
+        self._boomerang_exiled_windows[window_id] = exile_record
+
+        # Start auto-return timer if configured
+        if auto_return_timeout and auto_return_timeout > 0:
+            task_key = f"auto_return_{window_id}"
+            if task_key in self._boomerang_auto_return_tasks:
+                self._boomerang_auto_return_tasks[task_key].cancel()
+
+            task = asyncio.create_task(
+                self._boomerang_auto_return_after_timeout(
+                    window_id, auto_return_timeout
+                )
+            )
+            self._boomerang_auto_return_tasks[task_key] = task
+            logger.debug(
+                f"[YABAI v63.0] ⏰ Auto-return timer set: {auto_return_timeout}s for window {window_id}"
+            )
+
+        return True
+
+    async def _boomerang_auto_return_after_timeout(
+        self,
+        window_id: int,
+        timeout_seconds: float
+    ) -> None:
+        """
+        v63.0: Internal timer for auto-return after timeout.
+        """
+        try:
+            await asyncio.sleep(timeout_seconds)
+
+            # Check if window is still registered (not already returned)
+            if window_id in self._boomerang_exiled_windows:
+                record = self._boomerang_exiled_windows[window_id]
+                if record.get("status") == "exiled":
+                    logger.info(
+                        f"[YABAI v63.0] ⏰ BOOMERANG TIMEOUT: Auto-returning window {window_id} "
+                        f"after {timeout_seconds}s"
+                    )
+                    await self.boomerang_trigger_return_async(
+                        window_id=window_id,
+                        trigger_reason="timeout"
+                    )
+
+        except asyncio.CancelledError:
+            logger.debug(f"[YABAI v63.0] Auto-return timer cancelled for window {window_id}")
+        except Exception as e:
+            logger.warning(f"[YABAI v63.0] Auto-return timer error: {e}")
+
+    async def boomerang_trigger_return_async(
+        self,
+        window_id: Optional[int] = None,
+        app_name: Optional[str] = None,
+        trigger_reason: str = "manual",
+        parallel: bool = True,
+        focus_after: bool = True
+    ) -> Dict[str, Any]:
+        """
+        v63.0: BOOMERANG TRIGGER - Initiate the return of exiled window(s).
+
+        This is the central entry point for all summon triggers. It handles:
+        - Single window return (by window_id)
+        - App-based return (all windows of an app)
+        - Parallel processing for multiple windows
+        - State verification and cleanup
+
+        Args:
+            window_id: Specific window to return (optional)
+            app_name: Return all windows of this app (optional)
+            trigger_reason: What triggered the return (for logging/analytics)
+            parallel: Use parallel async for multiple windows
+            focus_after: Focus the window(s) after return
+
+        Returns:
+            Dict with success status, returned window IDs, and details
+        """
+        logger.info(
+            f"[YABAI v63.0] 🪃 BOOMERANG TRIGGER: Initiating return "
+            f"(window={window_id}, app={app_name}, reason={trigger_reason})"
+        )
+
+        result = {
+            "success": False,
+            "trigger_reason": trigger_reason,
+            "returned_windows": [],
+            "failed_windows": [],
+            "details": {}
+        }
+
+        # Determine which windows to return
+        windows_to_return = []
+
+        if window_id is not None:
+            if window_id in self._boomerang_exiled_windows:
+                windows_to_return.append(self._boomerang_exiled_windows[window_id])
+            else:
+                # Window not in registry, try direct summon anyway
+                windows_to_return.append({
+                    "window_id": window_id,
+                    "app_name": app_name or "Unknown",
+                    "original_space": 0,  # Auto-detect
+                    "original_display": 0  # User's active display
+                })
+
+        elif app_name is not None:
+            # Return all windows of this app
+            windows_to_return = [
+                record for record in self._boomerang_exiled_windows.values()
+                if record.get("app_name") == app_name and record.get("status") == "exiled"
+            ]
+
+        else:
+            # Return ALL exiled windows
+            windows_to_return = [
+                record for record in self._boomerang_exiled_windows.values()
+                if record.get("status") == "exiled"
+            ]
+
+        if not windows_to_return:
+            logger.info("[YABAI v63.0] 🪃 No windows to return")
+            result["success"] = True
+            result["details"]["message"] = "No exiled windows found to return"
+            return result
+
+        logger.info(f"[YABAI v63.0] 🪃 Returning {len(windows_to_return)} window(s)...")
+
+        # v63.0: PARALLEL RETURN for efficiency
+        if parallel and len(windows_to_return) > 1:
+            # Create return tasks for each window
+            return_tasks = [
+                self._boomerang_return_single_window(record, focus_after=(i == len(windows_to_return) - 1 and focus_after))
+                for i, record in enumerate(windows_to_return)
+            ]
+
+            # Execute in parallel
+            task_results = await asyncio.gather(*return_tasks, return_exceptions=True)
+
+            for i, task_result in enumerate(task_results):
+                record = windows_to_return[i]
+                wid = record.get("window_id")
+
+                if isinstance(task_result, Exception):
+                    logger.warning(f"[YABAI v63.0] Return failed for window {wid}: {task_result}")
+                    result["failed_windows"].append(wid)
+                elif task_result.get("success"):
+                    result["returned_windows"].append(task_result.get("final_window_id", wid))
+                else:
+                    result["failed_windows"].append(wid)
+
+        else:
+            # Sequential return
+            for i, record in enumerate(windows_to_return):
+                is_last = (i == len(windows_to_return) - 1)
+                single_result = await self._boomerang_return_single_window(
+                    record, focus_after=(is_last and focus_after)
+                )
+
+                wid = record.get("window_id")
+                if single_result.get("success"):
+                    result["returned_windows"].append(single_result.get("final_window_id", wid))
+                else:
+                    result["failed_windows"].append(wid)
+
+        result["success"] = len(result["returned_windows"]) > 0
+        result["details"]["total_attempted"] = len(windows_to_return)
+        result["details"]["total_returned"] = len(result["returned_windows"])
+        result["details"]["total_failed"] = len(result["failed_windows"])
+
+        logger.info(
+            f"[YABAI v63.0] 🪃 BOOMERANG COMPLETE: {len(result['returned_windows'])}/{len(windows_to_return)} "
+            f"windows returned (trigger={trigger_reason})"
+        )
+
+        return result
+
+    async def _boomerang_return_single_window(
+        self,
+        record: Dict[str, Any],
+        focus_after: bool = False
+    ) -> Dict[str, Any]:
+        """
+        v63.0: Return a single window from the Shadow Realm.
+
+        Uses the SUMMON PROTOCOL (v57.0) internally but adds:
+        - Original position restoration (if tracked)
+        - State verification
+        - Registry cleanup
+
+        Args:
+            record: Exile record from boomerang registry
+            focus_after: Whether to focus after return
+
+        Returns:
+            Dict with success status and details
+        """
+        window_id = record.get("window_id")
+        app_name = record.get("app_name", "Unknown")
+        original_display = record.get("original_display", 0)
+
+        result = {
+            "success": False,
+            "window_id": window_id,
+            "final_window_id": window_id,
+            "method": "unknown"
+        }
+
+        try:
+            # Use the existing SUMMON PROTOCOL
+            success, method, final_id = await self.summon_window_from_shadow_realm_async(
+                window_id=window_id,
+                app_name=app_name,
+                target_display=original_display if original_display > 0 else None,
+                focus_after_summon=focus_after,
+                maximize_after_summon=False
+            )
+
+            result["success"] = success
+            result["method"] = method
+            result["final_window_id"] = final_id or window_id
+
+            if success:
+                # Update registry
+                if window_id in self._boomerang_exiled_windows:
+                    self._boomerang_exiled_windows[window_id]["status"] = "returned"
+                    self._boomerang_exiled_windows[window_id]["return_timestamp"] = asyncio.get_event_loop().time()
+
+                # Cancel any pending auto-return timer
+                task_key = f"auto_return_{window_id}"
+                if task_key in self._boomerang_auto_return_tasks:
+                    self._boomerang_auto_return_tasks[task_key].cancel()
+                    del self._boomerang_auto_return_tasks[task_key]
+
+                logger.debug(f"[YABAI v63.0] ✅ Window {window_id} returned successfully")
+
+        except Exception as e:
+            logger.warning(f"[YABAI v63.0] Return failed for window {window_id}: {e}")
+            result["method"] = f"exception_{e}"
+
+        return result
+
+    async def boomerang_on_detection_complete_async(
+        self,
+        app_name: str,
+        detection_result: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """
+        v63.0: DETECTION TRIGGER - Called when surveillance detects the target.
+
+        This is the primary trigger for God Mode surveillance. When JARVIS
+        detects "bouncing ball" (or whatever was being watched), this
+        automatically returns the windows to the user's screen.
+
+        Args:
+            app_name: The app that was being watched
+            detection_result: Optional details about what was detected
+
+        Returns:
+            Dict with return results
+        """
+        logger.info(
+            f"[YABAI v63.0] 🎯 BOOMERANG DETECTION TRIGGER: Surveillance complete for {app_name}"
+        )
+
+        # Find windows with return_on_detection=True
+        windows_to_return = [
+            record for record in self._boomerang_exiled_windows.values()
+            if record.get("app_name") == app_name
+            and record.get("status") == "exiled"
+            and record.get("return_on_detection", True)
+        ]
+
+        if not windows_to_return:
+            logger.info(f"[YABAI v63.0] No {app_name} windows registered for detection return")
+            return {"success": True, "returned_windows": [], "message": "No windows to return"}
+
+        # Trigger the return
+        result = await self.boomerang_trigger_return_async(
+            app_name=app_name,
+            trigger_reason="detection_complete",
+            parallel=True,
+            focus_after=True
+        )
+
+        return result
+
+    async def boomerang_on_app_activated_async(
+        self,
+        activated_app_name: str,
+        activation_source: str = "unknown"
+    ) -> Dict[str, Any]:
+        """
+        v63.0: APP ACTIVATION TRIGGER - Called when user activates an exiled app.
+
+        Detects when the user clicks an app in the Dock, opens via Spotlight,
+        or uses Cmd+Tab to switch to an app whose windows are in the Shadow Realm.
+
+        This trigger respects Single-Seat Concurrency - we only return windows
+        when the user explicitly requests the app on their main display.
+
+        Args:
+            activated_app_name: The app being activated
+            activation_source: How it was activated (dock, spotlight, cmd_tab)
+
+        Returns:
+            Dict with return results
+        """
+        logger.info(
+            f"[YABAI v63.0] 📱 BOOMERANG APP ACTIVATION: {activated_app_name} "
+            f"(source={activation_source})"
+        )
+
+        # Find windows with return_on_app_activate=True
+        windows_to_return = [
+            record for record in self._boomerang_exiled_windows.values()
+            if record.get("app_name") == activated_app_name
+            and record.get("status") == "exiled"
+            and record.get("return_on_app_activate", True)
+        ]
+
+        if not windows_to_return:
+            logger.debug(f"[YABAI v63.0] No {activated_app_name} windows registered for activation return")
+            return {"success": True, "returned_windows": [], "message": "No matching windows"}
+
+        # Trigger the return
+        result = await self.boomerang_trigger_return_async(
+            app_name=activated_app_name,
+            trigger_reason=f"app_activated_{activation_source}",
+            parallel=True,
+            focus_after=True
+        )
+
+        return result
+
+    async def boomerang_on_display_changed_async(
+        self,
+        display_event: str,
+        affected_display: int
+    ) -> Dict[str, Any]:
+        """
+        v63.0: DISPLAY CHANGE TRIGGER - Called when display topology changes.
+
+        If the Shadow Realm display is disconnected, this emergency-returns
+        all exiled windows to prevent them from being lost.
+
+        Args:
+            display_event: Type of event (disconnected, reconfigured, etc.)
+            affected_display: Which display changed
+
+        Returns:
+            Dict with return results
+        """
+        shadow_display = int(os.getenv("JARVIS_SHADOW_DISPLAY", "2"))
+
+        logger.info(
+            f"[YABAI v63.0] 🖥️ BOOMERANG DISPLAY CHANGE: {display_event} on Display {affected_display}"
+        )
+
+        # If Shadow Realm is affected, emergency return all windows
+        if affected_display == shadow_display and display_event == "disconnected":
+            logger.warning(
+                f"[YABAI v63.0] ⚠️ SHADOW REALM DISCONNECTED! Emergency returning all windows..."
+            )
+
+            result = await self.boomerang_trigger_return_async(
+                app_name=None,  # All apps
+                trigger_reason="display_disconnected_emergency",
+                parallel=True,
+                focus_after=False  # Don't disrupt user
+            )
+
+            return result
+
+        return {"success": True, "message": "Display change noted, no action needed"}
+
+    def boomerang_get_exiled_windows(self) -> List[Dict[str, Any]]:
+        """
+        v63.0: Get list of currently exiled windows.
+
+        Returns:
+            List of exile records
+        """
+        return [
+            record for record in self._boomerang_exiled_windows.values()
+            if record.get("status") == "exiled"
+        ]
+
+    def boomerang_clear_returned_windows(self) -> int:
+        """
+        v63.0: Clean up the registry by removing returned windows.
+
+        Returns:
+            Number of records cleaned
+        """
+        to_remove = [
+            wid for wid, record in self._boomerang_exiled_windows.items()
+            if record.get("status") == "returned"
+        ]
+
+        for wid in to_remove:
+            del self._boomerang_exiled_windows[wid]
+
+        if to_remove:
+            logger.debug(f"[YABAI v63.0] Cleaned {len(to_remove)} returned window records")
+
+        return len(to_remove)
+
+    async def boomerang_voice_command_async(
+        self,
+        command: str,
+        app_filter: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        v63.0: VOICE COMMAND TRIGGER - Handle natural language return commands.
+
+        Supports commands like:
+        - "bring back my windows"
+        - "bring back Chrome"
+        - "return all windows"
+        - "summon the windows"
+
+        Args:
+            command: The voice command text
+            app_filter: Optional app name to filter by
+
+        Returns:
+            Dict with return results and response message
+        """
+        command_lower = command.lower()
+
+        logger.info(
+            f"[YABAI v63.0] 🎤 BOOMERANG VOICE COMMAND: '{command}' (filter={app_filter})"
+        )
+
+        # Parse command intent
+        is_bring_back = any(phrase in command_lower for phrase in [
+            "bring back", "return", "summon", "get back", "restore",
+            "bring the windows", "bring my windows"
+        ])
+
+        if not is_bring_back:
+            return {
+                "success": False,
+                "message": "Command not recognized as a window return request"
+            }
+
+        # Determine app filter from command if not provided
+        if not app_filter:
+            # Check for app names in command
+            exiled_apps = set(
+                record.get("app_name") for record in self._boomerang_exiled_windows.values()
+                if record.get("status") == "exiled"
+            )
+
+            for app in exiled_apps:
+                if app and app.lower() in command_lower:
+                    app_filter = app
+                    break
+
+        # Trigger the return
+        result = await self.boomerang_trigger_return_async(
+            app_name=app_filter,
+            trigger_reason="voice_command",
+            parallel=True,
+            focus_after=True
+        )
+
+        # Generate response message
+        if result["success"]:
+            count = len(result["returned_windows"])
+            if app_filter:
+                message = f"Returned {count} {app_filter} window{'s' if count != 1 else ''} to your screen."
+            else:
+                message = f"Returned {count} window{'s' if count != 1 else ''} to your screen."
+        else:
+            message = "No exiled windows found to return."
+
+        result["response_message"] = message
+        return result
+
     async def _find_window_by_chemical_bond_async(
         self,
         app_name: str,

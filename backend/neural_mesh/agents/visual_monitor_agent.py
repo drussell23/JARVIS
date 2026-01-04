@@ -2664,7 +2664,28 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                                             w["rescue_strategy"] = detail.get("strategy")
                                             w["rescue_duration_ms"] = detail.get("duration_ms")
                                             teleported_windows.append(w)
-                                            
+
+                                            # v63.0: BOOMERANG REGISTRATION - Track for auto-return
+                                            # This enables intelligent window return via multiple triggers:
+                                            # - Detection complete (surveillance found target)
+                                            # - App activation (user clicks Dock/Spotlight)
+                                            # - Voice command ("bring back my windows")
+                                            # - Timeout (configurable auto-return)
+                                            try:
+                                                auto_return_timeout = float(os.getenv('JARVIS_BOOMERANG_TIMEOUT', '0'))
+                                                await yabai.boomerang_register_exile_async(
+                                                    window_id=w.get("window_id"),
+                                                    app_name=w.get("app", app_name),
+                                                    original_space=detail.get("source_space", 0),
+                                                    original_display=1,  # Main display (dynamic detection in return)
+                                                    window_title=w.get("title", ""),
+                                                    auto_return_timeout=auto_return_timeout if auto_return_timeout > 0 else None,
+                                                    return_on_detection=True,
+                                                    return_on_app_activate=True
+                                                )
+                                            except Exception as boomerang_err:
+                                                logger.debug(f"[v63.0] Boomerang registration failed: {boomerang_err}")
+
                                             # v32.0: Emit progress for each teleported window
                                             if PROGRESS_STREAM_AVAILABLE:
                                                 try:
@@ -8968,12 +8989,33 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
             
             # Step 6: Stop health monitoring and cleanup
             await ghost_manager.stop_health_monitoring()
-            
+
+            # v63.0: BOOMERANG CLEANUP - Clear returned windows from registry
+            # This notifies the Boomerang Protocol that detection is complete
+            # and the windows have been successfully returned.
+            try:
+                # Notify Boomerang that detection is complete
+                boomerang_result = await yabai.boomerang_on_detection_complete_async(
+                    app_name=app_name,
+                    detection_result={
+                        "trigger_text": trigger_text,
+                        "context": detection_context,
+                        "returned_count": result["returned_count"]
+                    }
+                )
+                # Clean up any remaining returned records
+                yabai.boomerang_clear_returned_windows()
+                logger.debug(
+                    f"[v63.0] Boomerang detection cleanup complete for {app_name}"
+                )
+            except Exception as boomerang_err:
+                logger.debug(f"[v63.0] Boomerang cleanup error: {boomerang_err}")
+
             logger.info(
                 f"[v42.0] ✅ Window return complete: {result['returned_count']} windows "
                 f"returned to main workspace"
             )
-            
+
             return result
             
         except Exception as e:

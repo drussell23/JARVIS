@@ -598,6 +598,69 @@ class VisionCommandHandler:
             }
 
         # =========================================================================
+        # 🪃 v63.0: BOOMERANG PROTOCOL - Voice-Activated Window Return
+        # =========================================================================
+        # Handle "bring back windows" commands before other processing.
+        # This triggers the Boomerang Protocol to return exiled windows.
+        #
+        # Supported commands:
+        # - "bring back my windows"
+        # - "bring back Chrome windows"
+        # - "return all windows"
+        # - "summon the windows"
+        # =========================================================================
+        boomerang_keywords = [
+            "bring back", "bring my windows", "bring the windows",
+            "return windows", "return my windows", "return all windows",
+            "summon windows", "summon my windows", "get back windows",
+            "restore windows", "restore my windows"
+        ]
+
+        if any(keyword in command_lower for keyword in boomerang_keywords):
+            logger.info(f"[VISION] 🪃 BOOMERANG VOICE COMMAND detected: {command_text}")
+
+            try:
+                from backend.vision.yabai_space_detector import get_yabai_detector
+                yabai = get_yabai_detector()
+
+                # Extract app filter from command if present
+                app_filter = None
+                common_apps = ["chrome", "safari", "firefox", "terminal", "code", "slack", "discord", "figma"]
+                for app in common_apps:
+                    if app in command_lower:
+                        # Capitalize properly
+                        app_filter = app.title() if app != "code" else "Visual Studio Code"
+                        break
+
+                # Execute Boomerang voice command
+                result = await yabai.boomerang_voice_command_async(
+                    command=command_text,
+                    app_filter=app_filter
+                )
+
+                response_message = result.get("response_message", "No windows to return.")
+                returned_count = len(result.get("returned_windows", []))
+
+                logger.info(f"[VISION] 🪃 BOOMERANG COMPLETE: {returned_count} windows returned")
+
+                return {
+                    "handled": True,
+                    "response": response_message,
+                    "boomerang": True,
+                    "returned_count": returned_count,
+                    "command_type": "boomerang_return",
+                }
+
+            except Exception as e:
+                logger.error(f"[VISION] 🪃 Boomerang command failed: {e}", exc_info=True)
+                return {
+                    "handled": True,
+                    "response": f"I tried to bring back your windows, but encountered an issue: {str(e)}",
+                    "boomerang": True,
+                    "error": True,
+                }
+
+        # =========================================================================
         # 🏎️ GOD MODE SURVEILLANCE - Voice-Activated Window Monitoring
         # =========================================================================
         # Check for "watch" commands FIRST - route to IntelligentCommandHandler
