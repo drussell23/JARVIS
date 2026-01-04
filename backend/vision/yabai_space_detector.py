@@ -3932,14 +3932,21 @@ class YabaiSpaceDetector:
         target_space: int,
         follow: bool = False,
         verify: bool = True,
-        max_retries: int = 3
+        max_retries: int = 3,
+        silent: bool = False
     ) -> bool:
         """
-        v34.0 DISPLAY HANDOFF PROTOCOL: Intelligent cross-display window management.
+        v34.0 STEALTH & DISPLAY HANDOFF PROTOCOL: Intelligent window management.
 
         ROOT CAUSE FIX: The --space command silently fails when moving windows
         across displays without Scripting Additions. macOS blocks cross-GPU
         texture transfers via space commands for security reasons.
+
+        v34.0 STEALTH MODE (silent=True):
+        - NEVER uses --focus commands (won't hijack user's screen)
+        - Uses progressive retries with delays for non-focus strategies
+        - Returns False instead of escalating to focus-based strategies
+        - Ideal for background monitoring (God Mode)
 
         SOLUTION: Display Handoff Protocol
         1. DETECT: Check if source and target are on different displays
@@ -4218,22 +4225,52 @@ class YabaiSpaceDetector:
         # For same-display moves, standard strategies are used
         # ═══════════════════════════════════════════════════════════════════
 
+        # ═══════════════════════════════════════════════════════════════════
+        # v34.0: STEALTH MODE - NEVER HIJACK USER'S SCREEN
+        # ═══════════════════════════════════════════════════════════════════
+        # When silent=True (used by God Mode / background monitoring):
+        # - ONLY use non-focus strategies
+        # - Progressive retries with delays for Strategy 1
+        # - Return False instead of escalating to focus-based strategies
+        # ═══════════════════════════════════════════════════════════════════
+
+        if silent:
+            logger.info(f"[YABAI] 🤫 STEALTH MODE: Focus strategies DISABLED for window {window_id}")
+
         if is_cross_display_move:
             # Cross-display: Prioritize Display Handoff
-            strategies = [
-                ("display_handoff", "Display Handoff (cross-display native)"),
-                ("display_then_space", "Display Handoff + Space refinement"),
-                ("focus_first", "Focus window first, then move"),
-                ("switch_grab_return", "Full space switch, focus, move, return"),
-            ]
+            if silent:
+                # STEALTH: Only non-focus strategies with progressive retries
+                strategies = [
+                    ("display_handoff", "Display Handoff (cross-display native)"),
+                    ("display_handoff_retry_1", "Display Handoff (retry 1, +0.5s delay)"),
+                    ("display_handoff_retry_2", "Display Handoff (retry 2, +1.0s delay)"),
+                    ("display_then_space", "Display Handoff + Space refinement"),
+                ]
+            else:
+                strategies = [
+                    ("display_handoff", "Display Handoff (cross-display native)"),
+                    ("display_then_space", "Display Handoff + Space refinement"),
+                    ("focus_first", "Focus window first, then move"),
+                    ("switch_grab_return", "Full space switch, focus, move, return"),
+                ]
         else:
             # Same-display: Use standard strategies
-            strategies = [
-                ("direct_fire_confirm", "Direct move with progressive verification"),
-                ("focus_first", "Focus window first, then move"),
-                ("wake_then_move", "Wake space via AppleScript, then direct move"),
-                ("switch_grab_return", "Full space switch, focus, move, return"),
-            ]
+            if silent:
+                # STEALTH: Only non-focus strategies with progressive retries
+                strategies = [
+                    ("direct_fire_confirm", "Direct move with progressive verification"),
+                    ("direct_retry_1", "Direct move (retry 1, +0.5s delay)"),
+                    ("direct_retry_2", "Direct move (retry 2, +1.0s delay)"),
+                    ("wake_then_move", "Wake space via AppleScript (no focus)"),
+                ]
+            else:
+                strategies = [
+                    ("direct_fire_confirm", "Direct move with progressive verification"),
+                    ("focus_first", "Focus window first, then move"),
+                    ("wake_then_move", "Wake space via AppleScript, then direct move"),
+                    ("switch_grab_return", "Full space switch, focus, move, return"),
+                ]
 
         for attempt, (strategy, description) in enumerate(strategies[:max_retries]):
             logger.info(
@@ -4310,6 +4347,65 @@ class YabaiSpaceDetector:
                         if await verify_move_with_patience(target_space, strategy):
                             self._health.record_success(0)
                             return True
+
+                elif strategy.startswith("display_handoff_retry"):
+                    # =============================================================
+                    # v34.0 STEALTH RETRY: Progressive Display Handoff Retries
+                    # =============================================================
+                    # Instead of escalating to focus-based strategies, we retry
+                    # the display handoff with increasing delays between attempts.
+                    # This gives macOS more time to complete GPU context switches.
+                    # =============================================================
+                    if target_display is None:
+                        logger.warning("[YABAI] Display handoff retry skipped - target display unknown")
+                        continue
+
+                    # Extract retry number for delay calculation
+                    retry_num = 1 if "retry_1" in strategy else 2
+                    delay = 0.5 * retry_num  # 0.5s, 1.0s
+
+                    logger.info(f"[YABAI] 🔄 STEALTH RETRY: Waiting {delay}s before retry {retry_num}...")
+                    await asyncio.sleep(delay)
+
+                    cmd_success, error_msg = await execute_display_handoff(window_id, target_display)
+
+                    if not cmd_success:
+                        logger.warning(f"[YABAI] ❌ Display Handoff retry {retry_num} REJECTED: {error_msg}")
+                        continue
+
+                    if verify:
+                        if await verify_move_with_patience(target_space, strategy):
+                            self._health.record_success(0)
+                            return True
+                    else:
+                        self._health.record_success(0)
+                        return True
+
+                elif strategy.startswith("direct_retry"):
+                    # =============================================================
+                    # v34.0 STEALTH RETRY: Progressive Direct Move Retries
+                    # =============================================================
+                    # For same-display moves, retry with increasing delays.
+                    # =============================================================
+                    retry_num = 1 if "retry_1" in strategy else 2
+                    delay = 0.5 * retry_num  # 0.5s, 1.0s
+
+                    logger.info(f"[YABAI] 🔄 STEALTH RETRY: Waiting {delay}s before retry {retry_num}...")
+                    await asyncio.sleep(delay)
+
+                    cmd_success, error_msg = await execute_yabai_move(window_id, target_space)
+
+                    if not cmd_success:
+                        logger.warning(f"[YABAI] ❌ Direct move retry {retry_num} REJECTED: {error_msg}")
+                        continue
+
+                    if verify:
+                        if await verify_move_with_patience(target_space, strategy):
+                            self._health.record_success(0)
+                            return True
+                    else:
+                        self._health.record_success(0)
+                        return True
 
                 elif strategy == "direct_fire_confirm":
                     # =============================================================
@@ -5241,21 +5337,24 @@ class YabaiSpaceDetector:
         self,
         windows: List[Dict[str, Any]],
         ghost_space: Optional[int] = None,
-        max_parallel: int = 5
+        max_parallel: int = 5,
+        silent: bool = True  # v34.0: Default to silent for background operations
     ) -> Dict[str, Any]:
         """
-        INTELLIGENT BATCH RESCUE v24.0: Move multiple windows to Ghost Display.
+        v34.0 STEALTH BATCH RESCUE: Move windows to Ghost Display without focus hijacking.
 
         This is the main entry point for Auto-Handoff, featuring:
         - Parallel rescue for windows on the same space
         - Telemetry-driven strategy selection per window
         - Dynamic wake delay calibration
         - Comprehensive result tracking
+        - v34.0: STEALTH MODE - Never hijacks user's screen with focus
 
         Args:
             windows: List of window dicts with 'window_id', 'space_id', and optionally 'app_name'
             ghost_space: Target Ghost Display space (auto-detected if None)
             max_parallel: Maximum parallel window moves within a space
+            silent: v34.0 - If True, NEVER use focus strategies (won't hijack user's screen)
 
         Returns:
             Dict with:
@@ -5326,7 +5425,7 @@ class YabaiSpaceDetector:
                 app_name = w.get("app_name") or w.get("app")
                 move_start = time.time()
 
-                success = await self.move_window_to_space_async(window_id, ghost_space)
+                success = await self.move_window_to_space_async(window_id, ghost_space, silent=silent)
                 duration_ms = (time.time() - move_start) * 1000
 
                 telemetry.record_attempt(
@@ -5469,7 +5568,7 @@ class YabaiSpaceDetector:
                     current_ghost_space = ghost_space  # Fallback to original
                     logger.warning(f"[YABAI] Could not re-query ghost space, using {ghost_space}")
 
-                success = await self.move_window_to_space_async(window_id, current_ghost_space)
+                success = await self.move_window_to_space_async(window_id, current_ghost_space, silent=silent)
                 duration_ms = (time.time() - move_start) * 1000
 
                 # If first attempt failed and window is minimized, try unminimize
@@ -5481,7 +5580,7 @@ class YabaiSpaceDetector:
                             timeout=2.0
                         )
                         await asyncio.sleep(wake_delay_s)
-                        success = await self.move_window_to_space_async(window_id, current_ghost_space)
+                        success = await self.move_window_to_space_async(window_id, current_ghost_space, silent=silent)
                         strategy = RescueStrategy.UNMINIMIZE_FIRST
                     except Exception:
                         pass
@@ -5493,7 +5592,7 @@ class YabaiSpaceDetector:
                         # Wait a bit more and retry with fresh ghost space index
                         await asyncio.sleep(0.5)
                         retry_ghost_space = self.get_ghost_display_space() or current_ghost_space
-                        success = await self.move_window_to_space_async(window_id, retry_ghost_space)
+                        success = await self.move_window_to_space_async(window_id, retry_ghost_space, silent=silent)
                     except Exception:
                         pass
 

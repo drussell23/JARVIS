@@ -4895,32 +4895,51 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
 
                         validation_details['checks_passed'].append('not_minimized')
 
-                        # Check 4: Is window on visible space?
+                        # =====================================================================
+                        # v34.0: SOFT VALIDATION - Location Agnostic Approach
+                        # =====================================================================
+                        # OLD BEHAVIOR: Reject if window not on Ghost Display
+                        # NEW BEHAVIOR: Accept if window is ANYWHERE visible (Ghost or current)
+                        #
+                        # This fixes the "All windows failed" crash when teleportation misses
+                        # a window - we watch it WHERE IT IS instead of rejecting it.
+                        # =====================================================================
                         if ghost_space is not None:
                             if current_space != ghost_space:
-                                # Window not on Ghost Display - may still be moving
+                                # Window not on Ghost Display - check if it's still visible/capturable
+
+                                # v34.0: SOFT VALIDATION - Check if window is on ANY visible space
+                                # Instead of failing immediately, we'll check compositor state later
+                                # and accept the window if it's visible anywhere
+
                                 if attempt < max_retries - 1:
+                                    # First few attempts: Wait for teleportation to complete
                                     logger.debug(
                                         f"[Validation] Window {window_id} on space {current_space}, "
                                         f"expected {ghost_space} - waiting {current_delay_ms:.0f}ms before retry"
                                     )
-                                    # v28.3: Exponential backoff sleep
                                     await asyncio.sleep(current_delay_ms / 1000.0)
                                     total_wait_time_ms += current_delay_ms
                                     validation_details['backoff_sequence'].append(current_delay_ms)
                                     current_delay_ms = min(current_delay_ms * backoff_multiplier, max_single_delay_ms)
                                     continue
 
-                                validation_details['checks_failed'].append('on_visible_space')
-                                validation_details['total_wait_time_ms'] = total_wait_time_ms
-                                return (
-                                    False,
-                                    f"Window {window_id} still on space {current_space} "
-                                    f"(expected Ghost Display space {ghost_space}) after {total_wait_time_ms:.0f}ms - teleportation may have failed",
-                                    validation_details
+                                # v34.0: SOFT VALIDATION - Accept window if visible anywhere
+                                # Don't fail here - we'll check compositor state (kCGWindowIsOnscreen)
+                                # in Phase 2 and accept if the window is visible ANYWHERE
+                                logger.warning(
+                                    f"[Validation] ⚠️ v34.0 SOFT VALIDATION: Window {window_id} "
+                                    f"not on Ghost Display (space {current_space} vs expected {ghost_space}). "
+                                    f"Teleport may have failed - will watch in-place if visible."
                                 )
+                                validation_details['teleport_failed'] = True
+                                validation_details['watching_in_place'] = True
+                                validation_details['actual_space'] = current_space
+                                # Mark as passed but note the location mismatch
+                                validation_details['checks_passed'].append('on_visible_space_soft')
 
-                        validation_details['checks_passed'].append('on_visible_space')
+                        if 'on_visible_space_soft' not in validation_details.get('checks_passed', []):
+                            validation_details['checks_passed'].append('on_visible_space')
                     else:
                         # v28.2: Yabai doesn't know this window, skip minimized/space checks
                         validation_details['skipped_checks'] = ['not_minimized', 'on_visible_space']
