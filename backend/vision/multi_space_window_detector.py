@@ -4,6 +4,7 @@ Multi-Space Window Detector for JARVIS
 Enhanced window detection with space awareness and metadata intelligence
 """
 
+import os
 import Quartz
 import AppKit
 import time
@@ -469,29 +470,34 @@ class MultiSpaceWindowDetector:
 
     async def get_all_visible_spaces(self) -> List[int]:
         """
-        v22.0.0: Multi-Monitor Visibility Support
+        v60.0: PANOPTICON PROTOCOL - Multi-Monitor + Shadow Realm Visibility
 
-        Get ALL visible space IDs across ALL displays (not just the current/focused space).
+        Get ALL visible space IDs across ALL displays, including the Ghost Display
+        (Shadow Realm) even if yabai reports it as not visible.
 
         WHY THIS MATTERS:
         =================
         - Single monitor: Only 1 space is visible at a time
         - Multi-monitor: MULTIPLE spaces can be visible simultaneously (one per display)
         - Virtual monitors (BetterDisplay): Additional visible spaces for background capture
+        - v60.0: Ghost Display spaces may report is_visible=False but ARE capturable
 
-        EXAMPLE:
-        ========
-        - Display 1 (Main): Space 1 visible (where you're working)
-        - Display 2 (Virtual): Space 4 visible (where JARVIS can watch)
-        - Spaces 2, 3, 5: Hidden (not visible on any display)
+        THE PANOPTICON INSIGHT:
+        =======================
+        Exile ≠ Death. Windows teleported to the Shadow Realm (Display 2+) are still
+        ALIVE and CAPTURABLE. Yabai may report these spaces as "not visible" because
+        they're on a virtual display, but JARVIS can still see them.
 
-        JARVIS should only try to capture windows on Space 1 and Space 4,
-        not Spaces 2, 3, or 5 (which would fail with frame_production_failed).
+        SOLUTION:
+        =========
+        Include ALL spaces on Display 2+ (Ghost Display) regardless of visibility flag.
+        This ensures windows on the Shadow Realm are not filtered out as "hidden."
 
         Returns:
-            List of space IDs where is_visible == True
+            List of space IDs that JARVIS can see (visible OR on Ghost Display)
         """
         visible_space_ids = []
+        ghost_display_index = int(os.getenv("JARVIS_SHADOW_DISPLAY", "2"))
 
         try:
             from .yabai_space_detector import get_yabai_detector
@@ -510,18 +516,43 @@ class MultiSpaceWindowDetector:
                         lambda: yabai_detector.enumerate_all_spaces(include_display_info=True)
                     )
 
+                ghost_spaces_found = 0
                 for space in spaces:
-                    if space.get('is_visible', False):
-                        space_id = space.get('space_id')
-                        display_id = space.get('display', 'unknown')
-                        if space_id:
-                            visible_space_ids.append(space_id)
+                    space_id = space.get('space_id')
+                    display_id = space.get('display', 1)
+                    is_visible = space.get('is_visible', False)
+
+                    if not space_id:
+                        continue
+
+                    # ═══════════════════════════════════════════════════════════════
+                    # v60.0 PANOPTICON CLAUSE: Include space if:
+                    # 1. Standard check: is_visible == True (normal visible space)
+                    # 2. PANOPTICON: display >= ghost_display_index (Shadow Realm)
+                    # ═══════════════════════════════════════════════════════════════
+                    is_on_ghost_display = display_id >= ghost_display_index
+
+                    if is_visible or is_on_ghost_display:
+                        visible_space_ids.append(space_id)
+
+                        if is_on_ghost_display and not is_visible:
+                            ghost_spaces_found += 1
+                            logger.debug(
+                                f"[v60.0 PANOPTICON] 👁️ Shadow Realm Space {space_id} on Display {display_id} "
+                                f"included despite is_visible=False"
+                            )
+                        else:
                             logger.debug(
                                 f"[MULTI-MONITOR] Space {space_id} visible on Display {display_id}"
                             )
 
+                if ghost_spaces_found > 0:
+                    logger.info(
+                        f"[v60.0 PANOPTICON] 👁️ Included {ghost_spaces_found} Shadow Realm space(s) in visibility list"
+                    )
+
                 logger.info(
-                    f"[MULTI-MONITOR] Found {len(visible_space_ids)} visible spaces: {visible_space_ids}"
+                    f"[MULTI-MONITOR] Found {len(visible_space_ids)} capturable spaces: {visible_space_ids}"
                 )
 
         except Exception as e:
@@ -535,9 +566,13 @@ class MultiSpaceWindowDetector:
 
     def get_all_visible_spaces_sync(self) -> List[int]:
         """
-        Synchronous version of get_all_visible_spaces for non-async contexts.
+        v60.0: Synchronous version of get_all_visible_spaces with PANOPTICON PROTOCOL.
+
+        Includes Shadow Realm (Ghost Display) spaces even if yabai reports them
+        as not visible, because they ARE capturable.
         """
         visible_space_ids = []
+        ghost_display_index = int(os.getenv("JARVIS_SHADOW_DISPLAY", "2"))
 
         try:
             from .yabai_space_detector import get_yabai_detector
@@ -546,14 +581,39 @@ class MultiSpaceWindowDetector:
             if yabai_detector.is_available():
                 spaces = yabai_detector.enumerate_all_spaces(include_display_info=True)
 
+                ghost_spaces_found = 0
                 for space in spaces:
-                    if space.get('is_visible', False):
-                        space_id = space.get('space_id')
-                        if space_id:
-                            visible_space_ids.append(space_id)
+                    space_id = space.get('space_id')
+                    display_id = space.get('display', 1)
+                    is_visible = space.get('is_visible', False)
+
+                    if not space_id:
+                        continue
+
+                    # ═══════════════════════════════════════════════════════════════
+                    # v60.0 PANOPTICON CLAUSE: Include space if:
+                    # 1. Standard check: is_visible == True (normal visible space)
+                    # 2. PANOPTICON: display >= ghost_display_index (Shadow Realm)
+                    # ═══════════════════════════════════════════════════════════════
+                    is_on_ghost_display = display_id >= ghost_display_index
+
+                    if is_visible or is_on_ghost_display:
+                        visible_space_ids.append(space_id)
+
+                        if is_on_ghost_display and not is_visible:
+                            ghost_spaces_found += 1
+                            logger.debug(
+                                f"[v60.0 PANOPTICON SYNC] 👁️ Shadow Realm Space {space_id} on Display {display_id} "
+                                f"included despite is_visible=False"
+                            )
+
+                if ghost_spaces_found > 0:
+                    logger.info(
+                        f"[v60.0 PANOPTICON SYNC] 👁️ Included {ghost_spaces_found} Shadow Realm space(s) in visibility list"
+                    )
 
                 logger.info(
-                    f"[MULTI-MONITOR] Found {len(visible_space_ids)} visible spaces: {visible_space_ids}"
+                    f"[MULTI-MONITOR] Found {len(visible_space_ids)} capturable spaces: {visible_space_ids}"
                 )
 
         except Exception as e:
