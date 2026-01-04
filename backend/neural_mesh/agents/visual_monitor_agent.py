@@ -2257,11 +2257,68 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                     windows_on_hidden = []
                     windows_on_user_space = []
                     windows_already_good = []
+                    windows_self_preserved = []  # v41.5: Track skipped JARVIS windows
 
                     for w in windows:
+                        window_id = w.get('window_id')
                         window_space = w.get('space_id')
+                        window_title = w.get('window_title', '') or w.get('title', '') or ''
+                        window_title_lower = window_title.lower()
+                        
+                        # ==========================================================
+                        # v41.5: SELF-PRESERVATION PROTOCOL
+                        # ==========================================================
+                        # ROOT CAUSE FIX: With v41.0's aggressive orphan recovery,
+                        # JARVIS might find its own UI and try to teleport it,
+                        # causing the "Self-Kidnapping" loop.
+                        #
+                        # SOLUTION: Intelligent title-based filtering to preserve:
+                        # - JARVIS Control Panel / Dashboard
+                        # - localhost development windows
+                        # - Any window serving the JARVIS interface
+                        #
+                        # This is NOT hardcoding - it's semantic protection of the
+                        # control interface that should NEVER be moved.
+                        # ==========================================================
+                        self_preservation_keywords = [
+                            'j.a.r.v.i.s',
+                            'jarvis',
+                            'localhost:3000',
+                            'localhost:8080',
+                            '127.0.0.1:3000',
+                            '127.0.0.1:8080',
+                        ]
+                        
+                        is_jarvis_ui = any(
+                            keyword in window_title_lower 
+                            for keyword in self_preservation_keywords
+                        )
+                        
+                        if is_jarvis_ui:
+                            # Never teleport the JARVIS Control Panel!
+                            logger.info(
+                                f"[God Mode v41.5] 🛡️ SELF-PRESERVATION: Skipping JARVIS UI "
+                                f"(Window {window_id}: '{window_title[:40]}...')"
+                            )
+                            windows_self_preserved.append(w)
+                            # If it's already on Ghost Display, still monitor it
+                            # But don't teleport or disrupt it
+                            if window_space == ghost_space:
+                                windows_already_good.append(w)
+                            continue
+                        
+                        # ==========================================================
+                        # v41.5: GHOST RESIDENCY CHECK
+                        # ==========================================================
+                        # If window is already on Ghost Display, don't waste time
+                        # trying to teleport it - just add to monitoring list
+                        # ==========================================================
                         if window_space == ghost_space:
                             # Already on ghost display - perfect!
+                            logger.debug(
+                                f"[God Mode v41.5] ✅ Window {window_id} already on Ghost Display "
+                                f"(Space {ghost_space}) - skipping teleport"
+                            )
                             windows_already_good.append(w)
                         elif window_space == current_user_space:
                             # On user's current space - will block their view
@@ -2272,6 +2329,13 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                         else:
                             # On another visible space (not user's, not ghost)
                             windows_already_good.append(w)
+                    
+                    # v41.5: Log self-preservation summary
+                    if windows_self_preserved:
+                        logger.info(
+                            f"[God Mode v41.5] 🛡️ Self-Preservation: Protected "
+                            f"{len(windows_self_preserved)} JARVIS UI window(s) from teleportation"
+                        )
 
                     # =========================================================
                     # PHASE 2: Teleport windows to Ghost Display
@@ -4710,11 +4774,44 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                 # Filter for matching app across ALL spaces
                 app_name_lower = app_name.lower()
                 matching_windows = []
+                jarvis_ui_skipped = 0  # v41.5: Track skipped JARVIS windows
+
+                # v41.5: Self-Preservation keywords (semantic, not hardcoded URLs)
+                self_preservation_keywords = [
+                    'j.a.r.v.i.s',
+                    'jarvis',
+                    'localhost:3000',
+                    'localhost:8080',
+                    '127.0.0.1:3000',
+                    '127.0.0.1:8080',
+                ]
 
                 for window_obj in all_windows:
                     # Access EnhancedWindowInfo object attributes
                     window_app = window_obj.app_name if hasattr(window_obj, 'app_name') else ''
                     window_app_lower = window_app.lower()
+                    window_title = window_obj.window_title if hasattr(window_obj, 'window_title') else ''
+                    window_title_lower = window_title.lower()
+
+                    # ==========================================================
+                    # v41.5: SELF-PRESERVATION PROTOCOL (Defense-in-Depth Layer 1)
+                    # ==========================================================
+                    # Filter out JARVIS UI windows at discovery time, before they
+                    # even reach the teleportation phase. This is a second layer
+                    # of protection in case the teleportation filter is bypassed.
+                    # ==========================================================
+                    is_jarvis_ui = any(
+                        keyword in window_title_lower 
+                        for keyword in self_preservation_keywords
+                    )
+                    
+                    if is_jarvis_ui:
+                        jarvis_ui_skipped += 1
+                        logger.debug(
+                            f"[v41.5] 🛡️ Discovery Self-Preservation: Skipping JARVIS UI "
+                            f"(Window {window_obj.window_id}: '{window_title[:30]}...')"
+                        )
+                        continue
 
                     # Match strategies
                     confidence = 0
@@ -4733,12 +4830,19 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                             'window_id': window_obj.window_id,
                             'space_id': window_obj.space_id if window_obj.space_id else 1,
                             'app_name': window_app,
-                            'window_title': window_obj.window_title if hasattr(window_obj, 'window_title') else '',
+                            'window_title': window_title,
                             'bounds': window_obj.bounds if hasattr(window_obj, 'bounds') else {},
                             'is_visible': True,  # All windows from multi-space detector are visible
                             'confidence': confidence,
                             'method': 'multi_space_detector'
                         })
+                
+                # v41.5: Log self-preservation summary at discovery
+                if jarvis_ui_skipped > 0:
+                    logger.info(
+                        f"[v41.5] 🛡️ Discovery Self-Preservation: Filtered out "
+                        f"{jarvis_ui_skipped} JARVIS UI window(s)"
+                    )
 
                 if matching_windows:
                     # Sort by confidence
