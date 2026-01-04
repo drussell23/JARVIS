@@ -2192,6 +2192,7 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
         # to the Ghost Display, then successfully watch them.
         # =====================================================================
         teleported_windows = []
+        teleported_ghost_space = None  # v41.6: Track Ghost Display space at higher scope
         auto_handoff_enabled = bool(os.getenv('JARVIS_AUTO_HANDOFF', '1') == '1')
 
         if windows and auto_handoff_enabled and MULTI_SPACE_AVAILABLE:
@@ -2248,6 +2249,8 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                     raise Exception("Yabai space detection unavailable")
 
                 if ghost_space is not None:
+                    # v41.6: Save to higher-scope variable for validation phase
+                    teleported_ghost_space = ghost_space
                     # =========================================================
                     # PHASE 1: Identify windows that need teleporting
                     # =========================================================
@@ -2641,6 +2644,25 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                             # Update the windows list with successful teleports
                             # Combine already-good windows with teleported ones
                             windows = windows_already_good + teleported_windows
+                            
+                            # ==========================================================
+                            # v41.6: POST-TELEPORTATION SETTLING DELAY
+                            # ==========================================================
+                            # ROOT CAUSE FIX: After teleportation, the window might not
+                            # be immediately visible to ScreenCaptureKit because:
+                            # 1. macOS window server needs to register the move
+                            # 2. GPU needs to render the window on the new display
+                            # 3. ScreenCaptureKit needs to recognize the new location
+                            #
+                            # SOLUTION: Brief settling delay before validation/spawning
+                            # ==========================================================
+                            settling_delay_ms = float(os.getenv('JARVIS_TELEPORT_SETTLING_DELAY_MS', '500'))
+                            logger.debug(
+                                f"[God Mode v41.6] ⏱️ Waiting {settling_delay_ms:.0f}ms for windows "
+                                f"to settle on Ghost Display..."
+                            )
+                            await asyncio.sleep(settling_delay_ms / 1000.0)
+                            logger.debug(f"[God Mode v41.6] ✅ Settling delay complete")
                     else:
                         logger.debug(
                             f"[God Mode] All {len(windows)} windows already on visible spaces - no teleport needed"
@@ -2809,10 +2831,10 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                 except Exception as e:
                     logger.debug(f"[v32.7] Validation progress emit failed: {e}")
 
-            # Determine ghost_space for validation (if available from earlier teleportation)
-            validation_ghost_space = None
-            if 'ghost_space' in dir() and ghost_space:
-                validation_ghost_space = ghost_space
+            # v41.6: Use teleported_ghost_space from higher scope (reliable)
+            # The previous check 'ghost_space' in dir() was unreliable because
+            # ghost_space was defined in a nested try block that might not be in scope.
+            validation_ghost_space = teleported_ghost_space  # v41.6: Safe reference
 
             # Run batch validation in parallel
             try:
