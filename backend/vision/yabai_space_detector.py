@@ -4220,8 +4220,14 @@ class YabaiSpaceDetector:
         jarvis_patterns = ["JARVIS", "localhost", "127.0.0.1"]
         
         if app_type == "chrome":
-            # Chrome/Chromium family: Uses `full screen` property
-            # v44.0: Smart targeting - skip JARVIS windows
+            # ═══════════════════════════════════════════════════════════════════
+            # v46.0: REALITY ANCHOR - Full Re-Materialization Protocol
+            # ═══════════════════════════════════════════════════════════════════
+            # Chrome/Chromium family: Forces windows to exit all "ghost states":
+            # 1. Exit fullscreen (destroys phantom space)
+            # 2. Un-minimize (pulls from dock)
+            # 3. Ensure visibility (renders the window)
+            # ═══════════════════════════════════════════════════════════════════
             script = f'''
             tell application "{safe_app_name}"
                 try
@@ -4236,10 +4242,27 @@ class YabaiSpaceDetector:
                             if winName contains "127.0.0.1" then set isJarvis to true
                             
                             if not isJarvis then
-                                set full screen of w to false
+                                -- v46.0: STEP 1 - Exit fullscreen (destroys phantom space)
+                                try
+                                    if full screen of w is true then
+                                        set full screen of w to false
+                                    end if
+                                end try
+                                
+                                -- v46.0: STEP 2 - Un-minimize (pull from dock)
+                                try
+                                    if miniaturized of w is true then
+                                        set miniaturized of w to false
+                                    end if
+                                end try
+                                
+                                -- v46.0: STEP 3 - Ensure visibility
+                                try
+                                    set visible of w to true
+                                end try
                             end if
                         on error errMsg
-                            -- Window might not support fullscreen, ignore
+                            -- Window might not support these properties, ignore
                         end try
                     end repeat
                 on error errMsg
@@ -4249,8 +4272,10 @@ class YabaiSpaceDetector:
             '''
             
         elif app_type == "safari":
-            # Safari: Uses `fullscreen` property (no space)
-            # v44.0: Smart targeting - skip JARVIS windows
+            # ═══════════════════════════════════════════════════════════════════
+            # v46.0: REALITY ANCHOR for Safari
+            # Safari uses `fullscreen` property (no space in name)
+            # ═══════════════════════════════════════════════════════════════════
             script = f'''
             tell application "{safe_app_name}"
                 try
@@ -4265,10 +4290,27 @@ class YabaiSpaceDetector:
                             if winName contains "127.0.0.1" then set isJarvis to true
                             
                             if not isJarvis then
-                                set fullscreen of w to false
+                                -- v46.0: Exit fullscreen
+                                try
+                                    if fullscreen of w is true then
+                                        set fullscreen of w to false
+                                    end if
+                                end try
+                                
+                                -- v46.0: Un-minimize
+                                try
+                                    if miniaturized of w is true then
+                                        set miniaturized of w to false
+                                    end if
+                                end try
+                                
+                                -- v46.0: Ensure visibility
+                                try
+                                    set visible of w to true
+                                end try
                             end if
                         on error errMsg
-                            -- Window might not support fullscreen, ignore
+                            -- Window might not support these properties, ignore
                         end try
                     end repeat
                 on error errMsg
@@ -4278,8 +4320,10 @@ class YabaiSpaceDetector:
             '''
             
         elif app_type == "electron":
-            # Electron apps: Usually support `full screen` like Chrome
-            # v44.0: Smart targeting - skip JARVIS windows
+            # ═══════════════════════════════════════════════════════════════════
+            # v46.0: REALITY ANCHOR for Electron apps
+            # Usually support `full screen` like Chrome
+            # ═══════════════════════════════════════════════════════════════════
             script = f'''
             tell application "{safe_app_name}"
                 try
@@ -4294,6 +4338,25 @@ class YabaiSpaceDetector:
                             if winName contains "127.0.0.1" then set isJarvis to true
                             
                             if not isJarvis then
+                                -- v46.0: Exit fullscreen
+                                try
+                                    if full screen of w is true then
+                                        set full screen of w to false
+                                    end if
+                                end try
+                                
+                                -- v46.0: Un-minimize
+                                try
+                                    if miniaturized of w is true then
+                                        set miniaturized of w to false
+                                    end if
+                                end try
+                                
+                                -- v46.0: Ensure visibility
+                                try
+                                    set visible of w to true
+                                end try
+                            end if
                                 set full screen of w to false
                             end if
                         on error
@@ -4747,32 +4810,79 @@ class YabaiSpaceDetector:
             if current_space:
                 visible_spaces.add(current_space)
         
+        # ═══════════════════════════════════════════════════════════════════════
+        # v46.0: REALITY ANCHOR PROTOCOL - Detect Phantom Spaces
+        # ═══════════════════════════════════════════════════════════════════════
+        # Native Fullscreen windows exist in their own "dimension" - a separate
+        # Space created just for them. These spaces have characteristics:
+        # 1. space_id > number of normal spaces (often very high numbers)
+        # 2. space_id == 0 (orphaned/transitional state)
+        # 3. space_id == -1 (completely orphaned)
+        # 4. is-native-fullscreen flag is True (if yabai can see it)
+        #
+        # THE PROBLEM: You cannot move a SPACE, only a WINDOW. Attempting to
+        # move a window that IS a space causes silent failure.
+        #
+        # THE SOLUTION: Force the window to "Re-Materialize" by exiting
+        # fullscreen, destroying its phantom space, and landing on a real space.
+        # ═══════════════════════════════════════════════════════════════════════
+        
+        # Count normal spaces to detect phantom space IDs
+        normal_space_count = len(visible_spaces) if visible_spaces else 10  # Default assumption
+        
+        # v46.0: Detect if window is in a PHANTOM SPACE (Fullscreen Dimension)
+        # Phantom space indicators:
+        # - space_id > normal_space_count (fullscreen spaces get high IDs)
+        # - space_id == 0 (transitional/orphaned)
+        # - space_id == -1 (completely orphaned)
+        # - is-native-fullscreen flag is True
+        is_in_phantom_space = (
+            window_space_id > normal_space_count or
+            window_space_id == 0 or
+            window_space_id == -1 or
+            is_native_fullscreen  # Even if yabai reports it
+        )
+        
         # v44.2: DEFINITIVE hidden space detection
         # Window is on hidden space if:
         # 1. space_id is NOT in visible_spaces set, OR
         # 2. space_id is -1 (orphaned), OR
         # 3. is-visible flag is explicitly False
+        # 4. v46.0: Window is in a phantom space
         is_on_hidden_space = (
             (window_space_id != -1 and window_space_id not in visible_spaces) or
             window_space_id == -1 or
-            is_visible_flag is False
+            is_visible_flag is False or
+            is_in_phantom_space  # v46.0: Phantom spaces are always "hidden"
         )
         
-        # v44.2: Log the physics state for debugging
+        # v46.0: Log the physics state for debugging
         if is_on_hidden_space:
+            phantom_reason = []
+            if is_in_phantom_space:
+                if window_space_id > normal_space_count:
+                    phantom_reason.append(f"space_id {window_space_id} > {normal_space_count}")
+                if window_space_id == 0:
+                    phantom_reason.append("space_id=0 (orphaned)")
+                if window_space_id == -1:
+                    phantom_reason.append("space_id=-1 (orphaned)")
+                if is_native_fullscreen:
+                    phantom_reason.append("is-native-fullscreen=true")
+            
             logger.info(
-                f"[YABAI v44.2] 🔬 QUANTUM STATE: Window {window_id} ({app_name}) is on "
-                f"HIDDEN Space {window_space_id} (visible spaces: {visible_spaces}). "
-                f"Yabai fullscreen={is_native_fullscreen} (UNTRUSTED for hidden windows)"
+                f"[YABAI v46.0] ⚓ REALITY ANCHOR: Window {window_id} ({app_name}) detected in "
+                f"{'PHANTOM SPACE' if is_in_phantom_space else 'HIDDEN SPACE'} {window_space_id}. "
+                f"Reason: {', '.join(phantom_reason) if phantom_reason else 'not visible'}. "
+                f"Normal spaces: {visible_spaces}"
             )
         
-        # v44.2: ALWAYS run Deep Unpack for Chrome-like windows on hidden spaces
+        # v46.0: ALWAYS run Deep Unpack for Chrome-like windows on hidden/phantom spaces
         # This respects LAW 1 (Topology Drift) - we don't trust Yabai's state report
         if is_on_hidden_space and is_chrome_like:
             logger.warning(
-                f"[YABAI v44.2] ⚠️ QUANTUM MECHANICS: Window {window_id} ({app_name}) "
-                f"exists on hidden Space {window_space_id} - executing ATOMIC TRANSITION "
-                f"(Yabai state unreliable, forcing precautionary unpack)"
+                f"[YABAI v46.0] ⚓ DROPPING REALITY ANCHOR: Window {window_id} ({app_name}) "
+                f"exists in {'PHANTOM SPACE' if is_in_phantom_space else 'hidden space'} {window_space_id} - "
+                f"forcing RE-MATERIALIZATION via AppleScript"
             )
             
             # ═══════════════════════════════════════════════════════════════════
