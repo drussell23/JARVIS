@@ -5119,16 +5119,19 @@ class YabaiSpaceDetector:
         # ═══════════════════════════════════════════════════════════════════
         is_fullscreen = False
         is_phantom = False
+        is_dehydrated = False
         window_space = -1
         window_display = -1
+        original_space = None
 
+        # First query attempt - may fail for dehydrated windows
         try:
             proc = await asyncio.create_subprocess_exec(
                 yabai_path, "-m", "query", "--windows", "--window", str(window_id),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE
             )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
 
             if proc.returncode == 0 and stdout:
                 window_info = json.loads(stdout.decode())
@@ -5138,23 +5141,150 @@ class YabaiSpaceDetector:
                 pid = pid or window_info.get("pid")
 
                 # v50.0: NEGATIVE LOGIC - Check if space is phantom
-                # A space is phantom if the window claims to be on it but it doesn't exist
                 if window_space > 0:
                     space_proc = await asyncio.create_subprocess_exec(
                         yabai_path, "-m", "query", "--spaces", "--space", str(window_space),
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE
                     )
-                    space_stdout, _ = await asyncio.wait_for(space_proc.communicate(), timeout=3.0)
+                    space_stdout, space_stderr = await asyncio.wait_for(space_proc.communicate(), timeout=3.0)
                     if space_proc.returncode != 0:
                         is_phantom = True
                         logger.warning(
                             f"[YABAI v53.0] 👻 PHANTOM SPACE DETECTED: Window {window_id} claims "
                             f"Space {window_space} but space doesn't exist in topology!"
                         )
+                    else:
+                        # Space exists - check if it's hidden (window might be dehydrated)
+                        space_info = json.loads(space_stdout.decode())
+                        if not space_info.get("is-visible", True):
+                            is_dehydrated = True
+                            logger.info(
+                                f"[YABAI v53.0] 💧 Window {window_id} may be dehydrated "
+                                f"(on hidden Space {window_space})"
+                            )
+            else:
+                # Yabai couldn't find the window by ID - try querying ALL windows
+                # This happens when window has lost AX reference (has-ax-reference: false)
+                is_dehydrated = True
+                error_msg = stderr.decode().strip() if stderr else "Unknown"
+                logger.warning(
+                    f"[YABAI v53.0] Window query by ID failed: {error_msg} - trying full query..."
+                )
+
+                # Query all windows and find by ID
+                try:
+                    all_proc = await asyncio.create_subprocess_exec(
+                        yabai_path, "-m", "query", "--windows",
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    )
+                    all_stdout, _ = await asyncio.wait_for(all_proc.communicate(), timeout=5.0)
+                    if all_proc.returncode == 0 and all_stdout:
+                        all_windows = json.loads(all_stdout.decode())
+                        for w in all_windows:
+                            if w.get("id") == window_id:
+                                is_fullscreen = w.get("is-native-fullscreen", False)
+                                window_space = w.get("space", -1)
+                                window_display = w.get("display", -1)
+                                pid = pid or w.get("pid")
+                                has_ax_reference = w.get("has-ax-reference", True)
+                                logger.info(
+                                    f"[YABAI v53.0] 📋 Found window {window_id} in full query: "
+                                    f"space={window_space}, display={window_display}, "
+                                    f"fullscreen={is_fullscreen}, ax_ref={has_ax_reference}"
+                                )
+                                break
+                except Exception as e2:
+                    logger.warning(f"[YABAI v53.0] Full query also failed: {e2}")
 
         except Exception as e:
             logger.warning(f"[YABAI v53.0] Window query failed: {e}")
+            is_dehydrated = True
+
+        # ═══════════════════════════════════════════════════════════════════
+        # PHASE 1.5: WAKE - Hydrate dehydrated windows by switching to their space
+        # ═══════════════════════════════════════════════════════════════════
+        # ROOT CAUSE FIX: macOS "dehydrates" windows on hidden spaces, making
+        # them inaccessible to yabai. We need to temporarily switch to the
+        # window's space to "wake" it up before we can interact with it.
+        # ═══════════════════════════════════════════════════════════════════
+        if is_dehydrated and window_space > 0:
+            logger.info(
+                f"[YABAI v53.0] 💧 HYDRATING: Switching to Space {window_space} to wake window {window_id}..."
+            )
+
+            # Save current space to return later
+            try:
+                current_proc = await asyncio.create_subprocess_exec(
+                    yabai_path, "-m", "query", "--spaces", "--space",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                current_stdout, _ = await asyncio.wait_for(current_proc.communicate(), timeout=3.0)
+                if current_proc.returncode == 0 and current_stdout:
+                    current_info = json.loads(current_stdout.decode())
+                    original_space = current_info.get("index")
+            except Exception:
+                pass
+
+            # Switch to the window's space to wake it
+            wake_success = await self._switch_to_space_async(window_space)
+            if wake_success:
+                # Wait for macOS to hydrate the window
+                await asyncio.sleep(0.5)
+                logger.info(f"[YABAI v53.0] 💧 Switched to Space {window_space} - window should be hydrated")
+
+                # Re-query window info now that it's hydrated
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        yabai_path, "-m", "query", "--windows", "--window", str(window_id),
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    )
+                    stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+
+                    if proc.returncode == 0 and stdout:
+                        window_info = json.loads(stdout.decode())
+                        is_fullscreen = window_info.get("is-native-fullscreen", False)
+                        window_space = window_info.get("space", -1)
+                        window_display = window_info.get("display", -1)
+                        pid = pid or window_info.get("pid")
+                        is_dehydrated = False
+                        logger.info(
+                            f"[YABAI v53.0] ✅ Window {window_id} hydrated: "
+                            f"fullscreen={is_fullscreen}, space={window_space}, display={window_display}"
+                        )
+                    else:
+                        # Still can't query by ID - use AppleScript to activate
+                        logger.warning(
+                            f"[YABAI v53.0] Window {window_id} still inaccessible after space switch - "
+                            "trying AppleScript activation..."
+                        )
+                        if pid:
+                            try:
+                                activate_script = f'''
+                                tell application "System Events"
+                                    set targetProc to first process whose unix id is {pid}
+                                    set frontmost of targetProc to true
+                                    set visible of targetProc to true
+                                    delay 0.3
+                                end tell
+                                '''
+                                act_proc = await asyncio.create_subprocess_exec(
+                                    "osascript", "-e", activate_script,
+                                    stdout=asyncio.subprocess.PIPE,
+                                    stderr=asyncio.subprocess.PIPE
+                                )
+                                await asyncio.wait_for(act_proc.communicate(), timeout=5.0)
+                                await asyncio.sleep(0.5)
+                                logger.info(f"[YABAI v53.0] AppleScript activation sent for PID {pid}")
+                            except Exception as e2:
+                                logger.warning(f"[YABAI v53.0] AppleScript activation failed: {e2}")
+                except Exception as e:
+                    logger.warning(f"[YABAI v53.0] Re-query after wake failed: {e}")
+            else:
+                logger.warning(f"[YABAI v53.0] Failed to switch to Space {window_space} for hydration")
 
         # Already on target display? Just maximize if needed
         if window_display == shadow_display:
@@ -5211,6 +5341,53 @@ class YabaiSpaceDetector:
                         await asyncio.sleep(1.5)  # Wait for animation
                 except Exception as e:
                     logger.debug(f"[YABAI v53.0] AppleScript unpack failed: {e}")
+
+            # Strategy 4: Nuclear Option - Activate app by name and send Escape
+            # This is for windows with no AX reference that are truly stuck
+            if not unpack_success and app_name:
+                logger.info(
+                    f"[YABAI v53.0] 🔥 NUCLEAR OPTION: Activating {app_name} and sending Escape..."
+                )
+                try:
+                    nuclear_script = f'''
+                    -- First try to activate the app by name
+                    tell application "{app_name}"
+                        activate
+                    end tell
+                    delay 0.5
+
+                    -- Now send keyboard shortcuts to exit fullscreen
+                    tell application "System Events"
+                        tell process "{app_name}"
+                            set frontmost to true
+                            delay 0.3
+
+                            -- Try Escape first
+                            key code 53
+                            delay 0.5
+
+                            -- Then try Ctrl+Cmd+F (fullscreen toggle)
+                            keystroke "f" using {{control down, command down}}
+                            delay 1.0
+                        end tell
+                    end tell
+                    '''
+                    proc = await asyncio.create_subprocess_exec(
+                        "osascript", "-e", nuclear_script,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    )
+                    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10.0)
+                    if proc.returncode == 0:
+                        unpack_success = True
+                        unpack_method = "applescript_nuclear"
+                        await asyncio.sleep(2.0)  # Longer wait for animation
+                        logger.info(f"[YABAI v53.0] Nuclear option executed successfully")
+                    else:
+                        error = stderr.decode().strip() if stderr else "Unknown"
+                        logger.warning(f"[YABAI v53.0] Nuclear option failed: {error}")
+                except Exception as e:
+                    logger.warning(f"[YABAI v53.0] Nuclear option exception: {e}")
 
             if not unpack_success:
                 logger.warning(
@@ -8870,177 +9047,166 @@ class YabaiSpaceDetector:
                 )
 
             # Parallel move windows from this space (works with or without space switch)
-                async def rescue_window(w):
-                    window_id = w.get("window_id")
-                    app_name = w.get("app_name") or w.get("app")
-                    window_title = w.get("title", "") or w.get("window_title", "")
-                    window_pid = w.get("pid")
-                    is_minimized = w.get("minimized", False) or w.get("is-minimized", False)
-                    is_fullscreen = w.get("is_fullscreen", False) or w.get("is-native-fullscreen", False)
-                    move_start = time.time()
+            async def rescue_window(w):
+                window_id = w.get("window_id")
+                app_name = w.get("app_name") or w.get("app")
+                window_title = w.get("title", "") or w.get("window_title", "")
+                window_pid = w.get("pid")
+                is_minimized = w.get("minimized", False) or w.get("is-minimized", False)
+                is_fullscreen = w.get("is_fullscreen", False) or w.get("is-native-fullscreen", False)
+                move_start = time.time()
 
-                    strategy = RescueStrategy.DIRECT  # v31.1: Default to direct move
-                    success = False
-                    exile_method = None
+                strategy = RescueStrategy.DIRECT  # v31.1: Default to direct move
+                success = False
+                exile_method = None
 
-                    # ═══════════════════════════════════════════════════════════════
-                    # v53.0: SHADOW REALM PROTOCOL - PRIMARY STRATEGY
-                    # ═══════════════════════════════════════════════════════════════
-                    # ROOT CAUSE FIX: For windows on hidden/phantom spaces, the
-                    # --space command fails. The ONLY reliable solution is to use
-                    # --display to exile windows to the Shadow Realm (BetterDisplay).
-                    #
-                    # This is now the PRIMARY strategy, not a fallback!
-                    # ═══════════════════════════════════════════════════════════════
-                    shadow_display = int(os.getenv("JARVIS_SHADOW_DISPLAY", "2"))
-                    use_shadow_realm = bool(os.getenv("JARVIS_SHADOW_REALM_ENABLED", "1") == "1")
+                # ═══════════════════════════════════════════════════════════════
+                # v53.0: SHADOW REALM PROTOCOL - PRIMARY STRATEGY
+                # ═══════════════════════════════════════════════════════════════
+                # ROOT CAUSE FIX: For windows on hidden/phantom spaces, the
+                # --space command fails. The ONLY reliable solution is to use
+                # --display to exile windows to the Shadow Realm (BetterDisplay).
+                #
+                # This is now the PRIMARY strategy, not a fallback!
+                # ═══════════════════════════════════════════════════════════════
+                shadow_display = int(os.getenv("JARVIS_SHADOW_DISPLAY", "2"))
+                use_shadow_realm = bool(os.getenv("JARVIS_SHADOW_REALM_ENABLED", "1") == "1")
 
-                    if use_shadow_realm:
-                        logger.info(
-                            f"[YABAI v53.0] 🌑 SHADOW REALM PRIMARY: Attempting exile for "
-                            f"window {window_id} ({app_name}) → Display {shadow_display}"
-                        )
-
-                        success, exile_method = await self._exile_to_shadow_realm_async(
-                            window_id=window_id,
-                            app_name=app_name or "Unknown",
-                            window_title=window_title,
-                            pid=window_pid,
-                            silent=silent,
-                            shadow_display=shadow_display,
-                            maximize_after_exile=True
-                        )
-
-                        if success:
-                            duration_ms = (time.time() - move_start) * 1000
-                            telemetry.record_attempt(
-                                success=True,
-                                strategy=RescueStrategy.DIRECT,  # Shadow Realm counts as direct
-                                duration_ms=duration_ms,
-                                app_name=app_name,
-                                wake_delay_used_ms=0  # No wake delay needed
-                            )
-
-                            return {
-                                "window_id": window_id,
-                                "source_space": space_id,
-                                "success": True,
-                                "method": f"shadow_realm_{exile_method}",
-                                "strategy": "shadow_realm",
-                                "duration_ms": duration_ms,
-                                "app_name": app_name,
-                                "was_fullscreen": is_fullscreen,
-                                "target_display": shadow_display
-                            }
-                        else:
-                            logger.warning(
-                                f"[YABAI v53.0] Shadow Realm failed ({exile_method}), "
-                                f"falling back to space-based move..."
-                            )
-
-                    # ═══════════════════════════════════════════════════════════════
-                    # FALLBACK: Traditional space-based move (legacy behavior)
-                    # ═══════════════════════════════════════════════════════════════
-                    # Only reached if Shadow Realm is disabled or failed
-                    # ═══════════════════════════════════════════════════════════════
-
-                    if is_fullscreen:
-                        logger.info(
-                            f"[YABAI] 🖥️ Window {window_id} is fullscreen - will be unpacked by move_window_to_space_async"
-                        )
-                        strategy = RescueStrategy.EXIT_FULLSCREEN_FIRST
-
-                    # v31.1: RE-QUERY ghost space index before each move
-                    current_ghost_space = self.get_ghost_display_space()
-                    if current_ghost_space is None:
-                        current_ghost_space = ghost_space
-                        logger.warning(f"[YABAI] Could not re-query ghost space, using {ghost_space}")
-
-                    success = await self.move_window_to_space_async(window_id, current_ghost_space, silent=silent)
-                    duration_ms = (time.time() - move_start) * 1000
-
-                    # If first attempt failed and window is minimized, try unminimize
-                    if not success and is_minimized:
-                        try:
-                            yabai_path = self._health.yabai_path or "yabai"
-                            await run_subprocess_async(
-                                [yabai_path, "-m", "window", str(window_id), "--minimize", "off"],
-                                timeout=2.0
-                            )
-                            await asyncio.sleep(wake_delay_s)
-                            success = await self.move_window_to_space_async(window_id, current_ghost_space, silent=silent)
-                            strategy = RescueStrategy.UNMINIMIZE_FIRST
-                        except Exception:
-                            pass
-
-                    # If still failed and was fullscreen, maybe animation wasn't complete
-                    if not success and is_fullscreen:
-                        logger.debug(f"[YABAI] Retry after fullscreen exit for window {window_id}")
-                        try:
-                            await asyncio.sleep(0.5)
-                            retry_ghost_space = self.get_ghost_display_space() or current_ghost_space
-                            success = await self.move_window_to_space_async(window_id, retry_ghost_space, silent=silent)
-                        except Exception:
-                            pass
-
-                    # ═══════════════════════════════════════════════════════════════
-                    # v53.0: LAST RESORT - Try Shadow Realm if space moves failed
-                    # ═══════════════════════════════════════════════════════════════
-                    if not success and not use_shadow_realm:
-                        # If Shadow Realm was disabled but space moves failed, try it anyway
-                        logger.warning(
-                            f"[YABAI v53.0] 🆘 LAST RESORT: Space moves failed, trying Shadow Realm..."
-                        )
-                        success, exile_method = await self._exile_to_shadow_realm_async(
-                            window_id=window_id,
-                            app_name=app_name or "Unknown",
-                            window_title=window_title,
-                            pid=window_pid,
-                            silent=silent,
-                            shadow_display=shadow_display,
-                            maximize_after_exile=True
-                        )
-                        if success:
-                            strategy = RescueStrategy.DIRECT
-
-                    telemetry.record_attempt(
-                        success=success,
-                        strategy=strategy,
-                        duration_ms=duration_ms,
-                        app_name=app_name,
-                        wake_delay_used_ms=base_wake_delay_ms
+                if use_shadow_realm:
+                    logger.info(
+                        f"[YABAI v53.0] 🌑 SHADOW REALM PRIMARY: Attempting exile for "
+                        f"window {window_id} ({app_name}) → Display {shadow_display}"
                     )
 
-                    return {
-                        "window_id": window_id,
-                        "source_space": space_id,
-                        "success": success,
-                        "method": f"shadow_realm_lastresort_{exile_method}" if success and exile_method else ("rescue" if success else "failed"),
-                        "strategy": strategy.value,
-                        "duration_ms": duration_ms,
-                        "app_name": app_name,
-                        "was_fullscreen": is_fullscreen
-                    }
+                    success, exile_method = await self._exile_to_shadow_realm_async(
+                        window_id=window_id,
+                        app_name=app_name or "Unknown",
+                        window_title=window_title,
+                        pid=window_pid,
+                        silent=silent,
+                        shadow_display=shadow_display,
+                        maximize_after_exile=True
+                    )
 
-                # Execute rescues in parallel (OUTSIDE rescue_window function)
-                tasks = [rescue_window(w) for w in space_windows]
+                    if success:
+                        duration_ms = (time.time() - move_start) * 1000
+                        telemetry.record_attempt(
+                            success=True,
+                            strategy=RescueStrategy.DIRECT,  # Shadow Realm counts as direct
+                            duration_ms=duration_ms,
+                            app_name=app_name,
+                            wake_delay_used_ms=0  # No wake delay needed
+                        )
 
-                if len(tasks) > max_parallel:
-                    for i in range(0, len(tasks), max_parallel):
-                        batch = tasks[i:i + max_parallel]
-                        batch_results = await asyncio.gather(*batch, return_exceptions=True)
-                        for r in batch_results:
-                            if isinstance(r, Exception):
-                                result["failed_count"] += 1
-                            elif r.get("success"):
-                                result["rescue_count"] += 1
-                                result["details"].append(r)
-                            else:
-                                result["failed_count"] += 1
-                                result["details"].append(r)
-                else:
-                    rescue_results = await asyncio.gather(*tasks, return_exceptions=True)
-                    for r in rescue_results:
+                        return {
+                            "window_id": window_id,
+                            "source_space": space_id,
+                            "success": True,
+                            "method": f"shadow_realm_{exile_method}",
+                            "strategy": "shadow_realm",
+                            "duration_ms": duration_ms,
+                            "app_name": app_name,
+                            "was_fullscreen": is_fullscreen,
+                            "target_display": shadow_display
+                        }
+                    else:
+                        logger.warning(
+                            f"[YABAI v53.0] Shadow Realm failed ({exile_method}), "
+                            f"falling back to space-based move..."
+                        )
+
+                # ═══════════════════════════════════════════════════════════════
+                # FALLBACK: Traditional space-based move (legacy behavior)
+                # ═══════════════════════════════════════════════════════════════
+                # Only reached if Shadow Realm is disabled or failed
+                # ═══════════════════════════════════════════════════════════════
+
+                if is_fullscreen:
+                    logger.info(
+                        f"[YABAI] 🖥️ Window {window_id} is fullscreen - will be unpacked by move_window_to_space_async"
+                    )
+                    strategy = RescueStrategy.EXIT_FULLSCREEN_FIRST
+
+                # v31.1: RE-QUERY ghost space index before each move
+                current_ghost_space = self.get_ghost_display_space()
+                if current_ghost_space is None:
+                    current_ghost_space = ghost_space
+                    logger.warning(f"[YABAI] Could not re-query ghost space, using {ghost_space}")
+
+                success = await self.move_window_to_space_async(window_id, current_ghost_space, silent=silent)
+                duration_ms = (time.time() - move_start) * 1000
+
+                # If first attempt failed and window is minimized, try unminimize
+                if not success and is_minimized:
+                    try:
+                        yabai_path = self._health.yabai_path or "yabai"
+                        await run_subprocess_async(
+                            [yabai_path, "-m", "window", str(window_id), "--minimize", "off"],
+                            timeout=2.0
+                        )
+                        await asyncio.sleep(wake_delay_s)
+                        success = await self.move_window_to_space_async(window_id, current_ghost_space, silent=silent)
+                        strategy = RescueStrategy.UNMINIMIZE_FIRST
+                    except Exception:
+                        pass
+
+                # If still failed and was fullscreen, maybe animation wasn't complete
+                if not success and is_fullscreen:
+                    logger.debug(f"[YABAI] Retry after fullscreen exit for window {window_id}")
+                    try:
+                        await asyncio.sleep(0.5)
+                        retry_ghost_space = self.get_ghost_display_space() or current_ghost_space
+                        success = await self.move_window_to_space_async(window_id, retry_ghost_space, silent=silent)
+                    except Exception:
+                        pass
+
+                # ═══════════════════════════════════════════════════════════════
+                # v53.0: LAST RESORT - Try Shadow Realm if space moves failed
+                # ═══════════════════════════════════════════════════════════════
+                if not success and not use_shadow_realm:
+                    # If Shadow Realm was disabled but space moves failed, try it anyway
+                    logger.warning(
+                        f"[YABAI v53.0] 🆘 LAST RESORT: Space moves failed, trying Shadow Realm..."
+                    )
+                    success, exile_method = await self._exile_to_shadow_realm_async(
+                        window_id=window_id,
+                        app_name=app_name or "Unknown",
+                        window_title=window_title,
+                        pid=window_pid,
+                        silent=silent,
+                        shadow_display=shadow_display,
+                        maximize_after_exile=True
+                    )
+                    if success:
+                        strategy = RescueStrategy.DIRECT
+
+                telemetry.record_attempt(
+                    success=success,
+                    strategy=strategy,
+                    duration_ms=duration_ms,
+                    app_name=app_name,
+                    wake_delay_used_ms=base_wake_delay_ms
+                )
+
+                return {
+                    "window_id": window_id,
+                    "source_space": space_id,
+                    "success": success,
+                    "method": f"shadow_realm_lastresort_{exile_method}" if success and exile_method else ("rescue" if success else "failed"),
+                    "strategy": strategy.value,
+                    "duration_ms": duration_ms,
+                    "app_name": app_name,
+                    "was_fullscreen": is_fullscreen
+                }
+
+            # Execute rescues in parallel (OUTSIDE rescue_window function)
+            tasks = [rescue_window(w) for w in space_windows]
+
+            if len(tasks) > max_parallel:
+                for i in range(0, len(tasks), max_parallel):
+                    batch = tasks[i:i + max_parallel]
+                    batch_results = await asyncio.gather(*batch, return_exceptions=True)
+                    for r in batch_results:
                         if isinstance(r, Exception):
                             result["failed_count"] += 1
                         elif r.get("success"):
@@ -9049,6 +9215,17 @@ class YabaiSpaceDetector:
                         else:
                             result["failed_count"] += 1
                             result["details"].append(r)
+            else:
+                rescue_results = await asyncio.gather(*tasks, return_exceptions=True)
+                for r in rescue_results:
+                    if isinstance(r, Exception):
+                        result["failed_count"] += 1
+                    elif r.get("success"):
+                        result["rescue_count"] += 1
+                        result["details"].append(r)
+                    else:
+                        result["failed_count"] += 1
+                        result["details"].append(r)
 
         # Return to original space (may fail without SA - that's OK)
         if current_space:
