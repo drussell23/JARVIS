@@ -42,7 +42,7 @@ rouge-score==0.1.2
 
 # Memory management dependencies
 psutil==5.9.8
-objgraph==3.6.1
+objgraph==3.6.2
 pympler==1.0.1
 
 # LangChain and Tools
