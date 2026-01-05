@@ -1,5 +1,5 @@
 fastapi==0.120.2
-uvicorn[standard]==0.27.0
+uvicorn[standard]==0.40.0
 transformers==4.36.2
 torch==2.1.2
 accelerate==0.25.0
