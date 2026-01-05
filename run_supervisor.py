@@ -8405,54 +8405,11 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
                 stdout_file = open(stdout_log, "w")
                 stderr_file = open(stderr_log, "w")
 
-                # Create a runner script inline that starts the orchestrator
-                # This is needed because the module doesn't have a __main__ block
-                runner_code = '''
-import asyncio
-import signal
-import sys
-sys.path.insert(0, "{repo_path}")
-
-from reactor_core.orchestration.trinity_orchestrator import (
-    initialize_orchestrator,
-    shutdown_orchestrator,
-)
-
-async def main():
-    print("Reactor-Core Trinity Orchestrator starting...")
-    orchestrator = await initialize_orchestrator()
-    print(f"Orchestrator running: {{orchestrator.is_running()}}")
-
-    # Keep running until interrupted
-    stop_event = asyncio.Event()
-
-    def signal_handler():
-        print("\\nShutdown signal received...")
-        stop_event.set()
-
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        loop.add_signal_handler(sig, signal_handler)
-
-    try:
-        await stop_event.wait()
-    finally:
-        await shutdown_orchestrator()
-        print("Orchestrator shutdown complete")
-
-if __name__ == "__main__":
-    asyncio.run(main())
-'''.format(repo_path=str(self._reactor_core_repo_path))
-
-                # Write runner script to temp location
-                runner_script = log_dir / "reactor_core_runner.py"
-                with open(runner_script, "w") as f:
-                    f.write(runner_code)
-
-                # Launch subprocess
+                # v74.0: Direct execution - trinity_orchestrator.py now has __main__ block
+                # No need for inline runner script anymore
                 self._reactor_core_orchestrator_process = await asyncio.create_subprocess_exec(
                     python_cmd,
-                    str(runner_script),
+                    str(orchestrator_module),
                     cwd=str(self._reactor_core_repo_path),
                     env=env,
                     stdout=stdout_file,
