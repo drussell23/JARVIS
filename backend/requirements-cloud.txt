@@ -25,7 +25,7 @@ requests==2.31.0
 httpx==0.27.0
 
 # RAG dependencies
-sentence-transformers==2.3.0
+sentence-transformers==5.2.0
 faiss-cpu==1.7.4
 chromadb==0.4.22
 tiktoken==0.5.2
