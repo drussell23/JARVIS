@@ -52,6 +52,16 @@ from .trinity_handlers import (
     register_trinity_handlers,
 )
 
+# PROJECT TRINITY: Auto-Initializer
+from .trinity_initializer import (
+    initialize_trinity,
+    shutdown_trinity,
+    trinity_context,
+    is_trinity_initialized,
+    get_trinity_status,
+    JARVIS_INSTANCE_ID,
+)
+
 __all__ = [
     # v67.0 Cerebro
     'AppLibrary',
@@ -81,4 +91,11 @@ __all__ = [
     'TrinitySource',
     'HeartbeatPayload',
     'register_trinity_handlers',
+    # Trinity Initializer
+    'initialize_trinity',
+    'shutdown_trinity',
+    'trinity_context',
+    'is_trinity_initialized',
+    'get_trinity_status',
+    'JARVIS_INSTANCE_ID',
 ]
