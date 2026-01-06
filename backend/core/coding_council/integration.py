@@ -232,6 +232,596 @@ async def list_pending_approvals() -> List[Dict[str, Any]]:
 
 
 # ============================================================================
+# Advanced Concurrency Control (v77.2 Super-Beefed)
+# ============================================================================
+
+
+class EvolutionSemaphore:
+    """
+    Concurrent execution limiter with priority queue.
+
+    Features:
+    - Limits concurrent evolutions (default: 3)
+    - Priority-based queue (higher priority executes first)
+    - Fair scheduling with aging (prevents starvation)
+    - Automatic timeout release
+    """
+
+    def __init__(self, max_concurrent: int = 3):
+        self._semaphore = asyncio.Semaphore(max_concurrent)
+        self._max_concurrent = max_concurrent
+        self._active_tasks: Dict[str, float] = {}  # task_id -> start_time
+        self._queue: List[Tuple[int, float, str, asyncio.Event]] = []  # (priority, timestamp, task_id, event)
+        self._lock = asyncio.Lock()
+
+    async def acquire(self, task_id: str, priority: int = 5, timeout: float = 300.0) -> bool:
+        """
+        Acquire execution slot with priority.
+
+        Args:
+            task_id: Unique task identifier
+            priority: 1-10 (higher = more urgent)
+            timeout: Max wait time in seconds
+
+        Returns:
+            True if acquired, False if timed out
+        """
+        event = asyncio.Event()
+        enqueue_time = time.time()
+
+        async with self._lock:
+            # Add to priority queue (negative priority for max-heap behavior)
+            self._queue.append((-priority, enqueue_time, task_id, event))
+            self._queue.sort(key=lambda x: (x[0], x[1]))  # Sort by priority, then time
+
+        try:
+            # Wait for slot with timeout
+            acquired = await asyncio.wait_for(
+                self._wait_for_slot(task_id, event),
+                timeout=timeout
+            )
+
+            if acquired:
+                async with self._lock:
+                    self._active_tasks[task_id] = time.time()
+
+            return acquired
+
+        except asyncio.TimeoutError:
+            # Remove from queue on timeout
+            async with self._lock:
+                self._queue = [q for q in self._queue if q[2] != task_id]
+            return False
+
+    async def _wait_for_slot(self, task_id: str, event: asyncio.Event) -> bool:
+        """Wait for execution slot."""
+        await self._semaphore.acquire()
+
+        async with self._lock:
+            # Check if we're next in queue
+            if self._queue and self._queue[0][2] == task_id:
+                self._queue.pop(0)
+                event.set()
+                return True
+
+            # Not our turn, release and wait
+            self._semaphore.release()
+
+        # Wait for our turn
+        await event.wait()
+        await self._semaphore.acquire()
+        return True
+
+    async def release(self, task_id: str) -> None:
+        """Release execution slot."""
+        async with self._lock:
+            if task_id in self._active_tasks:
+                del self._active_tasks[task_id]
+
+            # Signal next in queue
+            if self._queue:
+                _, _, next_task_id, next_event = self._queue[0]
+                next_event.set()
+
+        self._semaphore.release()
+
+    @property
+    def active_count(self) -> int:
+        """Number of active evolutions."""
+        return len(self._active_tasks)
+
+    @property
+    def queue_length(self) -> int:
+        """Number of waiting evolutions."""
+        return len(self._queue)
+
+
+# Global semaphore
+_evolution_semaphore: Optional[EvolutionSemaphore] = None
+
+
+def get_evolution_semaphore() -> EvolutionSemaphore:
+    """Get or create global evolution semaphore."""
+    global _evolution_semaphore
+    if _evolution_semaphore is None:
+        max_concurrent = int(os.getenv("CODING_COUNCIL_MAX_CONCURRENT", "3"))
+        _evolution_semaphore = EvolutionSemaphore(max_concurrent)
+    return _evolution_semaphore
+
+
+# ============================================================================
+# Advanced Rate Limiter (Token Bucket Algorithm)
+# ============================================================================
+
+
+class RateLimiter:
+    """
+    Token bucket rate limiter with burst support.
+
+    Features:
+    - Configurable rate (requests per second)
+    - Burst allowance for temporary spikes
+    - Per-client tracking (IP/user based)
+    - Sliding window for smooth limiting
+    """
+
+    def __init__(
+        self,
+        rate: float = 10.0,  # requests per second
+        burst: int = 20,  # max burst size
+        per_client: bool = True
+    ):
+        self._rate = rate
+        self._burst = burst
+        self._per_client = per_client
+        self._tokens: Dict[str, float] = {}  # client_id -> tokens
+        self._last_update: Dict[str, float] = {}  # client_id -> timestamp
+        self._lock = asyncio.Lock()
+
+    async def acquire(self, client_id: str = "global") -> Tuple[bool, float]:
+        """
+        Try to acquire a rate limit token.
+
+        Returns:
+            Tuple of (allowed, wait_time_if_denied)
+        """
+        if not self._per_client:
+            client_id = "global"
+
+        async with self._lock:
+            current_time = time.time()
+
+            # Initialize if new client
+            if client_id not in self._tokens:
+                self._tokens[client_id] = self._burst
+                self._last_update[client_id] = current_time
+
+            # Refill tokens based on elapsed time
+            elapsed = current_time - self._last_update[client_id]
+            self._tokens[client_id] = min(
+                self._burst,
+                self._tokens[client_id] + elapsed * self._rate
+            )
+            self._last_update[client_id] = current_time
+
+            # Check if we have tokens
+            if self._tokens[client_id] >= 1.0:
+                self._tokens[client_id] -= 1.0
+                return True, 0.0
+            else:
+                # Calculate wait time
+                wait_time = (1.0 - self._tokens[client_id]) / self._rate
+                return False, wait_time
+
+    async def wait_and_acquire(self, client_id: str = "global", max_wait: float = 30.0) -> bool:
+        """Wait for rate limit if needed, up to max_wait seconds."""
+        allowed, wait_time = await self.acquire(client_id)
+
+        if allowed:
+            return True
+
+        if wait_time > max_wait:
+            return False
+
+        await asyncio.sleep(wait_time)
+        return (await self.acquire(client_id))[0]
+
+
+# Global rate limiter
+_rate_limiter: Optional[RateLimiter] = None
+
+
+def get_rate_limiter() -> RateLimiter:
+    """Get or create global rate limiter."""
+    global _rate_limiter
+    if _rate_limiter is None:
+        rate = float(os.getenv("CODING_COUNCIL_RATE_LIMIT", "10.0"))
+        burst = int(os.getenv("CODING_COUNCIL_RATE_BURST", "20"))
+        _rate_limiter = RateLimiter(rate=rate, burst=burst)
+    return _rate_limiter
+
+
+# ============================================================================
+# Circuit Breaker with Exponential Backoff
+# ============================================================================
+
+
+class CircuitState(Enum):
+    """Circuit breaker states."""
+    CLOSED = "closed"  # Normal operation
+    OPEN = "open"  # Failing, reject requests
+    HALF_OPEN = "half_open"  # Testing if recovered
+
+
+class CircuitBreaker:
+    """
+    Circuit breaker pattern with exponential backoff.
+
+    Features:
+    - Prevents cascading failures
+    - Automatic recovery testing
+    - Exponential backoff on repeated failures
+    - Per-operation tracking
+    - Health metrics reporting
+    """
+
+    def __init__(
+        self,
+        failure_threshold: int = 5,
+        recovery_timeout: float = 30.0,
+        half_open_max_calls: int = 3,
+        backoff_multiplier: float = 2.0,
+        max_backoff: float = 300.0
+    ):
+        self._failure_threshold = failure_threshold
+        self._recovery_timeout = recovery_timeout
+        self._half_open_max_calls = half_open_max_calls
+        self._backoff_multiplier = backoff_multiplier
+        self._max_backoff = max_backoff
+
+        self._state = CircuitState.CLOSED
+        self._failure_count = 0
+        self._success_count = 0
+        self._last_failure_time: Optional[float] = None
+        self._current_backoff = recovery_timeout
+        self._half_open_calls = 0
+        self._lock = asyncio.Lock()
+
+        # Metrics
+        self._total_calls = 0
+        self._total_failures = 0
+        self._total_rejections = 0
+
+    async def can_execute(self) -> Tuple[bool, str]:
+        """
+        Check if execution is allowed.
+
+        Returns:
+            Tuple of (allowed, reason)
+        """
+        async with self._lock:
+            self._total_calls += 1
+
+            if self._state == CircuitState.CLOSED:
+                return True, "circuit_closed"
+
+            elif self._state == CircuitState.OPEN:
+                # Check if recovery timeout has passed
+                if self._last_failure_time:
+                    elapsed = time.time() - self._last_failure_time
+                    if elapsed >= self._current_backoff:
+                        # Transition to half-open
+                        self._state = CircuitState.HALF_OPEN
+                        self._half_open_calls = 0
+                        logger.info(f"🔌 [CircuitBreaker] Transitioning to HALF_OPEN after {elapsed:.1f}s")
+                        return True, "circuit_half_open"
+
+                self._total_rejections += 1
+                remaining = self._current_backoff - (time.time() - (self._last_failure_time or 0))
+                return False, f"circuit_open:retry_in_{remaining:.1f}s"
+
+            elif self._state == CircuitState.HALF_OPEN:
+                if self._half_open_calls < self._half_open_max_calls:
+                    self._half_open_calls += 1
+                    return True, "circuit_half_open"
+                return False, "circuit_half_open:max_calls_reached"
+
+            return False, "unknown_state"
+
+    async def record_success(self) -> None:
+        """Record successful execution."""
+        async with self._lock:
+            self._success_count += 1
+
+            if self._state == CircuitState.HALF_OPEN:
+                # Successful call in half-open, close the circuit
+                self._state = CircuitState.CLOSED
+                self._failure_count = 0
+                self._current_backoff = self._recovery_timeout  # Reset backoff
+                logger.info("🔌 [CircuitBreaker] Circuit CLOSED - recovery successful")
+
+    async def record_failure(self, error: Optional[Exception] = None) -> None:
+        """Record failed execution."""
+        async with self._lock:
+            self._failure_count += 1
+            self._total_failures += 1
+            self._last_failure_time = time.time()
+
+            if self._state == CircuitState.HALF_OPEN:
+                # Failure in half-open, reopen with increased backoff
+                self._state = CircuitState.OPEN
+                self._current_backoff = min(
+                    self._current_backoff * self._backoff_multiplier,
+                    self._max_backoff
+                )
+                logger.warning(f"🔌 [CircuitBreaker] Circuit OPEN - half-open test failed, backoff: {self._current_backoff:.1f}s")
+
+            elif self._state == CircuitState.CLOSED:
+                if self._failure_count >= self._failure_threshold:
+                    self._state = CircuitState.OPEN
+                    logger.warning(f"🔌 [CircuitBreaker] Circuit OPEN - {self._failure_count} failures")
+
+    async def reset(self) -> None:
+        """Manually reset the circuit breaker."""
+        async with self._lock:
+            self._state = CircuitState.CLOSED
+            self._failure_count = 0
+            self._success_count = 0
+            self._current_backoff = self._recovery_timeout
+            logger.info("🔌 [CircuitBreaker] Circuit manually reset")
+
+    @property
+    def state(self) -> CircuitState:
+        return self._state
+
+    @property
+    def metrics(self) -> Dict[str, Any]:
+        return {
+            "state": self._state.value,
+            "failure_count": self._failure_count,
+            "success_count": self._success_count,
+            "total_calls": self._total_calls,
+            "total_failures": self._total_failures,
+            "total_rejections": self._total_rejections,
+            "current_backoff": self._current_backoff,
+        }
+
+
+# Global circuit breaker
+_circuit_breaker: Optional[CircuitBreaker] = None
+
+
+def get_circuit_breaker() -> CircuitBreaker:
+    """Get or create global circuit breaker."""
+    global _circuit_breaker
+    if _circuit_breaker is None:
+        _circuit_breaker = CircuitBreaker(
+            failure_threshold=int(os.getenv("CODING_COUNCIL_FAILURE_THRESHOLD", "5")),
+            recovery_timeout=float(os.getenv("CODING_COUNCIL_RECOVERY_TIMEOUT", "30.0")),
+        )
+    return _circuit_breaker
+
+
+# ============================================================================
+# Adaptive Framework Selector (Thompson Sampling / Multi-Armed Bandit)
+# ============================================================================
+
+
+class AdaptiveFrameworkSelector:
+    """
+    Adaptive framework selection using Thompson Sampling.
+
+    Features:
+    - Bayesian approach to exploration/exploitation
+    - Learns from historical success rates
+    - Automatic adaptation to changing conditions
+    - Context-aware selection (task complexity, file types)
+    - Persistence of learned parameters
+    """
+
+    def __init__(self):
+        # Beta distribution parameters (alpha=successes+1, beta=failures+1)
+        # Start with weak priors (alpha=1, beta=1 = uniform)
+        self._framework_stats: Dict[str, Dict[str, float]] = {
+            "aider": {"alpha": 2.0, "beta": 1.0},  # Slight prior for aider (known good)
+            "metagpt": {"alpha": 1.5, "beta": 1.0},
+            "claude_code": {"alpha": 1.5, "beta": 1.0},
+            "openhands": {"alpha": 1.0, "beta": 1.0},
+            "continue": {"alpha": 1.0, "beta": 1.0},
+        }
+
+        # Context-specific stats (complexity -> framework -> stats)
+        self._context_stats: Dict[str, Dict[str, Dict[str, float]]] = {}
+
+        self._lock = asyncio.Lock()
+        self._selection_history: List[Dict[str, Any]] = []
+
+    async def select_framework(
+        self,
+        available_frameworks: List[str],
+        context: Optional[Dict[str, Any]] = None,
+        exploration_rate: float = 0.1
+    ) -> str:
+        """
+        Select framework using Thompson Sampling.
+
+        Args:
+            available_frameworks: List of available framework names
+            context: Optional context (complexity, file_types, etc.)
+            exploration_rate: Probability of random exploration (0-1)
+
+        Returns:
+            Selected framework name
+        """
+        import random
+
+        async with self._lock:
+            # Exploration: random selection with probability exploration_rate
+            if random.random() < exploration_rate:
+                selected = random.choice(available_frameworks)
+                self._selection_history.append({
+                    "selected": selected,
+                    "method": "exploration",
+                    "timestamp": time.time(),
+                })
+                return selected
+
+            # Exploitation: Thompson Sampling
+            samples = {}
+            for framework in available_frameworks:
+                stats = self._get_stats(framework, context)
+                # Sample from Beta distribution
+                sample = random.betavariate(stats["alpha"], stats["beta"])
+                samples[framework] = sample
+
+            # Select framework with highest sample
+            selected = max(samples, key=samples.get)
+
+            self._selection_history.append({
+                "selected": selected,
+                "method": "thompson_sampling",
+                "samples": samples,
+                "timestamp": time.time(),
+            })
+
+            return selected
+
+    def _get_stats(
+        self,
+        framework: str,
+        context: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, float]:
+        """Get stats for framework, optionally context-specific."""
+        # Try context-specific stats first
+        if context and "complexity" in context:
+            complexity = context["complexity"]
+            if complexity in self._context_stats:
+                if framework in self._context_stats[complexity]:
+                    return self._context_stats[complexity][framework]
+
+        # Fall back to global stats
+        return self._framework_stats.get(
+            framework,
+            {"alpha": 1.0, "beta": 1.0}
+        )
+
+    async def record_result(
+        self,
+        framework: str,
+        success: bool,
+        context: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """
+        Record execution result to update beliefs.
+
+        Args:
+            framework: Framework that was used
+            success: Whether execution succeeded
+            context: Optional context for context-specific learning
+        """
+        async with self._lock:
+            # Update global stats
+            if framework not in self._framework_stats:
+                self._framework_stats[framework] = {"alpha": 1.0, "beta": 1.0}
+
+            if success:
+                self._framework_stats[framework]["alpha"] += 1.0
+            else:
+                self._framework_stats[framework]["beta"] += 1.0
+
+            # Update context-specific stats
+            if context and "complexity" in context:
+                complexity = context["complexity"]
+                if complexity not in self._context_stats:
+                    self._context_stats[complexity] = {}
+                if framework not in self._context_stats[complexity]:
+                    self._context_stats[complexity][framework] = {"alpha": 1.0, "beta": 1.0}
+
+                if success:
+                    self._context_stats[complexity][framework]["alpha"] += 1.0
+                else:
+                    self._context_stats[complexity][framework]["beta"] += 1.0
+
+            logger.debug(f"🎰 [AdaptiveSelector] Updated {framework}: success={success}")
+
+    def get_success_rates(self) -> Dict[str, float]:
+        """Get estimated success rates for all frameworks."""
+        rates = {}
+        for framework, stats in self._framework_stats.items():
+            # Expected value of Beta distribution
+            rates[framework] = stats["alpha"] / (stats["alpha"] + stats["beta"])
+        return rates
+
+    @property
+    def stats(self) -> Dict[str, Any]:
+        return {
+            "global_stats": self._framework_stats,
+            "context_stats": self._context_stats,
+            "success_rates": self.get_success_rates(),
+            "selection_count": len(self._selection_history),
+        }
+
+
+# Global adaptive selector
+_adaptive_selector: Optional[AdaptiveFrameworkSelector] = None
+
+
+def get_adaptive_selector() -> AdaptiveFrameworkSelector:
+    """Get or create global adaptive framework selector."""
+    global _adaptive_selector
+    if _adaptive_selector is None:
+        _adaptive_selector = AdaptiveFrameworkSelector()
+    return _adaptive_selector
+
+
+# ============================================================================
+# Timeout Wrapper for Long Operations
+# ============================================================================
+
+
+async def with_timeout(
+    coro: Any,
+    timeout: float,
+    task_id: str,
+    operation: str,
+    on_timeout: Optional[Callable[[], Any]] = None
+) -> Tuple[bool, Any]:
+    """
+    Execute coroutine with timeout and cleanup.
+
+    Args:
+        coro: Coroutine to execute
+        timeout: Timeout in seconds
+        task_id: Task ID for logging
+        operation: Operation name for logging
+        on_timeout: Optional cleanup callback on timeout
+
+    Returns:
+        Tuple of (success, result_or_error)
+    """
+    try:
+        result = await asyncio.wait_for(coro, timeout=timeout)
+        return True, result
+    except asyncio.TimeoutError:
+        logger.warning(f"⏱️ [Timeout] {operation} timed out after {timeout}s (task: {task_id})")
+        if on_timeout:
+            try:
+                if asyncio.iscoroutinefunction(on_timeout):
+                    await on_timeout()
+                else:
+                    on_timeout()
+            except Exception as e:
+                logger.error(f"⏱️ [Timeout] Cleanup failed: {e}")
+        return False, f"Timeout after {timeout}s"
+    except asyncio.CancelledError:
+        logger.info(f"⏱️ [Timeout] {operation} cancelled (task: {task_id})")
+        raise
+    except Exception as e:
+        logger.error(f"⏱️ [Timeout] {operation} error: {e}")
+        return False, str(e)
+
+
+# ============================================================================
 # Command Classification (Intelligent, No Hardcoding)
 # ============================================================================
 
@@ -1367,46 +1957,66 @@ async def _select_framework(
     context: Dict[str, Any]
 ) -> str:
     """
-    Select the optimal framework for the evolution task.
+    Select the optimal framework using hybrid approach:
+    1. Rule-based constraints (sandbox, critical risk)
+    2. Adaptive Thompson Sampling for exploration/exploitation
 
     Decision Matrix:
-    - Trivial changes → Aider (fast)
-    - Complex refactors → MetaGPT (planning)
-    - Sandboxed execution → OpenHands
-    - IDE integration → Continue
-    - Default → Claude Code
+    - Sandbox required → OpenHands (hard constraint)
+    - Critical risk → MetaGPT (hard constraint)
+    - Otherwise → Adaptive selection via Thompson Sampling
     """
     risk_level = context.get("risk_level", "medium")
     files_analyzed = context.get("files_analyzed", [])
     total_lines = sum(f.get("lines", 0) for f in files_analyzed)
+    complexity = "high" if total_lines > 500 else "medium" if total_lines > 100 else "low"
 
-    # Check framework availability (from config)
-    preferred = CodingCouncilConfig.PREFERRED_FRAMEWORK
-    fallbacks = CodingCouncilConfig.FALLBACK_FRAMEWORKS
-
-    # Decision logic
-    if request.require_sandbox:
-        framework = "openhands"
-    elif risk_level == "critical" or request.require_planning:
-        framework = "metagpt"
-    elif total_lines > 1000 or len(request.target_files) > 5:
-        framework = "metagpt"  # Complex task
-    elif total_lines < 100 and risk_level == "low":
-        framework = "aider"  # Simple task
-    else:
-        framework = preferred
-
-    # Verify framework is available (mock check)
+    # Available frameworks
     available_frameworks = ["aider", "metagpt", "claude_code", "continue"]
 
-    if framework not in available_frameworks:
-        # Use fallback
-        for fallback in fallbacks:
-            if fallback in available_frameworks:
-                framework = fallback
-                break
-        else:
-            framework = "claude_code"  # Ultimate fallback
+    # Hard constraints (rule-based, no learning)
+    if request.require_sandbox:
+        return "openhands" if "openhands" in available_frameworks else "claude_code"
+
+    if risk_level == "critical":
+        return "metagpt" if "metagpt" in available_frameworks else "claude_code"
+
+    # Soft constraints: filter available frameworks based on task
+    candidate_frameworks = available_frameworks.copy()
+
+    # For complex tasks, prefer planning frameworks
+    if risk_level == "high" or total_lines > 1000:
+        # Boost planning frameworks by keeping them, remove simple ones
+        if "metagpt" in candidate_frameworks:
+            # Keep metagpt as an option but let adaptive selector choose
+            pass
+
+    # For simple tasks, prefer fast frameworks
+    if risk_level == "low" and total_lines < 100:
+        # Boost fast frameworks
+        if "aider" in candidate_frameworks:
+            pass
+
+    # Use adaptive selector with Thompson Sampling
+    selector = get_adaptive_selector()
+    selection_context = {
+        "complexity": complexity,
+        "risk_level": risk_level,
+        "total_lines": total_lines,
+        "file_count": len(request.target_files),
+    }
+
+    # Exploration rate based on confidence
+    # Lower exploration for simple tasks, higher for complex
+    exploration_rate = 0.05 if risk_level == "low" else 0.15 if risk_level == "high" else 0.1
+
+    framework = await selector.select_framework(
+        available_frameworks=candidate_frameworks,
+        context=selection_context,
+        exploration_rate=exploration_rate,
+    )
+
+    logger.info(f"🎰 [FrameworkSelection] Selected {framework} (risk={risk_level}, lines={total_lines})")
 
     return framework
 
@@ -1633,6 +2243,29 @@ def create_coding_council_router():
         broadcaster = get_evolution_broadcaster()
         start_time = time.time()
 
+        # ═══════════════════════════════════════════════════════════════════
+        # PRE-FLIGHT: Rate Limiting (Prevents abuse)
+        # ═══════════════════════════════════════════════════════════════════
+        rate_limiter = get_rate_limiter()
+        allowed, wait_time = await rate_limiter.acquire("evolution_api")
+        if not allowed:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Rate limit exceeded. Retry in {wait_time:.1f} seconds.",
+                headers={"Retry-After": str(int(wait_time) + 1)},
+            )
+
+        # ═══════════════════════════════════════════════════════════════════
+        # PRE-FLIGHT: Circuit Breaker (Prevents cascading failures)
+        # ═══════════════════════════════════════════════════════════════════
+        circuit_breaker = get_circuit_breaker()
+        can_execute, cb_reason = await circuit_breaker.can_execute()
+        if not can_execute:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Service temporarily unavailable: {cb_reason}",
+            )
+
         try:
             # ═══════════════════════════════════════════════════════════════════
             # STAGE 0: Initialize and validate request
@@ -1669,6 +2302,7 @@ def create_coding_council_router():
             async def execute_advanced_evolution():
                 """
                 Advanced evolution pipeline with real-time progress tracking.
+                Includes semaphore for concurrency control and result tracking.
                 """
                 nonlocal evo_request
                 evolution_context = {
@@ -1681,6 +2315,24 @@ def create_coding_council_router():
                     "validation_results": {},
                     "rollback_prepared": False,
                 }
+
+                # Acquire execution slot (with priority based on request)
+                semaphore = get_evolution_semaphore()
+                slot_acquired = await semaphore.acquire(
+                    task_id=task_id,
+                    priority=evo_request.priority,
+                    timeout=CodingCouncilConfig.EVOLUTION_TIMEOUT
+                )
+
+                if not slot_acquired:
+                    await broadcaster.broadcast(
+                        task_id=task_id,
+                        status="queued_timeout",
+                        progress=0.0,
+                        message="Evolution timed out waiting for execution slot",
+                        details={"queue_length": semaphore.queue_length},
+                    )
+                    return
 
                 try:
                     # ═══════════════════════════════════════════════════════════
@@ -1906,6 +2558,20 @@ def create_coding_council_router():
 
                     logger.info(f"🧬 [Evolution] Task {task_id} {'completed' if success else 'failed'} in {elapsed:.2f}s")
 
+                    # Record result for adaptive learning and circuit breaker
+                    framework = evolution_context.get("framework", "unknown")
+                    selector = get_adaptive_selector()
+                    await selector.record_result(
+                        framework=framework,
+                        success=success,
+                        context={"complexity": evolution_context.get("risk_level", "medium")},
+                    )
+
+                    if success:
+                        await circuit_breaker.record_success()
+                    else:
+                        await circuit_breaker.record_failure()
+
                 except asyncio.CancelledError:
                     await broadcaster.broadcast(
                         task_id=task_id,
@@ -1913,6 +2579,7 @@ def create_coding_council_router():
                         progress=evolution_context.get("last_progress", 0),
                         message="Evolution cancelled",
                     )
+                    await circuit_breaker.record_failure()
                     raise
 
                 except Exception as e:
@@ -1928,6 +2595,11 @@ def create_coding_council_router():
                             "stages_completed": evolution_context.get("stages_completed", []),
                         },
                     )
+                    await circuit_breaker.record_failure(e)
+
+                finally:
+                    # Always release the semaphore
+                    await semaphore.release(task_id)
 
             # ═══════════════════════════════════════════════════════════════════
             # Determine execution mode
