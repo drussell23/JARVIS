@@ -1,8 +1,18 @@
 """
-v77.0: MetaGPT Framework Adapter
-================================
+v77.3: MetaGPT Framework Adapter (Anthropic-Powered)
+====================================================
 
-Adapter for MetaGPT - multi-agent planning and PRD generation.
+Adapter for MetaGPT-style multi-agent planning and PRD generation.
+
+Primary Implementation: Anthropic Claude API (simulated multi-agent)
+Fallback: MetaGPT package (if installed)
+
+Features:
+- Multi-agent planning via Claude (PM, Architect, Tech Lead, Engineer)
+- PRD generation
+- Architecture design
+- Risk analysis
+- No external tool dependencies required
 
 MetaGPT provides:
 - Product Requirements Documents (PRD)
@@ -12,8 +22,8 @@ MetaGPT provides:
 
 For complex features requiring structured planning.
 
-Author: JARVIS v77.0
-Version: 1.0.0
+Author: JARVIS v77.3
+Version: 2.0.0
 """
 
 from __future__ import annotations
@@ -37,41 +47,92 @@ logger = logging.getLogger(__name__)
 
 class MetaGPTAdapter:
     """
-    Adapter for MetaGPT multi-agent planning.
+    Adapter for MetaGPT-style multi-agent planning.
 
-    If MetaGPT is not installed, falls back to LLM-based
-    planning using the available Claude/OpenAI API.
+    Primary: Uses Anthropic Claude API with simulated multi-agent roles
+    Fallback: MetaGPT package (if installed)
+
+    Simulated Agents:
+    - Product Manager: Creates PRD
+    - Architect: Designs system architecture
+    - Tech Lead: Creates technical specification
+    - Engineer: Breaks down into implementation steps
     """
 
     def __init__(self, config: "CodingCouncilConfig"):
         self.config = config
         self.repo_root = config.repo_root
         self._available: Optional[bool] = None
+        self._metagpt_available: Optional[bool] = None
+        self._anthropic_engine: Optional[Any] = None
 
-    async def is_available(self) -> bool:
-        """Check if MetaGPT is available."""
-        if self._available is not None:
-            return self._available
+        # Use Anthropic engine by default
+        self._prefer_metagpt = os.getenv("METAGPT_PREFER_PACKAGE", "false").lower() == "true"
+
+    async def _get_anthropic_engine(self):
+        """Lazy-load Anthropic engine."""
+        if self._anthropic_engine is None:
+            try:
+                from .anthropic_engine import AnthropicUnifiedEngine
+                self._anthropic_engine = AnthropicUnifiedEngine(self.repo_root)
+                await self._anthropic_engine.initialize()
+            except Exception as e:
+                logger.warning(f"[MetaGPTAdapter] Anthropic engine init failed: {e}")
+                self._anthropic_engine = None
+        return self._anthropic_engine
+
+    async def _check_metagpt_available(self) -> bool:
+        """Check if MetaGPT package is installed."""
+        if self._metagpt_available is not None:
+            return self._metagpt_available
 
         try:
             import importlib.util
             spec = importlib.util.find_spec("metagpt")
-            self._available = spec is not None
+            self._metagpt_available = spec is not None
+            if self._metagpt_available:
+                logger.info("[MetaGPTAdapter] MetaGPT package available")
         except Exception:
-            self._available = False
+            self._metagpt_available = False
 
-        if not self._available:
-            logger.info("[MetaGPTAdapter] MetaGPT not installed, using fallback planning")
+        return self._metagpt_available
 
-        return True  # Always available due to fallback
+    async def is_available(self) -> bool:
+        """Check if MetaGPT-style planning is available (always True with Anthropic)."""
+        if self._available is not None:
+            return self._available
+
+        # Anthropic engine is always available if API key is set
+        anthropic_key = os.getenv("ANTHROPIC_API_KEY")
+        if anthropic_key:
+            engine = await self._get_anthropic_engine()
+            if engine:
+                logger.info("[MetaGPTAdapter] Using Anthropic engine (Claude multi-agent)")
+                self._available = True
+                return True
+
+        # Fall back to MetaGPT package check
+        self._available = await self._check_metagpt_available()
+        return self._available or True  # Always available due to fallback
 
     async def plan(
         self,
         description: str,
-        analysis: Optional["AnalysisResult"] = None
+        analysis: Optional["AnalysisResult"] = None,
+        complexity: str = "auto",
+        progress_callback: Optional[Any] = None,
     ) -> "PlanResult":
         """
         Create execution plan for task.
+
+        Primary: Uses Anthropic Claude with multi-agent simulation
+        Fallback: MetaGPT package or template-based planning
+
+        Args:
+            description: What to implement
+            analysis: Optional codebase analysis
+            complexity: auto, simple, medium, complex
+            progress_callback: Optional progress callback
 
         Returns:
             PlanResult with PRD, architecture, and steps
@@ -80,11 +141,86 @@ class MetaGPTAdapter:
 
         logger.info(f"[MetaGPTAdapter] Planning: {description[:50]}...")
 
-        if self._available:
-            # Use actual MetaGPT
+        # Prefer Anthropic engine (no external dependencies)
+        if not self._prefer_metagpt:
+            engine = await self._get_anthropic_engine()
+            if engine:
+                return await self._plan_with_anthropic(
+                    description, analysis, complexity, progress_callback
+                )
+
+        # Fall back to MetaGPT package if available and preferred
+        if await self._check_metagpt_available():
             return await self._plan_with_metagpt(description, analysis)
-        else:
-            # Use fallback planning
+
+        # Final fallback to template-based planning
+        return await self._plan_with_fallback(description, analysis)
+
+    async def _plan_with_anthropic(
+        self,
+        description: str,
+        analysis: Optional["AnalysisResult"],
+        complexity: str = "auto",
+        progress_callback: Optional[Any] = None,
+    ) -> "PlanResult":
+        """Plan using Anthropic Claude multi-agent simulation (primary method)."""
+        from ..types import PlanResult, TaskComplexity
+
+        engine = await self._get_anthropic_engine()
+        if not engine:
+            return await self._plan_with_fallback(description, analysis)
+
+        try:
+            # Build codebase context from analysis
+            codebase_context = None
+            if analysis:
+                context_parts = []
+                if hasattr(analysis, 'target_files'):
+                    context_parts.append(f"Target files: {', '.join(analysis.target_files)}")
+                if hasattr(analysis, 'insights'):
+                    context_parts.append(f"Insights: {'; '.join(analysis.insights[:3])}")
+                if hasattr(analysis, 'dependencies'):
+                    deps = list(analysis.dependencies.keys())[:5]
+                    context_parts.append(f"Dependencies: {', '.join(deps)}")
+                codebase_context = "\n".join(context_parts)
+
+            # Get plan from Anthropic engine
+            plan = await engine.create_plan(
+                description=description,
+                codebase_context=codebase_context,
+                complexity=complexity,
+                progress_callback=progress_callback,
+            )
+
+            # Convert to PlanResult
+            estimated_complexity = TaskComplexity.MEDIUM
+            if plan.estimated_duration_minutes < 15:
+                estimated_complexity = TaskComplexity.SIMPLE
+            elif plan.estimated_duration_minutes > 60:
+                estimated_complexity = TaskComplexity.COMPLEX
+
+            # Convert steps
+            steps = []
+            for step in plan.steps:
+                steps.append({
+                    "step": step.step_number,
+                    "description": step.description,
+                    "files": step.files_affected,
+                    "complexity": step.estimated_complexity,
+                })
+
+            return PlanResult(
+                prd=plan.prd,
+                architecture=plan.architecture,
+                steps=steps,
+                estimated_complexity=estimated_complexity,
+                estimated_time_minutes=plan.estimated_duration_minutes,
+                risks=[plan.risk_assessment] if plan.risk_assessment else [],
+                dependencies=[],
+            )
+
+        except Exception as e:
+            logger.warning(f"[MetaGPTAdapter] Anthropic planning failed: {e}")
             return await self._plan_with_fallback(description, analysis)
 
     async def _plan_with_metagpt(

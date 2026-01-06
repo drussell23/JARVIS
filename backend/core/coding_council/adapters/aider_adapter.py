@@ -1,8 +1,18 @@
 """
-v77.0: Aider Framework Adapter
-==============================
+v77.3: Aider Framework Adapter (Anthropic-Powered)
+==================================================
 
-Adapter for Aider - the fast, git-integrated AI coding assistant.
+Adapter for Aider-style git-integrated AI coding assistance.
+
+Primary Implementation: Anthropic Claude API (no external dependencies)
+Fallback: Aider CLI (if installed)
+
+Features:
+- Direct Claude API integration (primary)
+- SEARCH/REPLACE block-based editing
+- Git-aware operations with auto-commits
+- No external tool dependencies required
+- Falls back to Aider CLI if available and preferred
 
 Aider is ideal for:
 - Single file edits
@@ -11,21 +21,19 @@ Aider is ideal for:
 - Adding features to existing code
 - Git-aware changes
 
-Installation:
-    pip install aider-chat
-
 Usage:
     adapter = AiderAdapter(config)
     result = await adapter.execute(task, analysis, plan)
 
 Safety Features:
-- Subprocess isolation
+- Subprocess isolation (for CLI fallback)
 - Timeout handling
 - Output parsing
 - Error recovery
+- Protected path enforcement
 
-Author: JARVIS v77.0
-Version: 1.0.0
+Author: JARVIS v77.3
+Version: 2.0.0
 """
 
 from __future__ import annotations
@@ -55,18 +63,22 @@ logger = logging.getLogger(__name__)
 
 class AiderAdapter:
     """
-    Adapter for Aider AI coding assistant.
+    Adapter for Aider-style AI coding assistance.
 
-    Aider provides:
-    - Direct file editing
+    Primary: Uses Anthropic Claude API directly (no external dependencies)
+    Fallback: Aider CLI (if installed and preferred)
+
+    Features:
+    - SEARCH/REPLACE block-based editing via Claude
     - Git integration (auto-commits)
-    - Multiple LLM backends
-    - Code context awareness
+    - No external tool dependencies
+    - Falls back to Aider CLI if preferred
 
     Addresses:
     - Gap #10: Framework Timeout
     - Gap #15: API Key Management
     - Gap #36: Subprocess Zombie
+    - Gap #77: External Tool Dependencies
     """
 
     def __init__(self, config: "CodingCouncilConfig"):
@@ -74,6 +86,8 @@ class AiderAdapter:
         self.repo_root = config.repo_root
         self._executor = ThreadPoolExecutor(max_workers=2)
         self._available: Optional[bool] = None
+        self._cli_available: Optional[bool] = None
+        self._anthropic_engine: Optional[Any] = None
 
         # API key sources (environment-driven)
         self._api_keys = {
@@ -83,17 +97,31 @@ class AiderAdapter:
         }
 
         # Aider configuration
-        self._model = os.getenv("AIDER_MODEL", "claude-3-5-sonnet-20241022")
+        self._model = os.getenv("AIDER_MODEL", "claude-sonnet-4-20250514")
         self._auto_commits = os.getenv("AIDER_AUTO_COMMITS", "false").lower() == "true"
         self._show_diffs = os.getenv("AIDER_SHOW_DIFFS", "true").lower() == "true"
 
-    async def is_available(self) -> bool:
-        """Check if Aider is installed and configured."""
-        if self._available is not None:
-            return self._available
+        # Use Anthropic engine by default (no external deps)
+        self._prefer_cli = os.getenv("AIDER_PREFER_CLI", "false").lower() == "true"
+
+    async def _get_anthropic_engine(self):
+        """Lazy-load Anthropic engine."""
+        if self._anthropic_engine is None:
+            try:
+                from .anthropic_engine import AnthropicUnifiedEngine
+                self._anthropic_engine = AnthropicUnifiedEngine(self.repo_root)
+                await self._anthropic_engine.initialize()
+            except Exception as e:
+                logger.warning(f"[AiderAdapter] Anthropic engine init failed: {e}")
+                self._anthropic_engine = None
+        return self._anthropic_engine
+
+    async def _check_cli_available(self) -> bool:
+        """Check if Aider CLI is installed."""
+        if self._cli_available is not None:
+            return self._cli_available
 
         try:
-            # Check if aider is installed
             result = await asyncio.create_subprocess_exec(
                 "aider", "--version",
                 stdout=asyncio.subprocess.PIPE,
@@ -103,33 +131,55 @@ class AiderAdapter:
 
             if result.returncode == 0:
                 version = stdout.decode().strip()
-                logger.info(f"[AiderAdapter] Found Aider: {version}")
-                self._available = True
+                logger.info(f"[AiderAdapter] Found Aider CLI: {version}")
+                self._cli_available = True
             else:
-                self._available = False
+                self._cli_available = False
 
         except FileNotFoundError:
-            logger.warning("[AiderAdapter] Aider not installed")
-            self._available = False
+            logger.debug("[AiderAdapter] Aider CLI not installed")
+            self._cli_available = False
         except Exception as e:
-            logger.warning(f"[AiderAdapter] Availability check failed: {e}")
-            self._available = False
+            logger.debug(f"[AiderAdapter] Aider CLI check failed: {e}")
+            self._cli_available = False
 
+        return self._cli_available
+
+    async def is_available(self) -> bool:
+        """Check if Aider-style editing is available (always True with Anthropic)."""
+        if self._available is not None:
+            return self._available
+
+        # Anthropic engine is always available if API key is set
+        if self._api_keys.get("anthropic"):
+            engine = await self._get_anthropic_engine()
+            if engine:
+                logger.info("[AiderAdapter] Using Anthropic engine (Claude API)")
+                self._available = True
+                return True
+
+        # Fall back to CLI check
+        self._available = await self._check_cli_available()
         return self._available
 
     async def execute(
         self,
         task: "EvolutionTask",
         analysis: Optional["AnalysisResult"] = None,
-        plan: Optional["PlanResult"] = None
+        plan: Optional["PlanResult"] = None,
+        progress_callback: Optional[Any] = None,
     ) -> "FrameworkResult":
         """
-        Execute code changes using Aider.
+        Execute code changes using Aider-style approach.
+
+        Primary: Uses Anthropic Claude API directly
+        Fallback: Aider CLI if preferred or Anthropic unavailable
 
         Args:
             task: The evolution task to execute
             analysis: Optional codebase analysis from RepoMaster
             plan: Optional plan from MetaGPT
+            progress_callback: Optional async callback for progress
 
         Returns:
             FrameworkResult with execution details
@@ -141,8 +191,109 @@ class AiderAdapter:
             return FrameworkResult(
                 framework=FrameworkType.AIDER,
                 success=False,
-                error="Aider not available"
+                error="Aider-style editing not available"
             )
+
+        logger.info(f"[AiderAdapter] Executing task: {task.task_id}")
+
+        # Prefer Anthropic engine (no external dependencies)
+        if not self._prefer_cli and self._anthropic_engine:
+            return await self._execute_with_anthropic(task, analysis, plan, progress_callback)
+
+        # Fall back to CLI if available
+        if await self._check_cli_available():
+            return await self._execute_with_cli(task, analysis, plan)
+
+        # Final fallback to Anthropic engine
+        engine = await self._get_anthropic_engine()
+        if engine:
+            return await self._execute_with_anthropic(task, analysis, plan, progress_callback)
+
+        return FrameworkResult(
+            framework=FrameworkType.AIDER,
+            success=False,
+            error="No execution method available"
+        )
+
+    async def _execute_with_anthropic(
+        self,
+        task: "EvolutionTask",
+        analysis: Optional["AnalysisResult"],
+        plan: Optional["PlanResult"],
+        progress_callback: Optional[Any] = None,
+    ) -> "FrameworkResult":
+        """Execute using Anthropic Claude API (primary method)."""
+        from ..types import FrameworkResult, FrameworkType
+
+        engine = await self._get_anthropic_engine()
+        if not engine:
+            return FrameworkResult(
+                framework=FrameworkType.AIDER,
+                success=False,
+                error="Anthropic engine not available"
+            )
+
+        try:
+            # Build context for Claude
+            context_files = []
+            if analysis and hasattr(analysis, 'target_files'):
+                # Get related files for context
+                context_files = list(analysis.target_files)[:5]
+
+            # Execute via Anthropic engine
+            result = await engine.edit_code(
+                description=task.description,
+                target_files=task.target_files,
+                context_files=context_files,
+                auto_commit=self._auto_commits,
+                progress_callback=progress_callback,
+            )
+
+            if result.success:
+                # Build change descriptions
+                changes = []
+                for edit in result.edits:
+                    changes.append(f"Modified {edit.file_path}: +{edit.lines_added}/-{edit.lines_removed} lines")
+
+                if result.commit_hash:
+                    changes.append(f"Committed: {result.commit_message} ({result.commit_hash})")
+
+                return FrameworkResult(
+                    framework=FrameworkType.AIDER,
+                    success=True,
+                    changes_made=changes,
+                    files_modified=result.files_modified,
+                    output=f"Edited {len(result.files_modified)} file(s) via Claude API",
+                )
+            else:
+                return FrameworkResult(
+                    framework=FrameworkType.AIDER,
+                    success=False,
+                    error=result.error or "Unknown error",
+                )
+
+        except asyncio.TimeoutError:
+            return FrameworkResult(
+                framework=FrameworkType.AIDER,
+                success=False,
+                error=f"Timeout after {self.config.execution_timeout}s"
+            )
+        except Exception as e:
+            logger.error(f"[AiderAdapter] Anthropic execution failed: {e}")
+            return FrameworkResult(
+                framework=FrameworkType.AIDER,
+                success=False,
+                error=str(e)
+            )
+
+    async def _execute_with_cli(
+        self,
+        task: "EvolutionTask",
+        analysis: Optional["AnalysisResult"],
+        plan: Optional["PlanResult"],
+    ) -> "FrameworkResult":
+        """Execute using Aider CLI (fallback method)."""
+        from ..types import FrameworkResult, FrameworkType
 
         # Build the message for Aider
         message = self._build_message(task, analysis, plan)
@@ -150,8 +301,7 @@ class AiderAdapter:
         # Build command
         cmd = self._build_command(task, message)
 
-        logger.info(f"[AiderAdapter] Executing task: {task.task_id}")
-        logger.debug(f"[AiderAdapter] Command: {' '.join(cmd)}")
+        logger.info(f"[AiderAdapter] Using CLI: {' '.join(cmd[:3])}...")
 
         try:
             # Run Aider with timeout
@@ -184,7 +334,7 @@ class AiderAdapter:
                 error=f"Timeout after {self.config.execution_timeout}s"
             )
         except Exception as e:
-            logger.error(f"[AiderAdapter] Execution failed: {e}")
+            logger.error(f"[AiderAdapter] CLI execution failed: {e}")
             return FrameworkResult(
                 framework=FrameworkType.AIDER,
                 success=False,

@@ -1,8 +1,11 @@
 """
-v77.0: Coding Council Framework Adapters
-========================================
+v77.3: Coding Council Framework Adapters (Anthropic-Powered)
+============================================================
 
-Adapters for integrating external coding frameworks with the Coding Council.
+Adapters for integrating coding frameworks with the Coding Council.
+
+Primary: Anthropic Claude API (no external dependencies)
+Fallback: External tools (Aider CLI, MetaGPT package, etc.)
 
 Each adapter provides a unified interface for:
 - analyze(): Codebase analysis
@@ -10,19 +13,22 @@ Each adapter provides a unified interface for:
 - execute(): Code modification
 
 Adapters:
-    AiderAdapter     - Fast code editing with git integration
+    AnthropicUnifiedEngine - Primary Claude-powered engine (recommended)
+    AiderAdapter     - Aider-style editing (uses Claude, falls back to CLI)
     OpenHandsAdapter - Sandboxed execution in Docker
-    MetaGPTAdapter   - Multi-agent planning
+    MetaGPTAdapter   - Multi-agent planning (uses Claude, falls back to package)
     RepoMasterAdapter - Codebase analysis
     ContinueAdapter   - IDE integration
 
-Author: JARVIS v77.0
-Version: 1.0.0
+Author: JARVIS v77.3
+Version: 2.0.0
 """
 
 from __future__ import annotations
 
 __all__ = [
+    "AnthropicUnifiedEngine",
+    "get_anthropic_engine",
     "AiderAdapter",
     "OpenHandsAdapter",
     "MetaGPTAdapter",
@@ -33,7 +39,13 @@ __all__ = [
 
 def __getattr__(name: str):
     """Lazy import adapters to avoid heavy dependencies."""
-    if name == "AiderAdapter":
+    if name == "AnthropicUnifiedEngine":
+        from .anthropic_engine import AnthropicUnifiedEngine
+        return AnthropicUnifiedEngine
+    elif name == "get_anthropic_engine":
+        from .anthropic_engine import get_anthropic_engine
+        return get_anthropic_engine
+    elif name == "AiderAdapter":
         from .aider_adapter import AiderAdapter
         return AiderAdapter
     elif name == "OpenHandsAdapter":

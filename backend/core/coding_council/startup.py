@@ -1,14 +1,22 @@
 """
-v77.0: Coding Council Startup Integration
-==========================================
+v77.3: Coding Council Startup Integration (Anthropic-Powered)
+==============================================================
 
 Integrates the Unified Coding Council with JARVIS startup sequence.
+
+v77.3 Features:
+- Anthropic Claude API integration (primary engine)
+- No external tool dependencies required
+- Aider-style editing via Claude
+- MetaGPT-style multi-agent planning via Claude
+- Cross-repo Trinity synchronization
 
 This module provides:
 - Single-command startup integration
 - run_supervisor.py hook
 - Lifespan event handlers
 - Health check endpoints
+- Anthropic engine auto-initialization
 
 Usage in run_supervisor.py:
     from backend.core.coding_council.startup import (
@@ -23,8 +31,8 @@ Usage in run_supervisor.py:
     # During JARVIS shutdown
     await shutdown_coding_council_startup()
 
-Author: JARVIS v77.0
-Version: 1.0.0
+Author: JARVIS v77.3
+Version: 2.0.0
 """
 
 from __future__ import annotations
@@ -34,10 +42,11 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional, TYPE_CHECKING
+from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .orchestrator import UnifiedCodingCouncil
+    from .adapters.anthropic_engine import AnthropicUnifiedEngine
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +65,7 @@ CODING_COUNCIL_VOICE_ANNOUNCE = os.getenv("CODING_COUNCIL_VOICE_ANNOUNCE", "true
 # =============================================================================
 
 _council: Optional["UnifiedCodingCouncil"] = None
+_anthropic_engine: Optional[Any] = None
 _startup_time: Optional[float] = None
 _initialized = False
 
@@ -153,9 +163,25 @@ async def initialize_coding_council_startup(
 
 
 async def _initialize_council_full() -> "UnifiedCodingCouncil":
-    """Internal: Full council initialization with Trinity."""
+    """Internal: Full council initialization with Trinity and Anthropic engine."""
+    global _anthropic_engine
+
     from . import initialize_coding_council_full
-    return await initialize_coding_council_full()
+
+    # Initialize council
+    council = await initialize_coding_council_full()
+
+    # Initialize Anthropic engine (primary engine for Aider/MetaGPT style operations)
+    try:
+        from .adapters.anthropic_engine import get_anthropic_engine
+        _anthropic_engine = await get_anthropic_engine()
+        if _anthropic_engine:
+            logger.info("[CodingCouncilStartup] Anthropic engine initialized (Claude API)")
+    except Exception as e:
+        logger.warning(f"[CodingCouncilStartup] Anthropic engine not available: {e}")
+        _anthropic_engine = None
+
+    return council
 
 
 async def shutdown_coding_council_startup() -> None:
@@ -164,13 +190,22 @@ async def shutdown_coding_council_startup() -> None:
 
     This should be called from run_supervisor.py during shutdown.
     """
-    global _council, _initialized
+    global _council, _anthropic_engine, _initialized
 
     if not _initialized:
         return
 
     logger.info("[CodingCouncilStartup] Shutting down Coding Council...")
 
+    # Shutdown Anthropic engine
+    try:
+        if _anthropic_engine:
+            await _anthropic_engine.close()
+            logger.info("[CodingCouncilStartup] Anthropic engine closed")
+    except Exception as e:
+        logger.warning(f"[CodingCouncilStartup] Anthropic engine shutdown warning: {e}")
+
+    # Shutdown council
     try:
         from . import shutdown_coding_council
         await shutdown_coding_council()
@@ -178,6 +213,7 @@ async def shutdown_coding_council_startup() -> None:
         logger.warning(f"[CodingCouncilStartup] Shutdown warning: {e}")
 
     _council = None
+    _anthropic_engine = None
     _initialized = False
     logger.info("[CodingCouncilStartup] Shutdown complete")
 
@@ -298,12 +334,29 @@ def register_coding_council_routes(app):
             raise HTTPException(status_code=503, detail="Coding Council not initialized")
 
         framework_status = {}
+
+        # Check Anthropic engine first (primary engine)
+        if _anthropic_engine:
+            try:
+                available = await _anthropic_engine.is_available()
+                framework_status["anthropic_engine"] = {
+                    "available": available,
+                    "type": "primary",
+                    "features": ["aider_style", "metagpt_style", "git_aware", "no_external_deps"],
+                    "tokens_used": _anthropic_engine.tokens_used,
+                }
+            except Exception as e:
+                framework_status["anthropic_engine"] = {"available": False, "error": str(e)}
+        else:
+            framework_status["anthropic_engine"] = {"available": False, "error": "Not initialized"}
+
+        # Check traditional adapters (fallback)
         for name in ["aider", "repomaster", "metagpt", "openhands", "continue"]:
             adapter = getattr(_council, f"_{name}", None)
             if adapter:
                 try:
                     available = await adapter.is_available()
-                    framework_status[name] = {"available": available}
+                    framework_status[name] = {"available": available, "type": "adapter"}
                 except Exception as e:
                     framework_status[name] = {"available": False, "error": str(e)}
             else:
