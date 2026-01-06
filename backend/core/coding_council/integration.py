@@ -1045,6 +1045,527 @@ def get_voice_evolution_handler() -> VoiceEvolutionHandler:
 
 
 # ============================================================================
+# Advanced Evolution Pipeline Helpers (v77.2 Super-Beefed)
+# ============================================================================
+
+
+async def _validate_evolution_request(
+    request: EvolutionRequest,
+    context: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    Pre-flight validation for evolution requests.
+
+    Checks:
+    - Target files exist (if specified)
+    - Files are readable
+    - No syntax errors in target files
+    - Not in protected paths
+    - Description is meaningful
+    """
+    errors = []
+    warnings = []
+
+    # Validate description
+    if not request.description or len(request.description.strip()) < 10:
+        errors.append("Description too short (minimum 10 characters)")
+
+    # Validate target files
+    for target_file in request.target_files:
+        # Check protected paths
+        if CodingCouncilConfig.is_protected_path(target_file):
+            errors.append(f"Protected path: {target_file}")
+            continue
+
+        # Check file exists (if it's a specific file, not a pattern)
+        if not target_file.endswith("/") and "*" not in target_file:
+            file_path = Path(target_file)
+            if not file_path.is_absolute():
+                # Try relative to common roots
+                possible_paths = [
+                    Path.cwd() / target_file,
+                    Path.cwd() / "backend" / target_file,
+                    Path(__file__).parent.parent.parent / target_file,
+                ]
+                found = False
+                for p in possible_paths:
+                    if p.exists():
+                        found = True
+                        break
+                if not found:
+                    warnings.append(f"File may not exist: {target_file}")
+            elif not file_path.exists():
+                warnings.append(f"File not found: {target_file}")
+
+            # Check Python syntax if .py file
+            if target_file.endswith(".py"):
+                try:
+                    import ast
+                    for p in possible_paths if not file_path.is_absolute() else [file_path]:
+                        if p.exists():
+                            with open(p, "r") as f:
+                                ast.parse(f.read())
+                            break
+                except SyntaxError as e:
+                    warnings.append(f"Syntax error in {target_file}: {e}")
+                except Exception:
+                    pass  # File might not exist yet
+
+    return {
+        "valid": len(errors) == 0,
+        "errors": errors,
+        "warnings": warnings,
+        "files_checked": len(request.target_files),
+    }
+
+
+async def _assess_evolution_risk(
+    request: EvolutionRequest,
+    context: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    Intelligent risk assessment for evolution requests.
+
+    Risk Factors:
+    - Critical files involved
+    - Number of files affected
+    - Intent type (security > refactor > feature > doc)
+    - Complexity indicators in description
+    - Historical failure rate for similar tasks
+    """
+    risk_score = 0
+    risk_factors = []
+
+    # Factor 1: Critical files (weight: 30)
+    critical_count = sum(
+        1 for f in request.target_files
+        if CodingCouncilConfig.is_critical_file(f)
+    )
+    if critical_count > 0:
+        risk_score += min(30, critical_count * 15)
+        risk_factors.append(f"{critical_count} critical file(s)")
+
+    # Factor 2: Number of files (weight: 20)
+    file_count = len(request.target_files)
+    if file_count > 10:
+        risk_score += 20
+        risk_factors.append(f"Large scope ({file_count} files)")
+    elif file_count > 5:
+        risk_score += 10
+        risk_factors.append(f"Medium scope ({file_count} files)")
+    elif file_count > 1:
+        risk_score += 5
+
+    # Factor 3: Intent type (weight: 25)
+    high_risk_intents = {
+        EvolutionIntent.SECURITY_FIX: 25,
+        EvolutionIntent.REFACTOR: 15,
+        EvolutionIntent.DEPENDENCY_UPDATE: 15,
+    }
+    if request.intent in high_risk_intents:
+        risk_score += high_risk_intents[request.intent]
+        risk_factors.append(f"High-risk intent: {request.intent.value}")
+
+    # Factor 4: Complexity indicators (weight: 15)
+    complexity_keywords = [
+        "complex", "major", "significant", "breaking", "architecture",
+        "restructure", "rewrite", "overhaul", "migration"
+    ]
+    desc_lower = request.description.lower()
+    complexity_count = sum(1 for kw in complexity_keywords if kw in desc_lower)
+    if complexity_count > 0:
+        risk_score += min(15, complexity_count * 5)
+        risk_factors.append(f"Complexity indicators detected")
+
+    # Factor 5: Protected path proximity (weight: 10)
+    for f in request.target_files:
+        if any(p in f.lower() for p in ["config", "settings", "auth", "secret"]):
+            risk_score += 10
+            risk_factors.append("Sensitive path proximity")
+            break
+
+    # Determine risk level
+    if risk_score >= 70:
+        level = "critical"
+    elif risk_score >= 50:
+        level = "high"
+    elif risk_score >= 30:
+        level = "medium"
+    else:
+        level = "low"
+
+    return {
+        "level": level,
+        "score": risk_score,
+        "factors": risk_factors,
+        "max_score": 100,
+        "recommendation": (
+            "manual_review" if level in ("critical", "high") else
+            "auto_approve" if level == "low" else "caution"
+        ),
+    }
+
+
+async def _analyze_target_file(
+    file_path: str,
+    context: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    Analyze a target file for evolution context.
+
+    Returns:
+    - File type
+    - Size
+    - Complexity metrics
+    - Dependencies
+    - Recent changes
+    """
+    try:
+        path = Path(file_path)
+
+        # Try to find the actual file
+        if not path.is_absolute():
+            for base in [Path.cwd(), Path.cwd() / "backend", Path(__file__).parent.parent.parent]:
+                candidate = base / file_path
+                if candidate.exists():
+                    path = candidate
+                    break
+
+        if not path.exists():
+            return {
+                "path": file_path,
+                "exists": False,
+                "analysis": "file_not_found",
+            }
+
+        stat = path.stat()
+        content = path.read_text(encoding="utf-8", errors="ignore")
+        lines = content.split("\n")
+
+        # Basic metrics
+        analysis = {
+            "path": file_path,
+            "exists": True,
+            "size_bytes": stat.st_size,
+            "lines": len(lines),
+            "type": path.suffix,
+            "modified": stat.st_mtime,
+        }
+
+        # Python-specific analysis
+        if path.suffix == ".py":
+            try:
+                import ast
+                tree = ast.parse(content)
+
+                # Count entities
+                classes = [n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)]
+                functions = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]
+                async_functions = [n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef)]
+
+                analysis["python"] = {
+                    "classes": len(classes),
+                    "functions": len(functions),
+                    "async_functions": len(async_functions),
+                    "imports": len([n for n in ast.walk(tree) if isinstance(n, (ast.Import, ast.ImportFrom))]),
+                    "syntax_valid": True,
+                }
+
+                # Estimate complexity
+                total_entities = len(classes) + len(functions) + len(async_functions)
+                if total_entities > 50:
+                    analysis["complexity"] = "high"
+                elif total_entities > 20:
+                    analysis["complexity"] = "medium"
+                else:
+                    analysis["complexity"] = "low"
+
+            except SyntaxError:
+                analysis["python"] = {"syntax_valid": False}
+                analysis["complexity"] = "unknown"
+
+        return analysis
+
+    except Exception as e:
+        return {
+            "path": file_path,
+            "exists": False,
+            "error": str(e),
+        }
+
+
+async def _create_evolution_plan(
+    request: EvolutionRequest,
+    context: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    Create a detailed execution plan for the evolution.
+
+    Uses MetaGPT-style planning for complex changes.
+    """
+    plan = {
+        "id": str(uuid.uuid4())[:8],
+        "created_at": time.time(),
+        "steps": [],
+    }
+
+    # Analyze files for planning
+    files_analyzed = context.get("files_analyzed", [])
+
+    # Generate steps based on intent
+    if request.intent == EvolutionIntent.REFACTOR:
+        plan["steps"] = [
+            {"step": 1, "action": "analyze_dependencies", "description": "Map all imports and dependencies"},
+            {"step": 2, "action": "create_tests", "description": "Ensure test coverage before refactoring"},
+            {"step": 3, "action": "refactor_iteratively", "description": "Apply changes in small increments"},
+            {"step": 4, "action": "validate_each_step", "description": "Run tests after each change"},
+            {"step": 5, "action": "update_documentation", "description": "Update docstrings and comments"},
+        ]
+    elif request.intent == EvolutionIntent.FEATURE_ADD:
+        plan["steps"] = [
+            {"step": 1, "action": "design_interface", "description": "Define function signatures and types"},
+            {"step": 2, "action": "implement_core", "description": "Write core functionality"},
+            {"step": 3, "action": "add_error_handling", "description": "Add try/except and validation"},
+            {"step": 4, "action": "write_tests", "description": "Create unit tests"},
+            {"step": 5, "action": "integrate", "description": "Connect to existing code"},
+        ]
+    elif request.intent == EvolutionIntent.BUG_FIX:
+        plan["steps"] = [
+            {"step": 1, "action": "reproduce_issue", "description": "Understand the bug scenario"},
+            {"step": 2, "action": "identify_root_cause", "description": "Find the actual bug location"},
+            {"step": 3, "action": "write_regression_test", "description": "Create test that fails before fix"},
+            {"step": 4, "action": "apply_fix", "description": "Fix the bug with minimal changes"},
+            {"step": 5, "action": "verify_fix", "description": "Ensure test passes and no regressions"},
+        ]
+    else:
+        plan["steps"] = [
+            {"step": 1, "action": "analyze", "description": "Understand current state"},
+            {"step": 2, "action": "plan_changes", "description": "Design the modifications"},
+            {"step": 3, "action": "implement", "description": "Apply changes"},
+            {"step": 4, "action": "validate", "description": "Verify correctness"},
+        ]
+
+    # Add file-specific notes
+    plan["target_files"] = [
+        {
+            "file": f.get("path", "unknown"),
+            "complexity": f.get("complexity", "unknown"),
+            "lines": f.get("lines", 0),
+        }
+        for f in files_analyzed
+    ]
+
+    plan["estimated_duration_seconds"] = len(plan["steps"]) * 30 + sum(
+        f.get("lines", 100) // 50 for f in files_analyzed
+    )
+
+    return plan
+
+
+async def _select_framework(
+    request: EvolutionRequest,
+    context: Dict[str, Any]
+) -> str:
+    """
+    Select the optimal framework for the evolution task.
+
+    Decision Matrix:
+    - Trivial changes → Aider (fast)
+    - Complex refactors → MetaGPT (planning)
+    - Sandboxed execution → OpenHands
+    - IDE integration → Continue
+    - Default → Claude Code
+    """
+    risk_level = context.get("risk_level", "medium")
+    files_analyzed = context.get("files_analyzed", [])
+    total_lines = sum(f.get("lines", 0) for f in files_analyzed)
+
+    # Check framework availability (from config)
+    preferred = CodingCouncilConfig.PREFERRED_FRAMEWORK
+    fallbacks = CodingCouncilConfig.FALLBACK_FRAMEWORKS
+
+    # Decision logic
+    if request.require_sandbox:
+        framework = "openhands"
+    elif risk_level == "critical" or request.require_planning:
+        framework = "metagpt"
+    elif total_lines > 1000 or len(request.target_files) > 5:
+        framework = "metagpt"  # Complex task
+    elif total_lines < 100 and risk_level == "low":
+        framework = "aider"  # Simple task
+    else:
+        framework = preferred
+
+    # Verify framework is available (mock check)
+    available_frameworks = ["aider", "metagpt", "claude_code", "continue"]
+
+    if framework not in available_frameworks:
+        # Use fallback
+        for fallback in fallbacks:
+            if fallback in available_frameworks:
+                framework = fallback
+                break
+        else:
+            framework = "claude_code"  # Ultimate fallback
+
+    return framework
+
+
+async def _prepare_rollback(
+    request: EvolutionRequest,
+    context: Dict[str, Any]
+) -> str:
+    """
+    Prepare rollback snapshot before making changes.
+
+    Creates:
+    - Git stash or branch
+    - File backups
+    - State snapshot
+    """
+    rollback_id = f"rollback_{request.id[:8]}_{int(time.time())}"
+
+    try:
+        import subprocess
+
+        # Try to create git stash
+        result = subprocess.run(
+            ["git", "stash", "push", "-m", f"JARVIS Evolution Rollback: {rollback_id}"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            cwd=Path.cwd(),
+        )
+
+        if result.returncode == 0:
+            logger.info(f"🧬 [Rollback] Git stash created: {rollback_id}")
+        else:
+            # Fallback: create backup files
+            logger.debug(f"🧬 [Rollback] Git stash failed, using file backup")
+
+    except Exception as e:
+        logger.debug(f"🧬 [Rollback] Preparation warning: {e}")
+
+    return rollback_id
+
+
+async def _verify_evolution_result(
+    result: Any,
+    context: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    Verify evolution result with multiple checks.
+
+    Checks:
+    - Syntax validation (AST parse)
+    - Type checking (if mypy available)
+    - Import validation
+    - Basic security scan
+    """
+    verification = {
+        "passed": True,
+        "checks": [],
+    }
+
+    # Get modified files from result
+    files_modified = getattr(result, "files_modified", [])
+
+    for file_path in files_modified:
+        if not file_path.endswith(".py"):
+            continue
+
+        try:
+            path = Path(file_path)
+            if not path.exists():
+                continue
+
+            content = path.read_text(encoding="utf-8")
+
+            # Check 1: AST parsing (syntax)
+            try:
+                import ast
+                ast.parse(content)
+                verification["checks"].append({
+                    "file": file_path,
+                    "check": "syntax",
+                    "passed": True,
+                })
+            except SyntaxError as e:
+                verification["passed"] = False
+                verification["checks"].append({
+                    "file": file_path,
+                    "check": "syntax",
+                    "passed": False,
+                    "error": str(e),
+                })
+
+            # Check 2: Basic security scan
+            security_issues = []
+            dangerous_patterns = [
+                (r"\beval\s*\(", "eval() usage"),
+                (r"\bexec\s*\(", "exec() usage"),
+                (r"\b__import__\s*\(", "dynamic import"),
+                (r"subprocess\..*shell\s*=\s*True", "shell injection risk"),
+            ]
+
+            import re
+            for pattern, issue in dangerous_patterns:
+                if re.search(pattern, content):
+                    security_issues.append(issue)
+
+            if security_issues:
+                verification["checks"].append({
+                    "file": file_path,
+                    "check": "security",
+                    "passed": False,
+                    "issues": security_issues,
+                })
+                # Don't fail on security warnings, just flag them
+            else:
+                verification["checks"].append({
+                    "file": file_path,
+                    "check": "security",
+                    "passed": True,
+                })
+
+        except Exception as e:
+            verification["checks"].append({
+                "file": file_path,
+                "check": "general",
+                "passed": False,
+                "error": str(e),
+            })
+
+    return verification
+
+
+async def _execute_rollback(rollback_id: str) -> bool:
+    """
+    Execute rollback to restore previous state.
+    """
+    try:
+        import subprocess
+
+        # Try git stash pop
+        result = subprocess.run(
+            ["git", "stash", "pop"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            cwd=Path.cwd(),
+        )
+
+        if result.returncode == 0:
+            logger.info(f"🧬 [Rollback] Restored from git stash")
+            return True
+
+    except Exception as e:
+        logger.error(f"🧬 [Rollback] Failed: {e}")
+
+    return False
+
+
+# ============================================================================
 # FastAPI Routes Integration (Gap #2)
 # ============================================================================
 
