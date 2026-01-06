@@ -7486,6 +7486,120 @@ class AsyncSystemManager:
 
         logger.info("🚀 Cost optimization components initialized (v2.5)")
 
+        # =====================================================================
+        # 🔧 v78.0: Advanced Startup Orchestrator Integration
+        # =====================================================================
+        # Provides enterprise-grade startup patterns:
+        # - Dynamic configuration discovery (zero hardcoding)
+        # - Circuit breakers with exponential backoff
+        # - Connection verification loops
+        # - Dependency graph resolution
+        # =====================================================================
+        self._orchestrator_hooks = None
+        self._discovered_config = None
+        self._advanced_orchestrator_enabled = os.getenv("ADVANCED_ORCHESTRATOR_ENABLED", "true").lower() == "true"
+
+        if self._advanced_orchestrator_enabled:
+            try:
+                from backend.core.supervisor_orchestrator_bridge import (
+                    get_orchestrator_hooks,
+                    OrchestratorBridgeConfig,
+                )
+                # Note: Actual initialization happens in async context
+                # This just sets up the flag - see _init_advanced_orchestrator()
+                logger.info("🔧 Advanced Orchestrator module available")
+            except ImportError:
+                logger.debug("Advanced Orchestrator module not available")
+                self._advanced_orchestrator_enabled = False
+            except Exception as e:
+                logger.warning(f"Advanced Orchestrator setup failed: {e}")
+                self._advanced_orchestrator_enabled = False
+
+    async def _init_advanced_orchestrator(self):
+        """
+        Initialize the v78.0 Advanced Startup Orchestrator.
+
+        This provides:
+        - Dynamic configuration discovery (no hardcoded paths/ports)
+        - Circuit breakers for component startup
+        - Connection verification loops
+        - Cross-repo Trinity integration
+        """
+        if not self._advanced_orchestrator_enabled:
+            return False
+
+        try:
+            from backend.core.supervisor_orchestrator_bridge import (
+                get_orchestrator_hooks,
+                OrchestratorBridgeConfig,
+            )
+
+            config = OrchestratorBridgeConfig.from_env()
+            self._orchestrator_hooks = await get_orchestrator_hooks(config=config)
+            self._discovered_config = self._orchestrator_hooks.discovered_config
+
+            if self._discovered_config:
+                # Log discovered configuration
+                logger.info("[v78.0] Dynamic configuration discovered:")
+                logger.info(f"  Repos: {len(self._discovered_config.repo_paths)}")
+                logger.info(f"  Trinity dir: {self._discovered_config.trinity_dir}")
+
+                # Update ports from discovered config
+                if "jarvis_backend" in self._discovered_config.ports:
+                    discovered_port = self._discovered_config.ports["jarvis_backend"]
+                    if discovered_port != self.ports["main_api"]:
+                        logger.info(f"  Using discovered port: {discovered_port}")
+                        self.ports["main_api"] = discovered_port
+                        self.backend_port = discovered_port
+
+            print(f"{Colors.GREEN}✓ v78.0 Advanced Orchestrator: Active{Colors.ENDC}")
+            print(f"  → Dynamic discovery, circuit breakers, connection verification")
+            return True
+
+        except Exception as e:
+            logger.warning(f"[v78.0] Advanced Orchestrator initialization failed: {e}")
+            print(f"{Colors.YELLOW}⚠️ Advanced Orchestrator: Not available ({e}){Colors.ENDC}")
+            return False
+
+    async def verify_trinity_connections(self, timeout: float = 30.0):
+        """
+        Verify Trinity component connections using the advanced orchestrator.
+
+        Returns:
+            TrinityHealthStatus or None if orchestrator not available
+        """
+        if not self._orchestrator_hooks:
+            return None
+
+        try:
+            return await self._orchestrator_hooks.verify_trinity_connections(timeout=timeout)
+        except Exception as e:
+            logger.warning(f"[v78.0] Trinity verification failed: {e}")
+            return None
+
+    async def wait_for_backend_ready(self, timeout: float = 60.0):
+        """
+        Wait for backend to be ready using orchestrator verification.
+
+        Falls back to simple port check if orchestrator not available.
+        """
+        if self._orchestrator_hooks:
+            return await self._orchestrator_hooks.wait_for_backend_ready(
+                timeout=timeout,
+                port=self.ports["main_api"]
+            )
+
+        # Fallback to simple port check
+        import socket
+        start = time.time()
+        while time.time() - start < timeout:
+            try:
+                with socket.create_connection(("127.0.0.1", self.ports["main_api"]), timeout=2):
+                    return True
+            except (socket.error, OSError):
+                await asyncio.sleep(1)
+        return False
+
     def print_header(self):
         """Print system header with resource optimization info"""
         print(f"\n{Colors.HEADER}{'='*70}")
@@ -14091,6 +14205,23 @@ except Exception as e:
     async def run(self):
         """Main run method with self-healing"""
         self.print_header()
+
+        # =================================================================
+        # v78.0: Initialize Advanced Startup Orchestrator
+        # =================================================================
+        # Provides enterprise-grade startup patterns:
+        # - Dynamic configuration discovery (zero hardcoding)
+        # - Circuit breakers with exponential backoff
+        # - Connection verification loops
+        # - Dependency graph resolution
+        # =================================================================
+        if self._advanced_orchestrator_enabled:
+            print(f"\n{Colors.CYAN}🔧 Initializing v78.0 Advanced Orchestrator...{Colors.ENDC}")
+            orchestrator_ready = await self._init_advanced_orchestrator()
+            if orchestrator_ready and self._discovered_config:
+                print(f"{Colors.GREEN}   ✓ Dynamic config discovered{Colors.ENDC}")
+                print(f"{Colors.CYAN}     Repos: {len(self._discovered_config.repo_paths)}{Colors.ENDC}")
+                print(f"{Colors.CYAN}     Trinity: {self._discovered_config.trinity_dir}{Colors.ENDC}")
 
         # =================================================================
         # SUPERVISOR COORDINATION: Use progress bridge when supervised

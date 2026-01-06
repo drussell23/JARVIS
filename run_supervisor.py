@@ -2599,6 +2599,58 @@ class SupervisorBootstrapper:
             await self._propagate_agi_os_settings()
             
             # ═══════════════════════════════════════════════════════════════════
+            # v78.0: Initialize Advanced Startup Orchestrator
+            # ═══════════════════════════════════════════════════════════════════
+            # This enables enterprise-grade startup patterns:
+            # - Dependency graph resolution (Kahn's algorithm)
+            # - Circuit breakers with exponential backoff
+            # - Dynamic configuration discovery (zero hardcoding)
+            # - Connection verification loops
+            # - Graceful degradation for non-critical components
+            # ═══════════════════════════════════════════════════════════════════
+            try:
+                from core.supervisor_orchestrator_bridge import (
+                    enhance_supervisor_with_orchestrator,
+                    OrchestratorBridgeConfig,
+                )
+
+                orchestrator_config = OrchestratorBridgeConfig.from_env()
+                if orchestrator_config.enabled:
+                    self._orchestrator_hooks = await enhance_supervisor_with_orchestrator(
+                        bootstrapper=self,
+                        config=orchestrator_config,
+                    )
+
+                    # Log discovered configuration
+                    if self._orchestrator_hooks.discovered_config:
+                        config = self._orchestrator_hooks.discovered_config
+                        self.logger.info("[Orchestrator] Dynamic configuration discovered:")
+                        self.logger.info(f"  Repos: {len(config.repo_paths)}")
+                        self.logger.info(f"  Trinity dir: {config.trinity_dir}")
+                        self.logger.info(f"  Ports: {config.ports}")
+
+                        # Update paths from discovered config
+                        from core.advanced_startup_orchestrator import TrinityRepo
+                        if TrinityRepo.JARVIS_PRIME in config.repo_paths:
+                            self._jprime_repo_path = config.repo_paths[TrinityRepo.JARVIS_PRIME]
+                        if TrinityRepo.REACTOR_CORE in config.repo_paths:
+                            self._reactor_core_repo_path = config.repo_paths[TrinityRepo.REACTOR_CORE]
+
+                    print(f"  {TerminalUI.GREEN}✓ Advanced Startup Orchestrator: Active{TerminalUI.RESET}")
+                    print(f"    → Dependency graph, circuit breakers, dynamic discovery enabled")
+                else:
+                    self._orchestrator_hooks = None
+                    self.logger.debug("[Orchestrator] Disabled via configuration")
+
+            except ImportError as e:
+                self._orchestrator_hooks = None
+                self.logger.debug(f"[Orchestrator] Module not available: {e}")
+            except Exception as e:
+                self._orchestrator_hooks = None
+                self.logger.warning(f"[Orchestrator] Initialization failed: {e}")
+                print(f"  {TerminalUI.YELLOW}⚠️ Advanced Orchestrator: Not available{TerminalUI.RESET}")
+
+            # ═══════════════════════════════════════════════════════════════════
             # v5.0: Initialize Intelligent Rate Orchestrator (ML Forecasting)
             # ═══════════════════════════════════════════════════════════════════
             # This starts the ML-powered rate limiting system that:
@@ -2714,6 +2766,40 @@ class SupervisorBootstrapper:
                 except Exception as e:
                     self.logger.warning(f"[CodingCouncil] Initialization failed: {e}")
                     print(f"  {TerminalUI.YELLOW}⚠️ Coding Council: Failed ({e}){TerminalUI.RESET}")
+
+            # ═══════════════════════════════════════════════════════════════════
+            # v78.0: Verify Trinity Connections (Advanced Orchestrator)
+            # ═══════════════════════════════════════════════════════════════════
+            # Uses the advanced orchestrator to verify all Trinity components
+            # are properly connected and healthy before proceeding.
+            # ═══════════════════════════════════════════════════════════════════
+            if hasattr(self, '_orchestrator_hooks') and self._orchestrator_hooks:
+                try:
+                    self.logger.info("[Orchestrator] Verifying Trinity connections...")
+                    health_status = await self._orchestrator_hooks.verify_trinity_connections(
+                        timeout=30.0
+                    )
+
+                    if health_status.all_healthy:
+                        print(f"  {TerminalUI.GREEN}✓ Trinity Connections: All healthy{TerminalUI.RESET}")
+                        self.logger.info(f"[Orchestrator] Trinity health: {health_status.summary}")
+                    else:
+                        print(f"  {TerminalUI.YELLOW}⚠️ Trinity Connections: Partial ({health_status.summary}){TerminalUI.RESET}")
+                        self.logger.warning(f"[Orchestrator] Trinity partial health: {health_status.summary}")
+
+                        # Log specific statuses
+                        if not health_status.jarvis_backend:
+                            self.logger.warning("[Orchestrator] Backend not responding - may still be starting")
+                        if not health_status.jarvis_prime:
+                            self.logger.info("[Orchestrator] J-Prime not connected (optional)")
+                        if not health_status.reactor_core:
+                            self.logger.info("[Orchestrator] Reactor-Core not connected (optional)")
+
+                    # Store health status for monitoring
+                    self._trinity_health_status = health_status
+
+                except Exception as e:
+                    self.logger.debug(f"[Orchestrator] Health verification skipped: {e}")
 
             # ═══════════════════════════════════════════════════════════════════
             # v10.6: Start Real-Time Log Monitor with Voice Narrator Integration
@@ -8646,6 +8732,15 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
 
         # v75.0: Stop Trinity Health Monitor
         await self._stop_trinity_health_monitor()
+
+        # v78.0: Shutdown Advanced Orchestrator
+        if hasattr(self, '_orchestrator_hooks') and self._orchestrator_hooks:
+            try:
+                self.logger.info("   Shutting down Advanced Orchestrator...")
+                await self._orchestrator_hooks.shutdown()
+                self.logger.info("   ✅ Advanced Orchestrator stopped")
+            except Exception as e:
+                self.logger.debug(f"   Orchestrator shutdown error: {e}")
 
         self.logger.info("✅ Trinity component shutdown complete")
 

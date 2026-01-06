@@ -1478,6 +1478,33 @@ async def parallel_lifespan(app: FastAPI):
             app.state.ai_manager = None
 
         # =================================================================
+        # v78.0: Advanced Startup Orchestrator (Background Init)
+        # =================================================================
+        # Initialize orchestrator in background for dynamic discovery
+        app.state.orchestrator_hooks = None
+        app.state.discovered_config = None
+
+        async def _init_orchestrator_background():
+            """Initialize Advanced Orchestrator in background."""
+            try:
+                from core.supervisor_orchestrator_bridge import (
+                    get_orchestrator_hooks,
+                    OrchestratorBridgeConfig,
+                )
+
+                config = OrchestratorBridgeConfig.from_env()
+                if config.enabled:
+                    hooks = await get_orchestrator_hooks(config=config)
+                    app.state.orchestrator_hooks = hooks
+                    app.state.discovered_config = hooks.discovered_config
+                    logger.info("✅ v78.0 Orchestrator: Active (background init)")
+            except Exception as e:
+                logger.debug(f"Orchestrator background init: {e}")
+
+        # Launch orchestrator in background
+        asyncio.create_task(_init_orchestrator_background(), name="orchestrator_init")
+
+        # =================================================================
         # v77.4 UNIFIED CODING COUNCIL: Background initialization
         # =================================================================
         # In parallel mode, start Coding Council initialization as background task
@@ -3242,6 +3269,47 @@ async def lifespan(app: FastAPI):  # type: ignore[misc]
     except Exception as e:
         logger.warning(f"AI Loader initialization failed: {e}")
         app.state.ai_manager = None
+
+    # =================================================================
+    # v78.0: Advanced Startup Orchestrator Integration
+    # =================================================================
+    # Provides enterprise-grade startup patterns:
+    # - Dynamic configuration discovery (zero hardcoding)
+    # - Circuit breakers with exponential backoff
+    # - Connection verification loops
+    # - Cross-repo Trinity health monitoring
+    # =================================================================
+    app.state.orchestrator_hooks = None
+    app.state.discovered_config = None
+    try:
+        from core.supervisor_orchestrator_bridge import (
+            get_orchestrator_hooks,
+            OrchestratorBridgeConfig,
+        )
+
+        orchestrator_config = OrchestratorBridgeConfig.from_env()
+        if orchestrator_config.enabled:
+            orchestrator_hooks = await get_orchestrator_hooks(config=orchestrator_config)
+            app.state.orchestrator_hooks = orchestrator_hooks
+            app.state.discovered_config = orchestrator_hooks.discovered_config
+
+            if orchestrator_hooks.discovered_config:
+                config = orchestrator_hooks.discovered_config
+                logger.info("=" * 60)
+                logger.info("v78.0 ADVANCED ORCHESTRATOR: Initialized")
+                logger.info("=" * 60)
+                logger.info(f"   • Repos discovered: {len(config.repo_paths)}")
+                logger.info(f"   • Trinity dir: {config.trinity_dir}")
+                logger.info(f"   • Dynamic ports: {config.ports}")
+                logger.info("   • Circuit breakers: Enabled")
+                logger.info("   • Connection verification: Ready")
+            else:
+                logger.info("✅ v78.0 Orchestrator: Active (minimal mode)")
+
+    except ImportError as e:
+        logger.debug(f"Advanced Orchestrator not available: {e}")
+    except Exception as e:
+        logger.warning(f"⚠️ Advanced Orchestrator initialization failed: {e}")
 
     # =================================================================
     # v77.4 UNIFIED CODING COUNCIL: Self-Evolution + IDE Integration
