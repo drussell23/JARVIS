@@ -2438,7 +2438,11 @@ class IntelligentCommandHandler:
 
         return None
 
-    async def _check_evolution_command(self, text: str) -> Optional[Dict[str, Any]]:
+    async def _check_evolution_command(
+        self,
+        text: str,
+        context: Optional[Dict[str, Any]] = None
+    ) -> Optional[Dict[str, Any]]:
         """
         v77.2: Check if the command is a code evolution request.
 
@@ -2447,8 +2451,11 @@ class IntelligentCommandHandler:
         of evolution commands like "evolve yourself", "self-improve", "update
         your code", etc.
 
+        Also handles evolution confirmation commands ("confirm {id}").
+
         Args:
             text: The command text to check
+            context: Optional context dict with speaker_verified, etc.
 
         Returns:
             Dictionary with evolution result if detected:
@@ -2472,6 +2479,29 @@ class IntelligentCommandHandler:
                 logger.debug("[Evolution] CommandClassifier not loaded")
                 return None
 
+            # Get the voice evolution handler
+            handler_func = get_voice_evolution_handler
+            if handler_func is None:
+                logger.warning("[Evolution] Voice evolution handler not available")
+                return None
+
+            voice_handler = handler_func()
+            if voice_handler is None:
+                logger.warning("[Evolution] Could not instantiate voice handler")
+                return None
+
+            # Check for confirmation command first ("confirm {id}")
+            import re
+            confirm_match = re.match(r"confirm\s+([a-f0-9]{8})", text.lower().strip())
+            if confirm_match:
+                confirmation_id = confirm_match.group(1)
+                logger.info(f"🧬 [Evolution] Confirmation command detected: {confirmation_id}")
+                result = await voice_handler.confirm_evolution(confirmation_id)
+                if result:
+                    result["is_evolution"] = True
+                    return result
+                return None
+
             # Check if this looks like an evolution command
             is_evolution = CommandClassifier.is_evolution_command(text)
 
@@ -2480,23 +2510,55 @@ class IntelligentCommandHandler:
 
             logger.info(f"🧬 [Evolution] Detected evolution command: {text[:50]}...")
 
-            # Get the voice evolution handler
-            handler_func = get_voice_evolution_handler
-            if handler_func is None:
-                logger.warning("[Evolution] Voice evolution handler not available")
-                return {"is_evolution": True, "message": "Evolution system initializing..."}
+            # Determine speaker verification status
+            # Priority: context > voice unlock system > assume unverified
+            speaker_verified = False
+            if context and context.get("speaker_verified"):
+                speaker_verified = True
+            else:
+                # Try to check voice unlock system
+                try:
+                    try:
+                        from backend.voice_unlock.voice_biometric_intelligence import (
+                            get_vbi_service
+                        )
+                    except ImportError:
+                        from voice_unlock.voice_biometric_intelligence import (
+                            get_vbi_service
+                        )
 
-            voice_handler = handler_func()
-            if voice_handler is None:
-                logger.warning("[Evolution] Could not instantiate voice handler")
-                return {"is_evolution": True, "message": "Evolution handler not ready"}
+                    vbi = get_vbi_service()
+                    if vbi and hasattr(vbi, "is_authenticated"):
+                        speaker_verified = vbi.is_authenticated()
+                    elif vbi and hasattr(vbi, "last_verification_success"):
+                        speaker_verified = vbi.last_verification_success
+                except Exception as e:
+                    logger.debug(f"[Evolution] Could not check voice unlock: {e}")
+
+            logger.debug(f"🧬 [Evolution] Speaker verified: {speaker_verified}")
 
             # Process the voice evolution command
             # This routes through TrinityProtocol to J-Prime for orchestration
-            result = await voice_handler.process_voice_command(text)
+            result = await voice_handler.process_voice_command(
+                command_text=text,
+                speaker_verified=speaker_verified
+            )
 
             if result:
                 result["is_evolution"] = True
+                action = result.get("action", "")
+
+                # Handle different action types
+                if action == "require_verification":
+                    logger.info("🧬 [Evolution] Speaker verification required")
+                    result["message"] = (
+                        f"Voice verification required for code evolution, {self.user_name}. "
+                        "Please verify your identity first."
+                    )
+                elif action == "require_confirmation":
+                    logger.info(f"🧬 [Evolution] Confirmation required: {result.get('confirmation_id')}")
+                    # The message already contains the confirmation ID
+
                 logger.info(f"🧬 [Evolution] Processing result: {result.get('message', 'No message')[:100]}")
                 return result
             else:
@@ -3027,8 +3089,9 @@ class IntelligentCommandHandler:
             # v77.2: Check for evolution commands BEFORE routing
             # This ensures self-evolution ALWAYS works regardless of classifier
             # Uses CommandClassifier from integration module (no hardcoding)
+            # Also handles confirmation commands ("confirm {id}")
             # ===================================================================
-            evolution_result = await self._check_evolution_command(text)
+            evolution_result = await self._check_evolution_command(text, context)
             if evolution_result and evolution_result.get("is_evolution"):
                 logger.info(f"🧬 PRE-CLASSIFICATION: Code evolution command detected")
                 response = evolution_result.get("message", "Evolution processing...")

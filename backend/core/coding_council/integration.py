@@ -354,9 +354,10 @@ class EvolutionBroadcaster:
 
     Features:
     - Real-time progress updates
-    - Multi-client broadcast
+    - Multi-client broadcast via UnifiedWebSocketManager
     - Buffered replay for late joiners
     - Automatic cleanup
+    - Bridge to main WebSocket infrastructure
     """
 
     def __init__(self, buffer_size: int = 100):
@@ -364,6 +365,37 @@ class EvolutionBroadcaster:
         self._buffer: List[Dict[str, Any]] = []
         self._buffer_size = buffer_size
         self._lock = asyncio.Lock()
+        self._unified_ws_manager: Optional[Any] = None
+        self._ws_manager_checked = False
+
+    def _get_unified_ws_manager(self) -> Optional[Any]:
+        """
+        Lazily get the UnifiedWebSocketManager for bridged broadcasting.
+
+        This connects evolution broadcasts to the main WebSocket infrastructure
+        so frontend clients can receive real-time updates.
+        """
+        if self._ws_manager_checked:
+            return self._unified_ws_manager
+
+        self._ws_manager_checked = True
+        try:
+            # Try to import and get the global ws manager
+            try:
+                from backend.api.unified_websocket import get_ws_manager
+            except ImportError:
+                from api.unified_websocket import get_ws_manager
+
+            self._unified_ws_manager = get_ws_manager()
+            logger.info("[EvolutionBroadcaster] Connected to UnifiedWebSocketManager")
+        except ImportError:
+            logger.debug("[EvolutionBroadcaster] UnifiedWebSocketManager not available")
+            self._unified_ws_manager = None
+        except Exception as e:
+            logger.debug(f"[EvolutionBroadcaster] Failed to get WS manager: {e}")
+            self._unified_ws_manager = None
+
+        return self._unified_ws_manager
 
     async def register_client(self, client: Any) -> None:
         """Register a WebSocket client."""
@@ -405,6 +437,10 @@ class EvolutionBroadcaster:
         """
         Broadcast evolution status to all clients.
 
+        Broadcasts via two channels:
+        1. Direct registered clients (for evolution-specific connections)
+        2. UnifiedWebSocketManager (for main frontend connections)
+
         Returns:
             Number of clients notified
         """
@@ -424,7 +460,7 @@ class EvolutionBroadcaster:
             if len(self._buffer) > self._buffer_size:
                 self._buffer.pop(0)
 
-            # Broadcast to all clients
+            # Broadcast to all direct clients
             notified = 0
             dead_refs = []
 
@@ -448,6 +484,21 @@ class EvolutionBroadcaster:
             # Clean up dead references
             for ref in dead_refs:
                 self._clients.discard(ref)
+
+            # Bridge to UnifiedWebSocketManager for main frontend
+            ws_manager = self._get_unified_ws_manager()
+            if ws_manager:
+                try:
+                    # Broadcast via unified manager with evolution capability filter
+                    await ws_manager.broadcast(payload, capability="evolution")
+                    logger.debug(f"[Broadcaster] Bridged to UnifiedWS: {status}")
+                except Exception as e:
+                    logger.debug(f"[Broadcaster] UnifiedWS broadcast failed: {e}")
+                    # Try fallback without capability filter
+                    try:
+                        await ws_manager.broadcast(payload)
+                    except Exception:
+                        pass
 
             return notified
 
