@@ -5703,6 +5703,16 @@ def mount_routers():
     except ImportError as e:
         logger.debug(f"Coding Council API not available: {e}")
 
+    # v77.3: Coding Council IDE Integration Routes
+    try:
+        from core.coding_council.startup import register_coding_council_routes
+        register_coding_council_routes(app)
+        logger.info("✅ Coding Council IDE routes mounted at /coding-council/*")
+        logger.info("   IDE endpoints: /coding-council/ide/status, /coding-council/ide/suggest")
+        logger.info("   Trinity endpoints: /coding-council/ide/trinity/repos, /coding-council/ide/trinity/publish")
+    except ImportError as e:
+        logger.debug(f"Coding Council IDE routes not available: {e}")
+
     # Context Intelligence API (Priority 1-3 features)
     if hasattr(app.state, "context_bridge") and app.state.context_bridge:
         from pydantic import BaseModel

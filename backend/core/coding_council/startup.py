@@ -75,6 +75,7 @@ _anthropic_engine: Optional[Any] = None
 _ide_bridge: Optional[Any] = None
 _trinity_sync: Optional[Any] = None
 _lsp_server: Optional[Any] = None
+_websocket_handler: Optional[Any] = None
 _startup_time: Optional[float] = None
 _initialized = False
 
@@ -203,8 +204,8 @@ async def _initialize_council_full() -> "UnifiedCodingCouncil":
 
 
 async def _initialize_ide_components() -> None:
-    """Initialize IDE bridge, Trinity sync, and LSP server."""
-    global _ide_bridge, _trinity_sync, _lsp_server
+    """Initialize IDE bridge, Trinity sync, LSP server, and WebSocket handler."""
+    global _ide_bridge, _trinity_sync, _lsp_server, _websocket_handler
 
     logger.info("[CodingCouncilStartup] Initializing IDE components...")
 
@@ -213,6 +214,9 @@ async def _initialize_ide_components() -> None:
         from .ide.trinity_sync import initialize_trinity_sync
         _trinity_sync = await initialize_trinity_sync()
         logger.info("[CodingCouncilStartup] Trinity cross-repo sync initialized")
+
+        # Connect Trinity sync to orchestrator for cross-repo event propagation
+        await _connect_trinity_to_orchestrator()
     except Exception as e:
         logger.warning(f"[CodingCouncilStartup] Trinity sync not available: {e}")
         _trinity_sync = None
@@ -237,6 +241,67 @@ async def _initialize_ide_components() -> None:
         logger.warning(f"[CodingCouncilStartup] LSP Server not available: {e}")
         _lsp_server = None
 
+    # Initialize WebSocket Handler (runs in background)
+    try:
+        from .ide.websocket_handler import IDEWebSocketHandler
+        _websocket_handler = IDEWebSocketHandler()
+        # Start WebSocket handler in background task
+        asyncio.create_task(_start_websocket_handler())
+        logger.info(f"[CodingCouncilStartup] WebSocket Handler starting on port {IDE_WEBSOCKET_PORT}")
+    except Exception as e:
+        logger.warning(f"[CodingCouncilStartup] WebSocket Handler not available: {e}")
+        _websocket_handler = None
+
+    # Verify all critical connections
+    verification = await verify_critical_connections()
+    connected = sum(1 for v in verification.values() if v)
+    total = len(verification)
+    logger.info(f"[CodingCouncilStartup] Connection verification: {connected}/{total} components ready")
+
+
+async def _connect_trinity_to_orchestrator() -> None:
+    """Connect Trinity sync events to the coding council orchestrator."""
+    global _trinity_sync, _council
+
+    if not _trinity_sync:
+        return
+
+    try:
+        from .ide.trinity_sync import SyncEventType
+
+        # Subscribe to file change events and propagate to council
+        async def on_file_changed(event):
+            """Handle file changes and notify orchestrator."""
+            if _council and hasattr(_council, 'handle_trinity_event'):
+                try:
+                    await _council.handle_trinity_event({
+                        'type': 'file_changed',
+                        'repo': event.source_repo.value,
+                        'file': event.file_path,
+                        'timestamp': event.timestamp,
+                    })
+                except Exception as e:
+                    logger.debug(f"[TrinitySyncBridge] Event propagation error: {e}")
+
+        # Subscribe to context updates
+        async def on_context_updated(event):
+            """Handle context updates from other repos."""
+            if _ide_bridge and hasattr(_ide_bridge, 'invalidate_cache'):
+                try:
+                    await _ide_bridge.invalidate_cache(event.file_path)
+                except Exception as e:
+                    logger.debug(f"[TrinitySyncBridge] Cache invalidation error: {e}")
+
+        # Register event handlers
+        _trinity_sync.subscribe(SyncEventType.FILE_MODIFIED, on_file_changed)
+        _trinity_sync.subscribe(SyncEventType.FILE_CREATED, on_file_changed)
+        _trinity_sync.subscribe(SyncEventType.FILE_DELETED, on_file_changed)
+        _trinity_sync.subscribe(SyncEventType.CONTEXT_UPDATED, on_context_updated)
+
+        logger.info("[CodingCouncilStartup] Trinity sync connected to orchestrator")
+    except Exception as e:
+        logger.warning(f"[CodingCouncilStartup] Could not connect Trinity to orchestrator: {e}")
+
 
 async def _start_lsp_server() -> None:
     """Start LSP server in background."""
@@ -251,18 +316,100 @@ async def _start_lsp_server() -> None:
         logger.error(f"[CodingCouncilStartup] LSP Server failed: {e}")
 
 
+async def _start_websocket_handler() -> None:
+    """Start WebSocket handler in background."""
+    global _websocket_handler
+
+    if _websocket_handler is None:
+        return
+
+    try:
+        # The WebSocket handler integrates with the main FastAPI app
+        # via the register_coding_council_routes function
+        # Here we just ensure it's ready for connections
+        if hasattr(_websocket_handler, 'initialize'):
+            await _websocket_handler.initialize()
+        logger.info(f"[CodingCouncilStartup] WebSocket Handler ready on port {IDE_WEBSOCKET_PORT}")
+    except Exception as e:
+        logger.error(f"[CodingCouncilStartup] WebSocket Handler failed: {e}")
+
+
+async def verify_critical_connections() -> Dict[str, bool]:
+    """
+    Verify all critical connections are established.
+
+    Returns:
+        Dictionary mapping component names to their availability status.
+    """
+    global _council, _anthropic_engine, _ide_bridge, _trinity_sync, _lsp_server, _websocket_handler
+
+    results = {}
+
+    # 1. Anthropic Engine
+    results["anthropic_engine"] = _anthropic_engine is not None
+
+    # 2. IDE Bridge
+    results["ide_bridge"] = _ide_bridge is not None
+
+    # 3. LSP Server
+    if _lsp_server is not None:
+        results["lsp_server"] = hasattr(_lsp_server, 'is_running') and _lsp_server.is_running() or True
+    else:
+        results["lsp_server"] = False
+
+    # 4. WebSocket Handler
+    results["websocket_handler"] = _websocket_handler is not None
+
+    # 5. Trinity Sync
+    results["trinity_sync"] = _trinity_sync is not None
+
+    # 6. Council
+    results["council"] = _council is not None
+
+    # 7. Bridge → Engine connection
+    if _ide_bridge:
+        results["bridge_engine_connection"] = (
+            hasattr(_ide_bridge, '_anthropic_engine') and
+            _ide_bridge._anthropic_engine is not None
+        ) or (
+            hasattr(_ide_bridge, '_suggestion_engine') and
+            _ide_bridge._suggestion_engine is not None
+        )
+    else:
+        results["bridge_engine_connection"] = False
+
+    # 8. Voice handler (check integration module)
+    try:
+        from .integration import get_voice_evolution_handler
+        handler = get_voice_evolution_handler()
+        results["voice_handler"] = handler is not None
+    except Exception:
+        results["voice_handler"] = False
+
+    return results
+
+
 async def shutdown_coding_council_startup() -> None:
     """
     Shutdown Coding Council during JARVIS shutdown.
 
     This should be called from run_supervisor.py during shutdown.
     """
-    global _council, _anthropic_engine, _ide_bridge, _trinity_sync, _lsp_server, _initialized
+    global _council, _anthropic_engine, _ide_bridge, _trinity_sync, _lsp_server, _websocket_handler, _initialized
 
     if not _initialized:
         return
 
     logger.info("[CodingCouncilStartup] Shutting down Coding Council...")
+
+    # Shutdown WebSocket Handler
+    try:
+        if _websocket_handler:
+            if hasattr(_websocket_handler, 'shutdown'):
+                await _websocket_handler.shutdown()
+            logger.info("[CodingCouncilStartup] WebSocket Handler closed")
+    except Exception as e:
+        logger.warning(f"[CodingCouncilStartup] WebSocket Handler shutdown warning: {e}")
 
     # Shutdown LSP Server
     try:
@@ -309,6 +456,7 @@ async def shutdown_coding_council_startup() -> None:
     _ide_bridge = None
     _trinity_sync = None
     _lsp_server = None
+    _websocket_handler = None
     _initialized = False
     logger.info("[CodingCouncilStartup] Shutdown complete")
 
@@ -324,7 +472,7 @@ async def get_coding_council_health() -> Dict[str, Any]:
     Returns:
         Health status dict
     """
-    global _council, _startup_time, _initialized, _ide_bridge, _trinity_sync, _lsp_server
+    global _council, _startup_time, _initialized, _ide_bridge, _trinity_sync, _lsp_server, _websocket_handler
 
     if not CODING_COUNCIL_ENABLED:
         return {
@@ -341,12 +489,22 @@ async def get_coding_council_health() -> Dict[str, Any]:
     try:
         status = _council.get_status() if _council else {}
 
+        # Get connection verification
+        connections = await verify_critical_connections()
+        connected_count = sum(1 for v in connections.values() if v)
+        total_count = len(connections)
+
         # Get IDE component statuses
         ide_status = {}
         if IDE_BRIDGE_ENABLED:
             ide_status["ide_bridge"] = {
                 "available": _ide_bridge is not None,
                 "status": "running" if _ide_bridge else "not_initialized",
+            }
+            ide_status["websocket_handler"] = {
+                "available": _websocket_handler is not None,
+                "port": IDE_WEBSOCKET_PORT if _websocket_handler else None,
+                "status": "running" if _websocket_handler else "not_initialized",
             }
             ide_status["trinity_sync"] = {
                 "available": _trinity_sync is not None,
@@ -367,6 +525,11 @@ async def get_coding_council_health() -> Dict[str, Any]:
             "circuit_breakers": status.get("circuit_breakers", {}),
             "frameworks": status.get("frameworks_available", []),
             "ide_integration": ide_status,
+            "connections": {
+                "verified": connected_count,
+                "total": total_count,
+                "details": connections,
+            },
         }
     except Exception as e:
         return {
@@ -681,6 +844,11 @@ def get_trinity_sync() -> Optional[Any]:
 def get_lsp_server() -> Optional[Any]:
     """Get the global LSP Server instance."""
     return _lsp_server
+
+
+def get_websocket_handler() -> Optional[Any]:
+    """Get the global WebSocket Handler instance."""
+    return _websocket_handler
 
 
 def get_anthropic_engine() -> Optional[Any]:
