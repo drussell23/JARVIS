@@ -50,18 +50,61 @@ T = TypeVar("T")
 
 
 # =============================================================================
-# Configuration
+# Configuration (Dynamic via unified config)
 # =============================================================================
 
-TRINITY_REPOS = {
-    "jarvis": Path(os.getenv("JARVIS_REPO", "/Users/djrussell23/Documents/repos/JARVIS-AI-Agent")),
-    "j_prime": Path(os.getenv("J_PRIME_REPO", "/Users/djrussell23/Documents/repos/jarvis-prime")),
-    "reactor_core": Path(os.getenv("REACTOR_CORE_REPO", "/Users/djrussell23/Documents/repos/reactor-core")),
-}
+def _get_config():
+    """Get unified configuration."""
+    try:
+        from ..config import get_config
+        return get_config()
+    except ImportError:
+        return None
 
-TRINITY_SYNC_DIR = Path(os.getenv("TRINITY_SYNC_DIR", os.path.expanduser("~/.jarvis/trinity/ide_sync")))
-TRINITY_SYNC_INTERVAL = float(os.getenv("TRINITY_SYNC_INTERVAL", "5.0"))
-TRINITY_HEARTBEAT_INTERVAL = float(os.getenv("TRINITY_HEARTBEAT_INTERVAL", "10.0"))
+
+def _get_trinity_repos() -> Dict[str, Path]:
+    """Get Trinity repos from unified config or fallback."""
+    config = _get_config()
+    if config:
+        return {name: repo.path for name, repo in config.repos.items()}
+
+    # Fallback to environment variables
+    return {
+        "jarvis": Path(os.getenv("JARVIS_REPO", Path(__file__).parent.parent.parent.parent.parent)),
+        "j_prime": Path(os.getenv("J_PRIME_REPO", Path.home() / "Documents/repos/jarvis-prime")),
+        "reactor_core": Path(os.getenv("REACTOR_CORE_REPO", Path.home() / "Documents/repos/reactor-core")),
+    }
+
+
+def _get_sync_dir() -> Path:
+    """Get Trinity sync directory from config or fallback."""
+    config = _get_config()
+    if config:
+        return config.trinity_dir / "ide_sync"
+    return Path(os.getenv("TRINITY_SYNC_DIR", os.path.expanduser("~/.jarvis/trinity/ide_sync")))
+
+
+def _get_sync_interval() -> float:
+    """Get sync interval from config or fallback."""
+    config = _get_config()
+    if config:
+        return config.sync_interval
+    return float(os.getenv("TRINITY_SYNC_INTERVAL", "5.0"))
+
+
+def _get_heartbeat_interval() -> float:
+    """Get heartbeat interval from config or fallback."""
+    config = _get_config()
+    if config:
+        return config.heartbeat_interval
+    return float(os.getenv("TRINITY_HEARTBEAT_INTERVAL", "10.0"))
+
+
+# Dynamic property accessors for backward compatibility
+TRINITY_REPOS = property(lambda self: _get_trinity_repos())
+TRINITY_SYNC_DIR = property(lambda self: _get_sync_dir())
+TRINITY_SYNC_INTERVAL = property(lambda self: _get_sync_interval())
+TRINITY_HEARTBEAT_INTERVAL = property(lambda self: _get_heartbeat_interval())
 
 
 # =============================================================================
@@ -605,15 +648,19 @@ class TrinityIDESynchronizer:
         self._last_sync_duration = 0.0
         self._start_time: Optional[float] = None
 
-        # Initialize sync directory
-        TRINITY_SYNC_DIR.mkdir(parents=True, exist_ok=True)
+        # Initialize sync directory (use dynamic config)
+        sync_dir = _get_sync_dir()
+        sync_dir.mkdir(parents=True, exist_ok=True)
 
     async def initialize(self) -> bool:
-        """Initialize the synchronizer."""
+        """Initialize the synchronizer with dynamic configuration."""
         logger.info("[TrinitySynchronizer] Initializing cross-repo sync...")
 
+        # Get repos from dynamic config
+        trinity_repos = _get_trinity_repos()
+
         # Initialize repo contexts
-        for repo_type, path in TRINITY_REPOS.items():
+        for repo_type, path in trinity_repos.items():
             repo_enum = RepoType(repo_type)
             self._repos[repo_enum] = RepoContext(
                 repo_type=repo_enum,
@@ -834,13 +881,16 @@ class TrinityIDESynchronizer:
     # -------------------------------------------------------------------------
 
     async def _sync_worker(self) -> None:
-        """Main sync worker loop."""
+        """Main sync worker loop with dynamic interval."""
         while self._running:
             try:
                 sync_start = time.time()
 
+                # Get dynamic sync interval
+                sync_interval = _get_sync_interval()
+
                 # Process events
-                event = await self._event_queue.get(timeout=TRINITY_SYNC_INTERVAL)
+                event = await self._event_queue.get(timeout=sync_interval)
 
                 if event:
                     await self._process_event(event)
@@ -899,15 +949,19 @@ class TrinityIDESynchronizer:
             logger.error(f"[TrinitySynchronizer] Event processing error: {e}")
 
     async def _heartbeat_worker(self) -> None:
-        """Heartbeat worker to maintain repo health status."""
+        """Heartbeat worker to maintain repo health status with dynamic intervals."""
         while self._running:
             try:
+                # Get dynamic sync directory and interval
+                sync_dir = _get_sync_dir()
+                heartbeat_interval = _get_heartbeat_interval()
+
                 for repo_type, ctx in self._repos.items():
                     # Check if repo is accessible
                     ctx.healthy = ctx.root_path.exists()
 
                     # Update heartbeat file
-                    heartbeat_file = TRINITY_SYNC_DIR / f"{repo_type.value}_heartbeat.json"
+                    heartbeat_file = sync_dir / f"{repo_type.value}_heartbeat.json"
                     heartbeat_data = {
                         "repo": repo_type.value,
                         "timestamp": time.time(),
@@ -915,10 +969,13 @@ class TrinityIDESynchronizer:
                         "active_files": len(ctx.active_files),
                     }
 
-                    with open(heartbeat_file, "w") as f:
-                        json.dump(heartbeat_data, f)
+                    try:
+                        with open(heartbeat_file, "w") as f:
+                            json.dump(heartbeat_data, f)
+                    except Exception as write_err:
+                        logger.debug(f"[TrinitySynchronizer] Could not write heartbeat: {write_err}")
 
-                await asyncio.sleep(TRINITY_HEARTBEAT_INTERVAL)
+                await asyncio.sleep(heartbeat_interval)
 
             except asyncio.CancelledError:
                 break
@@ -932,7 +989,8 @@ class TrinityIDESynchronizer:
 
     async def _load_state(self) -> None:
         """Load persisted sync state."""
-        state_file = TRINITY_SYNC_DIR / "sync_state.json"
+        sync_dir = _get_sync_dir()
+        state_file = sync_dir / "sync_state.json"
 
         if not state_file.exists():
             return
@@ -952,7 +1010,8 @@ class TrinityIDESynchronizer:
 
     async def _save_state(self) -> None:
         """Save sync state to disk."""
-        state_file = TRINITY_SYNC_DIR / "sync_state.json"
+        sync_dir = _get_sync_dir()
+        state_file = sync_dir / "sync_state.json"
 
         try:
             state = {
@@ -1013,8 +1072,9 @@ async def shutdown_trinity_sync() -> None:
 def detect_repo_type(file_path: str) -> Optional[RepoType]:
     """Detect which repo a file belongs to based on path."""
     path = Path(file_path).resolve()
+    trinity_repos = _get_trinity_repos()
 
-    for repo_type, repo_path in TRINITY_REPOS.items():
+    for repo_type, repo_path in trinity_repos.items():
         try:
             path.relative_to(repo_path)
             return RepoType(repo_type)
@@ -1027,7 +1087,11 @@ def detect_repo_type(file_path: str) -> Optional[RepoType]:
 def get_relative_path(file_path: str, repo: RepoType) -> str:
     """Get the path relative to a repo root."""
     path = Path(file_path).resolve()
-    repo_path = TRINITY_REPOS[repo.value]
+    trinity_repos = _get_trinity_repos()
+    repo_path = trinity_repos.get(repo.value)
+
+    if not repo_path:
+        return file_path
 
     try:
         return str(path.relative_to(repo_path))

@@ -1211,11 +1211,17 @@ class UnifiedCodingCouncil:
                 self._saga_coordinator = SagaCoordinator()
 
                 # Distributed Transaction Coordinator
-                repos = {
-                    "jarvis": self.config.repo_root,
-                    "jarvis_prime": Path(os.getenv("JARVIS_PRIME_REPO", str(Path.home() / "Documents/repos/jarvis-prime"))),
-                    "reactor_core": Path(os.getenv("REACTOR_CORE_REPO", str(Path.home() / "Documents/repos/reactor-core"))),
-                }
+                # Get repos from unified config
+                try:
+                    from .config import get_config
+                    config = get_config()
+                    repos = {name: repo.path for name, repo in config.repos.items()}
+                except ImportError:
+                    repos = {
+                        "jarvis": self.config.repo_root,
+                        "jarvis_prime": Path(os.getenv("JARVIS_PRIME_REPO", str(Path.home() / "Documents/repos/jarvis-prime"))),
+                        "reactor_core": Path(os.getenv("REACTOR_CORE_REPO", str(Path.home() / "Documents/repos/reactor-core"))),
+                    }
                 self._transaction_coordinator = DistributedTransactionCoordinator(repos=repos)
 
                 # Cross-Repo Dependency Tracker

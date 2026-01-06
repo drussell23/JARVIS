@@ -88,11 +88,36 @@ T = TypeVar("T")
 # Configuration (Environment-Driven, No Hardcoding)
 # =============================================================================
 
-class AnthropicEngineConfig:
-    """Dynamic configuration from environment variables."""
+def _get_unified_config():
+    """Get unified config if available."""
+    try:
+        from ..config import get_config
+        return get_config()
+    except ImportError:
+        return None
 
-    # API Configuration
-    API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
+
+class AnthropicEngineConfig:
+    """Dynamic configuration with unified config integration."""
+
+    @classmethod
+    def _get_api_key(cls) -> str:
+        """Get API key from unified config or environment."""
+        config = _get_unified_config()
+        if config and config.anthropic_key.value:
+            return config.anthropic_key.value
+        return os.getenv("ANTHROPIC_API_KEY", "")
+
+    @classmethod
+    def _can_use_ai(cls) -> bool:
+        """Check if AI is available via unified config."""
+        config = _get_unified_config()
+        if config:
+            return config.can_use_ai
+        return bool(os.getenv("ANTHROPIC_API_KEY"))
+
+    # API Configuration (use property-like class methods for dynamic access)
+    API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")  # Legacy - use _get_api_key()
     MODEL: str = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
     MAX_TOKENS: int = int(os.getenv("ANTHROPIC_MAX_TOKENS", "8192"))
     TEMPERATURE: float = float(os.getenv("ANTHROPIC_TEMPERATURE", "0.3"))

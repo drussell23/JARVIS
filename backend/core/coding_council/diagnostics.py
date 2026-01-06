@@ -42,27 +42,64 @@ T = TypeVar("T")
 
 
 # =============================================================================
-# Configuration
+# Configuration (Dynamic via unified config)
 # =============================================================================
 
-TRINITY_REPOS = {
-    "jarvis": Path(os.getenv("JARVIS_REPO", "/Users/djrussell23/Documents/repos/JARVIS-AI-Agent")),
-    "j_prime": Path(os.getenv("J_PRIME_REPO", "/Users/djrussell23/Documents/repos/jarvis-prime")),
-    "reactor_core": Path(os.getenv("REACTOR_CORE_REPO", "/Users/djrussell23/Documents/repos/reactor-core")),
-}
+def _get_trinity_repos() -> Dict[str, Path]:
+    """Get Trinity repos from unified config."""
+    try:
+        from .config import get_config
+        config = get_config()
+        return {name: repo.path for name, repo in config.repos.items()}
+    except ImportError:
+        # Fallback if config not available
+        return {
+            "jarvis": Path(os.getenv("JARVIS_REPO", Path(__file__).parent.parent.parent.parent)),
+            "j_prime": Path(os.getenv("J_PRIME_REPO", Path.home() / "Documents/repos/jarvis-prime")),
+            "reactor_core": Path(os.getenv("REACTOR_CORE_REPO", Path.home() / "Documents/repos/reactor-core")),
+        }
 
-REQUIRED_PORTS = {
-    "jarvis_api": int(os.getenv("JARVIS_PORT", "8010")),
-    "lsp_server": int(os.getenv("LSP_SERVER_PORT", "9257")),
-    "websocket": int(os.getenv("IDE_WEBSOCKET_PORT", "9258")),
-}
 
+def _get_required_ports() -> Dict[str, int]:
+    """Get required ports from unified config."""
+    try:
+        from .config import get_config
+        config = get_config()
+        return {
+            "jarvis_api": config.jarvis_api_port.port,
+            "lsp_server": config.lsp_server_port.port,
+            "websocket": config.websocket_port.port,
+        }
+    except ImportError:
+        return {
+            "jarvis_api": int(os.getenv("JARVIS_PORT", "8010")),
+            "lsp_server": int(os.getenv("LSP_SERVER_PORT", "9257")),
+            "websocket": int(os.getenv("IDE_WEBSOCKET_PORT", "9258")),
+        }
+
+
+def _allows_graceful_degradation() -> bool:
+    """Check if graceful degradation is enabled."""
+    try:
+        from .config import get_config
+        return get_config().degradation.allow_no_api_key
+    except ImportError:
+        return True  # Default to allowing degradation
+
+
+# Dynamic config accessors
+TRINITY_REPOS = property(lambda self: _get_trinity_repos())
+REQUIRED_PORTS = property(lambda self: _get_required_ports())
+
+# Environment variable definitions with graceful degradation support
 REQUIRED_ENV_VARS = {
     "ANTHROPIC_API_KEY": {
-        "required": True,
+        "required": False,  # NOT required - graceful degradation supported
+        "degradable": True,  # Can work without this
         "format": r"^sk-ant-|^sk-",
-        "description": "Claude API key for Anthropic",
+        "description": "Claude API key for Anthropic (AI features disabled without this)",
         "fix": "export ANTHROPIC_API_KEY=sk-ant-api03-...",
+        "degradation_impact": "AI-powered suggestions and code generation will be unavailable",
     },
 }
 
@@ -74,6 +111,10 @@ OPTIONAL_ENV_VARS = {
     "IDE_BRIDGE_ENABLED": {
         "default": "true",
         "description": "Enable/disable IDE integration",
+    },
+    "TRINITY_SYNC_ENABLED": {
+        "default": "true",
+        "description": "Enable/disable Trinity cross-repo sync",
     },
 }
 
@@ -264,18 +305,33 @@ class EnvironmentChecker:
         name: str,
         config: Dict[str, Any],
     ) -> CheckResult:
-        """Check an environment variable."""
+        """Check an environment variable with graceful degradation support."""
         import re
 
         start = time.time()
         value = os.getenv(name, "")
         required = config.get("required", False)
+        degradable = config.get("degradable", False)
         format_pattern = config.get("format")
         description = config.get("description", name)
         fix_command = config.get("fix")
+        degradation_impact = config.get("degradation_impact", "")
 
         if not value:
-            if required:
+            # Check if this is a degradable requirement
+            if degradable and _allows_graceful_degradation():
+                # Not a failure - graceful degradation allows this
+                impact_msg = f" Impact: {degradation_impact}" if degradation_impact else ""
+                return CheckResult(
+                    name=f"Env: {name}",
+                    category=CheckCategory.ENVIRONMENT,
+                    status=CheckStatus.WARN,
+                    message=f"{name} not set (graceful degradation active)",
+                    details=f"{description}.{impact_msg}",
+                    fix_command=fix_command,
+                    duration_ms=(time.time() - start) * 1000,
+                )
+            elif required:
                 return CheckResult(
                     name=f"Env: {name}",
                     category=CheckCategory.ENVIRONMENT,
@@ -437,6 +493,73 @@ class TrinityChecker:
                 duration_ms=(time.time() - start) * 1000,
             )
 
+    @staticmethod
+    async def check_stale_heartbeats(stale_threshold: float = 60.0) -> List[CheckResult]:
+        """
+        Check for stale heartbeats indicating dead components.
+
+        Args:
+            stale_threshold: Seconds after which a heartbeat is considered stale
+
+        Returns:
+            List of check results for each component
+        """
+        results = []
+        heartbeat_dir = Path(os.path.expanduser("~/.jarvis/trinity/components"))
+
+        if not heartbeat_dir.exists():
+            return results
+
+        for heartbeat_file in heartbeat_dir.glob("*.json"):
+            start = time.time()
+            component_name = heartbeat_file.stem
+
+            try:
+                with open(heartbeat_file) as f:
+                    data = json.load(f)
+
+                last_update = data.get("timestamp", 0)
+                age = time.time() - last_update
+
+                if age > stale_threshold:
+                    results.append(CheckResult(
+                        name=f"Heartbeat: {component_name}",
+                        category=CheckCategory.TRINITY,
+                        status=CheckStatus.WARN,
+                        message=f"Stale heartbeat ({age:.0f}s old)",
+                        details=f"Component may be dead or unresponsive",
+                        fix_command=f"rm {heartbeat_file}  # Clear stale heartbeat",
+                        duration_ms=(time.time() - start) * 1000,
+                    ))
+                else:
+                    results.append(CheckResult(
+                        name=f"Heartbeat: {component_name}",
+                        category=CheckCategory.TRINITY,
+                        status=CheckStatus.PASS,
+                        message=f"Healthy ({age:.1f}s ago)",
+                        duration_ms=(time.time() - start) * 1000,
+                    ))
+
+            except json.JSONDecodeError:
+                results.append(CheckResult(
+                    name=f"Heartbeat: {component_name}",
+                    category=CheckCategory.TRINITY,
+                    status=CheckStatus.WARN,
+                    message="Corrupted heartbeat file",
+                    fix_command=f"rm {heartbeat_file}",
+                    duration_ms=(time.time() - start) * 1000,
+                ))
+            except Exception as e:
+                results.append(CheckResult(
+                    name=f"Heartbeat: {component_name}",
+                    category=CheckCategory.TRINITY,
+                    status=CheckStatus.WARN,
+                    message=f"Cannot read heartbeat: {e}",
+                    duration_ms=(time.time() - start) * 1000,
+                ))
+
+        return results
+
 
 # =============================================================================
 # Module Import Checker
@@ -582,58 +705,150 @@ class PreFlightChecker:
         self.report = DiagnosticReport()
 
     async def run_all_checks(self) -> DiagnosticReport:
-        """Run all diagnostic checks."""
+        """Run all diagnostic checks with advanced parallel execution."""
         self.report = DiagnosticReport()
         self.report.start_time = time.time()
 
         # Collect system info
         self.report.system_info = self._collect_system_info()
 
-        # Run checks in parallel where possible
-        checks = []
+        # Get dynamic configuration
+        trinity_repos = _get_trinity_repos()
+        required_ports = _get_required_ports()
+
+        # Get stale threshold from config
+        try:
+            from .config import get_config
+            stale_threshold = get_config().stale_threshold
+        except ImportError:
+            stale_threshold = 60.0
+
+        # Phase 1: Fast checks (environment, ports) - run in parallel
+        fast_checks = []
 
         # Environment checks
         for name, config in REQUIRED_ENV_VARS.items():
-            checks.append(EnvironmentChecker.check_env_var(name, config))
+            fast_checks.append(EnvironmentChecker.check_env_var(name, config))
         for name, config in OPTIONAL_ENV_VARS.items():
-            checks.append(EnvironmentChecker.check_env_var(name, config))
+            fast_checks.append(EnvironmentChecker.check_env_var(name, config))
 
         # Port checks
-        for name, port in REQUIRED_PORTS.items():
-            checks.append(PortChecker.check_port(port, name))
+        for name, port in required_ports.items():
+            fast_checks.append(PortChecker.check_port(port, name))
 
-        # Trinity checks
-        for name, path in TRINITY_REPOS.items():
-            checks.append(TrinityChecker.check_repo(name, path))
-        checks.append(TrinityChecker.check_heartbeat_dir())
+        # Execute fast checks in parallel with timeout
+        try:
+            fast_results = await asyncio.wait_for(
+                asyncio.gather(*fast_checks, return_exceptions=True),
+                timeout=10.0
+            )
+        except asyncio.TimeoutError:
+            fast_results = []
+            self.report.checks.append(CheckResult(
+                name="Fast Checks",
+                category=CheckCategory.RUNTIME,
+                status=CheckStatus.WARN,
+                message="Fast checks timed out",
+                duration_ms=10000,
+            ))
 
-        # Module checks
-        module_checks = [
+        # Phase 2: Trinity checks - run in parallel
+        trinity_checks = []
+        for name, path in trinity_repos.items():
+            trinity_checks.append(TrinityChecker.check_repo(name, path))
+        trinity_checks.append(TrinityChecker.check_heartbeat_dir())
+
+        try:
+            trinity_results = await asyncio.wait_for(
+                asyncio.gather(*trinity_checks, return_exceptions=True),
+                timeout=15.0
+            )
+        except asyncio.TimeoutError:
+            trinity_results = []
+            self.report.checks.append(CheckResult(
+                name="Trinity Checks",
+                category=CheckCategory.TRINITY,
+                status=CheckStatus.WARN,
+                message="Trinity checks timed out",
+                duration_ms=15000,
+            ))
+
+        # Phase 2.5: Stale heartbeat checks
+        try:
+            stale_results = await TrinityChecker.check_stale_heartbeats(stale_threshold)
+        except Exception as e:
+            stale_results = [CheckResult(
+                name="Stale Heartbeat Check",
+                category=CheckCategory.TRINITY,
+                status=CheckStatus.WARN,
+                message=f"Could not check stale heartbeats: {e}",
+            )]
+
+        # Phase 3: Module checks - run in parallel
+        module_checks_list = [
+            ("backend.core.coding_council.config", "Configuration Module"),
             ("backend.core.coding_council.startup", "Startup Module"),
             ("backend.core.coding_council.orchestrator", "Orchestrator"),
             ("backend.core.coding_council.ide", "IDE Module"),
             ("backend.core.coding_council.adapters.anthropic_engine", "Anthropic Engine"),
             ("backend.core.coding_council.integration", "Integration Module"),
         ]
-        for module_path, description in module_checks:
-            checks.append(ModuleChecker.check_module(module_path, description))
+        module_checks = [
+            ModuleChecker.check_module(module_path, description)
+            for module_path, description in module_checks_list
+        ]
 
-        # Runtime checks
-        checks.append(RuntimeChecker.check_anthropic_api())
+        try:
+            module_results = await asyncio.wait_for(
+                asyncio.gather(*module_checks, return_exceptions=True),
+                timeout=20.0
+            )
+        except asyncio.TimeoutError:
+            module_results = []
+            self.report.checks.append(CheckResult(
+                name="Module Checks",
+                category=CheckCategory.DEPENDENCIES,
+                status=CheckStatus.WARN,
+                message="Module checks timed out",
+                duration_ms=20000,
+            ))
 
-        # Execute all checks in parallel
-        results = await asyncio.gather(*checks, return_exceptions=True)
+        # Phase 4: Runtime checks (network calls) - with timeout
+        runtime_checks = [RuntimeChecker.check_anthropic_api()]
 
-        for result in results:
+        try:
+            runtime_results = await asyncio.wait_for(
+                asyncio.gather(*runtime_checks, return_exceptions=True),
+                timeout=15.0
+            )
+        except asyncio.TimeoutError:
+            runtime_results = [CheckResult(
+                name="Runtime Checks",
+                category=CheckCategory.CONNECTIVITY,
+                status=CheckStatus.WARN,
+                message="Runtime checks timed out",
+                duration_ms=15000,
+            )]
+
+        # Collect all results
+        all_results = (
+            list(fast_results) +
+            list(trinity_results) +
+            stale_results +
+            list(module_results) +
+            list(runtime_results)
+        )
+
+        for result in all_results:
             if isinstance(result, Exception):
                 self.report.checks.append(CheckResult(
-                    name="Unknown Check",
+                    name="Check Error",
                     category=CheckCategory.RUNTIME,
-                    status=CheckStatus.FAIL,
+                    status=CheckStatus.WARN,
                     message=f"Check failed with exception",
                     details=str(result),
                 ))
-            else:
+            elif isinstance(result, CheckResult):
                 self.report.checks.append(result)
 
         self.report.end_time = time.time()
@@ -727,40 +942,74 @@ class AutoRecovery:
     """
     Automatic recovery for common issues.
 
-    Can attempt to fix issues found during diagnostics.
+    Can attempt to fix issues found during diagnostics with
+    advanced parallel execution and intelligent recovery strategies.
     """
 
     @staticmethod
     async def attempt_recovery(report: DiagnosticReport) -> List[str]:
         """
-        Attempt to recover from failures.
+        Attempt to recover from failures with parallel execution.
 
         Returns list of recovery actions taken.
         """
         actions = []
+        recovery_tasks = []
 
         for check in report.checks:
-            if check.status != CheckStatus.FAIL:
-                continue
+            # Handle failures
+            if check.status == CheckStatus.FAIL:
+                # Port conflict recovery
+                if check.category == CheckCategory.PORTS and check.fix_command:
+                    recovery_tasks.append(
+                        AutoRecovery._recover_port(check)
+                    )
 
-            # Port conflict recovery
-            if check.category == CheckCategory.PORTS and check.fix_command:
-                if await AutoRecovery._kill_port_user(check):
-                    actions.append(f"Killed process using port (from: {check.name})")
+                # Directory creation recovery
+                elif check.category == CheckCategory.TRINITY:
+                    if "directory" in check.message.lower() and check.fix_command:
+                        recovery_tasks.append(
+                            AutoRecovery._create_directory(check)
+                        )
 
-            # Directory creation recovery
-            elif check.category == CheckCategory.TRINITY:
-                if "directory" in check.message.lower() and check.fix_command:
-                    if await AutoRecovery._create_directory(check):
-                        actions.append(f"Created directory (from: {check.name})")
+            # Handle warnings that can be auto-fixed
+            elif check.status == CheckStatus.WARN:
+                # Stale heartbeat cleanup
+                if "Stale heartbeat" in check.message:
+                    recovery_tasks.append(
+                        AutoRecovery._cleanup_stale_heartbeat(check)
+                    )
+
+                # Corrupted heartbeat cleanup
+                elif "Corrupted heartbeat" in check.message:
+                    recovery_tasks.append(
+                        AutoRecovery._cleanup_corrupted_heartbeat(check)
+                    )
+
+        # Execute all recovery tasks in parallel
+        if recovery_tasks:
+            try:
+                results = await asyncio.wait_for(
+                    asyncio.gather(*recovery_tasks, return_exceptions=True),
+                    timeout=30.0
+                )
+
+                for result in results:
+                    if isinstance(result, str) and result:
+                        actions.append(result)
+                    elif isinstance(result, Exception):
+                        logger.debug(f"Recovery task failed: {result}")
+
+            except asyncio.TimeoutError:
+                logger.warning("Recovery tasks timed out")
 
         return actions
 
     @staticmethod
-    async def _kill_port_user(check: CheckResult) -> bool:
-        """Kill process using a port."""
+    async def _recover_port(check: CheckResult) -> Optional[str]:
+        """Attempt to recover a port conflict."""
         if not check.fix_command:
-            return False
+            return None
 
         try:
             result = subprocess.run(
@@ -769,15 +1018,18 @@ class AutoRecovery:
                 capture_output=True,
                 timeout=5,
             )
-            return result.returncode == 0
-        except Exception:
-            return False
+            if result.returncode == 0:
+                return f"Killed process using port (from: {check.name})"
+        except Exception as e:
+            logger.debug(f"Port recovery failed: {e}")
+
+        return None
 
     @staticmethod
-    async def _create_directory(check: CheckResult) -> bool:
+    async def _create_directory(check: CheckResult) -> Optional[str]:
         """Create a missing directory."""
         if not check.fix_command:
-            return False
+            return None
 
         try:
             result = subprocess.run(
@@ -786,9 +1038,123 @@ class AutoRecovery:
                 capture_output=True,
                 timeout=5,
             )
-            return result.returncode == 0
-        except Exception:
-            return False
+            if result.returncode == 0:
+                return f"Created directory (from: {check.name})"
+        except Exception as e:
+            logger.debug(f"Directory creation failed: {e}")
+
+        return None
+
+    @staticmethod
+    async def _cleanup_stale_heartbeat(check: CheckResult) -> Optional[str]:
+        """
+        Cleanup a stale heartbeat file.
+
+        Instead of just deleting, we archive it for debugging.
+        """
+        if not check.fix_command:
+            return None
+
+        # Extract file path from fix command
+        # Format: "rm /path/to/file.json  # comment"
+        parts = check.fix_command.split()
+        if len(parts) < 2:
+            return None
+
+        heartbeat_path = Path(parts[1])
+        if not heartbeat_path.exists():
+            return None
+
+        try:
+            # Archive instead of delete
+            archive_dir = heartbeat_path.parent / "archived"
+            archive_dir.mkdir(exist_ok=True)
+
+            timestamp = int(time.time())
+            archive_path = archive_dir / f"{heartbeat_path.stem}_{timestamp}.json"
+
+            # Move to archive
+            heartbeat_path.rename(archive_path)
+
+            return f"Archived stale heartbeat: {heartbeat_path.name}"
+
+        except Exception as e:
+            logger.debug(f"Heartbeat cleanup failed: {e}")
+
+            # Fallback to delete
+            try:
+                heartbeat_path.unlink()
+                return f"Removed stale heartbeat: {heartbeat_path.name}"
+            except Exception:
+                pass
+
+        return None
+
+    @staticmethod
+    async def _cleanup_corrupted_heartbeat(check: CheckResult) -> Optional[str]:
+        """Cleanup a corrupted heartbeat file."""
+        if not check.fix_command:
+            return None
+
+        parts = check.fix_command.split()
+        if len(parts) < 2:
+            return None
+
+        heartbeat_path = Path(parts[1])
+        if not heartbeat_path.exists():
+            return None
+
+        try:
+            heartbeat_path.unlink()
+            return f"Removed corrupted heartbeat: {heartbeat_path.name}"
+        except Exception as e:
+            logger.debug(f"Corrupted heartbeat cleanup failed: {e}")
+
+        return None
+
+    @staticmethod
+    async def cleanup_all_stale_heartbeats(stale_threshold: float = 60.0) -> List[str]:
+        """
+        Cleanup all stale heartbeats proactively.
+
+        This can be called during startup to clean up stale state.
+        """
+        actions = []
+        heartbeat_dir = Path(os.path.expanduser("~/.jarvis/trinity/components"))
+
+        if not heartbeat_dir.exists():
+            return actions
+
+        archive_dir = heartbeat_dir / "archived"
+
+        for heartbeat_file in heartbeat_dir.glob("*.json"):
+            try:
+                with open(heartbeat_file) as f:
+                    data = json.load(f)
+
+                last_update = data.get("timestamp", 0)
+                age = time.time() - last_update
+
+                if age > stale_threshold:
+                    # Archive the stale heartbeat
+                    archive_dir.mkdir(exist_ok=True)
+                    timestamp = int(time.time())
+                    archive_path = archive_dir / f"{heartbeat_file.stem}_{timestamp}.json"
+
+                    heartbeat_file.rename(archive_path)
+                    actions.append(f"Archived stale heartbeat: {heartbeat_file.name} (age: {age:.0f}s)")
+
+            except json.JSONDecodeError:
+                # Corrupted - just delete
+                try:
+                    heartbeat_file.unlink()
+                    actions.append(f"Removed corrupted heartbeat: {heartbeat_file.name}")
+                except Exception:
+                    pass
+            except Exception as e:
+                logger.debug(f"Could not process heartbeat {heartbeat_file}: {e}")
+
+        return actions
 
 
 # =============================================================================

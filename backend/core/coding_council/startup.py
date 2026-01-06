@@ -58,9 +58,67 @@ logger = logging.getLogger(__name__)
 
 
 # =============================================================================
-# Configuration
+# Configuration (Dynamic via unified config)
 # =============================================================================
 
+def _get_config():
+    """Get unified configuration."""
+    try:
+        from .config import get_config
+        return get_config()
+    except ImportError:
+        return None
+
+
+def _is_coding_council_enabled() -> bool:
+    """Check if Coding Council is enabled."""
+    config = _get_config()
+    if config:
+        return config.enabled
+    return os.getenv("CODING_COUNCIL_ENABLED", "true").lower() == "true"
+
+
+def _is_ide_bridge_enabled() -> bool:
+    """Check if IDE Bridge is enabled."""
+    config = _get_config()
+    if config:
+        return config.ide_bridge_enabled
+    return os.getenv("IDE_BRIDGE_ENABLED", "true").lower() == "true"
+
+
+def _get_lsp_server_port() -> int:
+    """Get LSP server port."""
+    config = _get_config()
+    if config:
+        return config.lsp_server_port.port
+    return int(os.getenv("LSP_SERVER_PORT", "9257"))
+
+
+def _get_websocket_port() -> int:
+    """Get WebSocket port."""
+    config = _get_config()
+    if config:
+        return config.websocket_port.port
+    return int(os.getenv("IDE_WEBSOCKET_PORT", "9258"))
+
+
+def _get_startup_timeout() -> float:
+    """Get startup timeout."""
+    config = _get_config()
+    if config:
+        return config.timeouts.startup
+    return float(os.getenv("CODING_COUNCIL_STARTUP_TIMEOUT", "30.0"))
+
+
+def _can_use_ai() -> bool:
+    """Check if AI functionality is available."""
+    config = _get_config()
+    if config:
+        return config.can_use_ai
+    return bool(os.getenv("ANTHROPIC_API_KEY"))
+
+
+# Legacy constants for backward compatibility
 CODING_COUNCIL_ENABLED = os.getenv("CODING_COUNCIL_ENABLED", "true").lower() == "true"
 CODING_COUNCIL_STARTUP_TIMEOUT = float(os.getenv("CODING_COUNCIL_STARTUP_TIMEOUT", "30.0"))
 CODING_COUNCIL_VOICE_ANNOUNCE = os.getenv("CODING_COUNCIL_VOICE_ANNOUNCE", "true").lower() == "true"
@@ -298,8 +356,8 @@ async def initialize_coding_council_startup(
     """
     global _council, _startup_time, _initialized
 
-    if not CODING_COUNCIL_ENABLED:
-        logger.info("[CodingCouncilStartup] Disabled via CODING_COUNCIL_ENABLED=false")
+    if not _is_coding_council_enabled():
+        logger.info("[CodingCouncilStartup] Disabled via configuration")
         return False
 
     if _initialized:
@@ -319,8 +377,25 @@ async def initialize_coding_council_startup(
         if not preflight_passed:
             log.warning("[CodingCouncilStartup] Some pre-flight checks failed, continuing anyway")
 
+        # Cleanup stale heartbeats from previous runs
+        try:
+            from .diagnostics import AutoRecovery
+            stale_cleanup = await AutoRecovery.cleanup_all_stale_heartbeats(stale_threshold=60.0)
+            if stale_cleanup:
+                log.info(f"  Cleaned up {len(stale_cleanup)} stale heartbeats:")
+                for action in stale_cleanup:
+                    log.info(f"    ⚡ {action}")
+                    _recovery_log.append({
+                        "action": action,
+                        "timestamp": time.time(),
+                        "source": "startup_cleanup",
+                        "success": True,
+                    })
+        except Exception as e:
+            log.debug(f"  Stale heartbeat cleanup skipped: {e}")
+
         log.info("=" * 60)
-        log.info("v77.3 UNIFIED CODING COUNCIL: Initializing")
+        log.info("v77.4 UNIFIED CODING COUNCIL: Initializing")
         log.info("=" * 60)
 
         # Voice announcement if narrator available
@@ -333,16 +408,17 @@ async def initialize_coding_council_startup(
             except Exception:
                 pass  # Voice is optional
 
-        # Initialize with timeout
+        # Initialize with timeout (use dynamic config)
+        startup_timeout = _get_startup_timeout()
         try:
             _council = await asyncio.wait_for(
                 _initialize_council_full(),
-                timeout=CODING_COUNCIL_STARTUP_TIMEOUT
+                timeout=startup_timeout
             )
         except asyncio.TimeoutError:
             log.warning(
                 f"[CodingCouncilStartup] Initialization timed out after "
-                f"{CODING_COUNCIL_STARTUP_TIMEOUT}s, continuing in background"
+                f"{startup_timeout}s, continuing in background"
             )
             # Start in background instead
             asyncio.create_task(_initialize_council_full())
