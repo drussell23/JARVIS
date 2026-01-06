@@ -76,15 +76,61 @@ except ImportError as e:
 
 
 # =============================================================================
-# Configuration (Environment-Driven)
+# Configuration (Unified Config Integration)
 # =============================================================================
 
+def _get_unified_config():
+    """Get unified configuration."""
+    try:
+        from .config import get_config
+        return get_config()
+    except ImportError:
+        return None
+
+
+def _get_trinity_repos() -> Dict[str, Path]:
+    """Get Trinity repos from unified config."""
+    config = _get_unified_config()
+    if config:
+        return {name: repo.path for name, repo in config.repos.items()}
+    return {
+        "jarvis": Path(os.getenv("JARVIS_REPO", str(Path.home() / "Documents/repos/JARVIS-AI-Agent"))),
+        "j_prime": Path(os.getenv("JARVIS_PRIME_REPO", str(Path.home() / "Documents/repos/jarvis-prime"))),
+        "reactor_core": Path(os.getenv("REACTOR_CORE_REPO", str(Path.home() / "Documents/repos/reactor-core"))),
+    }
+
+
+def _is_enabled() -> bool:
+    """Check if Coding Council is enabled."""
+    config = _get_unified_config()
+    if config:
+        return config.enabled
+    return os.getenv("CODING_COUNCIL_ENABLED", "true").lower() == "true"
+
+
+def _is_cross_repo_enabled() -> bool:
+    """Check if cross-repo operations are enabled."""
+    config = _get_unified_config()
+    if config:
+        return config.trinity_sync_enabled
+    return os.getenv("CODING_COUNCIL_CROSS_REPO", "true").lower() == "true"
+
+
+def _get_trinity_dir() -> Path:
+    """Get Trinity directory."""
+    config = _get_unified_config()
+    if config:
+        return config.trinity_dir
+    return Path.home() / ".jarvis" / "trinity"
+
+
+# Legacy constants for backward compatibility
 CODING_COUNCIL_ENABLED = os.getenv("CODING_COUNCIL_ENABLED", "true").lower() == "true"
 CODING_COUNCIL_CROSS_REPO = os.getenv("CODING_COUNCIL_CROSS_REPO", "true").lower() == "true"
 CODING_COUNCIL_AUTO_APPROVE = os.getenv("CODING_COUNCIL_AUTO_APPROVE", "false").lower() == "true"
 STATUS_BROADCAST_INTERVAL = float(os.getenv("CODING_COUNCIL_STATUS_INTERVAL", "10.0"))
 
-# Cross-repo paths (environment-driven)
+# Cross-repo paths (use dynamic functions when possible)
 JARVIS_REPO = Path(os.getenv("JARVIS_REPO", str(Path.home() / "Documents/repos/JARVIS-AI-Agent")))
 JARVIS_PRIME_REPO = Path(os.getenv("JARVIS_PRIME_REPO", str(Path.home() / "Documents/repos/jarvis-prime")))
 REACTOR_CORE_REPO = Path(os.getenv("REACTOR_CORE_REPO", str(Path.home() / "Documents/repos/reactor-core")))

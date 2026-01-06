@@ -81,15 +81,49 @@ T = TypeVar("T")
 
 
 # ============================================================================
-# Configuration (Environment Variables - No Hardcoding)
+# Configuration (Unified Config Integration)
 # ============================================================================
+
+def _get_unified_config():
+    """Get unified configuration."""
+    try:
+        from .config import get_config
+        return get_config()
+    except ImportError:
+        return None
+
 
 class CodingCouncilConfig:
     """
-    Dynamic configuration from environment variables.
+    Dynamic configuration with unified config integration.
 
-    All settings can be overridden via environment without code changes.
+    All settings can be overridden via environment or unified config.
     """
+
+    @classmethod
+    def is_enabled(cls) -> bool:
+        """Check if Coding Council is enabled."""
+        config = _get_unified_config()
+        if config:
+            return config.enabled
+        return os.getenv("CODING_COUNCIL_ENABLED", "true").lower() == "true"
+
+    @classmethod
+    def get_timeout(cls, operation: str) -> float:
+        """Get timeout for an operation."""
+        config = _get_unified_config()
+        if config:
+            return config.timeouts.get(operation)
+        # Fallback to default
+        return float(os.getenv(f"CODING_COUNCIL_{operation.upper()}_TIMEOUT", "300"))
+
+    @classmethod
+    def get_max_concurrent(cls) -> int:
+        """Get max concurrent operations."""
+        config = _get_unified_config()
+        if config:
+            return config.max_concurrent_operations
+        return int(os.getenv("CODING_COUNCIL_MAX_CONCURRENT", "3"))
 
     # Auto-approval settings
     AUTO_APPROVE: bool = os.getenv("CODING_COUNCIL_AUTO_APPROVE", "false").lower() == "true"
