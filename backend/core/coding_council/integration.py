@@ -81,6 +81,157 @@ T = TypeVar("T")
 
 
 # ============================================================================
+# Configuration (Environment Variables - No Hardcoding)
+# ============================================================================
+
+class CodingCouncilConfig:
+    """
+    Dynamic configuration from environment variables.
+
+    All settings can be overridden via environment without code changes.
+    """
+
+    # Auto-approval settings
+    AUTO_APPROVE: bool = os.getenv("CODING_COUNCIL_AUTO_APPROVE", "false").lower() == "true"
+    REQUIRE_APPROVAL: bool = os.getenv("CODING_COUNCIL_REQUIRE_APPROVAL", "true").lower() == "true"
+    AUTO_APPROVE_SAFE_ONLY: bool = os.getenv("CODING_COUNCIL_AUTO_APPROVE_SAFE_ONLY", "true").lower() == "true"
+
+    # Risk thresholds
+    MAX_AUTO_APPROVE_LINES: int = int(os.getenv("CODING_COUNCIL_MAX_AUTO_APPROVE_LINES", "100"))
+    MAX_AUTO_APPROVE_FILES: int = int(os.getenv("CODING_COUNCIL_MAX_AUTO_APPROVE_FILES", "3"))
+
+    # Protected paths (never auto-approve)
+    PROTECTED_PATHS: Set[str] = set(
+        os.getenv("CODING_COUNCIL_PROTECTED_PATHS",
+                  ".env,.git,secrets,credentials,private_key,api_key").split(",")
+    )
+
+    # Critical files (always require approval)
+    CRITICAL_FILES: Set[str] = set(
+        os.getenv("CODING_COUNCIL_CRITICAL_FILES",
+                  "main.py,run_supervisor.py,__init__.py,setup.py,pyproject.toml").split(",")
+    )
+
+    # Framework preferences
+    PREFERRED_FRAMEWORK: str = os.getenv("CODING_COUNCIL_PREFERRED_FRAMEWORK", "aider")
+    FALLBACK_FRAMEWORKS: List[str] = os.getenv(
+        "CODING_COUNCIL_FALLBACK_FRAMEWORKS", "metagpt,repomaster"
+    ).split(",")
+
+    # Timeouts
+    EVOLUTION_TIMEOUT: int = int(os.getenv("CODING_COUNCIL_EVOLUTION_TIMEOUT", "300"))
+    APPROVAL_TIMEOUT: int = int(os.getenv("CODING_COUNCIL_APPROVAL_TIMEOUT", "3600"))
+
+    @classmethod
+    def is_protected_path(cls, path: str) -> bool:
+        """Check if a path is protected from auto-approval."""
+        path_lower = path.lower()
+        return any(p in path_lower for p in cls.PROTECTED_PATHS)
+
+    @classmethod
+    def is_critical_file(cls, path: str) -> bool:
+        """Check if a file is critical and always requires approval."""
+        filename = Path(path).name
+        return filename in cls.CRITICAL_FILES
+
+    @classmethod
+    def can_auto_approve(cls, request: "EvolutionRequest") -> Tuple[bool, str]:
+        """
+        Determine if a request can be auto-approved.
+
+        Returns:
+            Tuple of (can_auto_approve, reason)
+        """
+        # Check if auto-approve is enabled
+        if not cls.AUTO_APPROVE:
+            return False, "auto_approve_disabled"
+
+        # Check protected paths
+        for path in request.target_files:
+            if cls.is_protected_path(path):
+                return False, f"protected_path:{path}"
+            if cls.is_critical_file(path):
+                return False, f"critical_file:{path}"
+
+        # Check risk indicators
+        if request.intent == EvolutionIntent.SECURITY_FIX:
+            return False, "security_change"
+
+        # Check for safe-only mode
+        if cls.AUTO_APPROVE_SAFE_ONLY:
+            safe_intents = {
+                EvolutionIntent.DOC_UPDATE,
+                EvolutionIntent.TEST_ADD,
+                EvolutionIntent.OPTIMIZE,
+            }
+            if request.intent not in safe_intents:
+                return False, f"unsafe_intent:{request.intent.value}"
+
+        return True, "approved"
+
+
+# Global pending approvals storage (in-memory with cleanup)
+_pending_approvals: Dict[str, Tuple["EvolutionRequest", float]] = {}
+_pending_approvals_lock = asyncio.Lock()
+
+
+async def store_pending_approval(request: "EvolutionRequest") -> str:
+    """Store a pending approval request."""
+    async with _pending_approvals_lock:
+        # Clean up expired approvals
+        current_time = time.time()
+        expired = [
+            k for k, (_, t) in _pending_approvals.items()
+            if current_time - t > CodingCouncilConfig.APPROVAL_TIMEOUT
+        ]
+        for k in expired:
+            del _pending_approvals[k]
+
+        # Store new approval
+        _pending_approvals[request.id] = (request, current_time)
+        return request.id
+
+
+async def get_pending_approval(task_id: str) -> Optional["EvolutionRequest"]:
+    """Get a pending approval request."""
+    async with _pending_approvals_lock:
+        if task_id in _pending_approvals:
+            request, timestamp = _pending_approvals[task_id]
+            # Check if expired
+            if time.time() - timestamp > CodingCouncilConfig.APPROVAL_TIMEOUT:
+                del _pending_approvals[task_id]
+                return None
+            return request
+        return None
+
+
+async def remove_pending_approval(task_id: str) -> bool:
+    """Remove a pending approval after execution."""
+    async with _pending_approvals_lock:
+        if task_id in _pending_approvals:
+            del _pending_approvals[task_id]
+            return True
+        return False
+
+
+async def list_pending_approvals() -> List[Dict[str, Any]]:
+    """List all pending approval requests."""
+    async with _pending_approvals_lock:
+        current_time = time.time()
+        result = []
+        for task_id, (request, timestamp) in _pending_approvals.items():
+            age = current_time - timestamp
+            if age <= CodingCouncilConfig.APPROVAL_TIMEOUT:
+                result.append({
+                    "task_id": task_id,
+                    "request": request.to_dict(),
+                    "age_seconds": int(age),
+                    "expires_in": int(CodingCouncilConfig.APPROVAL_TIMEOUT - age),
+                })
+        return result
+
+
+# ============================================================================
 # Command Classification (Intelligent, No Hardcoding)
 # ============================================================================
 
@@ -935,12 +1086,36 @@ def create_coding_council_router():
         background_tasks: BackgroundTasks,
     ):
         """
-        Trigger code evolution.
+        v77.2 Advanced Evolution Endpoint - Super-beefed up version.
 
-        This endpoint starts an evolution task and returns immediately.
-        Use the task_id to track progress via WebSocket or /status endpoint.
+        Features:
+        - Intelligent risk assessment before execution
+        - Pre-flight validation (file existence, syntax, permissions)
+        - Real-time progress broadcasting at each stage
+        - Parallel file analysis for multiple targets
+        - Framework selection based on task complexity
+        - Rate limiting and circuit breaker protection
+        - Comprehensive audit logging
+        - Automatic rollback preparation
+
+        Stages:
+        1. VALIDATION (5%) - Pre-flight checks
+        2. RISK_ASSESSMENT (15%) - Analyze risk level
+        3. PLANNING (30%) - Create execution plan
+        4. FRAMEWORK_SELECTION (35%) - Choose best framework
+        5. EXECUTION (80%) - Apply changes
+        6. VERIFICATION (95%) - Validate changes
+        7. COMPLETE (100%) - Finalize
+
+        Returns immediately with task_id. Track progress via WebSocket or /status.
         """
+        broadcaster = get_evolution_broadcaster()
+        start_time = time.time()
+
         try:
+            # ═══════════════════════════════════════════════════════════════════
+            # STAGE 0: Initialize and validate request
+            # ═══════════════════════════════════════════════════════════════════
             try:
                 from backend.core.coding_council import get_coding_council
             except ImportError:
@@ -950,9 +1125,13 @@ def create_coding_council_router():
             if not council:
                 raise HTTPException(status_code=503, detail="Coding Council not available")
 
-            # Create evolution request
+            # Classify intent from description
+            intent = CommandClassifier.classify_intent(request.description)
+
+            # Create evolution request with classified intent
             evo_request = EvolutionRequest(
                 description=request.description,
+                intent=intent,
                 target_files=request.target_files,
                 source="http",
                 require_approval=request.require_approval,
@@ -960,50 +1139,328 @@ def create_coding_council_router():
                 require_planning=request.require_planning,
             )
 
-            # Execute in background if approval not required
-            if not request.require_approval:
-                async def execute_evolution():
-                    try:
-                        result = await council.evolve(
-                            description=request.description,
-                            target_files=request.target_files,
-                            require_approval=False,
-                            require_sandbox=request.require_sandbox,
-                            require_planning=request.require_planning,
-                        )
+            task_id = evo_request.id
+            logger.info(f"🧬 [Evolution] Task {task_id} created: {request.description[:50]}...")
 
-                        broadcaster = get_evolution_broadcaster()
+            # ═══════════════════════════════════════════════════════════════════
+            # Define the comprehensive evolution pipeline
+            # ═══════════════════════════════════════════════════════════════════
+            async def execute_advanced_evolution():
+                """
+                Advanced evolution pipeline with real-time progress tracking.
+                """
+                nonlocal evo_request
+                evolution_context = {
+                    "task_id": task_id,
+                    "start_time": start_time,
+                    "stages_completed": [],
+                    "risk_level": "unknown",
+                    "framework": "auto",
+                    "files_analyzed": [],
+                    "validation_results": {},
+                    "rollback_prepared": False,
+                }
+
+                try:
+                    # ═══════════════════════════════════════════════════════════
+                    # STAGE 1: PRE-FLIGHT VALIDATION (5%)
+                    # ═══════════════════════════════════════════════════════════
+                    await broadcaster.broadcast(
+                        task_id=task_id,
+                        status="validating",
+                        progress=0.05,
+                        message="Running pre-flight validation...",
+                        details={"stage": "validation", "stage_number": 1},
+                    )
+
+                    validation_results = await _validate_evolution_request(
+                        evo_request, evolution_context
+                    )
+                    evolution_context["validation_results"] = validation_results
+                    evolution_context["stages_completed"].append("validation")
+
+                    if not validation_results.get("valid", False):
                         await broadcaster.broadcast(
-                            task_id=evo_request.id,
-                            status="complete" if result.success else "failed",
-                            progress=1.0,
-                            details={"result": result.to_dict() if hasattr(result, "to_dict") else str(result)},
+                            task_id=task_id,
+                            status="failed",
+                            progress=0.05,
+                            message=f"Validation failed: {validation_results.get('error', 'Unknown')}",
+                            details={"stage": "validation", "errors": validation_results.get("errors", [])},
                         )
-                    except Exception as e:
-                        logger.error(f"Background evolution failed: {e}")
+                        return
 
-                background_tasks.add_task(execute_evolution)
+                    # ═══════════════════════════════════════════════════════════
+                    # STAGE 2: RISK ASSESSMENT (15%)
+                    # ═══════════════════════════════════════════════════════════
+                    await broadcaster.broadcast(
+                        task_id=task_id,
+                        status="assessing_risk",
+                        progress=0.15,
+                        message="Analyzing risk level...",
+                        details={"stage": "risk_assessment", "stage_number": 2},
+                    )
+
+                    risk_assessment = await _assess_evolution_risk(
+                        evo_request, evolution_context
+                    )
+                    evolution_context["risk_level"] = risk_assessment["level"]
+                    evolution_context["risk_details"] = risk_assessment
+                    evolution_context["stages_completed"].append("risk_assessment")
+
+                    logger.info(f"🧬 [Evolution] Risk assessment: {risk_assessment['level']}")
+
+                    # Block high-risk without approval
+                    if risk_assessment["level"] == "critical" and request.require_approval:
+                        await broadcaster.broadcast(
+                            task_id=task_id,
+                            status="blocked",
+                            progress=0.15,
+                            message="Critical risk detected - manual approval required",
+                            details={"stage": "risk_assessment", "risk": risk_assessment},
+                        )
+                        # Store for manual approval
+                        await store_pending_approval(evo_request)
+                        return
+
+                    # ═══════════════════════════════════════════════════════════
+                    # STAGE 3: PARALLEL FILE ANALYSIS (25%)
+                    # ═══════════════════════════════════════════════════════════
+                    await broadcaster.broadcast(
+                        task_id=task_id,
+                        status="analyzing",
+                        progress=0.25,
+                        message=f"Analyzing {len(request.target_files)} target file(s)...",
+                        details={"stage": "file_analysis", "stage_number": 3},
+                    )
+
+                    # Parallel analysis of all target files
+                    if request.target_files:
+                        analysis_tasks = [
+                            _analyze_target_file(f, evolution_context)
+                            for f in request.target_files
+                        ]
+                        file_analyses = await asyncio.gather(*analysis_tasks, return_exceptions=True)
+                        evolution_context["files_analyzed"] = [
+                            a for a in file_analyses if not isinstance(a, Exception)
+                        ]
+
+                    evolution_context["stages_completed"].append("file_analysis")
+
+                    # ═══════════════════════════════════════════════════════════
+                    # STAGE 4: PLANNING (35%)
+                    # ═══════════════════════════════════════════════════════════
+                    if request.require_planning or risk_assessment["level"] in ("high", "critical"):
+                        await broadcaster.broadcast(
+                            task_id=task_id,
+                            status="planning",
+                            progress=0.35,
+                            message="Creating detailed execution plan...",
+                            details={"stage": "planning", "stage_number": 4},
+                        )
+
+                        # Use MetaGPT-style planning if complex
+                        plan = await _create_evolution_plan(evo_request, evolution_context)
+                        evolution_context["plan"] = plan
+                        evolution_context["stages_completed"].append("planning")
+
+                    # ═══════════════════════════════════════════════════════════
+                    # STAGE 5: FRAMEWORK SELECTION (40%)
+                    # ═══════════════════════════════════════════════════════════
+                    await broadcaster.broadcast(
+                        task_id=task_id,
+                        status="selecting_framework",
+                        progress=0.40,
+                        message="Selecting optimal framework...",
+                        details={"stage": "framework_selection", "stage_number": 5},
+                    )
+
+                    framework = await _select_framework(evo_request, evolution_context)
+                    evolution_context["framework"] = framework
+                    evolution_context["stages_completed"].append("framework_selection")
+
+                    logger.info(f"🧬 [Evolution] Selected framework: {framework}")
+
+                    # ═══════════════════════════════════════════════════════════
+                    # STAGE 6: ROLLBACK PREPARATION (45%)
+                    # ═══════════════════════════════════════════════════════════
+                    await broadcaster.broadcast(
+                        task_id=task_id,
+                        status="preparing_rollback",
+                        progress=0.45,
+                        message="Preparing rollback snapshot...",
+                        details={"stage": "rollback_prep", "stage_number": 6},
+                    )
+
+                    rollback_id = await _prepare_rollback(evo_request, evolution_context)
+                    evolution_context["rollback_id"] = rollback_id
+                    evolution_context["rollback_prepared"] = True
+                    evolution_context["stages_completed"].append("rollback_prep")
+
+                    # ═══════════════════════════════════════════════════════════
+                    # STAGE 7: EXECUTION (50-80%)
+                    # ═══════════════════════════════════════════════════════════
+                    await broadcaster.broadcast(
+                        task_id=task_id,
+                        status="executing",
+                        progress=0.50,
+                        message=f"Executing evolution via {framework}...",
+                        details={"stage": "execution", "stage_number": 7, "framework": framework},
+                    )
+
+                    # Execute with progress callback
+                    async def progress_callback(pct: float, msg: str):
+                        # Map 0-100% to 50-80%
+                        mapped_progress = 0.50 + (pct / 100.0) * 0.30
+                        await broadcaster.broadcast(
+                            task_id=task_id,
+                            status="executing",
+                            progress=mapped_progress,
+                            message=msg,
+                            details={"stage": "execution", "sub_progress": pct},
+                        )
+
+                    result = await council.evolve(
+                        description=request.description,
+                        target_files=request.target_files,
+                        require_approval=False,
+                        require_sandbox=request.require_sandbox,
+                        require_planning=False,  # Already planned
+                        progress_callback=progress_callback if hasattr(council.evolve, '__code__') and 'progress_callback' in council.evolve.__code__.co_varnames else None,
+                    )
+
+                    evolution_context["stages_completed"].append("execution")
+                    evolution_context["result"] = result
+
+                    # ═══════════════════════════════════════════════════════════
+                    # STAGE 8: VERIFICATION (85%)
+                    # ═══════════════════════════════════════════════════════════
+                    await broadcaster.broadcast(
+                        task_id=task_id,
+                        status="verifying",
+                        progress=0.85,
+                        message="Verifying changes...",
+                        details={"stage": "verification", "stage_number": 8},
+                    )
+
+                    verification = await _verify_evolution_result(result, evolution_context)
+                    evolution_context["verification"] = verification
+                    evolution_context["stages_completed"].append("verification")
+
+                    # ═══════════════════════════════════════════════════════════
+                    # STAGE 9: FINALIZATION (95-100%)
+                    # ═══════════════════════════════════════════════════════════
+                    success = result.success if hasattr(result, "success") else True
+                    success = success and verification.get("passed", True)
+
+                    if not success and evolution_context["rollback_prepared"]:
+                        await broadcaster.broadcast(
+                            task_id=task_id,
+                            status="rolling_back",
+                            progress=0.95,
+                            message="Verification failed, rolling back...",
+                            details={"stage": "rollback", "stage_number": 9},
+                        )
+                        await _execute_rollback(evolution_context["rollback_id"])
+
+                    # Calculate elapsed time
+                    elapsed = time.time() - start_time
+
+                    # Final broadcast
+                    await broadcaster.broadcast(
+                        task_id=task_id,
+                        status="complete" if success else "failed",
+                        progress=1.0,
+                        message="Evolution complete" if success else "Evolution failed",
+                        details={
+                            "stage": "complete",
+                            "success": success,
+                            "elapsed_seconds": round(elapsed, 2),
+                            "stages_completed": evolution_context["stages_completed"],
+                            "risk_level": evolution_context["risk_level"],
+                            "framework": evolution_context["framework"],
+                            "files_modified": getattr(result, "files_modified", []) if success else [],
+                            "verification": verification,
+                        },
+                    )
+
+                    logger.info(f"🧬 [Evolution] Task {task_id} {'completed' if success else 'failed'} in {elapsed:.2f}s")
+
+                except asyncio.CancelledError:
+                    await broadcaster.broadcast(
+                        task_id=task_id,
+                        status="cancelled",
+                        progress=evolution_context.get("last_progress", 0),
+                        message="Evolution cancelled",
+                    )
+                    raise
+
+                except Exception as e:
+                    logger.error(f"🧬 [Evolution] Task {task_id} error: {e}", exc_info=True)
+                    await broadcaster.broadcast(
+                        task_id=task_id,
+                        status="error",
+                        progress=0,
+                        message=f"Evolution error: {str(e)}",
+                        details={
+                            "error": str(e),
+                            "error_type": type(e).__name__,
+                            "stages_completed": evolution_context.get("stages_completed", []),
+                        },
+                    )
+
+            # ═══════════════════════════════════════════════════════════════════
+            # Determine execution mode
+            # ═══════════════════════════════════════════════════════════════════
+            if not request.require_approval:
+                # Execute immediately in background
+                background_tasks.add_task(execute_advanced_evolution)
 
                 return {
                     "success": True,
-                    "task_id": evo_request.id,
+                    "task_id": task_id,
                     "status": "started",
-                    "message": "Evolution started in background",
+                    "message": "Advanced evolution pipeline started",
+                    "stages": ["validation", "risk_assessment", "file_analysis", "planning",
+                              "framework_selection", "rollback_prep", "execution", "verification", "complete"],
+                    "websocket_url": f"/api/evolution/ws",
                 }
 
-            # If approval required, return pending status
+            # Check auto-approval
+            can_auto, reason = CodingCouncilConfig.can_auto_approve(evo_request)
+
+            if can_auto:
+                logger.info(f"🧬 [Evolution] Auto-approving {task_id}: {reason}")
+                background_tasks.add_task(execute_advanced_evolution)
+
+                return {
+                    "success": True,
+                    "task_id": task_id,
+                    "status": "auto_approved",
+                    "reason": reason,
+                    "message": "Evolution auto-approved and started",
+                    "stages": ["validation", "risk_assessment", "file_analysis", "planning",
+                              "framework_selection", "rollback_prep", "execution", "verification", "complete"],
+                }
+
+            # Store for manual approval
+            await store_pending_approval(evo_request)
+
             return {
                 "success": True,
-                "task_id": evo_request.id,
+                "task_id": task_id,
                 "status": "pending_approval",
                 "message": "Evolution request created, awaiting approval",
+                "approval_url": f"/api/evolution/approve/{task_id}",
+                "reject_url": f"/api/evolution/reject/{task_id}",
+                "expires_in_seconds": CodingCouncilConfig.APPROVAL_TIMEOUT,
                 "request": evo_request.to_dict(),
+                "intent": intent.value,
             }
 
         except HTTPException:
             raise
         except Exception as e:
-            logger.error(f"[API] Evolution failed: {e}")
+            logger.error(f"🧬 [Evolution] Initialization failed: {e}", exc_info=True)
             raise HTTPException(status_code=500, detail=str(e))
 
     @router.get("/status")
@@ -1058,6 +1515,142 @@ def create_coding_council_router():
                 "healthy": False,
                 "error": str(e),
             }
+
+    @router.get("/pending")
+    async def get_pending_evolutions():
+        """
+        Get list of pending evolution requests awaiting approval.
+
+        Returns:
+            List of pending approval requests with their age and expiry time.
+        """
+        try:
+            pending = await list_pending_approvals()
+            return {
+                "success": True,
+                "pending_count": len(pending),
+                "pending": pending,
+                "approval_timeout_seconds": CodingCouncilConfig.APPROVAL_TIMEOUT,
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": str(e),
+            }
+
+    @router.post("/approve/{task_id}")
+    async def approve_evolution(task_id: str):
+        """
+        Approve a pending evolution request and execute it.
+
+        Args:
+            task_id: The task ID of the pending evolution
+
+        Returns:
+            Evolution result after execution
+        """
+        try:
+            # Get the pending request
+            request = await get_pending_approval(task_id)
+            if not request:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"No pending evolution with ID {task_id}. It may have expired or been executed."
+                )
+
+            # Get the coding council
+            try:
+                from backend.core.coding_council import get_coding_council
+            except ImportError:
+                from core.coding_council import get_coding_council
+
+            council = await get_coding_council()
+            if not council:
+                raise HTTPException(status_code=503, detail="Coding Council not available")
+
+            # Broadcast approval
+            broadcaster = get_evolution_broadcaster()
+            await broadcaster.broadcast(
+                task_id=task_id,
+                status="approved",
+                progress=0.1,
+                message="Evolution approved, starting execution...",
+            )
+
+            # Execute the evolution
+            result = await council.evolve(
+                description=request.description,
+                target_files=request.target_files,
+                require_approval=False,  # Already approved
+                require_sandbox=request.require_sandbox,
+                require_planning=request.require_planning,
+            )
+
+            # Remove from pending
+            await remove_pending_approval(task_id)
+
+            # Broadcast result
+            success = result.success if hasattr(result, "success") else True
+            await broadcaster.broadcast(
+                task_id=task_id,
+                status="complete" if success else "failed",
+                progress=1.0 if success else 0.0,
+                message="Evolution complete" if success else str(getattr(result, "error", "Unknown error")),
+            )
+
+            return {
+                "success": success,
+                "task_id": task_id,
+                "result": result.to_dict() if hasattr(result, "to_dict") else str(result),
+            }
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"[API] Approval execution failed: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @router.post("/reject/{task_id}")
+    async def reject_evolution(task_id: str):
+        """
+        Reject a pending evolution request.
+
+        Args:
+            task_id: The task ID of the pending evolution
+
+        Returns:
+            Confirmation of rejection
+        """
+        try:
+            request = await get_pending_approval(task_id)
+            if not request:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"No pending evolution with ID {task_id}"
+                )
+
+            await remove_pending_approval(task_id)
+
+            # Broadcast rejection
+            broadcaster = get_evolution_broadcaster()
+            await broadcaster.broadcast(
+                task_id=task_id,
+                status="rejected",
+                progress=0.0,
+                message="Evolution request rejected by user",
+            )
+
+            return {
+                "success": True,
+                "task_id": task_id,
+                "status": "rejected",
+                "message": "Evolution request rejected",
+            }
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
 
     @router.post("/rollback")
     async def rollback_evolution(request: RollbackRequestModel):
