@@ -266,6 +266,17 @@ except ImportError as e:
     # logger not yet defined at module load time
     ADVANCED_V780_AVAILABLE = False
 
+# v79.0: Voice Announcer Integration
+try:
+    from .voice_announcer import (
+        get_evolution_announcer,
+        CodingCouncilVoiceAnnouncer,
+    )
+    VOICE_ANNOUNCER_AVAILABLE = True
+except ImportError:
+    VOICE_ANNOUNCER_AVAILABLE = False
+    get_evolution_announcer = None  # type: ignore
+
 logger = logging.getLogger(__name__)
 
 
@@ -1122,6 +1133,84 @@ class UnifiedCodingCouncil:
         # Cross-Repo Transaction Coordinator (atomic multi-repo commits)
         self._cross_repo_tx: Optional[CrossRepoTransactionCoordinator] = None
 
+        # =================================================================
+        # v79.0: Voice Announcer Integration
+        # =================================================================
+        self._voice_announcer: Optional[CodingCouncilVoiceAnnouncer] = None
+        self._voice_announcer_checked = False
+
+    async def _announce_progress(
+        self,
+        task_id: str,
+        stage: str,
+        message: str,
+        progress: int = 0,
+        error: Optional[str] = None,
+    ) -> None:
+        """
+        v79.0: Announce evolution progress via voice.
+
+        This is a fire-and-forget operation - voice failures don't affect
+        the evolution pipeline.
+        """
+        if not VOICE_ANNOUNCER_AVAILABLE:
+            return
+
+        # Lazy initialize voice announcer
+        if not self._voice_announcer_checked:
+            self._voice_announcer_checked = True
+            try:
+                if get_evolution_announcer:
+                    self._voice_announcer = get_evolution_announcer()
+                    logger.info("[v79.0] Voice announcer initialized for orchestrator")
+            except Exception as e:
+                logger.debug(f"[v79.0] Voice announcer not available: {e}")
+                self._voice_announcer = None
+
+        if not self._voice_announcer:
+            return
+
+        try:
+            # Fire and forget - don't await to avoid blocking evolution
+            asyncio.create_task(
+                self._voice_announcer.announce_progress(
+                    task_id=task_id,
+                    stage=stage,
+                    message=message,
+                    progress=progress,
+                )
+            )
+        except Exception as e:
+            # Log but don't fail - voice is non-critical
+            logger.debug(f"[v79.0] Voice announcement failed: {e}")
+
+    async def _announce_completion(
+        self,
+        task_id: str,
+        success: bool,
+        files_modified: int,
+        execution_time_ms: float,
+        error: Optional[str] = None,
+    ) -> None:
+        """
+        v79.0: Announce evolution completion via voice.
+        """
+        if not VOICE_ANNOUNCER_AVAILABLE or not self._voice_announcer:
+            return
+
+        try:
+            asyncio.create_task(
+                self._voice_announcer.announce_completion(
+                    task_id=task_id,
+                    success=success,
+                    files_modified=files_modified,
+                    execution_time_ms=execution_time_ms,
+                    error=error,
+                )
+            )
+        except Exception as e:
+            logger.debug(f"[v79.0] Voice completion announcement failed: {e}")
+
     async def initialize(self) -> bool:
         """Initialize the Coding Council."""
         if self._initialized:
@@ -1587,6 +1676,14 @@ class UnifiedCodingCouncil:
             # Phase 0: Pre-flight checks
             await self._pre_flight_checks(task)
 
+            # v79.0: Announce task start
+            await self._announce_progress(
+                task_id=task.task_id,
+                stage="requested",
+                message=f"Starting evolution: {task.description[:50]}..." if len(task.description) > 50 else f"Starting evolution: {task.description}",
+                progress=5,
+            )
+
             # Acquire task semaphore
             async with self._task_semaphore:
                 self._active_tasks[task.task_id] = task
@@ -1607,6 +1704,14 @@ class UnifiedCodingCouncil:
                     task.current_phase = "analysis"
                     task.progress_percent = 10
 
+                    # v79.0: Announce analysis phase
+                    await self._announce_progress(
+                        task_id=task.task_id,
+                        stage="analyzing",
+                        message="Analyzing codebase structure and dependencies",
+                        progress=10,
+                    )
+
                     analysis = None
                     if self.router.should_use_analysis(task):
                         analysis = await self._run_analysis(task)
@@ -1620,6 +1725,14 @@ class UnifiedCodingCouncil:
                     task.status = TaskStatus.PLANNING
                     task.current_phase = "planning"
                     task.progress_percent = 30
+
+                    # v79.0: Announce planning phase
+                    await self._announce_progress(
+                        task_id=task.task_id,
+                        stage="planning",
+                        message="Planning code changes and modifications",
+                        progress=30,
+                    )
 
                     plan = None
                     if self.router.should_use_planning(task):
@@ -1645,6 +1758,14 @@ class UnifiedCodingCouncil:
                     task.status = TaskStatus.EXECUTING
                     task.current_phase = "execution"
                     task.progress_percent = 50
+
+                    # v79.0: Announce execution phase
+                    await self._announce_progress(
+                        task_id=task.task_id,
+                        stage="generating",
+                        message=f"Executing changes via {framework.value}",
+                        progress=50,
+                    )
 
                     # v78.0: Track operation for adaptive timeout statistics
                     if self._timeout_manager:
@@ -1681,6 +1802,14 @@ class UnifiedCodingCouncil:
                     task.current_phase = "validation"
                     task.progress_percent = 80
 
+                    # v79.0: Announce validation phase
+                    await self._announce_progress(
+                        task_id=task.task_id,
+                        stage="testing",
+                        message=f"Validating {len(framework_result.files_modified)} modified files",
+                        progress=80,
+                    )
+
                     validation = await self.validator.validate_files(
                         framework_result.files_modified
                     )
@@ -1709,6 +1838,14 @@ class UnifiedCodingCouncil:
                     self._stats["tasks_completed"] += 1
                     self._stats["frameworks_used"][framework.value] += 1
 
+                    # v79.0: Announce successful completion
+                    await self._announce_progress(
+                        task_id=task.task_id,
+                        stage="complete",
+                        message=f"Evolution complete! {len(framework_result.files_modified)} files modified",
+                        progress=100,
+                    )
+
                 finally:
                     # Always release hot reload lock
                     await self.hot_reload_lock.release()
@@ -1729,11 +1866,29 @@ class UnifiedCodingCouncil:
                 )
                 self._stats["rollbacks_performed"] += 1
 
+            # v79.0: Announce timeout failure
+            await self._announce_progress(
+                task_id=task.task_id,
+                stage="failed",
+                message=f"Evolution timed out after {timeout}s - changes rolled back",
+                progress=0,
+                error=result.error,
+            )
+
         except Exception as e:
             result.error = str(e)
             task.status = TaskStatus.FAILED
             self._stats["tasks_failed"] += 1
             logger.error(f"[CodingCouncil] Task {task.task_id} failed: {e}")
+
+            # v79.0: Announce error failure
+            await self._announce_progress(
+                task_id=task.task_id,
+                stage="failed",
+                message=f"Evolution failed: {str(e)[:100]}",
+                progress=0,
+                error=str(e),
+            )
 
         # Record execution time
         result.execution_time_ms = (time.time() - start_time) * 1000

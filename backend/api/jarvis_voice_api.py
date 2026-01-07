@@ -4652,34 +4652,290 @@ async def get_drift_status(user_id: Optional[str] = None):
         logger.error(f"Drift status error: {e}")
         raise HTTPException(status_code=500, detail=f"Drift status failed: {str(e)}")
 
-        if not vbi._drift_detector_available or not vbi._drift_detector:
+
+# =============================================================================
+# v79.0: CODING COUNCIL VOICE ENDPOINTS
+# =============================================================================
+# Voice integration endpoints for the Coding Council evolution system.
+# Provides voice status, history, test, and config APIs.
+# =============================================================================
+
+# Lazy import for voice announcer to avoid circular dependencies
+_voice_announcer_cache = None
+_voice_announcer_checked = False
+
+async def _get_voice_announcer():
+    """Lazily get the Coding Council Voice Announcer instance."""
+    global _voice_announcer_cache, _voice_announcer_checked
+
+    if _voice_announcer_checked:
+        return _voice_announcer_cache
+
+    _voice_announcer_checked = True
+
+    try:
+        from ..core.coding_council.voice_announcer import get_evolution_announcer
+        _voice_announcer_cache = get_evolution_announcer()
+        logger.info("[v79.0] Voice announcer loaded successfully")
+    except ImportError as e:
+        logger.warning(f"[v79.0] Voice announcer not available: {e}")
+        _voice_announcer_cache = None
+    except Exception as e:
+        logger.warning(f"[v79.0] Voice announcer initialization failed: {e}")
+        _voice_announcer_cache = None
+
+    return _voice_announcer_cache
+
+
+@router.get("/voice/coding-council/status")
+async def get_coding_council_voice_status():
+    """
+    v79.0: Get Coding Council Voice Announcer status and statistics.
+
+    Returns:
+    - Announcer availability
+    - Circuit breaker status
+    - Task registry status
+    - Recent announcement statistics
+    """
+    try:
+        announcer = await _get_voice_announcer()
+
+        if announcer is None:
             return {
                 "available": False,
-                "message": "Drift detection not enabled",
-                "drift_status": {},
+                "reason": "Voice announcer not initialized",
+                "timestamp": time.time(),
             }
 
-        # Get drift status
-        status = await vbi._drift_detector.get_status(
-            user_id=user_id or vbi._owner_name or "owner"
-        )
+        # Get status from announcer
+        status = await announcer.get_status() if hasattr(announcer, 'get_status') else {}
 
         return {
             "available": True,
-            "user_id": user_id or vbi._owner_name,
-            "drift_status": status,
-            "config": {
-                "threshold": vbi._config.drift_threshold,
-                "auto_adapt": vbi._config.drift_auto_adapt,
-                "adaptation_rate": vbi._config.drift_adaptation_rate,
-            },
-            "stats": {
-                "drift_detections": vbi._stats.get('drift_detections', 0),
-            },
+            "status": status.get("status", "operational"),
+            "circuit_breaker": status.get("circuit_breaker", {}),
+            "task_registry": status.get("task_registry", {}),
+            "statistics": status.get("statistics", {}),
+            "config": status.get("config", {}),
+            "timestamp": time.time(),
         }
 
-    except HTTPException:
-        raise
     except Exception as e:
-        logger.error(f"Drift status error: {e}")
-        raise HTTPException(status_code=500, detail=f"Drift status failed: {str(e)}")
+        logger.error(f"[v79.0] Voice status error: {e}")
+        return {
+            "available": False,
+            "error": str(e),
+            "timestamp": time.time(),
+        }
+
+
+@router.get("/voice/coding-council/history")
+async def get_coding_council_voice_history(limit: int = 10):
+    """
+    v79.0: Get recent voice announcement history from Coding Council.
+
+    Args:
+    - **limit**: Maximum number of announcements to return (default: 10)
+
+    Returns:
+    - List of recent announcements with timestamps
+    """
+    try:
+        announcer = await _get_voice_announcer()
+
+        if announcer is None:
+            return {
+                "available": False,
+                "history": [],
+                "timestamp": time.time(),
+            }
+
+        # Get history from announcer
+        history = []
+        if hasattr(announcer, '_message_cache') and announcer._message_cache:
+            # Get recent items from message cache
+            for key, value in list(announcer._message_cache._cache.items())[:limit]:
+                history.append({
+                    "key": key,
+                    "message": value.get("message", "") if isinstance(value, dict) else str(value),
+                    "timestamp": value.get("timestamp", 0) if isinstance(value, dict) else 0,
+                })
+
+        return {
+            "available": True,
+            "history": history,
+            "count": len(history),
+            "limit": limit,
+            "timestamp": time.time(),
+        }
+
+    except Exception as e:
+        logger.error(f"[v79.0] Voice history error: {e}")
+        return {
+            "available": False,
+            "history": [],
+            "error": str(e),
+            "timestamp": time.time(),
+        }
+
+
+@router.post("/voice/coding-council/test")
+async def test_coding_council_voice(message: str = "Testing Coding Council voice announcer"):
+    """
+    v79.0: Test the voice announcement system.
+
+    Args:
+    - **message**: Test message to announce (default: test message)
+
+    Returns:
+    - Success status and announcement details
+    """
+    try:
+        announcer = await _get_voice_announcer()
+
+        if announcer is None:
+            return {
+                "success": False,
+                "reason": "Voice announcer not available",
+                "timestamp": time.time(),
+            }
+
+        # Try to announce the test message
+        success = False
+        if hasattr(announcer, 'announce_progress'):
+            success = await announcer.announce_progress(
+                task_id="test-" + str(int(time.time())),
+                stage="testing",
+                message=message,
+                progress=50,
+            )
+
+        return {
+            "success": success,
+            "message": message,
+            "timestamp": time.time(),
+        }
+
+    except Exception as e:
+        logger.error(f"[v79.0] Voice test error: {e}")
+        return {
+            "success": False,
+            "error": str(e),
+            "timestamp": time.time(),
+        }
+
+
+@router.get("/voice/coding-council/config")
+async def get_coding_council_voice_config():
+    """
+    v79.0: Get current voice announcer configuration.
+
+    Returns:
+    - Voice announcement settings
+    - Cooldown timings
+    - Feature flags
+    """
+    try:
+        announcer = await _get_voice_announcer()
+
+        if announcer is None:
+            return {
+                "available": False,
+                "config": {},
+                "timestamp": time.time(),
+            }
+
+        # Get config from announcer
+        config = {}
+        if hasattr(announcer, '_config'):
+            cfg = announcer._config
+            config = {
+                "enabled": cfg.enabled if hasattr(cfg, 'enabled') else True,
+                "voice_cooldown": getattr(cfg, 'voice_cooldown', 2.0),
+                "circuit_breaker_threshold": getattr(cfg, 'circuit_breaker_threshold', 5),
+                "circuit_breaker_recovery": getattr(cfg, 'circuit_breaker_recovery', 30),
+                "max_concurrent_announcements": getattr(cfg, 'max_concurrent_announcements', 3),
+                "enable_trinity_broadcasts": getattr(cfg, 'enable_trinity_broadcasts', True),
+                "enable_approval_voice": getattr(cfg, 'enable_approval_voice', True),
+            }
+
+        return {
+            "available": True,
+            "config": config,
+            "timestamp": time.time(),
+        }
+
+    except Exception as e:
+        logger.error(f"[v79.0] Voice config error: {e}")
+        return {
+            "available": False,
+            "config": {},
+            "error": str(e),
+            "timestamp": time.time(),
+        }
+
+
+@router.post("/voice/coding-council/approval-response")
+async def submit_evolution_approval_response(
+    task_id: str,
+    approved: bool,
+    reason: Optional[str] = None
+):
+    """
+    v79.0: Submit approval/rejection for an evolution task.
+
+    Args:
+    - **task_id**: The task ID to approve/reject
+    - **approved**: True to approve, False to reject
+    - **reason**: Optional reason for the decision
+
+    Returns:
+    - Confirmation of the approval response
+    """
+    try:
+        announcer = await _get_voice_announcer()
+
+        # Also try to notify the orchestrator directly
+        result = {
+            "task_id": task_id,
+            "approved": approved,
+            "reason": reason,
+            "acknowledged": False,
+            "timestamp": time.time(),
+        }
+
+        # Try to find and notify the pending approval
+        if announcer and hasattr(announcer, '_pending_approvals'):
+            if task_id in announcer._pending_approvals:
+                approval_future = announcer._pending_approvals.pop(task_id, None)
+                if approval_future and not approval_future.done():
+                    approval_future.set_result((approved, reason))
+                    result["acknowledged"] = True
+
+        # Announce the decision
+        if announcer and hasattr(announcer, 'announce_progress'):
+            decision_message = f"Evolution {'approved' if approved else 'rejected'}"
+            if reason:
+                decision_message += f": {reason}"
+            await announcer.announce_progress(
+                task_id=task_id,
+                stage="approval_response",
+                message=decision_message,
+                progress=100 if approved else 0,
+            )
+
+        return result
+
+    except Exception as e:
+        logger.error(f"[v79.0] Approval response error: {e}")
+        return {
+            "task_id": task_id,
+            "approved": approved,
+            "error": str(e),
+            "acknowledged": False,
+            "timestamp": time.time(),
+        }
+
+
+# v79.0: Coding Council voice integration endpoints complete

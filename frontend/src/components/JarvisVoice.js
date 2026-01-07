@@ -726,6 +726,23 @@ const JarvisVoice = () => {
   const [ghostDisplayStatus, setGhostDisplayStatus] = useState(null);
   // { available, status, window_count, apps, resolution }
 
+  // ═══════════════════════════════════════════════════════════════════
+  // v79.0: CODING COUNCIL EVOLUTION PROGRESS STATE
+  // ═══════════════════════════════════════════════════════════════════
+  // Real-time tracking of code evolution/generation from Coding Council
+  // Enables visual feedback for: analysis → planning → generation → testing
+  // ═══════════════════════════════════════════════════════════════════
+  const [evolutionProgress, setEvolutionProgress] = useState(null);
+  // { taskId, stage, stageName, stageIcon, progress, message, details, error, timestamp }
+  const [evolutionHistory, setEvolutionHistory] = useState([]);
+  // History of evolution stages for timeline display
+  const [evolutionApprovalRequest, setEvolutionApprovalRequest] = useState(null);
+  // Pending approval request: { taskId, description, riskLevel, target, confidence }
+  const evolutionTimeoutRef = useRef(null);
+  // Auto-hide timeout for evolution progress
+  const [codingCouncilAnnouncements, setCodingCouncilAnnouncements] = useState([]);
+  // Recent voice announcements from Coding Council
+
   const typingTimeoutRef = useRef(null);
 
   const wsRef = useRef(null);
@@ -2710,6 +2727,336 @@ const JarvisVoice = () => {
           console.log('🎤 Skipping narration - speak flag is false or no message');
         }
         break;
+
+      // ═══════════════════════════════════════════════════════════════════
+      // v79.0: CODING COUNCIL EVOLUTION HANDLERS
+      // ═══════════════════════════════════════════════════════════════════
+      // Real-time voice announcements and progress tracking for code evolution
+      // Integrates with backend CodingCouncilVoiceAnnouncer (v79.1)
+      // ═══════════════════════════════════════════════════════════════════
+
+      case 'coding_council_announcement': {
+        // Voice announcement from Coding Council system
+        const announcement = data.announcement || data;
+        const message = announcement.message || data.message || '';
+        const priority = announcement.priority || data.priority || 'medium';
+        const source = announcement.source || data.source || 'coding_council';
+        const taskId = announcement.task_id || data.task_id || '';
+        const stage = announcement.stage || data.stage || '';
+        const shouldSpeak = announcement.speak !== false && data.speak !== false;
+
+        console.log('%c[🏛️ Coding Council Announcement]', 'color: #9b59b6; font-weight: bold',
+          `[${priority.toUpperCase()}] ${message}`);
+
+        // Add to announcements history (keep last 20)
+        setCodingCouncilAnnouncements(prev => {
+          const newAnnouncement = {
+            id: `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+            message,
+            priority,
+            source,
+            taskId,
+            stage,
+            timestamp: Date.now(),
+          };
+          return [newAnnouncement, ...prev.slice(0, 19)];
+        });
+
+        // Update response display for high priority announcements
+        if (priority === 'high' || priority === 'critical') {
+          setResponse(message);
+        }
+
+        // Speak the announcement if enabled
+        if (shouldSpeak && message) {
+          const isPriorityHigh = priority === 'high' || priority === 'critical';
+          speakResponse(message, isPriorityHigh);
+        }
+        break;
+      }
+
+      case 'evolution_progress': {
+        // Real-time evolution progress updates from Coding Council
+        const taskId = data.task_id || data.taskId || '';
+        const stage = data.stage || 'processing';
+        const progress = data.progress || 0;
+        const message = data.message || data.status_message || '';
+        const details = data.details || {};
+        const error = data.error || null;
+
+        // Stage icon mapping for evolution stages
+        const getEvolutionStageIcon = (stageName) => {
+          const icons = {
+            // Request stages
+            'requested': '📥',
+            'validating': '🔍',
+            'approval_pending': '⏳',
+
+            // Analysis stages
+            'analyzing': '🧠',
+            'planning': '📋',
+
+            // Generation stages
+            'generating': '⚡',
+            'writing': '✏️',
+            'coding': '💻',
+
+            // Testing stages
+            'testing': '🧪',
+            'verifying': '✅',
+
+            // Completion stages
+            'applying': '🔧',
+            'cross_repo_sync': '🔄',
+            'complete': '🎉',
+            'success': '✨',
+
+            // Error stages
+            'failed': '❌',
+            'rollback': '⏮️',
+            'error': '⚠️',
+          };
+          return icons[stageName?.toLowerCase()] || '🔧';
+        };
+
+        // Calculate stage name for display
+        const stageName = stage.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+
+        console.log('%c[🧬 Evolution Progress]', 'color: #27ae60; font-weight: bold',
+          `${stage} (${progress}%) - ${message}`);
+
+        // Determine status
+        const isError = stage === 'failed' || stage === 'error' || stage === 'rollback';
+        const isComplete = stage === 'complete' || stage === 'success' || progress >= 100;
+        const status = isError ? 'failed' : isComplete ? 'complete' : 'in_progress';
+
+        // Update evolution progress state
+        setEvolutionProgress({
+          taskId,
+          stage,
+          stageName,
+          stageIcon: getEvolutionStageIcon(stage),
+          progress,
+          message,
+          details,
+          error,
+          status,
+          timestamp: Date.now(),
+        });
+
+        // Update response for significant stages
+        if (message && progress > 0 && progress < 100) {
+          setResponse(`🧬 ${stageName}: ${message}`);
+        }
+
+        // Add to history for significant progress points
+        const significantThresholds = [25, 50, 75, 100];
+        const significantStages = ['analyzing', 'planning', 'generating', 'testing', 'complete', 'failed'];
+        const shouldAddToHistory = significantThresholds.includes(progress) ||
+          significantStages.includes(stage?.toLowerCase());
+
+        if (shouldAddToHistory) {
+          setEvolutionHistory(prev => {
+            // Avoid duplicates
+            if (prev.some(h => h.stage === stage && h.progress === progress)) {
+              return prev;
+            }
+            return [...prev.slice(-9), {
+              taskId,
+              stage,
+              stageName,
+              stageIcon: getEvolutionStageIcon(stage),
+              progress,
+              message,
+              status,
+              timestamp: Date.now(),
+            }];
+          });
+        }
+
+        // Auto-clear on completion or error
+        if (isComplete || isError) {
+          if (evolutionTimeoutRef.current) {
+            clearTimeout(evolutionTimeoutRef.current);
+          }
+          evolutionTimeoutRef.current = setTimeout(() => {
+            setEvolutionProgress(null);
+            if (isComplete) {
+              setEvolutionHistory([]);
+            }
+          }, isError ? 10000 : 5000);
+        }
+        break;
+      }
+
+      case 'evolution_complete': {
+        // Evolution task completion notification
+        const taskId = data.task_id || data.taskId || '';
+        const success = data.success !== false;
+        const filesModified = data.files_modified || data.filesModified || 0;
+        const description = data.description || data.message || '';
+        const duration = data.duration_ms || data.duration || 0;
+
+        console.log('%c[🎉 Evolution Complete]', 'color: #27ae60; font-weight: bold; font-size: 14px',
+          success ? `✅ Success! ${filesModified} files modified` : `❌ Failed: ${description}`);
+
+        // Build completion message
+        const completionMessage = success
+          ? `Evolution complete! ${filesModified} file${filesModified !== 1 ? 's' : ''} modified${duration > 0 ? ` in ${(duration / 1000).toFixed(1)}s` : ''}.`
+          : `Evolution failed: ${description || 'Unknown error'}`;
+
+        // Update progress to complete state
+        setEvolutionProgress(prev => prev ? {
+          ...prev,
+          stage: success ? 'complete' : 'failed',
+          stageName: success ? 'Complete' : 'Failed',
+          stageIcon: success ? '🎉' : '❌',
+          progress: 100,
+          status: success ? 'complete' : 'failed',
+          message: completionMessage,
+          details: {
+            ...prev.details,
+            filesModified,
+            duration,
+            success,
+          },
+          timestamp: Date.now(),
+        } : null);
+
+        // Update response
+        setResponse(completionMessage);
+
+        // Speak completion
+        if (data.speak !== false) {
+          speakResponse(completionMessage, true);
+        }
+
+        // Auto-clear after delay
+        if (evolutionTimeoutRef.current) {
+          clearTimeout(evolutionTimeoutRef.current);
+        }
+        evolutionTimeoutRef.current = setTimeout(() => {
+          setEvolutionProgress(null);
+          setEvolutionHistory([]);
+        }, success ? 5000 : 10000);
+        break;
+      }
+
+      case 'evolution_approval_request': {
+        // Request for user approval before proceeding with evolution
+        const taskId = data.task_id || data.taskId || '';
+        const description = data.description || data.message || '';
+        const riskLevel = data.risk_level || data.riskLevel || 'high';
+        const target = data.target || '';
+        const confidence = data.confidence || 0.85;
+        const timeoutMs = data.timeout_ms || data.timeout || 60000;
+
+        console.log('%c[⚠️ Evolution Approval Request]', 'color: #e67e22; font-weight: bold; font-size: 14px',
+          `[${riskLevel.toUpperCase()}] ${description}`);
+
+        // Set approval request state
+        setEvolutionApprovalRequest({
+          taskId,
+          description,
+          riskLevel,
+          target,
+          confidence,
+          timeoutMs,
+          timestamp: Date.now(),
+        });
+
+        // Update response to show approval request
+        const approvalMessage = `🔐 Approval needed: ${description}. Risk: ${riskLevel}. Say "approve" or "reject".`;
+        setResponse(approvalMessage);
+
+        // Speak the approval request
+        if (data.speak !== false) {
+          speakResponse(approvalMessage, true);
+        }
+
+        // Auto-timeout the approval request
+        setTimeout(() => {
+          setEvolutionApprovalRequest(prev => {
+            if (prev && prev.taskId === taskId) {
+              // Send timeout response to backend
+              if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+                wsRef.current.send(JSON.stringify({
+                  type: 'evolution_approval_response',
+                  task_id: taskId,
+                  approved: false,
+                  reason: 'timeout',
+                }));
+              }
+              return null;
+            }
+            return prev;
+          });
+        }, timeoutMs);
+        break;
+      }
+
+      case 'trinity_voice_broadcast': {
+        // Cross-repo voice broadcast from Trinity architecture
+        const source = data.source_repo || data.source || 'unknown';
+        const message = data.message || '';
+        const priority = data.priority || 'medium';
+        const eventType = data.event_type || 'notification';
+
+        console.log('%c[🔺 Trinity Voice Broadcast]', 'color: #3498db; font-weight: bold',
+          `[${source}] ${message}`);
+
+        // Map source to display icon
+        const sourceIcons = {
+          'jarvis': '🤖',
+          'j_prime': '🧠',
+          'reactor_core': '⚡',
+          'coding_council': '🏛️',
+        };
+        const sourceIcon = sourceIcons[source?.toLowerCase()] || '🔺';
+
+        // Add to announcements with Trinity source
+        setCodingCouncilAnnouncements(prev => {
+          const newBroadcast = {
+            id: `trinity-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+            message: `${sourceIcon} [${source}] ${message}`,
+            priority,
+            source: `trinity_${source}`,
+            taskId: data.task_id || '',
+            stage: eventType,
+            timestamp: Date.now(),
+            isTrinityBroadcast: true,
+          };
+          return [newBroadcast, ...prev.slice(0, 19)];
+        });
+
+        // Update response for important broadcasts
+        if (priority === 'high' || priority === 'critical') {
+          setResponse(`${sourceIcon} ${message}`);
+        }
+
+        // Speak the broadcast if enabled
+        if (data.speak !== false && message) {
+          speakResponse(message, priority === 'high' || priority === 'critical');
+        }
+        break;
+      }
+
+      case 'evolution_status': {
+        // General evolution status update (similar to evolution_progress but more general)
+        const status = data.status || 'unknown';
+        const message = data.message || '';
+        const taskId = data.task_id || '';
+
+        console.log('%c[📊 Evolution Status]', 'color: #9b59b6',
+          `[${status}] ${message}`);
+
+        // Update response for status changes
+        if (message) {
+          setResponse(`🧬 ${message}`);
+        }
+        break;
+      }
+
       default:
         break;
     }
