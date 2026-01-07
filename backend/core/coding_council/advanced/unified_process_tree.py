@@ -636,11 +636,22 @@ class UnifiedProcessTree:
                 self.log.warning(f"[ProcessTree] CRASH detected: {node.name} (PID {pid})")
                 await self._fire_callback("on_crash", node)
 
-            # Check heartbeat timeout
-            elif node.is_alive and not node.is_healthy:
-                if node.state == ProcessState.RUNNING:
-                    node.state = ProcessState.DEGRADED
-                    self.log.warning(f"[ProcessTree] DEGRADED: {node.name} (PID {pid}) - heartbeat timeout")
+            # v78.1: Auto-heartbeat for processes verified alive via psutil
+            # If process is alive (verified by OS), automatically update heartbeat
+            # This prevents false DEGRADED states for processes that don't self-report
+            elif node.is_alive:
+                # Process is alive - update heartbeat if metrics were successfully gathered
+                if node.metrics.last_updated > node.last_heartbeat:
+                    node.update_heartbeat()
+                    # Recover from degraded state if now healthy
+                    if node.state == ProcessState.DEGRADED:
+                        node.state = ProcessState.RUNNING
+                        self.log.info(f"[ProcessTree] RECOVERED: {node.name} (PID {pid}) - now healthy")
+                # Only mark as degraded if we can't verify via psutil AND heartbeat timed out
+                elif not node.is_healthy and not node.metrics.last_updated:
+                    if node.state == ProcessState.RUNNING:
+                        node.state = ProcessState.DEGRADED
+                        self.log.warning(f"[ProcessTree] DEGRADED: {node.name} (PID {pid}) - no metrics or heartbeat")
 
             # Check for orphans
             if node.parent_pid and node.parent_pid not in self._nodes:
@@ -813,14 +824,22 @@ class UnifiedProcessTree:
 # =============================================================================
 
 _process_tree: Optional[UnifiedProcessTree] = None
-_tree_lock = asyncio.Lock()
+_tree_lock: Optional[asyncio.Lock] = None  # v78.1: Lazy init for Python 3.9 compat
+
+
+def _get_tree_lock() -> asyncio.Lock:
+    """v78.1: Lazy lock initialization to avoid 'no running event loop' error on import."""
+    global _tree_lock
+    if _tree_lock is None:
+        _tree_lock = asyncio.Lock()
+    return _tree_lock
 
 
 async def get_process_tree() -> UnifiedProcessTree:
     """Get or create the singleton process tree instance."""
     global _process_tree
 
-    async with _tree_lock:
+    async with _get_tree_lock():
         if _process_tree is None:
             _process_tree = UnifiedProcessTree()
             # Try to load previous state

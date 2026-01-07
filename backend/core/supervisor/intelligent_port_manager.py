@@ -703,10 +703,15 @@ class IntelligentPortManager:
             return await self._use_fallback_port(info)
 
         finally:
-            # Ensure all tasks are cancelled
+            # v78.1: Ensure all tasks are properly cancelled AND awaited
+            # This prevents task leaks and "task was destroyed but pending" warnings
             for task in tasks:
                 if not task.done():
                     task.cancel()
+
+            # Wait for all cancelled tasks to finish
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _graceful_http_shutdown(self, info: ProcessInfo) -> CleanupResult:
         """Attempt graceful HTTP shutdown for JARVIS Prime instances."""
@@ -907,6 +912,7 @@ class IntelligentPortManager:
 
     async def _get_pid_on_port(self, port: int) -> Optional[int]:
         """Get PID of process using a port."""
+        proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 "lsof", "-t", "-i", f":{port}",
@@ -923,6 +929,13 @@ class IntelligentPortManager:
             return None
 
         except asyncio.TimeoutError:
+            # v78.1: Properly cleanup subprocess on timeout to prevent zombies
+            if proc is not None:
+                try:
+                    proc.kill()
+                    await proc.wait()
+                except ProcessLookupError:
+                    pass
             return None
         except Exception:
             return None

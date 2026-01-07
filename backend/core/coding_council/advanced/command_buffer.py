@@ -620,14 +620,22 @@ class CommandBuffer:
 # =============================================================================
 
 _command_buffer: Optional[CommandBuffer] = None
-_buffer_lock = asyncio.Lock()
+_buffer_lock: Optional[asyncio.Lock] = None  # v78.1: Lazy init for Python 3.9 compat
+
+
+def _get_buffer_lock() -> asyncio.Lock:
+    """v78.1: Lazy lock initialization to avoid 'no running event loop' error on import."""
+    global _buffer_lock
+    if _buffer_lock is None:
+        _buffer_lock = asyncio.Lock()
+    return _buffer_lock
 
 
 async def get_command_buffer() -> CommandBuffer:
     """Get or create the singleton command buffer instance."""
     global _command_buffer
 
-    async with _buffer_lock:
+    async with _get_buffer_lock():
         if _command_buffer is None:
             _command_buffer = CommandBuffer()
             # Try to load previous state

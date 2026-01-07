@@ -779,14 +779,22 @@ class AdaptiveTimeoutManager:
 # =============================================================================
 
 _timeout_manager: Optional[AdaptiveTimeoutManager] = None
-_manager_lock = asyncio.Lock()
+_manager_lock: Optional[asyncio.Lock] = None  # v78.1: Lazy init for Python 3.9 compat
+
+
+def _get_manager_lock() -> asyncio.Lock:
+    """v78.1: Lazy lock initialization to avoid 'no running event loop' error on import."""
+    global _manager_lock
+    if _manager_lock is None:
+        _manager_lock = asyncio.Lock()
+    return _manager_lock
 
 
 async def get_timeout_manager() -> AdaptiveTimeoutManager:
     """Get or create the singleton timeout manager."""
     global _timeout_manager
 
-    async with _manager_lock:
+    async with _get_manager_lock():
         if _timeout_manager is None:
             _timeout_manager = AdaptiveTimeoutManager()
             await _timeout_manager.load_stats()

@@ -983,14 +983,22 @@ class AtomicCommandQueue:
 # =============================================================================
 
 _queues: Dict[str, AtomicCommandQueue] = {}
-_queues_lock = asyncio.Lock()
+_queues_lock: Optional[asyncio.Lock] = None  # v78.1: Lazy init for Python 3.9 compat
+
+
+def _get_queues_lock() -> asyncio.Lock:
+    """v78.1: Lazy lock initialization to avoid 'no running event loop' error on import."""
+    global _queues_lock
+    if _queues_lock is None:
+        _queues_lock = asyncio.Lock()
+    return _queues_lock
 
 
 async def get_atomic_queue(queue_name: str) -> AtomicCommandQueue:
     """Get or create an atomic queue instance."""
     global _queues
 
-    async with _queues_lock:
+    async with _get_queues_lock():
         if queue_name not in _queues:
             _queues[queue_name] = AtomicCommandQueue(queue_name)
         return _queues[queue_name]

@@ -797,14 +797,22 @@ def with_retry(
 # =============================================================================
 
 _retry_manager: Optional[IntelligentRetryManager] = None
-_manager_lock = asyncio.Lock()
+_manager_lock: Optional[asyncio.Lock] = None  # v78.1: Lazy init for Python 3.9 compat
+
+
+def _get_manager_lock() -> asyncio.Lock:
+    """v78.1: Lazy lock initialization to avoid 'no running event loop' error on import."""
+    global _manager_lock
+    if _manager_lock is None:
+        _manager_lock = asyncio.Lock()
+    return _manager_lock
 
 
 async def get_retry_manager() -> IntelligentRetryManager:
     """Get or create the singleton retry manager."""
     global _retry_manager
 
-    async with _manager_lock:
+    async with _get_manager_lock():
         if _retry_manager is None:
             _retry_manager = IntelligentRetryManager()
         return _retry_manager

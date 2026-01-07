@@ -263,6 +263,7 @@ class GitOperations:
 
     async def run_git(self, *args: str, timeout: float = 30.0) -> Tuple[bool, str]:
         """Run a git command and return (success, output)."""
+        proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 "git",
@@ -281,6 +282,13 @@ class GitOperations:
             return success, output
 
         except asyncio.TimeoutError:
+            # v78.1: Properly cleanup subprocess on timeout to prevent zombies
+            if proc is not None:
+                try:
+                    proc.kill()
+                    await proc.wait()
+                except ProcessLookupError:
+                    pass  # Process already dead
             return False, "Command timed out"
         except Exception as e:
             return False, str(e)
@@ -1067,14 +1075,22 @@ class CrossRepoTransactionCoordinator:
 # =============================================================================
 
 _coordinator: Optional[CrossRepoTransactionCoordinator] = None
-_coordinator_lock = asyncio.Lock()
+_coordinator_lock: Optional[asyncio.Lock] = None  # v78.1: Lazy init for Python 3.9 compat
+
+
+def _get_coordinator_lock() -> asyncio.Lock:
+    """v78.1: Lazy lock initialization to avoid 'no running event loop' error on import."""
+    global _coordinator_lock
+    if _coordinator_lock is None:
+        _coordinator_lock = asyncio.Lock()
+    return _coordinator_lock
 
 
 async def get_transaction_coordinator() -> CrossRepoTransactionCoordinator:
     """Get or create the singleton transaction coordinator."""
     global _coordinator
 
-    async with _coordinator_lock:
+    async with _get_coordinator_lock():
         if _coordinator is None:
             _coordinator = CrossRepoTransactionCoordinator()
             # Recover any incomplete transactions
