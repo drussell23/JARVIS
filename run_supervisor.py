@@ -2672,7 +2672,8 @@ class SupervisorBootstrapper:
                     ProcessRole,
                     JARVIS_TO_JPRIME,
                 )
-                import os
+                # NOTE: os is imported at module level (line 236), do not reimport here
+                # Reimporting inside the function causes UnboundLocalError at line 2453
 
                 # Initialize Process Tree Manager
                 self._process_tree = await get_process_tree()

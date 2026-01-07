@@ -289,10 +289,17 @@ class AtomicFileLock:
                 fcntl.flock(self._fd, lock_flags)
                 self._acquired = True
 
-                # Write our PID to lock file for stale lock detection
+                # v78.1: Write PID:generation:timestamp to lock file for enhanced stale detection
                 if self.lock_type == LockType.EXCLUSIVE:
+                    # Generation counter persisted per lock file
+                    generation = getattr(self, '_generation', 0) + 1
+                    self._generation = generation
+                    timestamp = time.time()
+                    lock_info = f"{os.getpid()}:{generation}:{timestamp}"
+
                     os.ftruncate(self._fd, 0)
-                    os.write(self._fd, str(os.getpid()).encode())
+                    os.lseek(self._fd, 0, os.SEEK_SET)
+                    os.write(self._fd, lock_info.encode())
                     os.fsync(self._fd)
 
                 return True
@@ -333,18 +340,52 @@ class AtomicFileLock:
         """
         Check if the current lock holder is dead.
 
-        If dead, clear the stale lock.
+        v78.1: Enhanced stale lock detection with generation counter and timestamp.
+        Lock file format: "pid:generation:timestamp"
+        - pid: Process ID of lock holder
+        - generation: Monotonically increasing counter per lock acquisition
+        - timestamp: Unix timestamp when lock was acquired
+
+        If dead or stale (> 5 minutes old), clear the stale lock.
         """
+        STALE_THRESHOLD_SECONDS = 300  # 5 minutes
+
         try:
             if not self.lock_file.exists():
                 return False
 
-            # Read PID from lock file
+            # Read lock info from file
             content = self.lock_file.read_text().strip()
             if not content:
                 return False
 
-            holder_pid = int(content)
+            # Parse lock file format
+            parts = content.split(":")
+            if len(parts) >= 1:
+                holder_pid = int(parts[0])
+            else:
+                return False
+
+            # Check timestamp if available (v78.1 format)
+            lock_timestamp = None
+            if len(parts) >= 3:
+                try:
+                    lock_timestamp = float(parts[2])
+                except ValueError:
+                    pass
+
+            # Check if lock is stale by timestamp
+            if lock_timestamp:
+                age_seconds = time.time() - lock_timestamp
+                if age_seconds > STALE_THRESHOLD_SECONDS:
+                    self.log.warning(
+                        f"[AtomicLock] Clearing stale lock (age: {age_seconds:.0f}s > {STALE_THRESHOLD_SECONDS}s)"
+                    )
+                    try:
+                        self.lock_file.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    return True
 
             # Check if process is still alive
             try:
@@ -355,7 +396,10 @@ class AtomicFileLock:
                 self.log.warning(
                     f"[AtomicLock] Clearing stale lock from dead PID {holder_pid}"
                 )
-                self.lock_file.unlink(missing_ok=True)
+                try:
+                    self.lock_file.unlink(missing_ok=True)
+                except Exception:
+                    pass
                 return True
             except PermissionError:
                 # Process exists but we can't signal it
@@ -456,20 +500,75 @@ class AtomicCommandQueue:
         except Exception:
             self._sequence_counter = 0
 
-    def _save_sequence_counter(self):
-        """Save sequence counter to disk atomically."""
+    def _atomic_increment_sequence(self) -> int:
+        """
+        Atomically increment sequence counter.
+
+        v78.1: Fixed race condition where crash between increment and save
+        could cause duplicate sequence IDs.
+
+        Uses file locking to ensure atomicity:
+        1. Lock sequence file
+        2. Read current value
+        3. Write incremented value
+        4. Release lock
+        5. Return new value
+        """
+        lock_file = self.sequence_file.with_suffix(".lock")
+
         try:
-            temp_file = self.sequence_file.with_suffix(".tmp")
-            temp_file.write_text(str(self._sequence_counter))
-            temp_file.rename(self.sequence_file)
+            # Open with exclusive lock
+            fd = os.open(str(lock_file), os.O_RDWR | os.O_CREAT, 0o666)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+
+                # Read current value from disk (not memory!)
+                if self.sequence_file.exists():
+                    try:
+                        current = int(self.sequence_file.read_text().strip())
+                    except (ValueError, OSError):
+                        current = self._sequence_counter
+                else:
+                    current = self._sequence_counter
+
+                # Increment and write atomically
+                new_value = current + 1
+                temp_file = self.sequence_file.with_suffix(".tmp")
+
+                # Write with explicit fsync for durability
+                with open(temp_file, 'w') as f:
+                    f.write(str(new_value))
+                    f.flush()
+                    os.fsync(f.fileno())
+
+                # Atomic rename
+                temp_file.rename(self.sequence_file)
+
+                # Update in-memory cache
+                self._sequence_counter = new_value
+
+                return new_value
+
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                os.close(fd)
+
         except Exception as e:
-            self.log.debug(f"[AtomicQueue] Failed to save sequence: {e}")
+            self.log.error(f"[AtomicQueue] Sequence increment failed: {e}")
+            # Fallback: Use timestamp + random for uniqueness
+            import random
+            fallback = int(time.time() * 1000000) + random.randint(0, 999999)
+            self._sequence_counter = fallback
+            return fallback
 
     def _generate_sequence_id(self) -> str:
-        """Generate a globally unique sequence ID."""
-        self._sequence_counter += 1
-        self._save_sequence_counter()
-        return f"{self.queue_name}:{self._sequence_counter}:{uuid4().hex[:8]}"
+        """
+        Generate a globally unique sequence ID.
+
+        v78.1: Uses atomic increment to prevent duplicate IDs on crash.
+        """
+        seq_num = self._atomic_increment_sequence()
+        return f"{self.queue_name}:{seq_num}:{uuid4().hex[:8]}"
 
     async def enqueue(
         self,

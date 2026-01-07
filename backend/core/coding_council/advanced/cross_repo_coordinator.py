@@ -386,6 +386,16 @@ class CrossRepoTransactionCoordinator:
         self._lock = asyncio.Lock()
         self._stats = CoordinatorStats()
 
+        # v78.1: Per-repo locks for transaction isolation
+        # Prevents concurrent modifications to same repo during 2PC
+        self._repo_locks: Dict[RepoScope, asyncio.Lock] = {
+            scope: asyncio.Lock() for scope in RepoScope if scope != RepoScope.ALL
+        }
+        # Track which transactions hold which locks
+        self._lock_holders: Dict[RepoScope, Optional[str]] = {
+            scope: None for scope in RepoScope if scope != RepoScope.ALL
+        }
+
         # Persistence
         self._journal_dir = Path.home() / ".jarvis" / "trinity" / "transactions"
         self._journal_dir.mkdir(parents=True, exist_ok=True)
@@ -394,35 +404,124 @@ class CrossRepoTransactionCoordinator:
         self._discover_repos()
 
     def _discover_repos(self):
-        """Discover repository paths dynamically."""
-        base_paths = [
-            Path.home() / "Documents" / "repos",
-            Path("/Users/djrussell23/Documents/repos"),
-            Path.cwd().parent,
-        ]
+        """
+        Discover repository paths dynamically with robust fallback chain.
 
-        repo_names = {
-            RepoScope.JARVIS: ["JARVIS-AI-Agent", "jarvis-ai-agent"],
-            RepoScope.JPRIME: ["jarvis-prime", "JARVIS-Prime"],
-            RepoScope.REACTOR: ["reactor-core", "Reactor-Core"],
+        v78.1: Fixed hardcoded paths issue. Now uses:
+        1. Environment variables (JARVIS_REPO_PATH, JPRIME_REPO_PATH, REACTOR_REPO_PATH)
+        2. JARVIS_REPOS_BASE for common parent directory
+        3. Dynamic home-based discovery
+        4. Relative path discovery from current working directory
+        """
+        # Environment variable overrides (highest priority)
+        env_overrides = {
+            RepoScope.JARVIS: os.getenv("JARVIS_REPO_PATH"),
+            RepoScope.JPRIME: os.getenv("JPRIME_REPO_PATH"),
+            RepoScope.REACTOR: os.getenv("REACTOR_REPO_PATH"),
         }
 
+        # Apply environment overrides first
+        for scope, env_path in env_overrides.items():
+            if env_path:
+                path = Path(env_path).expanduser().resolve()
+                if self._validate_repo(path):
+                    self._repo_paths[scope] = path
+                    self._git_ops[scope] = GitOperations(path, self.log)
+                    self.log.info(f"[CrossRepo] {scope.value} from env: {path}")
+
+        # Base paths for discovery (no hardcoded user paths)
+        repos_base = os.getenv("JARVIS_REPOS_BASE")
+        base_paths = []
+
+        if repos_base:
+            base_paths.append(Path(repos_base).expanduser().resolve())
+
+        base_paths.extend([
+            Path.home() / "Documents" / "repos",
+            Path.home() / "repos",
+            Path.home() / "Projects",
+            Path.home() / "dev",
+            Path.cwd().parent,
+            Path.cwd().parent.parent,
+        ])
+
+        # Remove duplicates while preserving order
+        seen = set()
+        unique_base_paths = []
+        for p in base_paths:
+            if p not in seen and p.exists():
+                seen.add(p)
+                unique_base_paths.append(p)
+
+        repo_names = {
+            RepoScope.JARVIS: ["JARVIS-AI-Agent", "jarvis-ai-agent", "jarvis"],
+            RepoScope.JPRIME: ["jarvis-prime", "JARVIS-Prime", "j-prime", "jprime"],
+            RepoScope.REACTOR: ["reactor-core", "Reactor-Core", "reactor"],
+        }
+
+        # Discover repos not already set via environment
+        discovered_paths = {}  # Track all discovered paths for logging
+
         for scope, names in repo_names.items():
-            for base in base_paths:
+            if scope in self._repo_paths:
+                continue  # Already set via environment
+
+            for base in unique_base_paths:
                 for name in names:
                     path = base / name
-                    if path.exists() and (path / ".git").exists():
-                        self._repo_paths[scope] = path
-                        self._git_ops[scope] = GitOperations(path, self.log)
-                        self.log.debug(f"[CrossRepo] Found {scope.value} at {path}")
-                        break
-                if scope in self._repo_paths:
-                    break
+                    if self._validate_repo(path):
+                        if scope not in discovered_paths:
+                            discovered_paths[scope] = []
+                        discovered_paths[scope].append(path)
 
+                        # Use first valid match
+                        if scope not in self._repo_paths:
+                            self._repo_paths[scope] = path
+                            self._git_ops[scope] = GitOperations(path, self.log)
+                            self.log.debug(f"[CrossRepo] Discovered {scope.value} at {path}")
+
+        # Log discovery summary with diagnostic info
         self.log.info(
-            f"[CrossRepo] Discovered {len(self._repo_paths)} repos: "
+            f"[CrossRepo] Discovered {len(self._repo_paths)}/3 repos: "
             f"{[r.value for r in self._repo_paths.keys()]}"
         )
+
+        # Warn about missing repos
+        missing = set(RepoScope) - set(self._repo_paths.keys())
+        if missing:
+            self.log.warning(
+                f"[CrossRepo] Missing repos: {[r.value for r in missing]}. "
+                f"Set JARVIS_REPOS_BASE or individual *_REPO_PATH env vars."
+            )
+
+        # Warn about multiple discoveries (potential version conflicts)
+        for scope, paths in discovered_paths.items():
+            if len(paths) > 1:
+                self.log.warning(
+                    f"[CrossRepo] Multiple {scope.value} repos found: {paths}. "
+                    f"Using: {self._repo_paths.get(scope)}"
+                )
+
+    def _validate_repo(self, path: Path) -> bool:
+        """
+        Validate that a path is a valid git repository.
+
+        v78.1: Enhanced validation beyond just .git existence.
+        """
+        if not path.exists():
+            return False
+
+        git_dir = path / ".git"
+        if not git_dir.exists():
+            return False
+
+        # Verify it's a valid git repo by checking HEAD exists
+        head_file = git_dir / "HEAD"
+        if not head_file.exists():
+            self.log.debug(f"[CrossRepo] Invalid repo (no HEAD): {path}")
+            return False
+
+        return True
 
     async def refresh_repo_info(self, scope: RepoScope) -> Optional[RepoInfo]:
         """Refresh information about a repository."""
@@ -502,9 +601,79 @@ class CrossRepoTransactionCoordinator:
 
             return tx
 
+    async def _acquire_repo_locks(self, tx: Transaction, timeout: float = 30.0) -> bool:
+        """
+        v78.1: Acquire locks on all repos involved in transaction.
+
+        Acquires locks in sorted order to prevent deadlocks.
+        Returns True if all locks acquired, False otherwise.
+        """
+        # Sort repos to prevent deadlock (always acquire in same order)
+        sorted_repos = sorted(tx.repos, key=lambda r: r.value)
+        acquired: List[RepoScope] = []
+
+        try:
+            for scope in sorted_repos:
+                if scope == RepoScope.ALL:
+                    continue
+
+                lock = self._repo_locks.get(scope)
+                if not lock:
+                    continue
+
+                try:
+                    # Try to acquire with timeout
+                    acquired_lock = await asyncio.wait_for(
+                        lock.acquire(),
+                        timeout=timeout / len(sorted_repos)
+                    )
+                    if acquired_lock:
+                        acquired.append(scope)
+                        self._lock_holders[scope] = tx.transaction_id
+                        self.log.debug(f"[CrossRepo] TX {tx.transaction_id} acquired lock on {scope.value}")
+                except asyncio.TimeoutError:
+                    self.log.warning(
+                        f"[CrossRepo] TX {tx.transaction_id} failed to acquire lock on {scope.value}"
+                    )
+                    # Release already acquired locks
+                    for acq_scope in acquired:
+                        self._repo_locks[acq_scope].release()
+                        self._lock_holders[acq_scope] = None
+                    return False
+
+            return True
+
+        except Exception as e:
+            self.log.error(f"[CrossRepo] Lock acquisition error: {e}")
+            # Release any acquired locks
+            for acq_scope in acquired:
+                try:
+                    self._repo_locks[acq_scope].release()
+                    self._lock_holders[acq_scope] = None
+                except Exception:
+                    pass
+            return False
+
+    def _release_repo_locks(self, tx: Transaction):
+        """v78.1: Release all locks held by a transaction."""
+        for scope in tx.repos:
+            if scope == RepoScope.ALL:
+                continue
+
+            if self._lock_holders.get(scope) == tx.transaction_id:
+                try:
+                    self._repo_locks[scope].release()
+                    self._lock_holders[scope] = None
+                    self.log.debug(f"[CrossRepo] TX {tx.transaction_id} released lock on {scope.value}")
+                except Exception as e:
+                    self.log.debug(f"[CrossRepo] Lock release error for {scope.value}: {e}")
+
     async def prepare(self, transaction_id: str) -> bool:
         """
         Execute Phase 1: Prepare all participants.
+
+        v78.1: Now acquires per-repo locks to ensure transaction isolation.
+        Locks are held until commit or abort.
 
         Returns:
             True if all participants voted YES
@@ -519,63 +688,69 @@ class CrossRepoTransactionCoordinator:
 
             tx.state = TransactionState.PREPARING
 
-        start_time = time.time()
-
-        # Prepare all repos in parallel
-        prepare_tasks = [
-            self._prepare_participant(tx, scope)
-            for scope in tx.repos
-        ]
-
-        try:
-            votes = await asyncio.wait_for(
-                asyncio.gather(*prepare_tasks, return_exceptions=True),
-                timeout=self.prepare_timeout
-            )
-        except asyncio.TimeoutError:
-            self.log.error(f"[CrossRepo] Prepare timeout for {transaction_id}")
+        # v78.1: Acquire per-repo locks BEFORE prepare phase
+        if not await self._acquire_repo_locks(tx, self.prepare_timeout / 2):
             async with self._lock:
                 tx.state = TransactionState.ABORTED
-                tx.error = "Prepare phase timeout"
+                tx.error = "Failed to acquire repo locks"
             return False
 
-        # Process votes
-        async with self._lock:
-            for vote in votes:
-                if isinstance(vote, Exception):
-                    self.log.error(f"[CrossRepo] Prepare error: {vote}")
-                    tx.votes["error"] = ParticipantVote(
-                        repo=RepoScope.ALL,
-                        vote=VoteResult.NO,
-                        reason=str(vote),
-                    )
-                elif isinstance(vote, ParticipantVote):
-                    tx.votes[vote.repo.value] = vote
+        start_time = time.time()
 
-            prepare_time_ms = (time.time() - start_time) * 1000
-            self._stats.avg_prepare_time_ms = (
-                self._stats.avg_prepare_time_ms + prepare_time_ms
-            ) / 2
+        try:
+            # Prepare all repos in parallel (locks already held)
+            prepare_tasks = [
+                self._prepare_participant(tx, scope)
+                for scope in tx.repos
+            ]
 
-            if tx.all_voted_yes:
-                tx.state = TransactionState.PREPARED
-                tx.prepared_at = time.time()
-                await self._journal_write(tx, "PREPARED")
-                self.log.info(f"[CrossRepo] Transaction prepared: {transaction_id}")
-                return True
-            else:
-                tx.state = TransactionState.ABORTED
-                self._stats.conflicts_detected += 1
-                await self._journal_write(tx, "PREPARE_FAILED")
-
-                # Log conflicts
-                for repo, vote in tx.votes.items():
-                    if vote.vote != VoteResult.YES:
-                        self.log.warning(
-                            f"[CrossRepo] {repo} voted NO: {vote.reason}"
-                        )
-
+            try:
+                votes = await asyncio.wait_for(
+                    asyncio.gather(*prepare_tasks, return_exceptions=True),
+                    timeout=self.prepare_timeout / 2  # Half timeout since lock already took some
+                )
+            except asyncio.TimeoutError:
+                self.log.error(f"[CrossRepo] Prepare timeout for {transaction_id}")
+                self._release_repo_locks(tx)  # Release locks on timeout
+                async with self._lock:
+                    tx.state = TransactionState.ABORTED
+                    tx.error = "Prepare phase timeout"
                 return False
+
+            # Process votes
+            async with self._lock:
+                for vote in votes:
+                    if isinstance(vote, Exception):
+                        self.log.error(f"[CrossRepo] Prepare error: {vote}")
+                        tx.votes["error"] = ParticipantVote(
+                            repo=RepoScope.ALL,
+                            vote=VoteResult.NO,
+                            reason=str(vote),
+                        )
+                    elif isinstance(vote, ParticipantVote):
+                        tx.votes[vote.repo.value] = vote
+
+                prepare_time_ms = (time.time() - start_time) * 1000
+                self._stats.avg_prepare_time_ms = (
+                    self._stats.avg_prepare_time_ms + prepare_time_ms
+                ) / 2
+
+                if tx.all_voted_yes:
+                    tx.state = TransactionState.PREPARED
+                    tx.prepared_at = time.time()
+                    await self._journal_write(tx, "PREPARED")
+                    self.log.info(f"[CrossRepo] Transaction prepared: {transaction_id}")
+                    # NOTE: Locks held until commit or abort
+                    return True
+                else:
+                    # Release locks if prepare failed
+                    self._release_repo_locks(tx)
+                    return False
+
+        except Exception as e:
+            # Release locks on any error
+            self._release_repo_locks(tx)
+            raise
 
     async def _prepare_participant(
         self,
@@ -664,6 +839,9 @@ class CrossRepoTransactionCoordinator:
                 await self._journal_write(tx, "COMMITTED")
 
             self.log.info(f"[CrossRepo] Transaction committed: {transaction_id}")
+
+            # v78.1: Release repo locks after successful commit
+            self._release_repo_locks(tx)
             return True
 
         except Exception as e:
@@ -678,6 +856,8 @@ class CrossRepoTransactionCoordinator:
                 self._stats.failed_transactions += 1
                 await self._journal_write(tx, "COMMIT_FAILED")
 
+            # v78.1: Release repo locks on failure
+            self._release_repo_locks(tx)
             return False
 
     async def abort(self, transaction_id: str) -> bool:
@@ -703,27 +883,73 @@ class CrossRepoTransactionCoordinator:
             self._stats.aborted_transactions += 1
             await self._journal_write(tx, "ABORTED")
 
+        # v78.1: Release repo locks after abort
+        self._release_repo_locks(tx)
+
         self.log.info(f"[CrossRepo] Transaction aborted: {transaction_id}")
         return True
 
-    async def _rollback(self, tx: Transaction, repos: List[RepoScope]):
-        """Rollback specified repos to their pre-transaction state."""
+    async def _rollback(self, tx: Transaction, repos: List[RepoScope]) -> Tuple[int, int]:
+        """
+        Rollback specified repos to their pre-transaction state.
+
+        v78.1: Enhanced with saga-style compensation:
+        - Tracks which repos are already rolled back (idempotency)
+        - Attempts all rollbacks even if some fail
+        - Returns (success_count, failure_count) tuple
+
+        Returns:
+            Tuple of (successful_rollbacks, failed_rollbacks)
+        """
+        # Track already rolled back repos for idempotency
+        if not hasattr(tx, '_rolled_back_repos'):
+            tx._rolled_back_repos = set()
+
+        success_count = 0
+        failure_count = 0
+
         for scope in repos:
+            # Idempotency check
+            if scope.value in tx._rolled_back_repos:
+                self.log.debug(f"[CrossRepo] {scope.value} already rolled back, skipping")
+                success_count += 1
+                continue
+
             git = self._git_ops.get(scope)
             if not git:
+                self.log.warning(f"[CrossRepo] No git ops for {scope.value}")
                 continue
 
             rollback_commit = tx.rollback_points.get(scope.value)
-            if rollback_commit:
-                success = await git.reset_to_commit(rollback_commit)
-                if success:
-                    self.log.info(f"[CrossRepo] Rolled back {scope.value}")
-                    self._stats.rollbacks_performed += 1
+
+            try:
+                if rollback_commit:
+                    success = await git.reset_to_commit(rollback_commit)
+                    if success:
+                        self.log.info(f"[CrossRepo] Rolled back {scope.value} to {rollback_commit[:8]}")
+                        self._stats.rollbacks_performed += 1
+                        tx._rolled_back_repos.add(scope.value)
+                        success_count += 1
+                    else:
+                        self.log.error(f"[CrossRepo] Failed to rollback {scope.value}")
+                        failure_count += 1
                 else:
-                    self.log.error(f"[CrossRepo] Failed to rollback {scope.value}")
-            else:
-                # Just unstage
-                await git.unstage_all()
+                    # Just unstage if no rollback point
+                    await git.unstage_all()
+                    tx._rolled_back_repos.add(scope.value)
+                    success_count += 1
+
+            except Exception as e:
+                self.log.error(f"[CrossRepo] Rollback error for {scope.value}: {e}")
+                failure_count += 1
+                # Continue with other repos - don't fail fast
+
+        if failure_count > 0:
+            self.log.warning(
+                f"[CrossRepo] Partial rollback: {success_count} succeeded, {failure_count} failed"
+            )
+
+        return success_count, failure_count
 
     async def get_transaction(self, transaction_id: str) -> Optional[Transaction]:
         """Get a transaction by ID."""

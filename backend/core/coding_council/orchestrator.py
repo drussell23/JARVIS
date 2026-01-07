@@ -257,6 +257,7 @@ try:
         # Cross-Repo Coordinator
         CrossRepoTransactionCoordinator,
         RepoScope,
+        CrossRepoTxState as TransactionState,  # v78.1: For shutdown cleanup
         get_transaction_coordinator,
         get_transaction_coordinator_sync,
     )
@@ -1335,20 +1336,81 @@ class UnifiedCodingCouncil:
         """Handler for graceful shutdown."""
         await self.shutdown()
 
-    async def shutdown(self) -> None:
-        """Shutdown the Coding Council."""
-        logger.info("[CodingCouncil] Shutting down...")
+    async def shutdown(self, drain_timeout: float = 30.0) -> None:
+        """
+        Shutdown the Coding Council gracefully.
+
+        v78.1: Enhanced with proper drain pattern:
+        1. Set shutdown flag to stop accepting new tasks
+        2. Wait for in-flight tasks to complete (with timeout)
+        3. Release all locks
+        4. Cleanup v78.0 components
+        5. Shutdown v77.0 modules in reverse order
+
+        Args:
+            drain_timeout: Maximum time to wait for in-flight tasks (default 30s)
+        """
+        logger.info("[CodingCouncil] Initiating graceful shutdown...")
         self._shutdown = True
 
         # Release hot reload lock if held
         if self.hot_reload_lock.is_held:
             await self.hot_reload_lock.release()
 
-        # Wait for active tasks
+        # v78.1: Proper drain pattern for in-flight tasks
         if self._active_tasks:
-            logger.info(f"[CodingCouncil] Waiting for {len(self._active_tasks)} active tasks...")
-            # Give tasks 30 seconds to complete
-            await asyncio.sleep(30)
+            num_tasks = len(self._active_tasks)
+            logger.info(f"[CodingCouncil] Draining {num_tasks} active task(s)...")
+
+            # Wait for tasks with periodic status updates
+            start_time = time.time()
+            check_interval = 5.0  # Check every 5 seconds
+
+            while self._active_tasks and (time.time() - start_time) < drain_timeout:
+                remaining = len(self._active_tasks)
+                elapsed = time.time() - start_time
+                logger.info(
+                    f"[CodingCouncil] {remaining} task(s) still running "
+                    f"({elapsed:.0f}s/{drain_timeout:.0f}s)..."
+                )
+                await asyncio.sleep(min(check_interval, drain_timeout - elapsed))
+
+            # Check if any tasks timed out
+            if self._active_tasks:
+                logger.warning(
+                    f"[CodingCouncil] Timeout waiting for {len(self._active_tasks)} task(s). "
+                    f"Forcing shutdown..."
+                )
+                # Clear active tasks to prevent blocking
+                self._active_tasks.clear()
+            else:
+                logger.info("[CodingCouncil] All tasks drained successfully")
+
+        # v78.1: Cleanup in-progress transactions
+        if self._cross_repo_tx:
+            try:
+                # Abort any pending transactions
+                pending_txs = await self._cross_repo_tx.list_transactions(
+                    state=TransactionState.PREPARING
+                )
+                for tx in pending_txs:
+                    logger.warning(f"[CodingCouncil] Aborting pending TX: {tx.transaction_id}")
+                    await self._cross_repo_tx.abort(tx.transaction_id)
+            except Exception as e:
+                logger.warning(f"[CodingCouncil] Transaction cleanup error: {e}")
+
+        # v78.1: Persist v78.0 component state
+        if self._timeout_manager:
+            try:
+                await self._timeout_manager.persist()
+            except Exception as e:
+                logger.warning(f"[CodingCouncil] Timeout manager persist error: {e}")
+
+        if self._retry_manager:
+            try:
+                await self._retry_manager.persist()
+            except Exception as e:
+                logger.warning(f"[CodingCouncil] Retry manager persist error: {e}")
 
         # =================================================================
         # Shutdown v77.0 Modules (reverse order of init)
