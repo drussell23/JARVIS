@@ -132,9 +132,10 @@ class IntelligentPortManager:
         primary_port: int = 8002,
         fallback_port_start: int = 8003,
         fallback_port_end: int = 8020,
-        max_cleanup_time_seconds: float = 10.0,  # Much faster than 21s!
+        max_cleanup_time_seconds: float = 15.0,  # v78.1: Increased from 10s to 15s
         adopt_existing_instances: bool = True,
-        health_probe_timeout: float = 2.0,
+        health_probe_timeout: float = 5.0,  # v78.1: Increased from 2s to 5s for slow startup
+        health_probe_retries: int = 3,  # v78.1: Added retry count
     ):
         self.host = host
         self.primary_port = primary_port
@@ -143,6 +144,7 @@ class IntelligentPortManager:
         self.max_cleanup_time = max_cleanup_time_seconds
         self.adopt_existing = adopt_existing_instances
         self.health_probe_timeout = health_probe_timeout
+        self.health_probe_retries = health_probe_retries  # v78.1: Store retry count
 
         # State tracking
         self._current_port = primary_port
@@ -445,22 +447,63 @@ class IntelligentPortManager:
             return False
 
     async def _probe_jarvis_health(self, port: int) -> bool:
-        """Quick health probe for JARVIS Prime."""
+        """
+        Health probe for JARVIS Prime with retry logic.
+
+        v78.1: Added configurable retries with exponential backoff for slow startups.
+        """
         try:
             import aiohttp
+        except ImportError:
+            logger.warning("[PortManager] aiohttp not available for health probe")
+            return False
 
-            url = f"http://{self.host}:{port}/health"
-            timeout = aiohttp.ClientTimeout(total=self.health_probe_timeout)
+        url = f"http://{self.host}:{port}/health"
+        per_request_timeout = self.health_probe_timeout / max(self.health_probe_retries, 1)
 
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(url) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        return data.get("status", "").lower() in ("ok", "healthy", "running")
+        last_error: Optional[str] = None
 
-        except Exception:
-            pass
+        for attempt in range(self.health_probe_retries):
+            try:
+                timeout = aiohttp.ClientTimeout(total=per_request_timeout)
 
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.get(url) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            status = data.get("status", "").lower()
+
+                            if status in ("ok", "healthy", "running"):
+                                if attempt > 0:
+                                    logger.debug(
+                                        f"[PortManager] Health probe succeeded on attempt {attempt + 1}/{self.health_probe_retries}"
+                                    )
+                                return True
+                            else:
+                                last_error = f"unhealthy status: {status}"
+                        else:
+                            last_error = f"HTTP {resp.status}"
+
+            except asyncio.TimeoutError:
+                last_error = f"timeout after {per_request_timeout:.1f}s"
+            except aiohttp.ClientConnectorError as e:
+                last_error = f"connection refused: {e}"
+            except Exception as e:
+                last_error = f"unexpected error: {type(e).__name__}: {e}"
+
+            # Exponential backoff between retries (0.2s, 0.4s, 0.8s...)
+            if attempt < self.health_probe_retries - 1:
+                backoff = 0.2 * (2 ** attempt)
+                logger.debug(
+                    f"[PortManager] Health probe attempt {attempt + 1}/{self.health_probe_retries} "
+                    f"failed ({last_error}), retrying in {backoff:.1f}s..."
+                )
+                await asyncio.sleep(backoff)
+
+        logger.debug(
+            f"[PortManager] Health probe failed after {self.health_probe_retries} attempts. "
+            f"Last error: {last_error}"
+        )
         return False
 
     # =========================================================================
@@ -518,8 +561,18 @@ class IntelligentPortManager:
 
         This is the key innovation: instead of sequential SIGINT → SIGTERM → SIGKILL,
         we start multiple strategies concurrently and use the first one that works.
+
+        v78.1: Enhanced with comprehensive diagnostic logging.
         """
         start_time = time.perf_counter()
+
+        # v78.1: Track strategy results for diagnostics
+        strategy_results: Dict[str, Optional[CleanupResult]] = {}
+
+        logger.info(
+            f"[PortManager] Starting parallel cleanup for PID {info.pid} on port {info.port} "
+            f"(max_time={self.max_cleanup_time}s, type={info.process_type.value})"
+        )
 
         # Create tasks for different cleanup strategies
         tasks = [
@@ -549,14 +602,31 @@ class IntelligentPortManager:
                 return_when=asyncio.FIRST_COMPLETED,
             )
 
+            elapsed_so_far = (time.perf_counter() - start_time) * 1000
+
+            # v78.1: Log which strategies completed vs timed out
+            completed_names = [t.get_name() for t in done]
+            pending_names = [t.get_name() for t in pending]
+            logger.debug(
+                f"[PortManager] After {elapsed_so_far:.0f}ms - "
+                f"completed: {completed_names}, pending: {pending_names}"
+            )
+
             # Cancel remaining tasks
             for task in pending:
                 task.cancel()
+                strategy_results[task.get_name()] = None  # Timed out
 
             # Check results
             for task in done:
-                if task.get_name() == "port_monitor" and port_free_event.is_set():
+                task_name = task.get_name()
+
+                if task_name == "port_monitor" and port_free_event.is_set():
                     elapsed = (time.perf_counter() - start_time) * 1000
+                    logger.info(
+                        f"[PortManager] ✅ Port {info.port} released (detected by monitor) "
+                        f"after {elapsed:.0f}ms"
+                    )
                     return CleanupResult(
                         success=True,
                         method="port_released",
@@ -566,15 +636,36 @@ class IntelligentPortManager:
 
                 try:
                     result = task.result()
-                    if isinstance(result, CleanupResult) and result.success:
-                        return result
-                except Exception:
-                    pass
+                    strategy_results[task_name] = result
+
+                    if isinstance(result, CleanupResult):
+                        if result.success:
+                            logger.info(
+                                f"[PortManager] ✅ Strategy '{task_name}' succeeded "
+                                f"in {result.elapsed_ms:.0f}ms"
+                            )
+                            return result
+                        else:
+                            logger.debug(
+                                f"[PortManager] Strategy '{task_name}' failed "
+                                f"after {result.elapsed_ms:.0f}ms: {result.error or 'no error info'}"
+                            )
+                except asyncio.CancelledError:
+                    strategy_results[task_name] = None
+                except Exception as e:
+                    logger.debug(
+                        f"[PortManager] Strategy '{task_name}' raised exception: {e}"
+                    )
+                    strategy_results[task_name] = None
 
             # Timeout - check if port is free anyway
             pid = await self._get_pid_on_port(info.port)
             if pid is None:
                 elapsed = (time.perf_counter() - start_time) * 1000
+                logger.info(
+                    f"[PortManager] ✅ Port {info.port} freed (post-timeout check) "
+                    f"after {elapsed:.0f}ms"
+                )
                 return CleanupResult(
                     success=True,
                     method="timeout_but_free",
@@ -582,15 +673,33 @@ class IntelligentPortManager:
                     port_freed=True,
                 )
 
-            # Cleanup failed - use fallback
+            # v78.1: Detailed failure diagnostics
+            elapsed = (time.perf_counter() - start_time) * 1000
+            diagnostics = []
+            for strategy, result in strategy_results.items():
+                if result is None:
+                    diagnostics.append(f"{strategy}=TIMEOUT")
+                elif result.success:
+                    diagnostics.append(f"{strategy}=OK({result.elapsed_ms:.0f}ms)")
+                else:
+                    diagnostics.append(
+                        f"{strategy}=FAILED({result.elapsed_ms:.0f}ms, {result.error or 'unknown'})"
+                    )
+
             logger.warning(
-                f"[PortManager] Parallel cleanup failed after {self.max_cleanup_time}s, "
-                f"using fallback port"
+                f"[PortManager] ⚠️ Parallel cleanup failed after {elapsed:.0f}ms. "
+                f"PID {info.pid} still holding port {info.port}. "
+                f"Strategy results: {', '.join(diagnostics)}. "
+                f"Using fallback port..."
             )
             return await self._use_fallback_port(info)
 
         except Exception as e:
-            logger.error(f"[PortManager] Parallel cleanup error: {e}")
+            elapsed = (time.perf_counter() - start_time) * 1000
+            logger.error(
+                f"[PortManager] ❌ Parallel cleanup error after {elapsed:.0f}ms: "
+                f"{type(e).__name__}: {e}"
+            )
             return await self._use_fallback_port(info)
 
         finally:

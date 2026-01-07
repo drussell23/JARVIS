@@ -557,14 +557,16 @@ class TrinityHealthMonitor:
 
     HEARTBEAT_TIMEOUT = 15.0  # 3 missed heartbeats (5s interval)
     CHECK_INTERVAL = 5.0
-    MAX_RESTART_ATTEMPTS = 3
-    RESTART_BACKOFF_BASE = 2.0
+    MAX_RESTART_ATTEMPTS = 5  # v78.1: Increased from 3 to 5
+    RESTART_BACKOFF_BASE = 1.5  # v78.1: Reduced from 2.0 to 1.5
+    MAX_BACKOFF_SECONDS = 60.0  # v78.1: Cap max backoff at 60 seconds
+    GRACE_PERIOD_SECONDS = 30.0  # v78.1: Grace period before first restart
 
     def __init__(self):
         self._monitoring_task: Optional[asyncio.Task] = None
         self._running = False
 
-        # Component states: "healthy", "degraded", "down", "restarting"
+        # Component states: "healthy", "degraded", "down", "restarting", "starting"
         self._component_states: Dict[str, str] = {
             "j_prime": "unknown",
             "reactor_core": "unknown",
@@ -577,6 +579,10 @@ class TrinityHealthMonitor:
             "reactor_core": 0,
         }
         self._last_restart_time: Dict[str, float] = {}
+
+        # v78.1: Track when we first saw each component (for grace period)
+        self._component_first_seen: Dict[str, float] = {}
+        self._component_last_healthy: Dict[str, float] = {}
 
         # Callbacks for restart triggers
         self._restart_callbacks: Dict[str, Any] = {}
@@ -650,9 +656,33 @@ class TrinityHealthMonitor:
         component: str,
         heartbeat_file: Path,
     ) -> None:
-        """Check a specific component's health."""
+        """
+        Check a specific component's health.
+
+        v78.1: Enhanced with grace period handling for startup scenarios.
+        """
+        now = time.time()
+
+        # v78.1: Initialize first-seen time if not set
+        if component not in self._component_first_seen:
+            self._component_first_seen[component] = now
+
+        time_since_first_seen = now - self._component_first_seen[component]
+        in_startup_grace = time_since_first_seen < self.GRACE_PERIOD_SECONDS
+
         # Check heartbeat file exists
         if not heartbeat_file.exists():
+            # v78.1: During startup grace period, missing heartbeat is expected
+            if in_startup_grace:
+                if self._component_states[component] not in ("starting", "unknown"):
+                    logger.info(
+                        f"[Trinity] {component} heartbeat not yet available "
+                        f"(grace: {self.GRACE_PERIOD_SECONDS - time_since_first_seen:.0f}s remaining)"
+                    )
+                self._component_states[component] = "starting"
+                return
+
+            # After grace period, missing heartbeat is a problem
             if self._component_states[component] != "down":
                 logger.warning(f"[Trinity] {component} heartbeat file missing")
             await self._handle_component_down(component, "heartbeat_missing")
@@ -661,13 +691,34 @@ class TrinityHealthMonitor:
         # Read heartbeat with safe JSON parsing
         state = read_json_safe(heartbeat_file)
         if not state:
+            # v78.1: During startup, corrupted heartbeat might be transient
+            if in_startup_grace:
+                logger.debug(f"[Trinity] {component} heartbeat parse failed during startup")
+                self._component_states[component] = "starting"
+                return
+
             await self._handle_component_down(component, "heartbeat_corrupted")
             return
 
         # Check heartbeat age
         timestamp = state.get("timestamp", 0)
-        age = time.time() - timestamp
-        if age > self.HEARTBEAT_TIMEOUT:
+        age = now - timestamp
+
+        # v78.1: Extended timeout during startup grace period
+        effective_timeout = self.HEARTBEAT_TIMEOUT
+        if in_startup_grace:
+            # Allow longer timeout during startup (components may be slow to initialize)
+            effective_timeout = self.GRACE_PERIOD_SECONDS
+
+        if age > effective_timeout:
+            # v78.1: Log differently based on startup vs normal operation
+            if in_startup_grace:
+                logger.debug(
+                    f"[Trinity] {component} heartbeat stale ({age:.1f}s) but still in grace period"
+                )
+                self._component_states[component] = "starting"
+                return
+
             await self._handle_component_down(
                 component,
                 f"heartbeat_stale_{age:.1f}s"
@@ -684,9 +735,13 @@ class TrinityHealthMonitor:
 
         # Component is healthy
         if self._component_states[component] != "healthy":
-            logger.info(f"[Trinity] {component} recovered to healthy state")
+            if self._component_states[component] == "starting":
+                logger.info(f"[Trinity] {component} completed startup (healthy)")
+            else:
+                logger.info(f"[Trinity] {component} recovered to healthy state")
 
         self._component_states[component] = "healthy"
+        self._component_last_healthy[component] = now
         self._restart_attempts[component] = 0  # Reset restart attempts
 
     def _extract_pid_from_instance_id(self, instance_id: str) -> Optional[int]:
@@ -716,21 +771,36 @@ class TrinityHealthMonitor:
         if old_state != "down":
             logger.error(f"[Trinity] {component} is DOWN: {reason}")
 
-        # Circuit breaker: check if we've exceeded restart attempts
+        # v78.1: Enhanced circuit breaker with reasonable backoff
         attempts = self._restart_attempts.get(component, 0)
+        last_restart = self._last_restart_time.get(component, 0)
+        time_since_restart = time.time() - last_restart if last_restart else float('inf')
+
         if attempts >= self.MAX_RESTART_ATTEMPTS:
-            # Check if enough time has passed for backoff reset
-            last_restart = self._last_restart_time.get(component, 0)
-            backoff_time = self.RESTART_BACKOFF_BASE ** attempts
-            if time.time() - last_restart < backoff_time * 60:
+            # Calculate backoff in SECONDS (not minutes!) with a cap
+            raw_backoff = self.RESTART_BACKOFF_BASE ** attempts
+            backoff_seconds = min(raw_backoff, self.MAX_BACKOFF_SECONDS)
+
+            if time_since_restart < backoff_seconds:
+                remaining = backoff_seconds - time_since_restart
                 logger.warning(
                     f"[Trinity] {component} restart circuit breaker OPEN "
-                    f"(attempts={attempts}, backoff={backoff_time:.0f}min)"
+                    f"(attempts={attempts}/{self.MAX_RESTART_ATTEMPTS}, "
+                    f"retry in {remaining:.0f}s)"
                 )
                 return
             else:
                 # Reset attempts after backoff period
+                logger.info(f"[Trinity] {component} circuit breaker RESET after {time_since_restart:.0f}s")
                 self._restart_attempts[component] = 0
+                attempts = 0
+
+        # v78.1: Grace period for new components (don't restart too quickly)
+        if attempts == 0 and time_since_restart < self.GRACE_PERIOD_SECONDS:
+            logger.debug(
+                f"[Trinity] {component} in grace period, {self.GRACE_PERIOD_SECONDS - time_since_restart:.0f}s remaining"
+            )
+            # Still allow first restart attempt, but log it
 
         # Trigger restart if callback registered
         if component in self._restart_callbacks:
@@ -742,6 +812,9 @@ class TrinityHealthMonitor:
         self._restart_attempts[component] = self._restart_attempts.get(component, 0) + 1
         self._last_restart_time[component] = time.time()
         self._components_restarted += 1
+
+        # v78.1: Reset first-seen time to give restarted component a fresh grace period
+        self._component_first_seen[component] = time.time()
 
         logger.info(
             f"[Trinity] Triggering {component} restart "
@@ -776,6 +849,17 @@ class TrinityHealthMonitor:
 
     def get_status(self) -> Dict[str, Any]:
         """Get health monitor status."""
+        now = time.time()
+
+        # v78.1: Calculate grace period remaining for each component
+        grace_remaining = {}
+        for comp, first_seen in self._component_first_seen.items():
+            time_since = now - first_seen
+            if time_since < self.GRACE_PERIOD_SECONDS:
+                grace_remaining[comp] = round(self.GRACE_PERIOD_SECONDS - time_since, 1)
+            else:
+                grace_remaining[comp] = 0
+
         return {
             "running": self._running,
             "component_states": self._component_states.copy(),
@@ -783,7 +867,203 @@ class TrinityHealthMonitor:
             "health_checks_performed": self._health_checks_performed,
             "components_restarted": self._components_restarted,
             "dead_letter_queue_size": self._commands_in_dlq,
+            # v78.1: Additional diagnostics
+            "grace_period_remaining": grace_remaining,
+            "last_healthy_times": {
+                comp: round(now - ts, 1) if ts else None
+                for comp, ts in self._component_last_healthy.items()
+            },
+            "circuit_breaker_status": {
+                comp: "OPEN" if attempts >= self.MAX_RESTART_ATTEMPTS else "CLOSED"
+                for comp, attempts in self._restart_attempts.items()
+            },
         }
+
+    # =========================================================================
+    # v78.1: STARTUP DEPENDENCY MANAGEMENT
+    # =========================================================================
+
+    async def check_startup_dependencies(self) -> Dict[str, Any]:
+        """
+        v78.1: Check Trinity startup dependencies before enabling full functionality.
+
+        Startup order:
+        1. Reactor-Core (nerves) - must be up first for message passing
+        2. J-Prime (mind) - depends on Reactor-Core for communication
+        3. JARVIS Body - can function in degraded mode without the others
+
+        Returns:
+            Dict with dependency status and recommended action
+        """
+        components_dir = Path.home() / ".jarvis" / "trinity" / "components"
+        now = time.time()
+
+        results = {
+            "reactor_core": {"status": "unknown", "heartbeat_age": None, "error": None},
+            "j_prime": {"status": "unknown", "heartbeat_age": None, "error": None},
+            "dependency_order": ["reactor_core", "j_prime", "jarvis_body"],
+            "ready_for_full_operation": False,
+            "degraded_mode_required": False,
+            "recommendations": [],
+        }
+
+        # Check Reactor-Core first (it's the communication backbone)
+        reactor_file = components_dir / "reactor_core.json"
+        reactor_status = await self._check_dependency_status(
+            "reactor_core", reactor_file, now
+        )
+        results["reactor_core"] = reactor_status
+
+        # Check J-Prime (depends on Reactor-Core)
+        jprime_file = components_dir / "j_prime.json"
+        jprime_status = await self._check_dependency_status(
+            "j_prime", jprime_file, now
+        )
+        results["j_prime"] = jprime_status
+
+        # Determine overall status
+        reactor_ok = reactor_status["status"] in ("healthy", "starting")
+        jprime_ok = jprime_status["status"] in ("healthy", "starting")
+
+        if reactor_ok and jprime_ok:
+            results["ready_for_full_operation"] = True
+            results["recommendations"].append("Trinity is fully operational")
+        elif reactor_ok and not jprime_ok:
+            results["degraded_mode_required"] = True
+            results["recommendations"].extend([
+                "J-Prime is not available - operating in degraded mode",
+                "JARVIS can execute commands but cognitive functions are limited",
+                f"J-Prime error: {jprime_status.get('error', 'unknown')}",
+            ])
+        elif not reactor_ok:
+            results["degraded_mode_required"] = True
+            results["recommendations"].extend([
+                "Reactor-Core is not available - operating in standalone mode",
+                "Trinity communication is disabled",
+                f"Reactor error: {reactor_status.get('error', 'unknown')}",
+            ])
+
+            # J-Prime can't work without Reactor-Core anyway
+            if jprime_status["status"] == "healthy":
+                results["recommendations"].append(
+                    "J-Prime is up but can't communicate without Reactor-Core"
+                )
+
+        return results
+
+    async def _check_dependency_status(
+        self,
+        component: str,
+        heartbeat_file: Path,
+        now: float,
+    ) -> Dict[str, Any]:
+        """Check status of a specific dependency."""
+        result = {
+            "status": "unknown",
+            "heartbeat_age": None,
+            "error": None,
+            "pid": None,
+            "process_alive": None,
+        }
+
+        if not heartbeat_file.exists():
+            result["status"] = "not_started"
+            result["error"] = "heartbeat file missing"
+            return result
+
+        state = read_json_safe(heartbeat_file)
+        if not state:
+            result["status"] = "error"
+            result["error"] = "heartbeat file corrupted"
+            return result
+
+        timestamp = state.get("timestamp", 0)
+        age = now - timestamp
+        result["heartbeat_age"] = round(age, 1)
+
+        # Check heartbeat freshness
+        if age > self.HEARTBEAT_TIMEOUT:
+            result["status"] = "stale"
+            result["error"] = f"heartbeat stale ({age:.0f}s old, max {self.HEARTBEAT_TIMEOUT}s)"
+        elif age > self.GRACE_PERIOD_SECONDS:
+            result["status"] = "healthy"
+        else:
+            # In grace period
+            result["status"] = "starting"
+
+        # Check process liveness
+        pid = state.get("pid") or self._extract_pid_from_instance_id(
+            state.get("instance_id", "")
+        )
+        if pid:
+            result["pid"] = pid
+            result["process_alive"] = self._is_process_alive(pid)
+
+            if not result["process_alive"] and result["status"] == "healthy":
+                result["status"] = "zombie"
+                result["error"] = f"process {pid} is not alive"
+
+        return result
+
+    async def wait_for_dependencies(
+        self,
+        timeout: float = 60.0,
+        check_interval: float = 2.0,
+    ) -> bool:
+        """
+        v78.1: Wait for Trinity dependencies to become available.
+
+        This should be called during JARVIS startup to ensure dependencies
+        are ready before enabling full functionality.
+
+        Args:
+            timeout: Maximum time to wait for dependencies
+            check_interval: Time between dependency checks
+
+        Returns:
+            True if all dependencies are ready, False if timeout or failures
+        """
+        start_time = time.time()
+        logger.info(f"[Trinity] Waiting for dependencies (timeout={timeout}s)...")
+
+        while (time.time() - start_time) < timeout:
+            status = await self.check_startup_dependencies()
+
+            if status["ready_for_full_operation"]:
+                elapsed = time.time() - start_time
+                logger.info(f"[Trinity] ✓ All dependencies ready in {elapsed:.1f}s")
+                return True
+
+            # Log progress
+            reactor = status["reactor_core"]["status"]
+            jprime = status["j_prime"]["status"]
+            logger.debug(
+                f"[Trinity] Waiting: reactor_core={reactor}, j_prime={jprime}"
+            )
+
+            await asyncio.sleep(check_interval)
+
+        # Timeout - log final status
+        status = await self.check_startup_dependencies()
+        logger.warning(
+            f"[Trinity] Dependency wait timed out after {timeout}s. "
+            f"Status: {status['recommendations']}"
+        )
+
+        return False
+
+    def reset_component_tracking(self, component: str) -> None:
+        """
+        v78.1: Reset tracking for a component (useful when manually restarting).
+
+        This clears the circuit breaker and grace period tracking.
+        """
+        self._restart_attempts[component] = 0
+        self._component_first_seen.pop(component, None)
+        self._component_last_healthy.pop(component, None)
+        self._component_states[component] = "unknown"
+
+        logger.info(f"[Trinity] Reset tracking for {component}")
 
 
 # =============================================================================
@@ -946,3 +1226,8 @@ __all__ = [
     # v75.0: File system resilience
     "FileSystemGuard",
 ]
+
+# v78.1 methods are available on TrinityHealthMonitor instance:
+# - check_startup_dependencies() - Check Trinity dependency status
+# - wait_for_dependencies(timeout, check_interval) - Wait for deps to be ready
+# - reset_component_tracking(component) - Reset circuit breaker for component
