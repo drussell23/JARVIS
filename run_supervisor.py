@@ -1054,37 +1054,72 @@ class ParallelProcessCleaner:
     
     async def _terminate_process(self, pid: int, info: ProcessInfo) -> bool:
         """
-        Terminate a single process with cascade strategy.
-        
-        SIGINT → wait → SIGTERM → wait → SIGKILL
+        v79.0: Terminate a single process with cascade strategy and race-safe PID validation.
+
+        RACE CONDITION FIX: Previous implementation had race between checking process
+        existence and sending signals. Now validates PID before each signal.
+
+        Strategy: SIGINT → wait → SIGTERM → wait → SIGKILL
         """
         try:
             import psutil
-            
-            proc = psutil.Process(pid)
-            
+
+            # v79.0: Helper to safely send signal with PID validation
+            def _safe_kill(target_pid: int, sig: int) -> bool:
+                """Send signal with race-safe PID validation."""
+                try:
+                    # Re-validate process exists before each signal
+                    proc = psutil.Process(target_pid)
+
+                    # Extra validation: check process matches expected info
+                    if info and info.cmdline:
+                        try:
+                            current_cmdline = " ".join(proc.cmdline())
+                            # If cmdline completely changed, it's a different process
+                            if info.cmdline and info.cmdline[0] not in current_cmdline:
+                                self.logger.debug(
+                                    f"PID {target_pid} recycled: expected '{info.cmdline[0]}', "
+                                    f"got '{current_cmdline[:50]}'"
+                                )
+                                return True  # Don't kill, wrong process
+                        except (psutil.NoSuchProcess, psutil.AccessDenied):
+                            pass
+
+                    os.kill(target_pid, sig)
+                    return True
+                except (psutil.NoSuchProcess, ProcessLookupError, OSError) as e:
+                    if isinstance(e, OSError) and e.errno == 3:  # ESRCH: No such process
+                        return True  # Process already gone
+                    return True  # Consider success if process doesn't exist
+
             # Phase 1: SIGINT (graceful)
-            try:
-                os.kill(pid, signal.SIGINT)
-                await asyncio.sleep(0.1)  # Brief pause
-                proc.wait(timeout=self.config.cleanup_timeout_sigint)
-                return True
-            except psutil.TimeoutExpired:
-                pass
-            
+            if _safe_kill(pid, signal.SIGINT):
+                try:
+                    proc = psutil.Process(pid)
+                    await asyncio.sleep(0.1)  # Brief pause
+                    proc.wait(timeout=self.config.cleanup_timeout_sigint)
+                    return True
+                except (psutil.NoSuchProcess, psutil.TimeoutExpired):
+                    pass
+
             # Phase 2: SIGTERM
-            try:
-                os.kill(pid, signal.SIGTERM)
-                proc.wait(timeout=self.config.cleanup_timeout_sigterm)
-                return True
-            except psutil.TimeoutExpired:
-                pass
-            
+            if _safe_kill(pid, signal.SIGTERM):
+                try:
+                    proc = psutil.Process(pid)
+                    proc.wait(timeout=self.config.cleanup_timeout_sigterm)
+                    return True
+                except (psutil.NoSuchProcess, psutil.TimeoutExpired):
+                    pass
+
             # Phase 3: SIGKILL (force)
-            os.kill(pid, signal.SIGKILL)
-            proc.wait(timeout=self.config.cleanup_timeout_sigkill)
+            if _safe_kill(pid, signal.SIGKILL):
+                try:
+                    proc = psutil.Process(pid)
+                    proc.wait(timeout=self.config.cleanup_timeout_sigkill)
+                except (psutil.NoSuchProcess, psutil.TimeoutExpired):
+                    pass
             return True
-            
+
         except (psutil.NoSuchProcess, ProcessLookupError):
             return True  # Already gone
         except Exception as e:
@@ -4527,8 +4562,13 @@ class SupervisorBootstrapper:
 
     def _setup_signal_handlers(self) -> None:
         """
-        Setup signal handlers for graceful shutdown with VM cleanup.
-        
+        v79.0: Setup async-safe signal handlers for graceful shutdown.
+
+        RACE CONDITION FIX: Previous implementation called self._shutdown_event.set()
+        directly from signal handler context, which is not async-safe.
+
+        Now uses loop.call_soon_threadsafe() to safely set the event from signal context.
+
         The shutdown hook module handles its own signal registration,
         but we also set the shutdown event so the main loop can exit gracefully.
         """
@@ -4537,20 +4577,55 @@ class SupervisorBootstrapper:
             backend_path = Path(__file__).parent / "backend"
             if str(backend_path) not in sys.path:
                 sys.path.insert(0, str(backend_path))
-            
+
             from backend.scripts.shutdown_hook import register_handlers
             register_handlers()
             self.logger.debug("✅ Shutdown hook handlers registered")
         except Exception as e:
             self.logger.warning(f"⚠️ Could not register shutdown hook: {e}")
-        
+
+        # v79.0: Async-safe signal handler using call_soon_threadsafe
         def handle_signal(signum, frame):
-            """Handle SIGTERM by setting shutdown event."""
-            self._shutdown_event.set()
-            self.logger.info(f"🛑 Received signal {signum} - initiating shutdown")
+            """
+            Handle SIGTERM by setting shutdown event safely.
+
+            v79.0: Uses call_soon_threadsafe() to prevent race conditions
+            when signal arrives during async operations.
+            """
+            try:
+                # Try to get the running event loop
+                loop = asyncio.get_running_loop()
+
+                # Use thread-safe method to set the event
+                def _set_event():
+                    if not self._shutdown_event.is_set():
+                        self._shutdown_event.set()
+
+                loop.call_soon_threadsafe(_set_event)
+                self.logger.info(f"🛑 Received signal {signum} - initiating shutdown (async-safe)")
+
+            except RuntimeError:
+                # No running loop - fall back to direct set (pre-asyncio context)
+                self._shutdown_event.set()
+                self.logger.info(f"🛑 Received signal {signum} - initiating shutdown (sync)")
 
         signal.signal(signal.SIGTERM, handle_signal)
-        # SIGINT is handled by KeyboardInterrupt in the main run() method
+
+        # v79.0: Also handle SIGINT async-safely for cleaner KeyboardInterrupt handling
+        def handle_sigint(signum, frame):
+            """Handle SIGINT (Ctrl+C) with async-safe shutdown."""
+            try:
+                loop = asyncio.get_running_loop()
+                loop.call_soon_threadsafe(lambda: self._shutdown_event.set())
+                self.logger.info("🛑 Received SIGINT (Ctrl+C) - initiating graceful shutdown")
+            except RuntimeError:
+                self._shutdown_event.set()
+                self.logger.info("🛑 Received SIGINT - direct shutdown")
+            # Let the main loop handle the actual KeyboardInterrupt
+
+        # Only set SIGINT handler if not in interactive mode
+        if not hasattr(sys, 'ps1'):  # Not in interactive Python shell
+            signal.signal(signal.SIGINT, handle_sigint)
         
     async def cleanup_resources(self):
         """
