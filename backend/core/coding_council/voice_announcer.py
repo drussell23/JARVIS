@@ -1185,9 +1185,212 @@ class CodingCouncilVoiceAnnouncer:
             "approvals_granted": 0,
             "approvals_denied": 0,
             "trinity_broadcasts": 0,
+            "events_emitted": 0,
         }
 
+        # v79.1: Event listener system for external integrations
+        # Allows VoiceAuthenticationNarrator, run_supervisor, etc. to receive events
+        self._event_listeners: List[Callable[[str, Dict[str, Any]], Coroutine[Any, Any, None]]] = []
+        self._event_listeners_sync: List[Callable[[str, Dict[str, Any]], None]] = []
+        self._pending_approvals: Dict[str, asyncio.Future] = {}
+
         logger.info(f"[CodingCouncilVoice] v79.1 Initialized (enabled={self.config.enabled})")
+
+    # =========================================================================
+    # v79.1: Event Listener System (for external integrations)
+    # =========================================================================
+
+    async def add_event_listener(
+        self,
+        callback: Callable[[str, Dict[str, Any]], Coroutine[Any, Any, None]]
+    ) -> bool:
+        """
+        Register an async callback to receive evolution events.
+
+        The callback will be invoked with:
+            - event_type: str (e.g., 'started', 'progress', 'complete', 'failed')
+            - details: Dict[str, Any] containing event-specific data
+
+        Example:
+            async def my_handler(event_type: str, details: Dict[str, Any]) -> None:
+                if event_type == 'complete':
+                    print(f"Evolution {details['task_id']} completed!")
+
+            await announcer.add_event_listener(my_handler)
+
+        Args:
+            callback: Async function to call on events
+
+        Returns:
+            True if registered successfully
+        """
+        if callback not in self._event_listeners:
+            self._event_listeners.append(callback)
+            logger.debug(f"[CodingCouncilVoice] Added event listener: {callback.__name__ if hasattr(callback, '__name__') else 'anonymous'}")
+            return True
+        return False
+
+    def add_event_listener_sync(
+        self,
+        callback: Callable[[str, Dict[str, Any]], None]
+    ) -> bool:
+        """
+        Register a synchronous callback to receive evolution events.
+
+        Args:
+            callback: Sync function to call on events
+
+        Returns:
+            True if registered successfully
+        """
+        if callback not in self._event_listeners_sync:
+            self._event_listeners_sync.append(callback)
+            logger.debug(f"[CodingCouncilVoice] Added sync event listener: {callback.__name__ if hasattr(callback, '__name__') else 'anonymous'}")
+            return True
+        return False
+
+    async def remove_event_listener(
+        self,
+        callback: Callable[[str, Dict[str, Any]], Coroutine[Any, Any, None]]
+    ) -> bool:
+        """
+        Remove an async event listener.
+
+        Args:
+            callback: Previously registered callback to remove
+
+        Returns:
+            True if removed, False if not found
+        """
+        if callback in self._event_listeners:
+            self._event_listeners.remove(callback)
+            logger.debug(f"[CodingCouncilVoice] Removed event listener")
+            return True
+        return False
+
+    def remove_event_listener_sync(
+        self,
+        callback: Callable[[str, Dict[str, Any]], None]
+    ) -> bool:
+        """
+        Remove a synchronous event listener.
+
+        Args:
+            callback: Previously registered sync callback to remove
+
+        Returns:
+            True if removed, False if not found
+        """
+        if callback in self._event_listeners_sync:
+            self._event_listeners_sync.remove(callback)
+            return True
+        return False
+
+    async def _emit_event(
+        self,
+        event_type: str,
+        details: Dict[str, Any],
+        fire_and_forget: bool = True
+    ) -> int:
+        """
+        Emit an event to all registered listeners.
+
+        Args:
+            event_type: Type of event (started, progress, complete, failed, etc.)
+            details: Event-specific data
+            fire_and_forget: If True, don't wait for listeners to complete
+
+        Returns:
+            Number of listeners notified
+        """
+        self._stats["events_emitted"] += 1
+        notified = 0
+
+        # Add timestamp and event_type to details
+        enriched_details = {
+            **details,
+            "event_type": event_type,
+            "timestamp": time.time(),
+            "timestamp_iso": datetime.now().isoformat(),
+        }
+
+        # Notify async listeners
+        for listener in self._event_listeners:
+            try:
+                if fire_and_forget:
+                    # Non-blocking: spawn task and continue
+                    asyncio.create_task(
+                        self._safe_call_listener(listener, event_type, enriched_details)
+                    )
+                else:
+                    # Blocking: wait for listener
+                    await self._safe_call_listener(listener, event_type, enriched_details)
+                notified += 1
+            except Exception as e:
+                logger.warning(f"[CodingCouncilVoice] Async listener error: {e}")
+
+        # Notify sync listeners (in executor to avoid blocking)
+        for listener in self._event_listeners_sync:
+            try:
+                loop = asyncio.get_event_loop()
+                if fire_and_forget:
+                    loop.run_in_executor(
+                        None,
+                        lambda: self._safe_call_sync_listener(listener, event_type, enriched_details)
+                    )
+                else:
+                    await loop.run_in_executor(
+                        None,
+                        lambda: self._safe_call_sync_listener(listener, event_type, enriched_details)
+                    )
+                notified += 1
+            except Exception as e:
+                logger.warning(f"[CodingCouncilVoice] Sync listener error: {e}")
+
+        if notified > 0:
+            logger.debug(f"[CodingCouncilVoice] Emitted '{event_type}' to {notified} listeners")
+
+        return notified
+
+    async def _safe_call_listener(
+        self,
+        listener: Callable[[str, Dict[str, Any]], Coroutine[Any, Any, None]],
+        event_type: str,
+        details: Dict[str, Any]
+    ) -> None:
+        """Safely call an async listener with timeout."""
+        try:
+            await asyncio.wait_for(
+                listener(event_type, details),
+                timeout=5.0  # 5 second timeout for listeners
+            )
+        except asyncio.TimeoutError:
+            listener_name = getattr(listener, '__name__', 'anonymous')
+            logger.warning(f"[CodingCouncilVoice] Listener '{listener_name}' timed out")
+        except Exception as e:
+            listener_name = getattr(listener, '__name__', 'anonymous')
+            logger.warning(f"[CodingCouncilVoice] Listener '{listener_name}' error: {e}")
+
+    def _safe_call_sync_listener(
+        self,
+        listener: Callable[[str, Dict[str, Any]], None],
+        event_type: str,
+        details: Dict[str, Any]
+    ) -> None:
+        """Safely call a sync listener."""
+        try:
+            listener(event_type, details)
+        except Exception as e:
+            listener_name = getattr(listener, '__name__', 'anonymous')
+            logger.warning(f"[CodingCouncilVoice] Sync listener '{listener_name}' error: {e}")
+
+    def get_listener_count(self) -> Dict[str, int]:
+        """Get count of registered listeners."""
+        return {
+            "async_listeners": len(self._event_listeners),
+            "sync_listeners": len(self._event_listeners_sync),
+            "total": len(self._event_listeners) + len(self._event_listeners_sync),
+        }
 
     def _can_announce(self, announcement_type: AnnouncementType) -> bool:
         """Check if we can make an announcement."""
@@ -1362,6 +1565,13 @@ class CodingCouncilVoiceAnnouncer:
         if approved:
             self._stats["approvals_granted"] += 1
             logger.info(f"[CodingCouncilVoice] Approval granted for {task_id}")
+            # v79.1: Emit approval granted event
+            await self._emit_event("approval_granted", {
+                "task_id": task_id,
+                "description": description,
+                "risk_level": risk_level.value,
+                "feedback": feedback,
+            })
         else:
             self._stats["approvals_denied"] += 1
             logger.info(f"[CodingCouncilVoice] Approval denied for {task_id}")
@@ -1369,6 +1579,13 @@ class CodingCouncilVoiceAnnouncer:
                 self._composer.compose_error_message("approval_denied"),
                 priority="medium"
             )
+            # v79.1: Emit approval denied event
+            await self._emit_event("approval_denied", {
+                "task_id": task_id,
+                "description": description,
+                "risk_level": risk_level.value,
+                "feedback": feedback,
+            })
 
         return approved, feedback
 
@@ -1498,6 +1715,16 @@ class CodingCouncilVoiceAnnouncer:
             self._record_announcement(AnnouncementType.START)
             logger.info(f"[CodingCouncilVoice] Announced start: {task_id}")
 
+        # v79.1: Emit event to listeners
+        await self._emit_event("started", {
+            "task_id": task_id,
+            "description": description,
+            "target_files": target_files or [],
+            "trinity_involved": trinity_involved,
+            "risk_level": risk_level.value,
+            "progress": 0.0,
+        })
+
         return result or False
 
     async def announce_evolution_progress(
@@ -1542,6 +1769,16 @@ class CodingCouncilVoiceAnnouncer:
         )
 
         self._record_announcement(AnnouncementType.PROGRESS)
+
+        # v79.1: Emit event to listeners
+        await self._emit_event("progress", {
+            "task_id": task_id,
+            "progress": progress,
+            "stage": ctx.current_stage.value if ctx else stage,
+            "description": ctx.description if ctx else "",
+            "files_modified": ctx.files_modified if ctx else 0,
+        })
+
         return True
 
     async def announce_evolution_complete(
@@ -1585,6 +1822,18 @@ class CodingCouncilVoiceAnnouncer:
         # Record to history
         self._record_evolution_history(ctx, success, error_message)
 
+        # v79.1: Emit event to listeners
+        event_type = "complete" if success else "failed"
+        await self._emit_event(event_type, {
+            "task_id": task_id,
+            "success": success,
+            "files_modified": files_modified or [],
+            "error": error_message if not success else None,
+            "duration_seconds": ctx.elapsed_seconds if ctx else 0,
+            "description": ctx.description if ctx else "",
+            "progress": 1.0 if success else (ctx.progress if ctx else 0),
+        })
+
         # Cleanup
         self._active_evolutions.pop(task_id, None)
 
@@ -1616,6 +1865,14 @@ class CodingCouncilVoiceAnnouncer:
             self._record_announcement(AnnouncementType.CONFIRMATION)
             logger.info(f"[CodingCouncilVoice] Confirmation needed: {task_id}")
 
+        # v79.1: Emit event to listeners
+        await self._emit_event("approval_needed", {
+            "task_id": task_id,
+            "description": description,
+            "confirmation_id": confirmation_id,
+            "stage": "validating",
+        })
+
         return result
 
     async def announce_error(
@@ -1635,6 +1892,15 @@ class CodingCouncilVoiceAnnouncer:
         ctx = self._active_evolutions.get(task_id)
         if ctx:
             ctx.errors.append(f"{error_type}: {details}")
+
+        # v79.1: Emit event to listeners
+        await self._emit_event("error", {
+            "task_id": task_id,
+            "error_type": error_type,
+            "details": details,
+            "description": ctx.description if ctx else "",
+            "progress": ctx.progress if ctx else 0,
+        })
 
         return result
 
@@ -1680,6 +1946,7 @@ class CodingCouncilVoiceAnnouncer:
             "trinity_bridge": self._trinity_bridge.get_status(),
             "agi_os_voice": self._agi_os_voice.get_status(),
             "message_cache": self._composer.get_cache_stats(),
+            "event_listeners": self.get_listener_count(),  # v79.1: Include listener counts
             "config": {
                 "enabled": self.config.enabled,
                 "progress_cooldown": self.config.progress_cooldown,
@@ -1697,6 +1964,44 @@ class CodingCouncilVoiceAnnouncer:
     def get_evolution_history(self, limit: int = 10) -> List[Dict[str, Any]]:
         """Get recent evolution history."""
         return self._evolution_history[-limit:]
+
+    # =========================================================================
+    # Convenience Methods
+    # =========================================================================
+
+    async def announce_completion(
+        self,
+        task_id: str,
+        success: bool,
+        files_modified: int = 0,
+        execution_time_ms: float = 0,
+        error: Optional[str] = None
+    ) -> bool:
+        """
+        Shorthand for announce_evolution_complete.
+
+        This method provides a simpler interface compatible with startup.py
+        and other integration points.
+
+        Args:
+            task_id: Evolution task ID
+            success: Whether evolution succeeded
+            files_modified: Count of files modified
+            execution_time_ms: Execution time in milliseconds
+            error: Error message if failed
+
+        Returns:
+            True if announcement was made
+        """
+        # Create file list placeholder for compatibility
+        files_list = [f"file_{i}" for i in range(files_modified)] if files_modified > 0 else []
+
+        return await self.announce_evolution_complete(
+            task_id=task_id,
+            success=success,
+            files_modified=files_list,
+            error_message=error or "",
+        )
 
     async def shutdown(self) -> None:
         """Graceful shutdown with task cleanup."""
@@ -1747,6 +2052,7 @@ async def setup_voice_integration() -> Dict[str, bool]:
         "trinity_bridge": False,
         "agi_os_voice": False,
         "broadcaster_hook": False,
+        "websocket_hook": False,
     }
 
     try:
@@ -1764,9 +2070,101 @@ async def setup_voice_integration() -> Dict[str, bool]:
         # Hook into broadcaster (done in integration.py)
         results["broadcaster_hook"] = True
 
+        # v79.1: Hook into WebSocket for real-time UI updates
+        try:
+            ws_ok = await setup_websocket_event_hook(announcer)
+            results["websocket_hook"] = ws_ok
+        except Exception as ws_err:
+            logger.debug(f"[CodingCouncilVoice] WebSocket hook not available: {ws_err}")
+
         logger.info(f"[CodingCouncilVoice] Voice integration setup: {results}")
 
     except Exception as e:
         logger.error(f"[CodingCouncilVoice] Integration setup failed: {e}")
 
     return results
+
+
+# =============================================================================
+# v79.1: WebSocket Event Broadcasting
+# =============================================================================
+
+
+async def setup_websocket_event_hook(announcer: CodingCouncilVoiceAnnouncer) -> bool:
+    """
+    Set up WebSocket event broadcasting for evolution events.
+
+    This allows connected IDE clients to receive real-time evolution status updates.
+
+    Args:
+        announcer: The voice announcer instance to hook into
+
+    Returns:
+        True if hook was set up successfully
+    """
+    try:
+        # Try to import WebSocket handler
+        try:
+            from .ide.websocket_handler import get_websocket_handler, WebSocketMessage, MessageType
+        except ImportError:
+            from backend.core.coding_council.ide.websocket_handler import (
+                get_websocket_handler, WebSocketMessage, MessageType
+            )
+
+        # Create the broadcast listener
+        async def websocket_evolution_broadcaster(event_type: str, details: Dict[str, Any]) -> None:
+            """Broadcast evolution events to connected IDE clients."""
+            try:
+                handler = await get_websocket_handler()
+                if handler.connection_count == 0:
+                    return  # No clients connected
+
+                # Map event types to WebSocket message format
+                # Frontend expects: { status, task_id, progress, stage, message, error }
+                ws_data = {
+                    "status": event_type,
+                    "task_id": details.get("task_id", ""),
+                    "progress": details.get("progress", 0),
+                    "stage": details.get("stage", event_type),
+                    "description": details.get("description", ""),
+                    "files_modified": details.get("files_modified", []),
+                    "timestamp": details.get("timestamp", time.time()),
+                    "timestamp_iso": details.get("timestamp_iso", ""),
+                }
+
+                # Add error info for failed events
+                if event_type in ("failed", "error"):
+                    ws_data["error"] = details.get("error") or details.get("details", "")
+
+                # Add success flag for complete events
+                if event_type == "complete":
+                    ws_data["success"] = details.get("success", True)
+
+                # Add approval info
+                if event_type in ("approval_needed", "approval_granted", "approval_denied"):
+                    ws_data["confirmation_id"] = details.get("confirmation_id", "")
+                    ws_data["risk_level"] = details.get("risk_level", "")
+
+                message = WebSocketMessage(
+                    type=MessageType.EVOLUTION_STATUS,
+                    data=ws_data,
+                )
+
+                sent = await handler.broadcast(message)
+                if sent > 0:
+                    logger.debug(f"[WebSocketHook] Broadcast '{event_type}' to {sent} clients")
+
+            except Exception as e:
+                logger.debug(f"[WebSocketHook] Broadcast failed: {e}")
+
+        # Register the listener
+        await announcer.add_event_listener(websocket_evolution_broadcaster)
+        logger.info("[CodingCouncilVoice] WebSocket event hook registered")
+        return True
+
+    except ImportError as e:
+        logger.debug(f"[CodingCouncilVoice] WebSocket handler not available: {e}")
+        return False
+    except Exception as e:
+        logger.warning(f"[CodingCouncilVoice] WebSocket hook setup failed: {e}")
+        return False
