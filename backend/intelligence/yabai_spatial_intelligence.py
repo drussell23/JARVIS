@@ -640,11 +640,16 @@ class YabaiSpatialIntelligence:
         Query Yabai for all Spaces with robust error handling (v10.6)
 
         Features:
-        - Timeout protection (5s) to prevent hangs
+        - Timeout protection (configurable, default 10s) to prevent hangs
         - Robust JSON parsing with incomplete response handling
         - Strips trailing commas and validates JSON structure
         - Returns empty list on any error (graceful degradation)
+
+        v78.1: Increased timeout from 5s to 10s, made configurable via env var.
         """
+        # v78.1: Configurable timeout (Yabai can be slow under memory pressure)
+        query_timeout = float(os.getenv('JARVIS_YABAI_QUERY_TIMEOUT', '10.0'))
+
         try:
             # Execute with timeout protection
             result = await asyncio.create_subprocess_exec(
@@ -656,12 +661,13 @@ class YabaiSpatialIntelligence:
             try:
                 stdout, stderr = await asyncio.wait_for(
                     result.communicate(),
-                    timeout=5.0  # 5 second timeout
+                    timeout=query_timeout
                 )
             except asyncio.TimeoutError:
-                logger.warning("[YABAI-SI] Query spaces timeout (5s), killing process")
+                logger.warning(f"[YABAI-SI] Query spaces timeout ({query_timeout}s), killing process")
                 try:
                     result.kill()
+                    await result.wait()  # v78.1: Properly wait for process cleanup
                 except Exception:
                     pass
                 return []
@@ -732,10 +738,15 @@ class YabaiSpatialIntelligence:
         Query Yabai for all windows with robust error handling (v10.6)
 
         Same robust handling as _query_spaces():
-        - Timeout protection
+        - Timeout protection (configurable, default 10s)
         - JSON parsing with error recovery
         - Graceful degradation
+
+        v78.1: Increased timeout from 5s to 10s, made configurable.
         """
+        # v78.1: Configurable timeout (Yabai can be slow with many windows)
+        query_timeout = float(os.getenv('JARVIS_YABAI_QUERY_TIMEOUT', '10.0'))
+
         try:
             # Execute with timeout protection
             result = await asyncio.create_subprocess_exec(
@@ -747,12 +758,13 @@ class YabaiSpatialIntelligence:
             try:
                 stdout, stderr = await asyncio.wait_for(
                     result.communicate(),
-                    timeout=5.0  # 5 second timeout
+                    timeout=query_timeout
                 )
             except asyncio.TimeoutError:
-                logger.warning("[YABAI-SI] Query windows timeout (5s), killing process")
+                logger.warning(f"[YABAI-SI] Query windows timeout ({query_timeout}s), killing process")
                 try:
                     result.kill()
+                    await result.wait()  # v78.1: Properly wait for process cleanup
                 except Exception:
                     pass
                 return []
