@@ -297,6 +297,35 @@ class AgenticRunnerConfig:
         default_factory=lambda: int(os.getenv("JARVIS_SAFE_CODE_MAX_MEMORY_MB", "512"))
     )
 
+    # Cognitive Architecture (v12.0 - "AGI Reasoning Core")
+    cognitive_architecture_enabled: bool = field(
+        default_factory=lambda: os.getenv("JARVIS_COGNITIVE_ENABLED", "true").lower() == "true"
+    )
+    cognitive_causal_reasoning: bool = field(
+        default_factory=lambda: os.getenv("JARVIS_COGNITIVE_CAUSAL", "true").lower() == "true"
+    )
+    cognitive_world_model: bool = field(
+        default_factory=lambda: os.getenv("JARVIS_COGNITIVE_WORLD_MODEL", "true").lower() == "true"
+    )
+    cognitive_theory_of_mind: bool = field(
+        default_factory=lambda: os.getenv("JARVIS_COGNITIVE_TOM", "true").lower() == "true"
+    )
+    cognitive_abstract_reasoning: bool = field(
+        default_factory=lambda: os.getenv("JARVIS_COGNITIVE_ABSTRACT", "true").lower() == "true"
+    )
+    cognitive_planning: bool = field(
+        default_factory=lambda: os.getenv("JARVIS_COGNITIVE_PLANNING", "true").lower() == "true"
+    )
+    cognitive_ethics: bool = field(
+        default_factory=lambda: os.getenv("JARVIS_COGNITIVE_ETHICS", "true").lower() == "true"
+    )
+    cognitive_pre_task_analysis: bool = field(
+        default_factory=lambda: os.getenv("JARVIS_COGNITIVE_PRE_ANALYSIS", "true").lower() == "true"
+    )
+    cognitive_post_task_learning: bool = field(
+        default_factory=lambda: os.getenv("JARVIS_COGNITIVE_POST_LEARNING", "true").lower() == "true"
+    )
+
 
 # =============================================================================
 # Enums
@@ -344,6 +373,15 @@ class AgenticTaskResult:
     visual_state_after: Optional[Dict[str, Any]] = None
     space_context: Optional[Dict[str, Any]] = None
     visual_learning_captured: bool = False
+    # Cognitive Architecture Integration (v12.0)
+    cognitive_used: bool = False
+    cognitive_causal_analysis: Optional[Dict[str, Any]] = None
+    cognitive_world_model_prediction: Optional[Dict[str, Any]] = None
+    cognitive_theory_of_mind: Optional[Dict[str, Any]] = None
+    cognitive_ethical_evaluation: Optional[Dict[str, Any]] = None
+    cognitive_planning_result: Optional[Dict[str, Any]] = None
+    cognitive_reasoning_steps: int = 0
+    cognitive_confidence: float = 0.0
 
 
 # =============================================================================
@@ -487,6 +525,19 @@ def _check_component_availability() -> Dict[str, bool]:
     except ImportError:
         availability["vision_safety"] = False
 
+    # =========================================================================
+    # Cognitive Architecture (v12.0 - "AGI Reasoning Core")
+    # =========================================================================
+    try:
+        from core.cognitive_architecture import (
+            CognitiveSystem,
+            get_cognitive_system,
+            shutdown_cognitive_system,
+        )
+        availability["cognitive_architecture"] = True
+    except ImportError:
+        availability["cognitive_architecture"] = False
+
     return availability
 
 
@@ -609,6 +660,14 @@ class AgenticTaskRunner:
         self._sop_enforcer_initialized = False
         self._design_plans_generated = 0
         self._tasks_blocked_by_sop = 0
+
+        # Cognitive Architecture (v12.0 - "AGI Reasoning Core")
+        self._cognitive_system = None
+        self._cognitive_initialized = False
+        self._cognitive_reasoning_count = 0
+        self._cognitive_ethical_checks = 0
+        self._cognitive_causal_analyses = 0
+        self._cognitive_plans_generated = 0
 
         self.logger.info("[AgenticRunner] Created")
         self._log_availability()
@@ -1048,6 +1107,50 @@ class AgenticTaskRunner:
                     self.logger.debug("[AgenticRunner] ✗ SOP Enforcer: module not available")
                 except Exception as e:
                     self.logger.debug(f"[AgenticRunner] ✗ SOP Enforcer: {e}")
+
+            # =================================================================
+            # Initialize Cognitive Architecture (v12.0 - "AGI Reasoning Core")
+            # =================================================================
+            if (
+                self._availability.get("cognitive_architecture")
+                and self.config.cognitive_architecture_enabled
+            ):
+                try:
+                    from core.cognitive_architecture import (
+                        CognitiveSystem,
+                        get_cognitive_system,
+                    )
+
+                    self._cognitive_system = await get_cognitive_system()
+                    self._cognitive_initialized = True
+
+                    # Log enabled capabilities
+                    capabilities = []
+                    if self.config.cognitive_causal_reasoning:
+                        capabilities.append("Causal")
+                    if self.config.cognitive_world_model:
+                        capabilities.append("WorldModel")
+                    if self.config.cognitive_theory_of_mind:
+                        capabilities.append("ToM")
+                    if self.config.cognitive_abstract_reasoning:
+                        capabilities.append("Abstract")
+                    if self.config.cognitive_planning:
+                        capabilities.append("Planning")
+                    if self.config.cognitive_ethics:
+                        capabilities.append("Ethics")
+
+                    self.logger.info(
+                        f"[AgenticRunner] ✓ Cognitive Architecture "
+                        f"({len(capabilities)} modules: {', '.join(capabilities)})"
+                    )
+                except ImportError:
+                    self.logger.debug("[AgenticRunner] ✗ Cognitive Architecture: module not available")
+                    self._cognitive_system = None
+                    self._cognitive_initialized = False
+                except Exception as e:
+                    self.logger.debug(f"[AgenticRunner] ✗ Cognitive Architecture: {e}")
+                    self._cognitive_system = None
+                    self._cognitive_initialized = False
 
             self._initialized = True
             self.logger.info("[AgenticRunner] Initialization complete")
@@ -2402,6 +2505,29 @@ class AgenticTaskRunner:
             except Exception as e:
                 self.logger.debug(f"Neural context query failed: {e}")
 
+        # =================================================================
+        # Cognitive Architecture Pre-Task Analysis (v12.0 - "AGI Reasoning Core")
+        # =================================================================
+        cognitive_analysis = None
+        if (
+            self._cognitive_system
+            and self._cognitive_initialized
+            and self.config.cognitive_pre_task_analysis
+        ):
+            try:
+                cognitive_analysis = await self._perform_cognitive_pre_analysis(goal, context)
+                if cognitive_analysis:
+                    if context is None:
+                        context = {}
+                    context["cognitive_analysis"] = cognitive_analysis
+                    self._cognitive_reasoning_count += 1
+                    self.logger.debug(
+                        f"[AgenticRunner] Cognitive pre-analysis: "
+                        f"{cognitive_analysis.get('reasoning_type', 'unknown')}"
+                    )
+            except Exception as e:
+                self.logger.debug(f"[AgenticRunner] Cognitive pre-analysis failed: {e}")
+
         # Announce start
         if narrate and self.tts_callback:
             await self.tts_callback(f"Starting task: {goal[:50]}")
@@ -2436,6 +2562,17 @@ class AgenticTaskRunner:
                 result.neural_mesh_context = neural_context
                 result.pattern_insights_applied = neural_context.pattern_insights
             result.neural_mesh_events_sent = self._nm_events_sent
+
+            # Cognitive Architecture: Attach analysis to result (v12.0)
+            if cognitive_analysis:
+                result.cognitive_used = True
+                result.cognitive_causal_analysis = cognitive_analysis.get("causal_analysis")
+                result.cognitive_world_model_prediction = cognitive_analysis.get("world_model")
+                result.cognitive_theory_of_mind = cognitive_analysis.get("theory_of_mind")
+                result.cognitive_ethical_evaluation = cognitive_analysis.get("ethics")
+                result.cognitive_planning_result = cognitive_analysis.get("planning")
+                result.cognitive_reasoning_steps = cognitive_analysis.get("reasoning_steps", 0)
+                result.cognitive_confidence = cognitive_analysis.get("confidence", 0.0)
 
             if result.success:
                 self._tasks_succeeded += 1
@@ -2476,6 +2613,10 @@ class AgenticTaskRunner:
             # Memory System Integration: Store task outcome for future reference (v6.0)
             if self.config.memory_system_enabled and self.config.memory_store_outcomes:
                 await self._store_task_outcome_in_memory(goal, result)
+
+            # Cognitive Architecture: Post-task learning (v12.0)
+            if self._cognitive_system and self.config.cognitive_post_task_learning:
+                await self._perform_cognitive_post_learning(goal, result, cognitive_analysis)
 
             self.logger.info(f"[AgenticRunner] Complete: success={result.success}, time={execution_time:.0f}ms")
             return result
@@ -4051,6 +4192,229 @@ class AgenticTaskRunner:
             self.logger.debug(f"Neural context query error: {e}")
 
         return context
+
+    # =========================================================================
+    # Cognitive Architecture Integration (v12.0 - "AGI Reasoning Core")
+    # =========================================================================
+
+    async def _perform_cognitive_pre_analysis(
+        self,
+        goal: str,
+        context: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Perform cognitive pre-task analysis using the AGI reasoning core.
+
+        Runs appropriate cognitive modules based on task type:
+        - Causal reasoning for "why" and cause-effect tasks
+        - World model for physical/predictive tasks
+        - Theory of mind for social/user-facing tasks
+        - Ethical evaluation for sensitive actions
+        - Planning for multi-step goals
+
+        Args:
+            goal: The task goal
+            context: Additional context
+
+        Returns:
+            Dict with cognitive analysis results or None
+        """
+        if not self._cognitive_system:
+            return None
+
+        context = context or {}
+        analysis_result = {
+            "reasoning_type": "pre_task",
+            "reasoning_steps": 0,
+            "confidence": 0.0,
+        }
+
+        try:
+            # Determine which cognitive modules to engage based on goal analysis
+            goal_lower = goal.lower()
+            reasoning_context = {
+                "goal": goal,
+                "original_context": context,
+            }
+
+            # 1. Ethical evaluation for all tasks (safety check)
+            if self.config.cognitive_ethics:
+                try:
+                    ethics_result = await self._cognitive_system.reason(
+                        query=f"Is this action ethically permissible: {goal}",
+                        context=reasoning_context,
+                    )
+                    analysis_result["ethics"] = ethics_result
+                    analysis_result["reasoning_steps"] += 1
+
+                    # Check if action should be blocked
+                    if (
+                        ethics_result.get("reasoning_type") == "ethical"
+                        and not ethics_result.get("is_permissible", True)
+                    ):
+                        analysis_result["ethics_block"] = True
+                        analysis_result["ethics_reason"] = ethics_result.get("explanation")
+                        self._cognitive_ethical_checks += 1
+                except Exception as e:
+                    self.logger.debug(f"[Cognitive] Ethics check failed: {e}")
+
+            # 2. Causal reasoning for understanding causality
+            if self.config.cognitive_causal_reasoning and any(
+                kw in goal_lower for kw in ["why", "cause", "because", "effect", "reason"]
+            ):
+                try:
+                    causal_result = await self._cognitive_system.reason(
+                        query=f"Analyze causal relationships: {goal}",
+                        context=reasoning_context,
+                    )
+                    analysis_result["causal_analysis"] = causal_result
+                    analysis_result["reasoning_steps"] += 1
+                    self._cognitive_causal_analyses += 1
+                except Exception as e:
+                    self.logger.debug(f"[Cognitive] Causal analysis failed: {e}")
+
+            # 3. World model for physical predictions
+            if self.config.cognitive_world_model and any(
+                kw in goal_lower for kw in ["what if", "predict", "will", "happen", "expect"]
+            ):
+                try:
+                    world_result = await self._cognitive_system.reason(
+                        query=f"Predict outcome: {goal}",
+                        context=reasoning_context,
+                    )
+                    analysis_result["world_model"] = world_result
+                    analysis_result["reasoning_steps"] += 1
+                except Exception as e:
+                    self.logger.debug(f"[Cognitive] World model failed: {e}")
+
+            # 4. Theory of mind for user-facing tasks
+            if self.config.cognitive_theory_of_mind and any(
+                kw in goal_lower for kw in ["user", "want", "expect", "think", "believe", "prefer"]
+            ):
+                try:
+                    tom_result = await self._cognitive_system.reason(
+                        query=f"What does the user expect: {goal}",
+                        context=reasoning_context,
+                    )
+                    analysis_result["theory_of_mind"] = tom_result
+                    analysis_result["reasoning_steps"] += 1
+                except Exception as e:
+                    self.logger.debug(f"[Cognitive] Theory of mind failed: {e}")
+
+            # 5. Planning for complex multi-step goals
+            if self.config.cognitive_planning and len(goal.split()) > 5:
+                try:
+                    planning_result = await self._cognitive_system.reason(
+                        query=f"Create execution plan: {goal}",
+                        context={
+                            **reasoning_context,
+                            "actions": self._get_available_actions_for_planning(),
+                        },
+                    )
+                    analysis_result["planning"] = planning_result
+                    analysis_result["reasoning_steps"] += 1
+                    self._cognitive_plans_generated += 1
+                except Exception as e:
+                    self.logger.debug(f"[Cognitive] Planning failed: {e}")
+
+            # Calculate overall confidence
+            step_count = analysis_result["reasoning_steps"]
+            if step_count > 0:
+                confidences = []
+                for key in ["ethics", "causal_analysis", "world_model", "theory_of_mind", "planning"]:
+                    if key in analysis_result and isinstance(analysis_result[key], dict):
+                        conf = analysis_result[key].get("confidence", 0.5)
+                        if conf:
+                            confidences.append(conf)
+                if confidences:
+                    analysis_result["confidence"] = sum(confidences) / len(confidences)
+
+            return analysis_result if analysis_result["reasoning_steps"] > 0 else None
+
+        except Exception as e:
+            self.logger.debug(f"[Cognitive] Pre-analysis error: {e}")
+            return None
+
+    def _get_available_actions_for_planning(self) -> List[Dict[str, Any]]:
+        """Get list of available actions for planning context."""
+        actions = []
+
+        # Computer use actions
+        if self._computer_use_tool or self._computer_use_connector:
+            actions.extend([
+                {"name": "click", "preconditions": ["screen_visible"], "effects": ["element_activated"]},
+                {"name": "type_text", "preconditions": ["input_focused"], "effects": ["text_entered"]},
+                {"name": "screenshot", "preconditions": [], "effects": ["screen_captured"]},
+                {"name": "key_press", "preconditions": [], "effects": ["key_sent"]},
+                {"name": "scroll", "preconditions": ["screen_visible"], "effects": ["viewport_changed"]},
+            ])
+
+        # System actions
+        actions.extend([
+            {"name": "open_app", "preconditions": [], "effects": ["app_running"], "cost": 2.0},
+            {"name": "close_app", "preconditions": ["app_running"], "effects": ["app_closed"]},
+            {"name": "execute_command", "preconditions": [], "effects": ["command_executed"]},
+        ])
+
+        return actions
+
+    async def _perform_cognitive_post_learning(
+        self,
+        goal: str,
+        result: "AgenticTaskResult",
+        cognitive_analysis: Optional[Dict[str, Any]],
+    ) -> None:
+        """
+        Perform cognitive post-task learning from execution outcome.
+
+        Updates cognitive models based on task success/failure.
+        """
+        if not self._cognitive_system or not self.config.cognitive_post_task_learning:
+            return
+
+        try:
+            # Update world model with actual outcome vs prediction
+            if cognitive_analysis and cognitive_analysis.get("world_model"):
+                predicted = cognitive_analysis["world_model"]
+                actual_outcome = {
+                    "success": result.success,
+                    "actions_count": result.actions_count,
+                    "error": result.error,
+                }
+                # Log prediction accuracy for learning
+                self.logger.debug(
+                    f"[Cognitive] World model prediction: {predicted.get('prediction')}, "
+                    f"Actual: success={result.success}"
+                )
+
+            # Record causal observations
+            if result.success and self._cognitive_system.causal:
+                await self._cognitive_system.causal.observe(
+                    variable=f"task_{goal[:30]}",
+                    value=1.0,
+                    metadata={"actions": result.actions_count},
+                )
+
+        except Exception as e:
+            self.logger.debug(f"[Cognitive] Post-learning error: {e}")
+
+    def get_cognitive_stats(self) -> Dict[str, Any]:
+        """Get cognitive architecture usage statistics."""
+        return {
+            "initialized": self._cognitive_initialized,
+            "reasoning_count": self._cognitive_reasoning_count,
+            "ethical_checks": self._cognitive_ethical_checks,
+            "causal_analyses": self._cognitive_causal_analyses,
+            "plans_generated": self._cognitive_plans_generated,
+            "modules_enabled": {
+                "causal": self.config.cognitive_causal_reasoning,
+                "world_model": self.config.cognitive_world_model,
+                "theory_of_mind": self.config.cognitive_theory_of_mind,
+                "abstract": self.config.cognitive_abstract_reasoning,
+                "planning": self.config.cognitive_planning,
+                "ethics": self.config.cognitive_ethics,
+            },
+        }
 
     # =========================================================================
     # v9.4: Neural Mesh Production Integration

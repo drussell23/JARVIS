@@ -811,3 +811,414 @@ async def shutdown_degradation() -> None:
                 pass
         _degradation = None
         logger.info("[Degradation] Shutdown complete")
+
+
+# =============================================================================
+# TRINITY-SPECIFIC FALLBACK CHAINS (v81.0)
+# =============================================================================
+
+
+class TrinityFallbackTarget(Enum):
+    """Extended targets for Trinity cross-component fallback."""
+    # J-Prime Chain
+    LOCAL_JARVIS_PRIME = "local_jarvis_prime"
+    CLOUD_RUN_PRIME = "cloud_run_prime"
+    CLOUD_CLAUDE_API = "cloud_claude_api"
+
+    # Reactor-Core Chain
+    LOCAL_REACTOR = "local_reactor"
+    EXPERIENCE_QUEUE = "experience_queue"
+    DISK_PERSISTENCE = "disk_persistence"
+
+    # Voice Chain
+    ECAPA_TDNN = "ecapa_tdnn"
+    BEHAVIORAL_ANALYSIS = "behavioral_analysis"
+    CHALLENGE_RESPONSE = "challenge_response"
+    PASSWORD_FALLBACK = "password_fallback"
+
+
+@dataclass
+class TrinityTargetStatus:
+    """Status of a Trinity fallback target."""
+    target: TrinityFallbackTarget
+    health: TargetHealth = TargetHealth.UNKNOWN
+    last_success: float = 0.0
+    last_failure: float = 0.0
+    consecutive_failures: int = 0
+    circuit_open: bool = False
+    enabled: bool = True
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def record_success(self) -> None:
+        """Record successful request."""
+        self.last_success = time.time()
+        self.consecutive_failures = 0
+        self.health = TargetHealth.HEALTHY
+        if time.time() - self.last_failure > 30:
+            self.circuit_open = False
+
+    def record_failure(self) -> None:
+        """Record failed request."""
+        self.last_failure = time.time()
+        self.consecutive_failures += 1
+        if self.consecutive_failures >= 5:
+            self.health = TargetHealth.UNHEALTHY
+            self.circuit_open = True
+        elif self.consecutive_failures >= 2:
+            self.health = TargetHealth.DEGRADED
+
+
+@dataclass
+class TrinityFallbackChain:
+    """
+    Defines a fallback chain for a Trinity service.
+
+    Example chains:
+        J-Prime Chain:
+            Local J-Prime -> Cloud Run J-Prime -> Cloud Claude API
+
+        Reactor-Core Chain:
+            Local Reactor -> Experience Queue -> Disk Persistence
+
+        Voice Chain:
+            ECAPA-TDNN -> Behavioral Analysis -> Challenge-Response -> Password
+    """
+    name: str
+    targets: List[TrinityFallbackTarget]
+    description: str = ""
+    timeout_per_target: float = 10.0
+
+
+class TrinityFallbackManager:
+    """
+    Extended fallback manager for Trinity cross-component orchestration.
+
+    Provides specialized fallback chains for:
+    - J-Prime (Mind) inference
+    - Reactor-Core (Nerves) training
+    - Voice authentication
+    """
+
+    # Pre-defined fallback chains
+    JPRIME_CHAIN = TrinityFallbackChain(
+        name="jprime",
+        targets=[
+            TrinityFallbackTarget.LOCAL_JARVIS_PRIME,
+            TrinityFallbackTarget.CLOUD_RUN_PRIME,
+            TrinityFallbackTarget.CLOUD_CLAUDE_API,
+        ],
+        description="J-Prime inference fallback chain",
+        timeout_per_target=30.0,
+    )
+
+    REACTOR_CHAIN = TrinityFallbackChain(
+        name="reactor",
+        targets=[
+            TrinityFallbackTarget.LOCAL_REACTOR,
+            TrinityFallbackTarget.EXPERIENCE_QUEUE,
+            TrinityFallbackTarget.DISK_PERSISTENCE,
+        ],
+        description="Reactor-Core training data fallback chain",
+        timeout_per_target=15.0,
+    )
+
+    VOICE_CHAIN = TrinityFallbackChain(
+        name="voice",
+        targets=[
+            TrinityFallbackTarget.ECAPA_TDNN,
+            TrinityFallbackTarget.BEHAVIORAL_ANALYSIS,
+            TrinityFallbackTarget.CHALLENGE_RESPONSE,
+            TrinityFallbackTarget.PASSWORD_FALLBACK,
+        ],
+        description="Voice authentication fallback chain",
+        timeout_per_target=5.0,
+    )
+
+    def __init__(self):
+        self._targets: Dict[TrinityFallbackTarget, TrinityTargetStatus] = {}
+        self._chains: Dict[str, TrinityFallbackChain] = {
+            "jprime": self.JPRIME_CHAIN,
+            "reactor": self.REACTOR_CHAIN,
+            "voice": self.VOICE_CHAIN,
+        }
+        self._lock = asyncio.Lock()
+        self._experience_queue: Optional[Any] = None  # ExperienceDataQueue
+
+        self._init_targets()
+
+    def _init_targets(self) -> None:
+        """Initialize all target statuses."""
+        for target in TrinityFallbackTarget:
+            self._targets[target] = TrinityTargetStatus(target=target)
+
+    async def get_experience_queue(self) -> Any:
+        """Lazy-load experience queue."""
+        if self._experience_queue is None:
+            try:
+                from backend.core.experience_queue import get_experience_queue
+                self._experience_queue = await get_experience_queue()
+            except ImportError:
+                logger.warning("[TrinityFallback] Experience queue not available")
+        return self._experience_queue
+
+    async def execute_chain(
+        self,
+        chain_name: str,
+        handlers: Dict[TrinityFallbackTarget, Callable[..., Awaitable[T]]],
+        *args,
+        **kwargs,
+    ) -> FallbackResult[T]:
+        """
+        Execute a fallback chain with handlers for each target.
+
+        Args:
+            chain_name: Name of the chain to execute
+            handlers: Dict mapping targets to handler functions
+            *args, **kwargs: Arguments passed to handlers
+
+        Returns:
+            FallbackResult with value and metadata
+        """
+        async with self._lock:
+            chain = self._chains.get(chain_name)
+            if not chain:
+                return FallbackResult(
+                    success=False,
+                    error=f"Unknown chain: {chain_name}",
+                )
+
+            start_time = time.time()
+            attempts = 0
+            last_error = None
+
+            for target in chain.targets:
+                status = self._targets[target]
+
+                # Skip disabled or circuit-open targets
+                if not status.enabled or status.circuit_open:
+                    continue
+
+                # Get handler for this target
+                handler = handlers.get(target)
+                if not handler:
+                    continue
+
+                attempts += 1
+
+                try:
+                    result = await asyncio.wait_for(
+                        handler(*args, **kwargs),
+                        timeout=chain.timeout_per_target,
+                    )
+
+                    status.record_success()
+                    latency_ms = (time.time() - start_time) * 1000
+
+                    return FallbackResult(
+                        success=True,
+                        value=result,
+                        target_used=InferenceTarget.LOCAL_PRIME,  # Map to base enum
+                        fallback_reason=FallbackReason.NONE if attempts == 1 else FallbackReason.PRIMARY_ERROR,
+                        latency_ms=latency_ms,
+                        attempts=attempts,
+                    )
+
+                except asyncio.TimeoutError:
+                    status.record_failure()
+                    last_error = f"{target.value} timeout"
+                    logger.warning(f"[TrinityFallback] {target.value} timeout")
+
+                except Exception as e:
+                    status.record_failure()
+                    last_error = str(e)
+                    logger.warning(f"[TrinityFallback] {target.value} error: {e}")
+
+            # All targets failed
+            latency_ms = (time.time() - start_time) * 1000
+            return FallbackResult(
+                success=False,
+                target_used=InferenceTarget.DEGRADED,
+                fallback_reason=FallbackReason.PRIMARY_ERROR,
+                latency_ms=latency_ms,
+                error=last_error or "All targets failed",
+                attempts=attempts,
+            )
+
+    async def execute_jprime_chain(
+        self,
+        request: Dict[str, Any],
+        local_handler: Optional[Callable] = None,
+        cloud_run_handler: Optional[Callable] = None,
+        claude_api_handler: Optional[Callable] = None,
+    ) -> FallbackResult:
+        """
+        Execute J-Prime inference with fallback chain.
+
+        Chain: Local J-Prime -> Cloud Run J-Prime -> Cloud Claude API
+        """
+        handlers = {}
+
+        if local_handler:
+            handlers[TrinityFallbackTarget.LOCAL_JARVIS_PRIME] = local_handler
+        if cloud_run_handler:
+            handlers[TrinityFallbackTarget.CLOUD_RUN_PRIME] = cloud_run_handler
+        if claude_api_handler:
+            handlers[TrinityFallbackTarget.CLOUD_CLAUDE_API] = claude_api_handler
+
+        return await self.execute_chain("jprime", handlers, request)
+
+    async def execute_reactor_chain(
+        self,
+        experience_data: Dict[str, Any],
+        local_handler: Optional[Callable] = None,
+    ) -> FallbackResult:
+        """
+        Execute Reactor-Core training data submission with fallback.
+
+        Chain: Local Reactor -> Experience Queue -> Disk Persistence
+        """
+        async def queue_handler(data):
+            queue = await self.get_experience_queue()
+            if queue:
+                from backend.core.experience_queue import ExperienceType, ExperiencePriority
+                entry_id = await queue.enqueue(
+                    experience_type=ExperienceType.INFERENCE_FEEDBACK,
+                    data=data,
+                    priority=ExperiencePriority.NORMAL,
+                )
+                return {"queued": True, "entry_id": entry_id}
+            raise RuntimeError("Queue not available")
+
+        async def disk_handler(data):
+            # Fallback to disk persistence
+            import json
+            from pathlib import Path
+
+            fallback_dir = Path.home() / ".jarvis" / "experience_fallback"
+            fallback_dir.mkdir(parents=True, exist_ok=True)
+
+            filename = f"{int(time.time() * 1000)}.json"
+            filepath = fallback_dir / filename
+
+            with open(filepath, "w") as f:
+                json.dump(data, f)
+
+            return {"persisted": True, "path": str(filepath)}
+
+        handlers = {
+            TrinityFallbackTarget.EXPERIENCE_QUEUE: queue_handler,
+            TrinityFallbackTarget.DISK_PERSISTENCE: disk_handler,
+        }
+
+        if local_handler:
+            handlers[TrinityFallbackTarget.LOCAL_REACTOR] = local_handler
+
+        return await self.execute_chain("reactor", handlers, experience_data)
+
+    async def execute_voice_chain(
+        self,
+        audio_data: bytes,
+        speaker_id: str,
+        ecapa_handler: Optional[Callable] = None,
+        behavioral_handler: Optional[Callable] = None,
+        challenge_handler: Optional[Callable] = None,
+        password_handler: Optional[Callable] = None,
+    ) -> FallbackResult:
+        """
+        Execute voice authentication with fallback chain.
+
+        Chain: ECAPA-TDNN -> Behavioral Analysis -> Challenge-Response -> Password
+        """
+        handlers = {}
+
+        if ecapa_handler:
+            handlers[TrinityFallbackTarget.ECAPA_TDNN] = ecapa_handler
+        if behavioral_handler:
+            handlers[TrinityFallbackTarget.BEHAVIORAL_ANALYSIS] = behavioral_handler
+        if challenge_handler:
+            handlers[TrinityFallbackTarget.CHALLENGE_RESPONSE] = challenge_handler
+        if password_handler:
+            handlers[TrinityFallbackTarget.PASSWORD_FALLBACK] = password_handler
+
+        return await self.execute_chain(
+            "voice", handlers, audio_data, speaker_id
+        )
+
+    def update_target_health(
+        self,
+        target: TrinityFallbackTarget,
+        health: TargetHealth,
+    ) -> None:
+        """Update health status of a target."""
+        if target in self._targets:
+            self._targets[target].health = health
+            logger.debug(f"[TrinityFallback] {target.value} health: {health.value}")
+
+    def enable_target(
+        self,
+        target: TrinityFallbackTarget,
+        enabled: bool = True,
+    ) -> None:
+        """Enable or disable a target."""
+        if target in self._targets:
+            self._targets[target].enabled = enabled
+            logger.info(
+                f"[TrinityFallback] {target.value} "
+                f"{'enabled' if enabled else 'disabled'}"
+            )
+
+    def reset_circuit(self, target: TrinityFallbackTarget) -> None:
+        """Reset circuit breaker for a target."""
+        if target in self._targets:
+            self._targets[target].circuit_open = False
+            self._targets[target].consecutive_failures = 0
+            logger.info(f"[TrinityFallback] Circuit reset for {target.value}")
+
+    def get_status(self) -> Dict[str, Any]:
+        """Get status of all Trinity fallback targets."""
+        return {
+            "chains": {
+                name: {
+                    "targets": [t.value for t in chain.targets],
+                    "description": chain.description,
+                    "timeout": chain.timeout_per_target,
+                }
+                for name, chain in self._chains.items()
+            },
+            "targets": {
+                target.value: {
+                    "health": status.health.value,
+                    "enabled": status.enabled,
+                    "circuit_open": status.circuit_open,
+                    "consecutive_failures": status.consecutive_failures,
+                }
+                for target, status in self._targets.items()
+            },
+        }
+
+
+# =============================================================================
+# TRINITY FALLBACK SINGLETON
+# =============================================================================
+
+_trinity_fallback: Optional[TrinityFallbackManager] = None
+_trinity_fallback_lock = asyncio.Lock()
+
+
+async def get_trinity_fallback() -> TrinityFallbackManager:
+    """Get the singleton TrinityFallbackManager instance."""
+    global _trinity_fallback
+
+    async with _trinity_fallback_lock:
+        if _trinity_fallback is None:
+            _trinity_fallback = TrinityFallbackManager()
+        return _trinity_fallback
+
+
+def get_trinity_fallback_sync() -> TrinityFallbackManager:
+    """Synchronous version for non-async contexts."""
+    global _trinity_fallback
+
+    if _trinity_fallback is None:
+        _trinity_fallback = TrinityFallbackManager()
+    return _trinity_fallback

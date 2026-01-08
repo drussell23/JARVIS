@@ -145,6 +145,7 @@ class IntelligenceSystem(str, Enum):
     REASONING = "reasoning"
     VBIA = "vbia"  # v6.2: Voice Biometric Intelligent Authentication
     SPATIAL = "spatial"  # v6.2: 3D OS Awareness (Proprioception)
+    VOICE_LEARNING = "voice_learning"  # v81.0: Unified Learning Loop
 
 
 class EventType(str, Enum):
@@ -200,6 +201,15 @@ class EventType(str, Enum):
     # Cross-System
     CONTEXT_ENRICHED = "context_enriched"
     STATE_SYNCHRONIZED = "state_synchronized"
+
+    # Unified Learning Loop - v81.0 Trinity Integration
+    VOICE_EXPERIENCE_COLLECTED = "voice_experience_collected"
+    MODEL_UPDATE_AVAILABLE = "model_update_available"
+    MODEL_DEPLOYED = "model_deployed"
+    MODEL_ROLLBACK = "model_rollback"
+    TRAINING_TRIGGERED = "training_triggered"
+    AB_TEST_STARTED = "ab_test_started"
+    AB_TEST_COMPLETED = "ab_test_completed"
 
 
 class TaskPriority(int, Enum):
@@ -875,6 +885,272 @@ class SpatialAwarenessAdapter:
         return self._initialized and self._is_available
 
 
+class VoiceLearningAdapter:
+    """
+    Adapter for Voice Unified Learning Loop.
+
+    v81.0 Trinity Integration: Connects voice authentication experiences
+    to the training pipeline via Reactor-Core.
+
+    Capabilities:
+    - Collect voice authentication experiences
+    - Deploy new voice models with A/B testing
+    - Automatic rollback on degradation
+    - Forward experiences to Reactor-Core training queue
+    """
+
+    def __init__(self, config: Optional["CrossRepoHubConfig"] = None):
+        self.config = config or CrossRepoHubConfig()
+        self._experience_collector = None
+        self._model_deployer = None
+        self._ab_testing_manager = None
+        self._initialized = False
+        self._is_available = False
+
+    async def initialize(self) -> None:
+        if self._initialized:
+            return
+        try:
+            from backend.voice_unlock.learning import (
+                get_voice_experience_collector,
+                get_voice_model_deployer,
+            )
+            from backend.voice_unlock.testing import get_ab_testing_manager
+
+            self._experience_collector = await get_voice_experience_collector()
+            self._model_deployer = await get_voice_model_deployer()
+            self._ab_testing_manager = await get_ab_testing_manager()
+            self._is_available = True
+            self._initialized = True
+            logger.info("VoiceLearningAdapter initialized")
+        except ImportError as e:
+            logger.info(f"Voice Learning Loop not available: {e}")
+            self._initialized = True
+        except Exception as e:
+            logger.warning(f"Voice Learning Loop initialization failed: {e}")
+            self._initialized = True
+
+    async def collect_experience(
+        self,
+        session_id: str,
+        user_id: str,
+        embedding: List[float],
+        outcome: str,
+        confidence: float,
+        audio_quality_metrics: Optional[Dict[str, float]] = None,
+        environmental_context: Optional[Dict[str, Any]] = None,
+        reasoning_trace: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[str]:
+        """
+        Collect a voice authentication experience for training.
+
+        Returns experience_id if successful, None otherwise.
+        """
+        if not self._initialized:
+            await self.initialize()
+        if not self._experience_collector:
+            return None
+
+        try:
+            from backend.voice_unlock.learning import ExperienceOutcome
+            outcome_enum = ExperienceOutcome(outcome.lower())
+            return await self._experience_collector.collect(
+                session_id=session_id,
+                user_id=user_id,
+                embedding=embedding,
+                outcome=outcome_enum,
+                confidence=confidence,
+                audio_quality_metrics=audio_quality_metrics,
+                environmental_context=environmental_context,
+                reasoning_trace=reasoning_trace,
+            )
+        except Exception as e:
+            logger.debug(f"Experience collection failed: {e}")
+            return None
+
+    async def deploy_model(
+        self,
+        model_path: str,
+        model_type: str,
+        strategy: str = "ab_test",
+        version_id: Optional[str] = None,
+        metrics: Optional[Dict[str, float]] = None,
+        traffic_percentage: float = 0.1,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Deploy a new voice model.
+
+        Strategies: immediate, gradual, ab_test, shadow, canary
+        """
+        if not self._initialized:
+            await self.initialize()
+        if not self._model_deployer:
+            return None
+
+        try:
+            from backend.voice_unlock.learning import (
+                ModelType,
+                DeploymentStrategy,
+            )
+            from pathlib import Path
+
+            model_type_enum = ModelType(model_type.lower())
+            strategy_enum = DeploymentStrategy(strategy.lower())
+
+            result = await self._model_deployer.deploy_model(
+                model_path=Path(model_path),
+                model_type=model_type_enum,
+                strategy=strategy_enum,
+                version_id=version_id,
+                metrics=metrics,
+                traffic_percentage=traffic_percentage,
+            )
+            return {
+                "success": result.success,
+                "version_id": result.version_id,
+                "deployment_id": result.deployment_id,
+                "ab_test_id": result.ab_test_id,
+                "message": result.message,
+            }
+        except Exception as e:
+            logger.debug(f"Model deployment failed: {e}")
+            return None
+
+    async def start_ab_test(
+        self,
+        test_id: str,
+        control_version: str,
+        treatment_version: str,
+        traffic_split: float = 0.1,
+        min_sample_size: int = 100,
+        confidence_level: float = 0.95,
+        metric_name: str = "accuracy",
+        duration_hours: float = 24.0,
+    ) -> Optional[Dict[str, Any]]:
+        """Start an A/B test between two model versions."""
+        if not self._initialized:
+            await self.initialize()
+        if not self._ab_testing_manager:
+            return None
+
+        try:
+            test = await self._ab_testing_manager.start_test(
+                test_id=test_id,
+                control_version=control_version,
+                treatment_version=treatment_version,
+                traffic_split=traffic_split,
+                min_sample_size=min_sample_size,
+                confidence_level=confidence_level,
+                metric_name=metric_name,
+                duration_hours=duration_hours,
+            )
+            if test:
+                return {
+                    "test_id": test.config.test_id,
+                    "status": test.status.value,
+                    "control": test.config.control_version,
+                    "treatment": test.config.treatment_version,
+                    "traffic_split": test.config.traffic_split,
+                }
+            return None
+        except Exception as e:
+            logger.debug(f"A/B test start failed: {e}")
+            return None
+
+    async def get_ab_test_variant(
+        self,
+        test_id: str,
+        user_id: str,
+    ) -> Optional[str]:
+        """Get the variant for a user in an A/B test."""
+        if not self._ab_testing_manager:
+            return None
+
+        try:
+            variant = await self._ab_testing_manager.get_variant(test_id, user_id)
+            return variant.value if variant else None
+        except Exception:
+            return None
+
+    async def record_ab_metric(
+        self,
+        test_id: str,
+        user_id: str,
+        metric_value: float,
+        is_success: bool,
+    ) -> bool:
+        """Record a metric observation for an A/B test."""
+        if not self._ab_testing_manager:
+            return False
+
+        try:
+            return await self._ab_testing_manager.record_metric(
+                test_id=test_id,
+                user_id=user_id,
+                metric_value=metric_value,
+                is_success=is_success,
+            )
+        except Exception:
+            return False
+
+    async def evaluate_ab_test(
+        self,
+        test_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Evaluate an A/B test and determine winner."""
+        if not self._ab_testing_manager:
+            return None
+
+        try:
+            result = await self._ab_testing_manager.evaluate_test(test_id)
+            if result:
+                return {
+                    "test_id": result.test_id,
+                    "winner": result.winner.value if result.winner else None,
+                    "control_mean": result.control_mean,
+                    "treatment_mean": result.treatment_mean,
+                    "control_samples": result.control_samples,
+                    "treatment_samples": result.treatment_samples,
+                    "p_value": result.p_value,
+                    "is_significant": result.is_significant,
+                    "effect_size": result.effect_size,
+                    "recommendation": result.recommendation,
+                }
+            return None
+        except Exception:
+            return None
+
+    async def rollback_model(
+        self,
+        model_type: str,
+        to_version: Optional[str] = None,
+    ) -> bool:
+        """Rollback to a previous model version."""
+        if not self._model_deployer:
+            return False
+
+        try:
+            from backend.voice_unlock.learning import ModelType
+            model_type_enum = ModelType(model_type.lower())
+            return await self._model_deployer.rollback(model_type_enum, to_version)
+        except Exception:
+            return False
+
+    async def get_experience_stats(self) -> Optional[Dict[str, Any]]:
+        """Get statistics about collected experiences."""
+        if not self._experience_collector:
+            return None
+
+        try:
+            return await self._experience_collector.get_stats()
+        except Exception:
+            return None
+
+    @property
+    def is_available(self) -> bool:
+        return self._initialized and self._is_available
+
+
 # ============================================================================
 # Cross-Repo Intelligence Hub
 # ============================================================================
@@ -908,6 +1184,9 @@ class CrossRepoIntelligenceHub:
 
         # v6.2: Grand Unification - Spatial Awareness (Proprioception)
         self._spatial_adapter = SpatialAwarenessAdapter(config)
+
+        # v81.0: Voice Unified Learning Loop
+        self._voice_learning_adapter = VoiceLearningAdapter(config)
 
         # Event handling
         self._event_handlers: Dict[EventType, List[Callable]] = {}
@@ -954,6 +1233,9 @@ class CrossRepoIntelligenceHub:
 
             # v6.2: Always try to initialize spatial awareness (Proprioception)
             init_tasks.append(self._spatial_adapter.initialize())
+
+            # v81.0: Always try to initialize voice learning loop
+            init_tasks.append(self._voice_learning_adapter.initialize())
 
             if init_tasks:
                 await asyncio.gather(*init_tasks, return_exceptions=True)
@@ -1231,6 +1513,191 @@ class CrossRepoIntelligenceHub:
         return result or {}
 
     # -------------------------------------------------------------------------
+    # Voice Learning Pipeline (v81.0)
+    # -------------------------------------------------------------------------
+
+    async def handle_voice_experience(
+        self,
+        session_id: str,
+        user_id: str,
+        embedding: List[float],
+        outcome: str,
+        confidence: float,
+        audio_quality_metrics: Optional[Dict[str, float]] = None,
+        environmental_context: Optional[Dict[str, Any]] = None,
+        reasoning_trace: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[str]:
+        """
+        Handle a voice authentication experience.
+
+        Collects the experience and forwards it to Reactor-Core training queue.
+        Returns experience_id if successful.
+        """
+        await self.initialize()
+
+        # Collect experience via voice learning adapter
+        experience_id = await self._voice_learning_adapter.collect_experience(
+            session_id=session_id,
+            user_id=user_id,
+            embedding=embedding,
+            outcome=outcome,
+            confidence=confidence,
+            audio_quality_metrics=audio_quality_metrics,
+            environmental_context=environmental_context,
+            reasoning_trace=reasoning_trace,
+        )
+
+        if experience_id:
+            # Emit experience collected event
+            await self.emit(HubEvent(
+                event_type=EventType.VOICE_EXPERIENCE_COLLECTED,
+                source_system=IntelligenceSystem.VOICE_LEARNING,
+                payload={
+                    "experience_id": experience_id,
+                    "session_id": session_id,
+                    "user_id": user_id,
+                    "outcome": outcome,
+                    "confidence": confidence,
+                },
+            ))
+
+            # Also stream to Reactor-Core if available
+            if self._reactor_core_adapter.is_online:
+                await self._reactor_core_adapter.stream_experience({
+                    "type": "voice_authentication",
+                    "experience_id": experience_id,
+                    "embedding": embedding,
+                    "outcome": outcome,
+                    "confidence": confidence,
+                    "audio_metrics": audio_quality_metrics,
+                    "context": environmental_context,
+                })
+
+        return experience_id
+
+    async def handle_model_update(
+        self,
+        model_path: str,
+        model_type: str,
+        strategy: str = "ab_test",
+        metrics: Optional[Dict[str, float]] = None,
+        traffic_percentage: float = 0.1,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Handle a model update from Reactor-Core.
+
+        Deploys the new model with the specified strategy.
+        """
+        await self.initialize()
+
+        result = await self._voice_learning_adapter.deploy_model(
+            model_path=model_path,
+            model_type=model_type,
+            strategy=strategy,
+            metrics=metrics,
+            traffic_percentage=traffic_percentage,
+        )
+
+        if result and result.get("success"):
+            event_type = EventType.MODEL_DEPLOYED
+            if result.get("ab_test_id"):
+                event_type = EventType.AB_TEST_STARTED
+
+            await self.emit(HubEvent(
+                event_type=event_type,
+                source_system=IntelligenceSystem.VOICE_LEARNING,
+                payload={
+                    "model_type": model_type,
+                    "strategy": strategy,
+                    "version_id": result.get("version_id"),
+                    "deployment_id": result.get("deployment_id"),
+                    "ab_test_id": result.get("ab_test_id"),
+                },
+            ))
+
+        return result
+
+    async def trigger_voice_training(
+        self,
+        force: bool = False,
+        priority: str = "normal",
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Trigger voice model training in Reactor-Core.
+
+        Returns training status if triggered.
+        """
+        await self.initialize()
+
+        # Get experience stats to determine if training is warranted
+        stats = await self._voice_learning_adapter.get_experience_stats()
+        experience_count = stats.get("total_experiences", 0) if stats else 0
+
+        if not force and experience_count < 100:
+            logger.info(f"Skipping training trigger: only {experience_count} experiences")
+            return {"triggered": False, "reason": "insufficient_data", "count": experience_count}
+
+        result = await self._reactor_core_adapter.trigger_training(
+            experience_count=experience_count,
+            priority=priority,
+            force=force,
+        )
+
+        if result:
+            await self.emit(HubEvent(
+                event_type=EventType.TRAINING_TRIGGERED,
+                source_system=IntelligenceSystem.VOICE_LEARNING,
+                payload={
+                    "experience_count": experience_count,
+                    "priority": priority,
+                    "force": force,
+                    "training_id": result.get("training_id"),
+                },
+            ))
+
+        return result
+
+    async def evaluate_voice_ab_test(
+        self,
+        test_id: str,
+        auto_apply: bool = True,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Evaluate a voice model A/B test.
+
+        If auto_apply=True and there's a clear winner, automatically
+        deploys the winning variant.
+        """
+        await self.initialize()
+
+        result = await self._voice_learning_adapter.evaluate_ab_test(test_id)
+
+        if result:
+            await self.emit(HubEvent(
+                event_type=EventType.AB_TEST_COMPLETED,
+                source_system=IntelligenceSystem.VOICE_LEARNING,
+                payload={
+                    "test_id": test_id,
+                    "winner": result.get("winner"),
+                    "is_significant": result.get("is_significant"),
+                    "p_value": result.get("p_value"),
+                    "recommendation": result.get("recommendation"),
+                },
+            ))
+
+            # Auto-apply winner if enabled and significant
+            if auto_apply and result.get("is_significant") and result.get("winner"):
+                winner = result["winner"]
+                if winner == "treatment":
+                    # Get test config to find treatment version
+                    # and deploy it as the new production model
+                    logger.info(f"Auto-applying A/B test winner: {test_id} -> treatment")
+                    # Note: Actual deployment would need the model path
+                    # This is handled by the A/B testing manager's auto-promotion
+
+        return result
+
+    # -------------------------------------------------------------------------
     # State and Health
     # -------------------------------------------------------------------------
 
@@ -1251,6 +1718,9 @@ class CrossRepoIntelligenceHub:
         # v6.2: Spatial Awareness (Proprioception)
         if self._spatial_adapter.is_available:
             active.add(IntelligenceSystem.SPATIAL)
+        # v81.0: Voice Learning Loop
+        if self._voice_learning_adapter.is_available:
+            active.add(IntelligenceSystem.VOICE_LEARNING)
         return active
 
     def get_state(self) -> HubState:
@@ -1268,6 +1738,7 @@ class CrossRepoIntelligenceHub:
                 IntelligenceSystem.MEMORY: self._memory_adapter.is_available,
                 IntelligenceSystem.WISDOM: self._wisdom_adapter.is_available,
                 IntelligenceSystem.SPATIAL: self._spatial_adapter.is_available,  # v6.2
+                IntelligenceSystem.VOICE_LEARNING: self._voice_learning_adapter.is_available,  # v81.0
             },
         )
 
@@ -1342,6 +1813,9 @@ __all__ = [
 
     # v6.2: Grand Unification
     "SpatialAwarenessAdapter",
+
+    # v81.0: Voice Learning Loop
+    "VoiceLearningAdapter",
 
     # Convenience Functions
     "get_intelligence_hub",

@@ -1,0 +1,957 @@
+"""
+Coordinated Shutdown Manager - Phased Shutdown Orchestration.
+==============================================================
+
+Provides a systematic, phased shutdown process for the Trinity architecture
+that ensures graceful termination with state preservation.
+
+Key Features:
+1. Phased shutdown (Announce → Drain → Save → Cleanup → Terminate → Verify)
+2. Process Group (PGID) tracking for clean termination
+3. Priority-based hook execution
+4. Timeout handling with escalation
+5. State persistence before shutdown
+6. Cross-component coordination via IPC
+
+Architecture:
+    ┌─────────────────────────────────────────────────────────────────────┐
+    │  CoordinatedShutdownManager                                         │
+    │  ├── ShutdownPhaseExecutor (runs hooks per phase)                   │
+    │  ├── ProcessGroupManager (PGID tracking and termination)            │
+    │  ├── StatePreserver (persists critical state before shutdown)       │
+    │  └── ShutdownCoordinator (cross-component shutdown signaling)       │
+    └─────────────────────────────────────────────────────────────────────┘
+
+Shutdown Phases:
+    ANNOUNCE   → Notify all components shutdown is starting
+    DRAIN      → Complete in-flight requests (grace period)
+    SAVE       → Persist critical state to disk
+    CLEANUP    → Close connections, release resources
+    TERMINATE  → Send signals to processes (SIGTERM → SIGKILL)
+    VERIFY     → Confirm all processes terminated
+
+Author: JARVIS Trinity v81.0 - Coordinated Shutdown Orchestration
+"""
+
+from __future__ import annotations
+
+import asyncio
+import enum
+import logging
+import os
+import signal
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
+
+logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Configuration
+# =============================================================================
+
+def _env_float(key: str, default: float) -> float:
+    try:
+        return float(os.getenv(key, str(default)))
+    except ValueError:
+        return default
+
+
+def _env_int(key: str, default: int) -> int:
+    try:
+        return int(os.getenv(key, str(default)))
+    except ValueError:
+        return default
+
+
+def _env_bool(key: str, default: bool) -> bool:
+    val = os.getenv(key, str(default)).lower()
+    return val in ("true", "1", "yes", "on")
+
+
+# =============================================================================
+# Types and Enums
+# =============================================================================
+
+class ShutdownPhase(enum.IntEnum):
+    """Shutdown phases in execution order."""
+    ANNOUNCE = 1    # Notify all components
+    DRAIN = 2       # Complete in-flight requests
+    SAVE = 3        # Persist critical state
+    CLEANUP = 4     # Close connections
+    TERMINATE = 5   # Send signals to processes
+    VERIFY = 6      # Confirm termination
+
+
+class ShutdownReason(enum.Enum):
+    """Reason for shutdown."""
+    USER_REQUEST = "user_request"
+    SIGNAL_RECEIVED = "signal_received"
+    HEALTH_CRITICAL = "health_critical"
+    UPDATE_REQUIRED = "update_required"
+    ERROR_RECOVERY = "error_recovery"
+    RESOURCE_EXHAUSTION = "resource_exhaustion"
+    SCHEDULED = "scheduled"
+
+
+class ProcessState(enum.Enum):
+    """State of a managed process."""
+    RUNNING = "running"
+    DRAINING = "draining"
+    STOPPING = "stopping"
+    STOPPED = "stopped"
+    ZOMBIE = "zombie"
+    UNKNOWN = "unknown"
+
+
+@dataclass
+class ShutdownHook:
+    """A hook to be executed during shutdown."""
+    name: str
+    phase: ShutdownPhase
+    priority: int  # Lower = earlier execution
+    callback: Callable[[], Awaitable[None]]
+    timeout: float = 10.0
+    critical: bool = False  # If True, failure aborts shutdown
+
+    def __lt__(self, other: "ShutdownHook") -> bool:
+        return self.priority < other.priority
+
+
+@dataclass
+class ManagedProcess:
+    """A process managed by the shutdown manager."""
+    name: str
+    pid: int
+    pgid: Optional[int] = None
+    state: ProcessState = ProcessState.RUNNING
+    component_type: Optional[str] = None  # jarvis_body, jarvis_prime, reactor_core
+    started_at: float = field(default_factory=time.time)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def age_seconds(self) -> float:
+        """How long this process has been running."""
+        return time.time() - self.started_at
+
+
+@dataclass
+class ShutdownResult:
+    """Result of a shutdown operation."""
+    success: bool
+    phase_reached: ShutdownPhase
+    elapsed_seconds: float
+    processes_terminated: int
+    hooks_executed: int
+    hooks_failed: int
+    errors: List[str] = field(default_factory=list)
+    state_saved: bool = False
+
+
+@dataclass
+class PhaseResult:
+    """Result of a single shutdown phase."""
+    phase: ShutdownPhase
+    success: bool
+    elapsed_seconds: float
+    hooks_executed: int
+    hooks_failed: int
+    errors: List[str] = field(default_factory=list)
+
+
+# =============================================================================
+# Process Group Manager
+# =============================================================================
+
+class ProcessGroupManager:
+    """
+    Manages process groups (PGIDs) for clean termination.
+
+    Uses PGID to ensure all child processes are terminated together.
+    """
+
+    def __init__(self):
+        self._processes: Dict[int, ManagedProcess] = {}
+        self._lock = asyncio.Lock()
+
+    async def register_process(
+        self,
+        name: str,
+        pid: int,
+        component_type: Optional[str] = None,
+        track_pgid: bool = True,
+    ) -> ManagedProcess:
+        """Register a process for shutdown management."""
+        async with self._lock:
+            pgid = None
+            if track_pgid:
+                try:
+                    pgid = os.getpgid(pid)
+                except (ProcessLookupError, PermissionError):
+                    logger.warning(
+                        f"[ShutdownManager] Could not get PGID for {name} (PID {pid})"
+                    )
+
+            process = ManagedProcess(
+                name=name,
+                pid=pid,
+                pgid=pgid,
+                component_type=component_type,
+            )
+            self._processes[pid] = process
+
+            logger.debug(
+                f"[ShutdownManager] Registered process: {name} "
+                f"(PID={pid}, PGID={pgid})"
+            )
+            return process
+
+    async def unregister_process(self, pid: int) -> None:
+        """Unregister a process."""
+        async with self._lock:
+            if pid in self._processes:
+                process = self._processes.pop(pid)
+                logger.debug(f"[ShutdownManager] Unregistered: {process.name}")
+
+    def get_process(self, pid: int) -> Optional[ManagedProcess]:
+        """Get a managed process by PID."""
+        return self._processes.get(pid)
+
+    def get_all_processes(self) -> List[ManagedProcess]:
+        """Get all managed processes."""
+        return list(self._processes.values())
+
+    def get_by_component(self, component_type: str) -> List[ManagedProcess]:
+        """Get processes by component type."""
+        return [
+            p for p in self._processes.values()
+            if p.component_type == component_type
+        ]
+
+    async def terminate_process(
+        self,
+        pid: int,
+        use_pgid: bool = True,
+        graceful_timeout: float = 5.0,
+        force_timeout: float = 3.0,
+    ) -> bool:
+        """
+        Terminate a process with graceful escalation.
+
+        1. Send SIGTERM to process (or PGID)
+        2. Wait for graceful_timeout
+        3. Send SIGKILL if still running
+        4. Wait for force_timeout
+        5. Return success status
+        """
+        process = self._processes.get(pid)
+        if not process:
+            return True  # Already gone
+
+        target_id = pid
+        use_pg = use_pgid and process.pgid is not None
+
+        if use_pg:
+            target_id = process.pgid
+            logger.debug(
+                f"[ShutdownManager] Terminating {process.name} via PGID {target_id}"
+            )
+        else:
+            logger.debug(
+                f"[ShutdownManager] Terminating {process.name} via PID {pid}"
+            )
+
+        # Mark as stopping
+        process.state = ProcessState.STOPPING
+
+        # Try graceful termination
+        try:
+            if use_pg:
+                os.killpg(target_id, signal.SIGTERM)
+            else:
+                os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            process.state = ProcessState.STOPPED
+            return True
+        except PermissionError:
+            logger.warning(
+                f"[ShutdownManager] Permission denied for SIGTERM to {process.name}"
+            )
+
+        # Wait for graceful termination
+        start_time = time.time()
+        while time.time() - start_time < graceful_timeout:
+            await asyncio.sleep(0.2)
+            if not self._process_exists(pid):
+                process.state = ProcessState.STOPPED
+                logger.info(f"[ShutdownManager] {process.name} terminated gracefully")
+                return True
+
+        # Force termination
+        logger.warning(
+            f"[ShutdownManager] {process.name} didn't respond to SIGTERM, sending SIGKILL"
+        )
+
+        try:
+            if use_pg:
+                os.killpg(target_id, signal.SIGKILL)
+            else:
+                os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            process.state = ProcessState.STOPPED
+            return True
+        except PermissionError:
+            logger.error(
+                f"[ShutdownManager] Permission denied for SIGKILL to {process.name}"
+            )
+            return False
+
+        # Wait for forced termination
+        start_time = time.time()
+        while time.time() - start_time < force_timeout:
+            await asyncio.sleep(0.2)
+            if not self._process_exists(pid):
+                process.state = ProcessState.STOPPED
+                logger.info(f"[ShutdownManager] {process.name} killed")
+                return True
+
+        # Still running - zombie or unkillable
+        process.state = ProcessState.ZOMBIE
+        logger.error(f"[ShutdownManager] Failed to kill {process.name}")
+        return False
+
+    def _process_exists(self, pid: int) -> bool:
+        """Check if a process exists."""
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True  # Exists but can't signal
+
+    async def terminate_all(
+        self,
+        order: Optional[List[str]] = None,
+        parallel: bool = False,
+        **kwargs,
+    ) -> Tuple[int, int]:
+        """
+        Terminate all managed processes.
+
+        Args:
+            order: Component types in termination order (e.g., ["reactor_core", "jarvis_prime", "jarvis_body"])
+            parallel: If True, terminate processes in parallel
+            **kwargs: Passed to terminate_process
+
+        Returns:
+            Tuple of (terminated_count, failed_count)
+        """
+        terminated = 0
+        failed = 0
+
+        if order:
+            # Terminate in specified order
+            for component_type in order:
+                processes = self.get_by_component(component_type)
+                for process in processes:
+                    if await self.terminate_process(process.pid, **kwargs):
+                        terminated += 1
+                    else:
+                        failed += 1
+        elif parallel:
+            # Terminate all in parallel
+            tasks = [
+                self.terminate_process(p.pid, **kwargs)
+                for p in self._processes.values()
+            ]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for result in results:
+                if result is True:
+                    terminated += 1
+                else:
+                    failed += 1
+        else:
+            # Terminate sequentially
+            for process in list(self._processes.values()):
+                if await self.terminate_process(process.pid, **kwargs):
+                    terminated += 1
+                else:
+                    failed += 1
+
+        return (terminated, failed)
+
+
+# =============================================================================
+# Coordinated Shutdown Manager
+# =============================================================================
+
+class CoordinatedShutdownManager:
+    """
+    Orchestrates phased shutdown for the Trinity architecture.
+
+    Features:
+    - Phase-based execution with configurable hooks
+    - Process group management for clean termination
+    - State preservation before shutdown
+    - Cross-component coordination via IPC
+    - Timeout handling with escalation
+    """
+
+    # Default phase timeouts (can be overridden via environment)
+    DEFAULT_PHASE_TIMEOUTS = {
+        ShutdownPhase.ANNOUNCE: 5.0,
+        ShutdownPhase.DRAIN: 30.0,
+        ShutdownPhase.SAVE: 15.0,
+        ShutdownPhase.CLEANUP: 10.0,
+        ShutdownPhase.TERMINATE: 20.0,
+        ShutdownPhase.VERIFY: 5.0,
+    }
+
+    # Termination order for Trinity components
+    TERMINATION_ORDER = ["reactor_core", "jarvis_prime", "jarvis_body"]
+
+    def __init__(
+        self,
+        ipc_bus: Optional[Any] = None,  # TrinityIPCBus
+        state_dir: Optional[Path] = None,
+    ):
+        """
+        Initialize the shutdown manager.
+
+        Args:
+            ipc_bus: Optional IPC bus for cross-component signaling
+            state_dir: Directory for state preservation
+        """
+        self.ipc_bus = ipc_bus
+        self.state_dir = state_dir or Path(os.environ.get(
+            "JARVIS_STATE_DIR",
+            str(Path.home() / ".jarvis" / "state")
+        ))
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+
+        # Process management
+        self.process_manager = ProcessGroupManager()
+
+        # Hooks organized by phase
+        self._hooks: Dict[ShutdownPhase, List[ShutdownHook]] = {
+            phase: [] for phase in ShutdownPhase
+        }
+
+        # Phase timeouts from environment
+        self._phase_timeouts = {
+            phase: _env_float(
+                f"SHUTDOWN_PHASE_{phase.name}_TIMEOUT",
+                self.DEFAULT_PHASE_TIMEOUTS[phase]
+            )
+            for phase in ShutdownPhase
+        }
+
+        # State
+        self._shutdown_in_progress = False
+        self._shutdown_lock = asyncio.Lock()
+        self._current_phase: Optional[ShutdownPhase] = None
+        self._shutdown_reason: Optional[ShutdownReason] = None
+
+        # Callbacks
+        self._on_shutdown_start: List[Callable[[ShutdownReason], None]] = []
+        self._on_phase_complete: List[Callable[[ShutdownPhase, PhaseResult], None]] = []
+        self._on_shutdown_complete: List[Callable[[ShutdownResult], None]] = []
+
+        logger.info(
+            f"[ShutdownManager] Initialized with state_dir={self.state_dir}"
+        )
+
+    # =========================================================================
+    # Hook Registration
+    # =========================================================================
+
+    def register_hook(
+        self,
+        name: str,
+        phase: ShutdownPhase,
+        callback: Callable[[], Awaitable[None]],
+        priority: int = 100,
+        timeout: float = 10.0,
+        critical: bool = False,
+    ) -> None:
+        """
+        Register a shutdown hook.
+
+        Args:
+            name: Hook name for logging
+            phase: Phase to execute in
+            callback: Async function to call
+            priority: Execution priority (lower = earlier)
+            timeout: Maximum execution time
+            critical: If True, failure aborts shutdown
+        """
+        hook = ShutdownHook(
+            name=name,
+            phase=phase,
+            priority=priority,
+            callback=callback,
+            timeout=timeout,
+            critical=critical,
+        )
+        self._hooks[phase].append(hook)
+        self._hooks[phase].sort()  # Keep sorted by priority
+
+        logger.debug(
+            f"[ShutdownManager] Registered hook '{name}' for phase {phase.name} "
+            f"(priority={priority}, critical={critical})"
+        )
+
+    def unregister_hook(self, name: str, phase: Optional[ShutdownPhase] = None) -> None:
+        """Unregister a hook by name."""
+        phases = [phase] if phase else list(ShutdownPhase)
+        for p in phases:
+            self._hooks[p] = [h for h in self._hooks[p] if h.name != name]
+
+    # =========================================================================
+    # Process Registration
+    # =========================================================================
+
+    async def register_process(
+        self,
+        name: str,
+        pid: int,
+        component_type: Optional[str] = None,
+    ) -> ManagedProcess:
+        """Register a process for managed shutdown."""
+        return await self.process_manager.register_process(
+            name=name,
+            pid=pid,
+            component_type=component_type,
+        )
+
+    async def unregister_process(self, pid: int) -> None:
+        """Unregister a process."""
+        await self.process_manager.unregister_process(pid)
+
+    # =========================================================================
+    # Shutdown Execution
+    # =========================================================================
+
+    async def initiate_shutdown(
+        self,
+        reason: ShutdownReason = ShutdownReason.USER_REQUEST,
+        timeout: Optional[float] = None,
+        force: bool = False,
+    ) -> ShutdownResult:
+        """
+        Initiate coordinated shutdown.
+
+        Args:
+            reason: Reason for shutdown
+            timeout: Overall timeout (uses sum of phase timeouts if None)
+            force: If True, skip draining and proceed immediately
+
+        Returns:
+            ShutdownResult with details
+        """
+        async with self._shutdown_lock:
+            if self._shutdown_in_progress and not force:
+                logger.warning("[ShutdownManager] Shutdown already in progress")
+                return ShutdownResult(
+                    success=False,
+                    phase_reached=self._current_phase or ShutdownPhase.ANNOUNCE,
+                    elapsed_seconds=0,
+                    processes_terminated=0,
+                    hooks_executed=0,
+                    hooks_failed=0,
+                    errors=["Shutdown already in progress"],
+                )
+
+            self._shutdown_in_progress = True
+            self._shutdown_reason = reason
+
+            start_time = time.time()
+            total_hooks_executed = 0
+            total_hooks_failed = 0
+            all_errors: List[str] = []
+            state_saved = False
+
+            logger.info(
+                f"[ShutdownManager] Initiating shutdown (reason={reason.value})"
+            )
+
+            # Notify start callbacks
+            for callback in self._on_shutdown_start:
+                try:
+                    callback(reason)
+                except Exception as e:
+                    logger.warning(f"[ShutdownManager] Start callback error: {e}")
+
+            # Execute phases
+            phases = list(ShutdownPhase)
+            if force:
+                # Skip DRAIN phase for forced shutdown
+                phases = [p for p in phases if p != ShutdownPhase.DRAIN]
+
+            last_successful_phase = ShutdownPhase.ANNOUNCE
+            processes_terminated = 0
+
+            for phase in phases:
+                self._current_phase = phase
+                phase_timeout = self._phase_timeouts[phase]
+
+                logger.info(
+                    f"[ShutdownManager] Executing phase {phase.name} "
+                    f"(timeout={phase_timeout}s)"
+                )
+
+                try:
+                    result = await asyncio.wait_for(
+                        self._execute_phase(phase),
+                        timeout=phase_timeout,
+                    )
+
+                    total_hooks_executed += result.hooks_executed
+                    total_hooks_failed += result.hooks_failed
+                    all_errors.extend(result.errors)
+
+                    # Track state saved
+                    if phase == ShutdownPhase.SAVE and result.success:
+                        state_saved = True
+
+                    # Notify phase complete callbacks
+                    for callback in self._on_phase_complete:
+                        try:
+                            callback(phase, result)
+                        except Exception as e:
+                            logger.warning(
+                                f"[ShutdownManager] Phase callback error: {e}"
+                            )
+
+                    if result.success:
+                        last_successful_phase = phase
+                    else:
+                        # Check if any critical hooks failed
+                        if any("critical" in e.lower() for e in result.errors):
+                            logger.error(
+                                f"[ShutdownManager] Critical failure in phase {phase.name}"
+                            )
+                            break
+
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        f"[ShutdownManager] Phase {phase.name} timed out"
+                    )
+                    all_errors.append(f"Phase {phase.name} timed out")
+
+            # Execute termination
+            if ShutdownPhase.TERMINATE in phases:
+                terminated, failed = await self.process_manager.terminate_all(
+                    order=self.TERMINATION_ORDER,
+                )
+                processes_terminated = terminated
+                if failed > 0:
+                    all_errors.append(f"Failed to terminate {failed} processes")
+
+            elapsed = time.time() - start_time
+
+            result = ShutdownResult(
+                success=last_successful_phase == phases[-1],
+                phase_reached=last_successful_phase,
+                elapsed_seconds=elapsed,
+                processes_terminated=processes_terminated,
+                hooks_executed=total_hooks_executed,
+                hooks_failed=total_hooks_failed,
+                errors=all_errors,
+                state_saved=state_saved,
+            )
+
+            # Notify complete callbacks
+            for callback in self._on_shutdown_complete:
+                try:
+                    callback(result)
+                except Exception as e:
+                    logger.warning(
+                        f"[ShutdownManager] Complete callback error: {e}"
+                    )
+
+            logger.info(
+                f"[ShutdownManager] Shutdown complete: "
+                f"success={result.success}, "
+                f"phase_reached={result.phase_reached.name}, "
+                f"elapsed={result.elapsed_seconds:.2f}s, "
+                f"processes_terminated={result.processes_terminated}"
+            )
+
+            self._shutdown_in_progress = False
+            self._current_phase = None
+
+            return result
+
+    async def _execute_phase(self, phase: ShutdownPhase) -> PhaseResult:
+        """Execute a single shutdown phase."""
+        start_time = time.time()
+        hooks_executed = 0
+        hooks_failed = 0
+        errors: List[str] = []
+
+        hooks = self._hooks[phase]
+        logger.debug(
+            f"[ShutdownManager] Phase {phase.name}: {len(hooks)} hooks to execute"
+        )
+
+        # Execute built-in actions for certain phases
+        if phase == ShutdownPhase.ANNOUNCE:
+            await self._announce_shutdown()
+        elif phase == ShutdownPhase.SAVE:
+            await self._save_state()
+
+        # Execute registered hooks
+        for hook in hooks:
+            try:
+                logger.debug(
+                    f"[ShutdownManager] Executing hook '{hook.name}' "
+                    f"(priority={hook.priority})"
+                )
+
+                await asyncio.wait_for(hook.callback(), timeout=hook.timeout)
+                hooks_executed += 1
+
+            except asyncio.TimeoutError:
+                hooks_failed += 1
+                error_msg = f"Hook '{hook.name}' timed out after {hook.timeout}s"
+                errors.append(error_msg)
+                logger.warning(f"[ShutdownManager] {error_msg}")
+
+                if hook.critical:
+                    errors.append(f"Critical hook '{hook.name}' failed")
+                    break
+
+            except Exception as e:
+                hooks_failed += 1
+                error_msg = f"Hook '{hook.name}' failed: {e}"
+                errors.append(error_msg)
+                logger.warning(f"[ShutdownManager] {error_msg}")
+
+                if hook.critical:
+                    errors.append(f"Critical hook '{hook.name}' failed")
+                    break
+
+        elapsed = time.time() - start_time
+        success = hooks_failed == 0 or not any(
+            h.critical for h in hooks if hooks_failed > 0
+        )
+
+        return PhaseResult(
+            phase=phase,
+            success=success,
+            elapsed_seconds=elapsed,
+            hooks_executed=hooks_executed,
+            hooks_failed=hooks_failed,
+            errors=errors,
+        )
+
+    async def _announce_shutdown(self) -> None:
+        """Announce shutdown to all components via IPC."""
+        if self.ipc_bus is None:
+            return
+
+        try:
+            from backend.core.trinity_ipc import TrinityCommand
+            import uuid
+
+            command = TrinityCommand(
+                id=str(uuid.uuid4()),
+                command_type="shutdown_announce",
+                source="jarvis_body",
+                target="all",
+                payload={
+                    "reason": self._shutdown_reason.value if self._shutdown_reason else "unknown",
+                    "timestamp": time.time(),
+                },
+            )
+            await self.ipc_bus.enqueue_command(command)
+            logger.info("[ShutdownManager] Shutdown announced via IPC")
+
+        except Exception as e:
+            logger.warning(f"[ShutdownManager] Failed to announce shutdown: {e}")
+
+    async def _save_state(self) -> None:
+        """Save critical state before shutdown."""
+        state_file = self.state_dir / "shutdown_state.json"
+
+        import json
+
+        state = {
+            "timestamp": time.time(),
+            "reason": self._shutdown_reason.value if self._shutdown_reason else "unknown",
+            "processes": [
+                {
+                    "name": p.name,
+                    "pid": p.pid,
+                    "component_type": p.component_type,
+                    "state": p.state.value,
+                }
+                for p in self.process_manager.get_all_processes()
+            ],
+        }
+
+        try:
+            with open(state_file, "w") as f:
+                json.dump(state, f, indent=2)
+            logger.info(f"[ShutdownManager] State saved to {state_file}")
+        except Exception as e:
+            logger.warning(f"[ShutdownManager] Failed to save state: {e}")
+
+    # =========================================================================
+    # Callbacks
+    # =========================================================================
+
+    def on_shutdown_start(
+        self,
+        callback: Callable[[ShutdownReason], None],
+    ) -> None:
+        """Register callback for shutdown start."""
+        self._on_shutdown_start.append(callback)
+
+    def on_phase_complete(
+        self,
+        callback: Callable[[ShutdownPhase, PhaseResult], None],
+    ) -> None:
+        """Register callback for phase completion."""
+        self._on_phase_complete.append(callback)
+
+    def on_shutdown_complete(
+        self,
+        callback: Callable[[ShutdownResult], None],
+    ) -> None:
+        """Register callback for shutdown completion."""
+        self._on_shutdown_complete.append(callback)
+
+    # =========================================================================
+    # Status and Introspection
+    # =========================================================================
+
+    @property
+    def is_shutting_down(self) -> bool:
+        """Check if shutdown is in progress."""
+        return self._shutdown_in_progress
+
+    @property
+    def current_phase(self) -> Optional[ShutdownPhase]:
+        """Get current shutdown phase."""
+        return self._current_phase
+
+    def get_status(self) -> Dict[str, Any]:
+        """Get shutdown manager status."""
+        return {
+            "shutting_down": self._shutdown_in_progress,
+            "current_phase": self._current_phase.name if self._current_phase else None,
+            "reason": self._shutdown_reason.value if self._shutdown_reason else None,
+            "hooks": {
+                phase.name: len(hooks)
+                for phase, hooks in self._hooks.items()
+            },
+            "processes": [
+                {
+                    "name": p.name,
+                    "pid": p.pid,
+                    "state": p.state.value,
+                    "component": p.component_type,
+                }
+                for p in self.process_manager.get_all_processes()
+            ],
+            "phase_timeouts": {
+                phase.name: timeout
+                for phase, timeout in self._phase_timeouts.items()
+            },
+        }
+
+
+# =============================================================================
+# Signal Handler Integration
+# =============================================================================
+
+def setup_signal_handlers(
+    shutdown_manager: CoordinatedShutdownManager,
+    loop: Optional[asyncio.AbstractEventLoop] = None,
+) -> None:
+    """
+    Set up signal handlers for graceful shutdown.
+
+    Handles SIGTERM, SIGINT, and SIGHUP.
+    """
+    if loop is None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = asyncio.get_event_loop()
+
+    def handle_signal(signum: int) -> None:
+        sig_name = signal.Signals(signum).name
+        logger.info(f"[ShutdownManager] Received signal {sig_name}")
+
+        # Determine shutdown reason
+        if signum == signal.SIGTERM:
+            reason = ShutdownReason.SIGNAL_RECEIVED
+        elif signum == signal.SIGINT:
+            reason = ShutdownReason.USER_REQUEST
+        elif signum == signal.SIGHUP:
+            reason = ShutdownReason.UPDATE_REQUIRED
+        else:
+            reason = ShutdownReason.SIGNAL_RECEIVED
+
+        # Schedule shutdown
+        asyncio.ensure_future(
+            shutdown_manager.initiate_shutdown(reason=reason),
+            loop=loop,
+        )
+
+    # Register handlers
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        try:
+            loop.add_signal_handler(sig, lambda s=sig: handle_signal(s))
+            logger.debug(f"[ShutdownManager] Registered handler for {sig.name}")
+        except NotImplementedError:
+            # Windows doesn't support add_signal_handler
+            signal.signal(sig, lambda s, f, sig=sig: handle_signal(sig))
+
+
+# =============================================================================
+# Singleton Access
+# =============================================================================
+
+_shutdown_manager: Optional[CoordinatedShutdownManager] = None
+_manager_lock = asyncio.Lock()
+
+
+async def get_shutdown_manager(
+    ipc_bus: Optional[Any] = None,
+    **kwargs,
+) -> CoordinatedShutdownManager:
+    """Get the singleton shutdown manager."""
+    global _shutdown_manager
+
+    async with _manager_lock:
+        if _shutdown_manager is None:
+            _shutdown_manager = CoordinatedShutdownManager(
+                ipc_bus=ipc_bus,
+                **kwargs,
+            )
+        return _shutdown_manager
+
+
+def get_shutdown_manager_sync(**kwargs) -> CoordinatedShutdownManager:
+    """Synchronous version for non-async contexts."""
+    global _shutdown_manager
+
+    if _shutdown_manager is None:
+        _shutdown_manager = CoordinatedShutdownManager(**kwargs)
+    return _shutdown_manager
+
+
+async def initiate_shutdown(
+    reason: ShutdownReason = ShutdownReason.USER_REQUEST,
+    **kwargs,
+) -> ShutdownResult:
+    """Convenience function to initiate shutdown."""
+    manager = await get_shutdown_manager()
+    return await manager.initiate_shutdown(reason=reason, **kwargs)
