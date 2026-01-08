@@ -1,0 +1,95 @@
+{
+  "workflow_name": "terraform in /infrastructure - Update #1203399878",
+  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/20811762580",
+  "branch": "main",
+  "commit_sha": "ce55c3a",
+  "run_number": 82,
+  "failed_count": 1,
+  "fix_branch": "fix/ci/terraform-in-infrastructure-update-1203399878-run82-20260108-092021",
+  "pr_title": "\ud83d\udea8 Fix CI/CD: terraform in /infrastructure - Update #1203399878 (Run #82)",
+  "analyses": [
+    {
+      "error_patterns": [
+        {
+          "pattern": "ERROR|Error|error",
+          "matches": [
+            {
+              "line_number": 69,
+              "content": "2026-01-08T09:19:17.8981560Z updater | 2026/01/08 09:19:17 ERROR <job_1203399878> Error during file fetching; aborting: No files found in /infrastructure",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 70,
+              "content": "2026-01-08T09:19:18.0093122Z   proxy | 2026/01/08 09:19:18 [008] POST /update_jobs/1203399878/record_update_job_error",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 71,
+              "content": "2026-01-08T09:19:18.0839483Z   proxy | 2026/01/08 09:19:18 [008] 204 /update_jobs/1203399878/record_update_job_error",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 76,
+              "content": "2026-01-08T09:19:18.2447095Z Dependabot encountered '1' error(s) during execution, please check the logs for more details.",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 78,
+              "content": "2026-01-08T09:19:18.2448436Z |                                    Errors                                     |",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 87,
+              "content": "2026-01-08T09:19:18.3677588Z Failure running container 8a87a7255d9116721ad462774937a793130a0b3a921d063317aacaffcfe151a7: Error: Command failed with exit code 1: /bin/sh -c $DEPENDABOT_HOME/dependabot-updater/bin/run update_files",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 91,
+              "content": "2026-01-08T09:19:18.9654294Z ##[error]Dependabot encountered an error performing the update",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 93,
+              "content": "Error: The updater encountered one or more errors.",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 96,
+              "content": "2026-01-08T09:19:18.9663856Z \ud83e\udd16 ~ finished: error reported to Dependabot ~",
+              "severity": "high",
+              "emoji": "\u274c"
+            }
+          ],
+          "count": 9
+        },
+        {
+          "pattern": "FAIL|Failed|failed",
+          "matches": [
+            {
+              "line_number": 87,
+              "content": "2026-01-08T09:19:18.3677588Z Failure running container 8a87a7255d9116721ad462774937a793130a0b3a921d063317aacaffcfe151a7: Error: Command failed with exit code 1: /bin/sh -c $DEPENDABOT_HOME/dependabot-updater/bin/run update_files",
+              "severity": "high",
+              "emoji": "\ud83d\udca5"
+            }
+          ],
+          "count": 1
+        }
+      ],
+      "suggested_fixes": [
+        "Consider increasing timeout values or optimizing slow operations"
+      ],
+      "severity": "high",
+      "category": "syntax_error",
+      "similar_failures": []
+    }
+  ],
+  "timestamp": "2026-01-08T09:20:21.328192"
+}
