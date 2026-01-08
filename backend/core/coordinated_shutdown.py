@@ -955,3 +955,486 @@ async def initiate_shutdown(
     """Convenience function to initiate shutdown."""
     manager = await get_shutdown_manager()
     return await manager.initiate_shutdown(reason=reason, **kwargs)
+
+
+# =============================================================================
+# Orphan Process Detection and Cleanup
+# =============================================================================
+
+
+@dataclass
+class OrphanProcess:
+    """Detected orphan process."""
+    pid: int
+    name: str
+    cmdline: str
+    started_at: float
+    component_type: Optional[str] = None
+    reason: str = "unknown"
+
+
+class OrphanProcessDetector:
+    """
+    Detects and cleans up orphan JARVIS processes.
+
+    Orphan processes can occur when:
+    - Supervisor crashes without cleanup
+    - System restart without proper shutdown
+    - Zombie processes from failed subprocess management
+
+    Features:
+    - Process name pattern matching
+    - PID file staleness detection
+    - Heartbeat file age analysis
+    - Safe termination with verification
+    """
+
+    # Process name patterns for JARVIS components
+    COMPONENT_PATTERNS = {
+        "jarvis_body": ["backend.main", "jarvis_supervisor", "run_supervisor"],
+        "jarvis_prime": ["jarvis_prime", "jarvis-prime", "jprime"],
+        "reactor_core": ["reactor_core", "reactor-core", "training_pipeline"],
+    }
+
+    def __init__(
+        self,
+        trinity_dir: Optional[Path] = None,
+        max_orphan_age_hours: float = 24.0,
+    ):
+        self.trinity_dir = trinity_dir or Path(
+            os.environ.get("TRINITY_DIR", str(Path.home() / ".jarvis" / "trinity"))
+        )
+        self.max_orphan_age_hours = max_orphan_age_hours
+        self._detected_orphans: List[OrphanProcess] = []
+
+    async def detect_orphans(self) -> List[OrphanProcess]:
+        """
+        Detect orphan JARVIS processes.
+
+        Returns:
+            List of detected orphan processes
+        """
+        self._detected_orphans = []
+
+        # Method 1: Check PID files for stale PIDs
+        await self._check_stale_pid_files()
+
+        # Method 2: Check for processes matching JARVIS patterns
+        await self._check_process_patterns()
+
+        # Method 3: Check heartbeat files for dead processes
+        await self._check_stale_heartbeats()
+
+        # Deduplicate by PID
+        seen_pids = set()
+        unique_orphans = []
+        for orphan in self._detected_orphans:
+            if orphan.pid not in seen_pids:
+                seen_pids.add(orphan.pid)
+                unique_orphans.append(orphan)
+
+        self._detected_orphans = unique_orphans
+
+        if self._detected_orphans:
+            logger.info(
+                f"[OrphanDetector] Found {len(self._detected_orphans)} orphan processes"
+            )
+
+        return self._detected_orphans
+
+    async def _check_stale_pid_files(self) -> None:
+        """Check for PID files pointing to dead processes."""
+        pid_dir = self.trinity_dir / "pids"
+        if not pid_dir.exists():
+            return
+
+        for pid_file in pid_dir.glob("*.pid"):
+            try:
+                pid = int(pid_file.read_text().strip())
+                component = pid_file.stem
+
+                # Check if process is still running
+                if self._process_exists(pid):
+                    # Process exists, but is it a JARVIS process?
+                    cmdline = self._get_process_cmdline(pid)
+                    if not self._matches_jarvis_pattern(cmdline):
+                        # PID was reused by OS - file is stale
+                        pid_file.unlink()
+                        logger.debug(
+                            f"[OrphanDetector] Removed stale PID file: {pid_file}"
+                        )
+                else:
+                    # Process doesn't exist - file is stale
+                    pid_file.unlink()
+                    logger.debug(
+                        f"[OrphanDetector] Removed stale PID file: {pid_file}"
+                    )
+
+            except (ValueError, PermissionError):
+                continue
+
+    async def _check_process_patterns(self) -> None:
+        """Check for running processes matching JARVIS patterns."""
+        try:
+            import subprocess
+
+            # Get all Python processes
+            result = subprocess.run(
+                ["ps", "aux"],
+                capture_output=True,
+                text=True,
+                timeout=5.0,
+            )
+
+            if result.returncode != 0:
+                return
+
+            current_pid = os.getpid()
+
+            for line in result.stdout.strip().split("\n")[1:]:  # Skip header
+                parts = line.split(None, 10)
+                if len(parts) < 11:
+                    continue
+
+                try:
+                    pid = int(parts[1])
+                except ValueError:
+                    continue
+
+                # Skip current process
+                if pid == current_pid:
+                    continue
+
+                cmdline = parts[10] if len(parts) > 10 else ""
+
+                # Check if this matches any JARVIS pattern
+                component_type = None
+                for comp, patterns in self.COMPONENT_PATTERNS.items():
+                    if any(p in cmdline.lower() for p in patterns):
+                        component_type = comp
+                        break
+
+                if component_type:
+                    # Check if this process has a valid heartbeat
+                    has_valid_heartbeat = await self._has_valid_heartbeat(
+                        component_type, pid
+                    )
+
+                    if not has_valid_heartbeat:
+                        # This is an orphan
+                        orphan = OrphanProcess(
+                            pid=pid,
+                            name=component_type,
+                            cmdline=cmdline[:200],  # Truncate
+                            started_at=0.0,  # Would need /proc access for this
+                            component_type=component_type,
+                            reason="no_valid_heartbeat",
+                        )
+                        self._detected_orphans.append(orphan)
+
+        except Exception as e:
+            logger.debug(f"[OrphanDetector] Process check failed: {e}")
+
+    async def _check_stale_heartbeats(self) -> None:
+        """Check for heartbeat files with dead processes."""
+        heartbeat_dir = self.trinity_dir / "components"
+        if not heartbeat_dir.exists():
+            return
+
+        for hb_file in heartbeat_dir.glob("*.json"):
+            try:
+                import json
+
+                with open(hb_file) as f:
+                    data = json.load(f)
+
+                pid = data.get("pid")
+                if not pid:
+                    continue
+
+                # Check if process exists
+                if not self._process_exists(pid):
+                    # Heartbeat for dead process - file is stale
+                    hb_file.unlink()
+                    logger.debug(
+                        f"[OrphanDetector] Removed stale heartbeat: {hb_file}"
+                    )
+                else:
+                    # Process exists but heartbeat may be old
+                    timestamp = data.get("timestamp", 0)
+                    age_hours = (time.time() - timestamp) / 3600
+
+                    if age_hours > self.max_orphan_age_hours:
+                        # Very old heartbeat - process may be zombie
+                        component = hb_file.stem
+                        cmdline = self._get_process_cmdline(pid)
+
+                        orphan = OrphanProcess(
+                            pid=pid,
+                            name=component,
+                            cmdline=cmdline,
+                            started_at=timestamp,
+                            component_type=component.replace("_", "-"),
+                            reason=f"stale_heartbeat_{age_hours:.1f}h",
+                        )
+                        self._detected_orphans.append(orphan)
+
+            except (json.JSONDecodeError, KeyError, PermissionError):
+                continue
+
+    async def _has_valid_heartbeat(
+        self,
+        component_type: str,
+        pid: int,
+    ) -> bool:
+        """Check if a process has a valid recent heartbeat."""
+        heartbeat_file = self.trinity_dir / "components" / f"{component_type}.json"
+
+        if not heartbeat_file.exists():
+            return False
+
+        try:
+            import json
+
+            with open(heartbeat_file) as f:
+                data = json.load(f)
+
+            # Check PID matches
+            if data.get("pid") != pid:
+                return False
+
+            # Check timestamp is recent
+            timestamp = data.get("timestamp", 0)
+            age_seconds = time.time() - timestamp
+
+            # Valid if heartbeat is less than 5 minutes old
+            return age_seconds < 300
+
+        except Exception:
+            return False
+
+    def _process_exists(self, pid: int) -> bool:
+        """Check if a process exists."""
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True  # Exists but no permission
+
+    def _get_process_cmdline(self, pid: int) -> str:
+        """Get command line of a process."""
+        try:
+            # macOS/Linux
+            proc_file = Path(f"/proc/{pid}/cmdline")
+            if proc_file.exists():
+                return proc_file.read_text().replace("\x00", " ").strip()
+
+            # Fallback using ps
+            import subprocess
+            result = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "command="],
+                capture_output=True,
+                text=True,
+                timeout=2.0,
+            )
+            if result.returncode == 0:
+                return result.stdout.strip()
+
+        except Exception:
+            pass
+
+        return "unknown"
+
+    def _matches_jarvis_pattern(self, cmdline: str) -> bool:
+        """Check if command line matches any JARVIS pattern."""
+        cmdline_lower = cmdline.lower()
+        for patterns in self.COMPONENT_PATTERNS.values():
+            if any(p in cmdline_lower for p in patterns):
+                return True
+        return False
+
+    async def cleanup_orphans(
+        self,
+        orphans: Optional[List[OrphanProcess]] = None,
+        force: bool = False,
+        timeout: float = 10.0,
+    ) -> Tuple[int, int]:
+        """
+        Clean up orphan processes.
+
+        Args:
+            orphans: List of orphans to clean (detects if None)
+            force: Use SIGKILL immediately instead of SIGTERM
+            timeout: Seconds to wait for graceful termination
+
+        Returns:
+            Tuple of (terminated_count, failed_count)
+        """
+        if orphans is None:
+            orphans = await self.detect_orphans()
+
+        if not orphans:
+            return (0, 0)
+
+        terminated = 0
+        failed = 0
+
+        for orphan in orphans:
+            try:
+                logger.info(
+                    f"[OrphanDetector] Terminating orphan: "
+                    f"PID={orphan.pid}, component={orphan.component_type}, "
+                    f"reason={orphan.reason}"
+                )
+
+                if force:
+                    os.kill(orphan.pid, signal.SIGKILL)
+                else:
+                    os.kill(orphan.pid, signal.SIGTERM)
+
+                # Wait for termination
+                start = time.time()
+                while time.time() - start < timeout:
+                    if not self._process_exists(orphan.pid):
+                        terminated += 1
+                        break
+                    await asyncio.sleep(0.2)
+                else:
+                    # Force kill if still running
+                    try:
+                        os.kill(orphan.pid, signal.SIGKILL)
+                        await asyncio.sleep(0.5)
+                        if not self._process_exists(orphan.pid):
+                            terminated += 1
+                        else:
+                            failed += 1
+                    except ProcessLookupError:
+                        terminated += 1
+
+            except ProcessLookupError:
+                # Already dead
+                terminated += 1
+            except PermissionError:
+                logger.warning(
+                    f"[OrphanDetector] No permission to kill PID {orphan.pid}"
+                )
+                failed += 1
+            except Exception as e:
+                logger.warning(
+                    f"[OrphanDetector] Failed to kill PID {orphan.pid}: {e}"
+                )
+                failed += 1
+
+        logger.info(
+            f"[OrphanDetector] Cleanup complete: "
+            f"terminated={terminated}, failed={failed}"
+        )
+
+        return (terminated, failed)
+
+
+# =============================================================================
+# Enhanced Shutdown Manager with Orphan Detection
+# =============================================================================
+
+
+class EnhancedShutdownManager(CoordinatedShutdownManager):
+    """
+    Extended shutdown manager with orphan detection.
+
+    Adds:
+    - Pre-shutdown orphan cleanup
+    - Post-shutdown verification
+    - Cross-repo process coordination
+    """
+
+    def __init__(
+        self,
+        ipc_bus: Optional[Any] = None,
+        state_dir: Optional[Path] = None,
+        detect_orphans_on_start: bool = True,
+    ):
+        super().__init__(ipc_bus, state_dir)
+        self.orphan_detector = OrphanProcessDetector()
+        self._detect_orphans_on_start = detect_orphans_on_start
+
+    async def startup_cleanup(self) -> Tuple[int, int]:
+        """
+        Clean up orphan processes on startup.
+
+        Should be called before starting JARVIS components.
+
+        Returns:
+            Tuple of (terminated, failed) counts
+        """
+        if not self._detect_orphans_on_start:
+            return (0, 0)
+
+        logger.info("[EnhancedShutdown] Checking for orphan processes...")
+        orphans = await self.orphan_detector.detect_orphans()
+
+        if orphans:
+            logger.warning(
+                f"[EnhancedShutdown] Found {len(orphans)} orphan processes, cleaning up..."
+            )
+            return await self.orphan_detector.cleanup_orphans(orphans)
+
+        logger.info("[EnhancedShutdown] No orphan processes found")
+        return (0, 0)
+
+    async def initiate_shutdown(
+        self,
+        reason: ShutdownReason = ShutdownReason.USER_REQUEST,
+        timeout: Optional[float] = None,
+        force: bool = False,
+        verify_cleanup: bool = True,
+    ) -> ShutdownResult:
+        """
+        Initiate shutdown with verification.
+
+        Args:
+            reason: Reason for shutdown
+            timeout: Overall timeout
+            force: Skip draining phase
+            verify_cleanup: Run orphan detection after shutdown
+
+        Returns:
+            ShutdownResult
+        """
+        result = await super().initiate_shutdown(reason, timeout, force)
+
+        if verify_cleanup:
+            # Verify no orphans remain
+            await asyncio.sleep(1.0)  # Brief delay for processes to fully exit
+            orphans = await self.orphan_detector.detect_orphans()
+
+            if orphans:
+                logger.warning(
+                    f"[EnhancedShutdown] {len(orphans)} orphans remain after shutdown"
+                )
+                terminated, failed = await self.orphan_detector.cleanup_orphans(
+                    orphans, force=True
+                )
+                result.processes_terminated += terminated
+
+        return result
+
+
+# =============================================================================
+# Convenience Functions
+# =============================================================================
+
+
+async def detect_orphan_processes() -> List[OrphanProcess]:
+    """Detect orphan JARVIS processes."""
+    detector = OrphanProcessDetector()
+    return await detector.detect_orphans()
+
+
+async def cleanup_orphan_processes(force: bool = False) -> Tuple[int, int]:
+    """Detect and cleanup orphan processes."""
+    detector = OrphanProcessDetector()
+    orphans = await detector.detect_orphans()
+    return await detector.cleanup_orphans(orphans, force=force)

@@ -2347,6 +2347,14 @@ class SupervisorBootstrapper:
         self._cross_repo_health_task = None
         self._v80_enabled = os.getenv("JARVIS_V80_CROSS_REPO", "true").lower() == "true"
 
+        # v81.0: TrinityIntegrator - Unified Cross-Repo Integration
+        # - Orphan process detection and cleanup
+        # - Resilient IPC with circuit breakers
+        # - Coordinated phased shutdown
+        # - Port allocation with fallback
+        self._trinity_integrator = None
+        self._trinity_integrator_enabled = os.getenv("TRINITY_INTEGRATOR_ENABLED", "true").lower() == "true"
+
         # CRITICAL: Set CI=true to prevent npm start from hanging interactively
         # if port 3000 is taken. This ensures we fail fast or handle it automatically.
         os.environ["CI"] = "true"
@@ -2617,7 +2625,47 @@ class SupervisorBootstrapper:
             self.logger.info("Set JARVIS_CLEANUP_DONE=1 - start_system.py will skip redundant cleanup")
 
             self.perf.end("cleanup")
-            
+
+            # ═══════════════════════════════════════════════════════════════════
+            # v81.0: TrinityIntegrator - Unified Cross-Repo Integration
+            # Provides: orphan cleanup, resilient IPC, port allocation, shutdown
+            # ═══════════════════════════════════════════════════════════════════
+            if self._trinity_integrator_enabled:
+                try:
+                    from backend.core.trinity_integrator import TrinityIntegrator
+
+                    # Create integrator with environment-aware configuration
+                    # Environment variables JARVIS_PRIME_ENABLED and REACTOR_CORE_ENABLED
+                    # will override the defaults passed here
+                    self._trinity_integrator = TrinityIntegrator(
+                        enable_jprime=self.config.jarvis_prime_enabled,
+                        enable_reactor=self.config.reactor_core_enabled,
+                        startup_timeout=self.config.jarvis_prime_startup_timeout,
+                        health_check_interval=30.0,
+                    )
+
+                    # Start the integrator (orphan cleanup, IPC, port allocation, health)
+                    TerminalUI.print_success("[v81.0] TrinityIntegrator starting...")
+                    start_success = await self._trinity_integrator.start()
+
+                    if start_success:
+                        # Register shutdown hooks with supervisor signals
+                        await self._register_trinity_shutdown_hooks()
+
+                        state = self._trinity_integrator.state.value
+                        TerminalUI.print_success(f"[v81.0] TrinityIntegrator ready (state={state})")
+                        self.logger.info(f"[v81.0] ✅ TrinityIntegrator started successfully (state={state})")
+                    else:
+                        self.logger.warning("[v81.0] TrinityIntegrator start returned false - continuing with fallback")
+                        self._trinity_integrator = None
+
+                except ImportError as e:
+                    self.logger.warning(f"[v81.0] TrinityIntegrator not available: {e}")
+                    self._trinity_integrator = None
+                except Exception as e:
+                    self.logger.warning(f"[v81.0] TrinityIntegrator initialization failed: {e}")
+                    self._trinity_integrator = None
+
             # Phase 2: Intelligent Resource Validation & Optimization
             self.perf.start("validation")
             TerminalUI.print_phase(2, 4, "Analyzing system resources")
@@ -4695,7 +4743,70 @@ class SupervisorBootstrapper:
         # Only set SIGINT handler if not in interactive mode
         if not hasattr(sys, 'ps1'):  # Not in interactive Python shell
             signal.signal(signal.SIGINT, handle_sigint)
-        
+
+    async def _register_trinity_shutdown_hooks(self) -> None:
+        """
+        v81.0: Register TrinityIntegrator shutdown hooks with the supervisor.
+
+        This integrates the coordinated shutdown manager with the supervisor's
+        signal handling, ensuring all Trinity components are properly cleaned up
+        on shutdown (SIGTERM, SIGINT, or graceful exit).
+
+        Note: The TrinityIntegrator.stop() method handles health monitoring
+        and IPC shutdown internally, so we just register hooks that need
+        supervisor-level coordination.
+        """
+        if self._trinity_integrator is None:
+            return
+
+        try:
+            # Register supervisor-level shutdown hooks
+            shutdown_manager = self._trinity_integrator._shutdown_manager
+            if shutdown_manager is None:
+                self.logger.debug("[v81.0] No shutdown manager available in TrinityIntegrator")
+                return
+
+            # Register hooks for various shutdown phases
+            from backend.core.coordinated_shutdown import ShutdownPhase
+
+            # Hook to log shutdown initiation
+            async def on_shutdown_start():
+                self.logger.info("[v81.0] Shutdown hook: Trinity shutdown initiated...")
+
+            # register_hook(name, phase, callback, priority, timeout, critical)
+            shutdown_manager.register_hook(
+                name="supervisor_shutdown_announce",
+                phase=ShutdownPhase.ANNOUNCE,
+                callback=on_shutdown_start,
+                priority=100,
+            )
+
+            # Hook to flush IPC state (if available)
+            async def persist_ipc_state():
+                if self._trinity_integrator and self._trinity_integrator._ipc_bus:
+                    self.logger.info("[v81.0] Shutdown hook: Persisting IPC state...")
+                    ipc_bus = self._trinity_integrator._ipc_bus
+                    # Flush any pending commands from fallback queue
+                    if hasattr(ipc_bus, '_fallback_queue') and ipc_bus._fallback_queue:
+                        try:
+                            await ipc_bus._flush_fallback_queue()
+                        except Exception as e:
+                            self.logger.debug(f"[v81.0] Fallback queue flush skipped: {e}")
+
+            shutdown_manager.register_hook(
+                name="persist_trinity_ipc_state",
+                phase=ShutdownPhase.SAVE,
+                callback=persist_ipc_state,
+                priority=50,
+            )
+
+            self.logger.info("[v81.0] ✅ Trinity shutdown hooks registered")
+
+        except ImportError:
+            self.logger.debug("[v81.0] Shutdown phase imports not available")
+        except Exception as e:
+            self.logger.warning(f"[v81.0] Failed to register shutdown hooks: {e}")
+
     async def cleanup_resources(self):
         """
         Cleanup remote resources (GCP VMs, Cloud Run, etc.) and local services on shutdown.
@@ -9268,17 +9379,36 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
     async def _shutdown_trinity_components(self) -> None:
         """
         v72.0: Gracefully shutdown Trinity component subprocesses.
+        v81.0: Enhanced with TrinityIntegrator coordinated shutdown.
 
         This is called during cleanup_resources() to ensure all subprocess
         launched by this supervisor are properly terminated.
 
         Shutdown sequence:
-        1. Send SIGTERM to each process
-        2. Wait up to 5 seconds for graceful shutdown
-        3. Send SIGKILL if process doesn't respond
-        4. Clean up process references
+        1. v81.0: Use TrinityIntegrator coordinated shutdown (if available)
+        2. Send SIGTERM to each process
+        3. Wait up to 5 seconds for graceful shutdown
+        4. Send SIGKILL if process doesn't respond
+        5. Clean up process references
         """
         self.logger.info("🔗 Shutting down Trinity components...")
+
+        # v81.0: Use TrinityIntegrator for coordinated phased shutdown
+        if self._trinity_integrator is not None:
+            try:
+                self.logger.info("   [v81.0] Initiating TrinityIntegrator coordinated shutdown...")
+                shutdown_success = await self._trinity_integrator.stop(
+                    timeout=30.0,
+                    force=False,
+                )
+                if shutdown_success:
+                    self.logger.info("   ✅ [v81.0] TrinityIntegrator coordinated shutdown complete")
+                else:
+                    self.logger.warning("   ⚠️ [v81.0] TrinityIntegrator shutdown incomplete - using fallback")
+            except Exception as e:
+                self.logger.warning(f"   ⚠️ [v81.0] TrinityIntegrator shutdown error: {e} - using fallback")
+            finally:
+                self._trinity_integrator = None
 
         # Shutdown J-Prime orchestrator
         if self._jprime_orchestrator_process is not None:

@@ -100,6 +100,269 @@ def _env_bool(key: str, default: bool) -> bool:
 
 
 # =============================================================================
+# UNCERTAINTY QUANTIFICATION (UQ)
+# =============================================================================
+
+@dataclass
+class CredibleInterval:
+    """
+    Bayesian credible interval for uncertainty quantification.
+
+    Unlike frequentist confidence intervals, credible intervals
+    represent our actual belief about where the true value lies.
+    """
+    lower: float
+    upper: float
+    probability: float = 0.95  # 95% credible interval by default
+    point_estimate: Optional[float] = None
+
+    @property
+    def width(self) -> float:
+        """Interval width (measure of uncertainty)."""
+        return self.upper - self.lower
+
+    @property
+    def midpoint(self) -> float:
+        """Midpoint of the interval."""
+        return (self.lower + self.upper) / 2
+
+    def contains(self, value: float) -> bool:
+        """Check if value is within the interval."""
+        return self.lower <= value <= self.upper
+
+
+@dataclass
+class UncertainValue:
+    """
+    A value with associated uncertainty.
+
+    Represents epistemic (knowledge) and aleatoric (inherent) uncertainty.
+    """
+    value: float
+    uncertainty: float  # Standard deviation or similar measure
+    credible_interval: Optional[CredibleInterval] = None
+    uncertainty_type: str = "combined"  # "epistemic", "aleatoric", or "combined"
+
+    @classmethod
+    def from_samples(cls, samples: List[float], confidence: float = 0.95) -> "UncertainValue":
+        """Create UncertainValue from a list of samples (e.g., from Monte Carlo)."""
+        if not samples:
+            return cls(value=0.0, uncertainty=float("inf"))
+
+        mean = sum(samples) / len(samples)
+        variance = sum((x - mean) ** 2 for x in samples) / len(samples)
+        std = variance ** 0.5
+
+        # Calculate credible interval
+        sorted_samples = sorted(samples)
+        n = len(sorted_samples)
+        alpha = 1 - confidence
+        lower_idx = int(n * alpha / 2)
+        upper_idx = int(n * (1 - alpha / 2))
+
+        return cls(
+            value=mean,
+            uncertainty=std,
+            credible_interval=CredibleInterval(
+                lower=sorted_samples[lower_idx] if lower_idx < n else sorted_samples[-1],
+                upper=sorted_samples[upper_idx] if upper_idx < n else sorted_samples[-1],
+                probability=confidence,
+                point_estimate=mean,
+            ),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for JSON serialization."""
+        result = {
+            "value": self.value,
+            "uncertainty": self.uncertainty,
+            "uncertainty_type": self.uncertainty_type,
+        }
+        if self.credible_interval:
+            result["credible_interval"] = {
+                "lower": self.credible_interval.lower,
+                "upper": self.credible_interval.upper,
+                "probability": self.credible_interval.probability,
+            }
+        return result
+
+
+@dataclass
+class ReasoningResult:
+    """
+    Unified result structure for cognitive reasoning with uncertainty.
+
+    All cognitive modules should return this structure for consistency.
+    """
+    reasoning_type: str
+    conclusion: Any
+    confidence: UncertainValue
+    explanation: str
+    evidence: List[str] = field(default_factory=list)
+    alternatives: List[Dict[str, Any]] = field(default_factory=list)
+    reasoning_steps: List[str] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def is_high_confidence(self) -> bool:
+        """Check if result has high confidence (>0.8)."""
+        return self.confidence.value >= 0.8
+
+    @property
+    def is_uncertain(self) -> bool:
+        """Check if result has high uncertainty."""
+        return self.confidence.uncertainty > 0.2
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for JSON serialization."""
+        return {
+            "reasoning_type": self.reasoning_type,
+            "conclusion": self.conclusion,
+            "confidence": self.confidence.to_dict(),
+            "explanation": self.explanation,
+            "evidence": self.evidence,
+            "alternatives": self.alternatives,
+            "reasoning_steps": self.reasoning_steps,
+            "is_high_confidence": self.is_high_confidence,
+            "is_uncertain": self.is_uncertain,
+            "metadata": self.metadata,
+        }
+
+
+class BayesianUpdater:
+    """
+    Simple Bayesian updater for belief revision.
+
+    Uses conjugate priors for efficient updating.
+    Supports Beta-Binomial (binary outcomes) and Normal-Normal (continuous).
+    """
+
+    def __init__(self):
+        # Beta distribution parameters (prior: Beta(1,1) = uniform)
+        self._beta_priors: Dict[str, Tuple[float, float]] = {}  # key -> (alpha, beta)
+
+        # Normal distribution parameters (prior: N(0, 1))
+        self._normal_priors: Dict[str, Tuple[float, float]] = {}  # key -> (mean, precision)
+
+    def update_beta(
+        self,
+        key: str,
+        successes: int,
+        failures: int,
+        prior_alpha: float = 1.0,
+        prior_beta: float = 1.0,
+    ) -> Tuple[float, float]:
+        """
+        Update Beta distribution with new observations.
+
+        Args:
+            key: Identifier for the belief
+            successes: Number of successes
+            failures: Number of failures
+            prior_alpha: Prior alpha (pseudo-successes)
+            prior_beta: Prior beta (pseudo-failures)
+
+        Returns:
+            (posterior_mean, posterior_std)
+        """
+        # Get or initialize prior
+        if key not in self._beta_priors:
+            self._beta_priors[key] = (prior_alpha, prior_beta)
+
+        alpha, beta = self._beta_priors[key]
+
+        # Bayesian update: posterior = prior + data
+        alpha_post = alpha + successes
+        beta_post = beta + failures
+
+        self._beta_priors[key] = (alpha_post, beta_post)
+
+        # Calculate posterior statistics
+        mean = alpha_post / (alpha_post + beta_post)
+        variance = (alpha_post * beta_post) / ((alpha_post + beta_post) ** 2 * (alpha_post + beta_post + 1))
+        std = variance ** 0.5
+
+        return mean, std
+
+    def get_beta_credible_interval(
+        self,
+        key: str,
+        probability: float = 0.95,
+    ) -> CredibleInterval:
+        """Get credible interval for a Beta belief."""
+        if key not in self._beta_priors:
+            return CredibleInterval(lower=0.0, upper=1.0, probability=probability)
+
+        alpha, beta = self._beta_priors[key]
+        mean = alpha / (alpha + beta)
+
+        # Approximate credible interval using normal approximation
+        variance = (alpha * beta) / ((alpha + beta) ** 2 * (alpha + beta + 1))
+        std = variance ** 0.5
+
+        # 95% CI ≈ mean ± 1.96*std
+        z = 1.96 if probability == 0.95 else 2.58  # 99%
+        lower = max(0.0, mean - z * std)
+        upper = min(1.0, mean + z * std)
+
+        return CredibleInterval(
+            lower=lower,
+            upper=upper,
+            probability=probability,
+            point_estimate=mean,
+        )
+
+    def update_normal(
+        self,
+        key: str,
+        observation: float,
+        observation_precision: float = 1.0,
+        prior_mean: float = 0.0,
+        prior_precision: float = 1.0,
+    ) -> Tuple[float, float]:
+        """
+        Update Normal distribution with new observation.
+
+        Args:
+            key: Identifier for the belief
+            observation: Observed value
+            observation_precision: Precision (1/variance) of observation
+            prior_mean: Prior mean
+            prior_precision: Prior precision
+
+        Returns:
+            (posterior_mean, posterior_std)
+        """
+        if key not in self._normal_priors:
+            self._normal_priors[key] = (prior_mean, prior_precision)
+
+        mu, tau = self._normal_priors[key]
+
+        # Bayesian update for Normal-Normal
+        tau_post = tau + observation_precision
+        mu_post = (tau * mu + observation_precision * observation) / tau_post
+
+        self._normal_priors[key] = (mu_post, tau_post)
+
+        # Calculate posterior statistics
+        std_post = (1.0 / tau_post) ** 0.5
+
+        return mu_post, std_post
+
+
+# Global Bayesian updater instance
+_bayesian_updater: Optional[BayesianUpdater] = None
+
+
+def get_bayesian_updater() -> BayesianUpdater:
+    """Get singleton BayesianUpdater instance."""
+    global _bayesian_updater
+    if _bayesian_updater is None:
+        _bayesian_updater = BayesianUpdater()
+    return _bayesian_updater
+
+
+# =============================================================================
 # 1. CAUSAL REASONING ENGINE
 # =============================================================================
 
@@ -3102,7 +3365,7 @@ class StrategyPerformance:
 
 class MetaLearner:
     """
-    Self-improvement through experience analysis.
+    Self-improvement through experience analysis with persistent storage.
 
     Capabilities:
         - Strategy selection optimization
@@ -3110,20 +3373,149 @@ class MetaLearner:
         - Weakness identification
         - Improvement recommendations
         - Adaptive behavior
+        - PERSISTENT STORAGE (survives restarts)
 
     Note: This is meta-learning (learning to learn), not code self-modification.
 
     Environment Variables:
         META_LEARNING_WINDOW: Number of experiences to analyze
         META_MIN_SAMPLES: Minimum samples before adapting
+        META_PERSISTENCE_DIR: Directory for persistent storage
+        META_AUTOSAVE_INTERVAL: Auto-save interval in experiences
     """
 
     def __init__(self):
-        self._learning_window = _env_int("META_LEARNING_WINDOW", 100)
+        self._learning_window = _env_int("META_LEARNING_WINDOW", 1000)  # Increased for persistence
         self._min_samples = _env_int("META_MIN_SAMPLES", 5)
+        self._autosave_interval = _env_int("META_AUTOSAVE_INTERVAL", 10)
         self._experiences: Deque[LearningExperience] = deque(maxlen=self._learning_window)
         self._strategy_stats: Dict[str, StrategyPerformance] = {}
         self._lock = asyncio.Lock()
+
+        # Persistence
+        self._persistence_dir = Path(
+            os.getenv("META_PERSISTENCE_DIR", str(Path.home() / ".jarvis" / "meta_learner"))
+        )
+        self._persistence_dir.mkdir(parents=True, exist_ok=True)
+        self._experiences_since_save = 0
+        self._loaded = False
+
+    async def _ensure_loaded(self) -> None:
+        """Ensure persistent state is loaded."""
+        if self._loaded:
+            return
+        await self.load_state()
+        self._loaded = True
+
+    async def save_state(self) -> bool:
+        """
+        Save current state to persistent storage.
+
+        Returns:
+            True if saved successfully
+        """
+        async with self._lock:
+            try:
+                # Save experiences
+                experiences_file = self._persistence_dir / "experiences.jsonl"
+                with open(experiences_file, "w") as f:
+                    for exp in self._experiences:
+                        line = json.dumps({
+                            "id": exp.id,
+                            "task_type": exp.task_type,
+                            "input_features": exp.input_features,
+                            "strategy_used": exp.strategy_used,
+                            "outcome": exp.outcome,
+                            "timestamp": exp.timestamp,
+                            "insights": exp.insights,
+                        }, default=str)
+                        f.write(line + "\n")
+
+                # Save strategy stats
+                stats_file = self._persistence_dir / "strategy_stats.json"
+                stats_data = {
+                    name: {
+                        "strategy": s.strategy,
+                        "attempts": s.attempts,
+                        "successes": s.successes,
+                        "average_outcome": s.average_outcome,
+                        "confidence": s.confidence,
+                        "context_patterns": s.context_patterns,
+                    }
+                    for name, s in self._strategy_stats.items()
+                }
+                temp_file = stats_file.with_suffix(".tmp")
+                temp_file.write_text(json.dumps(stats_data, indent=2))
+                temp_file.rename(stats_file)
+
+                # Save metadata
+                meta_file = self._persistence_dir / "metadata.json"
+                meta_data = {
+                    "total_experiences": len(self._experiences),
+                    "strategies_count": len(self._strategy_stats),
+                    "saved_at": time.time(),
+                    "version": "2.0",
+                }
+                meta_file.write_text(json.dumps(meta_data, indent=2))
+
+                self._experiences_since_save = 0
+                logger.debug(f"[MetaLearner] Saved {len(self._experiences)} experiences")
+                return True
+
+            except Exception as e:
+                logger.error(f"[MetaLearner] Save failed: {e}")
+                return False
+
+    async def load_state(self) -> bool:
+        """
+        Load state from persistent storage.
+
+        Returns:
+            True if loaded successfully
+        """
+        async with self._lock:
+            try:
+                # Load experiences
+                experiences_file = self._persistence_dir / "experiences.jsonl"
+                if experiences_file.exists():
+                    with open(experiences_file, "r") as f:
+                        for line in f:
+                            if line.strip():
+                                data = json.loads(line)
+                                exp = LearningExperience(
+                                    id=data["id"],
+                                    task_type=data["task_type"],
+                                    input_features=data["input_features"],
+                                    strategy_used=data["strategy_used"],
+                                    outcome=data["outcome"],
+                                    timestamp=data["timestamp"],
+                                    insights=data.get("insights", []),
+                                )
+                                self._experiences.append(exp)
+
+                # Load strategy stats
+                stats_file = self._persistence_dir / "strategy_stats.json"
+                if stats_file.exists():
+                    stats_data = json.loads(stats_file.read_text())
+                    for name, s in stats_data.items():
+                        self._strategy_stats[name] = StrategyPerformance(
+                            strategy=s["strategy"],
+                            attempts=s["attempts"],
+                            successes=s["successes"],
+                            average_outcome=s["average_outcome"],
+                            confidence=s["confidence"],
+                            context_patterns=s.get("context_patterns", []),
+                        )
+
+                logger.info(
+                    f"[MetaLearner] Loaded {len(self._experiences)} experiences, "
+                    f"{len(self._strategy_stats)} strategies"
+                )
+                return True
+
+            except Exception as e:
+                logger.warning(f"[MetaLearner] Load failed (starting fresh): {e}")
+                return False
 
     async def record_experience(
         self,
@@ -3133,7 +3525,9 @@ class MetaLearner:
         outcome: float,
         insights: Optional[List[str]] = None,
     ) -> None:
-        """Record a learning experience."""
+        """Record a learning experience with auto-persistence."""
+        await self._ensure_loaded()
+
         async with self._lock:
             experience = LearningExperience(
                 id=str(uuid.uuid4())[:8],
@@ -3145,12 +3539,17 @@ class MetaLearner:
                 insights=insights or [],
             )
             self._experiences.append(experience)
+            self._experiences_since_save += 1
 
-            # Update strategy statistics
-            await self._update_strategy_stats(experience)
+            # Update strategy statistics (without lock, we're already in lock)
+            await self._update_strategy_stats_unlocked(experience)
 
-    async def _update_strategy_stats(self, exp: LearningExperience) -> None:
-        """Update strategy performance statistics."""
+        # Auto-save periodically (outside lock)
+        if self._experiences_since_save >= self._autosave_interval:
+            await self.save_state()
+
+    async def _update_strategy_stats_unlocked(self, exp: LearningExperience) -> None:
+        """Update strategy performance statistics (caller must hold lock)."""
         strategy = exp.strategy_used
 
         if strategy not in self._strategy_stats:
@@ -3187,6 +3586,8 @@ class MetaLearner:
         Returns:
             (recommended_strategy, confidence)
         """
+        await self._ensure_loaded()
+
         async with self._lock:
             best_strategy = available_strategies[0] if available_strategies else "default"
             best_score = 0.0

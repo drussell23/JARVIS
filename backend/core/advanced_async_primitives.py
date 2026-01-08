@@ -2373,3 +2373,1511 @@ def with_rate_limit(
             return await func(*args, **kwargs)
         return wrapper
     return decorator
+
+
+# =============================================================================
+# 9. DISTRIBUTED COMMAND LOCK (CRITICAL FIX)
+# =============================================================================
+
+
+@dataclass
+class CommandLockEntry:
+    """Entry for tracking command lock ownership."""
+    command_id: str
+    owner_pid: int
+    owner_cookie: str  # Unique per-process cookie for PID reuse protection
+    acquired_at: float
+    expires_at: float
+
+
+class DistributedCommandLock:
+    """
+    Distributed lock for Trinity command writes.
+
+    Prevents multiple processes from writing to the same command file
+    simultaneously, which can cause data corruption.
+
+    Features:
+        - fcntl-based exclusive locks
+        - Unique command IDs with microsecond timestamp
+        - PID + cookie validation for reuse protection
+        - Automatic lock expiration
+        - Dead lock detection
+
+    Environment Variables:
+        TRINITY_CMD_LOCK_TIMEOUT: Lock acquisition timeout (default 10s)
+        TRINITY_CMD_LOCK_EXPIRY: Lock expiration time (default 60s)
+    """
+
+    def __init__(self, base_dir: Optional[str] = None):
+        self._base_dir = Path(
+            base_dir or os.getenv("TRINITY_IPC_DIR", str(Path.home() / ".jarvis" / "trinity"))
+        )
+        self._lock_timeout = _env_float("TRINITY_CMD_LOCK_TIMEOUT", 10.0)
+        self._lock_expiry = _env_float("TRINITY_CMD_LOCK_EXPIRY", 60.0)
+
+        # Unique cookie for this process (survives across PID reuse)
+        self._process_cookie = f"{os.getpid()}_{uuid.uuid4().hex[:8]}_{time.time()}"
+
+        # Lock directory
+        self._lock_dir = self._base_dir / "locks"
+        self._lock_dir.mkdir(parents=True, exist_ok=True)
+
+        # Active locks held by this process
+        self._active_locks: Dict[str, int] = {}  # command_id -> fd
+
+    def generate_unique_command_id(self) -> str:
+        """
+        Generate unique command ID with microsecond precision.
+
+        Format: {timestamp_micros}_{uuid_short}_{pid}
+        This prevents ID collisions even with simultaneous writes.
+        """
+        timestamp_micros = int(time.time() * 1_000_000)
+        unique_part = uuid.uuid4().hex[:8]
+        return f"{timestamp_micros}_{unique_part}_{os.getpid()}"
+
+    @asynccontextmanager
+    async def acquire(self, command_id: str):
+        """
+        Acquire exclusive lock for a command.
+
+        Args:
+            command_id: Unique command identifier
+
+        Yields:
+            CommandLockEntry with lock details
+        """
+        lock_file = self._lock_dir / f"{command_id}.lock"
+        lock_meta = self._lock_dir / f"{command_id}.meta"
+
+        fd = None
+        try:
+            # Create lock file atomically
+            fd = os.open(
+                str(lock_file),
+                os.O_RDWR | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+
+            # Try to acquire exclusive lock with timeout
+            start_time = time.time()
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except (IOError, OSError):
+                    if time.time() - start_time > self._lock_timeout:
+                        os.close(fd)
+                        try:
+                            os.unlink(str(lock_file))
+                        except OSError:
+                            pass
+                        raise TimeoutError(
+                            f"Command lock timeout for {command_id} after {self._lock_timeout}s"
+                        )
+                    await asyncio.sleep(0.01)
+
+            # Write lock metadata
+            now = time.time()
+            entry = CommandLockEntry(
+                command_id=command_id,
+                owner_pid=os.getpid(),
+                owner_cookie=self._process_cookie,
+                acquired_at=now,
+                expires_at=now + self._lock_expiry,
+            )
+
+            # Write metadata atomically
+            meta_content = json.dumps({
+                "command_id": entry.command_id,
+                "owner_pid": entry.owner_pid,
+                "owner_cookie": entry.owner_cookie,
+                "acquired_at": entry.acquired_at,
+                "expires_at": entry.expires_at,
+            })
+            temp_meta = lock_meta.with_suffix(".tmp")
+            temp_meta.write_text(meta_content)
+            temp_meta.rename(lock_meta)
+
+            self._active_locks[command_id] = fd
+
+            yield entry
+
+        except FileExistsError:
+            # Lock file already exists - check if stale
+            if lock_meta.exists():
+                try:
+                    meta = json.loads(lock_meta.read_text())
+                    if time.time() > meta.get("expires_at", 0):
+                        # Stale lock - clean up and retry
+                        logger.warning(f"Cleaning stale lock for {command_id}")
+                        try:
+                            os.unlink(str(lock_file))
+                            os.unlink(str(lock_meta))
+                        except OSError:
+                            pass
+                        # Recursive retry
+                        async with self.acquire(command_id) as entry:
+                            yield entry
+                            return
+                except (json.JSONDecodeError, OSError):
+                    pass
+            raise RuntimeError(f"Command {command_id} is already locked by another process")
+
+        finally:
+            # Release lock
+            if fd is not None and command_id in self._active_locks:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                except Exception:
+                    pass
+                try:
+                    os.close(fd)
+                except Exception:
+                    pass
+                try:
+                    os.unlink(str(lock_file))
+                    os.unlink(str(lock_meta))
+                except OSError:
+                    pass
+                self._active_locks.pop(command_id, None)
+
+    async def cleanup_stale_locks(self) -> int:
+        """Clean up expired locks from dead processes."""
+        cleaned = 0
+        now = time.time()
+
+        for meta_file in self._lock_dir.glob("*.meta"):
+            try:
+                meta = json.loads(meta_file.read_text())
+
+                # Check if expired
+                if now > meta.get("expires_at", 0):
+                    command_id = meta.get("command_id", meta_file.stem)
+                    lock_file = self._lock_dir / f"{command_id}.lock"
+
+                    try:
+                        os.unlink(str(lock_file))
+                    except OSError:
+                        pass
+                    os.unlink(str(meta_file))
+                    cleaned += 1
+                    logger.debug(f"Cleaned stale lock: {command_id}")
+
+            except (json.JSONDecodeError, OSError) as e:
+                logger.debug(f"Error cleaning lock {meta_file}: {e}")
+
+        return cleaned
+
+
+# =============================================================================
+# 10. PROCESS COOKIE VALIDATOR (PID REUSE PROTECTION)
+# =============================================================================
+
+
+class ProcessCookieValidator:
+    """
+    Validates process identity to prevent PID reuse attacks.
+
+    When a process starts, it registers a unique cookie.
+    Before sending signals, we verify the target PID still has
+    the expected cookie (hasn't been replaced by a new process).
+
+    Features:
+        - Unique per-process cookie generation
+        - Atomic cookie file operations
+        - Race-safe signal sending
+        - Automatic cleanup of stale cookies
+
+    Environment Variables:
+        TRINITY_COOKIE_DIR: Directory for cookie files
+        TRINITY_COOKIE_TTL: Time-to-live for cookies
+    """
+
+    def __init__(self, base_dir: Optional[str] = None):
+        self._base_dir = Path(
+            base_dir or os.getenv("TRINITY_COOKIE_DIR", str(Path.home() / ".jarvis" / "trinity" / "cookies"))
+        )
+        self._ttl = _env_float("TRINITY_COOKIE_TTL", 86400.0)  # 24 hours
+
+        self._base_dir.mkdir(parents=True, exist_ok=True)
+
+        # Generate unique cookie for this process
+        self._cookie = f"{uuid.uuid4().hex}_{time.time()}"
+        self._registered = False
+
+    def get_cookie_path(self, pid: int) -> Path:
+        """Get cookie file path for a PID."""
+        return self._base_dir / f"pid_{pid}.cookie"
+
+    async def register(self) -> str:
+        """
+        Register this process's cookie.
+
+        Returns:
+            The unique cookie for this process
+        """
+        pid = os.getpid()
+        cookie_path = self.get_cookie_path(pid)
+
+        cookie_data = {
+            "pid": pid,
+            "cookie": self._cookie,
+            "start_time": time.time(),
+            "expires_at": time.time() + self._ttl,
+            "cmdline": " ".join(sys.argv[:3]),  # First 3 args for identification
+        }
+
+        # Write atomically
+        temp_path = cookie_path.with_suffix(".tmp")
+        temp_path.write_text(json.dumps(cookie_data))
+        temp_path.rename(cookie_path)
+
+        self._registered = True
+        logger.debug(f"Registered process cookie for PID {pid}")
+
+        return self._cookie
+
+    async def validate(self, pid: int, expected_cookie: str) -> bool:
+        """
+        Validate that a PID still has the expected cookie.
+
+        Args:
+            pid: Process ID to validate
+            expected_cookie: Expected cookie value
+
+        Returns:
+            True if PID has expected cookie, False otherwise
+        """
+        cookie_path = self.get_cookie_path(pid)
+
+        if not cookie_path.exists():
+            return False
+
+        try:
+            data = json.loads(cookie_path.read_text())
+
+            # Check cookie match
+            if data.get("cookie") != expected_cookie:
+                return False
+
+            # Check not expired
+            if time.time() > data.get("expires_at", 0):
+                return False
+
+            # Check PID match
+            if data.get("pid") != pid:
+                return False
+
+            return True
+
+        except (json.JSONDecodeError, OSError):
+            return False
+
+    async def send_signal_safe(
+        self,
+        pid: int,
+        expected_cookie: str,
+        signal: int,
+    ) -> Tuple[bool, str]:
+        """
+        Send signal to process only if cookie validates.
+
+        This prevents PID reuse attacks where a new process
+        takes over the PID of a terminated process.
+
+        Args:
+            pid: Target PID
+            expected_cookie: Expected cookie
+            signal: Signal to send
+
+        Returns:
+            (success, message)
+        """
+        # First validate cookie
+        if not await self.validate(pid, expected_cookie):
+            return False, f"Cookie validation failed for PID {pid} (possible PID reuse)"
+
+        # Then send signal
+        try:
+            os.kill(pid, signal)
+            return True, f"Signal {signal} sent to PID {pid}"
+        except ProcessLookupError:
+            return False, f"Process {pid} no longer exists"
+        except PermissionError:
+            return False, f"Permission denied sending signal to PID {pid}"
+        except OSError as e:
+            return False, f"OS error sending signal: {e}"
+
+    async def cleanup_stale_cookies(self) -> int:
+        """Clean up expired or orphaned cookie files."""
+        cleaned = 0
+        now = time.time()
+
+        for cookie_file in self._base_dir.glob("pid_*.cookie"):
+            try:
+                data = json.loads(cookie_file.read_text())
+                pid = data.get("pid", 0)
+
+                # Check if expired
+                if now > data.get("expires_at", 0):
+                    os.unlink(str(cookie_file))
+                    cleaned += 1
+                    continue
+
+                # Check if process is dead
+                if pid > 0:
+                    try:
+                        os.kill(pid, 0)  # Check if process exists
+                    except ProcessLookupError:
+                        os.unlink(str(cookie_file))
+                        cleaned += 1
+                    except PermissionError:
+                        pass  # Process exists but we can't signal it
+
+            except (json.JSONDecodeError, OSError):
+                try:
+                    os.unlink(str(cookie_file))
+                    cleaned += 1
+                except OSError:
+                    pass
+
+        return cleaned
+
+
+# =============================================================================
+# 11. STARTUP BARRIER (COORDINATED INITIALIZATION)
+# =============================================================================
+
+
+@dataclass
+class ComponentReadiness:
+    """Readiness state for a component."""
+    name: str
+    ready: bool
+    timestamp: float
+    health_check_passed: bool
+    message: str = ""
+
+
+class StartupBarrier:
+    """
+    Coordinated startup barrier for Trinity components.
+
+    Ensures all required components are ready before proceeding.
+    Implements a distributed barrier using file-based signaling.
+
+    Features:
+        - Wait for N components to be ready
+        - Timeout with detailed status
+        - Health check integration
+        - Graceful degradation option
+
+    Environment Variables:
+        TRINITY_STARTUP_TIMEOUT: Maximum wait time
+        TRINITY_STARTUP_POLL_INTERVAL: Poll interval
+        TRINITY_STARTUP_REQUIRED: Comma-separated required components
+    """
+
+    def __init__(self, base_dir: Optional[str] = None):
+        self._base_dir = Path(
+            base_dir or os.getenv("TRINITY_IPC_DIR", str(Path.home() / ".jarvis" / "trinity"))
+        )
+        self._timeout = _env_float("TRINITY_STARTUP_TIMEOUT", 120.0)
+        self._poll_interval = _env_float("TRINITY_STARTUP_POLL_INTERVAL", 0.5)
+
+        required_str = os.getenv("TRINITY_STARTUP_REQUIRED", "jarvis_prime,reactor_core")
+        self._required_components = set(c.strip() for c in required_str.split(",") if c.strip())
+
+        self._ready_dir = self._base_dir / "ready"
+        self._ready_dir.mkdir(parents=True, exist_ok=True)
+
+    async def signal_ready(self, component_name: str, health_check_passed: bool = True) -> None:
+        """
+        Signal that a component is ready.
+
+        Args:
+            component_name: Name of the ready component
+            health_check_passed: Whether health check passed
+        """
+        ready_file = self._ready_dir / f"{component_name}.ready"
+
+        data = {
+            "name": component_name,
+            "ready": True,
+            "timestamp": time.time(),
+            "health_check_passed": health_check_passed,
+            "pid": os.getpid(),
+        }
+
+        # Write atomically
+        temp_file = ready_file.with_suffix(".tmp")
+        temp_file.write_text(json.dumps(data))
+        temp_file.rename(ready_file)
+
+        logger.info(f"[StartupBarrier] {component_name} signaled ready")
+
+    async def signal_not_ready(self, component_name: str, reason: str = "") -> None:
+        """Signal that a component is not ready (for shutdown or failure)."""
+        ready_file = self._ready_dir / f"{component_name}.ready"
+        try:
+            os.unlink(str(ready_file))
+        except OSError:
+            pass
+        logger.info(f"[StartupBarrier] {component_name} signaled not ready: {reason}")
+
+    async def wait_for_all(
+        self,
+        required: Optional[Set[str]] = None,
+        timeout: Optional[float] = None,
+        require_health: bool = True,
+    ) -> Tuple[bool, Dict[str, ComponentReadiness]]:
+        """
+        Wait for all required components to be ready.
+
+        Args:
+            required: Set of required component names (defaults to config)
+            timeout: Timeout in seconds (defaults to config)
+            require_health: Require health checks to pass
+
+        Returns:
+            (all_ready, component_states)
+        """
+        required = required or self._required_components
+        timeout = timeout or self._timeout
+        start_time = time.time()
+
+        logger.info(f"[StartupBarrier] Waiting for components: {required}")
+
+        while True:
+            elapsed = time.time() - start_time
+            if elapsed > timeout:
+                # Timeout - return current state
+                states = await self._get_component_states(required, require_health)
+                missing = [n for n, s in states.items() if not s.ready]
+                logger.warning(
+                    f"[StartupBarrier] Timeout after {elapsed:.1f}s. Missing: {missing}"
+                )
+                return False, states
+
+            # Check all components
+            states = await self._get_component_states(required, require_health)
+            all_ready = all(s.ready and (not require_health or s.health_check_passed) for s in states.values())
+
+            if all_ready:
+                logger.info(f"[StartupBarrier] All components ready after {elapsed:.1f}s")
+                return True, states
+
+            # Log progress periodically
+            if int(elapsed) % 10 == 0 and elapsed > 0:
+                ready_count = sum(1 for s in states.values() if s.ready)
+                logger.debug(
+                    f"[StartupBarrier] {ready_count}/{len(required)} ready after {elapsed:.1f}s"
+                )
+
+            await asyncio.sleep(self._poll_interval)
+
+    async def _get_component_states(
+        self,
+        required: Set[str],
+        require_health: bool,
+    ) -> Dict[str, ComponentReadiness]:
+        """Get readiness state for all required components."""
+        states = {}
+        now = time.time()
+
+        for name in required:
+            ready_file = self._ready_dir / f"{name}.ready"
+
+            if not ready_file.exists():
+                states[name] = ComponentReadiness(
+                    name=name,
+                    ready=False,
+                    timestamp=0,
+                    health_check_passed=False,
+                    message="Not yet signaled ready",
+                )
+                continue
+
+            try:
+                data = json.loads(ready_file.read_text())
+
+                # Check staleness (> 30 seconds old is considered stale)
+                age = now - data.get("timestamp", 0)
+                is_stale = age > 30.0
+
+                states[name] = ComponentReadiness(
+                    name=name,
+                    ready=data.get("ready", False) and not is_stale,
+                    timestamp=data.get("timestamp", 0),
+                    health_check_passed=data.get("health_check_passed", False),
+                    message=f"Stale ({age:.1f}s)" if is_stale else "OK",
+                )
+
+            except (json.JSONDecodeError, OSError) as e:
+                states[name] = ComponentReadiness(
+                    name=name,
+                    ready=False,
+                    timestamp=0,
+                    health_check_passed=False,
+                    message=f"Read error: {e}",
+                )
+
+        return states
+
+    async def cleanup(self) -> None:
+        """Clean up all ready signals (for shutdown)."""
+        for ready_file in self._ready_dir.glob("*.ready"):
+            try:
+                os.unlink(str(ready_file))
+            except OSError:
+                pass
+
+
+# =============================================================================
+# 12. HEARTBEAT CACHE MANAGER (CACHE INVALIDATION)
+# =============================================================================
+
+
+@dataclass
+class HeartbeatEntry:
+    """Cached heartbeat entry with validity tracking."""
+    component: str
+    data: Dict[str, Any]
+    fetched_at: float
+    file_mtime: float
+    is_valid: bool = True
+
+
+class HeartbeatCacheManager:
+    """
+    Intelligent heartbeat cache with automatic invalidation.
+
+    Solves the stale cache problem by:
+    1. Tracking file modification times
+    2. Automatic cache invalidation on file changes
+    3. TTL-based expiration
+    4. Proactive refresh on access
+
+    Features:
+        - File-based cache invalidation (mtime tracking)
+        - TTL-based expiration
+        - Automatic refresh
+        - Thread-safe access
+
+    Environment Variables:
+        TRINITY_HEARTBEAT_TTL: Cache TTL in seconds
+        TRINITY_HEARTBEAT_DIR: Directory for heartbeat files
+    """
+
+    def __init__(self, base_dir: Optional[str] = None):
+        self._base_dir = Path(
+            base_dir or os.getenv("TRINITY_IPC_DIR", str(Path.home() / ".jarvis" / "trinity"))
+        )
+        self._ttl = _env_float("TRINITY_HEARTBEAT_TTL", 5.0)  # 5 seconds
+
+        self._components_dir = self._base_dir / "components"
+        self._components_dir.mkdir(parents=True, exist_ok=True)
+
+        # Cache storage
+        self._cache: Dict[str, HeartbeatEntry] = {}
+        self._lock = asyncio.Lock()
+
+    def _get_heartbeat_path(self, component: str) -> Path:
+        """Get heartbeat file path for component."""
+        return self._components_dir / f"{component}.json"
+
+    async def get(self, component: str, force_refresh: bool = False) -> Optional[Dict[str, Any]]:
+        """
+        Get heartbeat data for a component.
+
+        Automatically refreshes cache if:
+        - Cache entry doesn't exist
+        - Cache entry is expired (TTL)
+        - File modification time changed
+        - force_refresh is True
+
+        Args:
+            component: Component name
+            force_refresh: Force cache refresh
+
+        Returns:
+            Heartbeat data or None if not available
+        """
+        async with self._lock:
+            heartbeat_path = self._get_heartbeat_path(component)
+
+            # Check if file exists
+            if not heartbeat_path.exists():
+                self._cache.pop(component, None)
+                return None
+
+            # Get file mtime
+            try:
+                file_mtime = heartbeat_path.stat().st_mtime
+            except OSError:
+                self._cache.pop(component, None)
+                return None
+
+            # Check cache
+            cached = self._cache.get(component)
+            now = time.time()
+
+            need_refresh = (
+                force_refresh
+                or cached is None
+                or not cached.is_valid
+                or (now - cached.fetched_at) > self._ttl
+                or cached.file_mtime != file_mtime  # File changed!
+            )
+
+            if need_refresh:
+                # Read fresh data
+                try:
+                    data = json.loads(heartbeat_path.read_text())
+
+                    self._cache[component] = HeartbeatEntry(
+                        component=component,
+                        data=data,
+                        fetched_at=now,
+                        file_mtime=file_mtime,
+                        is_valid=True,
+                    )
+
+                    return data
+
+                except (json.JSONDecodeError, OSError) as e:
+                    logger.debug(f"Error reading heartbeat for {component}: {e}")
+                    if cached:
+                        cached.is_valid = False
+                    return None
+
+            return cached.data if cached else None
+
+    async def is_component_online(
+        self,
+        component: str,
+        max_age: float = 15.0,
+    ) -> bool:
+        """
+        Check if a component is online based on heartbeat.
+
+        Uses fresh data (cache-invalidated) to avoid stale reads.
+
+        Args:
+            component: Component name
+            max_age: Maximum heartbeat age in seconds
+
+        Returns:
+            True if component is online (recent heartbeat)
+        """
+        data = await self.get(component, force_refresh=True)
+
+        if not data:
+            return False
+
+        timestamp = data.get("timestamp", 0)
+        age = time.time() - timestamp
+
+        return age < max_age
+
+    async def invalidate(self, component: str) -> None:
+        """Invalidate cache for a component."""
+        async with self._lock:
+            if component in self._cache:
+                self._cache[component].is_valid = False
+
+    async def invalidate_all(self) -> None:
+        """Invalidate all cached entries."""
+        async with self._lock:
+            for entry in self._cache.values():
+                entry.is_valid = False
+
+    async def get_all_components(self) -> Dict[str, Dict[str, Any]]:
+        """Get heartbeat data for all components."""
+        result = {}
+
+        for heartbeat_file in self._components_dir.glob("*.json"):
+            component = heartbeat_file.stem
+            data = await self.get(component)
+            if data:
+                result[component] = data
+
+        return result
+
+    async def get_health_summary(self, max_age: float = 15.0) -> Dict[str, Any]:
+        """
+        Get health summary for all components.
+
+        Returns:
+            Dict with component statuses and overall health
+        """
+        components = await self.get_all_components()
+        now = time.time()
+
+        statuses = {}
+        for name, data in components.items():
+            timestamp = data.get("timestamp", 0)
+            age = now - timestamp
+            statuses[name] = {
+                "online": age < max_age,
+                "age_seconds": age,
+                "status": data.get("status", "unknown"),
+            }
+
+        online_count = sum(1 for s in statuses.values() if s["online"])
+        total_count = len(statuses)
+
+        return {
+            "components": statuses,
+            "online_count": online_count,
+            "total_count": total_count,
+            "all_healthy": online_count == total_count and total_count > 0,
+            "timestamp": now,
+        }
+
+
+# =============================================================================
+# SINGLETON ACCESSORS FOR NEW COMPONENTS
+# =============================================================================
+
+_distributed_lock: Optional[DistributedCommandLock] = None
+_process_cookie: Optional[ProcessCookieValidator] = None
+_startup_barrier: Optional[StartupBarrier] = None
+_heartbeat_cache: Optional[HeartbeatCacheManager] = None
+
+
+async def get_distributed_lock() -> DistributedCommandLock:
+    """Get singleton DistributedCommandLock instance."""
+    global _distributed_lock
+    if _distributed_lock is None:
+        _distributed_lock = DistributedCommandLock()
+    return _distributed_lock
+
+
+async def get_process_cookie() -> ProcessCookieValidator:
+    """Get singleton ProcessCookieValidator instance."""
+    global _process_cookie
+    if _process_cookie is None:
+        _process_cookie = ProcessCookieValidator()
+        await _process_cookie.register()
+    return _process_cookie
+
+
+async def get_startup_barrier() -> StartupBarrier:
+    """Get singleton StartupBarrier instance."""
+    global _startup_barrier
+    if _startup_barrier is None:
+        _startup_barrier = StartupBarrier()
+    return _startup_barrier
+
+
+async def get_heartbeat_cache() -> HeartbeatCacheManager:
+    """Get singleton HeartbeatCacheManager instance."""
+    global _heartbeat_cache
+    if _heartbeat_cache is None:
+        _heartbeat_cache = HeartbeatCacheManager()
+    return _heartbeat_cache
+
+
+# =============================================================================
+# GRACEFUL SHUTDOWN COORDINATOR
+# =============================================================================
+
+
+class ShutdownPhase(str, Enum):
+    """Phases of graceful shutdown."""
+    NOT_STARTED = "not_started"
+    DRAINING = "draining"
+    WAITING_INFLIGHT = "waiting_inflight"
+    STOPPING_COMPONENTS = "stopping_components"
+    FLUSHING_DLQ = "flushing_dlq"
+    CLEANUP = "cleanup"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+@dataclass
+class ShutdownState:
+    """State tracking for shutdown process."""
+    phase: ShutdownPhase = ShutdownPhase.NOT_STARTED
+    started_at: Optional[float] = None
+    completed_at: Optional[float] = None
+    components_stopped: List[str] = field(default_factory=list)
+    inflight_commands_drained: int = 0
+    dlq_items_flushed: int = 0
+    errors: List[str] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+
+    @property
+    def duration(self) -> Optional[float]:
+        """Get shutdown duration in seconds."""
+        if self.started_at is None:
+            return None
+        end = self.completed_at or time.time()
+        return end - self.started_at
+
+    @property
+    def is_complete(self) -> bool:
+        """Check if shutdown completed."""
+        return self.phase in (ShutdownPhase.COMPLETED, ShutdownPhase.FAILED)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary."""
+        return {
+            "phase": self.phase.value,
+            "started_at": self.started_at,
+            "completed_at": self.completed_at,
+            "duration_seconds": self.duration,
+            "components_stopped": self.components_stopped,
+            "inflight_commands_drained": self.inflight_commands_drained,
+            "dlq_items_flushed": self.dlq_items_flushed,
+            "errors": self.errors,
+            "warnings": self.warnings,
+        }
+
+
+class GracefulShutdownCoordinator:
+    """
+    Coordinates graceful shutdown across Trinity components.
+
+    Shutdown order:
+    1. Signal all components to stop accepting new commands (DRAINING)
+    2. Wait for in-flight commands to complete with timeout (WAITING_INFLIGHT)
+    3. Stop Reactor-Core first (downstream)
+    4. Stop J-Prime (middle tier)
+    5. Stop JARVIS-AI-Agent (upstream/coordinator)
+    6. Flush DLQ to persistent storage
+    7. Clean up resources
+
+    Environment Variables:
+        SHUTDOWN_DRAIN_TIMEOUT: Max time to wait for drain (default: 5s)
+        SHUTDOWN_INFLIGHT_TIMEOUT: Max time to wait for in-flight (default: 30s)
+        SHUTDOWN_COMPONENT_TIMEOUT: Max time per component stop (default: 10s)
+        SHUTDOWN_DLQ_FLUSH_TIMEOUT: Max time for DLQ flush (default: 15s)
+        SHUTDOWN_SIGNAL_FILE_DIR: Directory for shutdown signals
+        SHUTDOWN_FORCE_AFTER: Force kill after this total time (default: 120s)
+    """
+
+    # Component shutdown order (downstream to upstream)
+    SHUTDOWN_ORDER = ["reactor_core", "jarvis_prime", "jarvis_agent"]
+
+    def __init__(
+        self,
+        signal_dir: Optional[Path] = None,
+        heartbeat_manager: Optional[HeartbeatCacheManager] = None,
+        process_validator: Optional[ProcessCookieValidator] = None,
+    ):
+        """
+        Initialize shutdown coordinator.
+
+        Args:
+            signal_dir: Directory for shutdown signal files
+            heartbeat_manager: Optional heartbeat cache manager
+            process_validator: Optional process cookie validator
+        """
+        env_dir = os.getenv("SHUTDOWN_SIGNAL_FILE_DIR")
+        if signal_dir:
+            self._signal_dir = signal_dir
+        elif env_dir:
+            self._signal_dir = Path(env_dir)
+        else:
+            jarvis_base = os.getenv("JARVIS_BASE_DIR", os.path.expanduser("~/.jarvis"))
+            self._signal_dir = Path(jarvis_base) / "trinity" / "shutdown"
+
+        self._signal_dir.mkdir(parents=True, exist_ok=True)
+
+        # Timeouts from environment
+        self._drain_timeout = _env_float("SHUTDOWN_DRAIN_TIMEOUT", 5.0)
+        self._inflight_timeout = _env_float("SHUTDOWN_INFLIGHT_TIMEOUT", 30.0)
+        self._component_timeout = _env_float("SHUTDOWN_COMPONENT_TIMEOUT", 10.0)
+        self._dlq_flush_timeout = _env_float("SHUTDOWN_DLQ_FLUSH_TIMEOUT", 15.0)
+        self._force_after = _env_float("SHUTDOWN_FORCE_AFTER", 120.0)
+
+        # Managers
+        self._heartbeat_manager = heartbeat_manager
+        self._process_validator = process_validator
+
+        # State
+        self._state = ShutdownState()
+        self._lock = asyncio.Lock()
+        self._shutdown_event = asyncio.Event()
+        self._inflight_counter = 0
+        self._inflight_lock = asyncio.Lock()
+        self._component_callbacks: Dict[str, Callable[[], Awaitable[bool]]] = {}
+        self._dlq_flush_callback: Optional[Callable[[], Awaitable[int]]] = None
+
+        # Logger
+        self._logger = logging.getLogger("jarvis.shutdown")
+
+    def register_component_callback(
+        self,
+        component: str,
+        callback: Callable[[], Awaitable[bool]],
+    ) -> None:
+        """
+        Register a shutdown callback for a component.
+
+        Args:
+            component: Component name
+            callback: Async function that returns True on success
+        """
+        self._component_callbacks[component] = callback
+        self._logger.info(f"Registered shutdown callback for {component}")
+
+    def register_dlq_flush_callback(
+        self,
+        callback: Callable[[], Awaitable[int]],
+    ) -> None:
+        """
+        Register callback to flush DLQ.
+
+        Args:
+            callback: Async function that returns count of items flushed
+        """
+        self._dlq_flush_callback = callback
+        self._logger.info("Registered DLQ flush callback")
+
+    async def register_inflight(self) -> str:
+        """
+        Register an in-flight command.
+
+        Returns:
+            Token to use when completing the command
+
+        Raises:
+            RuntimeError: If shutdown is in progress
+        """
+        async with self._inflight_lock:
+            if self._state.phase != ShutdownPhase.NOT_STARTED:
+                raise RuntimeError(
+                    f"Cannot register new command during shutdown "
+                    f"(phase: {self._state.phase.value})"
+                )
+            self._inflight_counter += 1
+            token = f"inflight_{time.time()}_{self._inflight_counter}"
+            return token
+
+    async def complete_inflight(self, token: str) -> None:
+        """
+        Mark an in-flight command as complete.
+
+        Args:
+            token: Token from register_inflight
+        """
+        async with self._inflight_lock:
+            self._inflight_counter = max(0, self._inflight_counter - 1)
+            if (
+                self._state.phase == ShutdownPhase.WAITING_INFLIGHT
+                and self._inflight_counter == 0
+            ):
+                self._state.inflight_commands_drained += 1
+
+    async def get_inflight_count(self) -> int:
+        """Get current in-flight command count."""
+        async with self._inflight_lock:
+            return self._inflight_counter
+
+    def is_shutting_down(self) -> bool:
+        """Check if shutdown is in progress."""
+        return self._state.phase != ShutdownPhase.NOT_STARTED
+
+    def get_state(self) -> ShutdownState:
+        """Get current shutdown state."""
+        return self._state
+
+    async def _signal_drain(self) -> bool:
+        """
+        Signal all components to stop accepting new commands.
+
+        Returns:
+            True if all components acknowledged
+        """
+        self._state.phase = ShutdownPhase.DRAINING
+        self._logger.info("Signaling all components to drain...")
+
+        # Write drain signal file
+        drain_file = self._signal_dir / "drain.signal"
+        drain_data = {
+            "initiated_by": os.getpid(),
+            "timestamp": time.time(),
+            "timeout": self._drain_timeout,
+        }
+
+        try:
+            async with aiofiles.open(drain_file, 'w') as f:
+                await f.write(json.dumps(drain_data, indent=2))
+        except Exception as e:
+            self._state.errors.append(f"Failed to write drain signal: {e}")
+            self._logger.error(f"Failed to write drain signal: {e}")
+            return False
+
+        # Wait for acknowledgments with timeout
+        start = time.time()
+        acknowledged = set()
+
+        while time.time() - start < self._drain_timeout:
+            for component in self.SHUTDOWN_ORDER:
+                ack_file = self._signal_dir / f"{component}.drain_ack"
+                if ack_file.exists() and component not in acknowledged:
+                    acknowledged.add(component)
+                    self._logger.info(f"Component {component} acknowledged drain")
+
+            if len(acknowledged) >= len(self.SHUTDOWN_ORDER):
+                break
+
+            await asyncio.sleep(0.1)
+
+        missing = set(self.SHUTDOWN_ORDER) - acknowledged
+        if missing:
+            self._state.warnings.append(
+                f"Components did not acknowledge drain: {missing}"
+            )
+            self._logger.warning(f"Missing drain acks from: {missing}")
+
+        return len(acknowledged) == len(self.SHUTDOWN_ORDER)
+
+    async def _wait_inflight(self) -> bool:
+        """
+        Wait for all in-flight commands to complete.
+
+        Returns:
+            True if all completed within timeout
+        """
+        self._state.phase = ShutdownPhase.WAITING_INFLIGHT
+        self._logger.info("Waiting for in-flight commands to complete...")
+
+        start = time.time()
+        initial_count = await self.get_inflight_count()
+
+        while time.time() - start < self._inflight_timeout:
+            count = await self.get_inflight_count()
+            if count == 0:
+                elapsed = time.time() - start
+                self._state.inflight_commands_drained = initial_count
+                self._logger.info(
+                    f"All {initial_count} in-flight commands completed "
+                    f"in {elapsed:.2f}s"
+                )
+                return True
+
+            # Log progress
+            if int(time.time() - start) % 5 == 0:
+                self._logger.info(
+                    f"Waiting for {count} in-flight commands "
+                    f"({time.time() - start:.1f}s elapsed)"
+                )
+
+            await asyncio.sleep(0.1)
+
+        remaining = await self.get_inflight_count()
+        self._state.warnings.append(
+            f"Timeout waiting for in-flight commands: {remaining} remaining"
+        )
+        self._logger.warning(
+            f"Timeout: {remaining} commands still in-flight after "
+            f"{self._inflight_timeout}s"
+        )
+        return False
+
+    async def _stop_component(self, component: str) -> bool:
+        """
+        Stop a single component.
+
+        Args:
+            component: Component name
+
+        Returns:
+            True if stopped successfully
+        """
+        self._logger.info(f"Stopping component: {component}")
+
+        # Try registered callback first
+        if component in self._component_callbacks:
+            try:
+                success = await asyncio.wait_for(
+                    self._component_callbacks[component](),
+                    timeout=self._component_timeout,
+                )
+                if success:
+                    self._state.components_stopped.append(component)
+                    self._logger.info(f"Component {component} stopped via callback")
+                    return True
+            except asyncio.TimeoutError:
+                self._state.warnings.append(
+                    f"Callback timeout for {component}"
+                )
+                self._logger.warning(f"Callback timeout for {component}")
+            except Exception as e:
+                self._state.errors.append(
+                    f"Callback error for {component}: {e}"
+                )
+                self._logger.error(f"Callback error for {component}: {e}")
+
+        # Try signal-based shutdown
+        shutdown_file = self._signal_dir / f"{component}.shutdown"
+        shutdown_data = {
+            "initiated_by": os.getpid(),
+            "timestamp": time.time(),
+            "component": component,
+        }
+
+        try:
+            async with aiofiles.open(shutdown_file, 'w') as f:
+                await f.write(json.dumps(shutdown_data, indent=2))
+        except Exception as e:
+            self._state.errors.append(f"Failed to write shutdown signal: {e}")
+            self._logger.error(f"Failed to write shutdown signal for {component}: {e}")
+            return False
+
+        # Try sending SIGTERM if we have process info
+        if self._process_validator and self._heartbeat_manager:
+            try:
+                heartbeat = await self._heartbeat_manager.get(component)
+                if heartbeat:
+                    pid = heartbeat.get("pid")
+                    cookie = heartbeat.get("process_cookie")
+                    if pid and cookie:
+                        success, msg = await self._process_validator.send_signal_safe(
+                            pid, cookie, signal.SIGTERM
+                        )
+                        if success:
+                            self._logger.info(f"Sent SIGTERM to {component} (PID {pid})")
+            except Exception as e:
+                self._logger.warning(f"Could not send signal to {component}: {e}")
+
+        # Wait for confirmation
+        start = time.time()
+        while time.time() - start < self._component_timeout:
+            ack_file = self._signal_dir / f"{component}.shutdown_ack"
+            if ack_file.exists():
+                self._state.components_stopped.append(component)
+                self._logger.info(f"Component {component} confirmed shutdown")
+                return True
+
+            # Check if heartbeat stopped
+            if self._heartbeat_manager:
+                is_online = await self._heartbeat_manager.is_component_online(
+                    component, max_age=5.0
+                )
+                if not is_online:
+                    self._state.components_stopped.append(component)
+                    self._logger.info(
+                        f"Component {component} stopped (heartbeat expired)"
+                    )
+                    return True
+
+            await asyncio.sleep(0.2)
+
+        self._state.warnings.append(
+            f"Component {component} did not confirm shutdown"
+        )
+        self._logger.warning(f"Timeout waiting for {component} to confirm shutdown")
+        return False
+
+    async def _stop_all_components(self) -> bool:
+        """
+        Stop all components in order.
+
+        Returns:
+            True if all components stopped
+        """
+        self._state.phase = ShutdownPhase.STOPPING_COMPONENTS
+        self._logger.info(f"Stopping components in order: {self.SHUTDOWN_ORDER}")
+
+        all_success = True
+        for component in self.SHUTDOWN_ORDER:
+            success = await self._stop_component(component)
+            if not success:
+                all_success = False
+
+        return all_success
+
+    async def _flush_dlq(self) -> int:
+        """
+        Flush DLQ to persistent storage.
+
+        Returns:
+            Number of items flushed
+        """
+        self._state.phase = ShutdownPhase.FLUSHING_DLQ
+        self._logger.info("Flushing DLQ to persistent storage...")
+
+        if not self._dlq_flush_callback:
+            self._logger.info("No DLQ flush callback registered")
+            return 0
+
+        try:
+            count = await asyncio.wait_for(
+                self._dlq_flush_callback(),
+                timeout=self._dlq_flush_timeout,
+            )
+            self._state.dlq_items_flushed = count
+            self._logger.info(f"Flushed {count} items from DLQ")
+            return count
+        except asyncio.TimeoutError:
+            self._state.errors.append("DLQ flush timeout")
+            self._logger.error(f"DLQ flush timeout after {self._dlq_flush_timeout}s")
+            return 0
+        except Exception as e:
+            self._state.errors.append(f"DLQ flush error: {e}")
+            self._logger.error(f"DLQ flush error: {e}")
+            return 0
+
+    async def _cleanup(self) -> None:
+        """Clean up shutdown signals and resources."""
+        self._state.phase = ShutdownPhase.CLEANUP
+        self._logger.info("Cleaning up shutdown signals...")
+
+        # Remove signal files
+        try:
+            for f in self._signal_dir.glob("*.signal"):
+                f.unlink(missing_ok=True)
+            for f in self._signal_dir.glob("*.shutdown"):
+                f.unlink(missing_ok=True)
+            for f in self._signal_dir.glob("*_ack"):
+                f.unlink(missing_ok=True)
+        except Exception as e:
+            self._state.warnings.append(f"Cleanup error: {e}")
+            self._logger.warning(f"Cleanup error: {e}")
+
+        # Signal completion
+        self._shutdown_event.set()
+
+    async def initiate_shutdown(self, reason: str = "requested") -> ShutdownState:
+        """
+        Initiate graceful shutdown of all Trinity components.
+
+        Args:
+            reason: Reason for shutdown
+
+        Returns:
+            Final shutdown state
+        """
+        async with self._lock:
+            if self._state.phase != ShutdownPhase.NOT_STARTED:
+                self._logger.warning(
+                    f"Shutdown already in progress (phase: {self._state.phase.value})"
+                )
+                return self._state
+
+            self._state.started_at = time.time()
+            self._logger.info(f"Initiating graceful shutdown: {reason}")
+
+            try:
+                # Set up force timeout
+                async def force_shutdown():
+                    await asyncio.sleep(self._force_after)
+                    if not self._state.is_complete:
+                        self._logger.critical(
+                            f"Force shutdown after {self._force_after}s"
+                        )
+                        self._state.phase = ShutdownPhase.FAILED
+                        self._state.errors.append("Force shutdown timeout")
+                        self._state.completed_at = time.time()
+                        self._shutdown_event.set()
+
+                force_task = asyncio.create_task(force_shutdown())
+
+                # Phase 1: Signal drain
+                await self._signal_drain()
+
+                # Phase 2: Wait for in-flight
+                await self._wait_inflight()
+
+                # Phase 3: Stop components in order
+                await self._stop_all_components()
+
+                # Phase 4: Flush DLQ
+                await self._flush_dlq()
+
+                # Phase 5: Cleanup
+                await self._cleanup()
+
+                # Mark complete
+                self._state.phase = ShutdownPhase.COMPLETED
+                self._state.completed_at = time.time()
+
+                # Cancel force timeout
+                force_task.cancel()
+                try:
+                    await force_task
+                except asyncio.CancelledError:
+                    pass
+
+                self._logger.info(
+                    f"Graceful shutdown completed in {self._state.duration:.2f}s. "
+                    f"Components stopped: {len(self._state.components_stopped)}, "
+                    f"DLQ items flushed: {self._state.dlq_items_flushed}"
+                )
+
+            except Exception as e:
+                self._state.phase = ShutdownPhase.FAILED
+                self._state.errors.append(f"Shutdown error: {e}")
+                self._state.completed_at = time.time()
+                self._logger.error(f"Shutdown failed: {e}")
+                self._logger.exception("Shutdown exception details:")
+
+            return self._state
+
+    async def wait_for_shutdown(self, timeout: Optional[float] = None) -> bool:
+        """
+        Wait for shutdown to complete.
+
+        Args:
+            timeout: Optional timeout in seconds
+
+        Returns:
+            True if shutdown completed, False if timeout
+        """
+        try:
+            await asyncio.wait_for(
+                self._shutdown_event.wait(),
+                timeout=timeout,
+            )
+            return True
+        except asyncio.TimeoutError:
+            return False
+
+    async def acknowledge_drain(self, component: str) -> bool:
+        """
+        Acknowledge drain signal (called by components).
+
+        Args:
+            component: Component name
+
+        Returns:
+            True if acknowledgment written
+        """
+        ack_file = self._signal_dir / f"{component}.drain_ack"
+        ack_data = {
+            "component": component,
+            "acknowledged_at": time.time(),
+            "pid": os.getpid(),
+        }
+
+        try:
+            async with aiofiles.open(ack_file, 'w') as f:
+                await f.write(json.dumps(ack_data, indent=2))
+            return True
+        except Exception as e:
+            self._logger.error(f"Failed to write drain ack for {component}: {e}")
+            return False
+
+    async def acknowledge_shutdown(self, component: str) -> bool:
+        """
+        Acknowledge shutdown signal (called by components).
+
+        Args:
+            component: Component name
+
+        Returns:
+            True if acknowledgment written
+        """
+        ack_file = self._signal_dir / f"{component}.shutdown_ack"
+        ack_data = {
+            "component": component,
+            "shutdown_at": time.time(),
+            "pid": os.getpid(),
+        }
+
+        try:
+            async with aiofiles.open(ack_file, 'w') as f:
+                await f.write(json.dumps(ack_data, indent=2))
+            return True
+        except Exception as e:
+            self._logger.error(f"Failed to write shutdown ack for {component}: {e}")
+            return False
+
+    async def check_drain_signal(self) -> bool:
+        """
+        Check if drain signal is active (called by components).
+
+        Returns:
+            True if drain signal present
+        """
+        drain_file = self._signal_dir / "drain.signal"
+        return drain_file.exists()
+
+    async def check_shutdown_signal(self, component: str) -> bool:
+        """
+        Check if shutdown signal is active for component.
+
+        Args:
+            component: Component name
+
+        Returns:
+            True if shutdown signal present
+        """
+        shutdown_file = self._signal_dir / f"{component}.shutdown"
+        return shutdown_file.exists()
+
+
+# Singleton accessor for shutdown coordinator
+_shutdown_coordinator: Optional[GracefulShutdownCoordinator] = None
+
+
+async def get_shutdown_coordinator(
+    heartbeat_manager: Optional[HeartbeatCacheManager] = None,
+    process_validator: Optional[ProcessCookieValidator] = None,
+) -> GracefulShutdownCoordinator:
+    """
+    Get singleton GracefulShutdownCoordinator instance.
+
+    Args:
+        heartbeat_manager: Optional heartbeat cache manager
+        process_validator: Optional process cookie validator
+
+    Returns:
+        GracefulShutdownCoordinator instance
+    """
+    global _shutdown_coordinator
+    if _shutdown_coordinator is None:
+        hb = heartbeat_manager or await get_heartbeat_cache()
+        pv = process_validator or await get_process_cookie()
+        _shutdown_coordinator = GracefulShutdownCoordinator(
+            heartbeat_manager=hb,
+            process_validator=pv,
+        )
+    return _shutdown_coordinator
+
+
+# Signal handlers for graceful shutdown
+def setup_shutdown_signal_handlers(
+    coordinator: GracefulShutdownCoordinator,
+    loop: Optional[asyncio.AbstractEventLoop] = None,
+) -> None:
+    """
+    Set up signal handlers for graceful shutdown.
+
+    Args:
+        coordinator: Shutdown coordinator instance
+        loop: Event loop (defaults to running loop)
+    """
+    import signal as sig
+
+    if loop is None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = asyncio.get_event_loop()
+
+    def handle_signal(signum, frame):
+        sig_name = sig.Signals(signum).name
+        logging.getLogger("jarvis.shutdown").info(
+            f"Received {sig_name}, initiating graceful shutdown..."
+        )
+        asyncio.run_coroutine_threadsafe(
+            coordinator.initiate_shutdown(reason=f"signal:{sig_name}"),
+            loop,
+        )
+
+    # Register handlers
+    for s in (sig.SIGTERM, sig.SIGINT):
+        try:
+            sig.signal(s, handle_signal)
+        except Exception as e:
+            logging.getLogger("jarvis.shutdown").warning(
+                f"Could not register handler for {s}: {e}"
+            )

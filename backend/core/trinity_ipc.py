@@ -1054,3 +1054,474 @@ async def close_trinity_ipc_bus() -> None:
         await _ipc_bus.cleanup_old_responses()
         _ipc_bus = None
         logger.info("[TrinityIPC] Closed IPC bus")
+
+
+# =============================================================================
+# ENHANCED IPC BUS WITH CIRCUIT BREAKER AND IN-MEMORY FALLBACK
+# =============================================================================
+
+
+class CircuitState(Enum):
+    """Circuit breaker states."""
+    CLOSED = "closed"      # Normal operation
+    OPEN = "open"          # Blocking requests (failing fast)
+    HALF_OPEN = "half_open"  # Testing recovery
+
+
+@dataclass
+class CircuitBreakerConfig:
+    """Circuit breaker configuration."""
+    failure_threshold: int = field(default_factory=lambda: _env_int(
+        "TRINITY_IPC_CIRCUIT_FAILURE_THRESHOLD", 5
+    ))
+    success_threshold: int = field(default_factory=lambda: _env_int(
+        "TRINITY_IPC_CIRCUIT_SUCCESS_THRESHOLD", 2
+    ))
+    timeout_seconds: float = field(default_factory=lambda: _env_float(
+        "TRINITY_IPC_CIRCUIT_TIMEOUT", 30.0
+    ))
+
+
+class IPCCircuitBreaker:
+    """
+    Circuit breaker for IPC operations.
+
+    When file operations fail repeatedly, the circuit opens and
+    operations fall back to in-memory mode.
+    """
+
+    def __init__(self, name: str, config: Optional[CircuitBreakerConfig] = None):
+        self.name = name
+        self.config = config or CircuitBreakerConfig()
+
+        self._state = CircuitState.CLOSED
+        self._failure_count = 0
+        self._success_count = 0
+        self._last_failure_time = 0.0
+        self._lock = asyncio.Lock()
+
+        # Metrics
+        self._total_failures = 0
+        self._total_successes = 0
+        self._circuit_opens = 0
+
+    @property
+    def state(self) -> CircuitState:
+        return self._state
+
+    @property
+    def is_open(self) -> bool:
+        return self._state == CircuitState.OPEN
+
+    async def can_execute(self) -> bool:
+        """Check if operation can proceed."""
+        async with self._lock:
+            if self._state == CircuitState.CLOSED:
+                return True
+
+            if self._state == CircuitState.OPEN:
+                # Check if timeout elapsed
+                if time.time() - self._last_failure_time >= self.config.timeout_seconds:
+                    self._state = CircuitState.HALF_OPEN
+                    logger.info(f"[IPC-CB:{self.name}] Circuit HALF_OPEN (testing)")
+                    return True
+                return False
+
+            # HALF_OPEN - allow single test request
+            return True
+
+    async def record_success(self) -> None:
+        """Record successful operation."""
+        async with self._lock:
+            self._total_successes += 1
+            self._success_count += 1
+
+            if self._state == CircuitState.HALF_OPEN:
+                if self._success_count >= self.config.success_threshold:
+                    self._state = CircuitState.CLOSED
+                    self._failure_count = 0
+                    logger.info(f"[IPC-CB:{self.name}] Circuit CLOSED (recovered)")
+            else:
+                self._failure_count = max(0, self._failure_count - 1)
+
+    async def record_failure(self) -> None:
+        """Record failed operation."""
+        async with self._lock:
+            self._total_failures += 1
+            self._failure_count += 1
+            self._last_failure_time = time.time()
+            self._success_count = 0
+
+            if self._state == CircuitState.HALF_OPEN:
+                self._state = CircuitState.OPEN
+                self._circuit_opens += 1
+                logger.warning(f"[IPC-CB:{self.name}] Circuit OPEN (test failed)")
+            elif (
+                self._state == CircuitState.CLOSED and
+                self._failure_count >= self.config.failure_threshold
+            ):
+                self._state = CircuitState.OPEN
+                self._circuit_opens += 1
+                logger.warning(
+                    f"[IPC-CB:{self.name}] Circuit OPEN "
+                    f"(threshold {self.config.failure_threshold} reached)"
+                )
+
+    def get_metrics(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "state": self._state.value,
+            "failure_count": self._failure_count,
+            "total_failures": self._total_failures,
+            "total_successes": self._total_successes,
+            "circuit_opens": self._circuit_opens,
+        }
+
+
+class InMemoryFallbackQueue:
+    """
+    In-memory fallback queue for when file operations fail.
+
+    Features:
+    - Bounded size with LRU eviction
+    - TTL-based expiration
+    - Automatic persistence on recovery
+    """
+
+    def __init__(
+        self,
+        max_size: int = 1000,
+        ttl_seconds: float = 300.0,
+    ):
+        self.max_size = max_size
+        self.ttl_seconds = ttl_seconds
+
+        self._commands: Dict[str, Tuple[float, TrinityCommand]] = {}
+        self._heartbeats: Dict[str, Tuple[float, HeartbeatData]] = {}
+        self._lock = asyncio.Lock()
+
+        logger.info(f"[InMemoryQueue] Initialized (max={max_size}, ttl={ttl_seconds}s)")
+
+    async def store_command(self, command: TrinityCommand) -> None:
+        """Store command in memory."""
+        async with self._lock:
+            # Evict oldest if at capacity
+            if len(self._commands) >= self.max_size:
+                oldest_id = min(
+                    self._commands.keys(),
+                    key=lambda k: self._commands[k][0]
+                )
+                del self._commands[oldest_id]
+
+            self._commands[command.command_id] = (time.time(), command)
+
+    async def get_commands(self, target: ComponentType) -> List[TrinityCommand]:
+        """Get commands for a target component."""
+        async with self._lock:
+            now = time.time()
+            result = []
+
+            for cmd_id, (timestamp, cmd) in list(self._commands.items()):
+                # Skip expired
+                if now - timestamp > self.ttl_seconds:
+                    del self._commands[cmd_id]
+                    continue
+
+                if cmd.target == target:
+                    result.append(cmd)
+                    del self._commands[cmd_id]
+
+            return result
+
+    async def store_heartbeat(self, heartbeat: HeartbeatData) -> None:
+        """Store heartbeat in memory."""
+        async with self._lock:
+            key = heartbeat.component_type.value
+            self._heartbeats[key] = (time.time(), heartbeat)
+
+    async def get_heartbeat(
+        self,
+        component: ComponentType,
+    ) -> Optional[HeartbeatData]:
+        """Get heartbeat for component."""
+        async with self._lock:
+            key = component.value
+            if key not in self._heartbeats:
+                return None
+
+            timestamp, heartbeat = self._heartbeats[key]
+
+            # Check TTL
+            if time.time() - timestamp > self.ttl_seconds:
+                del self._heartbeats[key]
+                return None
+
+            return heartbeat
+
+    async def get_all_commands(self) -> List[TrinityCommand]:
+        """Get all stored commands (for persistence on recovery)."""
+        async with self._lock:
+            now = time.time()
+            result = []
+
+            for cmd_id, (timestamp, cmd) in list(self._commands.items()):
+                if now - timestamp <= self.ttl_seconds:
+                    result.append(cmd)
+
+            return result
+
+    def __len__(self) -> int:
+        return len(self._commands) + len(self._heartbeats)
+
+
+class ResilientTrinityIPCBus(TrinityIPCBus):
+    """
+    Enhanced IPC bus with circuit breaker and in-memory fallback.
+
+    When file operations fail repeatedly:
+    1. Circuit breaker opens
+    2. Operations fall back to in-memory queue
+    3. When circuit recovers, pending operations are persisted
+
+    This ensures the IPC bus never blocks completely due to
+    file system issues.
+    """
+
+    def __init__(self, config: Optional[TrinityIPCConfig] = None):
+        super().__init__(config)
+
+        # Circuit breakers for different operation types
+        self._heartbeat_circuit = IPCCircuitBreaker("heartbeat")
+        self._command_circuit = IPCCircuitBreaker("command")
+
+        # In-memory fallback
+        self._fallback_queue = InMemoryFallbackQueue()
+
+        # Recovery task
+        self._recovery_task: Optional[asyncio.Task] = None
+        self._running = False
+
+        logger.info("[ResilientIPC] Initialized with circuit breaker and fallback")
+
+    async def start(self) -> None:
+        """Start the resilient IPC bus."""
+        self._running = True
+        self._recovery_task = asyncio.create_task(self._recovery_loop())
+
+    async def stop(self) -> None:
+        """Stop the resilient IPC bus."""
+        self._running = False
+        if self._recovery_task:
+            self._recovery_task.cancel()
+            try:
+                await self._recovery_task
+            except asyncio.CancelledError:
+                pass
+
+    async def _recovery_loop(self) -> None:
+        """Background loop to recover from circuit open state."""
+        while self._running:
+            try:
+                await asyncio.sleep(5.0)
+
+                # Check if any circuit is recovering
+                if not self._heartbeat_circuit.is_open and not self._command_circuit.is_open:
+                    # Persist any pending in-memory commands
+                    await self._persist_pending_commands()
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.debug(f"[ResilientIPC] Recovery loop error: {e}")
+
+    async def _persist_pending_commands(self) -> None:
+        """Persist pending in-memory commands to file."""
+        commands = await self._fallback_queue.get_all_commands()
+
+        if not commands:
+            return
+
+        logger.info(f"[ResilientIPC] Persisting {len(commands)} pending commands")
+
+        for cmd in commands:
+            try:
+                await super().enqueue_command(cmd)
+            except Exception as e:
+                logger.warning(f"[ResilientIPC] Failed to persist command: {e}")
+
+    # =========================================================================
+    # Override Heartbeat Operations with Circuit Breaker
+    # =========================================================================
+
+    async def publish_heartbeat(
+        self,
+        component: ComponentType,
+        status: str,
+        pid: int,
+        metrics: Optional[Dict[str, Any]] = None,
+        dependencies_ready: Optional[Dict[str, bool]] = None,
+    ) -> None:
+        """Publish heartbeat with circuit breaker protection."""
+        if not await self._heartbeat_circuit.can_execute():
+            # Fall back to in-memory
+            heartbeat = HeartbeatData(
+                component_type=component,
+                component_id=f"{component.value}_{pid}",
+                timestamp=time.time(),
+                pid=pid,
+                host=os.uname().nodename,
+                status=status,
+                uptime_seconds=time.time() - self._start_time,
+                metrics=metrics or {},
+                dependencies_ready=dependencies_ready or {},
+            )
+            await self._fallback_queue.store_heartbeat(heartbeat)
+            return
+
+        try:
+            await super().publish_heartbeat(
+                component=component,
+                status=status,
+                pid=pid,
+                metrics=metrics,
+                dependencies_ready=dependencies_ready,
+            )
+            await self._heartbeat_circuit.record_success()
+
+        except Exception as e:
+            await self._heartbeat_circuit.record_failure()
+            logger.warning(f"[ResilientIPC] Heartbeat publish failed: {e}")
+
+            # Fall back to in-memory
+            heartbeat = HeartbeatData(
+                component_type=component,
+                component_id=f"{component.value}_{pid}",
+                timestamp=time.time(),
+                pid=pid,
+                host=os.uname().nodename,
+                status=status,
+                uptime_seconds=time.time() - self._start_time,
+                metrics=metrics or {},
+                dependencies_ready=dependencies_ready or {},
+            )
+            await self._fallback_queue.store_heartbeat(heartbeat)
+
+    async def read_heartbeat(
+        self,
+        component: ComponentType,
+        max_age_seconds: Optional[float] = None,
+    ) -> Optional[HeartbeatData]:
+        """Read heartbeat with fallback to in-memory."""
+        # Try file-based first
+        if await self._heartbeat_circuit.can_execute():
+            try:
+                result = await super().read_heartbeat(component, max_age_seconds)
+                await self._heartbeat_circuit.record_success()
+                if result:
+                    return result
+            except Exception as e:
+                await self._heartbeat_circuit.record_failure()
+                logger.debug(f"[ResilientIPC] Heartbeat read failed: {e}")
+
+        # Fall back to in-memory
+        return await self._fallback_queue.get_heartbeat(component)
+
+    # =========================================================================
+    # Override Command Operations with Circuit Breaker
+    # =========================================================================
+
+    async def enqueue_command(self, command: TrinityCommand) -> str:
+        """Enqueue command with circuit breaker protection."""
+        if not await self._command_circuit.can_execute():
+            # Fall back to in-memory
+            await self._fallback_queue.store_command(command)
+            logger.debug(
+                f"[ResilientIPC] Command queued in-memory: {command.command_id}"
+            )
+            return command.command_id
+
+        try:
+            result = await super().enqueue_command(command)
+            await self._command_circuit.record_success()
+            return result
+
+        except Exception as e:
+            await self._command_circuit.record_failure()
+            logger.warning(f"[ResilientIPC] Command enqueue failed: {e}")
+
+            # Fall back to in-memory
+            await self._fallback_queue.store_command(command)
+            return command.command_id
+
+    async def dequeue_command(
+        self,
+        target: ComponentType,
+    ) -> Optional[TrinityCommand]:
+        """Dequeue command with fallback to in-memory."""
+        # Check in-memory first (higher priority for recovery)
+        in_memory_commands = await self._fallback_queue.get_commands(target)
+        if in_memory_commands:
+            return in_memory_commands[0]
+
+        # Then try file-based
+        if await self._command_circuit.can_execute():
+            try:
+                result = await super().dequeue_command(target)
+                await self._command_circuit.record_success()
+                return result
+            except Exception as e:
+                await self._command_circuit.record_failure()
+                logger.debug(f"[ResilientIPC] Command dequeue failed: {e}")
+
+        return None
+
+    # =========================================================================
+    # Metrics
+    # =========================================================================
+
+    def get_resilience_metrics(self) -> Dict[str, Any]:
+        """Get circuit breaker and fallback metrics."""
+        return {
+            "heartbeat_circuit": self._heartbeat_circuit.get_metrics(),
+            "command_circuit": self._command_circuit.get_metrics(),
+            "fallback_queue_size": len(self._fallback_queue),
+        }
+
+
+# =============================================================================
+# Enhanced Singleton with Resilient IPC
+# =============================================================================
+
+_resilient_ipc_bus: Optional[ResilientTrinityIPCBus] = None
+_resilient_ipc_lock = asyncio.Lock()
+
+
+async def get_resilient_trinity_ipc_bus(
+    config: Optional[TrinityIPCConfig] = None,
+) -> ResilientTrinityIPCBus:
+    """
+    Get or create the global resilient Trinity IPC bus.
+
+    This is the recommended IPC bus for production use as it
+    includes circuit breaker and in-memory fallback.
+    """
+    global _resilient_ipc_bus
+
+    async with _resilient_ipc_lock:
+        if _resilient_ipc_bus is None:
+            _resilient_ipc_bus = ResilientTrinityIPCBus(config)
+            await _resilient_ipc_bus.start()
+            logger.info("[TrinityIPC] Initialized resilient IPC bus")
+        return _resilient_ipc_bus
+
+
+async def close_resilient_trinity_ipc_bus() -> None:
+    """Close the resilient IPC bus."""
+    global _resilient_ipc_bus
+
+    if _resilient_ipc_bus is not None:
+        await _resilient_ipc_bus.stop()
+        await _resilient_ipc_bus.cleanup_stale_heartbeats()
+        await _resilient_ipc_bus.cleanup_old_responses()
+        _resilient_ipc_bus = None
+        logger.info("[TrinityIPC] Closed resilient IPC bus")
