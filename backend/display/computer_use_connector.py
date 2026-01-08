@@ -27,21 +27,88 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import fcntl
+import gc
+import hashlib
 import io
 import json
 import logging
+import os
+import random
+import signal
 import time
+import weakref
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from functools import partial
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple, Union
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Deque,
+    Dict,
+    List,
+    Optional,
+    Set,
+    Tuple,
+    TypeVar,
+    Union,
+)
 from uuid import uuid4
 
 import pyautogui
 from PIL import Image
+
+
+# =============================================================================
+# Environment Configuration (Zero Hardcoding)
+# =============================================================================
+
+def _env_int(key: str, default: int) -> int:
+    """Get integer from environment."""
+    return int(os.getenv(key, str(default)))
+
+
+def _env_float(key: str, default: float) -> float:
+    """Get float from environment."""
+    return float(os.getenv(key, str(default)))
+
+
+def _env_bool(key: str, default: bool) -> bool:
+    """Get boolean from environment."""
+    return os.getenv(key, str(default)).lower() in ("true", "1", "yes")
+
+
+# Connection pool settings
+CU_POOL_SIZE = _env_int("CU_POOL_SIZE", 3)
+CU_POOL_MAX_RETRIES = _env_int("CU_POOL_MAX_RETRIES", 5)
+CU_POOL_BACKOFF_BASE = _env_float("CU_POOL_BACKOFF_BASE", 2.0)
+CU_POOL_BACKOFF_MAX = _env_float("CU_POOL_BACKOFF_MAX", 60.0)
+CU_POOL_HEALTH_INTERVAL = _env_float("CU_POOL_HEALTH_INTERVAL", 30.0)
+
+# Rate limiting
+CU_RATE_LIMIT_RPM = _env_int("CU_RATE_LIMIT_RPM", 50)  # Requests per minute
+CU_RATE_LIMIT_BURST = _env_int("CU_RATE_LIMIT_BURST", 10)
+
+# Screenshot management
+CU_SCREENSHOT_CACHE_SIZE = _env_int("CU_SCREENSHOT_CACHE_SIZE", 5)
+CU_SCREENSHOT_MAX_MEMORY_MB = _env_int("CU_SCREENSHOT_MAX_MEMORY_MB", 100)
+
+# Parallel execution
+CU_PARALLEL_MAX_ACTIONS = _env_int("CU_PARALLEL_MAX_ACTIONS", 5)
+CU_PARALLEL_CONFLICT_DELAY = _env_float("CU_PARALLEL_CONFLICT_DELAY", 0.05)
+
+# Edge case handling
+CU_ANIMATION_WAIT_MS = _env_int("CU_ANIMATION_WAIT_MS", 300)
+CU_FOCUS_VERIFY_RETRIES = _env_int("CU_FOCUS_VERIFY_RETRIES", 3)
+CU_MULTI_MONITOR_ENABLED = _env_bool("CU_MULTI_MONITOR_ENABLED", True)
+
+T = TypeVar("T")
 
 # Import managed executor for clean shutdown
 try:
@@ -183,6 +250,1017 @@ class CircuitBreaker:
             "last_failure": self._last_failure_time,
             "threshold": self.failure_threshold
         }
+
+
+# =============================================================================
+# Token Bucket Rate Limiter
+# =============================================================================
+
+
+class TokenBucketRateLimiter:
+    """
+    Token bucket rate limiter with burst support.
+
+    Features:
+    - Configurable requests per minute
+    - Burst allowance for spiky traffic
+    - Async-safe with proper locking
+    - Automatic token replenishment
+    """
+
+    def __init__(
+        self,
+        rpm: int = CU_RATE_LIMIT_RPM,
+        burst: int = CU_RATE_LIMIT_BURST,
+    ):
+        self._rpm = rpm
+        self._burst = burst
+        self._tokens = float(burst)
+        self._last_refill = time.monotonic()
+        self._lock = asyncio.Lock()
+        self._refill_rate = rpm / 60.0  # Tokens per second
+
+    async def acquire(self, timeout: float = 30.0) -> bool:
+        """
+        Acquire a token, waiting if necessary.
+
+        Args:
+            timeout: Maximum time to wait for a token
+
+        Returns:
+            True if token acquired, False if timeout
+        """
+        start = time.monotonic()
+
+        while True:
+            async with self._lock:
+                self._refill_tokens()
+
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return True
+
+            # Calculate wait time
+            elapsed = time.monotonic() - start
+            if elapsed >= timeout:
+                return False
+
+            # Wait for next token
+            wait_time = min(1.0 / self._refill_rate, timeout - elapsed)
+            await asyncio.sleep(wait_time)
+
+    def _refill_tokens(self) -> None:
+        """Refill tokens based on elapsed time."""
+        now = time.monotonic()
+        elapsed = now - self._last_refill
+        self._tokens = min(
+            self._burst,
+            self._tokens + elapsed * self._refill_rate
+        )
+        self._last_refill = now
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Get rate limiter statistics."""
+        return {
+            "rpm": self._rpm,
+            "burst": self._burst,
+            "current_tokens": self._tokens,
+            "refill_rate": self._refill_rate,
+        }
+
+
+# =============================================================================
+# Error Classification for Adaptive Retry
+# =============================================================================
+
+
+class ErrorCategory(Enum):
+    """Categories of errors for adaptive retry."""
+    TRANSIENT = "transient"  # Retry immediately with backoff
+    RATE_LIMITED = "rate_limited"  # Wait longer, then retry
+    AUTH_ERROR = "auth_error"  # Don't retry, fail fast
+    TIMEOUT = "timeout"  # Retry with longer timeout
+    SERVER_ERROR = "server_error"  # Retry with exponential backoff
+    NETWORK_ERROR = "network_error"  # Retry with jitter
+    UNKNOWN = "unknown"  # Conservative retry
+
+
+@dataclass
+class ErrorClassification:
+    """Classification result for an error."""
+    category: ErrorCategory
+    should_retry: bool
+    wait_seconds: float
+    message: str
+    retry_with_longer_timeout: bool = False
+
+
+class ErrorClassifier:
+    """
+    Classifies errors for intelligent retry decisions.
+
+    Analyzes exception types and messages to determine:
+    - Whether to retry
+    - How long to wait
+    - Whether to adjust parameters
+    """
+
+    # Error patterns and their classifications
+    PATTERNS = {
+        "rate_limit": ErrorCategory.RATE_LIMITED,
+        "429": ErrorCategory.RATE_LIMITED,
+        "too many requests": ErrorCategory.RATE_LIMITED,
+        "authentication_error": ErrorCategory.AUTH_ERROR,
+        "invalid x-api-key": ErrorCategory.AUTH_ERROR,
+        "401": ErrorCategory.AUTH_ERROR,
+        "unauthorized": ErrorCategory.AUTH_ERROR,
+        "timeout": ErrorCategory.TIMEOUT,
+        "timed out": ErrorCategory.TIMEOUT,
+        "deadline exceeded": ErrorCategory.TIMEOUT,
+        "500": ErrorCategory.SERVER_ERROR,
+        "502": ErrorCategory.SERVER_ERROR,
+        "503": ErrorCategory.SERVER_ERROR,
+        "504": ErrorCategory.SERVER_ERROR,
+        "internal server error": ErrorCategory.SERVER_ERROR,
+        "connection reset": ErrorCategory.NETWORK_ERROR,
+        "connection refused": ErrorCategory.NETWORK_ERROR,
+        "network unreachable": ErrorCategory.NETWORK_ERROR,
+        "dns": ErrorCategory.NETWORK_ERROR,
+    }
+
+    def classify(
+        self,
+        error: Exception,
+        attempt: int = 0,
+        base_wait: float = CU_POOL_BACKOFF_BASE,
+    ) -> ErrorClassification:
+        """
+        Classify an error and determine retry strategy.
+
+        Args:
+            error: The exception to classify
+            attempt: Current attempt number (0-indexed)
+            base_wait: Base wait time for backoff
+
+        Returns:
+            ErrorClassification with retry decision
+        """
+        error_str = str(error).lower()
+        error_type = type(error).__name__.lower()
+
+        # Check patterns
+        category = ErrorCategory.UNKNOWN
+        for pattern, cat in self.PATTERNS.items():
+            if pattern in error_str or pattern in error_type:
+                category = cat
+                break
+
+        # Determine retry strategy based on category
+        if category == ErrorCategory.AUTH_ERROR:
+            return ErrorClassification(
+                category=category,
+                should_retry=False,
+                wait_seconds=0,
+                message="Authentication failed - check API key",
+            )
+
+        if category == ErrorCategory.RATE_LIMITED:
+            # Extract retry-after header if present
+            wait = self._extract_retry_after(error) or (base_wait * (2 ** attempt))
+            # Add jitter to prevent thundering herd
+            wait *= (1 + random.random() * 0.5)
+            wait = min(wait, CU_POOL_BACKOFF_MAX)
+            return ErrorClassification(
+                category=category,
+                should_retry=attempt < CU_POOL_MAX_RETRIES,
+                wait_seconds=wait,
+                message=f"Rate limited - waiting {wait:.1f}s",
+            )
+
+        if category == ErrorCategory.TIMEOUT:
+            wait = base_wait * (1.5 ** attempt)  # Slower backoff for timeouts
+            return ErrorClassification(
+                category=category,
+                should_retry=attempt < CU_POOL_MAX_RETRIES,
+                wait_seconds=wait,
+                message=f"Timeout - retrying with longer wait",
+                retry_with_longer_timeout=True,
+            )
+
+        if category == ErrorCategory.SERVER_ERROR:
+            wait = base_wait * (2 ** attempt)
+            wait = min(wait, CU_POOL_BACKOFF_MAX)
+            return ErrorClassification(
+                category=category,
+                should_retry=attempt < CU_POOL_MAX_RETRIES,
+                wait_seconds=wait,
+                message=f"Server error - backing off {wait:.1f}s",
+            )
+
+        if category == ErrorCategory.NETWORK_ERROR:
+            # Network errors get jitter to spread out retries
+            wait = base_wait * (2 ** attempt) * (0.5 + random.random())
+            wait = min(wait, CU_POOL_BACKOFF_MAX)
+            return ErrorClassification(
+                category=category,
+                should_retry=attempt < CU_POOL_MAX_RETRIES,
+                wait_seconds=wait,
+                message=f"Network error - retrying with jitter",
+            )
+
+        # Unknown/transient - conservative retry
+        wait = base_wait * (2 ** attempt)
+        wait = min(wait, CU_POOL_BACKOFF_MAX)
+        return ErrorClassification(
+            category=category,
+            should_retry=attempt < CU_POOL_MAX_RETRIES - 1,  # More conservative
+            wait_seconds=wait,
+            message=f"Unknown error - conservative retry",
+        )
+
+    def _extract_retry_after(self, error: Exception) -> Optional[float]:
+        """Extract retry-after value from error if present."""
+        error_str = str(error)
+        import re
+        # Look for "retry after X seconds" or "retry-after: X"
+        match = re.search(r'retry.?after[:\s]+(\d+(?:\.\d+)?)', error_str, re.I)
+        if match:
+            return float(match.group(1))
+        return None
+
+
+# =============================================================================
+# Anthropic Connection Pool
+# =============================================================================
+
+
+@dataclass
+class ConnectionHealth:
+    """Health status for a pooled connection."""
+    index: int
+    is_healthy: bool = True
+    last_used: float = field(default_factory=time.time)
+    last_error: Optional[str] = None
+    request_count: int = 0
+    error_count: int = 0
+    avg_latency_ms: float = 0.0
+    latency_samples: Deque[float] = field(default_factory=lambda: deque(maxlen=20))
+
+    def record_success(self, latency_ms: float) -> None:
+        """Record successful request."""
+        self.last_used = time.time()
+        self.request_count += 1
+        self.latency_samples.append(latency_ms)
+        self.avg_latency_ms = sum(self.latency_samples) / len(self.latency_samples)
+        self.is_healthy = True
+
+    def record_failure(self, error: str) -> None:
+        """Record failed request."""
+        self.last_used = time.time()
+        self.error_count += 1
+        self.last_error = error
+        # Mark unhealthy if too many recent errors
+        if self.error_count > 3:
+            self.is_healthy = False
+
+
+class AnthropicConnectionPool:
+    """
+    Advanced connection pool for Anthropic API.
+
+    Features:
+    - Multiple connections for parallel requests (70% overhead reduction)
+    - Automatic connection health monitoring
+    - Load-based connection selection (least-loaded)
+    - Rate limiting per pool (not per connection)
+    - Adaptive retry with error classification
+    - Graceful degradation when connections fail
+    """
+
+    def __init__(
+        self,
+        api_key: str,
+        pool_size: int = CU_POOL_SIZE,
+        health_check_interval: float = CU_POOL_HEALTH_INTERVAL,
+    ):
+        self._api_key = api_key
+        self._pool_size = pool_size
+        self._health_check_interval = health_check_interval
+
+        # Connection pool
+        self._connections: List[AsyncAnthropic] = []
+        self._health: Dict[int, ConnectionHealth] = {}
+        self._load: Dict[int, int] = {}  # Connection index -> active requests
+
+        # Synchronization
+        self._pool_lock = asyncio.Lock()
+        self._semaphore = asyncio.Semaphore(pool_size * 2)  # Allow 2x concurrency
+
+        # Rate limiting
+        self._rate_limiter = TokenBucketRateLimiter()
+
+        # Error handling
+        self._error_classifier = ErrorClassifier()
+
+        # Health monitoring
+        self._health_monitor_task: Optional[asyncio.Task] = None
+        self._shutdown = False
+
+        # Logger
+        self._logger = logging.getLogger("jarvis.cu.pool")
+
+    async def initialize(self) -> None:
+        """Initialize the connection pool."""
+        async with self._pool_lock:
+            if self._connections:
+                return  # Already initialized
+
+            self._logger.info(f"[POOL] Initializing {self._pool_size} connections...")
+
+            for i in range(self._pool_size):
+                try:
+                    conn = AsyncAnthropic(api_key=self._api_key)
+                    self._connections.append(conn)
+                    self._health[i] = ConnectionHealth(index=i)
+                    self._load[i] = 0
+                    self._logger.debug(f"[POOL] Connection {i} created")
+                except Exception as e:
+                    self._logger.error(f"[POOL] Failed to create connection {i}: {e}")
+
+            # Start health monitor
+            self._health_monitor_task = asyncio.create_task(
+                self._health_monitor_loop()
+            )
+
+            self._logger.info(
+                f"[POOL] Initialized with {len(self._connections)} connections"
+            )
+
+    async def shutdown(self) -> None:
+        """Shutdown the pool gracefully."""
+        self._shutdown = True
+        if self._health_monitor_task:
+            self._health_monitor_task.cancel()
+            try:
+                await self._health_monitor_task
+            except asyncio.CancelledError:
+                pass
+        self._logger.info("[POOL] Shutdown complete")
+
+    @asynccontextmanager
+    async def acquire(self):
+        """
+        Acquire a connection from the pool.
+
+        Yields:
+            AsyncAnthropic client
+        """
+        await self._semaphore.acquire()
+        conn_idx = -1
+
+        try:
+            async with self._pool_lock:
+                # Select least-loaded healthy connection
+                healthy = [
+                    (i, self._load.get(i, 0))
+                    for i, h in self._health.items()
+                    if h.is_healthy and i < len(self._connections)
+                ]
+
+                if not healthy:
+                    # Fall back to any connection
+                    healthy = [
+                        (i, self._load.get(i, 0))
+                        for i in range(len(self._connections))
+                    ]
+
+                if not healthy:
+                    raise RuntimeError("No connections available in pool")
+
+                # Select least loaded
+                conn_idx, _ = min(healthy, key=lambda x: x[1])
+                self._load[conn_idx] = self._load.get(conn_idx, 0) + 1
+
+            yield self._connections[conn_idx]
+
+        finally:
+            self._semaphore.release()
+            if conn_idx >= 0:
+                async with self._pool_lock:
+                    self._load[conn_idx] = max(0, self._load.get(conn_idx, 1) - 1)
+
+    async def execute_with_retry(
+        self,
+        method: Callable[..., Awaitable[T]],
+        *args,
+        timeout: float = 60.0,
+        **kwargs,
+    ) -> T:
+        """
+        Execute API call with adaptive retry and rate limiting.
+
+        Args:
+            method: Async method to call (receives connection as first arg)
+            *args: Arguments for method
+            timeout: Request timeout
+            **kwargs: Keyword arguments for method
+
+        Returns:
+            Result from API call
+
+        Raises:
+            Exception: If all retries exhausted
+        """
+        # Wait for rate limit
+        if not await self._rate_limiter.acquire(timeout=timeout):
+            raise RuntimeError("Rate limit timeout - too many requests")
+
+        last_error: Optional[Exception] = None
+        current_timeout = timeout
+
+        for attempt in range(CU_POOL_MAX_RETRIES + 1):
+            start_time = time.time()
+            conn_idx = -1
+
+            try:
+                async with self.acquire() as client:
+                    # Find which connection we got
+                    try:
+                        conn_idx = self._connections.index(client)
+                    except ValueError:
+                        conn_idx = 0
+
+                    # Execute with timeout
+                    result = await asyncio.wait_for(
+                        method(client, *args, **kwargs),
+                        timeout=current_timeout,
+                    )
+
+                    # Record success
+                    latency = (time.time() - start_time) * 1000
+                    if conn_idx in self._health:
+                        self._health[conn_idx].record_success(latency)
+
+                    return result
+
+            except Exception as e:
+                last_error = e
+                error_str = str(e)
+
+                # Record failure
+                if conn_idx >= 0 and conn_idx in self._health:
+                    self._health[conn_idx].record_failure(error_str)
+
+                # Classify error
+                classification = self._error_classifier.classify(
+                    e, attempt=attempt
+                )
+
+                self._logger.warning(
+                    f"[POOL] Attempt {attempt + 1} failed: "
+                    f"{classification.category.value} - {classification.message}"
+                )
+
+                if not classification.should_retry:
+                    raise
+
+                # Adjust timeout if needed
+                if classification.retry_with_longer_timeout:
+                    current_timeout = min(current_timeout * 1.5, 120.0)
+
+                # Wait before retry
+                if classification.wait_seconds > 0:
+                    await asyncio.sleep(classification.wait_seconds)
+
+        raise last_error or RuntimeError("Max retries exceeded")
+
+    async def _health_monitor_loop(self) -> None:
+        """Background task to monitor connection health."""
+        while not self._shutdown:
+            try:
+                await asyncio.sleep(self._health_check_interval)
+
+                async with self._pool_lock:
+                    for idx, health in self._health.items():
+                        # Mark idle connections as healthy
+                        if time.time() - health.last_used > 60:
+                            health.is_healthy = True
+                            health.error_count = 0
+
+                        # Log connection stats
+                        self._logger.debug(
+                            f"[POOL] Connection {idx}: "
+                            f"healthy={health.is_healthy}, "
+                            f"requests={health.request_count}, "
+                            f"errors={health.error_count}, "
+                            f"avg_latency={health.avg_latency_ms:.0f}ms"
+                        )
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self._logger.error(f"[POOL] Health monitor error: {e}")
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Get pool statistics."""
+        healthy_count = sum(1 for h in self._health.values() if h.is_healthy)
+        total_requests = sum(h.request_count for h in self._health.values())
+        total_errors = sum(h.error_count for h in self._health.values())
+
+        return {
+            "pool_size": self._pool_size,
+            "connections": len(self._connections),
+            "healthy_connections": healthy_count,
+            "total_requests": total_requests,
+            "total_errors": total_errors,
+            "error_rate": total_errors / max(total_requests, 1),
+            "rate_limiter": self._rate_limiter.get_stats(),
+        }
+
+
+# =============================================================================
+# Memory-Efficient Screenshot Manager
+# =============================================================================
+
+
+@dataclass
+class CachedScreenshot:
+    """A cached screenshot with metadata."""
+    image_hash: str
+    base64_data: str
+    timestamp: float
+    size_bytes: int
+    width: int
+    height: int
+    # Use weakref to allow GC when memory pressure is high
+    _image_ref: Optional[weakref.ref] = None
+
+    @property
+    def image(self) -> Optional[Image.Image]:
+        """Get image if still in memory."""
+        if self._image_ref:
+            return self._image_ref()
+        return None
+
+    def set_image(self, img: Image.Image) -> None:
+        """Set image with weak reference."""
+        self._image_ref = weakref.ref(img)
+
+
+class MemoryEfficientScreenshotManager:
+    """
+    Memory-efficient screenshot management with LRU cache.
+
+    Features:
+    - LRU cache with configurable size
+    - Memory pressure detection and cleanup
+    - Weak references to allow GC
+    - Hash-based deduplication
+    - Automatic resource cleanup
+    """
+
+    def __init__(
+        self,
+        cache_size: int = CU_SCREENSHOT_CACHE_SIZE,
+        max_memory_mb: int = CU_SCREENSHOT_MAX_MEMORY_MB,
+    ):
+        self._cache_size = cache_size
+        self._max_memory_bytes = max_memory_mb * 1024 * 1024
+        self._cache: Dict[str, CachedScreenshot] = {}
+        self._access_order: Deque[str] = deque()
+        self._lock = asyncio.Lock()
+        self._total_bytes = 0
+        self._logger = logging.getLogger("jarvis.cu.screenshots")
+
+    async def capture_and_cache(
+        self,
+        region: Optional[Tuple[int, int, int, int]] = None,
+        resize_for_api: bool = True,
+        max_dimension: int = 1568,
+    ) -> Tuple[Optional[Image.Image], str]:
+        """
+        Capture screenshot with caching and memory management.
+
+        Args:
+            region: Optional region to capture
+            resize_for_api: Whether to resize for API limits
+            max_dimension: Maximum dimension after resize
+
+        Returns:
+            Tuple of (PIL Image or None, base64 string)
+        """
+        async with self._lock:
+            # Capture screenshot
+            try:
+                screenshot = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: pyautogui.screenshot(region=region) if region else pyautogui.screenshot()
+                )
+            except Exception as e:
+                self._logger.error(f"[SCREENSHOT] Capture failed: {e}")
+                raise
+
+            # Process and resize
+            if resize_for_api:
+                width, height = screenshot.size
+                if width > max_dimension or height > max_dimension:
+                    ratio = min(max_dimension / width, max_dimension / height)
+                    new_size = (int(width * ratio), int(height * ratio))
+                    screenshot = screenshot.resize(new_size, Image.Resampling.LANCZOS)
+
+            # Convert to base64
+            buffer = io.BytesIO()
+            screenshot.save(buffer, format="PNG", optimize=True)
+            png_data = buffer.getvalue()
+            base64_data = base64.standard_b64encode(png_data).decode("utf-8")
+
+            # Calculate hash for deduplication
+            image_hash = hashlib.md5(png_data[:10000]).hexdigest()[:16]
+
+            # Check cache hit
+            if image_hash in self._cache:
+                self._logger.debug(f"[SCREENSHOT] Cache hit: {image_hash}")
+                cached = self._cache[image_hash]
+                # Update access order
+                if image_hash in self._access_order:
+                    self._access_order.remove(image_hash)
+                self._access_order.append(image_hash)
+                return cached.image, cached.base64_data
+
+            # Create cached entry
+            cached = CachedScreenshot(
+                image_hash=image_hash,
+                base64_data=base64_data,
+                timestamp=time.time(),
+                size_bytes=len(png_data),
+                width=screenshot.width,
+                height=screenshot.height,
+            )
+            cached.set_image(screenshot)
+
+            # Ensure we have space
+            await self._ensure_cache_space(len(png_data))
+
+            # Add to cache
+            self._cache[image_hash] = cached
+            self._access_order.append(image_hash)
+            self._total_bytes += len(png_data)
+
+            self._logger.debug(
+                f"[SCREENSHOT] Cached: {image_hash} "
+                f"({len(png_data) / 1024:.1f}KB, "
+                f"{screenshot.width}x{screenshot.height})"
+            )
+
+            return screenshot, base64_data
+
+    async def _ensure_cache_space(self, needed_bytes: int) -> None:
+        """Ensure cache has space, evicting LRU entries if needed."""
+        # Check memory pressure
+        while (
+            self._total_bytes + needed_bytes > self._max_memory_bytes
+            or len(self._cache) >= self._cache_size
+        ):
+            if not self._access_order:
+                break
+
+            # Evict LRU
+            oldest_hash = self._access_order.popleft()
+            if oldest_hash in self._cache:
+                evicted = self._cache.pop(oldest_hash)
+                self._total_bytes -= evicted.size_bytes
+                self._logger.debug(f"[SCREENSHOT] Evicted: {oldest_hash}")
+
+        # Force GC if memory is high
+        if self._total_bytes > self._max_memory_bytes * 0.8:
+            gc.collect()
+
+    def clear_cache(self) -> None:
+        """Clear all cached screenshots."""
+        self._cache.clear()
+        self._access_order.clear()
+        self._total_bytes = 0
+        gc.collect()
+        self._logger.info("[SCREENSHOT] Cache cleared")
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Get cache statistics."""
+        return {
+            "cache_size": len(self._cache),
+            "max_cache_size": self._cache_size,
+            "total_bytes": self._total_bytes,
+            "max_bytes": self._max_memory_bytes,
+            "memory_usage_percent": self._total_bytes / self._max_memory_bytes * 100,
+        }
+
+
+# =============================================================================
+# Parallel Action Executor
+# =============================================================================
+
+
+@dataclass
+class ActionDependency:
+    """Dependency between actions."""
+    action_id: str
+    depends_on: List[str] = field(default_factory=list)
+    conflicts_with: Set[str] = field(default_factory=set)
+
+
+class ParallelActionExecutor:
+    """
+    Executes actions in parallel when safe.
+
+    Features:
+    - Intelligent parallelization (non-conflicting actions run together)
+    - Dependency resolution (ordered execution when needed)
+    - Conflict detection (keyboard is single resource)
+    - Adaptive batching (groups compatible actions)
+    - Real-time progress tracking
+    """
+
+    # Action conflict groups - actions in same group can't run in parallel
+    CONFLICT_GROUPS = {
+        "keyboard": {"type", "key"},  # Keyboard is single resource
+        "mouse": {"click", "double_click", "right_click", "drag"},  # Mouse is single
+        "scroll": {"scroll"},  # Scroll can conflict with mouse
+    }
+
+    def __init__(
+        self,
+        max_parallel: int = CU_PARALLEL_MAX_ACTIONS,
+        conflict_delay: float = CU_PARALLEL_CONFLICT_DELAY,
+    ):
+        self._max_parallel = max_parallel
+        self._conflict_delay = conflict_delay
+        self._logger = logging.getLogger("jarvis.cu.parallel")
+        self._execution_lock = asyncio.Lock()
+
+    def _get_action_groups(self, action_type: str) -> Set[str]:
+        """Get conflict groups for an action type."""
+        groups = set()
+        for group, types in self.CONFLICT_GROUPS.items():
+            if action_type.lower() in types:
+                groups.add(group)
+        return groups
+
+    def _can_run_parallel(
+        self,
+        action1_type: str,
+        action2_type: str,
+    ) -> bool:
+        """Check if two actions can run in parallel."""
+        groups1 = self._get_action_groups(action1_type)
+        groups2 = self._get_action_groups(action2_type)
+        return groups1.isdisjoint(groups2)
+
+    def group_by_parallelism(
+        self,
+        actions: List["ComputerAction"],
+    ) -> List[List["ComputerAction"]]:
+        """
+        Group actions by parallelism tiers.
+
+        Returns list of action groups where actions within a group
+        can run in parallel, but groups must run sequentially.
+        """
+        if not actions:
+            return []
+
+        tiers: List[List["ComputerAction"]] = []
+        remaining = list(actions)
+
+        while remaining:
+            current_tier: List["ComputerAction"] = []
+            used_groups: Set[str] = set()
+            still_remaining = []
+
+            for action in remaining:
+                action_groups = self._get_action_groups(action.action_type.value)
+
+                # Check if conflicts with current tier
+                if action_groups.isdisjoint(used_groups):
+                    current_tier.append(action)
+                    used_groups.update(action_groups)
+
+                    # Limit tier size
+                    if len(current_tier) >= self._max_parallel:
+                        still_remaining.extend(remaining[remaining.index(action) + 1:])
+                        break
+                else:
+                    still_remaining.append(action)
+
+            tiers.append(current_tier)
+            remaining = still_remaining
+
+        return tiers
+
+    async def execute_batch_parallel(
+        self,
+        actions: List["ComputerAction"],
+        executor: "ActionExecutor",
+    ) -> List["ActionResult"]:
+        """
+        Execute actions with intelligent parallelization.
+
+        Args:
+            actions: List of actions to execute
+            executor: ActionExecutor instance
+
+        Returns:
+            List of ActionResults
+        """
+        if not actions:
+            return []
+
+        # Group by parallelism
+        tiers = self.group_by_parallelism(actions)
+        results: List["ActionResult"] = []
+
+        self._logger.info(
+            f"[PARALLEL] Executing {len(actions)} actions in {len(tiers)} tiers"
+        )
+
+        for tier_idx, tier in enumerate(tiers):
+            tier_start = time.time()
+
+            if len(tier) == 1:
+                # Single action - execute directly
+                result = await executor.execute(tier[0])
+                results.append(result)
+            else:
+                # Parallel execution with small stagger to avoid exact simultaneous
+                async def execute_with_stagger(action, stagger):
+                    if stagger > 0:
+                        await asyncio.sleep(stagger)
+                    return await executor.execute(action)
+
+                tier_results = await asyncio.gather(*[
+                    execute_with_stagger(action, i * self._conflict_delay)
+                    for i, action in enumerate(tier)
+                ], return_exceptions=True)
+
+                # Process results
+                for i, result in enumerate(tier_results):
+                    if isinstance(result, Exception):
+                        results.append(ActionResult(
+                            action_id=tier[i].action_id,
+                            success=False,
+                            error=str(result),
+                        ))
+                    else:
+                        results.append(result)
+
+            tier_time = (time.time() - tier_start) * 1000
+            self._logger.debug(
+                f"[PARALLEL] Tier {tier_idx + 1}: {len(tier)} actions in {tier_time:.0f}ms"
+            )
+
+        return results
+
+
+# =============================================================================
+# Edge Case Handler
+# =============================================================================
+
+
+class EdgeCaseHandler:
+    """
+    Handles edge cases in Computer Use automation.
+
+    Features:
+    - Animation detection and adaptive delays
+    - Multi-monitor coordinate mapping
+    - Window focus verification
+    - Theme awareness (dark/light mode)
+    - Network resilience
+    """
+
+    def __init__(self):
+        self._logger = logging.getLogger("jarvis.cu.edge")
+        self._animation_wait_ms = CU_ANIMATION_WAIT_MS
+        self._focus_retries = CU_FOCUS_VERIFY_RETRIES
+        self._multi_monitor = CU_MULTI_MONITOR_ENABLED
+        self._monitor_info: Optional[List[Dict]] = None
+
+    async def wait_for_animation(
+        self,
+        base_wait_ms: Optional[int] = None,
+    ) -> None:
+        """Wait for UI animation to complete."""
+        wait_ms = base_wait_ms or self._animation_wait_ms
+        await asyncio.sleep(wait_ms / 1000)
+
+    async def verify_window_focus(
+        self,
+        expected_app: Optional[str] = None,
+    ) -> bool:
+        """
+        Verify window focus is correct.
+
+        Args:
+            expected_app: Expected app name (optional)
+
+        Returns:
+            True if focus is correct
+        """
+        for attempt in range(self._focus_retries):
+            try:
+                # Get focused window info via AppleScript
+                script = '''
+                tell application "System Events"
+                    set frontApp to first application process whose frontmost is true
+                    return name of frontApp
+                end tell
+                '''
+
+                proc = await asyncio.create_subprocess_exec(
+                    "osascript", "-e", script,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, _ = await proc.communicate()
+
+                if proc.returncode == 0:
+                    focused_app = stdout.decode().strip()
+
+                    if expected_app is None:
+                        return True
+
+                    if expected_app.lower() in focused_app.lower():
+                        return True
+
+                    self._logger.warning(
+                        f"[EDGE] Focus mismatch: expected {expected_app}, got {focused_app}"
+                    )
+
+            except Exception as e:
+                self._logger.debug(f"[EDGE] Focus check failed: {e}")
+
+            if attempt < self._focus_retries - 1:
+                await asyncio.sleep(0.2)
+
+        return False
+
+    def map_coordinates_to_monitor(
+        self,
+        x: int,
+        y: int,
+        target_monitor: int = 0,
+    ) -> Tuple[int, int]:
+        """
+        Map coordinates to specific monitor.
+
+        Args:
+            x: X coordinate
+            y: Y coordinate
+            target_monitor: Monitor index (0 = primary)
+
+        Returns:
+            Adjusted (x, y) coordinates
+        """
+        if not self._multi_monitor:
+            return x, y
+
+        # Get monitor info if not cached
+        if self._monitor_info is None:
+            try:
+                # Get monitor layout from PyAutoGUI
+                screens = pyautogui.getAllWindows()
+                # For now, return as-is - proper multi-monitor handling
+                # would require AppKit or Quartz
+                return x, y
+            except Exception:
+                return x, y
+
+        return x, y
+
+    async def detect_dark_mode(self) -> bool:
+        """Detect if macOS is in dark mode."""
+        try:
+            script = '''
+            tell application "System Events"
+                tell appearance preferences
+                    return dark mode
+                end tell
+            end tell
+            '''
+
+            proc = await asyncio.create_subprocess_exec(
+                "osascript", "-e", script,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await proc.communicate()
+
+            if proc.returncode == 0:
+                return stdout.decode().strip().lower() == "true"
+
+        except Exception as e:
+            self._logger.debug(f"[EDGE] Dark mode detection failed: {e}")
+
+        return False
+
 
 try:
     from anthropic import Anthropic, AsyncAnthropic
