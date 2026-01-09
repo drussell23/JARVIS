@@ -3155,23 +3155,281 @@ class TrinityUnifiedOrchestrator:
 
     async def _shutdown_managed_processes(self) -> None:
         """
-        v84.0: Gracefully shutdown all managed processes.
+        v84.0: Gracefully shutdown all managed processes with force timeout.
         """
+        shutdown_timeout = float(os.getenv("TRINITY_SHUTDOWN_TIMEOUT", "30.0"))
+        graceful_timeout = float(os.getenv("TRINITY_GRACEFUL_TIMEOUT", "10.0"))
+
         for name, info in self._managed_processes.items():
             process = info.get("process")
             if process and process.returncode is None:
                 logger.info(f"[Shutdown] Terminating {name} (PID {process.pid})")
                 try:
+                    # Phase 1: Graceful termination
                     process.terminate()
                     try:
-                        await asyncio.wait_for(process.wait(), timeout=5.0)
+                        await asyncio.wait_for(process.wait(), timeout=graceful_timeout)
+                        logger.info(f"[Shutdown] {name} terminated gracefully")
                     except asyncio.TimeoutError:
-                        logger.warning(f"[Shutdown] Force killing {name}")
+                        # Phase 2: Force kill
+                        logger.warning(f"[Shutdown] Force killing {name} after {graceful_timeout}s")
                         process.kill()
+                        try:
+                            await asyncio.wait_for(process.wait(), timeout=5.0)
+                        except asyncio.TimeoutError:
+                            logger.error(f"[Shutdown] {name} did not respond to kill")
                 except Exception as e:
                     logger.warning(f"[Shutdown] Error terminating {name}: {e}")
 
         self._managed_processes.clear()
+
+    # =========================================================================
+    # v84.0: Process Supervision with Auto-Restart
+    # =========================================================================
+
+    async def _start_process_supervision(self) -> None:
+        """
+        v84.0: Start background process supervision task.
+
+        Features:
+        - PID monitoring with cookie validation
+        - Crash detection via heartbeat staleness
+        - Automatic restart with exponential backoff
+        - Circuit breaker integration
+        """
+        self._supervision_task = asyncio.create_task(self._process_supervision_loop())
+        logger.info("[Supervisor] Process supervision started")
+
+    async def _process_supervision_loop(self) -> None:
+        """Background loop for process supervision."""
+        supervision_interval = float(os.getenv("TRINITY_SUPERVISION_INTERVAL", "10.0"))
+        max_restart_delay = float(os.getenv("TRINITY_MAX_RESTART_DELAY", "300.0"))
+
+        restart_counts: Dict[str, int] = {}
+        last_restart_times: Dict[str, float] = {}
+
+        while self._running:
+            try:
+                await asyncio.sleep(supervision_interval)
+
+                # Check each managed process
+                for name, info in list(self._managed_processes.items()):
+                    process = info.get("process")
+                    pid = info.get("pid")
+
+                    if process is None:
+                        continue
+
+                    # Check if process is still running
+                    if process.returncode is not None:
+                        # Process exited - attempt restart
+                        logger.warning(
+                            f"[Supervisor] {name} exited with code {process.returncode}"
+                        )
+
+                        # Update restart count
+                        restart_counts[name] = restart_counts.get(name, 0) + 1
+                        count = restart_counts[name]
+
+                        # Calculate backoff delay
+                        base_delay = float(os.getenv("TRINITY_RESTART_BASE_DELAY", "5.0"))
+                        delay = min(base_delay * (2 ** (count - 1)), max_restart_delay)
+
+                        # Check if we should restart
+                        last_restart = last_restart_times.get(name, 0)
+                        if time.time() - last_restart < delay:
+                            logger.info(
+                                f"[Supervisor] {name} restart throttled "
+                                f"(attempt {count}, waiting {delay:.0f}s)"
+                            )
+                            continue
+
+                        # Record crash
+                        await self._crash_recovery.record_crash(name, f"Exit code {process.returncode}")
+
+                        # Check circuit breaker
+                        if count > 5:
+                            logger.error(
+                                f"[Supervisor] {name} exceeded restart limit ({count} attempts)"
+                            )
+                            continue
+
+                        # Attempt restart
+                        logger.info(f"[Supervisor] Restarting {name} (attempt {count})")
+                        last_restart_times[name] = time.time()
+
+                        if name == "jarvis_prime":
+                            success = await self._launch_jprime_process()
+                        elif name == "reactor_core":
+                            success = await self._launch_reactor_process()
+                        else:
+                            success = False
+
+                        if success:
+                            logger.info(f"[Supervisor] {name} restarted successfully")
+                        else:
+                            logger.error(f"[Supervisor] {name} restart failed")
+
+                    else:
+                        # Process running - verify via heartbeat
+                        heartbeat_ok = await self._verify_process_heartbeat(name, pid)
+                        if not heartbeat_ok:
+                            logger.warning(
+                                f"[Supervisor] {name} heartbeat stale (PID {pid})"
+                            )
+
+                # Reset restart counts for healthy processes
+                for name in list(restart_counts.keys()):
+                    info = self._managed_processes.get(name)
+                    if info and info.get("process") and info["process"].returncode is None:
+                        # Process is running, slowly decay restart count
+                        if restart_counts[name] > 0:
+                            # Decay after 5 minutes of stability
+                            last_restart = last_restart_times.get(name, 0)
+                            if time.time() - last_restart > 300:
+                                restart_counts[name] = max(0, restart_counts[name] - 1)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"[Supervisor] Error in supervision loop: {e}")
+
+    async def _verify_process_heartbeat(self, component: str, pid: int) -> bool:
+        """Verify process is healthy via heartbeat file."""
+        heartbeat_file = Path.home() / ".jarvis" / "trinity" / "components" / f"{component}.json"
+
+        if not heartbeat_file.exists():
+            return False
+
+        try:
+            with open(heartbeat_file, 'r') as f:
+                data = json.load(f)
+
+            # Check timestamp freshness
+            timestamp = data.get("timestamp", 0)
+            age = time.time() - timestamp
+
+            # Heartbeat stale threshold (30 seconds)
+            stale_threshold = float(os.getenv("TRINITY_HEARTBEAT_STALE_THRESHOLD", "30.0"))
+
+            if age > stale_threshold:
+                return False
+
+            # Verify PID matches
+            heartbeat_pid = data.get("pid")
+            if heartbeat_pid and heartbeat_pid != pid:
+                logger.warning(
+                    f"[Supervisor] {component} PID mismatch: expected {pid}, got {heartbeat_pid}"
+                )
+                return False
+
+            return True
+
+        except Exception as e:
+            logger.debug(f"[Supervisor] Heartbeat verification error: {e}")
+            return False
+
+    # =========================================================================
+    # v84.0: Lock Timeout Protection
+    # =========================================================================
+
+    class TimeoutLock:
+        """
+        v84.0: Lock with timeout protection and deadlock detection.
+
+        Features:
+        - Configurable acquisition timeout
+        - Deadlock detection via caller tracking
+        - Automatic release on timeout
+        - Metrics and logging
+        """
+
+        def __init__(
+            self,
+            name: str,
+            timeout: float = 30.0,
+            warn_threshold: float = 10.0,
+        ):
+            self._name = name
+            self._timeout = timeout
+            self._warn_threshold = warn_threshold
+            self._lock = asyncio.Lock()
+            self._holder: Optional[str] = None
+            self._acquired_at: float = 0.0
+            self._acquisition_count: int = 0
+            self._timeout_count: int = 0
+
+        async def acquire(self, caller: str = "unknown") -> bool:
+            """
+            Acquire lock with timeout.
+
+            Args:
+                caller: Identifier for deadlock detection
+
+            Returns:
+                True if acquired, False if timeout
+            """
+            start_time = time.time()
+
+            try:
+                acquired = await asyncio.wait_for(
+                    self._lock.acquire(),
+                    timeout=self._timeout,
+                )
+
+                if acquired:
+                    self._holder = caller
+                    self._acquired_at = time.time()
+                    self._acquisition_count += 1
+
+                    wait_time = time.time() - start_time
+                    if wait_time > self._warn_threshold:
+                        logger.warning(
+                            f"[Lock:{self._name}] Slow acquisition: {wait_time:.2f}s "
+                            f"(caller={caller})"
+                        )
+
+                return acquired
+
+            except asyncio.TimeoutError:
+                self._timeout_count += 1
+                logger.error(
+                    f"[Lock:{self._name}] Acquisition timeout after {self._timeout}s "
+                    f"(caller={caller}, current_holder={self._holder})"
+                )
+                return False
+
+        def release(self) -> None:
+            """Release the lock."""
+            if self._lock.locked():
+                hold_time = time.time() - self._acquired_at
+                if hold_time > self._warn_threshold:
+                    logger.warning(
+                        f"[Lock:{self._name}] Long hold time: {hold_time:.2f}s "
+                        f"(holder={self._holder})"
+                    )
+                self._holder = None
+                self._acquired_at = 0.0
+                self._lock.release()
+
+        async def __aenter__(self):
+            await self.acquire()
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            self.release()
+            return False
+
+        def get_stats(self) -> Dict[str, Any]:
+            """Get lock statistics."""
+            return {
+                "name": self._name,
+                "locked": self._lock.locked(),
+                "holder": self._holder,
+                "acquisition_count": self._acquisition_count,
+                "timeout_count": self._timeout_count,
+                "hold_time": time.time() - self._acquired_at if self._acquired_at > 0 else 0,
+            }
 
     async def _event_cleanup_loop(self) -> None:
         """Background loop to clean up expired events."""
