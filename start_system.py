@@ -17292,6 +17292,155 @@ async def main():
         os.environ["JARVIS_GOAL_AUTOMATION"] = "false"
         print(f"{Colors.YELLOW}⚠️ Goal Inference Automation: DISABLED{Colors.ENDC}")
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # v85.0: Unified State Coordination - Prevent duplicate launches
+    # ═══════════════════════════════════════════════════════════════════════════
+    # This coordinates with run_supervisor.py using atomic fcntl locks with
+    # process cookies to prevent race conditions, duplicate launches, and
+    # stale lock issues. Uses environment-driven configuration (zero hardcoding).
+    # ═══════════════════════════════════════════════════════════════════════════
+    _v85_state_coordinator = None
+    _v85_ownership_acquired = False
+    _v85_heartbeat_task = None
+    _v85_trinity_managed_externally = False
+
+    async def _v85_release_ownership():
+        """Release v85.0 ownership on shutdown."""
+        nonlocal _v85_state_coordinator, _v85_ownership_acquired, _v85_heartbeat_task
+        try:
+            if _v85_heartbeat_task:
+                _v85_heartbeat_task.cancel()
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(_v85_heartbeat_task),
+                        timeout=2.0,
+                    )
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    pass
+                _v85_heartbeat_task = None
+
+            if _v85_state_coordinator:
+                if _v85_ownership_acquired:
+                    await _v85_state_coordinator.release_ownership("jarvis")
+                    _v85_ownership_acquired = False
+                    logger.info("[v85.0] ✅ Ownership released (start_system)")
+                _v85_state_coordinator = None
+        except Exception as e:
+            logger.warning(f"[v85.0] Error releasing ownership: {e}")
+
+    try:
+        from backend.core.trinity_integrator import (
+            UnifiedStateCoordinator,
+            TrinityEntryPointDetector,
+            ResourceChecker,
+        )
+
+        # Detect entry point
+        entry_info = TrinityEntryPointDetector.detect_entry_point()
+        entry_point = entry_info.get("entry_point", "start_system")
+        logger.info(f"[v85.0] Entry point detected: {entry_point}")
+        print(f"{Colors.CYAN}[v85.0] Entry point: {entry_point}{Colors.ENDC}")
+
+        # Check if supervisor is already managing Trinity
+        should_manage = await TrinityEntryPointDetector.should_manage_trinity()
+
+        if not should_manage:
+            # Another process (likely supervisor) is managing - coordinate with it
+            coord_status = await TrinityEntryPointDetector.get_coordination_status()
+            owners = coord_status.get("owners", {})
+            jarvis_owner = owners.get("jarvis")
+            trinity_owner = owners.get("trinity")
+
+            if jarvis_owner or trinity_owner:
+                owner = jarvis_owner or trinity_owner
+                owner_entry = owner.get("entry_point", "unknown")
+                owner_pid = owner.get("pid", "unknown")
+                logger.info(
+                    f"[v85.0] Trinity managed by {owner_entry} (PID: {owner_pid})"
+                )
+                print(
+                    f"{Colors.GREEN}[v85.0] ✓ Trinity managed by {owner_entry} "
+                    f"(PID: {owner_pid}){Colors.ENDC}"
+                )
+                _v85_trinity_managed_externally = True
+                # Set env var so downstream components know
+                os.environ["JARVIS_MANAGED_EXTERNALLY"] = "1"
+                os.environ["JARVIS_MANAGER_PID"] = str(owner_pid)
+                os.environ["JARVIS_MANAGER_ENTRY"] = owner_entry
+            else:
+                _v85_trinity_managed_externally = False
+        else:
+            # We should manage - try to acquire ownership
+            _v85_state_coordinator = UnifiedStateCoordinator()
+
+            # First, cleanup any stale owners
+            try:
+                await _v85_state_coordinator._cleanup_stale_owners()
+                logger.debug("[v85.0] Stale owner cleanup complete")
+            except Exception as e:
+                logger.debug(f"[v85.0] Stale cleanup skipped: {e}")
+
+            acquired, existing_owner = await _v85_state_coordinator.acquire_ownership(
+                entry_point=entry_point,
+                component="jarvis",
+                timeout=30.0,
+                force=False,
+            )
+
+            if acquired:
+                _v85_ownership_acquired = True
+                logger.info("[v85.0] ✅ Acquired JARVIS ownership (start_system)")
+                print(f"{Colors.GREEN}[v85.0] ✓ Exclusive ownership acquired{Colors.ENDC}")
+
+                _v85_heartbeat_task = await _v85_state_coordinator.start_heartbeat_loop(
+                    component="jarvis",
+                    interval=5.0,
+                )
+            else:
+                if existing_owner:
+                    logger.warning(
+                        f"[v85.0] Could not acquire ownership - "
+                        f"held by {existing_owner.entry_point} (PID: {existing_owner.pid})"
+                    )
+                    print(
+                        f"{Colors.YELLOW}[v85.0] ⚠️ Ownership held by "
+                        f"{existing_owner.entry_point} (PID: {existing_owner.pid}){Colors.ENDC}"
+                    )
+                    _v85_trinity_managed_externally = True
+                    os.environ["JARVIS_MANAGED_EXTERNALLY"] = "1"
+                    os.environ["JARVIS_MANAGER_PID"] = str(existing_owner.pid)
+                    os.environ["JARVIS_MANAGER_ENTRY"] = existing_owner.entry_point
+
+        # Resource pre-flight check
+        can_proceed, issues = await ResourceChecker.check_resources_for_component("jarvis")
+        if not can_proceed:
+            for issue in issues:
+                print(f"{Colors.YELLOW}[v85.0] ⚠️ Resource issue: {issue}{Colors.ENDC}")
+                logger.warning(f"[v85.0] Resource issue: {issue}")
+        else:
+            logger.info("[v85.0] ✅ Resource pre-flight check passed")
+
+    except ImportError as e:
+        logger.debug(f"[v85.0] State coordination not available: {e}")
+        _v85_trinity_managed_externally = False
+    except Exception as e:
+        logger.warning(f"[v85.0] State coordination error (non-fatal): {e}")
+        _v85_trinity_managed_externally = False
+
+    # Register v85.0 cleanup on exit
+    import atexit
+    def _v85_cleanup_sync():
+        """Synchronous cleanup wrapper for atexit."""
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                loop.create_task(_v85_release_ownership())
+            else:
+                loop.run_until_complete(_v85_release_ownership())
+        except Exception:
+            pass
+    atexit.register(_v85_cleanup_sync)
+
     # PID file locking to prevent multiple instances
     pid_file = Path("/tmp/jarvis_master.pid")  # nosec B108
     pid_lock_acquired = False

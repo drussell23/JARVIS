@@ -7676,6 +7676,45 @@ if __name__ == "__main__":
     import argparse
 
     # ==========================================================================
+    # v85.0: Entry Point Detection - Know who launched us
+    # ==========================================================================
+    # This provides context for downstream components about the launch chain.
+    # Coordinates with run_supervisor.py and start_system.py via env vars.
+    # ==========================================================================
+    try:
+        from core.trinity_integrator import TrinityEntryPointDetector
+
+        _entry_info = TrinityEntryPointDetector.detect_entry_point()
+        _entry_point = _entry_info.get("entry_point", "unknown")
+        _parent_entry = _entry_info.get("parent_entry_point", "unknown")
+
+        logger.info(f"[v85.0] JARVIS backend launched - entry: {_entry_point}")
+
+        # Set environment variables for downstream components
+        if _entry_point == "run_supervisor" or os.environ.get("JARVIS_SUPERVISED") == "1":
+            os.environ["JARVIS_MANAGED_BY_SUPERVISOR"] = "1"
+            logger.info("[v85.0] Running under supervisor management")
+        elif _entry_point == "start_system":
+            os.environ["JARVIS_MANAGED_BY_START_SYSTEM"] = "1"
+            logger.info("[v85.0] Running via start_system.py")
+        elif _entry_point == "main_direct" or _entry_point == "unknown":
+            os.environ["JARVIS_DIRECT_LAUNCH"] = "1"
+            logger.info("[v85.0] Direct launch (no coordinator)")
+
+        # Check if externally managed (by another coordinator)
+        if os.environ.get("JARVIS_MANAGED_EXTERNALLY") == "1":
+            _manager_pid = os.environ.get("JARVIS_MANAGER_PID", "unknown")
+            _manager_entry = os.environ.get("JARVIS_MANAGER_ENTRY", "unknown")
+            logger.info(
+                f"[v85.0] Externally managed by {_manager_entry} (PID: {_manager_pid})"
+            )
+
+    except ImportError:
+        logger.debug("[v85.0] Entry point detection not available")
+    except Exception as e:
+        logger.debug(f"[v85.0] Entry point detection failed (non-fatal): {e}")
+
+    # ==========================================================================
     # HYPER-RUNTIME v9.0: Rust-First Server Architecture
     # ==========================================================================
     # Intelligent runtime selection:

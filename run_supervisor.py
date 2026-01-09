@@ -2608,7 +2608,7 @@ class SupervisorBootstrapper:
             # Release ownership
             if hasattr(self, "_state_coordinator") and self._state_coordinator:
                 if hasattr(self, "_ownership_acquired") and self._ownership_acquired:
-                    await self._state_coordinator.release_ownership("jarvis_body")
+                    await self._state_coordinator.release_ownership("jarvis")  # v85.0: Unified
                     self._ownership_acquired = False
                     self.logger.info("[v85.0] ✅ Ownership released")
                 self._state_coordinator = None
@@ -2687,10 +2687,18 @@ class SupervisorBootstrapper:
                     # We should be the manager - acquire ownership
                     self._state_coordinator = UnifiedStateCoordinator()
 
+                    # First, cleanup any stale owners (crash recovery)
+                    try:
+                        cleaned = await self._state_coordinator._cleanup_stale_owners()
+                        if cleaned > 0:
+                            self.logger.info(f"[v85.0] Cleaned {cleaned} stale owner(s)")
+                    except Exception as e:
+                        self.logger.debug(f"[v85.0] Stale cleanup skipped: {e}")
+
                     # Try to acquire ownership with atomic lock
                     acquired, existing_owner = await self._state_coordinator.acquire_ownership(
                         entry_point=entry_point,
-                        component="jarvis_body",
+                        component="jarvis",  # v85.0: Unified component name
                         timeout=30.0,
                         force=False,  # Don't force - respect existing owners
                     )
@@ -2702,7 +2710,7 @@ class SupervisorBootstrapper:
 
                         # Start heartbeat loop to maintain ownership
                         self._heartbeat_task = await self._state_coordinator.start_heartbeat_loop(
-                            component="jarvis_body",
+                            component="jarvis",  # v85.0: Unified component name
                             interval=5.0,  # 5-second heartbeat
                         )
                         self.logger.debug("[v85.0] Heartbeat loop started")

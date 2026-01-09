@@ -3166,6 +3166,105 @@ class UnifiedStateCoordinator:
             logger.debug(f"[StateCoord] Owner validation error: {e}")
             return False
 
+    async def _cleanup_stale_owners(self) -> int:
+        """
+        Cleanup stale owners on startup.
+
+        This handles cases where:
+        1. Previous process crashed without releasing ownership
+        2. Previous process's heartbeat expired
+        3. Lock file exists but owning process is dead
+        4. PID was reused but cookie doesn't match
+
+        Returns:
+            Number of stale owners cleaned up
+        """
+        cleaned = 0
+        async with self._file_lock:
+            try:
+                state = await self._read_state()
+                if not state:
+                    return 0
+
+                owners = state.get("owners", {})
+                stale_components = []
+
+                for component, owner_data in owners.items():
+                    try:
+                        owner = ProcessOwnership(
+                            entry_point=owner_data.get("entry_point", "unknown"),
+                            pid=owner_data.get("pid", 0),
+                            cookie=owner_data.get("cookie", ""),
+                            hostname=owner_data.get("hostname", ""),
+                            acquired_at=owner_data.get("acquired_at", 0),
+                            last_heartbeat=owner_data.get("last_heartbeat", 0),
+                        )
+
+                        is_alive = await self._validate_owner_alive(owner)
+                        if not is_alive:
+                            stale_components.append(component)
+                            logger.info(
+                                f"[StateCoord] Stale owner detected: {component} "
+                                f"(PID={owner.pid}, entry={owner.entry_point})"
+                            )
+
+                    except Exception as e:
+                        logger.debug(f"[StateCoord] Error checking owner {component}: {e}")
+                        stale_components.append(component)
+
+                # Remove stale owners
+                for component in stale_components:
+                    try:
+                        # Try to release lock file
+                        lock_file = self.lock_dir / f"{component}.lock"
+                        if lock_file.exists():
+                            try:
+                                # Open and try to acquire lock
+                                fd = os.open(str(lock_file), os.O_RDWR)
+                                try:
+                                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                                    # We got the lock - previous owner is dead
+                                    fcntl.flock(fd, fcntl.LOCK_UN)
+                                    os.close(fd)
+                                    lock_file.unlink(missing_ok=True)
+                                    logger.debug(
+                                        f"[StateCoord] Removed stale lock: {lock_file}"
+                                    )
+                                except BlockingIOError:
+                                    # Lock still held - owner might be alive
+                                    os.close(fd)
+                                    continue
+                            except Exception:
+                                pass
+
+                        # Remove from state
+                        del owners[component]
+                        cleaned += 1
+                        logger.info(f"[StateCoord] Cleaned stale owner: {component}")
+
+                    except Exception as e:
+                        logger.debug(f"[StateCoord] Failed to clean {component}: {e}")
+
+                # Write updated state
+                if cleaned > 0:
+                    state["owners"] = owners
+                    state["last_update"] = time.time()
+                    state["last_cleanup"] = time.time()
+
+                    temp_file = self.state_file.with_suffix(".tmp")
+                    temp_file.write_text(json.dumps(state, indent=2))
+                    temp_file.replace(self.state_file)
+
+                    self._state_cache = state
+                    self._last_cache_time = time.time()
+
+                    logger.info(f"[StateCoord] Cleaned {cleaned} stale owner(s)")
+
+            except Exception as e:
+                logger.debug(f"[StateCoord] Stale cleanup error: {e}")
+
+        return cleaned
+
     async def update_heartbeat(self, component: str) -> None:
         """Update heartbeat timestamp for owned component."""
         async with self._file_lock:
@@ -3340,50 +3439,13 @@ class UnifiedStateCoordinator:
         return state.get(key, default) if state else default
 
     async def cleanup_stale_owners(self) -> int:
-        """Clean up stale ownership records. Returns count cleaned."""
-        cleaned = 0
-        async with self._file_lock:
-            try:
-                state = await self._read_state()
-                if not state:
-                    return 0
+        """
+        Clean up stale ownership records. Returns count cleaned.
 
-                owners = state.get("owners", {})
-                stale_components = []
-
-                for component, owner_data in owners.items():
-                    owner = ProcessOwnership(
-                        entry_point=owner_data.get("entry_point", ""),
-                        pid=owner_data.get("pid", 0),
-                        cookie=owner_data.get("cookie", ""),
-                        hostname=owner_data.get("hostname", ""),
-                        acquired_at=owner_data.get("acquired_at", 0),
-                        last_heartbeat=owner_data.get("last_heartbeat", 0),
-                    )
-
-                    if not await self._validate_owner_alive(owner):
-                        stale_components.append(component)
-
-                for component in stale_components:
-                    del owners[component]
-                    cleaned += 1
-                    logger.info(f"[StateCoord] Cleaned stale owner for {component}")
-
-                if cleaned > 0:
-                    state["owners"] = owners
-                    state["last_update"] = time.time()
-
-                    temp_file = self.state_file.with_suffix(".tmp")
-                    temp_file.write_text(json.dumps(state, indent=2))
-                    temp_file.replace(self.state_file)
-
-                    self._state_cache = state
-                    self._last_cache_time = time.time()
-
-            except Exception as e:
-                logger.debug(f"[StateCoord] Cleanup error: {e}")
-
-        return cleaned
+        Public API - delegates to _cleanup_stale_owners which has more
+        comprehensive lock file handling for crash recovery.
+        """
+        return await self._cleanup_stale_owners()
 
 
 # =============================================================================
