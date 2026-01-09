@@ -2355,6 +2355,14 @@ class SupervisorBootstrapper:
         self._trinity_integrator = None
         self._trinity_integrator_enabled = os.getenv("TRINITY_INTEGRATOR_ENABLED", "true").lower() == "true"
 
+        # v85.0: Unified State Coordination - Atomic locks with process cookies
+        # - Prevents race conditions between run_supervisor.py and start_system.py
+        # - Uses fcntl locks with TTL-based expiration
+        # - Process cookies prevent PID reuse issues
+        self._state_coordinator: Optional[Any] = None  # UnifiedStateCoordinator
+        self._ownership_acquired: bool = False
+        self._heartbeat_task: Optional[asyncio.Task] = None
+
         # CRITICAL: Set CI=true to prevent npm start from hanging interactively
         # if port 3000 is taken. This ensures we fail fast or handle it automatically.
         os.environ["CI"] = "true"
@@ -2546,6 +2554,9 @@ class SupervisorBootstrapper:
         """v80.0: Emergency shutdown when startup times out."""
         self.logger.warning("🚨 Emergency shutdown initiated")
         try:
+            # v85.0: Release ownership and stop heartbeat FIRST
+            await self._release_v85_ownership()
+
             # Kill all Trinity components
             await self._shutdown_trinity_components()
 
@@ -2572,6 +2583,38 @@ class SupervisorBootstrapper:
 
         except Exception as e:
             self.logger.error(f"Emergency shutdown error: {e}")
+
+    async def _release_v85_ownership(self) -> None:
+        """
+        v85.0: Release state coordinator ownership and stop heartbeat.
+
+        This ensures clean ownership transfer when shutting down, preventing
+        stale lock files and allowing other processes to acquire ownership.
+        """
+        try:
+            # Stop heartbeat task first
+            if hasattr(self, "_heartbeat_task") and self._heartbeat_task:
+                self._heartbeat_task.cancel()
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(self._heartbeat_task),
+                        timeout=2.0,
+                    )
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    pass
+                self._heartbeat_task = None
+                self.logger.debug("[v85.0] Heartbeat task stopped")
+
+            # Release ownership
+            if hasattr(self, "_state_coordinator") and self._state_coordinator:
+                if hasattr(self, "_ownership_acquired") and self._ownership_acquired:
+                    await self._state_coordinator.release_ownership("jarvis_body")
+                    self._ownership_acquired = False
+                    self.logger.info("[v85.0] ✅ Ownership released")
+                self._state_coordinator = None
+
+        except Exception as e:
+            self.logger.warning(f"[v85.0] Error releasing ownership: {e}")
 
     async def _run_with_deep_health(self) -> int:
         """
@@ -9792,6 +9835,9 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
                 self.logger.info("   ✅ Retry Manager stats persisted")
             except Exception as e:
                 self.logger.debug(f"   Retry manager persist error: {e}")
+
+        # v85.0: Release state coordinator ownership (atomic lock cleanup)
+        await self._release_v85_ownership()
 
         self.logger.info("✅ Trinity component shutdown complete")
 
