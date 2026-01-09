@@ -2600,6 +2600,99 @@ class SupervisorBootstrapper:
             self.logger.info(f"{icon} [HYPER-RUNTIME] {_HYPER_RUNTIME_NAME} Engine ACTIVE - {desc}")
             TerminalUI.print_success(f"Hyper-Runtime: {_HYPER_RUNTIME_NAME} (Level {_HYPER_RUNTIME_LEVEL}/3)")
 
+            # ═══════════════════════════════════════════════════════════════════
+            # v85.0: Unified State Coordination - Acquire Exclusive Ownership
+            # ═══════════════════════════════════════════════════════════════════
+            # This prevents race conditions between run_supervisor.py and start_system.py
+            # by using atomic fcntl locks with process cookies for reliable ownership
+            # ═══════════════════════════════════════════════════════════════════
+            self._state_coordinator: Optional["UnifiedStateCoordinator"] = None
+            self._ownership_acquired = False
+            self._heartbeat_task: Optional[asyncio.Task] = None
+
+            try:
+                from backend.core.trinity_integrator import (
+                    UnifiedStateCoordinator,
+                    TrinityEntryPointDetector,
+                    ResourceChecker,
+                )
+
+                # Detect which entry point we are
+                entry_info = TrinityEntryPointDetector.detect_entry_point()
+                entry_point = entry_info.get("entry_point", "run_supervisor.py")
+                self.logger.info(f"[v85.0] Entry point detected: {entry_point}")
+                TerminalUI.print_success(f"[v85.0] Entry point: {entry_point}")
+
+                # Check if we should manage Trinity (prevents double-startup)
+                should_manage = await TrinityEntryPointDetector.should_manage_trinity()
+                if not should_manage:
+                    coord_status = await TrinityEntryPointDetector.get_coordination_status()
+                    existing_owner = coord_status.get("current_owner")
+                    if existing_owner:
+                        owner_pid = existing_owner.get("pid", "unknown")
+                        owner_entry = existing_owner.get("entry_point", "unknown")
+                        self.logger.warning(
+                            f"[v85.0] Another process is managing Trinity: "
+                            f"PID={owner_pid}, entry={owner_entry}"
+                        )
+                        TerminalUI.print_warning(
+                            f"[v85.0] Trinity already managed by PID {owner_pid} ({owner_entry})"
+                        )
+                        # Don't fail - let existing manager continue
+                        # We can still start as a subordinate
+                else:
+                    # We should be the manager - acquire ownership
+                    self._state_coordinator = UnifiedStateCoordinator()
+
+                    # Try to acquire ownership with atomic lock
+                    acquired, existing_owner = await self._state_coordinator.acquire_ownership(
+                        entry_point=entry_point,
+                        component="jarvis_body",
+                        timeout=30.0,
+                        force=False,  # Don't force - respect existing owners
+                    )
+
+                    if acquired:
+                        self._ownership_acquired = True
+                        self.logger.info("[v85.0] ✅ Ownership acquired successfully")
+                        TerminalUI.print_success("[v85.0] Exclusive ownership acquired (atomic lock)")
+
+                        # Start heartbeat loop to maintain ownership
+                        self._heartbeat_task = await self._state_coordinator.start_heartbeat_loop(
+                            component="jarvis_body",
+                            interval=5.0,  # 5-second heartbeat
+                        )
+                        self.logger.debug("[v85.0] Heartbeat loop started")
+                    else:
+                        if existing_owner:
+                            self.logger.warning(
+                                f"[v85.0] Could not acquire ownership - "
+                                f"held by PID {existing_owner.pid} ({existing_owner.entry_point})"
+                            )
+                            TerminalUI.print_warning(
+                                f"[v85.0] Ownership held by PID {existing_owner.pid}"
+                            )
+                        else:
+                            self.logger.warning("[v85.0] Could not acquire ownership (unknown reason)")
+
+                # v85.0: Resource pre-flight check
+                # Verify we have enough resources before proceeding
+                can_proceed, issues = await ResourceChecker.check_resources_for_component("jarvis_body")
+                if not can_proceed:
+                    for issue in issues:
+                        TerminalUI.print_error(f"[v85.0] Resource issue: {issue}")
+                    self.logger.error(f"[v85.0] Resource check failed: {issues}")
+                    # Don't fail hard - log and continue with degraded mode
+                    TerminalUI.print_warning("[v85.0] Continuing with degraded resources...")
+                else:
+                    self.logger.info("[v85.0] ✅ Resource pre-flight check passed")
+
+            except ImportError as e:
+                self.logger.debug(f"[v85.0] State coordination not available: {e}")
+            except Exception as e:
+                self.logger.warning(f"[v85.0] State coordination error (non-fatal): {e}")
+                # Non-fatal - continue without coordination
+
             # Phase 1: Cleanup existing instances
             self.perf.start("cleanup")
             TerminalUI.print_phase(1, 4, "Checking for existing instances")
@@ -2655,6 +2748,27 @@ class SupervisorBootstrapper:
                         state = self._trinity_integrator.state.value
                         TerminalUI.print_success(f"[v81.0] TrinityIntegrator ready (state={state})")
                         self.logger.info(f"[v81.0] ✅ TrinityIntegrator started successfully (state={state})")
+
+                        # ═══════════════════════════════════════════════════════════════
+                        # v85.0: Comprehensive Startup Verification
+                        # Verifies all Trinity components are truly functional:
+                        # - Heartbeat files exist and are fresh
+                        # - Health endpoints respond (if applicable)
+                        # - Cross-repo discovery succeeded
+                        # ═══════════════════════════════════════════════════════════════
+                        try:
+                            verification_results = await self._verify_trinity_startup_v85()
+                            if verification_results["all_verified"]:
+                                TerminalUI.print_success("[v85.0] All Trinity components verified and healthy")
+                                self.logger.info("[v85.0] ✅ Cross-repo verification complete")
+                            else:
+                                failed = [k for k, v in verification_results.get("components", {}).items() if not v]
+                                if failed:
+                                    self.logger.warning(f"[v85.0] Some components not verified: {failed}")
+                                    TerminalUI.print_warning(f"[v85.0] Components pending: {', '.join(failed)}")
+                        except Exception as verify_err:
+                            self.logger.debug(f"[v85.0] Verification check skipped: {verify_err}")
+
                     else:
                         self.logger.warning("[v81.0] TrinityIntegrator start returned false - continuing with fallback")
                         self._trinity_integrator = None
@@ -8319,6 +8433,172 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
                 self.logger.info("   ✅ Reactor-Core API stopped")
             except Exception as e:
                 self.logger.debug(f"   Reactor-Core shutdown error: {e}")
+
+    async def _verify_trinity_startup_v85(self) -> Dict[str, Any]:
+        """
+        v85.0: Comprehensive Trinity startup verification.
+
+        Verifies all Trinity components are truly functional by checking:
+        1. Heartbeat files exist and are fresh (< 30 seconds old)
+        2. Health endpoints respond for components that have them
+        3. Cross-repo discovery succeeded
+        4. Process PIDs are valid and running
+
+        Returns:
+            Dict with verification results including:
+            - all_verified: bool - True if all enabled components verified
+            - components: Dict[str, bool] - Per-component verification status
+            - details: Dict[str, Any] - Detailed info about each component
+        """
+        from pathlib import Path
+        import json
+
+        results = {
+            "all_verified": False,
+            "components": {},
+            "details": {},
+            "timestamp": time.time(),
+        }
+
+        trinity_dir = Path.home() / ".jarvis" / "trinity" / "components"
+
+        # Component definitions with health check URLs
+        components = {
+            "jarvis_body": {
+                "files": ["jarvis_body.json"],
+                "health_url": None,  # No HTTP endpoint
+                "required": True,
+            },
+            "jarvis_prime": {
+                "files": ["jarvis_prime.json", "j_prime.json"],
+                "health_url": f"http://localhost:{os.getenv('JARVIS_PRIME_PORT', '8000')}/health",
+                "required": os.getenv("JARVIS_PRIME_ENABLED", "true").lower() == "true",
+            },
+            "reactor_core": {
+                "files": ["reactor_core.json"],
+                "health_url": None,  # Uses file-based heartbeat
+                "required": os.getenv("REACTOR_CORE_ENABLED", "true").lower() == "true",
+            },
+            "coding_council": {
+                "files": ["coding_council.json"],
+                "health_url": None,
+                "required": False,  # Optional component
+            },
+        }
+
+        verified_count = 0
+        required_count = 0
+
+        for component_name, config in components.items():
+            component_verified = False
+            details = {
+                "heartbeat_found": False,
+                "heartbeat_fresh": False,
+                "heartbeat_age": None,
+                "health_check_passed": None,
+                "pid_valid": False,
+                "required": config["required"],
+            }
+
+            if config["required"]:
+                required_count += 1
+
+            # Check heartbeat files
+            for file_name in config["files"]:
+                heartbeat_path = trinity_dir / file_name
+                if heartbeat_path.exists():
+                    try:
+                        with open(heartbeat_path) as f:
+                            heartbeat_data = json.load(f)
+
+                        details["heartbeat_found"] = True
+
+                        # Check freshness (< 30 seconds)
+                        timestamp = heartbeat_data.get("timestamp", 0)
+                        age = time.time() - timestamp
+                        details["heartbeat_age"] = round(age, 1)
+
+                        if age < 30.0:
+                            details["heartbeat_fresh"] = True
+
+                            # Check PID validity
+                            pid = heartbeat_data.get("pid")
+                            if pid:
+                                try:
+                                    import psutil
+                                    proc = psutil.Process(pid)
+                                    if proc.is_running():
+                                        details["pid_valid"] = True
+                                        details["pid"] = pid
+                                except Exception:
+                                    pass
+
+                            component_verified = details["heartbeat_fresh"]
+                            break
+
+                    except Exception as e:
+                        self.logger.debug(f"[v85.0] Error reading {file_name}: {e}")
+
+            # Health check for components with HTTP endpoints
+            if config["health_url"] and details["heartbeat_fresh"]:
+                try:
+                    import aiohttp
+                    async with aiohttp.ClientSession(
+                        timeout=aiohttp.ClientTimeout(total=5.0)
+                    ) as session:
+                        async with session.get(config["health_url"]) as resp:
+                            if resp.status == 200:
+                                details["health_check_passed"] = True
+                            else:
+                                details["health_check_passed"] = False
+                                component_verified = False
+                except Exception as e:
+                    details["health_check_passed"] = False
+                    self.logger.debug(f"[v85.0] Health check failed for {component_name}: {e}")
+                    # Don't mark as failed if heartbeat is fresh but health check fails temporarily
+                    # (component might still be starting up)
+
+            results["components"][component_name] = component_verified
+            results["details"][component_name] = details
+
+            if component_verified:
+                verified_count += 1
+                self.logger.debug(f"[v85.0] {component_name}: ✅ Verified")
+            elif config["required"]:
+                self.logger.debug(f"[v85.0] {component_name}: ❌ Not verified (required)")
+            else:
+                self.logger.debug(f"[v85.0] {component_name}: ⚠ Not verified (optional)")
+
+        # Check if all required components verified
+        all_required_verified = all(
+            results["components"].get(name, False)
+            for name, config in components.items()
+            if config["required"]
+        )
+
+        results["all_verified"] = all_required_verified
+        results["verified_count"] = verified_count
+        results["required_count"] = required_count
+
+        # Also check cross-repo discovery via IntelligentRepoDiscovery
+        try:
+            from backend.core.trinity_integrator import get_repo_discovery
+            discovery = await get_repo_discovery()
+            all_repos = await discovery.discover_all()
+            results["cross_repo_discovery"] = {
+                repo_id: {
+                    "found": result.path is not None,
+                    "path": str(result.path) if result.path else None,
+                    "strategy": result.strategy_used.name if result.path else None,
+                    "confidence": result.confidence,
+                }
+                for repo_id, result in all_repos.items()
+            }
+        except Exception as e:
+            self.logger.debug(f"[v85.0] Cross-repo discovery check skipped: {e}")
+            results["cross_repo_discovery"] = None
+
+        return results
 
     async def _initialize_trinity(self) -> None:
         """

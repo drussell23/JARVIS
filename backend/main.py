@@ -1539,15 +1539,56 @@ async def parallel_lifespan(app: FastAPI):
         # =================================================================
         # TRINITY ECOSYSTEM: Initialize Prime Router & Graceful Degradation
         # =================================================================
-        # Initialize the Trinity routing infrastructure in background.
-        # This connects JARVIS to JARVIS-Prime (Mind) with cloud fallback.
+        # v85.0: Enhanced Trinity initialization with intelligent repo discovery
+        # and cross-repo verification. Uses IntelligentRepoDiscovery for
+        # zero-hardcoding path resolution.
         app.state.trinity_initialized = False
         app.state.prime_router = None
+        app.state.trinity_discovery = None
+        app.state.trinity_verification = None
 
         async def _init_trinity_background():
-            """Initialize Trinity ecosystem in background."""
+            """
+            v85.0: Initialize Trinity ecosystem in background.
+
+            Enhancements:
+            - IntelligentRepoDiscovery for dynamic repo path resolution
+            - Cross-repo verification to confirm all components are running
+            - Enhanced health status with discovery confidence scores
+            """
             try:
+                # =============================================================
+                # v85.0: Initialize IntelligentRepoDiscovery
+                # =============================================================
+                try:
+                    from core.trinity_integrator import get_repo_discovery, get_resource_aware_launcher
+                except ImportError:
+                    from backend.core.trinity_integrator import get_repo_discovery, get_resource_aware_launcher
+
+                logger.info("🔱 Trinity v85.0: Starting intelligent repo discovery...")
+
+                try:
+                    discovery = await get_repo_discovery()
+                    app.state.trinity_discovery = discovery
+
+                    # Discover all repos concurrently
+                    all_repos = await discovery.discover_all()
+
+                    for repo_id, result in all_repos.items():
+                        if result.path:
+                            logger.info(
+                                f"   📂 {repo_id}: {result.path} "
+                                f"(strategy: {result.strategy_used.name}, confidence: {result.confidence:.0%})"
+                            )
+                        else:
+                            logger.debug(f"   ⚠️ {repo_id}: Not found ({result.error})")
+
+                except Exception as e:
+                    logger.debug(f"   Repo discovery not available: {e}")
+
+                # =============================================================
                 # Initialize Prime Router (connects to JARVIS-Prime)
+                # =============================================================
                 try:
                     from core.prime_router import get_prime_router
                 except ImportError:
@@ -1557,7 +1598,9 @@ async def parallel_lifespan(app: FastAPI):
                 router = await get_prime_router()
                 app.state.prime_router = router
 
+                # =============================================================
                 # Initialize Graceful Degradation
+                # =============================================================
                 try:
                     from core.graceful_degradation import get_degradation
                 except ImportError:
@@ -1566,7 +1609,9 @@ async def parallel_lifespan(app: FastAPI):
                 degradation = get_degradation()
                 app.state.graceful_degradation = degradation
 
+                # =============================================================
                 # Check if JARVIS-Prime is available
+                # =============================================================
                 router_status = router.get_status()
                 prime_available = router_status.get("prime_client", {}).get("available", False)
 
@@ -1575,8 +1620,46 @@ async def parallel_lifespan(app: FastAPI):
                 else:
                     logger.info("⚠️ Trinity: JARVIS-Prime not available, using cloud fallback")
 
+                # =============================================================
+                # v85.0: Cross-repo verification
+                # =============================================================
+                try:
+                    import json
+                    from pathlib import Path
+
+                    trinity_dir = Path.home() / ".jarvis" / "trinity" / "components"
+                    verification = {
+                        "jarvis_body": False,
+                        "jarvis_prime": False,
+                        "reactor_core": False,
+                    }
+
+                    for component, file_name in [
+                        ("jarvis_body", "jarvis_body.json"),
+                        ("jarvis_prime", "jarvis_prime.json"),
+                        ("reactor_core", "reactor_core.json"),
+                    ]:
+                        path = trinity_dir / file_name
+                        if path.exists():
+                            try:
+                                with open(path) as f:
+                                    data = json.load(f)
+                                import time
+                                age = time.time() - data.get("timestamp", 0)
+                                if age < 60:  # Fresh heartbeat
+                                    verification[component] = True
+                            except Exception:
+                                pass
+
+                    app.state.trinity_verification = verification
+                    verified_count = sum(1 for v in verification.values() if v)
+                    logger.info(f"🔱 Trinity v85.0: {verified_count}/3 components verified online")
+
+                except Exception as e:
+                    logger.debug(f"   Verification check skipped: {e}")
+
                 app.state.trinity_initialized = True
-                logger.info("✅ Trinity ecosystem initialized (background init)")
+                logger.info("✅ Trinity v85.0 ecosystem initialized (background init)")
 
             except ImportError as e:
                 logger.debug(f"Trinity modules not available: {e}")
@@ -1586,7 +1669,7 @@ async def parallel_lifespan(app: FastAPI):
                 app.state.trinity_initialized = False
 
         # Launch Trinity initialization in background
-        asyncio.create_task(_init_trinity_background(), name="trinity_init")
+        asyncio.create_task(_init_trinity_background(), name="trinity_init_v85")
 
         yield
 
