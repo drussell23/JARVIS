@@ -4365,8 +4365,55 @@ class UnifiedCommandProcessor:
                         "command_type": "screen_lock",
                         "error": str(e),
                     }
+            elif command_type == CommandType.QUERY:
+                # ==========================================================================
+                # QUERY COMMAND HANDLER - Routes to J-Prime/Cloud via PrimeRouter
+                # v84.0: Trinity Integration with intelligent LLM routing
+                # ==========================================================================
+                try:
+                    from api.query_handler import handle_query
+
+                    logger.info(f"[UNIFIED] 🧠 Processing query via PrimeRouter: '{command_text[:50]}...'")
+
+                    # Build context for query
+                    query_context = {
+                        "screen_context": await self._get_screen_context() if hasattr(self, '_get_screen_context') else {},
+                        "history": self.context_history if hasattr(self, 'context_history') else [],
+                    }
+
+                    # Call the query handler (routes to J-Prime or cloud)
+                    result = await handle_query(command_text, query_context)
+
+                    logger.info(f"[UNIFIED] ✅ Query response from {result.get('source', 'unknown')}")
+
+                    return {
+                        "success": result.get("success", True),
+                        "response": result.get("response", ""),
+                        "command_type": command_type.value,
+                        "source": result.get("source", "unknown"),
+                        "model": result.get("model", "unknown"),
+                        "latency_ms": result.get("latency_ms", 0),
+                        **{k: v for k, v in result.items() if k not in ["success", "response"]},
+                    }
+                except ImportError as e:
+                    logger.error(f"[UNIFIED] Query handler not available: {e}")
+                    return {
+                        "success": False,
+                        "response": "Query processing is currently unavailable.",
+                        "command_type": command_type.value,
+                        "error": str(e),
+                    }
+                except Exception as e:
+                    logger.error(f"[UNIFIED] Query processing error: {e}", exc_info=True)
+                    return {
+                        "success": False,
+                        "response": f"Error processing query: {str(e)}",
+                        "command_type": command_type.value,
+                        "error": str(e),
+                    }
             else:
-                # Generic handler interface
+                # Generic handler interface - fallback for unhandled command types
+                logger.warning(f"[UNIFIED] ⚠️ No specific handler for {command_type.value}, using generic response")
                 return {
                     "success": True,
                     "response": f"Executing {command_type.value} command",

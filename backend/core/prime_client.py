@@ -124,8 +124,8 @@ class PrimeClientConfig:
 
     @property
     def base_url(self) -> str:
-        """Get the base URL for Prime API."""
-        return f"http://{self.prime_host}:{self.prime_port}/api/{self.prime_api_version}"
+        """Get the base URL for Prime API (OpenAI-compatible format without /api prefix)."""
+        return f"http://{self.prime_host}:{self.prime_port}/{self.prime_api_version}"
 
     @property
     def health_url(self) -> str:
@@ -471,9 +471,9 @@ class PrimeClient:
                 else:
                     # httpx style
                     resp = await session.get(self._config.health_url)
-                    if resp.status_code == 200:
+                    if resp.status == 200:
                         self._status = PrimeStatus.AVAILABLE
-                    elif resp.status_code < 500:
+                    elif resp.status < 500:
                         self._status = PrimeStatus.DEGRADED
                     else:
                         self._status = PrimeStatus.UNAVAILABLE
@@ -596,18 +596,18 @@ class PrimeClient:
             payload = self._build_payload(request)
 
             async with self._pool.get_session() as session:
-                url = f"{self._config.base_url}/generate"
+                # Use OpenAI-compatible chat completions endpoint
+                url = f"{self._config.base_url}/chat/completions"
 
-                # Handle both aiohttp and httpx
-                if hasattr(session, 'post') and hasattr(session.post, '__aenter__'):
-                    # aiohttp style (context manager)
+                # aiohttp.ClientSession - use context manager for response
+                try:
                     async with session.post(url, json=payload) as resp:
                         if resp.status != 200:
                             text = await resp.text()
                             raise RuntimeError(f"Prime returned {resp.status}: {text}")
                         data = await resp.json()
-                else:
-                    # httpx style
+                except TypeError:
+                    # Fallback for httpx style (no context manager on response)
                     resp = await session.post(url, json=payload)
                     if resp.status_code != 200:
                         raise RuntimeError(f"Prime returned {resp.status_code}: {resp.text}")
@@ -617,13 +617,29 @@ class PrimeClient:
 
             await self._circuit.record_success()
 
+            # Parse OpenAI-compatible response format
+            content = ""
+            if "choices" in data and len(data["choices"]) > 0:
+                choice = data["choices"][0]
+                if "message" in choice:
+                    content = choice["message"].get("content", "")
+                elif "text" in choice:
+                    content = choice["text"]
+            else:
+                # Fallback for non-standard responses
+                content = data.get("content", data.get("response", ""))
+
+            # Extract token usage
+            usage = data.get("usage", {})
+            tokens_used = usage.get("total_tokens", 0)
+
             return PrimeResponse(
-                content=data.get("content", data.get("response", "")),
+                content=content,
                 request_id=request.request_id,
                 model=data.get("model", "jarvis-prime"),
                 source="local_prime",
                 latency_ms=latency_ms,
-                tokens_used=data.get("tokens_used", 0),
+                tokens_used=tokens_used,
                 metadata=data.get("metadata", {}),
             )
 
@@ -667,8 +683,8 @@ class PrimeClient:
                 else:
                     # httpx style (async streaming)
                     async with session.stream('POST', url, json=payload) as resp:
-                        if resp.status_code != 200:
-                            raise RuntimeError(f"Prime returned {resp.status_code}")
+                        if resp.status != 200:
+                            raise RuntimeError(f"Prime returned {resp.status}")
 
                         async for line in resp.aiter_lines():
                             if line.startswith("data: "):
@@ -750,19 +766,37 @@ class PrimeClient:
             raise RuntimeError(f"Both Prime and cloud fallback failed: {e}")
 
     def _build_payload(self, request: PrimeRequest) -> Dict[str, Any]:
-        """Build request payload for Prime API."""
+        """Build request payload for Prime API (OpenAI-compatible format)."""
+        # Build messages list in OpenAI format
+        messages = []
+
+        # Add system prompt if provided
+        if request.system_prompt:
+            messages.append({
+                "role": "system",
+                "content": request.system_prompt
+            })
+
+        # Add context as system message if provided
+        if request.context:
+            context_str = str(request.context) if not isinstance(request.context, str) else request.context
+            messages.append({
+                "role": "system",
+                "content": f"Context: {context_str}"
+            })
+
+        # Add the user prompt
+        messages.append({
+            "role": "user",
+            "content": request.prompt
+        })
+
         payload = {
-            "prompt": request.prompt,
+            "messages": messages,
             "max_tokens": request.max_tokens,
             "temperature": request.temperature,
-            "request_id": request.request_id,
+            "model": "jarvis-prime",  # Required by OpenAI format
         }
-
-        if request.system_prompt:
-            payload["system_prompt"] = request.system_prompt
-
-        if request.context:
-            payload["context"] = request.context
 
         if request.metadata:
             payload["metadata"] = request.metadata
