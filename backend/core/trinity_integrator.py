@@ -2941,10 +2941,282 @@ class UnifiedStateCoordinator:
         # ═══════════════════════════════════════════════════════════════════════
         self._our_entry_point: Optional[str] = None
 
+        # ═══════════════════════════════════════════════════════════════════════
+        # v87.0: Advanced coordinator integration
+        # ═══════════════════════════════════════════════════════════════════════
+        self._advanced_coord: Optional["TrinityAdvancedCoordinator"] = None
+        self._advanced_coord_lock = asyncio.Lock()
+        self._enable_advanced_features = os.getenv(
+            "JARVIS_ENABLE_ADVANCED_COORD", "true"
+        ).lower() == "true"
+
+        # v87.0: Process group isolation
+        self._pgid = os.getpgid(os.getpid())
+        self._process_creation_time = self._get_process_creation_time()
+
+        # v87.0: Graceful degradation state
+        self._degradation_mode: str = "full"  # full, degraded, minimal
+        self._failed_components: Set[str] = set()
+
         logger.debug(
-            f"[StateCoord] v86.0 Initialized (PID={self._pid}, "
-            f"Cookie={self._process_cookie[:8]}...)"
+            f"[StateCoord] v87.0 Initialized (PID={self._pid}, "
+            f"PGID={self._pgid}, Cookie={self._process_cookie[:8]}...)"
         )
+
+    def _get_process_creation_time(self) -> float:
+        """Get process creation time for PID reuse detection."""
+        try:
+            proc = psutil.Process(os.getpid())
+            return proc.create_time()
+        except Exception:
+            return time.time()
+
+    async def _ensure_advanced_coord(self) -> Optional["TrinityAdvancedCoordinator"]:
+        """
+        v87.0: Lazy initialization of advanced coordinator.
+
+        Returns None if advanced features disabled or init fails.
+        """
+        if not self._enable_advanced_features:
+            return None
+
+        if self._advanced_coord is not None:
+            return self._advanced_coord
+
+        async with self._advanced_coord_lock:
+            if self._advanced_coord is not None:
+                return self._advanced_coord
+
+            try:
+                # Import here to avoid circular imports
+                coord = TrinityAdvancedCoordinator()
+                await coord.initialize()
+                self._advanced_coord = coord
+                logger.info("[StateCoord] v87.0 Advanced coordinator initialized")
+                return self._advanced_coord
+            except Exception as e:
+                logger.warning(f"[StateCoord] v87.0 Advanced coordinator init failed: {e}")
+                return None
+
+    async def get_degradation_mode(self) -> str:
+        """Get current degradation mode."""
+        return self._degradation_mode
+
+    async def set_degradation_mode(self, mode: str, failed_components: Optional[Set[str]] = None) -> None:
+        """Set degradation mode and track failed components."""
+        old_mode = self._degradation_mode
+        self._degradation_mode = mode
+        if failed_components:
+            self._failed_components = failed_components
+
+        if old_mode != mode:
+            logger.warning(f"[StateCoord] Degradation mode changed: {old_mode} -> {mode}")
+            await self.publish_component_event(
+                "system",
+                self.ComponentEventType.DEGRADED,
+                metadata={"mode": mode, "failed": list(self._failed_components)}
+            )
+
+    async def verify_process_isolation(self) -> Tuple[bool, str]:
+        """
+        v87.0: Verify process group isolation.
+
+        Checks that we're properly isolated from parent process group.
+        """
+        try:
+            current_pgid = os.getpgid(os.getpid())
+            parent_pid = os.getppid()
+
+            try:
+                parent_pgid = os.getpgid(parent_pid)
+            except (ProcessLookupError, OSError):
+                # Parent died - we're isolated
+                return True, "Parent process terminated, isolation confirmed"
+
+            # We should be in our own process group for proper cleanup
+            # OR we're the leader of our process group
+            if current_pgid == os.getpid():
+                return True, "Process group leader"
+
+            if current_pgid != parent_pgid:
+                return True, "Isolated from parent process group"
+
+            # Same group as parent - may have issues with signal handling
+            return False, f"Sharing process group with parent (PGID={current_pgid})"
+
+        except Exception as e:
+            return False, f"Process isolation check failed: {e}"
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # v87.0: Graceful Degradation Chain Integration
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    async def get_fallback_manager(self) -> Optional[Any]:
+        """
+        v87.0: Get Trinity fallback manager instance.
+
+        Provides access to the TrinityFallbackManager for executing
+        fallback chains (J-Prime, Reactor-Core, Voice).
+        """
+        if not hasattr(self, "_fallback_manager"):
+            self._fallback_manager = None
+
+        if self._fallback_manager is None:
+            try:
+                from backend.core.graceful_degradation import TrinityFallbackManager
+                self._fallback_manager = TrinityFallbackManager()
+                logger.debug("[StateCoord] v87.0 Fallback manager initialized")
+            except ImportError as e:
+                logger.warning(f"[StateCoord] v87.0 Fallback manager not available: {e}")
+                return None
+        return self._fallback_manager
+
+    async def update_component_health(
+        self,
+        component: str,
+        is_healthy: bool,
+        error: Optional[str] = None
+    ) -> None:
+        """
+        v87.0: Update component health and adjust degradation mode.
+
+        Args:
+            component: Component name (jprime, reactor, voice, etc.)
+            is_healthy: Whether component is healthy
+            error: Error message if unhealthy
+        """
+        if is_healthy:
+            # Remove from failed components
+            if component in self._failed_components:
+                self._failed_components.discard(component)
+                logger.info(f"[StateCoord] v87.0 Component recovered: {component}")
+
+                # Check if we can return to full mode
+                if not self._failed_components:
+                    await self.set_degradation_mode("full")
+        else:
+            # Add to failed components
+            self._failed_components.add(component)
+            logger.warning(f"[StateCoord] v87.0 Component failed: {component} - {error}")
+
+            # Determine degradation mode
+            critical_components = {"jarvis", "state_coordinator"}
+            non_critical = {"jprime", "reactor", "voice"}
+
+            if self._failed_components & critical_components:
+                # Critical component failed - minimal mode
+                await self.set_degradation_mode("minimal", self._failed_components)
+            elif self._failed_components & non_critical:
+                # Non-critical component failed - degraded mode
+                await self.set_degradation_mode("degraded", self._failed_components)
+
+    async def execute_with_fallback(
+        self,
+        chain_name: str,
+        operation: Callable[[], Awaitable[T]],
+        fallback_handlers: Optional[Dict[str, Callable]] = None,
+    ) -> Tuple[bool, Optional[T], str]:
+        """
+        v87.0: Execute operation with automatic fallback chain.
+
+        Args:
+            chain_name: Fallback chain to use (jprime, reactor, voice)
+            operation: Primary operation to execute
+            fallback_handlers: Optional custom fallback handlers
+
+        Returns:
+            Tuple of (success, result, message)
+        """
+        try:
+            # Try primary operation first
+            result = await operation()
+            await self.update_component_health(chain_name, True)
+            return True, result, "Primary operation succeeded"
+
+        except Exception as primary_error:
+            logger.warning(f"[StateCoord] v87.0 Primary {chain_name} failed: {primary_error}")
+            await self.update_component_health(chain_name, False, str(primary_error))
+
+            # Get fallback manager
+            fallback_manager = await self.get_fallback_manager()
+            if not fallback_manager:
+                return False, None, f"Primary failed, no fallback available: {primary_error}"
+
+            # Execute fallback chain
+            try:
+                if chain_name == "jprime" and fallback_handlers:
+                    result = await fallback_manager.execute_jprime_chain(
+                        {},  # Empty request, handlers provided
+                        local_handler=fallback_handlers.get("local"),
+                        cloud_run_handler=fallback_handlers.get("cloud_run"),
+                        claude_api_handler=fallback_handlers.get("claude_api"),
+                    )
+                elif chain_name == "reactor" and fallback_handlers:
+                    result = await fallback_manager.execute_reactor_chain(
+                        {},  # Empty data, handlers provided
+                        local_handler=fallback_handlers.get("local"),
+                    )
+                else:
+                    return False, None, f"Unknown chain or no handlers: {chain_name}"
+
+                if result.success:
+                    return True, result.value, f"Fallback succeeded via {result.target_used}"
+                return False, None, f"All fallbacks failed: {result.error}"
+
+            except Exception as fallback_error:
+                logger.error(f"[StateCoord] v87.0 Fallback chain failed: {fallback_error}")
+                return False, None, f"Fallback chain failed: {fallback_error}"
+
+    async def get_system_degradation_status(self) -> Dict[str, Any]:
+        """
+        v87.0: Get comprehensive system degradation status.
+
+        Returns dict with:
+            - mode: Current degradation mode (full/degraded/minimal)
+            - failed_components: Set of failed component names
+            - fallback_chains: Status of each fallback chain
+            - recommendations: List of recommended actions
+        """
+        status = {
+            "mode": self._degradation_mode,
+            "failed_components": list(self._failed_components),
+            "timestamp": time.time(),
+            "recommendations": [],
+        }
+
+        # Get fallback chain statuses
+        fallback_manager = await self.get_fallback_manager()
+        if fallback_manager:
+            status["fallback_chains"] = {
+                "jprime": {
+                    "targets": [t.value for t in fallback_manager.JPRIME_CHAIN.targets],
+                    "timeout": fallback_manager.JPRIME_CHAIN.timeout_per_target,
+                },
+                "reactor": {
+                    "targets": [t.value for t in fallback_manager.REACTOR_CHAIN.targets],
+                    "timeout": fallback_manager.REACTOR_CHAIN.timeout_per_target,
+                },
+                "voice": {
+                    "targets": [t.value for t in fallback_manager.VOICE_CHAIN.targets],
+                    "timeout": fallback_manager.VOICE_CHAIN.timeout_per_target,
+                },
+            }
+
+        # Generate recommendations
+        if "jprime" in self._failed_components:
+            status["recommendations"].append(
+                "J-Prime unavailable - check JARVIS_PRIME_URL or start jarvis-prime service"
+            )
+        if "reactor" in self._failed_components:
+            status["recommendations"].append(
+                "Reactor-Core unavailable - training data will be queued locally"
+            )
+        if self._degradation_mode == "minimal":
+            status["recommendations"].append(
+                "System in minimal mode - core functionality only"
+            )
+
+        return status
 
     @classmethod
     async def get_instance(cls) -> "UnifiedStateCoordinator":
@@ -2994,6 +3266,48 @@ class UnifiedStateCoordinator:
         """
         # Store our entry point for event publishing
         self._our_entry_point = entry_point
+
+        # ═══════════════════════════════════════════════════════════════════════
+        # v87.0: Pre-flight resource checks (network partition, filesystem, etc.)
+        # ═══════════════════════════════════════════════════════════════════════
+        adv_coord = await self._ensure_advanced_coord()
+        if adv_coord:
+            try:
+                # Check for network partition (critical for NFS-mounted state)
+                is_partitioned, partition_reason = await adv_coord.check_network_partition()
+                if is_partitioned:
+                    logger.error(f"[StateCoord] v87.0 Network partition detected: {partition_reason}")
+                    raise NetworkPartitionError(partition_reason)
+
+                # Check filesystem writability
+                fs_writable, fs_reason = await adv_coord.check_filesystem_writable(self.lock_dir)
+                if not fs_writable:
+                    logger.error(f"[StateCoord] v87.0 Filesystem not writable: {fs_reason}")
+                    raise RuntimeError(f"Filesystem not writable: {fs_reason}")
+
+                # Check disk space
+                disk_ok, disk_metrics = await adv_coord.check_disk_space(self.lock_dir)
+                if not disk_ok:
+                    warnings = disk_metrics.get("warnings", ["Unknown disk issue"])
+                    logger.warning(f"[StateCoord] v87.0 Disk issues: {warnings}")
+                    # Don't fail on disk warning, but log it
+
+                # Check clock skew
+                clock_skew, skew_seconds = await adv_coord.check_clock_skew()
+                if clock_skew:
+                    logger.warning(f"[StateCoord] v87.0 Clock skew detected: {skew_seconds:.2f}s")
+                    # Don't fail on clock skew, but log it
+
+                # Register for heartbeat watchdog
+                adv_coord.register_heartbeat_watchdog(component)
+
+                logger.debug("[StateCoord] v87.0 Pre-flight checks passed")
+
+            except NetworkPartitionError:
+                raise  # Re-raise network partition errors
+            except Exception as e:
+                logger.warning(f"[StateCoord] v87.0 Pre-flight check error: {e}")
+                # Continue without advanced features if check fails
 
         # Use adaptive timeout if available
         default_timeout = float(os.getenv("JARVIS_OWNERSHIP_TIMEOUT", "30.0"))
@@ -3861,6 +4175,14 @@ class UnifiedStateCoordinator:
                         self._state_cache = state
                         self._last_cache_time = time.time()
 
+                        # v87.0: Pet the watchdog to prevent deadlock detection
+                        adv_coord = await self._ensure_advanced_coord()
+                        if adv_coord:
+                            try:
+                                adv_coord.pet_watchdog(component)
+                            except Exception as watchdog_err:
+                                logger.debug(f"[StateCoord] v87.0 Watchdog pet error: {watchdog_err}")
+
             except Exception as e:
                 logger.debug(f"[StateCoord] Heartbeat update error: {e}")
 
@@ -3874,6 +4196,14 @@ class UnifiedStateCoordinator:
                     with suppress(asyncio.CancelledError):
                         await self._heartbeat_tasks[component]
                     del self._heartbeat_tasks[component]
+
+                # v87.0: Unregister watchdog for this component
+                adv_coord = await self._ensure_advanced_coord()
+                if adv_coord:
+                    try:
+                        adv_coord.unregister_heartbeat_watchdog(component)
+                    except Exception as watchdog_err:
+                        logger.debug(f"[StateCoord] v87.0 Watchdog unregister error: {watchdog_err}")
 
                 # Close lock file (releases fcntl lock automatically)
                 if component in self._lock_fds:
@@ -5697,6 +6027,12 @@ class TrinityAdvancedCoordinator:
         """Update watchdog timestamp (call from heartbeat task)."""
         if component in self._heartbeat_watchdog:
             self._heartbeat_watchdog[component] = time.time()
+
+    def unregister_heartbeat_watchdog(self, component: str) -> None:
+        """Unregister component from watchdog monitoring."""
+        if component in self._heartbeat_watchdog:
+            del self._heartbeat_watchdog[component]
+            logger.debug(f"[TrinityAdvanced] Unregistered watchdog for {component}")
 
     async def check_heartbeat_deadlocks(self) -> List[str]:
         """

@@ -2550,6 +2550,154 @@ class SupervisorBootstrapper:
             await self._emergency_shutdown()
             return 1
 
+    async def _run_v87_preflight_checks(self) -> bool:
+        """
+        v87.0: Run pre-flight resource checks before startup.
+
+        Verifies system resources are adequate before acquiring ownership:
+        - Network partition detection (for NFS-mounted state directories)
+        - Filesystem writability
+        - Disk space availability
+        - Clock skew detection
+        - File descriptor availability
+        - Process group isolation
+
+        Returns:
+            True if all checks pass, False if critical checks fail
+        """
+        enable_preflight = os.environ.get(
+            "JARVIS_V87_PREFLIGHT", "true"
+        ).lower() in ("1", "true", "yes")
+
+        if not enable_preflight:
+            self.logger.info("[v87.0] Pre-flight checks disabled via JARVIS_V87_PREFLIGHT=false")
+            return True
+
+        self.logger.info("[v87.0] Running pre-flight resource checks...")
+        TerminalUI.print_step("[v87.0] Pre-flight checks")
+
+        warnings: List[str] = []
+        critical_failures: List[str] = []
+
+        try:
+            from backend.core.trinity_integrator import TrinityAdvancedCoordinator
+
+            # Create a temporary coordinator for pre-flight checks
+            coord = TrinityAdvancedCoordinator()
+            await coord.initialize()
+
+            # 1. Network partition check (critical for NFS-mounted state)
+            try:
+                is_partitioned, reason = await coord.check_network_partition()
+                if is_partitioned:
+                    critical_failures.append(f"Network partition: {reason}")
+                    self.logger.error(f"[v87.0] ❌ Network partition detected: {reason}")
+                else:
+                    self.logger.debug(f"[v87.0] ✓ Network OK: {reason}")
+            except Exception as e:
+                warnings.append(f"Network check error: {e}")
+                self.logger.warning(f"[v87.0] Network check error (non-critical): {e}")
+
+            # 2. Filesystem writability check
+            try:
+                state_dir = Path(os.environ.get("TRINITY_STATE_DIR", str(Path.home() / ".jarvis" / "trinity")))
+                fs_ok, fs_reason = await coord.check_filesystem_writable(state_dir)
+                if not fs_ok:
+                    critical_failures.append(f"Filesystem: {fs_reason}")
+                    self.logger.error(f"[v87.0] ❌ Filesystem not writable: {fs_reason}")
+                else:
+                    self.logger.debug(f"[v87.0] ✓ Filesystem OK: {fs_reason}")
+            except Exception as e:
+                warnings.append(f"Filesystem check error: {e}")
+                self.logger.warning(f"[v87.0] Filesystem check error (non-critical): {e}")
+
+            # 3. Disk space check
+            try:
+                disk_ok, disk_metrics = await coord.check_disk_space(state_dir)
+                if not disk_ok:
+                    disk_warnings = disk_metrics.get("warnings", ["Low disk space"])
+                    warnings.extend(disk_warnings)
+                    for dw in disk_warnings:
+                        self.logger.warning(f"[v87.0] ⚠ Disk warning: {dw}")
+                else:
+                    free_pct = disk_metrics.get("free_percent", 0)
+                    self.logger.debug(f"[v87.0] ✓ Disk OK: {free_pct:.1f}% free")
+            except Exception as e:
+                warnings.append(f"Disk check error: {e}")
+                self.logger.warning(f"[v87.0] Disk check error (non-critical): {e}")
+
+            # 4. Clock skew detection
+            try:
+                has_skew, skew_seconds = await coord.check_clock_skew()
+                if has_skew:
+                    warnings.append(f"Clock skew: {skew_seconds:.2f}s")
+                    self.logger.warning(f"[v87.0] ⚠ Clock skew detected: {skew_seconds:.2f}s")
+                else:
+                    self.logger.debug(f"[v87.0] ✓ Clock OK: skew {skew_seconds:.2f}s")
+            except Exception as e:
+                warnings.append(f"Clock check error: {e}")
+                self.logger.warning(f"[v87.0] Clock check error (non-critical): {e}")
+
+            # 5. File descriptor check
+            try:
+                fd_ok, fd_metrics = await coord.check_file_descriptors()
+                fd_count = fd_metrics.get("current", 0)
+                fd_limit = fd_metrics.get("soft_limit", 0)
+                if not fd_ok:
+                    fd_warnings = fd_metrics.get("warnings", [])
+                    for fw in fd_warnings:
+                        warnings.append(fw)
+                    self.logger.warning(f"[v87.0] ⚠ FD issues: {fd_count}/{fd_limit}")
+                else:
+                    pct_used = fd_metrics.get("percent_used", 0)
+                    self.logger.debug(f"[v87.0] ✓ FD OK: {fd_count}/{fd_limit} ({pct_used:.1f}% used)")
+            except Exception as e:
+                warnings.append(f"FD check error: {e}")
+                self.logger.warning(f"[v87.0] FD check error (non-critical): {e}")
+
+            # 6. Process group isolation check
+            try:
+                from backend.core.trinity_integrator import UnifiedStateCoordinator
+                temp_coord = UnifiedStateCoordinator()
+                isolated, isolation_reason = await temp_coord.verify_process_isolation()
+                if not isolated:
+                    warnings.append(f"Process isolation: {isolation_reason}")
+                    self.logger.warning(f"[v87.0] ⚠ Process isolation issue: {isolation_reason}")
+                else:
+                    self.logger.debug(f"[v87.0] ✓ Process isolation OK: {isolation_reason}")
+            except Exception as e:
+                warnings.append(f"Process isolation check error: {e}")
+                self.logger.debug(f"[v87.0] Process isolation check error: {e}")
+
+            # Cleanup temporary coordinator
+            await coord.shutdown()
+
+        except ImportError as e:
+            # TrinityAdvancedCoordinator not available - skip advanced checks
+            self.logger.info(f"[v87.0] Advanced coordinator not available, using basic checks: {e}")
+
+        except Exception as e:
+            self.logger.warning(f"[v87.0] Pre-flight check error (continuing anyway): {e}")
+            # Don't fail on pre-flight errors - just log and continue
+
+        # Report results
+        if critical_failures:
+            self.logger.error(f"[v87.0] ❌ {len(critical_failures)} CRITICAL failures:")
+            for failure in critical_failures:
+                self.logger.error(f"  - {failure}")
+                TerminalUI.print_error(f"[v87.0] {failure}")
+            return False
+
+        if warnings:
+            self.logger.warning(f"[v87.0] ⚠ {len(warnings)} warnings (continuing):")
+            for warning in warnings:
+                self.logger.warning(f"  - {warning}")
+            TerminalUI.print_warning(f"[v87.0] {len(warnings)} warnings - check logs")
+
+        self.logger.info("[v87.0] ✅ Pre-flight checks passed")
+        TerminalUI.print_success("[v87.0] Pre-flight checks passed")
+        return True
+
     async def _emergency_shutdown(self) -> None:
         """v80.0: Emergency shutdown when startup times out."""
         self.logger.warning("🚨 Emergency shutdown initiated")
@@ -2642,6 +2790,19 @@ class SupervisorBootstrapper:
 
             self.logger.info(f"{icon} [HYPER-RUNTIME] {_HYPER_RUNTIME_NAME} Engine ACTIVE - {desc}")
             TerminalUI.print_success(f"Hyper-Runtime: {_HYPER_RUNTIME_NAME} (Level {_HYPER_RUNTIME_LEVEL}/3)")
+
+            # ═══════════════════════════════════════════════════════════════════
+            # v87.0: Pre-Flight Resource Checks
+            # ═══════════════════════════════════════════════════════════════════
+            # Verify system resources before attempting to acquire ownership.
+            # This catches network partitions, filesystem issues, disk space
+            # problems, and clock skew early in startup.
+            # ═══════════════════════════════════════════════════════════════════
+            preflight_passed = await self._run_v87_preflight_checks()
+            if not preflight_passed:
+                self.logger.error("[v87.0] ❌ Pre-flight checks failed - aborting startup")
+                TerminalUI.print_error("[v87.0] Pre-flight checks failed")
+                return 1
 
             # ═══════════════════════════════════════════════════════════════════
             # v85.0: Unified State Coordination - Acquire Exclusive Ownership
