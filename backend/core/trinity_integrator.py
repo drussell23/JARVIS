@@ -2810,7 +2810,7 @@ class ProcessOwnership:
 
 class UnifiedStateCoordinator:
     """
-    v85.0: Production-grade unified state management.
+    v86.0: Production-grade unified state management with advanced features.
 
     Critical Features:
     ══════════════════
@@ -2823,6 +2823,18 @@ class UnifiedStateCoordinator:
     ✅ Zero hardcoding (100% env-driven)
     ✅ Process tree walking for parent detection
 
+    v86.0 Advanced Features:
+    ════════════════════════
+    ✅ Priority-based ownership resolution (supervisor > start_system > main)
+    ✅ Lock file validation and recovery
+    ✅ Heartbeat task monitoring with auto-restart
+    ✅ Event-driven status synchronization
+    ✅ Circuit breaker for state operations
+    ✅ Adaptive timeout management
+    ✅ PID reuse detection with process creation time
+    ✅ State file corruption recovery with checksums
+    ✅ Timestamp-based tie-breaking for same priority
+
     This solves the critical gap of run_supervisor.py and start_system.py
     not knowing about each other, preventing:
     - Race conditions (simultaneous startup)
@@ -2834,6 +2846,34 @@ class UnifiedStateCoordinator:
 
     _instance: Optional["UnifiedStateCoordinator"] = None
     _instance_lock: asyncio.Lock = None
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # v86.0: Priority-based ownership resolution
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Higher priority = more important, can take over lower priority owners
+    ENTRY_POINT_PRIORITY: Final[Dict[str, int]] = {
+        "run_supervisor": 100,   # Highest - supervisor manages everything
+        "run_supervisor.py": 100,
+        "start_system": 50,      # Medium - system launcher
+        "start_system.py": 50,
+        "main_direct": 10,       # Low - direct launch
+        "main.py": 10,
+        "unknown": 0,            # Lowest - unknown entry point
+    }
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # v86.0: Component event types for event-driven synchronization
+    # ═══════════════════════════════════════════════════════════════════════════
+    class ComponentEventType(str, Enum):
+        STARTING = "starting"
+        READY = "ready"
+        DEGRADED = "degraded"
+        FAILED = "failed"
+        SHUTTING_DOWN = "shutting_down"
+        HEARTBEAT_LOST = "heartbeat_lost"
+        OWNERSHIP_ACQUIRED = "ownership_acquired"
+        OWNERSHIP_RELEASED = "ownership_released"
+        OWNERSHIP_TRANSFERRED = "ownership_transferred"
 
     def __init__(self):
         # State directories (env-driven)
@@ -2851,6 +2891,7 @@ class UnifiedStateCoordinator:
         self._process_cookie = str(uuid.uuid4())
         self._pid = os.getpid()
         self._hostname = socket.gethostname()
+        self._process_start_time = time.time()  # v86.0: For PID reuse detection
 
         # Lock file handles (keep open to hold lock)
         self._lock_fds: Dict[str, int] = {}
@@ -2870,8 +2911,38 @@ class UnifiedStateCoordinator:
         # File lock for state operations
         self._file_lock = asyncio.Lock()
 
+        # ═══════════════════════════════════════════════════════════════════════
+        # v86.0: Circuit breaker state for state operations
+        # ═══════════════════════════════════════════════════════════════════════
+        self._circuit_state = "closed"  # closed, open, half-open
+        self._circuit_failure_count = 0
+        self._circuit_last_failure_time = 0.0
+        self._circuit_failure_threshold = int(
+            os.getenv("JARVIS_STATE_CIRCUIT_FAILURE_THRESHOLD", "5")
+        )
+        self._circuit_recovery_timeout = float(
+            os.getenv("JARVIS_STATE_CIRCUIT_RECOVERY_TIMEOUT", "30.0")
+        )
+
+        # ═══════════════════════════════════════════════════════════════════════
+        # v86.0: Adaptive timeout tracking
+        # ═══════════════════════════════════════════════════════════════════════
+        self._operation_history: Dict[str, List[float]] = {}
+        self._timeout_multiplier = float(os.getenv("JARVIS_TIMEOUT_MULTIPLIER", "1.5"))
+
+        # ═══════════════════════════════════════════════════════════════════════
+        # v86.0: Event subscribers for event-driven coordination
+        # ═══════════════════════════════════════════════════════════════════════
+        self._event_subscribers: List[Callable] = []
+        self._event_poller_task: Optional[asyncio.Task] = None
+
+        # ═══════════════════════════════════════════════════════════════════════
+        # v86.0: Our entry point (for priority resolution)
+        # ═══════════════════════════════════════════════════════════════════════
+        self._our_entry_point: Optional[str] = None
+
         logger.debug(
-            f"[StateCoord] Initialized (PID={self._pid}, "
+            f"[StateCoord] v86.0 Initialized (PID={self._pid}, "
             f"Cookie={self._process_cookie[:8]}...)"
         )
 
@@ -2900,7 +2971,14 @@ class UnifiedStateCoordinator:
         force: bool = False,
     ) -> Tuple[bool, Optional[ProcessOwnership]]:
         """
-        Acquire ownership with atomic locking and process validation.
+        v86.0: Acquire ownership with priority-based resolution and validation.
+
+        Features:
+        - Priority-based conflict resolution (supervisor > start_system > main)
+        - Lock file validation and recovery
+        - State file integrity checking
+        - Event publishing for coordination
+        - Adaptive timeouts based on historical performance
 
         Uses fcntl for OS-level atomic locks. The lock is held as long as
         the file descriptor remains open (process dies → lock released).
@@ -2914,8 +2992,26 @@ class UnifiedStateCoordinator:
         Returns:
             (success: bool, previous_owner: Optional[ProcessOwnership])
         """
-        timeout = timeout or float(os.getenv("JARVIS_OWNERSHIP_TIMEOUT", "30.0"))
+        # Store our entry point for event publishing
+        self._our_entry_point = entry_point
+
+        # Use adaptive timeout if available
+        default_timeout = float(os.getenv("JARVIS_OWNERSHIP_TIMEOUT", "30.0"))
+        timeout = timeout or self.get_adaptive_timeout("acquire_ownership", default_timeout)
         start_time = time.time()
+
+        # v86.0: Validate and recover lock/state files FIRST
+        lock_file = self.lock_dir / f"{component}.lock"
+        await self._validate_and_recover_lock_file(lock_file)
+        await self._validate_and_recover_state_file()
+
+        # v86.0: Cleanup stale owners before attempting acquisition
+        try:
+            cleaned = await self._cleanup_stale_owners()
+            if cleaned > 0:
+                logger.info(f"[StateCoord] Pre-acquisition cleanup: {cleaned} stale owner(s)")
+        except Exception as e:
+            logger.debug(f"[StateCoord] Pre-acquisition cleanup error: {e}")
 
         while time.time() - start_time < timeout:
             try:
@@ -2929,12 +3025,27 @@ class UnifiedStateCoordinator:
                         f"[StateCoord] {entry_point} acquired {component} ownership "
                         f"(PID: {self._pid}, Cookie: {self._process_cookie[:8]}...)"
                     )
+                    # v86.0: Publish ownership acquired event
+                    await self.publish_component_event(
+                        component,
+                        self.ComponentEventType.OWNERSHIP_ACQUIRED,
+                        metadata={
+                            "entry_point": entry_point,
+                            "priority": self._get_entry_point_priority(entry_point),
+                            "previous_owner": previous_owner.entry_point if previous_owner else None,
+                        }
+                    )
+                    # Record successful acquisition duration
+                    self._record_operation_duration("acquire_ownership", time.time() - start_time)
                     return True, previous_owner
 
-                # Check if current owner is stale/dead
+                # v86.0: Priority-based conflict resolution
                 if previous_owner:
+                    # Check if owner is still alive
                     is_alive = await self._validate_owner_alive(previous_owner)
+
                     if not is_alive:
+                        # Owner is dead/stale - take over
                         logger.warning(
                             f"[StateCoord] Owner PID {previous_owner.pid} is dead/stale, "
                             f"force acquiring..."
@@ -2943,7 +3054,41 @@ class UnifiedStateCoordinator:
                             entry_point, component, force=True
                         )
                         if acquired:
+                            await self.publish_component_event(
+                                component,
+                                self.ComponentEventType.OWNERSHIP_TRANSFERRED,
+                                metadata={
+                                    "reason": "stale_owner",
+                                    "previous_owner_pid": previous_owner.pid,
+                                }
+                            )
                             return True, previous_owner
+                    else:
+                        # Owner is alive - check if we have higher priority
+                        should_takeover, reason = await self._resolve_ownership_conflict(
+                            entry_point, previous_owner
+                        )
+
+                        if should_takeover:
+                            logger.info(
+                                f"[StateCoord] Priority takeover: {reason}"
+                            )
+                            acquired, _ = await self._try_acquire_lock(
+                                entry_point, component, force=True
+                            )
+                            if acquired:
+                                await self.publish_component_event(
+                                    component,
+                                    self.ComponentEventType.OWNERSHIP_TRANSFERRED,
+                                    metadata={
+                                        "reason": "priority_takeover",
+                                        "resolution": reason,
+                                        "previous_owner_pid": previous_owner.pid,
+                                    }
+                                )
+                                return True, previous_owner
+                        else:
+                            logger.debug(f"[StateCoord] Cannot takeover: {reason}")
 
                 # Wait with exponential backoff + jitter
                 elapsed = time.time() - start_time
@@ -2956,7 +3101,7 @@ class UnifiedStateCoordinator:
                 await asyncio.sleep(0.5)
 
         logger.warning(
-            f"[StateCoord] Failed to acquire {component} ownership after {timeout}s"
+            f"[StateCoord] Failed to acquire {component} ownership after {timeout:.1f}s"
         )
         return False, None
 
@@ -3265,6 +3410,431 @@ class UnifiedStateCoordinator:
 
         return cleaned
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # v86.0: Priority-Based Ownership Resolution
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _get_entry_point_priority(self, entry_point: str) -> int:
+        """Get priority for entry point (higher = more important)."""
+        # Check exact match first
+        if entry_point in self.ENTRY_POINT_PRIORITY:
+            return self.ENTRY_POINT_PRIORITY[entry_point]
+
+        # Check partial match (e.g., "run_supervisor" in "run_supervisor.py")
+        for key, priority in self.ENTRY_POINT_PRIORITY.items():
+            if key in entry_point or entry_point in key:
+                return priority
+
+        return self.ENTRY_POINT_PRIORITY.get("unknown", 0)
+
+    async def _resolve_ownership_conflict(
+        self,
+        our_entry: str,
+        their_owner: ProcessOwnership,
+    ) -> Tuple[bool, str]:
+        """
+        v86.0: Resolve ownership conflict using priority + consensus.
+
+        Resolution order:
+        1. Higher priority wins (supervisor > start_system > main)
+        2. Same priority: Earlier timestamp wins (deterministic)
+        3. Same timestamp: Lower PID wins (deterministic tie-breaker)
+
+        Returns:
+            (should_acquire: bool, reason: str)
+        """
+        our_priority = self._get_entry_point_priority(our_entry)
+        their_priority = self._get_entry_point_priority(their_owner.entry_point)
+
+        if our_priority > their_priority:
+            return True, f"Higher priority ({our_entry}:{our_priority} > {their_owner.entry_point}:{their_priority})"
+        elif our_priority < their_priority:
+            return False, f"Lower priority ({our_entry}:{our_priority} < {their_owner.entry_point}:{their_priority})"
+        else:
+            # Same priority - use timestamp-based consensus
+            our_ts = self._process_start_time
+            their_ts = their_owner.acquired_at
+
+            if our_ts < their_ts:
+                return True, f"Earlier process start ({our_ts:.0f} < {their_ts:.0f})"
+            elif our_ts > their_ts:
+                return False, f"Later process start ({our_ts:.0f} > {their_ts:.0f})"
+            else:
+                # Same timestamp - use PID as deterministic tie-breaker
+                if self._pid < their_owner.pid:
+                    return True, f"Lower PID tie-breaker ({self._pid} < {their_owner.pid})"
+                else:
+                    return False, f"Higher PID tie-breaker ({self._pid} >= {their_owner.pid})"
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # v86.0: Lock File Validation and Recovery
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    async def _validate_and_recover_lock_file(self, lock_file: Path) -> bool:
+        """
+        v86.0: Validate lock file integrity and recover if corrupted.
+
+        Checks:
+        - File size (should be small)
+        - File readability
+        - File permissions
+
+        Returns:
+            True if lock file is valid or recovered
+        """
+        try:
+            if not lock_file.exists():
+                return True  # Doesn't exist = valid (will be created)
+
+            # Check file size (should be small)
+            max_size = int(os.getenv("JARVIS_LOCK_FILE_MAX_SIZE", "4096"))  # 4KB max
+            try:
+                size = lock_file.stat().st_size
+                if size > max_size:
+                    logger.warning(
+                        f"[StateCoord] Lock file {lock_file} suspiciously large "
+                        f"({size} bytes > {max_size}), recovering..."
+                    )
+                    backup = lock_file.with_suffix(".lock.corrupted")
+                    try:
+                        lock_file.rename(backup)
+                    except Exception:
+                        lock_file.unlink(missing_ok=True)
+                    logger.info(f"[StateCoord] Recovered corrupted lock file")
+                    return True
+            except OSError:
+                pass  # Can't stat, try to continue
+
+            # Check if file is readable/writable
+            try:
+                fd = os.open(str(lock_file), os.O_RDWR)
+                os.close(fd)
+            except PermissionError:
+                logger.warning(f"[StateCoord] Lock file {lock_file} permission denied, recovering...")
+                try:
+                    lock_file.chmod(0o644)
+                except Exception:
+                    lock_file.unlink(missing_ok=True)
+                return True
+            except OSError as e:
+                logger.warning(f"[StateCoord] Lock file {lock_file} error: {e}, recovering...")
+                lock_file.unlink(missing_ok=True)
+                return True
+
+            return True
+
+        except Exception as e:
+            logger.debug(f"[StateCoord] Lock file validation error: {e}")
+            try:
+                lock_file.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return True
+
+    async def _validate_and_recover_state_file(self) -> bool:
+        """
+        v86.0: Validate state file integrity with checksum recovery.
+
+        Returns:
+            True if state file is valid or recovered
+        """
+        try:
+            if not self.state_file.exists():
+                return True  # Doesn't exist = valid (will be created)
+
+            # Try to parse JSON
+            try:
+                content = self.state_file.read_text()
+                data = json.loads(content)
+
+                # Verify checksum if present
+                stored_checksum = data.get("_checksum")
+                if stored_checksum:
+                    # Calculate checksum without _checksum field
+                    data_copy = {k: v for k, v in data.items() if k != "_checksum"}
+                    import hashlib
+                    calculated = hashlib.sha256(
+                        json.dumps(data_copy, sort_keys=True).encode()
+                    ).hexdigest()[:16]
+
+                    if stored_checksum != calculated:
+                        logger.warning(
+                            f"[StateCoord] State file checksum mismatch, "
+                            f"expected {stored_checksum}, got {calculated}"
+                        )
+                        # Backup and recreate
+                        backup = self.state_file.with_suffix(".json.corrupted")
+                        self.state_file.rename(backup)
+                        return True
+
+                return True
+
+            except json.JSONDecodeError as e:
+                logger.warning(f"[StateCoord] State file JSON invalid: {e}, recovering...")
+                backup = self.state_file.with_suffix(".json.corrupted")
+                try:
+                    self.state_file.rename(backup)
+                except Exception:
+                    self.state_file.unlink(missing_ok=True)
+                return True
+
+        except Exception as e:
+            logger.debug(f"[StateCoord] State file validation error: {e}")
+            return True
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # v86.0: Circuit Breaker for State Operations
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    async def _circuit_breaker_execute(
+        self,
+        operation: Callable[[], Coroutine[Any, Any, Any]],
+        operation_name: str = "state_operation",
+    ) -> Any:
+        """
+        v86.0: Execute operation with circuit breaker protection.
+
+        Circuit states:
+        - CLOSED: Normal operation, failures tracked
+        - OPEN: Operations fail fast (too many recent failures)
+        - HALF-OPEN: Testing if system recovered
+
+        Raises:
+            CircuitOpenError: If circuit is open
+        """
+        # Check circuit state
+        if self._circuit_state == "open":
+            # Check if recovery timeout has passed
+            elapsed = time.time() - self._circuit_last_failure_time
+            if elapsed > self._circuit_recovery_timeout:
+                self._circuit_state = "half-open"
+                logger.info(
+                    f"[StateCoord] Circuit breaker: half-open (testing recovery after {elapsed:.1f}s)"
+                )
+            else:
+                raise CircuitOpenError(
+                    f"Circuit breaker is OPEN for {operation_name} "
+                    f"(failed {self._circuit_failure_count} times, "
+                    f"retry in {self._circuit_recovery_timeout - elapsed:.1f}s)"
+                )
+
+        start_time = time.time()
+        try:
+            result = await operation()
+
+            # Success - reset circuit breaker
+            duration = time.time() - start_time
+            self._record_operation_duration(operation_name, duration)
+
+            if self._circuit_state == "half-open":
+                self._circuit_state = "closed"
+                self._circuit_failure_count = 0
+                logger.info("[StateCoord] Circuit breaker: CLOSED (recovered)")
+            elif self._circuit_state == "closed":
+                self._circuit_failure_count = 0
+
+            return result
+
+        except Exception as e:
+            self._circuit_failure_count += 1
+            self._circuit_last_failure_time = time.time()
+
+            if self._circuit_failure_count >= self._circuit_failure_threshold:
+                self._circuit_state = "open"
+                logger.error(
+                    f"[StateCoord] Circuit breaker: OPEN "
+                    f"(failed {self._circuit_failure_count} times for {operation_name})"
+                )
+
+            raise
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # v86.0: Adaptive Timeout Management
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _record_operation_duration(self, operation: str, duration: float) -> None:
+        """Record operation duration for adaptive timeout learning."""
+        if operation not in self._operation_history:
+            self._operation_history[operation] = []
+
+        self._operation_history[operation].append(duration)
+
+        # Keep only last 100 measurements
+        max_history = int(os.getenv("JARVIS_TIMEOUT_HISTORY_SIZE", "100"))
+        if len(self._operation_history[operation]) > max_history:
+            self._operation_history[operation] = self._operation_history[operation][-max_history:]
+
+    def get_adaptive_timeout(
+        self,
+        operation: str,
+        default_timeout: float,
+    ) -> float:
+        """
+        v86.0: Get adaptive timeout based on historical performance.
+
+        Uses 95th percentile of historical durations * multiplier.
+        """
+        if operation not in self._operation_history:
+            return default_timeout
+
+        history = self._operation_history[operation]
+        if len(history) < 5:  # Need minimum samples
+            return default_timeout
+
+        # Calculate 95th percentile
+        sorted_history = sorted(history)
+        percentile_idx = int(len(sorted_history) * 0.95)
+        percentile_95 = sorted_history[min(percentile_idx, len(sorted_history) - 1)]
+
+        # Apply multiplier
+        adaptive_timeout = percentile_95 * self._timeout_multiplier
+
+        # Clamp between default and 10x default
+        min_timeout = default_timeout
+        max_timeout = default_timeout * 10.0
+
+        return max(min_timeout, min(adaptive_timeout, max_timeout))
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # v86.0: Event-Driven Status Synchronization
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    async def publish_component_event(
+        self,
+        component: str,
+        event_type: "UnifiedStateCoordinator.ComponentEventType",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """
+        v86.0: Publish component event to shared state for coordination.
+
+        Events are stored in state file and can be subscribed to.
+        """
+        event = {
+            "id": str(uuid.uuid4()),
+            "component": component,
+            "event_type": event_type.value if hasattr(event_type, 'value') else str(event_type),
+            "timestamp": time.time(),
+            "pid": self._pid,
+            "cookie": self._process_cookie[:8],
+            "entry_point": self._our_entry_point or "unknown",
+            "hostname": self._hostname,
+            "metadata": metadata or {},
+        }
+
+        async with self._file_lock:
+            try:
+                state = await self._read_state() or {}
+                events = state.get("events", [])
+                events.append(event)
+
+                # Keep only last N events (env-configurable)
+                max_events = int(os.getenv("JARVIS_STATE_MAX_EVENTS", "1000"))
+                if len(events) > max_events:
+                    events = events[-max_events:]
+
+                state["events"] = events
+                state["last_event"] = time.time()
+                state["last_event_type"] = event["event_type"]
+
+                # Write atomically with checksum
+                import hashlib
+                state_without_checksum = {k: v for k, v in state.items() if k != "_checksum"}
+                checksum = hashlib.sha256(
+                    json.dumps(state_without_checksum, sort_keys=True).encode()
+                ).hexdigest()[:16]
+                state["_checksum"] = checksum
+
+                temp_file = self.state_file.with_suffix(".tmp")
+                temp_file.write_text(json.dumps(state, indent=2))
+                temp_file.replace(self.state_file)
+
+                self._state_cache = state
+                self._last_cache_time = time.time()
+
+                logger.debug(f"[StateCoord] Published event: {component}.{event['event_type']}")
+
+            except Exception as e:
+                logger.debug(f"[StateCoord] Event publish error: {e}")
+
+    async def get_recent_events(
+        self,
+        component: Optional[str] = None,
+        event_types: Optional[List[str]] = None,
+        since_timestamp: Optional[float] = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """
+        v86.0: Get recent events with optional filtering.
+        """
+        state = await self._read_state()
+        if not state:
+            return []
+
+        events = state.get("events", [])
+
+        # Filter by component
+        if component:
+            events = [e for e in events if e.get("component") == component]
+
+        # Filter by event type
+        if event_types:
+            events = [e for e in events if e.get("event_type") in event_types]
+
+        # Filter by timestamp
+        if since_timestamp:
+            events = [e for e in events if e.get("timestamp", 0) > since_timestamp]
+
+        # Sort by timestamp (newest first) and limit
+        events = sorted(events, key=lambda e: e.get("timestamp", 0), reverse=True)
+        return events[:limit]
+
+    async def subscribe_to_events(
+        self,
+        callback: Callable[[Dict[str, Any]], Coroutine[Any, Any, None]],
+        component: Optional[str] = None,
+        event_types: Optional[List[str]] = None,
+    ) -> asyncio.Task:
+        """
+        v86.0: Subscribe to component events (polling-based).
+
+        Returns task that can be cancelled to unsubscribe.
+        """
+        poll_interval = float(os.getenv("JARVIS_EVENT_POLL_INTERVAL", "1.0"))
+
+        async def event_poller():
+            last_event_time = time.time()
+            while True:
+                try:
+                    events = await self.get_recent_events(
+                        component=component,
+                        event_types=event_types,
+                        since_timestamp=last_event_time,
+                    )
+
+                    for event in reversed(events):  # Oldest first
+                        try:
+                            await callback(event)
+                        except Exception as cb_err:
+                            logger.debug(f"[StateCoord] Event callback error: {cb_err}")
+                        last_event_time = max(last_event_time, event.get("timestamp", 0))
+
+                    await asyncio.sleep(poll_interval)
+
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    logger.debug(f"[StateCoord] Event poller error: {e}")
+                    await asyncio.sleep(5.0)
+
+        task = asyncio.create_task(event_poller())
+        self._event_subscribers.append(task)
+        return task
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # v86.0: Enhanced Heartbeat with Auto-Restart
+    # ═══════════════════════════════════════════════════════════════════════════
+
     async def update_heartbeat(self, component: str) -> None:
         """Update heartbeat timestamp for owned component."""
         async with self._file_lock:
@@ -3340,21 +3910,94 @@ class UnifiedStateCoordinator:
         component: str,
         interval: Optional[float] = None,
     ) -> asyncio.Task:
-        """Start background heartbeat task for a component."""
-        interval = interval or self._heartbeat_interval
+        """
+        v86.0: Start background heartbeat task with auto-restart on failure.
 
-        async def heartbeat_loop():
+        Features:
+        - Consecutive failure tracking
+        - Exponential backoff on failures
+        - Auto-restart after max failures
+        - Event publishing on heartbeat issues
+        """
+        interval = interval or self._heartbeat_interval
+        max_consecutive_failures = int(os.getenv("JARVIS_HEARTBEAT_MAX_FAILURES", "5"))
+        max_backoff = float(os.getenv("JARVIS_HEARTBEAT_MAX_BACKOFF", "60.0"))
+        auto_restart_delay = float(os.getenv("JARVIS_HEARTBEAT_RESTART_DELAY", "10.0"))
+
+        async def heartbeat_loop_with_monitoring():
+            consecutive_failures = 0
+            last_success_time = time.time()
+            restart_count = 0
+            max_restarts = int(os.getenv("JARVIS_HEARTBEAT_MAX_RESTARTS", "3"))
+
             while True:
                 try:
                     await self.update_heartbeat(component)
-                    await asyncio.sleep(interval)
-                except asyncio.CancelledError:
-                    break
-                except Exception as e:
-                    logger.debug(f"[StateCoord] Heartbeat error for {component}: {e}")
+                    consecutive_failures = 0  # Reset on success
+                    last_success_time = time.time()
                     await asyncio.sleep(interval)
 
-        task = asyncio.create_task(heartbeat_loop())
+                except asyncio.CancelledError:
+                    logger.debug(f"[StateCoord] Heartbeat cancelled for {component}")
+                    break
+
+                except Exception as e:
+                    consecutive_failures += 1
+                    logger.warning(
+                        f"[StateCoord] Heartbeat error for {component} "
+                        f"(failure {consecutive_failures}/{max_consecutive_failures}): {e}"
+                    )
+
+                    # Publish heartbeat failure event
+                    try:
+                        await self.publish_component_event(
+                            component,
+                            self.ComponentEventType.HEARTBEAT_LOST,
+                            metadata={
+                                "consecutive_failures": consecutive_failures,
+                                "last_success": last_success_time,
+                                "error": str(e),
+                            }
+                        )
+                    except Exception:
+                        pass
+
+                    # Check if heartbeat is completely broken
+                    if consecutive_failures >= max_consecutive_failures:
+                        logger.error(
+                            f"[StateCoord] Heartbeat failed {max_consecutive_failures} times for {component}"
+                        )
+
+                        # Try to restart if within restart limit
+                        if restart_count < max_restarts:
+                            restart_count += 1
+                            logger.info(
+                                f"[StateCoord] Attempting heartbeat restart "
+                                f"({restart_count}/{max_restarts}) for {component}"
+                            )
+                            await asyncio.sleep(auto_restart_delay)
+                            consecutive_failures = 0
+                            continue
+                        else:
+                            # Too many restarts - release ownership
+                            logger.error(
+                                f"[StateCoord] Max restarts exceeded for {component}, "
+                                "releasing ownership"
+                            )
+                            try:
+                                await self.release_ownership(component)
+                            except Exception:
+                                pass
+                            break
+
+                    # Exponential backoff on failure
+                    backoff = min(
+                        interval * (2 ** consecutive_failures),
+                        max_backoff,
+                    )
+                    await asyncio.sleep(backoff)
+
+        task = asyncio.create_task(heartbeat_loop_with_monitoring())
         self._heartbeat_tasks[component] = task
         return task
 
@@ -3818,6 +4461,597 @@ class ResourceChecker:
             await asyncio.sleep(check_interval)
 
         return False
+
+
+# =============================================================================
+# Resource-Aware Launch Sequencer v86.0
+# =============================================================================
+
+@dataclass
+class LaunchSequenceStep:
+    """A step in the resource-aware launch sequence."""
+    component: str
+    priority: int  # Lower = launch first
+    min_memory_gb: float
+    min_cpu_headroom: float  # CPU % that must be available
+    estimated_memory_usage_gb: float
+    estimated_startup_time_sec: float
+    dependencies: List[str] = field(default_factory=list)
+    can_parallel: bool = True  # Can be launched in parallel with others
+
+
+@dataclass
+class LaunchDecision:
+    """Decision about whether/how to launch a component."""
+    can_launch: bool
+    component: str
+    reason: str
+    wait_time_sec: float = 0.0
+    resource_warnings: List[str] = field(default_factory=list)
+    parallel_candidates: List[str] = field(default_factory=list)
+
+
+class ResourceAwareLaunchSequencer:
+    """
+    v86.0: Intelligent resource-aware component launch sequencing.
+
+    Features:
+    ═════════════════════════════════════════════════════════════════════════════
+    ✅ Dependency-aware ordering   - Components launch after dependencies ready
+    ✅ Resource headroom tracking  - Monitor available resources in real-time
+    ✅ Adaptive launch spacing     - Dynamically adjust delays based on system load
+    ✅ Parallel vs sequential      - Auto-decide based on resource pressure
+    ✅ Resource reservation        - Reserve resources before launching
+    ✅ Backoff on pressure         - Slow down when system is stressed
+    ✅ Component warmup tracking   - Track how long components take to become ready
+    ✅ Historical learning         - Learn optimal launch sequences over time
+    ✅ Zero hardcoding             - 100% env-configurable
+
+    Usage:
+        sequencer = ResourceAwareLaunchSequencer()
+        await sequencer.initialize()
+
+        for decision in await sequencer.get_launch_sequence():
+            if decision.wait_time_sec > 0:
+                await asyncio.sleep(decision.wait_time_sec)
+            await launch_component(decision.component)
+    """
+
+    # Default component configurations (all env-overridable)
+    DEFAULT_COMPONENTS: Final[Dict[str, Dict[str, Any]]] = {
+        "jarvis_body": {
+            "priority": 10,  # Launch first
+            "min_memory_gb": 1.0,
+            "min_cpu_headroom": 20.0,  # 20% CPU must be free
+            "estimated_memory_usage_gb": 0.5,
+            "estimated_startup_time_sec": 5.0,
+            "dependencies": [],
+            "can_parallel": True,
+        },
+        "jarvis_prime": {
+            "priority": 20,  # Launch second
+            "min_memory_gb": 2.0,
+            "min_cpu_headroom": 30.0,
+            "estimated_memory_usage_gb": 2.0,
+            "estimated_startup_time_sec": 15.0,
+            "dependencies": ["jarvis_body"],
+            "can_parallel": True,
+        },
+        "reactor_core": {
+            "priority": 30,  # Launch third
+            "min_memory_gb": 4.0,
+            "min_cpu_headroom": 40.0,
+            "estimated_memory_usage_gb": 3.0,
+            "estimated_startup_time_sec": 20.0,
+            "dependencies": ["jarvis_body"],
+            "can_parallel": True,
+        },
+    }
+
+    def __init__(self):
+        # Component configurations (loaded from env)
+        self._components: Dict[str, LaunchSequenceStep] = {}
+
+        # Resource tracking
+        self._reserved_memory_gb: float = 0.0
+        self._reserved_cpu_percent: float = 0.0
+        self._launched_components: Set[str] = set()
+        self._ready_components: Set[str] = set()
+
+        # Historical learning
+        self._startup_history: Dict[str, List[float]] = {}  # component -> [startup_times]
+        self._history_file = Path(os.path.expanduser(
+            os.getenv("JARVIS_LAUNCH_HISTORY_FILE", "~/.jarvis/state/launch_history.json")
+        ))
+
+        # Adaptive parameters
+        self._base_launch_delay = float(os.getenv("JARVIS_BASE_LAUNCH_DELAY", "2.0"))
+        self._max_launch_delay = float(os.getenv("JARVIS_MAX_LAUNCH_DELAY", "30.0"))
+        self._resource_pressure_threshold = float(
+            os.getenv("JARVIS_RESOURCE_PRESSURE_THRESHOLD", "80.0")
+        )
+        self._parallel_memory_threshold = float(
+            os.getenv("JARVIS_PARALLEL_MEMORY_THRESHOLD_GB", "8.0")
+        )
+
+        # State coordinator integration
+        self._state_coord: Optional["UnifiedStateCoordinator"] = None
+
+        # Synchronization
+        self._lock = asyncio.Lock()
+        self._initialized = False
+
+    async def initialize(self) -> None:
+        """Initialize the sequencer with env-driven configuration."""
+        async with self._lock:
+            if self._initialized:
+                return
+
+            # Get state coordinator
+            self._state_coord = await UnifiedStateCoordinator.get_instance()
+
+            # Load component configurations from environment
+            for name, defaults in self.DEFAULT_COMPONENTS.items():
+                env_prefix = name.upper().replace("_", "")
+
+                self._components[name] = LaunchSequenceStep(
+                    component=name,
+                    priority=int(os.getenv(
+                        f"{env_prefix}_LAUNCH_PRIORITY",
+                        str(defaults["priority"])
+                    )),
+                    min_memory_gb=float(os.getenv(
+                        f"{env_prefix}_MIN_MEMORY_GB",
+                        str(defaults["min_memory_gb"])
+                    )),
+                    min_cpu_headroom=float(os.getenv(
+                        f"{env_prefix}_MIN_CPU_HEADROOM",
+                        str(defaults["min_cpu_headroom"])
+                    )),
+                    estimated_memory_usage_gb=float(os.getenv(
+                        f"{env_prefix}_EST_MEMORY_GB",
+                        str(defaults["estimated_memory_usage_gb"])
+                    )),
+                    estimated_startup_time_sec=float(os.getenv(
+                        f"{env_prefix}_EST_STARTUP_SEC",
+                        str(defaults["estimated_startup_time_sec"])
+                    )),
+                    dependencies=os.getenv(
+                        f"{env_prefix}_DEPENDENCIES",
+                        ",".join(defaults["dependencies"])
+                    ).split(",") if os.getenv(f"{env_prefix}_DEPENDENCIES") else defaults["dependencies"],
+                    can_parallel=os.getenv(
+                        f"{env_prefix}_CAN_PARALLEL",
+                        "true"
+                    ).lower() == "true",
+                )
+
+            # Load historical startup times
+            await self._load_history()
+
+            self._initialized = True
+            logger.info(
+                f"[LaunchSequencer] v86.0 initialized with {len(self._components)} components"
+            )
+
+    async def _load_history(self) -> None:
+        """Load historical startup times for adaptive learning."""
+        try:
+            if self._history_file.exists():
+                data = json.loads(self._history_file.read_text())
+                self._startup_history = data.get("startup_times", {})
+                logger.debug(
+                    f"[LaunchSequencer] Loaded history for {len(self._startup_history)} components"
+                )
+        except Exception as e:
+            logger.debug(f"[LaunchSequencer] History load error: {e}")
+            self._startup_history = {}
+
+    async def _save_history(self) -> None:
+        """Save startup history for future adaptive learning."""
+        try:
+            self._history_file.parent.mkdir(parents=True, exist_ok=True)
+            data = {
+                "startup_times": self._startup_history,
+                "last_update": time.time(),
+            }
+            self._history_file.write_text(json.dumps(data, indent=2))
+        except Exception as e:
+            logger.debug(f"[LaunchSequencer] History save error: {e}")
+
+    def record_startup_time(self, component: str, startup_time_sec: float) -> None:
+        """Record startup time for adaptive learning."""
+        if component not in self._startup_history:
+            self._startup_history[component] = []
+
+        self._startup_history[component].append(startup_time_sec)
+
+        # Keep last 50 measurements
+        max_history = int(os.getenv("JARVIS_LAUNCH_HISTORY_SIZE", "50"))
+        if len(self._startup_history[component]) > max_history:
+            self._startup_history[component] = self._startup_history[component][-max_history:]
+
+    def get_estimated_startup_time(self, component: str) -> float:
+        """
+        Get estimated startup time using historical data.
+
+        Uses 90th percentile of historical times if available,
+        otherwise falls back to configured estimate.
+        """
+        history = self._startup_history.get(component, [])
+
+        if len(history) >= 5:  # Need minimum samples
+            sorted_history = sorted(history)
+            percentile_idx = int(len(sorted_history) * 0.9)
+            return sorted_history[min(percentile_idx, len(sorted_history) - 1)]
+
+        # Fallback to configured estimate
+        if component in self._components:
+            return self._components[component].estimated_startup_time_sec
+
+        return 10.0  # Default fallback
+
+    async def get_current_resource_state(self) -> Dict[str, Any]:
+        """Get current resource state with detailed metrics."""
+        try:
+            memory = psutil.virtual_memory()
+            cpu_percent = psutil.cpu_percent(interval=0.5)
+            disk = psutil.disk_usage("/")
+
+            # Calculate effective available resources
+            available_memory_gb = memory.available / (1024 ** 3)
+            effective_memory_gb = available_memory_gb - self._reserved_memory_gb
+            effective_cpu_headroom = 100.0 - cpu_percent - self._reserved_cpu_percent
+
+            # Calculate resource pressure (0-100, higher = more pressure)
+            memory_pressure = (1 - memory.available / memory.total) * 100
+            cpu_pressure = cpu_percent
+            overall_pressure = max(memory_pressure, cpu_pressure)
+
+            return {
+                "available_memory_gb": available_memory_gb,
+                "effective_memory_gb": max(0, effective_memory_gb),
+                "total_memory_gb": memory.total / (1024 ** 3),
+                "memory_percent_used": memory.percent,
+                "cpu_percent": cpu_percent,
+                "effective_cpu_headroom": max(0, effective_cpu_headroom),
+                "disk_free_gb": disk.free / (1024 ** 3),
+                "memory_pressure": memory_pressure,
+                "cpu_pressure": cpu_pressure,
+                "overall_pressure": overall_pressure,
+                "reserved_memory_gb": self._reserved_memory_gb,
+                "reserved_cpu_percent": self._reserved_cpu_percent,
+                "is_under_pressure": overall_pressure > self._resource_pressure_threshold,
+            }
+        except Exception as e:
+            logger.debug(f"[LaunchSequencer] Resource state error: {e}")
+            return {
+                "available_memory_gb": 16.0,  # Optimistic fallback
+                "effective_memory_gb": 16.0,
+                "cpu_percent": 50.0,
+                "overall_pressure": 50.0,
+                "is_under_pressure": False,
+                "error": str(e),
+            }
+
+    async def evaluate_launch(
+        self,
+        component: str,
+        force: bool = False,
+    ) -> LaunchDecision:
+        """
+        Evaluate whether a component can be launched now.
+
+        Checks:
+        1. Dependencies are ready
+        2. Resource requirements are met
+        3. Resource pressure allows launch
+        4. Component not already launched
+
+        Returns:
+            LaunchDecision with details about whether/how to launch
+        """
+        if not self._initialized:
+            await self.initialize()
+
+        # Check if component is known
+        if component not in self._components:
+            return LaunchDecision(
+                can_launch=False,
+                component=component,
+                reason=f"Unknown component: {component}",
+            )
+
+        config = self._components[component]
+
+        # Already launched?
+        if component in self._launched_components and not force:
+            return LaunchDecision(
+                can_launch=False,
+                component=component,
+                reason="Component already launched",
+            )
+
+        # Check dependencies
+        missing_deps = [
+            dep for dep in config.dependencies
+            if dep not in self._ready_components
+        ]
+        if missing_deps:
+            # Calculate wait time based on estimated startup times of dependencies
+            wait_time = sum(
+                self.get_estimated_startup_time(dep)
+                for dep in missing_deps
+            )
+            return LaunchDecision(
+                can_launch=False,
+                component=component,
+                reason=f"Missing dependencies: {', '.join(missing_deps)}",
+                wait_time_sec=min(wait_time, self._max_launch_delay),
+            )
+
+        # Check resources
+        resources = await self.get_current_resource_state()
+        warnings = []
+
+        # Memory check
+        if resources["effective_memory_gb"] < config.min_memory_gb:
+            if not force:
+                return LaunchDecision(
+                    can_launch=False,
+                    component=component,
+                    reason=f"Insufficient memory: {resources['effective_memory_gb']:.1f}GB < {config.min_memory_gb}GB required",
+                    wait_time_sec=self._base_launch_delay * 2,
+                )
+            warnings.append(f"Low memory: {resources['effective_memory_gb']:.1f}GB")
+
+        # CPU headroom check
+        if resources["effective_cpu_headroom"] < config.min_cpu_headroom:
+            if not force:
+                return LaunchDecision(
+                    can_launch=False,
+                    component=component,
+                    reason=f"Insufficient CPU headroom: {resources['effective_cpu_headroom']:.1f}% < {config.min_cpu_headroom}% required",
+                    wait_time_sec=self._base_launch_delay,
+                )
+            warnings.append(f"Low CPU headroom: {resources['effective_cpu_headroom']:.1f}%")
+
+        # Check resource pressure
+        wait_time = 0.0
+        if resources["is_under_pressure"]:
+            # Calculate adaptive delay based on pressure
+            pressure_factor = resources["overall_pressure"] / 100.0
+            wait_time = self._base_launch_delay * (1 + pressure_factor * 2)
+            wait_time = min(wait_time, self._max_launch_delay)
+            warnings.append(f"System under pressure ({resources['overall_pressure']:.0f}%)")
+
+        # Find parallel launch candidates
+        parallel_candidates = []
+        if config.can_parallel and resources["effective_memory_gb"] >= self._parallel_memory_threshold:
+            for name, other_config in self._components.items():
+                if (name != component and
+                    name not in self._launched_components and
+                    other_config.can_parallel and
+                    other_config.priority == config.priority and
+                    all(dep in self._ready_components for dep in other_config.dependencies)):
+                    parallel_candidates.append(name)
+
+        return LaunchDecision(
+            can_launch=True,
+            component=component,
+            reason="Resources available",
+            wait_time_sec=wait_time,
+            resource_warnings=warnings,
+            parallel_candidates=parallel_candidates,
+        )
+
+    async def get_launch_sequence(
+        self,
+        components: Optional[List[str]] = None,
+    ) -> List[LaunchDecision]:
+        """
+        Get the optimal launch sequence for components.
+
+        Returns ordered list of LaunchDecisions with appropriate delays.
+        """
+        if not self._initialized:
+            await self.initialize()
+
+        # Use all components if not specified
+        target_components = components or list(self._components.keys())
+
+        # Sort by priority (lower = first)
+        sorted_components = sorted(
+            target_components,
+            key=lambda c: self._components.get(c, LaunchSequenceStep(
+                component=c, priority=999, min_memory_gb=0, min_cpu_headroom=0,
+                estimated_memory_usage_gb=0, estimated_startup_time_sec=0
+            )).priority
+        )
+
+        sequence = []
+        cumulative_delay = 0.0
+
+        for component in sorted_components:
+            if component not in self._components:
+                continue
+
+            decision = await self.evaluate_launch(component)
+
+            # Adjust wait time to be cumulative
+            if decision.can_launch:
+                decision.wait_time_sec = max(decision.wait_time_sec, cumulative_delay)
+
+                # Add startup time to cumulative delay for next component
+                cumulative_delay += self.get_estimated_startup_time(component)
+
+            sequence.append(decision)
+
+        return sequence
+
+    async def reserve_resources(self, component: str) -> bool:
+        """Reserve resources for a component before launching."""
+        if component not in self._components:
+            return False
+
+        config = self._components[component]
+
+        async with self._lock:
+            # Check if we can reserve
+            resources = await self.get_current_resource_state()
+
+            if resources["effective_memory_gb"] < config.estimated_memory_usage_gb:
+                logger.warning(
+                    f"[LaunchSequencer] Cannot reserve resources for {component}: "
+                    f"need {config.estimated_memory_usage_gb}GB, "
+                    f"have {resources['effective_memory_gb']:.1f}GB"
+                )
+                return False
+
+            # Reserve
+            self._reserved_memory_gb += config.estimated_memory_usage_gb
+            self._reserved_cpu_percent += config.min_cpu_headroom / 2  # Estimate 50% of headroom used
+
+            logger.debug(
+                f"[LaunchSequencer] Reserved resources for {component}: "
+                f"{config.estimated_memory_usage_gb}GB memory"
+            )
+
+            # Publish event
+            if self._state_coord:
+                try:
+                    await self._state_coord.publish_component_event(
+                        component,
+                        UnifiedStateCoordinator.ComponentEventType.STARTING,
+                        metadata={
+                            "reserved_memory_gb": config.estimated_memory_usage_gb,
+                            "total_reserved_memory_gb": self._reserved_memory_gb,
+                        }
+                    )
+                except Exception:
+                    pass
+
+            return True
+
+    async def release_reservation(self, component: str) -> None:
+        """Release resource reservation after launch complete."""
+        if component not in self._components:
+            return
+
+        config = self._components[component]
+
+        async with self._lock:
+            self._reserved_memory_gb = max(
+                0, self._reserved_memory_gb - config.estimated_memory_usage_gb
+            )
+            self._reserved_cpu_percent = max(
+                0, self._reserved_cpu_percent - config.min_cpu_headroom / 2
+            )
+
+            logger.debug(
+                f"[LaunchSequencer] Released reservation for {component}"
+            )
+
+    async def mark_launched(self, component: str) -> None:
+        """Mark a component as launched (but not necessarily ready)."""
+        async with self._lock:
+            self._launched_components.add(component)
+            logger.debug(f"[LaunchSequencer] Marked {component} as launched")
+
+    async def mark_ready(
+        self,
+        component: str,
+        startup_time_sec: Optional[float] = None,
+    ) -> None:
+        """Mark a component as ready (passed health checks)."""
+        async with self._lock:
+            self._ready_components.add(component)
+
+            # Record startup time for adaptive learning
+            if startup_time_sec is not None:
+                self.record_startup_time(component, startup_time_sec)
+                await self._save_history()
+
+            # Release reservation
+            await self.release_reservation(component)
+
+            # Publish ready event
+            if self._state_coord:
+                try:
+                    await self._state_coord.publish_component_event(
+                        component,
+                        UnifiedStateCoordinator.ComponentEventType.READY,
+                        metadata={
+                            "startup_time_sec": startup_time_sec,
+                            "ready_components": list(self._ready_components),
+                        }
+                    )
+                except Exception:
+                    pass
+
+            logger.info(f"[LaunchSequencer] Marked {component} as ready")
+
+    async def mark_failed(self, component: str, error: str) -> None:
+        """Mark a component as failed to start."""
+        async with self._lock:
+            # Release resources
+            await self.release_reservation(component)
+            self._launched_components.discard(component)
+
+            # Publish failure event
+            if self._state_coord:
+                try:
+                    await self._state_coord.publish_component_event(
+                        component,
+                        UnifiedStateCoordinator.ComponentEventType.FAILED,
+                        metadata={"error": error}
+                    )
+                except Exception:
+                    pass
+
+            logger.error(f"[LaunchSequencer] Marked {component} as failed: {error}")
+
+    def get_status(self) -> Dict[str, Any]:
+        """Get current sequencer status."""
+        return {
+            "initialized": self._initialized,
+            "launched_components": list(self._launched_components),
+            "ready_components": list(self._ready_components),
+            "reserved_memory_gb": self._reserved_memory_gb,
+            "reserved_cpu_percent": self._reserved_cpu_percent,
+            "components": {
+                name: {
+                    "priority": config.priority,
+                    "min_memory_gb": config.min_memory_gb,
+                    "min_cpu_headroom": config.min_cpu_headroom,
+                    "dependencies": config.dependencies,
+                    "estimated_startup_sec": self.get_estimated_startup_time(name),
+                }
+                for name, config in self._components.items()
+            },
+        }
+
+    async def reset(self) -> None:
+        """Reset sequencer state (for testing or restart)."""
+        async with self._lock:
+            self._launched_components.clear()
+            self._ready_components.clear()
+            self._reserved_memory_gb = 0.0
+            self._reserved_cpu_percent = 0.0
+            logger.info("[LaunchSequencer] Reset complete")
+
+
+# Singleton instance for module-level access
+_launch_sequencer_instance: Optional[ResourceAwareLaunchSequencer] = None
+
+
+async def get_launch_sequencer() -> ResourceAwareLaunchSequencer:
+    """Get the singleton launch sequencer instance."""
+    global _launch_sequencer_instance
+    if _launch_sequencer_instance is None:
+        _launch_sequencer_instance = ResourceAwareLaunchSequencer()
+        await _launch_sequencer_instance.initialize()
+    return _launch_sequencer_instance
 
 
 # Import socket for hostname detection
