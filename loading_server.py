@@ -1386,6 +1386,421 @@ class SupervisorHeartbeatMonitor:
                 await asyncio.sleep(check_interval)
 
 
+class FileDescriptorMonitor:
+    """
+    v87.0: Monitor file descriptor usage to detect leaks.
+
+    Tracks FD count over time and detects abnormal growth patterns that indicate leaks.
+    Uses /proc/self/fd (Linux/macOS) or psutil fallback for cross-platform compatibility.
+    """
+
+    def __init__(self, sample_interval: float = 5.0, leak_threshold: int = 100):
+        """
+        Initialize FD monitor.
+
+        Args:
+            sample_interval: Seconds between FD count samples
+            leak_threshold: FD count increase to trigger leak warning
+        """
+        self.sample_interval = sample_interval
+        self.leak_threshold = leak_threshold
+
+        # Historical FD counts: [(timestamp, count), ...]
+        self._fd_history: list[tuple[float, int]] = []
+        self._max_history_size = 100  # Keep last 100 samples
+
+        # Leak detection state
+        self._leak_detected = False
+        self._leak_start_time: Optional[float] = None
+        self._baseline_fd_count: Optional[int] = None
+        self._peak_fd_count = 0
+
+        # Platform-specific FD counting
+        self._use_proc_fd = self._check_proc_fd_available()
+        self._use_psutil = False
+
+        if not self._use_proc_fd:
+            try:
+                import psutil
+                self._psutil = psutil
+                self._use_psutil = True
+            except ImportError:
+                logger.warning("[FDMonitor] Neither /proc/self/fd nor psutil available - FD monitoring disabled")
+
+    def _check_proc_fd_available(self) -> bool:
+        """Check if /proc/self/fd is available (Linux/macOS)."""
+        try:
+            import os
+            return os.path.isdir('/proc/self/fd') or os.path.isdir('/dev/fd')
+        except Exception:
+            return False
+
+    def get_current_fd_count(self) -> Optional[int]:
+        """Get current open file descriptor count."""
+        try:
+            if self._use_proc_fd:
+                import os
+                # Try /proc/self/fd first (Linux)
+                if os.path.isdir('/proc/self/fd'):
+                    return len(os.listdir('/proc/self/fd'))
+                # Fallback to /dev/fd (macOS)
+                elif os.path.isdir('/dev/fd'):
+                    return len(os.listdir('/dev/fd'))
+
+            elif self._use_psutil:
+                import os
+                process = self._psutil.Process(os.getpid())
+                return process.num_fds() if hasattr(process, 'num_fds') else len(process.open_files())
+
+            return None
+
+        except Exception as e:
+            logger.debug(f"[FDMonitor] Error counting FDs: {e}")
+            return None
+
+    def sample_fd_count(self) -> None:
+        """Sample current FD count and add to history."""
+        fd_count = self.get_current_fd_count()
+        if fd_count is None:
+            return
+
+        now = time.monotonic()
+        self._fd_history.append((now, fd_count))
+
+        # Keep history bounded
+        if len(self._fd_history) > self._max_history_size:
+            self._fd_history.pop(0)
+
+        # Update peak
+        if fd_count > self._peak_fd_count:
+            self._peak_fd_count = fd_count
+
+        # Set baseline on first sample
+        if self._baseline_fd_count is None:
+            self._baseline_fd_count = fd_count
+            logger.info(f"[FDMonitor] Baseline FD count: {fd_count}")
+
+    def detect_leak(self) -> tuple[bool, Optional[str]]:
+        """
+        Detect if FD leak is occurring.
+
+        Returns:
+            (is_leaking, reason)
+        """
+        if len(self._fd_history) < 2:
+            return False, None
+
+        # Get current and baseline counts
+        current_time, current_count = self._fd_history[-1]
+
+        if self._baseline_fd_count is None:
+            return False, None
+
+        # Check for sustained growth
+        fd_growth = current_count - self._baseline_fd_count
+
+        if fd_growth >= self.leak_threshold:
+            if not self._leak_detected:
+                self._leak_detected = True
+                self._leak_start_time = current_time
+                reason = f"FD count grew by {fd_growth} (from {self._baseline_fd_count} to {current_count})"
+                logger.error(f"[FDMonitor] LEAK DETECTED: {reason}")
+                return True, reason
+            return True, "Leak continues"
+
+        else:
+            # Leak resolved
+            if self._leak_detected:
+                logger.info(f"[FDMonitor] Leak resolved - FD count stabilized at {current_count}")
+                self._leak_detected = False
+                self._leak_start_time = None
+                # Update baseline to current stable state
+                self._baseline_fd_count = current_count
+
+            return False, None
+
+    def get_statistics(self) -> dict:
+        """Get FD monitoring statistics."""
+        if not self._fd_history:
+            return {
+                "available": False,
+                "reason": "No samples collected yet"
+            }
+
+        current_time, current_count = self._fd_history[-1]
+        baseline = self._baseline_fd_count or current_count
+
+        # Calculate growth rate (FDs per minute)
+        growth_rate = 0.0
+        if len(self._fd_history) >= 2:
+            first_time, first_count = self._fd_history[0]
+            time_span = current_time - first_time
+            if time_span > 0:
+                fd_delta = current_count - first_count
+                growth_rate = (fd_delta / time_span) * 60.0  # Per minute
+
+        leak_active, leak_reason = self.detect_leak()
+        leak_duration = None
+        if leak_active and self._leak_start_time:
+            leak_duration = current_time - self._leak_start_time
+
+        return {
+            "available": True,
+            "current_fd_count": current_count,
+            "baseline_fd_count": baseline,
+            "peak_fd_count": self._peak_fd_count,
+            "fd_growth": current_count - baseline,
+            "growth_rate_per_minute": round(growth_rate, 2),
+            "leak_detected": leak_active,
+            "leak_reason": leak_reason,
+            "leak_duration_seconds": leak_duration,
+            "sample_count": len(self._fd_history),
+            "threshold": self.leak_threshold,
+        }
+
+
+async def fd_monitor_loop() -> None:
+    """
+    v87.0: Background task to continuously monitor file descriptor usage.
+
+    Detects FD leaks by tracking count growth over time.
+    """
+    global file_descriptor_monitor
+
+    while True:
+        try:
+            await asyncio.sleep(file_descriptor_monitor.sample_interval)
+            file_descriptor_monitor.sample_fd_count()
+            file_descriptor_monitor.detect_leak()
+
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"[FDMonitor] Error in monitor loop: {e}")
+            await asyncio.sleep(file_descriptor_monitor.sample_interval)
+
+
+class FallbackStaticPageGenerator:
+    """
+    v87.0: Generate fallback static HTML page for when loading server is down.
+
+    Provides a minimal loading screen that works even if the backend crashes.
+    The page periodically retries connecting to the server and auto-redirects when available.
+    """
+
+    def __init__(self, backend_port: int = 8010, loading_port: int = 3001):
+        self.backend_port = backend_port
+        self.loading_port = loading_port
+
+    def generate(self) -> str:
+        """Generate self-contained fallback HTML page."""
+        return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>JARVIS - Connecting...</title>
+    <style>
+        * {{
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }}
+        body {{
+            background: linear-gradient(135deg, #0f0c29, #302b63, #24243e);
+            color: #00ffcc;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            overflow: hidden;
+        }}
+        .container {{
+            text-align: center;
+            padding: 40px;
+            background: rgba(0, 0, 0, 0.3);
+            border-radius: 20px;
+            border: 1px solid rgba(0, 255, 204, 0.3);
+            backdrop-filter: blur(10px);
+            max-width: 600px;
+        }}
+        h1 {{
+            font-size: 3em;
+            margin-bottom: 20px;
+            text-shadow: 0 0 20px rgba(0, 255, 204, 0.8);
+        }}
+        .status {{
+            font-size: 1.2em;
+            margin: 20px 0;
+            opacity: 0.8;
+        }}
+        .spinner {{
+            width: 80px;
+            height: 80px;
+            border: 8px solid rgba(0, 255, 204, 0.1);
+            border-top: 8px solid #00ffcc;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin: 30px auto;
+        }}
+        @keyframes spin {{
+            0% {{ transform: rotate(0deg); }}
+            100% {{ transform: rotate(360deg); }}
+        }}
+        .message {{
+            margin-top: 30px;
+            line-height: 1.6;
+        }}
+        .retry-info {{
+            margin-top: 20px;
+            font-size: 0.9em;
+            opacity: 0.6;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>JARVIS</h1>
+        <div class="spinner"></div>
+        <div class="status" id="status">Connecting to JARVIS...</div>
+        <div class="message">
+            <p>Loading server is temporarily unavailable.</p>
+            <p>Attempting to reconnect...</p>
+        </div>
+        <div class="retry-info" id="retry-info">
+            Next attempt in <span id="countdown">5</span>s
+        </div>
+    </div>
+
+    <script>
+        const BACKEND_PORT = {self.backend_port};
+        const LOADING_PORT = {self.loading_port};
+        const RETRY_INTERVAL = 5000; // 5 seconds
+
+        let retryCount = 0;
+        let countdown = 5;
+
+        function updateStatus(message) {{
+            document.getElementById('status').textContent = message;
+        }}
+
+        function updateCountdown() {{
+            document.getElementById('countdown').textContent = countdown;
+            if (countdown > 0) {{
+                countdown--;
+            }} else {{
+                countdown = 5;
+            }}
+        }}
+
+        async function checkServer() {{
+            try {{
+                retryCount++;
+                updateStatus(`Attempt #${{retryCount}} - Checking server...`);
+
+                // Try backend first
+                const backendUrl = `http://localhost:${{BACKEND_PORT}}/health`;
+                const response = await fetch(backendUrl, {{
+                    method: 'GET',
+                    cache: 'no-cache',
+                    signal: AbortSignal.timeout(3000)
+                }});
+
+                if (response.ok) {{
+                    updateStatus('✅ JARVIS is online! Redirecting...');
+                    setTimeout(() => {{
+                        window.location.href = `http://localhost:${{BACKEND_PORT}}/`;
+                    }}, 500);
+                    return true;
+                }}
+
+            }} catch (error) {{
+                console.debug('Server not available yet:', error.message);
+            }}
+
+            // Try loading server as fallback
+            try {{
+                const loadingUrl = `http://localhost:${{LOADING_PORT}}/health`;
+                const response = await fetch(loadingUrl, {{
+                    method: 'GET',
+                    cache: 'no-cache',
+                    signal: AbortSignal.timeout(3000)
+                }});
+
+                if (response.ok) {{
+                    updateStatus('✅ Loading server online! Continuing startup...');
+                    setTimeout(() => {{
+                        window.location.reload();
+                    }}, 500);
+                    return true;
+                }}
+
+            }} catch (error) {{
+                console.debug('Loading server not available:', error.message);
+            }}
+
+            updateStatus(`Attempt #${{retryCount}} failed - Retrying in 5s...`);
+            return false;
+        }}
+
+        // Initial check
+        checkServer();
+
+        // Periodic retry
+        setInterval(() => {{
+            checkServer();
+        }}, RETRY_INTERVAL);
+
+        // Countdown timer
+        setInterval(() => {{
+            updateCountdown();
+        }}, 1000);
+    </script>
+</body>
+</html>"""
+
+    async def save_to_file(self, filepath: str = None) -> str:
+        """
+        Save fallback page to filesystem.
+
+        Args:
+            filepath: Optional custom path. Defaults to frontend/public/fallback.html
+
+        Returns:
+            Path where file was saved
+        """
+        if filepath is None:
+            # Try to resolve frontend path
+            base_path = path_resolver.get_base_path()
+            if base_path:
+                filepath = str(base_path / "fallback.html")
+            else:
+                filepath = "/tmp/jarvis_fallback.html"
+
+        html_content = self.generate()
+
+        try:
+            # Write atomically
+            import tempfile
+            import shutil
+
+            temp_fd, temp_path = tempfile.mkstemp(suffix='.html', text=True)
+            try:
+                with os.fdopen(temp_fd, 'w') as f:
+                    f.write(html_content)
+                shutil.move(temp_path, filepath)
+                logger.info(f"[FallbackPage] Generated at: {filepath}")
+                return filepath
+            except Exception as e:
+                os.unlink(temp_path)
+                raise e
+
+        except Exception as e:
+            logger.error(f"[FallbackPage] Failed to save: {e}")
+            return None
+
+
 async def trinity_heartbeat_monitor_loop() -> None:
     """
     v87.0: Background task to continuously monitor Trinity component heartbeats.
@@ -3320,11 +3735,14 @@ self_healing_manager = SelfHealingRestartManager(max_restarts=3, restart_window=
 predictive_eta_calculator = PredictiveETACalculator()
 cross_repo_health_aggregator = CrossRepoHealthAggregator()
 supervisor_heartbeat_monitor = SupervisorHeartbeatMonitor(timeout_threshold=60.0)
+file_descriptor_monitor = FileDescriptorMonitor(sample_interval=5.0, leak_threshold=100)
+fallback_static_page_generator = FallbackStaticPageGenerator(backend_port=config.backend_port, loading_port=config.loading_port)
 
 # v87.0: Component status background tasks
 _trinity_heartbeat_task: Optional[asyncio.Task] = None
 _component_tracker_task: Optional[asyncio.Task] = None
 _supervisor_monitor_task: Optional[asyncio.Task] = None
+_fd_monitor_task: Optional[asyncio.Task] = None
 
 
 # =============================================================================
@@ -5724,6 +6142,131 @@ async def get_supervisor_heartbeat_status(request: web.Request) -> web.Response:
         }, status=500)
 
 
+async def get_progress_resume(request: web.Request) -> web.Response:
+    """
+    v87.0: Resume progress endpoint - Get current progress with sequence tracking.
+
+    This endpoint allows clients that disconnected to resume progress tracking
+    without missing updates. Returns:
+    - Current progress state
+    - Sequence number for update tracking
+    - Redirect readiness status
+    - Supervisor health
+    - Predictive ETA
+
+    Query parameters:
+    - last_sequence (optional): Client's last received sequence number
+      If provided, server can detect how many updates client missed
+    """
+    try:
+        # Get optional last sequence number from query params
+        last_sequence_str = request.query.get('last_sequence')
+        last_sequence = int(last_sequence_str) if last_sequence_str else None
+
+        # Calculate missed updates if last_sequence provided
+        missed_updates = None
+        if last_sequence is not None:
+            current_seq = progress_state._sequence_number
+            missed_updates = max(0, current_seq - last_sequence - 1)
+
+        # Build comprehensive resume response
+        response_data = progress_state.to_dict()
+
+        # Add ETA prediction if not complete
+        if progress_state.progress < 100.0:
+            try:
+                eta_seconds, confidence = predictive_eta_calculator.predict_eta(progress_state.progress)
+                if eta_seconds is not None:
+                    response_data['predictive_eta'] = {
+                        'eta_seconds': eta_seconds,
+                        'confidence': confidence,
+                        'estimated_completion': (
+                            datetime.now() + timedelta(seconds=eta_seconds)
+                        ).isoformat(),
+                        'prediction_method': 'ema_historical_fusion'
+                    }
+            except Exception as e:
+                logger.debug(f"[Resume] ETA prediction failed: {e}")
+
+        # Add supervisor heartbeat status
+        try:
+            supervisor_alive = supervisor_heartbeat_monitor.is_supervisor_alive()
+            response_data['supervisor_alive'] = supervisor_alive
+        except Exception as e:
+            logger.debug(f"[Resume] Supervisor check failed: {e}")
+            response_data['supervisor_alive'] = None
+
+        # Add unified health if requested
+        include_health = request.query.get('include_health', '').lower() == 'true'
+        if include_health:
+            try:
+                health_data = await cross_repo_health_aggregator.get_unified_health()
+                response_data['unified_health'] = health_data
+            except Exception as e:
+                logger.debug(f"[Resume] Health aggregation failed: {e}")
+
+        # Add metadata about resume
+        response_data['resume_metadata'] = {
+            'client_last_sequence': last_sequence,
+            'current_sequence': progress_state._sequence_number,
+            'missed_updates': missed_updates,
+            'timestamp': datetime.now().isoformat(),
+        }
+
+        logger.info(f"[Resume] Client resumed - missed {missed_updates or 0} updates")
+
+        return web.json_response({
+            "status": "ok",
+            **response_data,
+        })
+
+    except ValueError as e:
+        return web.json_response({
+            "status": "error",
+            "message": f"Invalid last_sequence parameter: {str(e)}"
+        }, status=400)
+    except Exception as e:
+        metrics.record_error(str(e))
+        logger.error(f"[Resume] Error: {e}")
+        return web.json_response({
+            "status": "error",
+            "message": str(e)
+        }, status=500)
+
+
+async def get_fd_leak_status(request: web.Request) -> web.Response:
+    """
+    v87.0: Get file descriptor leak detection status.
+
+    Returns:
+    - Current FD count
+    - Baseline FD count
+    - Peak FD count
+    - FD growth
+    - Growth rate (FDs per minute)
+    - Leak detected (boolean)
+    - Leak reason (if detected)
+    - Leak duration (if active)
+    """
+    try:
+        stats = file_descriptor_monitor.get_statistics()
+
+        return web.json_response({
+            "status": "ok",
+            **stats,
+            "timestamp": datetime.now().isoformat(),
+        })
+
+    except Exception as e:
+        metrics.record_error(str(e))
+        logger.error(f"[FDLeak] Error: {e}")
+        return web.json_response({
+            "status": "error",
+            "message": str(e),
+            "available": False
+        }, status=500)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # End of v87.0 Advanced Analytics Endpoints
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -6048,6 +6591,8 @@ def create_app() -> web.Application:
     app.router.add_get('/api/health/unified', get_unified_health)
     app.router.add_get('/api/analytics/startup-performance', get_startup_analytics)
     app.router.add_get('/api/supervisor/heartbeat', get_supervisor_heartbeat_status)
+    app.router.add_get('/api/progress/resume', get_progress_resume)
+    app.router.add_get('/api/diagnostics/fd-leak', get_fd_leak_status)
 
     # v5.0.1: Graceful Shutdown endpoints (fixes window termination errors)
     app.router.add_post('/api/shutdown/graceful', graceful_shutdown_endpoint)
@@ -6097,6 +6642,24 @@ async def start_server(host: str = '0.0.0.0', port: Optional[int] = None):
         trinity_heartbeat_monitor_loop(),
         name="trinity_heartbeat_monitor"
     )
+
+    # v87.0: Start FD leak detection monitor
+    logger.info("[v87.0] Starting FD leak detection monitor...")
+    _fd_monitor_task = asyncio.create_task(
+        fd_monitor_loop(),
+        name="fd_leak_monitor"
+    )
+
+    # v87.0: Generate fallback static page
+    logger.info("[v87.0] Generating fallback static page...")
+    try:
+        fallback_path = await fallback_static_page_generator.save_to_file()
+        if fallback_path:
+            logger.info(f"[v87.0] ✅ Fallback page ready: {fallback_path}")
+        else:
+            logger.warning("[v87.0] ⚠️  Fallback page generation failed")
+    except Exception as e:
+        logger.warning(f"[v87.0] ⚠️  Fallback page error: {e}")
 
     # v87.0: Start self-healing watchdog
     logger.info("[v87.0] Starting self-healing watchdog...")
@@ -6150,6 +6713,7 @@ async def start_server(host: str = '0.0.0.0', port: Optional[int] = None):
     logger.info(f"   ✅ Cross-Repo Health Monitor   - Unified JARVIS/J-Prime/Reactor")
     logger.info(f"   ✅ Supervisor Heartbeat Watch  - Crash detection (monotonic)")
     logger.info(f"   ✅ Startup Analytics Engine    - Performance trend analysis")
+    logger.info(f"   ✅ FD Leak Detection Monitor   - File descriptor leak detection")
     logger.info(f"{'='*70}")
     logger.info(f" Path Resolution:")
     logger.info(f"   loading.html:      {'✓' if resolved_loading else '✗'} {resolved_loading or 'NOT FOUND'}")
@@ -6177,6 +6741,8 @@ async def start_server(host: str = '0.0.0.0', port: Optional[int] = None):
     logger.info(f"   GET  /api/health/unified                 (Cross-repo health)")
     logger.info(f"   GET  /api/analytics/startup-performance  (Historical trends)")
     logger.info(f"   GET  /api/supervisor/heartbeat           (Supervisor alive check)")
+    logger.info(f"   GET  /api/progress/resume                (Resume with sequence tracking)")
+    logger.info(f"   GET  /api/diagnostics/fd-leak            (FD leak detection)")
     logger.info(f"   GET  /api/startup-progress               (Enhanced with ETA)")
     logger.info(f"{'='*70}")
     logger.info(f" CORS:        Enabled for all origins")

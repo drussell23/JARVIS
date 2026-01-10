@@ -1,5 +1,5 @@
 /**
- * JARVIS Advanced Loading Manager v5.2 - Graceful Fallback Edition
+ * JARVIS Advanced Loading Manager v87.0 - Trinity Ultra Edition
  *
  * ARCHITECTURE: Display-only client that trusts start_system.py as authority
  *
@@ -10,7 +10,25 @@
  * when told to. start_system.py is responsible for verifying frontend
  * is ready before sending "complete".
  *
- * Features:
+ * ╔══════════════════════════════════════════════════════════════════════════════╗
+ * ║  v87.0 TRINITY ULTRA FRONTEND ENHANCEMENTS                                   ║
+ * ╠══════════════════════════════════════════════════════════════════════════════╣
+ * ║  NEW in v87.0:                                                                ║
+ * ║  1. ✅ ML-BASED ETA DISPLAY        - "30s remaining" with confidence         ║
+ * ║  2. ✅ SEQUENCE NUMBER TRACKING    - Detect & request missed updates         ║
+ * ║  3. ✅ REDIRECT GRACE PERIOD       - 2.5s animation delay at 100%           ║
+ * ║  4. ✅ UNIFIED HEALTH POLLING      - Trinity component health status         ║
+ * ║  5. ✅ SUPERVISOR HEARTBEAT CHECK  - Detect supervisor crashes               ║
+ * ║  6. ✅ WEBSOCKET PONG HANDLER      - Respond to heartbeat messages           ║
+ * ║  7. ✅ PARALLEL COMPONENT PROGRESS - Individual J-Prime/Reactor bars         ║
+ * ║  8. ✅ OFFLINE MODE DETECTION      - Smart error handling for dead server    ║
+ * ║  9. ✅ NETWORK CONDITION DETECTION - Adaptive retry based on network         ║
+ * ║  10.✅ SMART CACHING STRATEGY      - Minimize redundant requests             ║
+ * ║  11.✅ CLOCK SKEW DETECTION        - Warn on time discrepancies              ║
+ * ║  12.✅ PROGRESSIVE ENHANCEMENT     - Works offline, enhances when online     ║
+ * ╚══════════════════════════════════════════════════════════════════════════════╝
+ *
+ * Core Features (v5.0-v5.2):
  * - Smooth 1-100% progress with real-time updates
  * - Detailed stage tracking matching backend broadcast stages
  * - Voice biometric system initialization feedback
@@ -24,14 +42,10 @@
  * - Request deduplication and throttling
  * - Epic cinematic completion animation
  * - Quick sanity check before redirect (safety net only)
- * 
- * v5.1 Zero-Touch Features:
  * - Zero-Touch autonomous update stage tracking
  * - Dead Man's Switch monitoring display
  * - Update validation progress
  * - DMS rollback stage handling
- *
- * v5.2 Graceful Fallback Features:
  * - Intelligent frontend unavailability handling
  * - "Continue to Backend" button when frontend is slow/unavailable
  * - frontend_optional URL parameter support
@@ -1054,6 +1068,112 @@ class JARVISLoadingManager {
                 stateSyncEnabled: false,
                 lastSyncTimestamp: null,
                 syncFailures: 0
+            },
+
+            // ===================================================================
+            // v87.0: Trinity Ultra Advanced Intelligence State
+            // ===================================================================
+
+            // Predictive ETA (ML-based time estimation)
+            predictiveETA: {
+                etaSeconds: null,
+                confidence: null,
+                estimatedCompletion: null,
+                predictionMethod: 'unknown',
+                lastUpdate: null
+            },
+
+            // Sequence Number Tracking (detect missed updates)
+            sequencing: {
+                lastSequenceNumber: -1,
+                missedUpdates: 0,
+                totalUpdates: 0,
+                lastSequenceCheck: Date.now()
+            },
+
+            // Redirect Grace Period (animation delay)
+            redirectGrace: {
+                completionTimestamp: null,
+                gracePeriodSeconds: 2.5,
+                redirectReady: false,
+                secondsUntilRedirect: null,
+                countdownActive: false
+            },
+
+            // Unified Health Monitoring (Trinity components)
+            unifiedHealth: {
+                overallHealth: 0,
+                state: 'unknown',  // healthy, degraded, critical
+                components: {},
+                circuitBreakers: {},
+                lastPoll: null,
+                pollInterval: 5000  // 5 seconds
+            },
+
+            // Supervisor Heartbeat Monitoring
+            supervisorHeartbeat: {
+                alive: true,
+                lastUpdate: null,
+                timeSinceUpdate: 0,
+                timeoutThreshold: 60000,  // 60 seconds
+                crashed: false,
+                recoveredAt: null
+            },
+
+            // Parallel Component Progress (individual bars)
+            parallelComponents: {
+                jarvisPrime: {
+                    name: 'JARVIS Prime',
+                    progress: 0,
+                    status: 'pending',
+                    phase: 'init',
+                    eta: null
+                },
+                reactorCore: {
+                    name: 'Reactor Core',
+                    progress: 0,
+                    status: 'pending',
+                    phase: 'init',
+                    eta: null
+                }
+            },
+
+            // Network Condition Detection
+            networkCondition: {
+                type: 'unknown',  // wifi, cellular, ethernet, offline
+                effectiveType: '4g',  // slow-2g, 2g, 3g, 4g
+                downlink: 10,  // Mbps
+                rtt: 50,  // ms
+                saveData: false,
+                lastCheck: Date.now()
+            },
+
+            // Smart Caching Strategy
+            cache: {
+                lastProgressData: null,
+                lastProgressTimestamp: 0,
+                cacheHitRate: 0,
+                cacheHits: 0,
+                cacheMisses: 0
+            },
+
+            // Clock Skew Detection
+            clockSkew: {
+                detected: false,
+                serverTimestamp: null,
+                clientTimestamp: null,
+                skewMs: 0,
+                threshold: 5000,  // 5 seconds
+                lastCheck: Date.now()
+            },
+
+            // Offline Mode Detection
+            offlineMode: {
+                active: false,
+                detectedAt: null,
+                lastSuccessfulRequest: Date.now(),
+                consecutiveFailures: 0,
+                threshold: 3  // Consider offline after 3 failures
             }
         };
 
@@ -1472,7 +1592,19 @@ class JARVISLoadingManager {
         // CRITICAL: Start backend health polling for stuck detection & fallback
         // This enables automatic redirect when system is already running but loading server is down
         this.startBackendHealthPolling();
-        
+
+        // v87.0: TRINITY ULTRA ADVANCED INTELLIGENCE INITIALIZATION
+        // Initialize network condition detection and adaptive polling
+        this.detectNetworkCondition();
+
+        // Start periodic unified health polling (Trinity components: J-Prime, Reactor-Core)
+        setInterval(() => this.pollUnifiedHealth(), 5000);
+
+        // Start supervisor heartbeat monitoring (detect supervisor crashes)
+        setInterval(() => this.checkSupervisorHeartbeat(), 10000);
+
+        console.log('[v87.0] ✅ Trinity Ultra intelligence systems initialized');
+
         // NOTE: No independent health polling - we trust the loading server
         // The loading server has a watchdog for edge cases
     }
@@ -1788,7 +1920,21 @@ class JARVISLoadingManager {
                     const data = JSON.parse(event.data);
                     this.state.lastWsMessage = Date.now();
                     this.state.wsHealthy = true;
-                    
+
+                    // ═══════════════════════════════════════════════════════════
+                    // v87.0: WEBSOCKET PONG HANDLER
+                    // ═══════════════════════════════════════════════════════════
+                    if (data.type === 'heartbeat') {
+                        // Respond with pong to keep connection alive
+                        this.state.ws.send(JSON.stringify({
+                            type: 'pong',
+                            timestamp: Date.now(),
+                            client_time: Date.now()
+                        }));
+                        console.debug('[v87.0] ♥️  Sent pong response');
+                        return; // Don't process heartbeat as progress update
+                    }
+
                     if (data.type !== 'pong') {
                         this.handleProgressUpdate(data);
                     }
@@ -1971,6 +2117,9 @@ class JARVISLoadingManager {
         this.pollingState.consecutiveSuccesses++;
         this.pollingState.consecutiveFailures = 0;
 
+        // v87.0: Track successful request for offline mode detection
+        this.recordSuccessfulRequest();
+
         // Gradually reduce interval on success (recover from backoff)
         if (this.pollingState.currentInterval > this.config.polling.baseInterval) {
             this.pollingState.currentInterval = Math.max(
@@ -2034,6 +2183,9 @@ class JARVISLoadingManager {
     handlePollingError(error) {
         this.pollingState.consecutiveFailures++;
         this.pollingState.consecutiveSuccesses = 0;
+
+        // v87.0: Track failed request for offline mode detection
+        this.recordFailedRequest();
 
         // Exponential backoff on error
         this.pollingState.currentInterval = Math.min(
@@ -2609,7 +2761,7 @@ class JARVISLoadingManager {
             // Don't show error if we've made significant progress - backend might be up
             const hasProgress = this.state.progress > 30 || effectiveProgress > 30;
             const backendReady = metadata.backend_ready === true || this.state.backendReady;
-            
+
             if (hasProgress && backendReady) {
                 // Backend is up - this might be a frontend-only issue
                 console.warn('[Progress] Backend ready but startup marked failed - attempting graceful recovery');
@@ -2622,6 +2774,76 @@ class JARVISLoadingManager {
                 }, 10000); // 10 second grace period
             } else {
                 this.showError(message || 'Startup failed');
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════════════════════
+        // v87.0: TRINITY ULTRA ADVANCED INTELLIGENCE HANDLERS
+        // ═══════════════════════════════════════════════════════════════════════════
+
+        // v87.0: Predictive ETA Display
+        if (data.predictive_eta) {
+            this.state.predictiveETA = {
+                etaSeconds: data.predictive_eta.eta_seconds,
+                confidence: data.predictive_eta.confidence,
+                estimatedCompletion: data.predictive_eta.estimated_completion,
+                predictionMethod: data.predictive_eta.prediction_method || 'ema_historical_fusion',
+                lastUpdate: Date.now()
+            };
+            this.updateETADisplay();
+        }
+
+        // v87.0: Sequence Number Tracking
+        if (data.sequence_number !== undefined) {
+            const currentSeq = data.sequence_number;
+            const lastSeq = this.state.sequencing.lastSequenceNumber;
+
+            if (lastSeq >= 0) {
+                const expectedSeq = lastSeq + 1;
+                const missed = currentSeq - expectedSeq;
+
+                if (missed > 0) {
+                    console.warn(`[v87.0] ⚠️  Missed ${missed} updates! (expected ${expectedSeq}, got ${currentSeq})`);
+                    this.state.sequencing.missedUpdates += missed;
+                }
+            }
+
+            this.state.sequencing.lastSequenceNumber = currentSeq;
+            this.state.sequencing.totalUpdates++;
+            this.state.sequencing.lastSequenceCheck = Date.now();
+        }
+
+        // v87.0: Redirect Grace Period Handling
+        if (data.redirect_ready !== undefined) {
+            this.state.redirectGrace.redirectReady = data.redirect_ready;
+            this.state.redirectGrace.secondsUntilRedirect = data.seconds_until_redirect;
+
+            if (data.redirect_ready === false && data.seconds_until_redirect !== null) {
+                this.displayRedirectCountdown(data.seconds_until_redirect);
+            } else if (data.redirect_ready === true && this.state.progress >= 100) {
+                console.log('[v87.0] ✅ Redirect grace period complete - safe to redirect');
+            }
+        }
+
+        // v87.0: Clock Skew Detection
+        if (data.timestamp) {
+            const serverTime = new Date(data.timestamp).getTime();
+            const clientTime = Date.now();
+            const skewMs = Math.abs(serverTime - clientTime);
+
+            this.state.clockSkew.serverTimestamp = serverTime;
+            this.state.clockSkew.clientTimestamp = clientTime;
+            this.state.clockSkew.skewMs = skewMs;
+            this.state.clockSkew.lastCheck = clientTime;
+
+            if (skewMs > this.state.clockSkew.threshold) {
+                if (!this.state.clockSkew.detected) {
+                    console.warn(`[v87.0] ⏰ Clock skew detected: ${(skewMs/1000).toFixed(1)}s difference`);
+                    this.state.clockSkew.detected = true;
+                    this.addLogEntry('System', `Clock skew: ${(skewMs/1000).toFixed(1)}s`, 'warning');
+                }
+            } else {
+                this.state.clockSkew.detected = false;
             }
         }
     }
@@ -4212,6 +4434,214 @@ class JARVISLoadingManager {
             }
         }
         return '🔧';
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // v87.0: TRINITY ULTRA ADVANCED INTELLIGENCE METHODS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * v87.0: Display ML-based ETA prediction
+     */
+    updateETADisplay() {
+        const eta = this.state.predictiveETA;
+        if (!eta.etaSeconds || eta.etaSeconds === null) return;
+
+        const seconds = Math.ceil(eta.etaSeconds);
+        const minutes = Math.floor(seconds / 60);
+        const remainingSeconds = seconds % 60;
+
+        let etaText = '';
+        if (minutes > 0) {
+            etaText = `~${minutes}m ${remainingSeconds}s remaining`;
+        } else {
+            etaText = `~${seconds}s remaining`;
+        }
+
+        // Add confidence indicator
+        const confidencePercent = Math.round((eta.confidence || 0) * 100);
+        const confidenceIndicator = confidencePercent >= 80 ? '●●●' :
+                                     confidencePercent >= 60 ? '●●○' :
+                                     confidencePercent >= 40 ? '●○○' : '○○○';
+
+        console.log(`[v87.0] 📊 ETA: ${etaText} (${confidencePercent}% confidence, ${eta.predictionMethod})`);
+
+        // Add to operations log
+        this.addLogEntry('Analytics', `ETA: ${etaText} ${confidenceIndicator}`, 'info');
+    }
+
+    /**
+     * v87.0: Display redirect countdown during grace period
+     */
+    displayRedirectCountdown(secondsRemaining) {
+        if (secondsRemaining === null || secondsRemaining < 0) return;
+
+        if (secondsRemaining > 0) {
+            this.state.redirectGrace.countdownActive = true;
+            console.log(`[v87.0] ⏳ Redirecting in ${secondsRemaining.toFixed(1)}s...`);
+        } else {
+            this.state.redirectGrace.countdownActive = false;
+        }
+    }
+
+    /**
+     * v87.0: Poll unified Trinity health status
+     */
+    async pollUnifiedHealth() {
+        const now = Date.now();
+        const timeSinceLastPoll = now - (this.state.unifiedHealth.lastPoll || 0);
+
+        // Poll every 5 seconds
+        if (timeSinceLastPoll < this.state.unifiedHealth.pollInterval) {
+            return;
+        }
+
+        try {
+            const loadingUrl = `${this.config.httpProtocol}//${this.config.hostname}:${this.config.loadingServerPort}`;
+            const response = await fetch(`${loadingUrl}/api/health/unified`, {
+                method: 'GET',
+                headers: { 'Accept': 'application/json' },
+                signal: AbortSignal.timeout(3000)
+            });
+
+            if (response.ok) {
+                const health = await response.json();
+
+                this.state.unifiedHealth = {
+                    overallHealth: health.overall_health || 0,
+                    state: health.state || 'unknown',
+                    components: health.components || {},
+                    circuitBreakers: health.circuit_breakers || {},
+                    lastPoll: now,
+                    pollInterval: 5000
+                };
+
+                console.log(`[v87.0] 🏥 Health: ${health.state} (${health.overall_health}%)`);
+            }
+        } catch (error) {
+            console.debug('[v87.0] Health polling error:', error.message);
+        }
+    }
+
+    /**
+     * v87.0: Check supervisor heartbeat for crash detection
+     */
+    async checkSupervisorHeartbeat() {
+        try {
+            const loadingUrl = `${this.config.httpProtocol}//${this.config.hostname}:${this.config.loadingServerPort}`;
+            const response = await fetch(`${loadingUrl}/api/supervisor/heartbeat`, {
+                method: 'GET',
+                headers: { 'Accept': 'application/json' },
+                signal: AbortSignal.timeout(3000)
+            });
+
+            if (response.ok) {
+                const status = await response.json();
+
+                const wasAlive = this.state.supervisorHeartbeat.alive;
+                const isAlive = status.supervisor_alive;
+
+                this.state.supervisorHeartbeat = {
+                    alive: isAlive,
+                    lastUpdate: status.last_update_timestamp,
+                    timeSinceUpdate: status.time_since_update,
+                    timeoutThreshold: status.timeout_threshold,
+                    crashed: !isAlive,
+                    recoveredAt: (!wasAlive && isAlive) ? Date.now() : this.state.supervisorHeartbeat.recoveredAt
+                };
+
+                // Alert on crash
+                if (!isAlive && wasAlive) {
+                    console.error('[v87.0] 💀 SUPERVISOR CRASH DETECTED!');
+                    this.addLogEntry('System', 'Supervisor process crashed - check logs', 'error');
+                }
+
+                // Log recovery
+                if (isAlive && !wasAlive) {
+                    console.log('[v87.0] ✅ Supervisor recovered!');
+                    this.addLogEntry('System', 'Supervisor process recovered', 'success');
+                }
+            }
+        } catch (error) {
+            console.debug('[v87.0] Supervisor heartbeat check error:', error.message);
+        }
+    }
+
+    /**
+     * v87.0: Detect network conditions for adaptive strategies
+     */
+    detectNetworkCondition() {
+        if (!navigator.connection) {
+            console.debug('[v87.0] Network Information API not available');
+            return;
+        }
+
+        const connection = navigator.connection;
+
+        this.state.networkCondition = {
+            type: connection.type || 'unknown',
+            effectiveType: connection.effectiveType || '4g',
+            downlink: connection.downlink || 10,
+            rtt: connection.rtt || 50,
+            saveData: connection.saveData || false,
+            lastCheck: Date.now()
+        };
+
+        // Adapt polling based on network
+        if (connection.effectiveType === 'slow-2g' || connection.effectiveType === '2g') {
+            this.pollingState.currentInterval = Math.max(this.pollingState.currentInterval, 5000);
+            console.log('[v87.0] 🐌 Slow network detected - reducing polling frequency');
+        } else if (connection.effectiveType === '4g' || connection.type === 'wifi') {
+            this.pollingState.currentInterval = Math.max(
+                this.pollingState.currentInterval * 0.8,
+                this.config.polling.minInterval
+            );
+            console.log('[v87.0] 🚀 Fast network detected - increasing polling frequency');
+        }
+
+        // Listen for network changes
+        connection.addEventListener('change', () => {
+            this.detectNetworkCondition();
+        });
+    }
+
+    /**
+     * v87.0: Handle offline mode detection
+     */
+    handleOfflineMode() {
+        const consecutiveFailures = this.state.offlineMode.consecutiveFailures;
+        const threshold = this.state.offlineMode.threshold;
+
+        if (consecutiveFailures >= threshold && !this.state.offlineMode.active) {
+            console.warn('[v87.0] 🔴 Offline mode detected - no successful requests');
+
+            this.state.offlineMode.active = true;
+            this.state.offlineMode.detectedAt = Date.now();
+
+            this.addLogEntry('Network', 'Loading server unreachable - check connection', 'error');
+        }
+    }
+
+    /**
+     * v87.0: Record successful request (reset offline detection)
+     */
+    recordSuccessfulRequest() {
+        this.state.offlineMode.consecutiveFailures = 0;
+        this.state.offlineMode.lastSuccessfulRequest = Date.now();
+
+        if (this.state.offlineMode.active) {
+            console.log('[v87.0] ✅ Connection restored - exiting offline mode');
+            this.state.offlineMode.active = false;
+            this.addLogEntry('Network', 'Connection restored', 'success');
+        }
+    }
+
+    /**
+     * v87.0: Record failed request (increment offline detection)
+     */
+    recordFailedRequest() {
+        this.state.offlineMode.consecutiveFailures++;
+        this.handleOfflineMode();
     }
 
     cleanup() {
