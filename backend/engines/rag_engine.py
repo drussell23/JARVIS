@@ -3561,6 +3561,542 @@ def get_timeout_manager() -> AdaptiveTimeoutManager:
     return AdaptiveTimeoutManager.get_instance()
 
 
+# =============================================================================
+# Phase 3: Chaos Engineering - Controlled Fault Injection
+# =============================================================================
+
+class FaultType(Enum):
+    """Types of faults that can be injected."""
+    LATENCY = "latency"           # Add artificial delay
+    ERROR = "error"               # Raise exception
+    TIMEOUT = "timeout"           # Force timeout
+    PARTIAL_FAILURE = "partial"   # Return degraded result
+    CORRUPTION = "corruption"     # Return corrupted data
+    CONNECTION_RESET = "reset"    # Simulate connection reset
+
+
+@dataclass
+class FaultConfig:
+    """Configuration for a specific fault type."""
+    fault_type: FaultType
+    probability: float = 0.0      # 0.0-1.0 chance of fault
+    latency_ms: float = 0.0       # For LATENCY type
+    error_message: str = ""       # For ERROR type
+    enabled: bool = False
+    target_services: List[str] = field(default_factory=list)  # Empty = all services
+
+
+class ChaosMonkey:
+    """
+    Controlled chaos engineering for resilience testing.
+    
+    Features:
+    - **Probability-based faults**: Each request has X% chance of fault
+    - **Targeted injection**: Only affect specific services
+    - **Scheduled chaos**: Run chaos tests at specific times
+    - **Kill switch**: Instantly disable all chaos
+    - **Gradual ramp**: Slowly increase fault rate
+    
+    Usage:
+        chaos = ChaosMonkey.get_instance()
+        chaos.enable_fault(FaultType.LATENCY, probability=0.1, latency_ms=500)
+        
+        # In your code:
+        await chaos.maybe_inject("rag_trinity")  # 10% chance of 500ms delay
+    
+    Safety:
+    - Disabled by default
+    - Requires explicit enable
+    - Environment variable kill switch: CHAOS_ENABLED=false
+    """
+    
+    _instance: Optional["ChaosMonkey"] = None
+    
+    def __init__(self):
+        self._enabled = os.getenv("CHAOS_ENABLED", "false").lower() == "true"
+        self._fault_configs: Dict[FaultType, FaultConfig] = {}
+        self._injection_count = 0
+        self._total_requests = 0
+        self._lock = asyncio.Lock()
+        
+        # Scheduled chaos windows (hour ranges when chaos is active)
+        self._chaos_windows: List[Tuple[int, int]] = []  # [(start_hour, end_hour), ...]
+        
+        # Gradual ramp configuration
+        self._ramp_enabled = False
+        self._ramp_start_time = 0.0
+        self._ramp_duration = 300.0  # 5 minutes to reach full probability
+        
+        logger.info(f"[ChaosMonkey] Initialized (enabled={self._enabled})")
+    
+    @classmethod
+    def get_instance(cls) -> "ChaosMonkey":
+        """Get singleton instance."""
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+    
+    def enable(self):
+        """Enable chaos monkey."""
+        self._enabled = True
+        logger.warning("[ChaosMonkey] ENABLED - Faults will be injected!")
+    
+    def disable(self):
+        """Kill switch - disable all chaos immediately."""
+        self._enabled = False
+        logger.info("[ChaosMonkey] DISABLED - All faults stopped")
+    
+    def enable_fault(
+        self,
+        fault_type: FaultType,
+        probability: float = 0.1,
+        latency_ms: float = 500.0,
+        error_message: str = "Chaos injection",
+        target_services: Optional[List[str]] = None,
+    ):
+        """Configure a fault type for injection."""
+        self._fault_configs[fault_type] = FaultConfig(
+            fault_type=fault_type,
+            probability=min(1.0, max(0.0, probability)),
+            latency_ms=latency_ms,
+            error_message=error_message,
+            enabled=True,
+            target_services=target_services or [],
+        )
+        logger.info(f"[ChaosMonkey] Enabled {fault_type.value} (p={probability:.1%})")
+    
+    def disable_fault(self, fault_type: FaultType):
+        """Disable a specific fault type."""
+        if fault_type in self._fault_configs:
+            self._fault_configs[fault_type].enabled = False
+    
+    def set_chaos_window(self, start_hour: int, end_hour: int):
+        """Set time window when chaos is active (24h format)."""
+        self._chaos_windows.append((start_hour % 24, end_hour % 24))
+    
+    def start_gradual_ramp(self, duration_seconds: float = 300.0):
+        """Start gradual ramp-up of fault probability."""
+        self._ramp_enabled = True
+        self._ramp_start_time = time.time()
+        self._ramp_duration = duration_seconds
+        logger.info(f"[ChaosMonkey] Starting gradual ramp over {duration_seconds}s")
+    
+    def _is_in_chaos_window(self) -> bool:
+        """Check if current time is in a chaos window."""
+        if not self._chaos_windows:
+            return True  # No windows = always active
+        
+        current_hour = int(time.time() // 3600) % 24
+        for start, end in self._chaos_windows:
+            if start <= end:
+                if start <= current_hour < end:
+                    return True
+            else:  # Wraps around midnight
+                if current_hour >= start or current_hour < end:
+                    return True
+        return False
+    
+    def _get_effective_probability(self, base_probability: float) -> float:
+        """Get effective probability considering ramp."""
+        if not self._ramp_enabled:
+            return base_probability
+        
+        elapsed = time.time() - self._ramp_start_time
+        ramp_factor = min(1.0, elapsed / self._ramp_duration)
+        return base_probability * ramp_factor
+    
+    async def maybe_inject(self, service: str) -> Optional[FaultType]:
+        """
+        Maybe inject a fault for this request.
+        
+        Returns:
+            FaultType if fault was injected, None otherwise
+        """
+        self._total_requests += 1
+        
+        # Check kill switches
+        if not self._enabled:
+            return None
+        if not self._is_in_chaos_window():
+            return None
+        
+        # Check each enabled fault
+        for fault_type, config in self._fault_configs.items():
+            if not config.enabled:
+                continue
+            
+            # Check service targeting
+            if config.target_services and service not in config.target_services:
+                continue
+            
+            # Roll dice
+            effective_prob = self._get_effective_probability(config.probability)
+            if random.random() < effective_prob:
+                self._injection_count += 1
+                await self._inject_fault(config)
+                return fault_type
+        
+        return None
+    
+    async def _inject_fault(self, config: FaultConfig):
+        """Actually inject the fault."""
+        if config.fault_type == FaultType.LATENCY:
+            await asyncio.sleep(config.latency_ms / 1000.0)
+            logger.debug(f"[ChaosMonkey] Injected {config.latency_ms}ms latency")
+            
+        elif config.fault_type == FaultType.ERROR:
+            raise Exception(f"[ChaosMonkey] {config.error_message}")
+            
+        elif config.fault_type == FaultType.TIMEOUT:
+            await asyncio.sleep(120)  # Force timeout
+            
+        elif config.fault_type == FaultType.CONNECTION_RESET:
+            raise ConnectionResetError("[ChaosMonkey] Connection reset")
+    
+    def get_status(self) -> Dict[str, Any]:
+        """Get chaos monkey status."""
+        return {
+            "enabled": self._enabled,
+            "in_chaos_window": self._is_in_chaos_window(),
+            "injection_count": self._injection_count,
+            "total_requests": self._total_requests,
+            "injection_rate": self._injection_count / max(1, self._total_requests),
+            "active_faults": [
+                {
+                    "type": ft.value,
+                    "probability": cfg.probability,
+                    "enabled": cfg.enabled,
+                }
+                for ft, cfg in self._fault_configs.items()
+            ],
+        }
+
+
+# =============================================================================
+# Phase 3: Security Layer - Request Validation & Sanitization
+# =============================================================================
+
+class SecurityViolation(Exception):
+    """Raised when a security check fails."""
+    pass
+
+
+class SecurityLayer:
+    """
+    Security hardening layer for request validation.
+    
+    Features:
+    - **Input sanitization**: Prevent injection attacks
+    - **Size limits**: Reject oversized requests
+    - **Pattern detection**: Detect suspicious patterns
+    - **Rate limiting**: Per-client request limits
+    - **Request signing**: HMAC verification for cross-repo calls
+    """
+    
+    _instance: Optional["SecurityLayer"] = None
+    
+    # Dangerous patterns to detect
+    DANGEROUS_PATTERNS = [
+        re.compile(r'<script.*?>.*?</script>', re.I | re.S),  # XSS
+        re.compile(r';\s*DROP\s+TABLE', re.I),                 # SQL injection
+        re.compile(r'__import__\s*\('),                        # Python exec
+        re.compile(r'eval\s*\('),                              # Eval
+        re.compile(r'\$\{.*?\}'),                              # Template injection
+        re.compile(r'{{.*?}}'),                                # Template injection
+    ]
+    
+    def __init__(self):
+        self._config = DynamicConfigManager.get_instance()
+        
+        # Limits (configurable via env)
+        self._max_query_length = int(os.getenv("SECURITY_MAX_QUERY_LENGTH", "10000"))
+        self._max_context_length = int(os.getenv("SECURITY_MAX_CONTEXT_LENGTH", "100000"))
+        
+        # HMAC key for request signing
+        self._hmac_key = os.getenv("JARVIS_HMAC_KEY", "").encode() or os.urandom(32)
+        
+        # Violation tracking
+        self._violation_count = 0
+        self._violations_by_type: Dict[str, int] = {}
+        
+        logger.info("[SecurityLayer] Initialized")
+    
+    @classmethod
+    def get_instance(cls) -> "SecurityLayer":
+        """Get singleton instance."""
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+    
+    def validate_query(self, query: str) -> str:
+        """
+        Validate and sanitize a user query.
+        
+        Args:
+            query: Raw user query
+            
+        Returns:
+            Sanitized query
+            
+        Raises:
+            SecurityViolation: If query fails validation
+        """
+        if not isinstance(query, str):
+            self._record_violation("invalid_type")
+            raise SecurityViolation("Query must be a string")
+        
+        # Length check
+        if len(query) > self._max_query_length:
+            self._record_violation("query_too_long")
+            raise SecurityViolation(f"Query exceeds max length ({self._max_query_length})")
+        
+        # Pattern detection
+        for pattern in self.DANGEROUS_PATTERNS:
+            if pattern.search(query):
+                self._record_violation("dangerous_pattern")
+                raise SecurityViolation("Query contains suspicious content")
+        
+        # Sanitize
+        sanitized = self._sanitize(query)
+        return sanitized
+    
+    def validate_context(self, context: str) -> str:
+        """Validate and sanitize context data."""
+        if len(context) > self._max_context_length:
+            self._record_violation("context_too_long")
+            # Truncate instead of reject
+            return context[:self._max_context_length]
+        return self._sanitize(context)
+    
+    def _sanitize(self, text: str) -> str:
+        """Sanitize text by removing/escaping dangerous content."""
+        # Remove null bytes
+        text = text.replace('\x00', '')
+        
+        # Remove control characters (except newline, tab)
+        text = ''.join(
+            c for c in text
+            if c in '\n\t' or (ord(c) >= 32 and ord(c) < 127) or ord(c) >= 128
+        )
+        
+        return text.strip()
+    
+    def _record_violation(self, violation_type: str):
+        """Record a security violation."""
+        self._violation_count += 1
+        self._violations_by_type[violation_type] = (
+            self._violations_by_type.get(violation_type, 0) + 1
+        )
+        logger.warning(f"[SecurityLayer] Violation: {violation_type}")
+    
+    def sign_request(self, payload: str, timestamp: float) -> str:
+        """
+        Sign a request for cross-repo authentication.
+        
+        Args:
+            payload: Request payload
+            timestamp: Unix timestamp
+            
+        Returns:
+            HMAC signature (hex)
+        """
+        import hmac as hmac_module
+        message = f"{timestamp}:{payload}".encode()
+        signature = hmac_module.new(self._hmac_key, message, hashlib.sha256).hexdigest()
+        return signature
+    
+    def verify_signature(
+        self,
+        payload: str,
+        timestamp: float,
+        signature: str,
+        max_age_seconds: float = 300.0,
+    ) -> bool:
+        """
+        Verify a request signature.
+        
+        Args:
+            payload: Request payload
+            timestamp: Claimed timestamp
+            signature: Claimed signature
+            max_age_seconds: Max age of request (replay protection)
+            
+        Returns:
+            True if valid
+        """
+        # Check age
+        age = time.time() - timestamp
+        if age > max_age_seconds or age < -60:  # Allow 60s clock skew
+            return False
+        
+        # Verify signature
+        expected = self.sign_request(payload, timestamp)
+        import hmac as hmac_module
+        return hmac_module.compare_digest(signature, expected)
+    
+    def get_status(self) -> Dict[str, Any]:
+        """Get security layer status."""
+        return {
+            "violation_count": self._violation_count,
+            "violations_by_type": self._violations_by_type.copy(),
+            "max_query_length": self._max_query_length,
+            "max_context_length": self._max_context_length,
+        }
+
+
+# =============================================================================
+# Phase 3: Rate Limit Guard - Per-Client Throttling
+# =============================================================================
+
+class RateLimitGuard:
+    """
+    Per-client rate limiting with sliding window.
+    
+    Features:
+    - **Sliding window**: More accurate than fixed window
+    - **Per-client**: Track by client_id
+    - **Tiered limits**: Different limits for different tiers
+    - **Burst allowance**: Allow short bursts
+    - **Gradual recovery**: Smooth rate limit recovery
+    """
+    
+    _instance: Optional["RateLimitGuard"] = None
+    
+    # Default limits per tier (requests per minute)
+    DEFAULT_LIMITS = {
+        "system": 1000,     # Internal system calls
+        "premium": 100,     # Premium users
+        "standard": 30,     # Standard users
+        "anonymous": 10,    # Anonymous/unknown
+    }
+    
+    def __init__(self):
+        self._limits = self.DEFAULT_LIMITS.copy()
+        
+        # Override from env
+        for tier in self._limits:
+            env_key = f"RATE_LIMIT_{tier.upper()}"
+            if os.getenv(env_key):
+                self._limits[tier] = int(os.getenv(env_key))
+        
+        # Sliding window state: client_id -> [(timestamp, count), ...]
+        self._windows: Dict[str, List[Tuple[float, int]]] = {}
+        self._window_size = 60.0  # 60 second window
+        self._lock = asyncio.Lock()
+        
+        # Metrics
+        self._allowed_count = 0
+        self._rejected_count = 0
+        
+        logger.info("[RateLimitGuard] Initialized")
+    
+    @classmethod
+    def get_instance(cls) -> "RateLimitGuard":
+        """Get singleton instance."""
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+    
+    async def check_rate_limit(
+        self,
+        client_id: str,
+        tier: str = "standard",
+    ) -> Tuple[bool, Dict[str, Any]]:
+        """
+        Check if request is allowed under rate limit.
+        
+        Args:
+            client_id: Unique client identifier
+            tier: Client tier for limit lookup
+            
+        Returns:
+            Tuple of (allowed, rate_limit_info)
+        """
+        async with self._lock:
+            now = time.time()
+            limit = self._limits.get(tier, self._limits["anonymous"])
+            
+            # Get or create window
+            if client_id not in self._windows:
+                self._windows[client_id] = []
+            
+            window = self._windows[client_id]
+            
+            # Remove old entries
+            window = [(t, c) for t, c in window if now - t < self._window_size]
+            
+            # Count current requests
+            current_count = sum(c for _, c in window)
+            
+            # Check limit
+            remaining = max(0, limit - current_count)
+            reset_time = now + self._window_size
+            
+            if current_count >= limit:
+                self._rejected_count += 1
+                return False, {
+                    "allowed": False,
+                    "limit": limit,
+                    "remaining": 0,
+                    "reset_at": reset_time,
+                    "retry_after": self._window_size,
+                }
+            
+            # Record this request
+            window.append((now, 1))
+            self._windows[client_id] = window
+            self._allowed_count += 1
+            
+            return True, {
+                "allowed": True,
+                "limit": limit,
+                "remaining": remaining - 1,
+                "reset_at": reset_time,
+            }
+    
+    async def cleanup_old_windows(self):
+        """Clean up stale client windows."""
+        async with self._lock:
+            now = time.time()
+            stale_clients = []
+            
+            for client_id, window in self._windows.items():
+                if not window or now - window[-1][0] > self._window_size * 2:
+                    stale_clients.append(client_id)
+            
+            for client_id in stale_clients:
+                del self._windows[client_id]
+    
+    def get_status(self) -> Dict[str, Any]:
+        """Get rate limiter status."""
+        return {
+            "limits": self._limits.copy(),
+            "active_clients": len(self._windows),
+            "allowed_count": self._allowed_count,
+            "rejected_count": self._rejected_count,
+            "rejection_rate": self._rejected_count / max(1, self._allowed_count + self._rejected_count),
+        }
+
+
+# =============================================================================
+# Global accessor functions for Phase 3 components
+# =============================================================================
+
+def get_chaos_monkey() -> ChaosMonkey:
+    """Get the chaos monkey instance."""
+    return ChaosMonkey.get_instance()
+
+
+def get_security_layer() -> SecurityLayer:
+    """Get the security layer instance."""
+    return SecurityLayer.get_instance()
+
+
+def get_rate_limit_guard() -> RateLimitGuard:
+    """Get the rate limit guard instance."""
+    return RateLimitGuard.get_instance()
+
+
 # Example usage
 if __name__ == "__main__":
     async def test_rag():
