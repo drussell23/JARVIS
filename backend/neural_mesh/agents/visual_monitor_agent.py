@@ -1008,7 +1008,7 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                 logger.debug("🟣 Purple indicator already active")
                 return True
 
-            loop = asyncio.get_event_loop()
+            # v89.0: Removed asyncio.get_event_loop() - use asyncio.to_thread() instead
 
             def _start_indicator_session_with_input():
                 """
@@ -1090,8 +1090,9 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
             indicator_timeout = float(os.getenv('JARVIS_INDICATOR_TIMEOUT', '5.0'))
 
             try:
+                # v89.0: Use asyncio.to_thread() for proper event loop handling
                 self._indicator_session = await asyncio.wait_for(
-                    loop.run_in_executor(None, _start_indicator_session_with_input),
+                    asyncio.to_thread(_start_indicator_session_with_input),
                     timeout=indicator_timeout
                 )
 
@@ -1114,15 +1115,16 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
         """Stop the purple indicator session when monitoring ends."""
         if self._indicator_session:
             try:
-                loop = asyncio.get_event_loop()
+                # v89.0: Use asyncio.to_thread() for proper event loop handling
+                session = self._indicator_session  # Capture reference before clearing
 
                 def _stop_session():
                     try:
-                        self._indicator_session.stopRunning()
+                        session.stopRunning()
                     except Exception:
                         pass
 
-                await loop.run_in_executor(None, _stop_session)
+                await asyncio.to_thread(_stop_session)
                 self._indicator_session = None
                 logger.debug("🟣 Purple indicator deactivated")
             except Exception as e:
@@ -1154,8 +1156,9 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
 
         logger.info("🚀 [VisualMonitor] Starting PARALLEL initialization v15.0...")
 
-        # Get event loop for executor calls
-        loop = asyncio.get_event_loop()
+        # v89.0: Removed asyncio.get_event_loop() - use asyncio.to_thread() instead
+        # This prevents "There is no current event loop in thread" errors when
+        # ThreadPoolExecutor threads try to access the event loop
 
         # Configurable timeouts from environment (no hardcoding)
         ferrari_init_timeout = float(os.getenv('JARVIS_FERRARI_INIT_TIMEOUT', '15.0'))  # v78.1: Increased from 5s
@@ -1201,8 +1204,10 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                     import fast_capture
                     return fast_capture.FastCaptureEngine()
 
+                # v89.0: Use asyncio.to_thread() instead of loop.run_in_executor()
+                # This properly handles event loop context in thread pools
                 self._fast_capture_engine = await asyncio.wait_for(
-                    loop.run_in_executor(None, _init_fast_capture),
+                    asyncio.to_thread(_init_fast_capture),
                     timeout=ferrari_init_timeout
                 )
                 component_status["ferrari_engine"]["success"] = True
@@ -1228,8 +1233,9 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                     from backend.vision.macos_video_capture_advanced import get_watcher_manager
                     return get_watcher_manager()
 
+                # v89.0: Use asyncio.to_thread() for proper event loop handling
                 self._watcher_manager = await asyncio.wait_for(
-                    loop.run_in_executor(None, _init_watcher_manager),
+                    asyncio.to_thread(_init_watcher_manager),
                     timeout=watcher_mgr_init_timeout
                 )
                 component_status["watcher_manager"]["success"] = True
@@ -1255,8 +1261,9 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                     from backend.vision.visual_event_detector import create_detector
                     return create_detector()
 
+                # v89.0: Use asyncio.to_thread() for proper event loop handling
                 self._detector = await asyncio.wait_for(
-                    loop.run_in_executor(None, _init_detector),
+                    asyncio.to_thread(_init_detector),
                     timeout=detector_init_timeout
                 )
                 component_status["detector"]["success"] = True
@@ -1285,8 +1292,9 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                     from backend.display.computer_use_connector import get_computer_use_connector
                     return get_computer_use_connector()
 
+                # v89.0: Use asyncio.to_thread() for proper event loop handling
                 self._computer_use_connector = await asyncio.wait_for(
-                    loop.run_in_executor(None, _init_computer_use),
+                    asyncio.to_thread(_init_computer_use),
                     timeout=computer_use_init_timeout
                 )
 
@@ -1349,8 +1357,9 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
             comp_start = time_module.time()
             try:
                 # Phase 1: Create agent (sync, in executor)
+                # v89.0: Use asyncio.to_thread() for proper event loop handling
                 self.spatial_agent = await asyncio.wait_for(
-                    loop.run_in_executor(None, self._create_spatial_agent_sync),
+                    asyncio.to_thread(self._create_spatial_agent_sync),
                     timeout=spatial_agent_init_timeout
                 )
 

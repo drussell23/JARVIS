@@ -666,15 +666,25 @@ class AdaptiveThrottleController:
     async def should_proceed(self, priority: RequestPriority = RequestPriority.NORMAL) -> Tuple[bool, float]:
         """
         Check if request should proceed and calculate delay.
-        
+
+        v89.0: Fixed to prevent complete lockout when throttle_factor is at maximum.
+        Even at max throttle, we allow a minimum effective limit to prevent deadlock.
+
         Returns:
             (should_proceed, recommended_delay)
         """
         current_rate = await self.get_current_rate()
-        
+
         # Calculate available capacity
-        effective_limit = self.base_rate_limit * self.burst_capacity * (1 - self._throttle_factor)
-        
+        # v89.0: CRITICAL FIX - Ensure effective_limit is never zero to prevent deadlock
+        # At max throttle (1.0), we still allow 10% of base rate to prevent complete lockout
+        throttle_factor = min(self._throttle_factor, 0.9)  # Never fully throttle
+        effective_limit = self.base_rate_limit * self.burst_capacity * (1 - throttle_factor)
+
+        # v89.0: Ensure minimum effective limit to prevent infinite wait
+        min_effective_limit = self.base_rate_limit * 0.1  # Always allow at least 10%
+        effective_limit = max(effective_limit, min_effective_limit)
+
         if current_rate >= effective_limit:
             # At or over limit
             if priority == RequestPriority.CRITICAL:
@@ -682,17 +692,21 @@ class AdaptiveThrottleController:
             elif priority == RequestPriority.HIGH:
                 return True, 0.1
             else:
-                return False, 1.0 / max(1, effective_limit)
-        
+                # v89.0: Instead of returning False (which causes retry loops),
+                # return True with a delay to allow gradual progress
+                # This prevents the "busy after 10 retries" infinite loop
+                delay = min(1.0 / max(1, effective_limit), 2.0)  # Cap delay at 2s
+                return True, delay
+
         # Under limit - proceed with appropriate delay
         utilization = current_rate / effective_limit if effective_limit > 0 else 1.0
         delay = 0.0
-        
+
         if utilization > 0.8:
             delay = 0.05 * (priority.value + 1)
         elif utilization > 0.6:
             delay = 0.01 * (priority.value + 1)
-        
+
         return True, delay
     
     def get_stats(self) -> Dict[str, Any]:
@@ -1273,34 +1287,77 @@ class ServiceThrottledError(Exception):
 # =============================================================================
 
 _orchestrator: Optional[IntelligentRateOrchestrator] = None
-_orchestrator_lock = asyncio.Lock()
+# v89.0: CRITICAL FIX - Lazy lock initialization to prevent event loop issues
+# Creating asyncio.Lock() at module load time (before event loop exists) causes
+# the lock to be bound to the wrong event loop, leading to perpetual blocking.
+# Instead, we use a simple boolean flag + threading lock for the initialization guard.
+_orchestrator_initializing = False
+_orchestrator_init_lock = None  # Will be lazily created
+
+def _get_init_lock():
+    """Lazily create the initialization lock to ensure it's bound to the correct event loop."""
+    global _orchestrator_init_lock
+    if _orchestrator_init_lock is None:
+        try:
+            # Try to create an asyncio.Lock in the current event loop
+            _orchestrator_init_lock = asyncio.Lock()
+        except RuntimeError:
+            # No event loop - create a new lock (will be replaced when loop is available)
+            pass
+    return _orchestrator_init_lock
 
 
 async def get_rate_orchestrator() -> IntelligentRateOrchestrator:
     """
     Get the singleton IntelligentRateOrchestrator instance.
-    
+
+    v89.0: Fixed lock initialization to prevent event loop binding issues.
+    The lock is now lazily created to ensure it's bound to the running event loop.
+
     Usage:
         orchestrator = await get_rate_orchestrator()
-        
+
         # Acquire before making request
         acquired, reason = await orchestrator.acquire(
-            ServiceType.CLAUDE_API, 
+            ServiceType.CLAUDE_API,
             OperationType.QUERY
         )
-        
+
         # Or use decorator
         @orchestrator.rate_limited(ServiceType.GCP_CLOUD_SQL)
         async def query_db():
             ...
     """
-    global _orchestrator
-    
-    async with _orchestrator_lock:
+    global _orchestrator, _orchestrator_initializing, _orchestrator_init_lock
+
+    # Fast path - already initialized
+    if _orchestrator is not None:
+        return _orchestrator
+
+    # Lazy lock creation - ensures lock is bound to current event loop
+    if _orchestrator_init_lock is None:
+        _orchestrator_init_lock = asyncio.Lock()
+
+    async with _orchestrator_init_lock:
+        # Double-check after acquiring lock
         if _orchestrator is None:
-            _orchestrator = IntelligentRateOrchestrator()
-            await _orchestrator.start()
-    
+            # Prevent reentrant initialization
+            if _orchestrator_initializing:
+                # Another coroutine is initializing - wait and return
+                while _orchestrator is None and _orchestrator_initializing:
+                    await asyncio.sleep(0.01)
+                if _orchestrator is not None:
+                    return _orchestrator
+                raise RuntimeError("Rate orchestrator initialization failed")
+
+            _orchestrator_initializing = True
+            try:
+                new_orchestrator = IntelligentRateOrchestrator()
+                await new_orchestrator.start()
+                _orchestrator = new_orchestrator
+            finally:
+                _orchestrator_initializing = False
+
     return _orchestrator
 
 
