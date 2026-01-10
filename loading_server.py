@@ -5682,6 +5682,92 @@ async def update_voice_biometrics_status(request: web.Request) -> web.Response:
 # v6.2: Intelligent Voice Narrator Endpoints
 # ═══════════════════════════════════════════════════════════════════════════════
 
+async def get_trinity_voice_status(request: web.Request) -> web.Response:
+    """
+    v87.0: Get Trinity Voice Coordinator status and metrics.
+
+    Returns comprehensive voice system state including:
+    - Running status
+    - Queue size
+    - Active TTS engines
+    - Success/failure rates
+    - Recent announcements
+    - Engine health scores
+    - Announcement metrics
+    """
+    try:
+        # Import Trinity Voice Coordinator
+        try:
+            from backend.core.trinity_voice_coordinator import get_voice_coordinator
+            coordinator = await get_voice_coordinator()
+            status = coordinator.get_status()
+
+            return web.json_response({
+                "status": "ok",
+                "voice_coordinator": status,
+                "timestamp": datetime.now().isoformat(),
+            })
+
+        except ImportError:
+            return web.json_response({
+                "status": "unavailable",
+                "message": "Trinity Voice Coordinator not available",
+                "timestamp": datetime.now().isoformat(),
+            })
+
+    except Exception as e:
+        metrics.record_error(str(e))
+        logger.error(f"[Trinity Voice] Get status error: {e}")
+        return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+
+async def test_trinity_voice(request: web.Request) -> web.Response:
+    """
+    v87.0: Test Trinity Voice Coordinator by sending a test announcement.
+
+    Returns:
+    - Success/failure status
+    - Coordinator availability
+    - TTS engine used
+    """
+    try:
+        # Import Trinity Voice Coordinator
+        try:
+            from backend.core.trinity_voice_coordinator import (
+                announce,
+                VoiceContext,
+                VoicePriority,
+            )
+
+            # Send test announcement
+            success = await announce(
+                message="Trinity Voice Coordinator test successful.",
+                context=VoiceContext.RUNTIME,
+                priority=VoicePriority.LOW,
+                source="loading_server_test",
+                metadata={"test": True}
+            )
+
+            return web.json_response({
+                "status": "ok",
+                "test_result": "success" if success else "skipped",
+                "message": "Test announcement queued" if success else "Test skipped (rate limited or duplicate)",
+                "timestamp": datetime.now().isoformat(),
+            })
+
+        except ImportError:
+            return web.json_response({
+                "status": "unavailable",
+                "message": "Trinity Voice Coordinator not available",
+                "timestamp": datetime.now().isoformat(),
+            }, status=503)
+
+    except Exception as e:
+        metrics.record_error(str(e))
+        logger.error(f"[Trinity Voice] Test error: {e}")
+        return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+
 async def get_narrator_status(request: web.Request) -> web.Response:
     """
     v6.2: Get Intelligent Voice Narrator status.
@@ -6573,6 +6659,10 @@ def create_app() -> web.Application:
     # v6.2: Voice Biometric Authentication System endpoints
     app.router.add_get('/api/voice-biometrics/status', get_voice_biometrics_status)
     app.router.add_post('/api/voice-biometrics/update', update_voice_biometrics_status)
+
+    # v87.0: Trinity Voice Coordinator endpoints
+    app.router.add_get('/api/trinity-voice/status', get_trinity_voice_status)
+    app.router.add_post('/api/trinity-voice/test', test_trinity_voice)
 
     # v6.2: Intelligent Voice Narrator endpoints
     app.router.add_get('/api/narrator/status', get_narrator_status)
