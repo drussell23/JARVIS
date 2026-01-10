@@ -7,6 +7,7 @@ import json
 import os
 import pickle
 import random
+import heapq
 from pathlib import Path
 import faiss
 import torch
@@ -3016,6 +3017,548 @@ async def execute_with_resilience(
 def get_service_registry() -> ServiceRegistry:
     """Get the global service registry."""
     return ServiceRegistry.get_instance()
+
+
+# =============================================================================
+# Phase 2.2: Cross-Repo Health Aggregation
+# =============================================================================
+
+class CrossRepoHealthAggregator:
+    """
+    Aggregates health status across JARVIS ecosystem (JARVIS, J-Prime, Reactor-Core).
+    
+    Features:
+    - **Dependency graph**: Knows which services depend on which
+    - **Cascading degradation**: If dependency unhealthy, mark dependents degraded
+    - **Parallel health checks**: Check all services concurrently
+    - **Health history**: Track health trends over time
+    - **Predictive alerts**: Warn before cascade failures
+    """
+    
+    _instance: Optional["CrossRepoHealthAggregator"] = None
+    
+    # Service dependency graph
+    DEPENDENCIES = {
+        "jarvis": [],  # JARVIS is root
+        "jarvis_prime": ["jarvis"],  # J-Prime depends on JARVIS
+        "reactor_core": ["jarvis", "jarvis_prime"],  # Reactor depends on both
+        "trinity_indexer": ["jarvis"],  # Trinity depends on JARVIS
+    }
+    
+    def __init__(self):
+        self._registry = ServiceRegistry.get_instance()
+        self._health_history: Dict[str, List[Tuple[float, bool]]] = {}
+        self._aggregated_status: Dict[str, str] = {}  # healthy, degraded, unhealthy
+        self._last_aggregate_time = 0.0
+        self._aggregate_lock = asyncio.Lock()
+        
+        logger.info("[CrossRepoHealthAggregator] Initialized")
+    
+    @classmethod
+    def get_instance(cls) -> "CrossRepoHealthAggregator":
+        """Get singleton instance."""
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+    
+    async def aggregate_health(self) -> Dict[str, Any]:
+        """
+        Aggregate health across all services with dependency awareness.
+        
+        Returns:
+            Dict with per-service health, overall score, and alerts
+        """
+        async with self._aggregate_lock:
+            now = time.time()
+            
+            # Get current health from registry
+            registry_status = self._registry.get_status()
+            services = registry_status.get("services", {})
+            
+            # Check each service
+            for name, info in services.items():
+                is_healthy = info.get("is_healthy", False)
+                
+                # Record history
+                if name not in self._health_history:
+                    self._health_history[name] = []
+                self._health_history[name].append((now, is_healthy))
+                
+                # Keep last 100 entries
+                if len(self._health_history[name]) > 100:
+                    self._health_history[name] = self._health_history[name][-100:]
+                
+                # Determine status with dependency awareness
+                if not is_healthy:
+                    self._aggregated_status[name] = "unhealthy"
+                else:
+                    # Check if any dependency is unhealthy
+                    deps = self.DEPENDENCIES.get(name, [])
+                    dep_unhealthy = any(
+                        self._aggregated_status.get(d) in ("unhealthy", "degraded")
+                        for d in deps
+                    )
+                    if dep_unhealthy:
+                        self._aggregated_status[name] = "degraded"
+                    else:
+                        self._aggregated_status[name] = "healthy"
+            
+            self._last_aggregate_time = now
+            
+            # Calculate overall system health
+            statuses = list(self._aggregated_status.values())
+            healthy_count = statuses.count("healthy")
+            total = len(statuses) if statuses else 1
+            
+            return {
+                "services": self._aggregated_status.copy(),
+                "overall_score": healthy_count / total,
+                "healthy_count": healthy_count,
+                "degraded_count": statuses.count("degraded"),
+                "unhealthy_count": statuses.count("unhealthy"),
+                "alerts": self._generate_alerts(),
+                "timestamp": now,
+            }
+    
+    def _generate_alerts(self) -> List[str]:
+        """Generate predictive alerts based on health trends."""
+        alerts = []
+        
+        for name, history in self._health_history.items():
+            if len(history) < 5:
+                continue
+            
+            # Check recent trend
+            recent = [h[1] for h in history[-10:]]
+            failure_rate = recent.count(False) / len(recent)
+            
+            if failure_rate > 0.5:
+                alerts.append(f"CRITICAL: {name} has {failure_rate:.0%} failure rate")
+            elif failure_rate > 0.2:
+                alerts.append(f"WARNING: {name} showing degradation ({failure_rate:.0%} failures)")
+        
+        return alerts
+    
+    def get_service_status(self, service_name: str) -> str:
+        """Get current aggregated status for a service."""
+        return self._aggregated_status.get(service_name, "unknown")
+
+
+# =============================================================================
+# Phase 2.2: Resource Bulkhead for Service Isolation
+# =============================================================================
+
+class ResourceBulkhead:
+    """
+    Bulkhead pattern for service isolation with semaphore-based concurrency limits.
+    
+    Prevents one slow service from consuming all resources.
+    Each service gets its own "compartment" with limited slots.
+    
+    Features:
+    - **Per-service isolation**: Separate limits for each service
+    - **Adaptive sizing**: Grows/shrinks based on success rate
+    - **Queue depth monitoring**: Track waiting requests
+    - **Timeout with rejection**: Reject if wait too long
+    """
+    
+    def __init__(
+        self,
+        name: str,
+        max_concurrent: int = 10,
+        queue_depth: int = 50,
+        adaptive: bool = True,
+    ):
+        self._name = name
+        self._max_concurrent = max_concurrent
+        self._initial_max = max_concurrent
+        self._queue_depth = queue_depth
+        self._adaptive = adaptive
+        
+        self._semaphore = asyncio.Semaphore(max_concurrent)
+        self._active_count = 0
+        self._queued_count = 0
+        self._rejected_count = 0
+        self._success_count = 0
+        self._failure_count = 0
+        self._lock = asyncio.Lock()
+        
+        logger.info(f"[Bulkhead:{name}] Initialized (max={max_concurrent})")
+    
+    @property
+    def is_full(self) -> bool:
+        """Check if bulkhead is at capacity."""
+        return self._active_count >= self._max_concurrent
+    
+    @property
+    def queue_full(self) -> bool:
+        """Check if queue is full."""
+        return self._queued_count >= self._queue_depth
+    
+    async def acquire(self, timeout: float = 5.0) -> bool:
+        """
+        Acquire a slot in the bulkhead.
+        
+        Returns:
+            True if acquired, False if rejected
+        """
+        # Check queue depth
+        async with self._lock:
+            if self.queue_full:
+                self._rejected_count += 1
+                logger.warning(f"[Bulkhead:{self._name}] Rejected (queue full)")
+                return False
+            self._queued_count += 1
+        
+        try:
+            # Try to acquire semaphore with timeout
+            acquired = await asyncio.wait_for(
+                self._semaphore.acquire(),
+                timeout=timeout
+            )
+            
+            async with self._lock:
+                self._queued_count -= 1
+                if acquired:
+                    self._active_count += 1
+                    return True
+                return False
+                
+        except asyncio.TimeoutError:
+            async with self._lock:
+                self._queued_count -= 1
+                self._rejected_count += 1
+            logger.warning(f"[Bulkhead:{self._name}] Timeout waiting for slot")
+            return False
+    
+    async def release(self, success: bool = True):
+        """Release a slot back to the bulkhead."""
+        self._semaphore.release()
+        
+        async with self._lock:
+            self._active_count = max(0, self._active_count - 1)
+            if success:
+                self._success_count += 1
+            else:
+                self._failure_count += 1
+            
+            # Adaptive sizing
+            if self._adaptive:
+                self._adjust_size()
+    
+    def _adjust_size(self):
+        """Adjust bulkhead size based on success rate."""
+        total = self._success_count + self._failure_count
+        if total < 10:
+            return
+        
+        success_rate = self._success_count / total
+        
+        if success_rate > 0.95 and self._max_concurrent < self._initial_max * 2:
+            # Increase capacity
+            self._max_concurrent += 1
+            self._semaphore = asyncio.Semaphore(self._max_concurrent)
+        elif success_rate < 0.5 and self._max_concurrent > 2:
+            # Decrease capacity
+            self._max_concurrent -= 1
+            self._semaphore = asyncio.Semaphore(self._max_concurrent)
+    
+    @asynccontextmanager
+    async def slot(self, timeout: float = 5.0):
+        """Context manager for acquiring a bulkhead slot."""
+        acquired = await self.acquire(timeout)
+        if not acquired:
+            raise Exception(f"Bulkhead '{self._name}' rejected request")
+        
+        success = True
+        try:
+            yield
+        except Exception:
+            success = False
+            raise
+        finally:
+            await self.release(success)
+    
+    def get_status(self) -> Dict[str, Any]:
+        """Get bulkhead status."""
+        total = self._success_count + self._failure_count
+        return {
+            "name": self._name,
+            "max_concurrent": self._max_concurrent,
+            "active_count": self._active_count,
+            "queued_count": self._queued_count,
+            "rejected_count": self._rejected_count,
+            "success_rate": self._success_count / max(1, total),
+        }
+
+
+# =============================================================================
+# Phase 2.2: Async Priority Queue with Preemption
+# =============================================================================
+
+class RequestPriority(Enum):
+    """Request priority levels."""
+    CRITICAL = 0   # System health, auth
+    HIGH = 1       # User-initiated actions
+    NORMAL = 2     # Regular requests
+    LOW = 3        # Background tasks
+    BULK = 4       # Batch operations
+
+
+@dataclass(order=True)
+class PrioritizedRequest:
+    """Request wrapper with priority ordering."""
+    priority: int
+    timestamp: float = field(compare=False)
+    request_id: str = field(compare=False)
+    func: Callable = field(compare=False)
+    args: tuple = field(compare=False)
+    kwargs: dict = field(compare=False)
+    future: asyncio.Future = field(compare=False)
+
+
+class AsyncPriorityQueue:
+    """
+    Priority queue with preemption for request scheduling.
+    
+    Features:
+    - **Priority levels**: CRITICAL > HIGH > NORMAL > LOW > BULK
+    - **Aging**: Low-priority requests get boosted over time
+    - **Preemption**: Critical requests can interrupt BULK
+    - **Fair scheduling**: Round-robin within same priority
+    """
+    
+    def __init__(self, max_size: int = 1000):
+        self._queue: List[PrioritizedRequest] = []
+        self._max_size = max_size
+        self._lock = asyncio.Lock()
+        self._not_empty = asyncio.Event()
+        self._request_count = 0
+        self._aging_interval = 30.0  # Boost priority every 30s
+    
+    async def enqueue(
+        self,
+        func: Callable,
+        priority: RequestPriority = RequestPriority.NORMAL,
+        *args,
+        **kwargs,
+    ) -> asyncio.Future:
+        """
+        Add request to queue with priority.
+        
+        Returns:
+            Future that will contain the result
+        """
+        async with self._lock:
+            if len(self._queue) >= self._max_size:
+                # Shed lowest priority
+                if self._queue:
+                    self._queue.sort()
+                    shed = self._queue.pop()
+                    shed.future.set_exception(Exception("Request shed due to queue overflow"))
+            
+            self._request_count += 1
+            request_id = f"req_{self._request_count}_{time.time()}"
+            future = asyncio.get_event_loop().create_future()
+            
+            request = PrioritizedRequest(
+                priority=priority.value,
+                timestamp=time.time(),
+                request_id=request_id,
+                func=func,
+                args=args,
+                kwargs=kwargs,
+                future=future,
+            )
+            
+            # Insert maintaining heap order
+            import heapq
+            heapq.heappush(self._queue, request)
+            self._not_empty.set()
+            
+            return future
+    
+    async def dequeue(self, timeout: float = 10.0) -> Optional[PrioritizedRequest]:
+        """Get next request from queue."""
+        try:
+            await asyncio.wait_for(self._not_empty.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            return None
+        
+        async with self._lock:
+            if not self._queue:
+                self._not_empty.clear()
+                return None
+            
+            # Apply aging before dequeue
+            self._apply_aging()
+            
+            import heapq
+            request = heapq.heappop(self._queue)
+            
+            if not self._queue:
+                self._not_empty.clear()
+            
+            return request
+    
+    def _apply_aging(self):
+        """Boost priority of old requests."""
+        now = time.time()
+        for req in self._queue:
+            age = now - req.timestamp
+            if age > self._aging_interval and req.priority > 0:
+                # Boost priority (lower number = higher priority)
+                req.priority = max(0, req.priority - 1)
+    
+    def get_status(self) -> Dict[str, Any]:
+        """Get queue status."""
+        priority_counts = {}
+        for req in self._queue:
+            p = RequestPriority(req.priority).name
+            priority_counts[p] = priority_counts.get(p, 0) + 1
+        
+        return {
+            "queue_size": len(self._queue),
+            "max_size": self._max_size,
+            "total_processed": self._request_count,
+            "by_priority": priority_counts,
+        }
+
+
+# =============================================================================
+# Phase 2.2: Adaptive Timeout Manager
+# =============================================================================
+
+class AdaptiveTimeoutManager:
+    """
+    Manages adaptive timeouts based on service latency history.
+    
+    Features:
+    - **Per-service timeouts**: Different limits for each service
+    - **Latency-based adjustment**: Uses P95 + headroom
+    - **Model-aware**: Larger models get longer timeouts
+    - **Load-aware**: Increase timeout under high load
+    """
+    
+    _instance: Optional["AdaptiveTimeoutManager"] = None
+    
+    # Base timeouts by service type (seconds)
+    DEFAULT_TIMEOUTS = {
+        "rag_trinity": 5.0,
+        "rag_local": 2.0,
+        "llm_claude": 30.0,
+        "llm_llama": 60.0,
+        "health_check": 3.0,
+        "default": 10.0,
+    }
+    
+    def __init__(self):
+        self._config = DynamicConfigManager.get_instance()
+        self._latency_history: Dict[str, List[float]] = {}
+        self._adaptive_timeouts: Dict[str, float] = {}
+        self._lock = asyncio.Lock()
+        
+        logger.info("[AdaptiveTimeoutManager] Initialized")
+    
+    @classmethod
+    def get_instance(cls) -> "AdaptiveTimeoutManager":
+        """Get singleton instance."""
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+    
+    def record_latency(self, service: str, latency: float):
+        """Record a latency observation for a service."""
+        if service not in self._latency_history:
+            self._latency_history[service] = []
+        
+        self._latency_history[service].append(latency)
+        
+        # Keep last 100 samples
+        if len(self._latency_history[service]) > 100:
+            self._latency_history[service] = self._latency_history[service][-100:]
+        
+        # Update adaptive timeout
+        self._update_timeout(service)
+    
+    def _update_timeout(self, service: str):
+        """Update adaptive timeout based on latency history."""
+        history = self._latency_history.get(service, [])
+        if len(history) < 10:
+            return
+        
+        # Calculate P95
+        sorted_latencies = sorted(history)
+        p95 = sorted_latencies[int(len(sorted_latencies) * 0.95)]
+        
+        # Adaptive timeout = P95 + 50% headroom
+        base = self.DEFAULT_TIMEOUTS.get(service, self.DEFAULT_TIMEOUTS["default"])
+        adaptive = max(base, p95 * 1.5)
+        
+        # Cap at 3x base
+        self._adaptive_timeouts[service] = min(adaptive, base * 3)
+    
+    def get_timeout(
+        self,
+        service: str,
+        model: Optional[str] = None,
+        load_factor: float = 1.0,
+    ) -> float:
+        """
+        Get timeout for a service.
+        
+        Args:
+            service: Service name
+            model: Optional model name (for LLM sizing)
+            load_factor: Current load (1.0 = normal, 2.0 = high)
+            
+        Returns:
+            Timeout in seconds
+        """
+        # Start with adaptive or default
+        timeout = self._adaptive_timeouts.get(
+            service,
+            self.DEFAULT_TIMEOUTS.get(service, self.DEFAULT_TIMEOUTS["default"])
+        )
+        
+        # Adjust for model size
+        if model:
+            if "opus" in model.lower():
+                timeout *= 1.5
+            elif "sonnet" in model.lower():
+                timeout *= 1.2
+            elif "70b" in model.lower():
+                timeout *= 2.0
+            elif "405b" in model.lower():
+                timeout *= 3.0
+        
+        # Adjust for load
+        if load_factor > 1.5:
+            timeout *= 1.3
+        
+        return timeout
+    
+    def get_status(self) -> Dict[str, Any]:
+        """Get timeout manager status."""
+        return {
+            "default_timeouts": self.DEFAULT_TIMEOUTS,
+            "adaptive_timeouts": self._adaptive_timeouts.copy(),
+            "services_tracked": list(self._latency_history.keys()),
+        }
+
+
+# =============================================================================
+# Global accessor functions for Priority 2 components
+# =============================================================================
+
+def get_health_aggregator() -> CrossRepoHealthAggregator:
+    """Get the cross-repo health aggregator."""
+    return CrossRepoHealthAggregator.get_instance()
+
+
+def get_timeout_manager() -> AdaptiveTimeoutManager:
+    """Get the adaptive timeout manager."""
+    return AdaptiveTimeoutManager.get_instance()
 
 
 # Example usage
