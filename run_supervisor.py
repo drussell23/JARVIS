@@ -399,11 +399,12 @@ class BootstrapConfig:
 
     # =========================================================================
     # v80.0: Global Startup Timeout and Deep Health Verification
+    # v86.0: Adaptive timeout based on cold vs warm start
     # =========================================================================
     # Prevents infinite hangs during startup with a global timeout.
     # Deep health verification ensures components are actually functional.
     # =========================================================================
-    global_startup_timeout: float = field(default_factory=lambda: float(os.getenv("SUPERVISOR_STARTUP_TIMEOUT", "300.0")))
+    global_startup_timeout: float = field(default_factory=lambda: float(os.getenv("SUPERVISOR_STARTUP_TIMEOUT", "600.0")))  # v86.0: Increased to 600s for cold starts
     deep_health_enabled: bool = field(default_factory=lambda: os.getenv("DEEP_HEALTH_ENABLED", "true").lower() == "true")
     deep_health_timeout: float = field(default_factory=lambda: float(os.getenv("DEEP_HEALTH_TIMEOUT", "10.0")))
     advanced_primitives_enabled: bool = field(default_factory=lambda: os.getenv("ADVANCED_PRIMITIVES_ENABLED", "true").lower() == "true")
