@@ -736,7 +736,16 @@ class JARVISPrimeClient(TrinityBaseClient[Dict[str, Any]]):
         - Detailed logging for each endpoint attempt (not silent)
         - Reordered endpoints by likelihood of success
         - Connection error differentiation
+
+        v90.0: Fixed aiohttp import issue - now properly imports at method level
         """
+        # v90.0: Import aiohttp at method level to avoid NameError
+        try:
+            import aiohttp
+        except ImportError:
+            logger.warning("[JARVISPrime] aiohttp not installed - health check skipped")
+            return False
+
         try:
             base_url = await self._get_base_url()
             session = await self._get_session()

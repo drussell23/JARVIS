@@ -9154,7 +9154,19 @@ class TrinityUnifiedOrchestrator:
             return False
 
     async def _wait_for_reactor(self) -> bool:
-        """Wait for Reactor-Core to be ready."""
+        """
+        Wait for Reactor-Core to be ready with retry loop.
+
+        v90.0: Fixed - Added wait loop with adaptive polling, matching the
+        pattern used for JARVIS Prime. Previously this would fail immediately
+        if Reactor-Core wasn't ready at the exact moment of check.
+
+        Features:
+        - Configurable timeout via REACTOR_CORE_STARTUP_TIMEOUT env var
+        - Adaptive polling interval (starts fast, slows down)
+        - Health check retries within the loop
+        - Detailed logging for debugging startup issues
+        """
         try:
             from backend.clients.reactor_core_client import (
                 initialize_reactor_client,
@@ -9164,15 +9176,69 @@ class TrinityUnifiedOrchestrator:
             await initialize_reactor_client()
             self._reactor_client = get_reactor_client()
 
+            # v90.0: Immediate check
             if self._reactor_client and self._reactor_client.is_online:
-                logger.info("[TrinityOrchestrator] Reactor-Core is ready")
+                logger.info("[TrinityOrchestrator] Reactor-Core is ready (immediate)")
                 return True
 
-            logger.warning("[TrinityOrchestrator] Reactor-Core not available")
+            # v90.0: Wait loop with timeout - same pattern as _wait_for_jprime
+            reactor_timeout = float(os.getenv("REACTOR_CORE_STARTUP_TIMEOUT", "60.0"))
+            poll_interval = 1.0  # Start with 1s polling
+            max_poll_interval = 5.0  # Max 5s between checks
+
+            logger.info(
+                f"[TrinityOrchestrator] Waiting for Reactor-Core to come online "
+                f"(timeout={reactor_timeout}s)..."
+            )
+
+            start = time.time()
+            check_count = 0
+            while time.time() - start < reactor_timeout:
+                check_count += 1
+
+                # Perform active health check instead of just checking is_online flag
+                if self._reactor_client:
+                    try:
+                        is_healthy = await asyncio.wait_for(
+                            self._reactor_client.health_check(),
+                            timeout=10.0
+                        )
+                        if is_healthy or self._reactor_client.is_online:
+                            elapsed = time.time() - start
+                            logger.info(
+                                f"[TrinityOrchestrator] Reactor-Core is ready "
+                                f"(after {elapsed:.1f}s, {check_count} checks)"
+                            )
+                            return True
+                    except asyncio.TimeoutError:
+                        logger.debug(
+                            f"[TrinityOrchestrator] Reactor-Core health check timeout "
+                            f"(check {check_count})"
+                        )
+                    except Exception as e:
+                        logger.debug(
+                            f"[TrinityOrchestrator] Reactor-Core health check error: {e}"
+                        )
+
+                # Adaptive poll interval - slower over time to reduce load
+                await asyncio.sleep(poll_interval)
+                poll_interval = min(poll_interval * 1.2, max_poll_interval)
+
+            # Timeout reached
+            elapsed = time.time() - start
+            logger.warning(
+                f"[TrinityOrchestrator] Reactor-Core not available after {elapsed:.1f}s "
+                f"({check_count} health checks attempted)"
+            )
             return False
 
+        except ImportError as e:
+            logger.warning(f"[TrinityOrchestrator] Reactor-Core client import failed: {e}")
+            return False
         except Exception as e:
             logger.warning(f"[TrinityOrchestrator] Reactor-Core init failed: {e}")
+            import traceback
+            traceback.print_exc()
             return False
 
     # =========================================================================
@@ -9496,10 +9562,49 @@ class TrinityUnifiedOrchestrator:
                     "launched_by": "v85.0_intelligent_launcher",
                 }
 
-                # Verify reactor started by checking heartbeat file
-                await asyncio.sleep(3.0)  # Give it time to write heartbeat
+                # v90.0: Verify reactor started by checking heartbeat file with retry loop
                 heartbeat_path = Path.home() / ".jarvis" / "trinity" / "components" / "reactor_core.json"
-                if heartbeat_path.exists():
+                heartbeat_timeout = float(os.getenv("REACTOR_CORE_HEARTBEAT_TIMEOUT", "30.0"))
+                heartbeat_poll = 1.0  # Check every second
+
+                logger.info(
+                    f"[Launcher] Waiting for Reactor-Core heartbeat "
+                    f"(timeout={heartbeat_timeout}s)..."
+                )
+
+                heartbeat_start = time.time()
+                heartbeat_verified = False
+
+                while time.time() - heartbeat_start < heartbeat_timeout:
+                    if heartbeat_path.exists():
+                        try:
+                            # v90.0: Also verify heartbeat file content is valid and fresh
+                            with open(heartbeat_path, 'r') as f:
+                                heartbeat_data = json.load(f)
+
+                            # Check timestamp freshness (within last 30 seconds)
+                            heartbeat_ts = heartbeat_data.get("timestamp", 0)
+                            heartbeat_age = time.time() - heartbeat_ts
+
+                            if heartbeat_age < 30.0:
+                                elapsed = time.time() - heartbeat_start
+                                logger.info(
+                                    f"[Launcher] Reactor-Core heartbeat verified "
+                                    f"(after {elapsed:.1f}s, age={heartbeat_age:.1f}s)"
+                                )
+                                heartbeat_verified = True
+                                break
+                            else:
+                                logger.debug(
+                                    f"[Launcher] Heartbeat file exists but stale "
+                                    f"(age={heartbeat_age:.1f}s)"
+                                )
+                        except (json.JSONDecodeError, KeyError) as e:
+                            logger.debug(f"[Launcher] Heartbeat file parse error: {e}")
+
+                    await asyncio.sleep(heartbeat_poll)
+
+                if heartbeat_verified:
                     logger.info("[Launcher] Reactor-Core heartbeat verified")
                 else:
                     logger.warning("[Launcher] Reactor-Core started but no heartbeat yet")
