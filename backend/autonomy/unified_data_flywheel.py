@@ -270,7 +270,7 @@ class FlywheelResult:
 # =============================================================================
 
 # Current schema version - increment when adding migrations
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # Unified schema definition - single source of truth
 UNIFIED_SCHEMA = """
@@ -414,6 +414,14 @@ SCHEMA_MIGRATIONS = {
         ("training_runs", "deployed_to_cloud", "INTEGER DEFAULT 0"),
         ("training_runs", "error_traceback", "TEXT"),
         ("training_runs", "config_json", "TEXT"),
+    ],
+    # Migration from version 2 to 3: Add indexing support for Trinity Knowledge Indexer
+    3: [
+        # scraped_content table additions for knowledge indexing
+        ("scraped_content", "indexed", "INTEGER DEFAULT 0"),
+        ("scraped_content", "indexed_at", "DATETIME"),
+        ("scraped_content", "chunk_count", "INTEGER DEFAULT 0"),
+        ("scraped_content", "embedding_model", "TEXT"),
     ],
 }
 
@@ -1501,6 +1509,205 @@ class UnifiedDataFlywheel:
                 await self._async_db_conn.close()
                 self._async_db_conn = None
                 logger.info("[Flywheel] Async SQLite connection closed")
+
+    # =========================================================================
+    # v11.0: Trinity Knowledge Indexer Integration Methods
+    # =========================================================================
+
+    async def get_unindexed_scraped_content(
+        self,
+        limit: int = 100,
+        min_quality: float = 0.0
+    ) -> List[Dict[str, Any]]:
+        """
+        v11.0: Get scraped content that hasn't been indexed yet.
+
+        This is used by Trinity Knowledge Indexer to process scraped content
+        into vector embeddings for RAG retrieval.
+
+        Args:
+            limit: Maximum number of content items to return
+            min_quality: Minimum quality score filter
+
+        Returns:
+            List of unindexed content dictionaries
+        """
+        conn = await self._get_async_db()
+        if not conn:
+            return []
+
+        try:
+            content_items = []
+            async with conn.execute("""
+                SELECT id, url, title, content, content_type, topic, language,
+                       quality_score, word_count, code_blocks, scraped_at
+                FROM scraped_content
+                WHERE (indexed = 0 OR indexed IS NULL)
+                  AND quality_score >= ?
+                ORDER BY quality_score DESC, scraped_at DESC
+                LIMIT ?
+            """, (min_quality, limit)) as cursor:
+                async for row in cursor:
+                    content_items.append({
+                        "id": row[0],
+                        "url": row[1],
+                        "title": row[2],
+                        "content": row[3],
+                        "content_type": row[4],
+                        "topic": row[5],
+                        "language": row[6],
+                        "quality_score": row[7],
+                        "word_count": row[8],
+                        "code_blocks": row[9],
+                        "scraped_at": row[10],
+                    })
+
+            logger.debug(f"[Flywheel] Retrieved {len(content_items)} unindexed content items")
+            return content_items
+
+        except Exception as e:
+            logger.error(f"[Flywheel] Failed to get unindexed content: {e}")
+            return []
+
+    async def mark_content_as_indexed(
+        self,
+        content_id: int,
+        chunk_count: int = 0,
+        embedding_model: Optional[str] = None
+    ) -> bool:
+        """
+        v11.0: Mark scraped content as indexed by Trinity Knowledge Indexer.
+
+        Args:
+            content_id: Content ID to mark
+            chunk_count: Number of chunks created from this content
+            embedding_model: Name of embedding model used
+
+        Returns:
+            True if successful
+        """
+        conn = await self._get_async_db()
+        if not conn:
+            return False
+
+        try:
+            await conn.execute("""
+                UPDATE scraped_content
+                SET indexed = 1,
+                    indexed_at = CURRENT_TIMESTAMP,
+                    chunk_count = ?,
+                    embedding_model = ?
+                WHERE id = ?
+            """, (chunk_count, embedding_model, content_id))
+
+            await conn.commit()
+            logger.debug(f"[Flywheel] Marked content {content_id} as indexed ({chunk_count} chunks)")
+            return True
+
+        except Exception as e:
+            logger.error(f"[Flywheel] Failed to mark content as indexed: {e}")
+            return False
+
+    async def get_unused_training_content(
+        self,
+        min_quality: float = 0.6,
+        limit: int = 500
+    ) -> List[Dict[str, Any]]:
+        """
+        v11.0: Get scraped content not yet used for training export.
+
+        This is used by Trinity Knowledge Indexer to export training data
+        to Reactor Core for model fine-tuning.
+
+        Args:
+            min_quality: Minimum quality score filter
+            limit: Maximum number of content items to return
+
+        Returns:
+            List of unused training content dictionaries
+        """
+        conn = await self._get_async_db()
+        if not conn:
+            return []
+
+        try:
+            content_items = []
+            async with conn.execute("""
+                SELECT id, url, title, content, content_type, topic, language,
+                       quality_score, word_count, code_blocks, scraped_at, indexed
+                FROM scraped_content
+                WHERE (used_in_training = 0 OR used_in_training IS NULL)
+                  AND quality_score >= ?
+                ORDER BY quality_score DESC, scraped_at DESC
+                LIMIT ?
+            """, (min_quality, limit)) as cursor:
+                async for row in cursor:
+                    content_items.append({
+                        "id": row[0],
+                        "url": row[1],
+                        "title": row[2],
+                        "content": row[3],
+                        "content_type": row[4],
+                        "topic": row[5],
+                        "language": row[6],
+                        "quality_score": row[7],
+                        "word_count": row[8],
+                        "code_blocks": row[9],
+                        "scraped_at": row[10],
+                        "indexed": row[11] or 0,
+                    })
+
+            logger.debug(f"[Flywheel] Retrieved {len(content_items)} unused training content items")
+            return content_items
+
+        except Exception as e:
+            logger.error(f"[Flywheel] Failed to get unused training content: {e}")
+            return []
+
+    async def mark_as_used_for_training(
+        self,
+        content_ids: List[int],
+        training_run_id: Optional[int] = None
+    ) -> bool:
+        """
+        v11.0: Mark scraped content as used for training.
+
+        Args:
+            content_ids: List of content IDs to mark
+            training_run_id: Optional training run ID to associate
+
+        Returns:
+            True if successful
+        """
+        if not content_ids:
+            return True
+
+        conn = await self._get_async_db()
+        if not conn:
+            return False
+
+        try:
+            placeholders = ",".join("?" * len(content_ids))
+            if training_run_id:
+                await conn.execute(f"""
+                    UPDATE scraped_content
+                    SET used_in_training = 1, training_run_id = ?
+                    WHERE id IN ({placeholders})
+                """, [training_run_id] + content_ids)
+            else:
+                await conn.execute(f"""
+                    UPDATE scraped_content
+                    SET used_in_training = 1
+                    WHERE id IN ({placeholders})
+                """, content_ids)
+
+            await conn.commit()
+            logger.debug(f"[Flywheel] Marked {len(content_ids)} content items as used for training")
+            return True
+
+        except Exception as e:
+            logger.error(f"[Flywheel] Failed to mark content as used for training: {e}")
+            return False
 
     async def _cleanup_components(self) -> None:
         """Cleanup all components."""

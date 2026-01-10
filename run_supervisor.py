@@ -2345,6 +2345,10 @@ class SupervisorBootstrapper:
         self._trinity_voice_enabled = os.getenv("TRINITY_VOICE_ENABLED", "true").lower() == "true"
         self._voice_announcer = None
 
+        # v88.0: Trinity Knowledge Indexer (Web scraping → Vector DB → RAG)
+        self._trinity_knowledge_indexer = None
+        self._trinity_knowledge_indexer_enabled = os.getenv("TRINITY_KNOWLEDGE_INDEXER_ENABLED", "true").lower() == "true"
+
         # v80.0: Advanced Cross-Repo Loading System
         # - CrossRepoHealthMonitor: Circuit breakers, adaptive intervals, trend analysis
         # - TrinityStartupCoordinator: Parallel startup, dependency resolution, progress broadcasting
@@ -5488,6 +5492,18 @@ class SupervisorBootstrapper:
                 self.logger.info("✅ Trinity Voice Coordinator stopped")
         except Exception as e:
             self.logger.warning(f"⚠️ Trinity Voice Coordinator cleanup error: {e}")
+
+        # v88.0: Shutdown Trinity Knowledge Indexer
+        try:
+            if hasattr(self, '_trinity_knowledge_indexer') and self._trinity_knowledge_indexer:
+                self.logger.info("🧠 Shutting down Trinity Knowledge Indexer...")
+
+                # Stop background indexing and export loops
+                await self._trinity_knowledge_indexer.stop()
+
+                self.logger.info("✅ Trinity Knowledge Indexer stopped")
+        except Exception as e:
+            self.logger.warning(f"⚠️ Trinity Knowledge Indexer cleanup error: {e}")
 
         # Cleanup JARVIS-Prime
         try:
@@ -9263,6 +9279,9 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
                 reactor_online=reactor_online
             )
 
+            # v88.0: Initialize Trinity Knowledge Indexer
+            await self._initialize_trinity_knowledge_indexer()
+
             # v80.0: Initialize Advanced Cross-Repo Loading System
             if self._v80_enabled:
                 await self._initialize_v80_cross_repo_system(
@@ -9400,6 +9419,99 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
         except Exception as e:
             self.logger.error(f"[v87.0] Trinity voice coordination init failed: {e}", exc_info=True)
             self._trinity_voice_coordinator = {"initialized": False, "error": str(e)}
+
+    async def _initialize_trinity_knowledge_indexer(self) -> None:
+        """
+        v88.0: Initialize Trinity Knowledge Indexer for scraped content → vector DB → RAG.
+
+        This is the "missing link" that makes web scraping actually useful by:
+        - Converting scraped content into semantic chunks
+        - Generating embeddings for vector search
+        - Storing in ChromaDB/FAISS for RAG retrieval
+        - Exporting training data to Reactor Core
+
+        Pipeline:
+            SQLite (scraped_content)
+              → Semantic Chunking (intelligent boundary detection)
+              → Quality Filtering (min 0.6 score)
+              → Parallel Embedding Generation (batch processing)
+              → ChromaDB/FAISS Storage (persistent vectors)
+              → Training Data Export (JSONL for Reactor Core)
+              → Mark as Indexed
+
+        Features:
+        - Semantic chunking (not fixed-size, preserves meaning)
+        - Parallel batch embedding (32 items/batch, 4 concurrent)
+        - Quality scoring and filtering
+        - SHA-256 fingerprint deduplication
+        - Metadata-rich vector storage
+        - Async/parallel processing
+        - Zero hardcoding (environment-driven)
+        - Incremental indexing (only new content)
+        - Graceful degradation (works without ChromaDB/FAISS)
+        """
+        if not self._trinity_knowledge_indexer_enabled:
+            self.logger.debug("[v88.0] Trinity Knowledge Indexer disabled via config")
+            return
+
+        try:
+            self.logger.info("[v88.0] 🧠 Initializing Trinity Knowledge Indexer...")
+
+            # Import and start the indexer
+            try:
+                from backend.autonomy.trinity_knowledge_indexer import get_knowledge_indexer
+
+                # Get the global indexer instance
+                indexer = await get_knowledge_indexer()
+
+                # Store reference for later use
+                self._trinity_knowledge_indexer = indexer
+
+                # Start background indexing and export loops
+                await indexer.start()
+
+                self.logger.info(
+                    f"[v88.0] ✅ Trinity Knowledge Indexer started "
+                    f"(indexing every {indexer.config.index_interval_seconds}s, "
+                    f"exporting every {indexer.config.export_interval_seconds}s)"
+                )
+
+                # Log configuration
+                self.logger.info(
+                    f"[v88.0]    Embedding model: {indexer.config.embedding_model_name}"
+                )
+                self.logger.info(
+                    f"[v88.0]    Chunk size: {indexer.config.chunk_size} tokens"
+                )
+                self.logger.info(
+                    f"[v88.0]    Min quality: {indexer.config.min_quality_score}"
+                )
+                self.logger.info(
+                    f"[v88.0]    Vector DB: {indexer.config.vector_db_path}"
+                )
+
+                if indexer.config.export_to_reactor:
+                    self.logger.info(
+                        f"[v88.0]    Training export: {indexer.config.reactor_export_path}"
+                    )
+
+            except ImportError as e:
+                self.logger.error(
+                    f"[v88.0] ❌ Trinity Knowledge Indexer import failed: {e}. "
+                    f"Knowledge indexing will not work. "
+                    f"Install dependencies: pip install sentence-transformers chromadb faiss-cpu"
+                )
+                self._trinity_knowledge_indexer = None
+
+            except Exception as e:
+                self.logger.error(
+                    f"[v88.0] ❌ Trinity Knowledge Indexer initialization failed: {e}"
+                )
+                self._trinity_knowledge_indexer = None
+
+        except Exception as e:
+            self.logger.error(f"[v88.0] Trinity knowledge indexer init failed: {e}", exc_info=True)
+            self._trinity_knowledge_indexer = None
 
     async def _initialize_v80_cross_repo_system(
         self,
