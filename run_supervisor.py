@@ -9574,6 +9574,24 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
             self.logger.error(f"[v88.0] Trinity knowledge indexer init failed: {e}", exc_info=True)
             self._trinity_knowledge_indexer = None
 
+        # =====================================================================
+        # PHASE 2: Start ServiceRegistry for cross-repo health monitoring
+        # =====================================================================
+        try:
+            from backend.engines.rag_engine import get_service_registry
+            
+            service_registry = get_service_registry()
+            await service_registry.start_health_checks()
+            
+            self.logger.info(
+                f"[v88.0] ✅ ServiceRegistry started - "
+                f"monitoring {len(service_registry._services)} services"
+            )
+        except ImportError:
+            self.logger.warning("[v88.0] ServiceRegistry not available (import failed)")
+        except Exception as e:
+            self.logger.warning(f"[v88.0] ServiceRegistry startup failed: {e}")
+
     async def _initialize_v80_cross_repo_system(
         self,
         jprime_online: bool = False,

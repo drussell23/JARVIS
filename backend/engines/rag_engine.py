@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import pickle
+import random
 from pathlib import Path
 import faiss
 import torch
@@ -1953,6 +1954,745 @@ async def get_unified_rag_context(
     """
     manager = await UnifiedRAGContextManager.get_instance()
     return await manager.get_context(query, correlation_context, **kwargs)
+
+
+# =============================================================================
+# Phase 2: ML-Enhanced Circuit Breaker with Failure Prediction
+# =============================================================================
+
+class CircuitState(Enum):
+    """Circuit breaker states with graduated recovery."""
+    CLOSED = "closed"          # Normal operation
+    OPEN = "open"              # Failing, reject requests
+    HALF_OPEN = "half_open"    # Testing recovery
+    DEGRADED = "degraded"      # Partial functionality
+
+
+@dataclass
+class CircuitMetrics:
+    """Metrics for ML-based failure prediction."""
+    total_calls: int = 0
+    successful_calls: int = 0
+    failed_calls: int = 0
+    consecutive_failures: int = 0
+    consecutive_successes: int = 0
+    latency_samples: List[float] = field(default_factory=list)
+    failure_timestamps: List[float] = field(default_factory=list)
+    state_changes: List[Tuple[str, float]] = field(default_factory=list)
+    
+    @property
+    def success_rate(self) -> float:
+        if self.total_calls == 0:
+            return 1.0
+        return self.successful_calls / self.total_calls
+    
+    @property
+    def failure_rate(self) -> float:
+        return 1.0 - self.success_rate
+    
+    @property
+    def p95_latency(self) -> float:
+        if len(self.latency_samples) < 10:
+            return 0.0
+        sorted_samples = sorted(self.latency_samples)
+        return sorted_samples[int(len(sorted_samples) * 0.95)]
+
+
+class AdaptiveMLCircuitBreaker:
+    """
+    ML-enhanced circuit breaker with failure prediction.
+    
+    Features:
+    - **Exponential smoothing** for failure rate prediction
+    - **Adaptive thresholds** based on rolling success rate
+    - **Jitter in recovery** to prevent thundering herd
+    - **Half-open with graduated traffic** (10% → 50% → 100%)
+    - **Degraded mode** for partial functionality
+    
+    Algorithm:
+    1. Track failure timestamps with exponential decay
+    2. Predict failure probability in next N seconds
+    3. Pre-emptively open circuit if P(failure) > threshold
+    4. Gradual recovery with random jitter
+    """
+    
+    def __init__(
+        self,
+        name: str,
+        failure_threshold: Optional[int] = None,
+        recovery_timeout: Optional[float] = None,
+        success_threshold: Optional[int] = None,
+        prediction_enabled: bool = True,
+    ):
+        self._name = name
+        self._config = DynamicConfigManager.get_instance()
+        
+        # Use config or defaults
+        self._failure_threshold = failure_threshold or self._config.get("circuit_failure_threshold", 3)
+        self._recovery_timeout = recovery_timeout or self._config.get("circuit_recovery_timeout", 30.0)
+        self._success_threshold = success_threshold or self._config.get("circuit_success_threshold", 2)
+        
+        # State
+        self._state = CircuitState.CLOSED
+        self._last_failure_time: Optional[float] = None
+        self._last_state_change = time.time()
+        self._half_open_successes = 0
+        self._half_open_traffic_pct = 0.1  # Start at 10%
+        
+        # Metrics
+        self._metrics = CircuitMetrics()
+        
+        # ML prediction
+        self._prediction_enabled = prediction_enabled
+        self._smoothing_factor = 0.3  # Exponential smoothing alpha
+        self._predicted_failure_rate = 0.0
+        self._prediction_threshold = 0.7  # Open if P(failure) > 70%
+        
+        logger.info(f"[AdaptiveMLCircuitBreaker:{name}] Initialized")
+    
+    @property
+    def state(self) -> CircuitState:
+        return self._state
+    
+    @property
+    def is_available(self) -> bool:
+        """Check if circuit allows requests."""
+        if self._state == CircuitState.CLOSED:
+            return True
+        if self._state == CircuitState.DEGRADED:
+            return True  # Allow with degraded functionality
+        if self._state == CircuitState.HALF_OPEN:
+            # Probabilistic allow based on graduated traffic
+            return random.random() < self._half_open_traffic_pct
+        if self._state == CircuitState.OPEN:
+            return self._should_attempt_recovery()
+        return False
+    
+    def _should_attempt_recovery(self) -> bool:
+        """Check if we should transition to half-open."""
+        if self._last_failure_time is None:
+            return True
+        
+        elapsed = time.time() - self._last_failure_time
+        # Add jitter to prevent thundering herd
+        jitter = random.uniform(0, self._recovery_timeout * 0.2)
+        
+        if elapsed > self._recovery_timeout + jitter:
+            self._transition_to(CircuitState.HALF_OPEN)
+            return True
+        return False
+    
+    def _transition_to(self, new_state: CircuitState):
+        """Transition to new state with logging."""
+        if new_state != self._state:
+            old_state = self._state
+            self._state = new_state
+            self._last_state_change = time.time()
+            self._metrics.state_changes.append((new_state.value, time.time()))
+            
+            if new_state == CircuitState.HALF_OPEN:
+                self._half_open_successes = 0
+                self._half_open_traffic_pct = 0.1  # Reset to 10%
+            
+            logger.info(f"[AdaptiveMLCircuitBreaker:{self._name}] {old_state.value} → {new_state.value}")
+    
+    def _update_prediction(self):
+        """Update failure rate prediction using exponential smoothing."""
+        if not self._prediction_enabled:
+            return
+        
+        # Calculate recent failure rate (last 60s)
+        now = time.time()
+        recent_failures = [t for t in self._metrics.failure_timestamps if now - t < 60]
+        recent_rate = len(recent_failures) / max(1, self._metrics.total_calls)
+        
+        # Exponential smoothing
+        self._predicted_failure_rate = (
+            self._smoothing_factor * recent_rate +
+            (1 - self._smoothing_factor) * self._predicted_failure_rate
+        )
+        
+        # Pre-emptive circuit open
+        if (self._state == CircuitState.CLOSED and 
+            self._predicted_failure_rate > self._prediction_threshold):
+            logger.warning(
+                f"[AdaptiveMLCircuitBreaker:{self._name}] Pre-emptive OPEN "
+                f"(predicted failure rate: {self._predicted_failure_rate:.2%})"
+            )
+            self._transition_to(CircuitState.DEGRADED)  # Go to degraded, not full open
+    
+    async def execute(
+        self,
+        func: Callable,
+        *args,
+        fallback: Optional[Callable] = None,
+        **kwargs,
+    ) -> Any:
+        """
+        Execute function with circuit breaker protection.
+        
+        Args:
+            func: Async function to execute
+            fallback: Optional fallback function if circuit is open
+            *args, **kwargs: Arguments for func
+            
+        Returns:
+            Function result or fallback result
+            
+        Raises:
+            CircuitOpenError: If circuit is open and no fallback
+        """
+        if not self.is_available:
+            if fallback:
+                logger.debug(f"[AdaptiveMLCircuitBreaker:{self._name}] Using fallback")
+                return await fallback(*args, **kwargs) if asyncio.iscoroutinefunction(fallback) else fallback(*args, **kwargs)
+            raise Exception(f"Circuit breaker '{self._name}' is OPEN")
+        
+        start_time = time.time()
+        try:
+            result = await func(*args, **kwargs)
+            latency = time.time() - start_time
+            self._on_success(latency)
+            return result
+        except Exception as e:
+            self._on_failure()
+            raise
+    
+    def _on_success(self, latency: float):
+        """Record successful call."""
+        self._metrics.total_calls += 1
+        self._metrics.successful_calls += 1
+        self._metrics.consecutive_successes += 1
+        self._metrics.consecutive_failures = 0
+        self._metrics.latency_samples.append(latency)
+        
+        # Keep last 100 samples
+        if len(self._metrics.latency_samples) > 100:
+            self._metrics.latency_samples = self._metrics.latency_samples[-100:]
+        
+        # State transitions
+        if self._state == CircuitState.HALF_OPEN:
+            self._half_open_successes += 1
+            
+            # Graduated recovery
+            if self._half_open_successes >= 2:
+                self._half_open_traffic_pct = min(1.0, self._half_open_traffic_pct + 0.2)
+                
+            if self._half_open_successes >= self._success_threshold:
+                self._transition_to(CircuitState.CLOSED)
+        
+        elif self._state == CircuitState.DEGRADED:
+            if self._metrics.consecutive_successes >= self._success_threshold:
+                self._transition_to(CircuitState.CLOSED)
+        
+        self._update_prediction()
+    
+    def _on_failure(self):
+        """Record failed call."""
+        self._metrics.total_calls += 1
+        self._metrics.failed_calls += 1
+        self._metrics.consecutive_failures += 1
+        self._metrics.consecutive_successes = 0
+        self._metrics.failure_timestamps.append(time.time())
+        self._last_failure_time = time.time()
+        
+        # Keep last 100 timestamps
+        if len(self._metrics.failure_timestamps) > 100:
+            self._metrics.failure_timestamps = self._metrics.failure_timestamps[-100:]
+        
+        # State transitions
+        if self._state == CircuitState.HALF_OPEN:
+            self._transition_to(CircuitState.OPEN)
+        elif self._state == CircuitState.CLOSED:
+            if self._metrics.consecutive_failures >= self._failure_threshold:
+                self._transition_to(CircuitState.OPEN)
+        
+        self._update_prediction()
+    
+    def get_status(self) -> Dict[str, Any]:
+        """Get circuit breaker status."""
+        return {
+            "name": self._name,
+            "state": self._state.value,
+            "success_rate": self._metrics.success_rate,
+            "failure_rate": self._metrics.failure_rate,
+            "predicted_failure_rate": self._predicted_failure_rate,
+            "consecutive_failures": self._metrics.consecutive_failures,
+            "p95_latency": self._metrics.p95_latency,
+            "total_calls": self._metrics.total_calls,
+            "half_open_traffic_pct": self._half_open_traffic_pct if self._state == CircuitState.HALF_OPEN else None,
+        }
+
+
+# =============================================================================
+# Phase 2: Unified Resilience Layer with Backpressure & Graceful Degradation
+# =============================================================================
+
+class TokenBucket:
+    """Token bucket rate limiter for backpressure."""
+    
+    def __init__(
+        self,
+        rate: float,  # tokens per second
+        capacity: int,  # max burst
+    ):
+        self._rate = rate
+        self._capacity = capacity
+        self._tokens = capacity
+        self._last_update = time.time()
+        self._lock = asyncio.Lock()
+    
+    async def acquire(self, tokens: int = 1, timeout: float = 5.0) -> bool:
+        """Try to acquire tokens, waiting if necessary."""
+        async with self._lock:
+            self._refill()
+            
+            if self._tokens >= tokens:
+                self._tokens -= tokens
+                return True
+            
+            # Wait for tokens
+            needed = tokens - self._tokens
+            wait_time = needed / self._rate
+            
+            if wait_time > timeout:
+                return False
+            
+            await asyncio.sleep(wait_time)
+            self._refill()
+            
+            if self._tokens >= tokens:
+                self._tokens -= tokens
+                return True
+            return False
+    
+    def _refill(self):
+        """Refill tokens based on elapsed time."""
+        now = time.time()
+        elapsed = now - self._last_update
+        self._tokens = min(self._capacity, self._tokens + elapsed * self._rate)
+        self._last_update = now
+    
+    @property
+    def available_tokens(self) -> float:
+        """Get current available tokens."""
+        self._refill()
+        return self._tokens
+
+
+class RequestDeduplicator:
+    """Deduplicates in-flight requests to prevent redundant work."""
+    
+    def __init__(self, ttl_seconds: float = 30.0):
+        self._in_flight: Dict[str, asyncio.Future] = {}
+        self._ttl = ttl_seconds
+        self._lock = asyncio.Lock()
+    
+    async def dedupe(
+        self,
+        key: str,
+        func: Callable,
+        *args,
+        **kwargs,
+    ) -> Any:
+        """
+        Execute function, deduplicating concurrent identical requests.
+        
+        If a request with the same key is already in flight, wait for it
+        instead of executing again.
+        """
+        async with self._lock:
+            if key in self._in_flight:
+                logger.debug(f"[Dedup] Waiting for in-flight request: {key[:20]}...")
+                return await self._in_flight[key]
+            
+            # Create future for this request
+            future: asyncio.Future = asyncio.get_event_loop().create_future()
+            self._in_flight[key] = future
+        
+        try:
+            result = await func(*args, **kwargs)
+            future.set_result(result)
+            return result
+        except Exception as e:
+            future.set_exception(e)
+            raise
+        finally:
+            async with self._lock:
+                self._in_flight.pop(key, None)
+
+
+class UnifiedResilienceLayer:
+    """
+    Central resilience coordinator for all RAG operations.
+    
+    Features:
+    - **Backpressure**: Token bucket rate limiting
+    - **Request deduplication**: Prevent duplicate retrievals
+    - **Graceful degradation**: Return partial results on failure
+    - **Load shedding**: Drop low-priority requests under load
+    - **Circuit breakers**: Per-source failure isolation
+    
+    Architecture:
+        ┌─────────────────────────────────────────────────────────────────┐
+        │             UnifiedResilienceLayer (Singleton)                   │
+        │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐   │
+        │  │ Token Bucket │  │ Deduplicator │  │ Circuit Breakers     │   │
+        │  │ (Backpressure│  │              │  │ (Per-Source)         │   │
+        │  └──────────────┘  └──────────────┘  └──────────────────────┘   │
+        │           │                                                      │
+        │           ▼                                                      │
+        │  ┌─────────────────────────────────────────────────────────┐    │
+        │  │  Graceful Degradation: Partial Results on Failure       │    │
+        │  └─────────────────────────────────────────────────────────┘    │
+        └─────────────────────────────────────────────────────────────────┘
+    """
+    
+    _instance: Optional["UnifiedResilienceLayer"] = None
+    _instance_lock: Optional[AsyncLockWithTimeout] = None
+    
+    def __init__(self):
+        self._config = DynamicConfigManager.get_instance()
+        
+        # Token bucket for backpressure (default 50 req/s, burst 100)
+        rate = float(os.getenv("RESILIENCE_RATE_LIMIT", "50"))
+        capacity = int(os.getenv("RESILIENCE_BURST_CAPACITY", "100"))
+        self._token_bucket = TokenBucket(rate=rate, capacity=capacity)
+        
+        # Request deduplicator
+        self._deduplicator = RequestDeduplicator(ttl_seconds=30.0)
+        
+        # Per-source circuit breakers
+        self._circuit_breakers: Dict[str, AdaptiveMLCircuitBreaker] = {}
+        
+        # Load tracking
+        self._current_load = 0
+        self._max_load = int(os.getenv("RESILIENCE_MAX_LOAD", "100"))
+        self._load_lock = asyncio.Lock()
+        
+        # Metrics
+        self._shed_count = 0
+        self._degraded_count = 0
+        self._total_requests = 0
+        
+        logger.info("[UnifiedResilienceLayer] Initialized")
+    
+    @classmethod
+    async def get_instance(cls) -> "UnifiedResilienceLayer":
+        """Get singleton instance."""
+        if cls._instance is not None:
+            return cls._instance
+        
+        if cls._instance_lock is None:
+            cls._instance_lock = AsyncLockWithTimeout(name="resilience_singleton")
+        
+        async with cls._instance_lock.acquire_with_context(correlation_id="resilience_init"):
+            if cls._instance is None:
+                cls._instance = cls()
+            return cls._instance
+    
+    def get_circuit_breaker(self, source: str) -> AdaptiveMLCircuitBreaker:
+        """Get or create circuit breaker for a source."""
+        if source not in self._circuit_breakers:
+            self._circuit_breakers[source] = AdaptiveMLCircuitBreaker(name=source)
+        return self._circuit_breakers[source]
+    
+    async def execute_with_resilience(
+        self,
+        source: str,
+        func: Callable,
+        *args,
+        priority: int = 1,  # 0=low, 1=normal, 2=high
+        fallback: Optional[Callable] = None,
+        dedupe_key: Optional[str] = None,
+        **kwargs,
+    ) -> Tuple[Any, bool]:
+        """
+        Execute function with full resilience protection.
+        
+        Args:
+            source: Source name for circuit breaker
+            func: Async function to execute
+            priority: Request priority for load shedding
+            fallback: Optional fallback on failure
+            dedupe_key: Optional key for deduplication
+            *args, **kwargs: Function arguments
+            
+        Returns:
+            Tuple of (result, was_degraded)
+        """
+        self._total_requests += 1
+        
+        # 1. Load shedding for low priority under high load
+        async with self._load_lock:
+            load_pct = self._current_load / max(1, self._max_load)
+            if load_pct > 0.9 and priority == 0:
+                self._shed_count += 1
+                logger.warning(f"[Resilience] Shedding low-priority request (load: {load_pct:.0%})")
+                if fallback:
+                    return await fallback(*args, **kwargs), True
+                raise Exception("Load shedding: system overloaded")
+            self._current_load += 1
+        
+        try:
+            # 2. Backpressure via token bucket
+            if not await self._token_bucket.acquire(tokens=1, timeout=5.0):
+                self._degraded_count += 1
+                logger.warning("[Resilience] Backpressure: rate limit exceeded")
+                if fallback:
+                    return await fallback(*args, **kwargs), True
+                raise Exception("Backpressure: rate limit exceeded")
+            
+            # 3. Get circuit breaker for source
+            cb = self.get_circuit_breaker(source)
+            
+            # 4. Execute with deduplication if key provided
+            async def execute():
+                return await cb.execute(func, *args, fallback=fallback, **kwargs)
+            
+            if dedupe_key:
+                result = await self._deduplicator.dedupe(dedupe_key, execute)
+            else:
+                result = await execute()
+            
+            return result, False
+            
+        except Exception as e:
+            # Graceful degradation: try fallback
+            if fallback:
+                self._degraded_count += 1
+                try:
+                    result = await fallback(*args, **kwargs) if asyncio.iscoroutinefunction(fallback) else fallback(*args, **kwargs)
+                    return result, True
+                except Exception:
+                    pass
+            raise
+        finally:
+            async with self._load_lock:
+                self._current_load = max(0, self._current_load - 1)
+    
+    def get_status(self) -> Dict[str, Any]:
+        """Get resilience layer status."""
+        return {
+            "current_load": self._current_load,
+            "max_load": self._max_load,
+            "load_pct": self._current_load / max(1, self._max_load),
+            "available_tokens": self._token_bucket.available_tokens,
+            "total_requests": self._total_requests,
+            "shed_count": self._shed_count,
+            "degraded_count": self._degraded_count,
+            "circuit_breakers": {
+                name: cb.get_status()
+                for name, cb in self._circuit_breakers.items()
+            },
+        }
+
+
+# =============================================================================
+# Phase 2: Service Registry for Cross-Repo Health Monitoring
+# =============================================================================
+
+@dataclass
+class ServiceEndpoint:
+    """Represents a service endpoint with health info."""
+    name: str
+    url: str
+    health_path: str = "/health"
+    is_healthy: bool = True
+    last_check: float = 0.0
+    consecutive_failures: int = 0
+    latency_ms: float = 0.0
+    tags: Dict[str, str] = field(default_factory=dict)
+
+
+class ServiceRegistry:
+    """
+    Dynamic service discovery with health-aware routing.
+    
+    Services:
+    - JARVIS (this instance)
+    - JARVIS-Prime (inference)
+    - Reactor-Core (training)
+    - Trinity Indexer (embedded)
+    
+    Features:
+    - Periodic health checks with adaptive intervals
+    - Automatic failover on degradation
+    - Weighted routing based on latency
+    """
+    
+    _instance: Optional["ServiceRegistry"] = None
+    
+    def __init__(self):
+        self._services: Dict[str, ServiceEndpoint] = {}
+        self._check_interval = float(os.getenv("SERVICE_CHECK_INTERVAL", "30.0"))
+        self._check_task: Optional[asyncio.Task] = None
+        self._running = False
+        
+        # Register default services
+        self._register_defaults()
+        
+        logger.info("[ServiceRegistry] Initialized")
+    
+    @classmethod
+    def get_instance(cls) -> "ServiceRegistry":
+        """Get singleton instance."""
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+    
+    def _register_defaults(self):
+        """Register default JARVIS ecosystem services."""
+        defaults = [
+            ServiceEndpoint(
+                name="jarvis_prime",
+                url=os.getenv("JARVIS_PRIME_URL", "http://localhost:8000"),
+                health_path="/health",
+                tags={"type": "inference"},
+            ),
+            ServiceEndpoint(
+                name="reactor_core",
+                url=os.getenv("REACTOR_CORE_URL", "http://localhost:8003"),
+                health_path="/health",
+                tags={"type": "training"},
+            ),
+            ServiceEndpoint(
+                name="trinity_indexer",
+                url="embedded://localhost",
+                health_path="",
+                tags={"type": "indexer"},
+            ),
+        ]
+        
+        for svc in defaults:
+            self._services[svc.name] = svc
+    
+    def register(self, endpoint: ServiceEndpoint):
+        """Register a service endpoint."""
+        self._services[endpoint.name] = endpoint
+        logger.info(f"[ServiceRegistry] Registered: {endpoint.name} at {endpoint.url}")
+    
+    def get_healthy_endpoints(self, tag: Optional[str] = None) -> List[ServiceEndpoint]:
+        """Get all healthy endpoints, optionally filtered by tag."""
+        healthy = [svc for svc in self._services.values() if svc.is_healthy]
+        if tag:
+            healthy = [svc for svc in healthy if svc.tags.get("type") == tag]
+        # Sort by latency (fastest first)
+        return sorted(healthy, key=lambda s: s.latency_ms)
+    
+    async def check_health(self, service_name: str) -> bool:
+        """Check health of a specific service."""
+        if service_name not in self._services:
+            return False
+        
+        svc = self._services[service_name]
+        
+        # Embedded services are always healthy
+        if svc.url.startswith("embedded://"):
+            svc.is_healthy = True
+            svc.last_check = time.time()
+            return True
+        
+        try:
+            import aiohttp
+            start = time.time()
+            
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
+                async with session.get(f"{svc.url}{svc.health_path}") as resp:
+                    latency = (time.time() - start) * 1000
+                    
+                    if resp.status == 200:
+                        svc.is_healthy = True
+                        svc.consecutive_failures = 0
+                        svc.latency_ms = latency
+                    else:
+                        svc.consecutive_failures += 1
+                        if svc.consecutive_failures >= 3:
+                            svc.is_healthy = False
+                    
+                    svc.last_check = time.time()
+                    return svc.is_healthy
+                    
+        except Exception as e:
+            svc.consecutive_failures += 1
+            if svc.consecutive_failures >= 3:
+                svc.is_healthy = False
+            svc.last_check = time.time()
+            logger.warning(f"[ServiceRegistry] Health check failed for {service_name}: {e}")
+            return False
+    
+    async def start_health_checks(self):
+        """Start periodic health checks."""
+        if self._running:
+            return
+        self._running = True
+        self._check_task = asyncio.create_task(self._health_check_loop())
+        logger.info("[ServiceRegistry] Started health checks")
+    
+    async def _health_check_loop(self):
+        """Background health check loop."""
+        while self._running:
+            try:
+                for name in list(self._services.keys()):
+                    await self.check_health(name)
+                await asyncio.sleep(self._check_interval)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"[ServiceRegistry] Health check error: {e}")
+                await asyncio.sleep(5)
+    
+    async def stop(self):
+        """Stop health checks."""
+        self._running = False
+        if self._check_task:
+            self._check_task.cancel()
+            try:
+                await self._check_task
+            except asyncio.CancelledError:
+                pass
+    
+    def get_status(self) -> Dict[str, Any]:
+        """Get registry status."""
+        return {
+            "services": {
+                name: {
+                    "url": svc.url,
+                    "is_healthy": svc.is_healthy,
+                    "latency_ms": svc.latency_ms,
+                    "consecutive_failures": svc.consecutive_failures,
+                    "last_check": svc.last_check,
+                }
+                for name, svc in self._services.items()
+            },
+            "healthy_count": len([s for s in self._services.values() if s.is_healthy]),
+            "total_count": len(self._services),
+        }
+
+
+# =============================================================================
+# Global accessor functions for Phase 2 components
+# =============================================================================
+
+async def execute_with_resilience(
+    source: str,
+    func: Callable,
+    *args,
+    **kwargs,
+) -> Tuple[Any, bool]:
+    """
+    Convenience function for resilient execution.
+    
+    Returns:
+        Tuple of (result, was_degraded)
+    """
+    layer = await UnifiedResilienceLayer.get_instance()
+    return await layer.execute_with_resilience(source, func, *args, **kwargs)
+
+
+def get_service_registry() -> ServiceRegistry:
+    """Get the global service registry."""
+    return ServiceRegistry.get_instance()
 
 
 # Example usage

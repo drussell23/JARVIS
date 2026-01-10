@@ -21,6 +21,7 @@ This module provides the main orchestration layer for JARVIS, handling:
 """
 
 import asyncio
+import hashlib
 import logging
 from typing import Any, Dict, List, Optional
 from enum import Enum
@@ -1262,16 +1263,18 @@ class HybridOrchestrator:
             return {"success": False, "error": f"Failed to load {model_def.name}"}
 
         # =================================================================
-        # PHASE 1: Inject Unified RAG Context for LLM models
+        # PHASE 1 + 2: Inject RAG Context with Resilience Protection
         # =================================================================
         rag_context = None
         enhanced_query = query
+        was_degraded = False
         
         if model_def.model_type == "llm":
             try:
                 from engines.rag_engine import (
                     get_unified_rag_context,
                     CorrelationContext,
+                    execute_with_resilience,
                 )
                 
                 # Create correlation context for distributed tracing
@@ -1279,13 +1282,33 @@ class HybridOrchestrator:
                 correlation.baggage["model"] = model_def.name
                 correlation.baggage["query_id"] = kwargs.get("query_id", correlation.span_id)
                 
-                # Get unified RAG context (Trinity + local KB)
-                rag_context = await get_unified_rag_context(
-                    query=query,
-                    correlation_context=correlation,
-                    include_web_sources=kwargs.get("include_web_sources", True),
-                    conversation_history=kwargs.get("conversation_history"),
-                )
+                # Define RAG retrieval function
+                async def retrieve_rag():
+                    return await get_unified_rag_context(
+                        query=query,
+                        correlation_context=correlation,
+                        include_web_sources=kwargs.get("include_web_sources", True),
+                        conversation_history=kwargs.get("conversation_history"),
+                    )
+                
+                # Define fallback for graceful degradation
+                async def fallback_empty():
+                    logger.warning("[RAG] Using fallback: empty context")
+                    return {"context_text": "", "sources": [], "web_sources": []}
+                
+                # Execute with PHASE 2 resilience protection
+                try:
+                    rag_context, was_degraded = await execute_with_resilience(
+                        source="rag_trinity",
+                        func=retrieve_rag,
+                        priority=2,  # High priority for RAG
+                        fallback=fallback_empty,
+                        dedupe_key=f"rag:{hashlib.md5(query.encode()).hexdigest()[:16]}",
+                    )
+                except Exception as resilience_err:
+                    logger.warning(f"[RAG] Resilience layer error: {resilience_err}")
+                    # Fallback to direct call
+                    rag_context = await retrieve_rag()
                 
                 # Build enhanced prompt with RAG context
                 if rag_context.get("context_text"):
