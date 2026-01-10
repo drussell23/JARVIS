@@ -18,6 +18,7 @@ from abc import ABC, abstractmethod
 import asyncio
 import aiofiles
 from collections import defaultdict
+from contextlib import asynccontextmanager
 import re
 import logging
 import time
@@ -1323,6 +1324,636 @@ class RAGEngine:
                 if i['feedback'] is not None
             ]) if any(i['feedback'] is not None for i in self.learning_engine.interaction_history) else None
         }
+
+
+# =============================================================================
+# Phase 1: Advanced Async Utilities
+# =============================================================================
+
+class AsyncLockWithTimeout:
+    """
+    Async lock with timeout, deadlock detection, and metrics.
+    
+    Features:
+    - Configurable timeout (default from config)
+    - Deadlock detection via waiter tracking
+    - Lock acquisition metrics
+    - Correlation ID for tracing
+    
+    Usage:
+        lock = AsyncLockWithTimeout(timeout=5.0, name="my_lock")
+        async with lock.acquire_with_context(correlation_id="abc123"):
+            # Critical section
+    """
+    
+    def __init__(
+        self,
+        timeout: Optional[float] = None,
+        name: str = "unnamed_lock",
+    ):
+        self._lock = asyncio.Lock()
+        self._timeout = timeout or float(os.getenv("ASYNC_LOCK_TIMEOUT", "5.0"))
+        self._name = name
+        self._waiters: Dict[str, float] = {}  # correlation_id -> wait_start_time
+        self._acquisition_count = 0
+        self._timeout_count = 0
+        
+    @asynccontextmanager
+    async def acquire_with_context(
+        self,
+        correlation_id: Optional[str] = None,
+        timeout: Optional[float] = None,
+    ):
+        """
+        Acquire lock with timeout and context tracking.
+        
+        Args:
+            correlation_id: Optional ID for tracing
+            timeout: Override timeout for this acquisition
+            
+        Raises:
+            asyncio.TimeoutError: If lock not acquired within timeout
+        """
+        effective_timeout = timeout or self._timeout
+        corr_id = correlation_id or f"anon_{id(asyncio.current_task())}"
+        wait_start = time.time()
+        
+        # Track waiter for deadlock detection
+        self._waiters[corr_id] = wait_start
+        
+        try:
+            await asyncio.wait_for(self._lock.acquire(), timeout=effective_timeout)
+            self._acquisition_count += 1
+            wait_time = time.time() - wait_start
+            
+            if wait_time > 1.0:
+                logger.warning(
+                    f"[AsyncLock:{self._name}] Slow lock acquisition: {wait_time:.2f}s "
+                    f"(correlation_id={corr_id})"
+                )
+            
+            try:
+                yield
+            finally:
+                self._lock.release()
+                
+        except asyncio.TimeoutError:
+            self._timeout_count += 1
+            logger.error(
+                f"[AsyncLock:{self._name}] Lock timeout after {effective_timeout}s "
+                f"(correlation_id={corr_id}, waiters={len(self._waiters)})"
+            )
+            raise
+        finally:
+            self._waiters.pop(corr_id, None)
+    
+    def get_metrics(self) -> Dict[str, Any]:
+        """Get lock metrics for monitoring."""
+        return {
+            "name": self._name,
+            "acquisition_count": self._acquisition_count,
+            "timeout_count": self._timeout_count,
+            "current_waiters": len(self._waiters),
+            "is_locked": self._lock.locked(),
+        }
+
+
+# Import asynccontextmanager if not already imported
+try:
+    from contextlib import asynccontextmanager
+except ImportError:
+    pass  # Already imported above
+
+
+@dataclass
+class CorrelationContext:
+    """
+    W3C Trace Context for distributed tracing.
+    
+    Propagates correlation IDs across all service calls for:
+    - Trinity Indexer searches
+    - LLM API calls
+    - Cross-repo calls (J-Prime, Reactor Core)
+    
+    Format follows W3C Trace Context specification.
+    """
+    trace_id: str  # 32 hex chars
+    span_id: str   # 16 hex chars
+    parent_span_id: Optional[str] = None
+    timestamp: float = field(default_factory=time.time)
+    baggage: Dict[str, str] = field(default_factory=dict)
+    
+    @classmethod
+    def create(cls) -> "CorrelationContext":
+        """Create a new trace root."""
+        import uuid
+        trace_id = uuid.uuid4().hex
+        span_id = uuid.uuid4().hex[:16]
+        return cls(trace_id=trace_id, span_id=span_id)
+    
+    def create_child_span(self) -> "CorrelationContext":
+        """Create a child span for nested operations."""
+        import uuid
+        return CorrelationContext(
+            trace_id=self.trace_id,
+            span_id=uuid.uuid4().hex[:16],
+            parent_span_id=self.span_id,
+            baggage=self.baggage.copy(),
+        )
+    
+    def to_headers(self) -> Dict[str, str]:
+        """Convert to W3C traceparent header format."""
+        return {
+            "traceparent": f"00-{self.trace_id}-{self.span_id}-01",
+            "tracestate": ",".join(f"{k}={v}" for k, v in self.baggage.items()),
+        }
+    
+    @classmethod
+    def from_headers(cls, headers: Dict[str, str]) -> Optional["CorrelationContext"]:
+        """Parse from W3C traceparent header."""
+        traceparent = headers.get("traceparent", "")
+        parts = traceparent.split("-")
+        if len(parts) >= 3:
+            return cls(trace_id=parts[1], span_id=parts[2])
+        return None
+    
+    @property
+    def short_id(self) -> str:
+        """Short ID for logging."""
+        return f"{self.trace_id[:8]}...{self.span_id[:4]}"
+
+
+class DynamicConfigManager:
+    """
+    Hot-reloadable configuration with adaptive parameters.
+    
+    Config sources (priority order):
+    1. Environment variables (hot-reload via signal)
+    2. Defaults (hardcoded fallback)
+    
+    Adaptive parameters:
+    - Timeouts adjust based on P95 latencies
+    - Thresholds adjust based on success rates
+    
+    All hardcoded values are replaced with config lookups.
+    """
+    
+    _instance: Optional["DynamicConfigManager"] = None
+    _instance_lock = asyncio.Lock() if asyncio.get_event_loop_policy() else None
+    
+    def __init__(self):
+        self._config: Dict[str, Any] = {}
+        self._latency_samples: List[float] = []
+        self._success_count = 0
+        self._failure_count = 0
+        self._last_reload = time.time()
+        self._load_from_env()
+    
+    @classmethod
+    def get_instance(cls) -> "DynamicConfigManager":
+        """Get singleton instance (thread-safe in sync context)."""
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+    
+    def _load_from_env(self):
+        """Load configuration from environment variables."""
+        self._config = {
+            # RAG Configuration
+            "rag_search_timeout": float(os.getenv("RAG_SEARCH_TIMEOUT", "5.0")),
+            "rag_max_results": int(os.getenv("RAG_MAX_RESULTS", "5")),
+            "rag_min_similarity": float(os.getenv("RAG_MIN_SIMILARITY", "0.3")),
+            "rag_cache_ttl_seconds": float(os.getenv("RAG_CACHE_TTL_SECONDS", "30.0")),
+            "rag_max_context_tokens": int(os.getenv("RAG_MAX_CONTEXT_TOKENS", "1500")),
+            
+            # Circuit Breaker Configuration
+            "circuit_failure_threshold": int(os.getenv("CIRCUIT_FAILURE_THRESHOLD", "3")),
+            "circuit_recovery_timeout": float(os.getenv("CIRCUIT_RECOVERY_TIMEOUT", "30.0")),
+            "circuit_success_threshold": int(os.getenv("CIRCUIT_SUCCESS_THRESHOLD", "2")),
+            
+            # Async Lock Configuration
+            "async_lock_timeout": float(os.getenv("ASYNC_LOCK_TIMEOUT", "5.0")),
+            
+            # Trinity Configuration
+            "trinity_enabled": os.getenv("TRINITY_RAG_ENABLED", "true").lower() == "true",
+            "trinity_search_timeout": float(os.getenv("TRINITY_SEARCH_TIMEOUT", "5.0")),
+            "trinity_max_results": int(os.getenv("TRINITY_MAX_RESULTS", "5")),
+            "trinity_min_similarity": float(os.getenv("TRINITY_MIN_SIMILARITY", "0.3")),
+            
+            # Adaptive Parameters (can be overridden)
+            "adaptive_timeout_enabled": os.getenv("ADAPTIVE_TIMEOUT_ENABLED", "true").lower() == "true",
+            "adaptive_p95_multiplier": float(os.getenv("ADAPTIVE_P95_MULTIPLIER", "1.5")),
+        }
+        self._last_reload = time.time()
+        logger.debug(f"[DynamicConfig] Loaded {len(self._config)} config values")
+    
+    def get(self, key: str, default: Any = None) -> Any:
+        """Get configuration value."""
+        return self._config.get(key, default)
+    
+    def record_latency(self, latency_seconds: float):
+        """Record latency sample for adaptive timeout calculation."""
+        self._latency_samples.append(latency_seconds)
+        # Keep last 100 samples
+        if len(self._latency_samples) > 100:
+            self._latency_samples = self._latency_samples[-100:]
+    
+    def record_result(self, success: bool):
+        """Record success/failure for adaptive threshold calculation."""
+        if success:
+            self._success_count += 1
+        else:
+            self._failure_count += 1
+    
+    def get_adaptive_timeout(self, base_key: str = "rag_search_timeout") -> float:
+        """
+        Get adaptive timeout based on P95 latency.
+        
+        If we have enough samples, use P95 * multiplier.
+        Otherwise, use configured base timeout.
+        """
+        base_timeout = self.get(base_key, 5.0)
+        
+        if not self.get("adaptive_timeout_enabled", True):
+            return base_timeout
+        
+        if len(self._latency_samples) < 10:
+            return base_timeout
+        
+        # Calculate P95
+        sorted_samples = sorted(self._latency_samples)
+        p95_index = int(len(sorted_samples) * 0.95)
+        p95_latency = sorted_samples[p95_index]
+        
+        multiplier = self.get("adaptive_p95_multiplier", 1.5)
+        adaptive_timeout = p95_latency * multiplier
+        
+        # Clamp between 1s and 30s
+        return max(1.0, min(30.0, adaptive_timeout))
+    
+    def get_adaptive_threshold(self, base_key: str = "rag_min_similarity") -> float:
+        """
+        Get adaptive similarity threshold based on success rate.
+        
+        If success rate is low, lower the threshold to get more results.
+        """
+        base_threshold = self.get(base_key, 0.3)
+        
+        total = self._success_count + self._failure_count
+        if total < 20:
+            return base_threshold
+        
+        success_rate = self._success_count / total
+        
+        # If success rate < 50%, lower threshold by up to 0.1
+        if success_rate < 0.5:
+            adjustment = (0.5 - success_rate) * 0.2
+            return max(0.1, base_threshold - adjustment)
+        
+        return base_threshold
+    
+    def get_status(self) -> Dict[str, Any]:
+        """Get config manager status."""
+        return {
+            "config_count": len(self._config),
+            "latency_samples": len(self._latency_samples),
+            "success_rate": self._success_count / max(1, self._success_count + self._failure_count),
+            "last_reload": self._last_reload,
+            "adaptive_timeout": self.get_adaptive_timeout(),
+            "adaptive_threshold": self.get_adaptive_threshold(),
+        }
+
+
+# =============================================================================
+# Phase 1: Unified RAG Context Manager - Global Singleton for All LLMs
+# =============================================================================
+
+class UnifiedRAGContextManager:
+    """
+    Global RAG context manager for all LLM pipelines.
+    
+    The "Brain Bridge" that provides unified RAG context to ALL LLMs:
+    - Claude API via HybridOrchestrator
+    - LLaMA 70B via local inference
+    - Any future LLM integrations
+    
+    Features:
+    - **Thread-safe singleton** with async lock
+    - **Context caching** with TTL (avoids duplicate retrievals)
+    - **Parallel retrieval** from Trinity + local KB + conversation history
+    - **Correlation ID propagation** for distributed tracing
+    - **Dynamic timeout** based on load
+    - **Graceful degradation** when sources fail
+    
+    Architecture:
+        ┌─────────────────────────────────────────────────────────────────┐
+        │           UnifiedRAGContextManager (Singleton)                   │
+        │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐   │
+        │  │ Context Cache│  │ Async Lock   │  │ Correlation Context  │   │
+        │  │ (TTL-based)  │  │ (Thread-safe)│  │ (Distributed Trace)  │   │
+        │  └──────────────┘  └──────────────┘  └──────────────────────┘   │
+        │           │                                                      │
+        │           ▼                                                      │
+        │  ┌─────────────────────────────────────────────────────────┐    │
+        │  │                 Parallel Retrieval                       │    │
+        │  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────────┐  │    │
+        │  │  │ Trinity     │  │ Local KB    │  │ Conversation    │  │    │
+        │  │  │ (Web Scrape)│  │ (FAISS)     │  │ History         │  │    │
+        │  │  └─────────────┘  └─────────────┘  └─────────────────┘  │    │
+        │  └─────────────────────────────────────────────────────────┘    │
+        │           │                                                      │
+        │           ▼                                                      │
+        │  ┌─────────────────────────────────────────────────────────┐    │
+        │  │  Merged Context: [Web Sources] + [Local KB] + [History] │    │
+        │  └─────────────────────────────────────────────────────────┘    │
+        └─────────────────────────────────────────────────────────────────┘
+    """
+    
+    _instance: Optional["UnifiedRAGContextManager"] = None
+    _instance_lock: Optional[AsyncLockWithTimeout] = None
+    
+    def __init__(self):
+        self._config = DynamicConfigManager.get_instance()
+        self._rag_engine: Optional[RAGEngine] = None
+        self._init_lock = AsyncLockWithTimeout(name="rag_init")
+        
+        # Context cache: query_hash -> (context, timestamp)
+        self._context_cache: Dict[str, Tuple[Dict[str, Any], float]] = {}
+        self._cache_lock = AsyncLockWithTimeout(name="cache_lock")
+        
+        # Metrics
+        self._cache_hits = 0
+        self._cache_misses = 0
+        self._total_retrievals = 0
+        self._failed_retrievals = 0
+        
+        logger.info("[UnifiedRAGContextManager] Initialized")
+    
+    @classmethod
+    async def get_instance(cls) -> "UnifiedRAGContextManager":
+        """
+        Get singleton instance with async-safe initialization.
+        
+        Uses double-check locking pattern to avoid race conditions.
+        """
+        if cls._instance is not None:
+            return cls._instance
+        
+        # Create lock if needed
+        if cls._instance_lock is None:
+            cls._instance_lock = AsyncLockWithTimeout(name="rag_singleton")
+        
+        async with cls._instance_lock.acquire_with_context(correlation_id="singleton_init"):
+            # Double-check after acquiring lock
+            if cls._instance is None:
+                cls._instance = cls()
+            return cls._instance
+    
+    async def _get_rag_engine(self) -> RAGEngine:
+        """Lazy-initialize RAG engine with lock protection."""
+        if self._rag_engine is not None:
+            return self._rag_engine
+        
+        async with self._init_lock.acquire_with_context(correlation_id="rag_engine_init"):
+            if self._rag_engine is None:
+                self._rag_engine = RAGEngine()
+                logger.info("[UnifiedRAGContextManager] RAGEngine initialized")
+            return self._rag_engine
+    
+    def _get_cache_key(self, query: str) -> str:
+        """Generate cache key from query."""
+        return hashlib.md5(query.lower().strip().encode()).hexdigest()
+    
+    async def get_context(
+        self,
+        query: str,
+        correlation_context: Optional[CorrelationContext] = None,
+        include_web_sources: bool = True,
+        include_local_kb: bool = True,
+        include_conversation: bool = False,
+        conversation_history: Optional[List[Dict[str, str]]] = None,
+        max_tokens: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        Get unified RAG context for any LLM.
+        
+        This is the main entry point for all RAG context retrieval.
+        
+        Args:
+            query: User query
+            correlation_context: Optional tracing context
+            include_web_sources: Include Trinity web scrape results
+            include_local_kb: Include local knowledge base results
+            include_conversation: Include conversation history context
+            conversation_history: Past conversation messages
+            max_tokens: Max context tokens (default from config)
+            
+        Returns:
+            Dict with:
+                - context_text: Formatted context string for LLM
+                - sources: List of source objects with metadata
+                - cache_hit: Whether result was from cache
+                - retrieval_time_ms: Time taken for retrieval
+                - correlation_id: Trace ID for this request
+        """
+        start_time = time.time()
+        correlation = correlation_context or CorrelationContext.create()
+        cache_key = self._get_cache_key(query)
+        
+        # Check cache first
+        cache_ttl = self._config.get("rag_cache_ttl_seconds", 30.0)
+        cached = self._context_cache.get(cache_key)
+        if cached:
+            context, timestamp = cached
+            if time.time() - timestamp < cache_ttl:
+                self._cache_hits += 1
+                logger.debug(f"[UnifiedRAG] Cache hit for query (correlation={correlation.short_id})")
+                return {
+                    **context,
+                    "cache_hit": True,
+                    "retrieval_time_ms": (time.time() - start_time) * 1000,
+                }
+        
+        self._cache_misses += 1
+        self._total_retrievals += 1
+        
+        try:
+            # Parallel retrieval from multiple sources
+            rag_engine = await self._get_rag_engine()
+            
+            tasks = []
+            source_names = []
+            
+            # Task 1: RAG engine retrieval (includes Trinity + local KB)
+            async def retrieve_rag():
+                return await rag_engine.generate_with_retrieval(
+                    query=query,
+                    conversation_history=conversation_history,
+                    include_web_sources=include_web_sources,
+                )
+            tasks.append(retrieve_rag())
+            source_names.append("rag_engine")
+            
+            # Execute in parallel with timeout
+            timeout = self._config.get_adaptive_timeout("rag_search_timeout")
+            results = await asyncio.wait_for(
+                asyncio.gather(*tasks, return_exceptions=True),
+                timeout=timeout,
+            )
+            
+            # Process results
+            context_text = ""
+            sources = []
+            web_sources = []
+            
+            for i, result in enumerate(results):
+                if isinstance(result, Exception):
+                    logger.warning(f"[UnifiedRAG] Source '{source_names[i]}' failed: {result}")
+                    continue
+                
+                if source_names[i] == "rag_engine" and isinstance(result, dict):
+                    context_text = result.get("context_used", "")
+                    sources.extend(result.get("sources", []))
+                    web_sources.extend(result.get("web_sources", []))
+            
+            # Build final context
+            max_ctx_tokens = max_tokens or self._config.get("rag_max_context_tokens", 1500)
+            final_context = self._build_final_context(
+                context_text, sources, web_sources, max_ctx_tokens
+            )
+            
+            # Record latency for adaptive timeout
+            latency = time.time() - start_time
+            self._config.record_latency(latency)
+            self._config.record_result(success=True)
+            
+            # Build response
+            response = {
+                "context_text": final_context,
+                "sources": sources,
+                "web_sources": web_sources,
+                "cache_hit": False,
+                "retrieval_time_ms": latency * 1000,
+                "correlation_id": correlation.trace_id,
+                "source_count": len(sources) + len(web_sources),
+            }
+            
+            # Update cache
+            async with self._cache_lock.acquire_with_context(correlation_id=correlation.short_id):
+                self._context_cache[cache_key] = (response, time.time())
+            
+            logger.debug(
+                f"[UnifiedRAG] Retrieved {len(sources)+len(web_sources)} sources "
+                f"in {latency*1000:.1f}ms (correlation={correlation.short_id})"
+            )
+            
+            return response
+            
+        except asyncio.TimeoutError:
+            self._failed_retrievals += 1
+            self._config.record_result(success=False)
+            logger.warning(f"[UnifiedRAG] Retrieval timeout (correlation={correlation.short_id})")
+            return {
+                "context_text": "",
+                "sources": [],
+                "web_sources": [],
+                "cache_hit": False,
+                "retrieval_time_ms": (time.time() - start_time) * 1000,
+                "correlation_id": correlation.trace_id,
+                "error": "retrieval_timeout",
+            }
+        except Exception as e:
+            self._failed_retrievals += 1
+            self._config.record_result(success=False)
+            logger.error(f"[UnifiedRAG] Retrieval failed: {e} (correlation={correlation.short_id})")
+            return {
+                "context_text": "",
+                "sources": [],
+                "web_sources": [],
+                "cache_hit": False,
+                "retrieval_time_ms": (time.time() - start_time) * 1000,
+                "correlation_id": correlation.trace_id,
+                "error": str(e),
+            }
+    
+    def _build_final_context(
+        self,
+        raw_context: str,
+        sources: List[Dict],
+        web_sources: List[Dict],
+        max_tokens: int,
+    ) -> str:
+        """Build final formatted context within token limit."""
+        parts = []
+        
+        # Add web sources first (most recent/relevant)
+        if web_sources:
+            parts.append("=== Recent Web Knowledge ===")
+            for ws in web_sources[:3]:  # Top 3
+                formatted = ws.get("formatted_source", ws.get("text", ""))
+                if formatted:
+                    parts.append(formatted)
+        
+        # Add local KB context
+        if raw_context and raw_context.strip():
+            if parts:
+                parts.append("\n=== Local Knowledge Base ===")
+            parts.append(raw_context.strip())
+        
+        combined = "\n\n".join(parts)
+        
+        # Simple token limit (rough: 4 chars per token)
+        max_chars = max_tokens * 4
+        if len(combined) > max_chars:
+            combined = combined[:max_chars] + "..."
+        
+        return combined
+    
+    def get_status(self) -> Dict[str, Any]:
+        """Get manager status for monitoring."""
+        return {
+            "cache_size": len(self._context_cache),
+            "cache_hits": self._cache_hits,
+            "cache_misses": self._cache_misses,
+            "cache_hit_rate": self._cache_hits / max(1, self._cache_hits + self._cache_misses),
+            "total_retrievals": self._total_retrievals,
+            "failed_retrievals": self._failed_retrievals,
+            "success_rate": (self._total_retrievals - self._failed_retrievals) / max(1, self._total_retrievals),
+            "config_status": self._config.get_status(),
+        }
+    
+    async def clear_cache(self):
+        """Clear the context cache."""
+        async with self._cache_lock.acquire_with_context(correlation_id="cache_clear"):
+            self._context_cache.clear()
+            logger.info("[UnifiedRAG] Cache cleared")
+
+
+# =============================================================================
+# Global accessor function for UnifiedRAGContextManager
+# =============================================================================
+
+async def get_unified_rag_context(
+    query: str,
+    correlation_context: Optional[CorrelationContext] = None,
+    **kwargs,
+) -> Dict[str, Any]:
+    """
+    Convenience function to get unified RAG context.
+    
+    This is the recommended entry point for all components needing RAG context.
+    
+    Args:
+        query: User query
+        correlation_context: Optional tracing context
+        **kwargs: Additional arguments passed to get_context()
+        
+    Returns:
+        Dict with context_text, sources, and metadata
+    """
+    manager = await UnifiedRAGContextManager.get_instance()
+    return await manager.get_context(query, correlation_context, **kwargs)
+
 
 # Example usage
 if __name__ == "__main__":

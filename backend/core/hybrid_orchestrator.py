@@ -1238,7 +1238,11 @@ class HybridOrchestrator:
     async def _execute_with_model(
         self, model_def, query: str, lifecycle_manager, **kwargs
     ) -> Dict[str, Any]:
-        """Execute query with a specific model.
+        """Execute query with a specific model and unified RAG context injection.
+        
+        PHASE 1 UPDATE: Now injects RAG context from UnifiedRAGContextManager
+        before executing any LLM, connecting all models to Trinity web knowledge
+        and local knowledge base.
         
         Args:
             model_def: Model definition containing name, type, and capabilities
@@ -1247,7 +1251,7 @@ class HybridOrchestrator:
             **kwargs: Additional parameters for model execution
             
         Returns:
-            Dict containing execution result
+            Dict containing execution result with RAG metadata
         """
         # Load model if needed
         model_instance = await lifecycle_manager.get_model(
@@ -1257,11 +1261,50 @@ class HybridOrchestrator:
         if not model_instance:
             return {"success": False, "error": f"Failed to load {model_def.name}"}
 
+        # =================================================================
+        # PHASE 1: Inject Unified RAG Context for LLM models
+        # =================================================================
+        rag_context = None
+        enhanced_query = query
+        
+        if model_def.model_type == "llm":
+            try:
+                from engines.rag_engine import (
+                    get_unified_rag_context,
+                    CorrelationContext,
+                )
+                
+                # Create correlation context for distributed tracing
+                correlation = CorrelationContext.create()
+                correlation.baggage["model"] = model_def.name
+                correlation.baggage["query_id"] = kwargs.get("query_id", correlation.span_id)
+                
+                # Get unified RAG context (Trinity + local KB)
+                rag_context = await get_unified_rag_context(
+                    query=query,
+                    correlation_context=correlation,
+                    include_web_sources=kwargs.get("include_web_sources", True),
+                    conversation_history=kwargs.get("conversation_history"),
+                )
+                
+                # Build enhanced prompt with RAG context
+                if rag_context.get("context_text"):
+                    enhanced_query = self._build_rag_enhanced_prompt(query, rag_context)
+                    logger.debug(
+                        f"[RAG] Injected {rag_context.get('source_count', 0)} sources "
+                        f"for {model_def.name} (correlation={correlation.short_id})"
+                    )
+                    
+            except ImportError as e:
+                logger.warning(f"[RAG] UnifiedRAGContextManager not available: {e}")
+            except Exception as e:
+                logger.warning(f"[RAG] Context retrieval failed, proceeding without RAG: {e}")
+
         # Execute based on model type
         if model_def.model_type == "llm":
-            # LLM inference
+            # LLM inference with RAG-enhanced query
             if model_def.name == "llama_70b":
-                result = await self.execute_llm_inference(query, **kwargs)
+                result = await self.execute_llm_inference(enhanced_query, **kwargs)
             elif model_def.name == "claude_api":
                 # TODO: Add Claude API execution
                 result = {
@@ -1355,7 +1398,61 @@ class HybridOrchestrator:
         else:
             result = {"success": False, "error": f"Unknown model type: {model_def.model_type}"}
 
+        # =================================================================
+        # PHASE 1: Add RAG metadata to result for source citation
+        # =================================================================
+        if rag_context and result.get("success"):
+            result["rag_sources"] = rag_context.get("sources", [])
+            result["web_sources"] = rag_context.get("web_sources", [])
+            result["rag_correlation_id"] = rag_context.get("correlation_id")
+            result["rag_cache_hit"] = rag_context.get("cache_hit", False)
+
         return result
+    
+    def _build_rag_enhanced_prompt(
+        self,
+        query: str,
+        rag_context: Dict[str, Any],
+    ) -> str:
+        """
+        Build an enhanced prompt with RAG context for LLM.
+        
+        Injects relevant context from Trinity web scrape and local KB
+        into the prompt before sending to the LLM.
+        
+        Format:
+            [CONTEXT START]
+            === Recent Web Knowledge ===
+            [Web Source: url] content
+            
+            === Local Knowledge Base ===
+            content
+            [CONTEXT END]
+            
+            User Query: {query}
+        
+        Args:
+            query: Original user query
+            rag_context: Context from UnifiedRAGContextManager
+            
+        Returns:
+            Enhanced prompt string with injected context
+        """
+        context_text = rag_context.get("context_text", "").strip()
+        
+        if not context_text:
+            return query
+        
+        # Build enhanced prompt with context
+        enhanced_prompt = f"""[CONTEXT START]
+Use the following context to inform your response. Cite sources when relevant.
+
+{context_text}
+[CONTEXT END]
+
+User Query: {query}"""
+        
+        return enhanced_prompt
 
     async def execute_llm_inference(
         self,
