@@ -589,7 +589,18 @@ class TrinityVoiceCoordinator:
         )
 
     def _detect_best_voice(self) -> str:
-        """Detect best available voice on system."""
+        """
+        Detect best available voice on system.
+
+        ⭐ JARVIS CANONICAL VOICE: UK Daniel (professional, deep, authoritative)
+
+        Priority:
+        1. Daniel (UK Male) - JARVIS's signature voice - NON-NEGOTIABLE
+        2. Samantha (US Female) - Clear fallback
+        3. Alex (US Male) - macOS default
+        4. Tom/Karen - Additional fallbacks
+        5. First available voice
+        """
         # Try to get list of available voices
         try:
             result = subprocess.run(
@@ -602,23 +613,53 @@ class TrinityVoiceCoordinator:
             if result.returncode == 0:
                 voices = result.stdout.strip().split('\n')
 
-                # Prefer these voices in order
-                preferred = ["Daniel", "Samantha", "Alex", "Tom", "Karen"]
+                # ⭐ ABSOLUTE PRIORITY: UK Daniel is JARVIS's voice
+                # Check for Daniel FIRST before anything else
+                for voice_line in voices:
+                    if "daniel" in voice_line.lower():
+                        logger.info(
+                            "[Trinity Voice] ✅ Using JARVIS signature voice: Daniel (UK Male)"
+                        )
+                        return "Daniel"
 
-                for pref in preferred:
+                # If Daniel not found, warn user and use fallback
+                logger.warning(
+                    "[Trinity Voice] ⚠️  UK Daniel voice not found! "
+                    "This is JARVIS's canonical voice. "
+                    "Install it via: System Settings → Accessibility → Spoken Content → "
+                    "System Voice → Download 'Daniel (United Kingdom)'"
+                )
+
+                # Fallback chain (only used if Daniel unavailable)
+                preferred_fallbacks = ["Samantha", "Alex", "Tom", "Karen"]
+
+                for pref in preferred_fallbacks:
                     for voice_line in voices:
                         if pref.lower() in voice_line.lower():
+                            logger.warning(
+                                f"[Trinity Voice] Using fallback voice: {pref} "
+                                f"(Install UK Daniel for authentic JARVIS experience)"
+                            )
                             return pref
 
-                # Fallback to first available
+                # Ultimate fallback to first available
                 if voices:
                     first_voice = voices[0].split()[0]
+                    logger.warning(
+                        f"[Trinity Voice] Using last-resort voice: {first_voice}"
+                    )
                     return first_voice
-        except:
-            pass
 
-        # Final fallback
-        return os.getenv("JARVIS_DEFAULT_VOICE_NAME", "Daniel")
+        except Exception as e:
+            logger.error(f"[Trinity Voice] Voice detection failed: {e}")
+
+        # Final emergency fallback
+        default = os.getenv("JARVIS_DEFAULT_VOICE_NAME", "Daniel")
+        logger.warning(
+            f"[Trinity Voice] Emergency fallback to: {default} "
+            f"(Voice detection failed)"
+        )
+        return default
 
     async def announce(
         self,

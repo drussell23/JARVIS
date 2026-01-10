@@ -3,12 +3,54 @@
 **Version:** 1.0
 **Author:** JARVIS Trinity System
 **Last Updated:** 2025-01-10
+**JARVIS Voice:** ⭐ **UK Daniel (Signature)** ⭐
 
 ## Overview
 
 The Trinity Voice Coordinator is a **zero-hardcoding, ultra-robust, cross-repo voice announcement system** that provides intelligent voice feedback across JARVIS (Body), JARVIS-Prime (Brain), and Reactor-Core (Self-Improvement).
 
-All configuration is driven by environment variables, allowing complete customization without code changes.
+**All configuration is driven by environment variables, allowing complete customization without code changes.**
+
+---
+
+## ⭐ JARVIS's Signature Voice: UK Daniel ⭐
+
+**The Trinity Voice System uses UK Daniel as JARVIS's canonical voice.**
+
+- **Name:** Daniel (United Kingdom)
+- **Gender:** Male
+- **Accent:** British English (UK)
+- **Tone:** Professional, deep, authoritative
+- **Why:** This is JARVIS's signature voice across all contexts
+
+**Auto-Detection:**
+The system automatically detects and uses UK Daniel if installed. If not found, you'll see:
+```
+⚠️ UK Daniel voice not found!
+Install it via: System Settings → Accessibility → Spoken Content →
+System Voice → Download 'Daniel (United Kingdom)'
+```
+
+**Verify UK Daniel is installed:**
+```bash
+say -v "?" | grep -i daniel
+```
+
+Expected output:
+```
+Daniel              en_GB    # Daniel from United Kingdom
+```
+
+**Install UK Daniel (if missing):**
+1. Open **System Settings** (macOS)
+2. Go to **Accessibility** → **Spoken Content**
+3. Click **System Voice** → **Manage Voices...**
+4. Find **Daniel (United Kingdom)**
+5. Click **Download**
+6. Wait for completion
+7. Restart JARVIS
+
+---
 
 ---
 

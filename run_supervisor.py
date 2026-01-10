@@ -5463,6 +5463,32 @@ class SupervisorBootstrapper:
             except Exception as e:
                 self.logger.warning(f"⚠️ Infrastructure cleanup error: {e}")
 
+        # v87.0: Shutdown Trinity Voice Coordinator
+        try:
+            if hasattr(self, '_trinity_voice_coordinator_instance') and self._trinity_voice_coordinator_instance:
+                self.logger.info("🎙️  Shutting down Trinity Voice Coordinator...")
+
+                # Final farewell announcement
+                try:
+                    from backend.core.trinity_voice_coordinator import announce, VoiceContext, VoicePriority
+                    await announce(
+                        message="JARVIS systems shutting down. Goodbye.",
+                        context=VoiceContext.RUNTIME,
+                        priority=VoicePriority.HIGH,
+                        source="supervisor",
+                        metadata={"event": "shutdown"}
+                    )
+                    # Give time for final announcement
+                    await asyncio.sleep(2.0)
+                except:
+                    pass
+
+                # Stop the coordinator
+                await self._trinity_voice_coordinator_instance.stop()
+                self.logger.info("✅ Trinity Voice Coordinator stopped")
+        except Exception as e:
+            self.logger.warning(f"⚠️ Trinity Voice Coordinator cleanup error: {e}")
+
         # Cleanup JARVIS-Prime
         try:
             await self._stop_jarvis_prime()
@@ -9255,90 +9281,124 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
         reactor_online: bool = False
     ) -> None:
         """
-        v79.1: Initialize Trinity Voice Coordination for cross-repo voice announcements.
+        v87.0 ULTRA: Initialize Trinity Voice Coordinator for cross-repo voice announcements.
 
-        This sets up the voice infrastructure to coordinate announcements across
-        JARVIS Body, J-Prime, and Reactor Core repos.
+        This is the CENTRAL voice system that coordinates ALL voice announcements across:
+        - JARVIS Body (main system)
+        - JARVIS-Prime (brain/inference)
+        - Reactor-Core (self-improvement/training)
 
         Features:
-        - Cross-repo voice announcements
-        - Evolution progress broadcasting
-        - Unified voice queue coordination
-        - AGI OS voice integration
+        - Multi-engine TTS fallback (MacOS Say → pyttsx3 → Edge TTS)
+        - Context-aware voice personalities (startup, narrator, runtime, alert, success, trinity)
+        - Intelligent priority queue (CRITICAL → HIGH → NORMAL → LOW → BACKGROUND)
+        - Deduplication, rate limiting, coalescing
+        - Health monitoring and engine selection
+        - Zero hardcoding (environment-driven)
+        - UK Daniel voice as JARVIS signature ⭐
         """
         if not self._trinity_voice_enabled:
-            self.logger.debug("[v79.1] Trinity voice coordination disabled")
+            self.logger.debug("[v87.0] Trinity Voice Coordinator disabled via config")
             return
 
         try:
-            self.logger.info("[v79.1] Initializing Trinity Voice Coordination")
+            self.logger.info("[v87.0] 🎙️  Initializing Trinity Voice Coordinator...")
 
-            # Try to get the Coding Council voice announcer
+            # Import and initialize the Trinity Voice Coordinator
             try:
-                from backend.core.coding_council.voice_announcer import get_evolution_announcer
+                from backend.core.trinity_voice_coordinator import (
+                    get_voice_coordinator,
+                    announce,
+                    VoiceContext,
+                    VoicePriority,
+                )
 
-                self._voice_announcer = get_evolution_announcer()
-                if self._voice_announcer:
-                    self.logger.info("[v79.1] ✅ Voice announcer connected")
+                # Get the global coordinator instance
+                coordinator = await get_voice_coordinator()
 
-                    # Configure Trinity bridge if available
-                    if hasattr(self._voice_announcer, '_trinity_bridge'):
-                        bridge = self._voice_announcer._trinity_bridge
-                        # Update component status in the bridge
-                        if hasattr(bridge, 'update_component_status'):
-                            await bridge.update_component_status(
-                                component="jarvis_body",
-                                online=True,
-                                instance_id=self._trinity_instance_id
-                            )
-                            if jprime_online:
-                                await bridge.update_component_status(
-                                    component="j_prime",
-                                    online=True
-                                )
-                            if reactor_online:
-                                await bridge.update_component_status(
-                                    component="reactor_core",
-                                    online=True
-                                )
-                        self.logger.info("[v79.1] ✅ Trinity Voice Bridge configured")
+                # Store reference for later use
+                self._trinity_voice_coordinator_instance = coordinator
 
-                    # Set up voice event listener for Trinity announcements
-                    if hasattr(self._voice_announcer, 'add_event_listener'):
-                        await self._voice_announcer.add_event_listener(
-                            self._handle_trinity_voice_event
-                        )
-                        self.logger.info("[v79.1] ✅ Trinity voice event listener registered")
+                # Test voice system is working
+                test_success = await announce(
+                    message="Trinity Voice Coordinator initialized. JARVIS systems online.",
+                    context=VoiceContext.STARTUP,
+                    priority=VoicePriority.HIGH,
+                    source="supervisor",
+                    metadata={
+                        "event": "coordinator_init",
+                        "jprime_online": jprime_online,
+                        "reactor_online": reactor_online,
+                    }
+                )
+
+                if test_success:
+                    self.logger.info(
+                        "[v87.0] ✅ Trinity Voice Coordinator active with UK Daniel voice"
+                    )
+                else:
+                    self.logger.warning(
+                        "[v87.0] ⚠️  Voice test queued but may be rate-limited/deduplicated"
+                    )
+
+                # Announce component status
+                if jprime_online:
+                    await announce(
+                        message="JARVIS Prime intelligence layer ready for local inference.",
+                        context=VoiceContext.TRINITY,
+                        priority=VoicePriority.NORMAL,
+                        source="supervisor",
+                        metadata={"component": "j_prime", "status": "online"}
+                    )
+
+                if reactor_online:
+                    await announce(
+                        message="Reactor Core self-improvement system ready for training.",
+                        context=VoiceContext.TRINITY,
+                        priority=VoicePriority.NORMAL,
+                        source="supervisor",
+                        metadata={"component": "reactor_core", "status": "online"}
+                    )
+
+                # Store status
+                self._trinity_voice_coordinator = {
+                    "initialized": True,
+                    "running": coordinator._running,
+                    "queue_size": coordinator._queue.qsize() if coordinator._queue else 0,
+                    "engines_available": len([e for e in coordinator._engines if e.available]),
+                    "jprime_online": jprime_online,
+                    "reactor_online": reactor_online,
+                }
+
+                self.logger.info(
+                    f"[v87.0] ✅ Trinity Voice Coordinator ready "
+                    f"({self._trinity_voice_coordinator['engines_available']} engines active)"
+                )
 
             except ImportError as e:
-                self.logger.debug(f"[v79.1] Voice announcer not available: {e}")
-            except Exception as e:
-                self.logger.debug(f"[v79.1] Voice announcer init error: {e}")
+                self.logger.error(
+                    f"[v87.0] ❌ Trinity Voice Coordinator import failed: {e}. "
+                    f"Voice announcements will not work."
+                )
+                self._trinity_voice_coordinator = {"initialized": False, "error": f"Import failed: {e}"}
 
-            # Also try to connect VoiceAuthenticationNarrator for evolution events
+            except Exception as e:
+                self.logger.error(
+                    f"[v87.0] ❌ Trinity Voice Coordinator initialization failed: {e}"
+                )
+                self._trinity_voice_coordinator = {"initialized": False, "error": str(e)}
+
+            # Legacy: Also try to connect old voice systems for backward compatibility
             try:
-                from backend.agi_os.voice_authentication_narrator import get_voice_narrator
-
-                narrator = get_voice_narrator()
-                if narrator and hasattr(narrator, 'subscribe_to_coding_council_events'):
-                    await narrator.subscribe_to_coding_council_events()
-                    self.logger.info("[v79.1] ✅ Voice Auth Narrator subscribed to evolution events")
-            except ImportError:
+                from backend.core.coding_council.voice_announcer import get_evolution_announcer
+                self._voice_announcer = get_evolution_announcer()
+                if self._voice_announcer:
+                    self.logger.debug("[v87.0] Legacy voice announcer connected (for compatibility)")
+            except:
                 pass
-            except Exception as e:
-                self.logger.debug(f"[v79.1] Voice narrator subscription error: {e}")
-
-            self._trinity_voice_coordinator = {
-                "initialized": True,
-                "jprime_online": jprime_online,
-                "reactor_online": reactor_online,
-                "announcer_available": self._voice_announcer is not None,
-            }
-
-            self.logger.info("[v79.1] ✅ Trinity Voice Coordination initialized")
 
         except Exception as e:
-            self.logger.warning(f"[v79.1] Trinity voice coordination init failed: {e}")
+            self.logger.error(f"[v87.0] Trinity voice coordination init failed: {e}", exc_info=True)
             self._trinity_voice_coordinator = {"initialized": False, "error": str(e)}
 
     async def _initialize_v80_cross_repo_system(
