@@ -302,6 +302,77 @@ except ImportError:
 except Exception:
     pass  # Fall back to standard asyncio
 
+# =============================================================================
+# v90.0: SYSTEM PRIMITIVES - Iron-Clad Production Layer
+# =============================================================================
+# Import the production-grade system primitives that fix critical issues:
+# - SafeProcess: Subprocess lifecycle with guaranteed cleanup
+# - AtomicStateWriter: Corruption-proof file writes
+# - PortManager: Distributed port locking
+# - TrueHeartbeat: PID-validated health monitoring
+# =============================================================================
+_SYSTEM_PRIMITIVES_AVAILABLE = False
+_ADVANCED_PRIMITIVES_AVAILABLE = False
+try:
+    from core.system_primitives import (
+        # Core primitives (v90.0)
+        SafeProcess,
+        AtomicStateWriter,
+        PortManager,
+        TrueHeartbeat,
+        FileLock,
+        AdaptiveWaiter,
+        ResourceGuard,
+        EnhancedExceptionHandler,
+        ProcessState,
+        HeartbeatStatus,
+        SystemConfig as SystemPrimitivesConfig,
+    )
+    _SYSTEM_PRIMITIVES_AVAILABLE = True
+
+    # Advanced features (v91.0) - Optional but powerful
+    try:
+        from core.system_primitives import (
+            ProcessHealthPredictor,
+            SelfHealingOrchestrator,
+            ResourceQuotaManager,
+            DistributedStateCoordinator,
+            GracefulDegradationManager,
+            DegradationLevel,
+            RemediationAction,
+            ResourceUsage,
+        )
+        _ADVANCED_PRIMITIVES_AVAILABLE = True
+        print("[INFO] Advanced system primitives v91.0 loaded (ML prediction, self-healing, coordination)")
+    except ImportError as e:
+        print(f"[INFO] Advanced primitives not available (optional): {e}")
+        ProcessHealthPredictor = None
+        SelfHealingOrchestrator = None
+        ResourceQuotaManager = None
+        DistributedStateCoordinator = None
+        GracefulDegradationManager = None
+        DegradationLevel = None
+        RemediationAction = None
+        ResourceUsage = None
+
+except ImportError as e:
+    print(f"[WARNING] System primitives not available: {e}")
+    # Provide stubs for backwards compatibility
+    SafeProcess = None
+    AtomicStateWriter = None
+    PortManager = None
+    TrueHeartbeat = None
+    FileLock = None
+    AdaptiveWaiter = None
+    ProcessHealthPredictor = None
+    SelfHealingOrchestrator = None
+    ResourceQuotaManager = None
+    DistributedStateCoordinator = None
+    GracefulDegradationManager = None
+    DegradationLevel = None
+    RemediationAction = None
+    ResourceUsage = None
+
 # v10.6: Structured Logging System with Real-Time Monitoring
 try:
     from core.logging import (
@@ -3125,6 +3196,21 @@ class SupervisorBootstrapper:
             "loaded": False,
             "source": None,  # "downloaded", "reactor_core", "existing"
         }
+
+        # v90.0: System Primitives Integration (Iron-Clad Production Layer)
+        self._port_manager = None
+        self._jprime_safe_process = None
+        self._reactor_safe_process = None
+        self._adaptive_waiter = None
+
+        # Initialize port manager if available
+        if _SYSTEM_PRIMITIVES_AVAILABLE and PortManager is not None:
+            try:
+                self._port_manager = PortManager()
+                self._adaptive_waiter = AdaptiveWaiter()
+                self.logger.info("[v90] System primitives initialized (SafeProcess, PortManager, TrueHeartbeat)")
+            except Exception as e:
+                self.logger.warning(f"[v90] Could not initialize port manager: {e}")
         self._model_download_in_progress = False
 
         # v9.4: Enhanced Neural Mesh (Production agent system)
@@ -6372,6 +6458,17 @@ class SupervisorBootstrapper:
 
         # v72.0: Cleanup Trinity component subprocesses
         await self._shutdown_trinity_components()
+
+        # v90.0: Release all port locks
+        if self._port_manager is not None:
+            try:
+                self.logger.info("🔓 Releasing port locks...")
+                self._port_manager.release_all()
+                self.logger.info("✅ Port locks released")
+            except Exception as e:
+                self.logger.warning(f"⚠️ Port lock release error: {e}")
+            finally:
+                self._port_manager = None
 
         # Cleanup GCP resources
         try:
@@ -11512,37 +11609,66 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
         - Config-driven timeouts and settings
         - Heartbeat-based detection with multiple file patterns
         - Atomic log file rotation
+        - v90.0: PID-validated heartbeat checking via TrueHeartbeat
         """
-        # Check if already running (via heartbeat)
-        trinity_dir = Path.home() / ".jarvis" / "trinity"
-        components_dir = trinity_dir / "components"
+        # v90.0: Use TrueHeartbeat for PID-validated heartbeat checking
+        # This fixes Issues #3 (Heartbeat Staleness) and #4 (Missing PID Validation)
+        if _SYSTEM_PRIMITIVES_AVAILABLE and TrueHeartbeat is not None:
+            # Check both naming conventions
+            for component_name in ["jarvis_prime", "j_prime"]:
+                heartbeat = TrueHeartbeat(component_name)
+                status, heartbeat_data = heartbeat.validate()
 
-        # Support multiple naming conventions
-        jprime_state_files = [
-            components_dir / "jarvis_prime.json",
-            components_dir / "j_prime.json",
-        ]
+                if status == HeartbeatStatus.ALIVE:
+                    self.logger.info(
+                        f"   🧠 [v90] J-Prime already running "
+                        f"(PID: {heartbeat_data.pid}, age: {heartbeat_data.age_seconds:.1f}s)"
+                    )
+                    print(
+                        f"  {TerminalUI.GREEN}✓ J-Prime: Already running "
+                        f"(PID: {heartbeat_data.pid}, heartbeat: {heartbeat_data.age_seconds:.1f}s ago){TerminalUI.RESET}"
+                    )
+                    return None  # Already running, not an error
+                elif status == HeartbeatStatus.DEAD:
+                    self.logger.info(
+                        f"   🧟 [v90] Found dead J-Prime heartbeat (PID {heartbeat_data.pid} is dead) - cleaning up"
+                    )
+                    # TrueHeartbeat already cleaned up the stale file
+                elif status == HeartbeatStatus.STALE:
+                    self.logger.warning(
+                        f"   ⚠️ [v90] J-Prime heartbeat is stale ({heartbeat_data.age_seconds:.1f}s old) - will restart"
+                    )
+                    heartbeat.cleanup()
+        else:
+            # Fallback to legacy heartbeat checking (without PID validation)
+            trinity_dir = Path.home() / ".jarvis" / "trinity"
+            components_dir = trinity_dir / "components"
 
-        for jprime_state_file in jprime_state_files:
-            if jprime_state_file.exists():
-                try:
-                    import json
-                    import time as time_module
-                    with open(jprime_state_file) as f:
-                        state = json.load(f)
-                    heartbeat_age = time_module.time() - state.get("timestamp", 0)
-                    if heartbeat_age < config.heartbeat_stale_threshold_sec:
-                        self.logger.info(
-                            f"   🧠 [v100] J-Prime already running "
-                            f"(heartbeat: {jprime_state_file.name}, age: {heartbeat_age:.1f}s)"
-                        )
-                        print(
-                            f"  {TerminalUI.GREEN}✓ J-Prime: Already running "
-                            f"(heartbeat: {heartbeat_age:.1f}s ago){TerminalUI.RESET}"
-                        )
-                        return None  # Already running, not an error
-                except Exception as e:
-                    self.logger.debug(f"   Could not read J-Prime state from {jprime_state_file}: {e}")
+            jprime_state_files = [
+                components_dir / "jarvis_prime.json",
+                components_dir / "j_prime.json",
+            ]
+
+            for jprime_state_file in jprime_state_files:
+                if jprime_state_file.exists():
+                    try:
+                        import json
+                        import time as time_module
+                        with open(jprime_state_file) as f:
+                            state = json.load(f)
+                        heartbeat_age = time_module.time() - state.get("timestamp", 0)
+                        if heartbeat_age < config.heartbeat_stale_threshold_sec:
+                            self.logger.info(
+                                f"   🧠 [legacy] J-Prime already running "
+                                f"(heartbeat: {jprime_state_file.name}, age: {heartbeat_age:.1f}s)"
+                            )
+                            print(
+                                f"  {TerminalUI.GREEN}✓ J-Prime: Already running "
+                                f"(heartbeat: {heartbeat_age:.1f}s ago){TerminalUI.RESET}"
+                            )
+                            return None  # Already running, not an error
+                    except Exception as e:
+                        self.logger.debug(f"   Could not read J-Prime state from {jprime_state_file}: {e}")
 
         # v100.0: Use RobustVenvDetector to find Python
         python_cmd = venv_detector.get_python_executable(jprime_path)
@@ -11581,63 +11707,107 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
 
                 try:
                     # Build environment with PYTHONPATH and trace context
-                    env = os.environ.copy()
-                    env["PYTHONPATH"] = str(jprime_path)
-                    env["TRINITY_ENABLED"] = "true"
-                    env["TRINITY_COMPONENT"] = "jprime"
+                    # v90.0: Use filtered environment to prevent pollution (Issue #15)
+                    env = {
+                        "PYTHONPATH": str(jprime_path),
+                        "TRINITY_ENABLED": "true",
+                        "TRINITY_COMPONENT": "jprime",
+                        # W3C Distributed Tracing headers
+                        "TRACEPARENT": trace_ctx.to_traceparent(),
+                        "TRINITY_TRACE_ID": trace_ctx.trace_id,
+                        "TRINITY_SPAN_ID": trace_ctx.span_id,
+                        "TRINITY_PARENT_ID": trace_ctx.parent_span_id or "",
+                        # Additional config-driven environment
+                        "TRINITY_INSTANCE_ID": config.trinity_instance_id,
+                        "TRINITY_LOG_LEVEL": config.log_level,
+                    }
 
-                    # W3C Distributed Tracing headers
-                    env["TRACEPARENT"] = trace_ctx.to_traceparent()
-                    env["TRINITY_TRACE_ID"] = trace_ctx.trace_id
-                    env["TRINITY_SPAN_ID"] = trace_ctx.span_id
-                    env["TRINITY_PARENT_ID"] = trace_ctx.parent_span_id or ""
-
-                    # Additional config-driven environment
-                    env["TRINITY_INSTANCE_ID"] = config.trinity_instance_id
-                    env["TRINITY_LOG_LEVEL"] = config.log_level
-
-                    # v100.0: Use context managers for file handles (ExitStack)
-                    from contextlib import ExitStack
-
-                    with ExitStack() as stack:
-                        stdout_file = stack.enter_context(open(stdout_log, "a"))  # Append mode
-                        stderr_file = stack.enter_context(open(stderr_log, "a"))
-
-                        # Write launch header
-                        launch_header = f"\n{'='*60}\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] J-Prime Launch (v100.0)\n{'='*60}\n"
-                        stdout_file.write(launch_header)
-                        stderr_file.write(launch_header)
-                        stdout_file.flush()
-                        stderr_file.flush()
-
-                        # Launch subprocess with detached session
-                        process = await asyncio.create_subprocess_exec(
-                            python_cmd,
-                            str(script_path),
-                            cwd=str(jprime_path),
+                    # v90.0: Use SafeProcess for guaranteed cleanup (fixes #1, #5, #6)
+                    if _SYSTEM_PRIMITIVES_AVAILABLE and SafeProcess is not None:
+                        # Create SafeProcess with process group management
+                        safe_proc = SafeProcess(
+                            name=f"jprime-{description.replace(' ', '-').lower()}",
+                            cmd=[python_cmd, str(script_path)],
+                            cwd=jprime_path,
                             env=env,
-                            stdout=stdout_file,
-                            stderr=stderr_file,
-                            start_new_session=True,
+                            stdout_path=stdout_log,
+                            stderr_path=stderr_log,
+                            inherit_env=True,  # Inherit PATH, HOME, etc.
+                            env_filter=["PATH", "HOME", "USER", "LANG", "LC_ALL", "SHELL",
+                                       "PYTHONPATH", "VIRTUAL_ENV", "CONDA_PREFIX"],  # Filter pollution
                         )
 
-                        # Store reference
-                        self._jprime_orchestrator_process = process
+                        # Start the process
+                        proc_info = await safe_proc.start()
 
-                    self.logger.info(
-                        f"   ✅ [v100] J-Prime launched (PID: {process.pid}, "
-                        f"trace: {trace_ctx.trace_id[:8]}...)"
-                    )
-                    self.logger.info(f"   📄 Logs: {stdout_log}")
-                    print(
-                        f"  {TerminalUI.GREEN}✓ J-Prime launched "
-                        f"(PID: {process.pid}){TerminalUI.RESET}"
-                    )
+                        # Store both SafeProcess and raw process reference
+                        self._jprime_safe_process = safe_proc
+                        self._jprime_orchestrator_process = safe_proc._process
 
-                    return process
+                        self.logger.info(
+                            f"   ✅ [v90] J-Prime launched via SafeProcess "
+                            f"(PID: {proc_info.pid}, PGID: {proc_info.pgid}, "
+                            f"trace: {trace_ctx.trace_id[:8]}...)"
+                        )
+                        self.logger.info(f"   📄 Logs: {stdout_log}")
+                        print(
+                            f"  {TerminalUI.GREEN}✓ J-Prime launched "
+                            f"(PID: {proc_info.pid}, PGID: {proc_info.pgid}){TerminalUI.RESET}"
+                        )
+
+                        return safe_proc._process
+
+                    else:
+                        # Fallback to legacy subprocess management
+                        env_full = os.environ.copy()
+                        env_full.update(env)
+
+                        # Use proper file handle management (still fixes #1)
+                        stdout_fd = os.open(str(stdout_log), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+                        stderr_fd = os.open(str(stderr_log), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+
+                        try:
+                            # Write launch header
+                            launch_header = f"\n{'='*60}\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] J-Prime Launch (v90.0-legacy)\n{'='*60}\n".encode()
+                            os.write(stdout_fd, launch_header)
+                            os.write(stderr_fd, launch_header)
+
+                            # Launch subprocess with detached session
+                            process = await asyncio.create_subprocess_exec(
+                                python_cmd,
+                                str(script_path),
+                                cwd=str(jprime_path),
+                                env=env_full,
+                                stdout=stdout_fd,
+                                stderr=stderr_fd,
+                                start_new_session=True,
+                            )
+
+                            # Store reference
+                            self._jprime_orchestrator_process = process
+
+                        finally:
+                            # Close file descriptors (process has its own copy)
+                            os.close(stdout_fd)
+                            os.close(stderr_fd)
+
+                        self.logger.info(
+                            f"   ✅ [legacy] J-Prime launched (PID: {process.pid}, "
+                            f"trace: {trace_ctx.trace_id[:8]}...)"
+                        )
+                        self.logger.info(f"   📄 Logs: {stdout_log}")
+                        print(
+                            f"  {TerminalUI.GREEN}✓ J-Prime launched "
+                            f"(PID: {process.pid}){TerminalUI.RESET}"
+                        )
+
+                        return process
 
                 except Exception as e:
                     self.logger.warning(f"   Failed to launch J-Prime: {e}")
+                    # v90.0: Log full traceback for debugging (fixes #8)
+                    if _SYSTEM_PRIMITIVES_AVAILABLE and EnhancedExceptionHandler is not None:
+                        self.logger.debug(EnhancedExceptionHandler.format_exception(e))
                     print(f"  {TerminalUI.YELLOW}⚠️ J-Prime launch failed: {e}{TerminalUI.RESET}")
                     raise  # Re-raise for retry logic
 
@@ -11661,30 +11831,56 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
         - Config-driven timeouts and settings
         - Heartbeat-based detection
         - Atomic log file rotation
+        - v90.0: PID-validated heartbeat checking via TrueHeartbeat
         """
-        # Check if already running (via heartbeat)
-        trinity_dir = Path.home() / ".jarvis" / "trinity"
-        reactor_state_file = trinity_dir / "components" / "reactor_core.json"
+        # v90.0: Use TrueHeartbeat for PID-validated heartbeat checking
+        if _SYSTEM_PRIMITIVES_AVAILABLE and TrueHeartbeat is not None:
+            heartbeat = TrueHeartbeat("reactor_core")
+            status, heartbeat_data = heartbeat.validate()
 
-        if reactor_state_file.exists():
-            try:
-                import json
-                import time as time_module
-                with open(reactor_state_file) as f:
-                    state = json.load(f)
-                heartbeat_age = time_module.time() - state.get("timestamp", 0)
-                if heartbeat_age < config.heartbeat_stale_threshold_sec:
-                    self.logger.info(
-                        f"   ⚡ [v100] Reactor-Core already running "
-                        f"(heartbeat: {heartbeat_age:.1f}s)"
-                    )
-                    print(
-                        f"  {TerminalUI.GREEN}✓ Reactor-Core: Already running "
-                        f"(heartbeat: {heartbeat_age:.1f}s ago){TerminalUI.RESET}"
-                    )
-                    return None  # Already running, not an error
-            except Exception as e:
-                self.logger.debug(f"   Could not read Reactor-Core state: {e}")
+            if status == HeartbeatStatus.ALIVE:
+                self.logger.info(
+                    f"   ⚡ [v90] Reactor-Core already running "
+                    f"(PID: {heartbeat_data.pid}, age: {heartbeat_data.age_seconds:.1f}s)"
+                )
+                print(
+                    f"  {TerminalUI.GREEN}✓ Reactor-Core: Already running "
+                    f"(PID: {heartbeat_data.pid}, heartbeat: {heartbeat_data.age_seconds:.1f}s ago){TerminalUI.RESET}"
+                )
+                return None  # Already running, not an error
+            elif status == HeartbeatStatus.DEAD:
+                self.logger.info(
+                    f"   🧟 [v90] Found dead Reactor-Core heartbeat (PID {heartbeat_data.pid} is dead) - cleaning up"
+                )
+            elif status == HeartbeatStatus.STALE:
+                self.logger.warning(
+                    f"   ⚠️ [v90] Reactor-Core heartbeat is stale ({heartbeat_data.age_seconds:.1f}s old) - will restart"
+                )
+                heartbeat.cleanup()
+        else:
+            # Fallback to legacy heartbeat checking
+            trinity_dir = Path.home() / ".jarvis" / "trinity"
+            reactor_state_file = trinity_dir / "components" / "reactor_core.json"
+
+            if reactor_state_file.exists():
+                try:
+                    import json
+                    import time as time_module
+                    with open(reactor_state_file) as f:
+                        state = json.load(f)
+                    heartbeat_age = time_module.time() - state.get("timestamp", 0)
+                    if heartbeat_age < config.heartbeat_stale_threshold_sec:
+                        self.logger.info(
+                            f"   ⚡ [legacy] Reactor-Core already running "
+                            f"(heartbeat: {heartbeat_age:.1f}s)"
+                        )
+                        print(
+                            f"  {TerminalUI.GREEN}✓ Reactor-Core: Already running "
+                            f"(heartbeat: {heartbeat_age:.1f}s ago){TerminalUI.RESET}"
+                        )
+                        return None  # Already running, not an error
+                except Exception as e:
+                    self.logger.debug(f"   Could not read Reactor-Core state: {e}")
 
         # v100.0: Use RobustVenvDetector to find Python
         python_cmd = venv_detector.get_python_executable(reactor_core_path)
@@ -11722,58 +11918,99 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
 
                 try:
                     # Build environment with PYTHONPATH and trace context
-                    env = os.environ.copy()
-                    env["PYTHONPATH"] = str(reactor_core_path)
-                    env["TRINITY_ENABLED"] = "true"
-                    env["TRINITY_COMPONENT"] = "reactor_core"
+                    # v90.0: Use filtered environment to prevent pollution (Issue #15)
+                    env = {
+                        "PYTHONPATH": str(reactor_core_path),
+                        "TRINITY_ENABLED": "true",
+                        "TRINITY_COMPONENT": "reactor_core",
+                        # W3C Distributed Tracing headers
+                        "TRACEPARENT": trace_ctx.to_traceparent(),
+                        "TRINITY_TRACE_ID": trace_ctx.trace_id,
+                        "TRINITY_SPAN_ID": trace_ctx.span_id,
+                        "TRINITY_PARENT_ID": trace_ctx.parent_span_id or "",
+                        # Additional config-driven environment
+                        "TRINITY_INSTANCE_ID": config.trinity_instance_id,
+                        "TRINITY_LOG_LEVEL": config.log_level,
+                    }
 
-                    # W3C Distributed Tracing headers
-                    env["TRACEPARENT"] = trace_ctx.to_traceparent()
-                    env["TRINITY_TRACE_ID"] = trace_ctx.trace_id
-                    env["TRINITY_SPAN_ID"] = trace_ctx.span_id
-                    env["TRINITY_PARENT_ID"] = trace_ctx.parent_span_id or ""
-
-                    # Additional config-driven environment
-                    env["TRINITY_INSTANCE_ID"] = config.trinity_instance_id
-                    env["TRINITY_LOG_LEVEL"] = config.log_level
-
-                    # v100.0: Use context managers for file handles
-                    from contextlib import ExitStack
-
-                    with ExitStack() as stack:
-                        stdout_file = stack.enter_context(open(stdout_log, "a"))
-                        stderr_file = stack.enter_context(open(stderr_log, "a"))
-
-                        # Write launch header
-                        launch_header = f"\n{'='*60}\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] Reactor-Core Launch (v100.0)\n{'='*60}\n"
-                        stdout_file.write(launch_header)
-                        stderr_file.write(launch_header)
-                        stdout_file.flush()
-                        stderr_file.flush()
-
-                        # Launch subprocess with detached session
-                        process = await asyncio.create_subprocess_exec(
-                            python_cmd,
-                            str(script_path),
-                            cwd=str(reactor_core_path),
+                    # v90.0: Use SafeProcess for guaranteed cleanup (fixes #1, #5, #6)
+                    if _SYSTEM_PRIMITIVES_AVAILABLE and SafeProcess is not None:
+                        # Create SafeProcess with process group management
+                        safe_proc = SafeProcess(
+                            name=f"reactor-{description.replace(' ', '-').lower()}",
+                            cmd=[python_cmd, str(script_path)],
+                            cwd=reactor_core_path,
                             env=env,
-                            stdout=stdout_file,
-                            stderr=stderr_file,
-                            start_new_session=True,
+                            stdout_path=stdout_log,
+                            stderr_path=stderr_log,
+                            inherit_env=True,
+                            env_filter=["PATH", "HOME", "USER", "LANG", "LC_ALL", "SHELL",
+                                       "PYTHONPATH", "VIRTUAL_ENV", "CONDA_PREFIX"],
                         )
 
-                        # Store reference
-                        self._reactor_core_orchestrator_process = process
+                        # Start the process
+                        proc_info = await safe_proc.start()
 
-                    self.logger.info(
-                        f"   ✅ [v100] Reactor-Core launched (PID: {process.pid}, "
-                        f"trace: {trace_ctx.trace_id[:8]}...)"
-                    )
-                    self.logger.info(f"   📄 Logs: {stdout_log}")
-                    print(
-                        f"  {TerminalUI.GREEN}✓ Reactor-Core launched "
-                        f"(PID: {process.pid}){TerminalUI.RESET}"
-                    )
+                        # Store both SafeProcess and raw process reference
+                        self._reactor_safe_process = safe_proc
+                        self._reactor_core_orchestrator_process = safe_proc._process
+
+                        self.logger.info(
+                            f"   ✅ [v90] Reactor-Core launched via SafeProcess "
+                            f"(PID: {proc_info.pid}, PGID: {proc_info.pgid}, "
+                            f"trace: {trace_ctx.trace_id[:8]}...)"
+                        )
+                        self.logger.info(f"   📄 Logs: {stdout_log}")
+                        print(
+                            f"  {TerminalUI.GREEN}✓ Reactor-Core launched "
+                            f"(PID: {proc_info.pid}, PGID: {proc_info.pgid}){TerminalUI.RESET}"
+                        )
+
+                        return safe_proc._process
+
+                    else:
+                        # Fallback to legacy subprocess management
+                        env_full = os.environ.copy()
+                        env_full.update(env)
+
+                        # Use proper file handle management
+                        stdout_fd = os.open(str(stdout_log), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+                        stderr_fd = os.open(str(stderr_log), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+
+                        try:
+                            # Write launch header
+                            launch_header = f"\n{'='*60}\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] Reactor-Core Launch (v90.0-legacy)\n{'='*60}\n".encode()
+                            os.write(stdout_fd, launch_header)
+                            os.write(stderr_fd, launch_header)
+
+                            # Launch subprocess with detached session
+                            process = await asyncio.create_subprocess_exec(
+                                python_cmd,
+                                str(script_path),
+                                cwd=str(reactor_core_path),
+                                env=env_full,
+                                stdout=stdout_fd,
+                                stderr=stderr_fd,
+                                start_new_session=True,
+                            )
+
+                            # Store reference
+                            self._reactor_core_orchestrator_process = process
+
+                        finally:
+                            # Close file descriptors
+                            os.close(stdout_fd)
+                            os.close(stderr_fd)
+
+                        self.logger.info(
+                            f"   ✅ [legacy] Reactor-Core launched (PID: {process.pid}, "
+                            f"trace: {trace_ctx.trace_id[:8]}...)"
+                        )
+                        self.logger.info(f"   📄 Logs: {stdout_log}")
+                        print(
+                            f"  {TerminalUI.GREEN}✓ Reactor-Core launched "
+                            f"(PID: {process.pid}){TerminalUI.RESET}"
+                        )
 
                     return process
 
@@ -11958,8 +12195,20 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
             finally:
                 self._trinity_integrator = None
 
-        # Shutdown J-Prime orchestrator
-        if self._jprime_orchestrator_process is not None:
+        # v90.0: Shutdown J-Prime orchestrator using SafeProcess if available
+        if hasattr(self, '_jprime_safe_process') and self._jprime_safe_process is not None:
+            # Use SafeProcess for process group shutdown (kills all children too)
+            try:
+                self.logger.info("   [v90] Stopping J-Prime orchestrator via SafeProcess...")
+                exit_code = await self._jprime_safe_process.stop(timeout=5.0)
+                self.logger.info(f"   ✅ [v90] J-Prime stopped (PGID kill, exit={exit_code})")
+            except Exception as e:
+                self.logger.debug(f"   J-Prime SafeProcess shutdown error: {e}")
+            finally:
+                self._jprime_safe_process = None
+                self._jprime_orchestrator_process = None
+        elif self._jprime_orchestrator_process is not None:
+            # Fallback to legacy shutdown
             try:
                 self.logger.info("   Stopping J-Prime orchestrator...")
                 self._jprime_orchestrator_process.terminate()
@@ -11980,8 +12229,20 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
             finally:
                 self._jprime_orchestrator_process = None
 
-        # Shutdown Reactor-Core orchestrator
-        if self._reactor_core_orchestrator_process is not None:
+        # v90.0: Shutdown Reactor-Core orchestrator using SafeProcess if available
+        if hasattr(self, '_reactor_safe_process') and self._reactor_safe_process is not None:
+            # Use SafeProcess for process group shutdown
+            try:
+                self.logger.info("   [v90] Stopping Reactor-Core orchestrator via SafeProcess...")
+                exit_code = await self._reactor_safe_process.stop(timeout=5.0)
+                self.logger.info(f"   ✅ [v90] Reactor-Core stopped (PGID kill, exit={exit_code})")
+            except Exception as e:
+                self.logger.debug(f"   Reactor-Core SafeProcess shutdown error: {e}")
+            finally:
+                self._reactor_safe_process = None
+                self._reactor_core_orchestrator_process = None
+        elif self._reactor_core_orchestrator_process is not None:
+            # Fallback to legacy shutdown
             try:
                 self.logger.info("   Stopping Reactor-Core orchestrator...")
                 self._reactor_core_orchestrator_process.terminate()
