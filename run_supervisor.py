@@ -3374,6 +3374,18 @@ class SupervisorBootstrapper:
         self._trinity_integrator = None
         self._trinity_integrator_enabled = os.getenv("TRINITY_INTEGRATOR_ENABLED", "true").lower() == "true"
 
+        # v100.0: Trinity Core Systems (Advanced Cross-Repo Infrastructure)
+        # - TrinityEventBus: Unified pub/sub with priority queues, persistence, replay
+        # - TrinityKnowledgeGraph: Shared knowledge storage with semantic search
+        # - TrinityTrainingPipeline: End-to-end training (JARVIS → Reactor → Prime)
+        # - TrinityMonitoring: Unified observability with distributed tracing, alerting
+        self._trinity_event_bus = None
+        self._trinity_knowledge_graph = None
+        self._trinity_training_pipeline = None
+        self._trinity_monitoring = None
+        self._trinity_core_systems_enabled = os.getenv("TRINITY_CORE_SYSTEMS_ENABLED", "true").lower() == "true"
+        self._trinity_core_systems_task = None
+
         # v85.0: Unified State Coordination - Atomic locks with process cookies
         # - Prevents race conditions between run_supervisor.py and start_system.py
         # - Uses fcntl locks with TTL-based expiration
@@ -6990,6 +7002,44 @@ class SupervisorBootstrapper:
                 self.logger.info("✅ Trinity Knowledge Indexer stopped")
         except Exception as e:
             self.logger.warning(f"⚠️ Trinity Knowledge Indexer cleanup error: {e}")
+
+        # v100.0: Shutdown Trinity Core Systems
+        try:
+            self.logger.info("🔧 Shutting down Trinity Core Systems...")
+
+            # Cancel monitoring task first
+            if self._trinity_core_systems_task:
+                self._trinity_core_systems_task.cancel()
+                try:
+                    await self._trinity_core_systems_task
+                except asyncio.CancelledError:
+                    pass
+
+            # Shutdown in reverse order
+            shutdown_tasks = []
+
+            if self._trinity_monitoring:
+                shutdown_tasks.append(("TrinityMonitoring", self._trinity_monitoring.stop()))
+            if self._trinity_training_pipeline:
+                shutdown_tasks.append(("TrinityTrainingPipeline", self._trinity_training_pipeline.stop()))
+            if self._trinity_knowledge_graph:
+                shutdown_tasks.append(("TrinityKnowledgeGraph", self._trinity_knowledge_graph.stop()))
+            if self._trinity_event_bus:
+                shutdown_tasks.append(("TrinityEventBus", self._trinity_event_bus.stop()))
+
+            # Execute shutdowns in parallel with timeout
+            for name, coro in shutdown_tasks:
+                try:
+                    await asyncio.wait_for(coro, timeout=5.0)
+                    self.logger.info(f"   ✅ {name} stopped")
+                except asyncio.TimeoutError:
+                    self.logger.warning(f"   ⚠️ {name} shutdown timed out")
+                except Exception as e:
+                    self.logger.warning(f"   ⚠️ {name} shutdown error: {e}")
+
+            self.logger.info("✅ Trinity Core Systems stopped")
+        except Exception as e:
+            self.logger.warning(f"⚠️ Trinity Core Systems cleanup error: {e}")
 
         # Cleanup JARVIS-Prime
         try:
@@ -11083,6 +11133,177 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
             self.logger.warning("[v88.0] ServiceRegistry not available (import failed)")
         except Exception as e:
             self.logger.warning(f"[v88.0] ServiceRegistry startup failed: {e}")
+
+        # =====================================================================
+        # PHASE 3: Initialize Trinity Core Systems (v100.0)
+        # =====================================================================
+        if self._trinity_core_systems_enabled:
+            await self._initialize_trinity_core_systems()
+
+    async def _initialize_trinity_core_systems(self) -> None:
+        """
+        v100.0: Initialize Trinity Core Systems - Advanced Cross-Repo Infrastructure.
+
+        This initializes the following core systems:
+        1. TrinityEventBus: Unified pub/sub messaging with priority queues,
+           persistence, and replay capability for cross-repo event streaming
+        2. TrinityKnowledgeGraph: Shared knowledge storage across repos with
+           semantic search, versioning, and cross-repo synchronization
+        3. TrinityTrainingPipeline: End-to-end training integration from
+           JARVIS experience capture → Reactor Core training → Prime deployment
+        4. TrinityMonitoring: Unified observability with distributed tracing,
+           metrics collection, health monitoring, and intelligent alerting
+        """
+        self.logger.info("=" * 60)
+        self.logger.info("[v100.0] Initializing Trinity Core Systems")
+        self.logger.info("=" * 60)
+
+        print(f"  {TerminalUI.CYAN}🔧 Trinity Core Systems: Initializing advanced infrastructure...{TerminalUI.RESET}")
+
+        initialized_count = 0
+        failed_systems = []
+
+        # 1. Initialize Trinity Event Bus
+        try:
+            from backend.core.trinity_event_bus import get_trinity_event_bus
+
+            self._trinity_event_bus = get_trinity_event_bus()
+            await self._trinity_event_bus.start()
+
+            self.logger.info("[v100.0] ✅ TrinityEventBus initialized - pub/sub messaging active")
+            initialized_count += 1
+        except ImportError as e:
+            self.logger.warning(f"[v100.0] ⚠️ TrinityEventBus import failed: {e}")
+            failed_systems.append("EventBus")
+        except Exception as e:
+            self.logger.warning(f"[v100.0] ⚠️ TrinityEventBus initialization failed: {e}")
+            failed_systems.append("EventBus")
+
+        # 2. Initialize Trinity Knowledge Graph
+        try:
+            from backend.core.trinity_knowledge_graph import get_trinity_knowledge_graph
+
+            self._trinity_knowledge_graph = get_trinity_knowledge_graph()
+            await self._trinity_knowledge_graph.start()
+
+            self.logger.info("[v100.0] ✅ TrinityKnowledgeGraph initialized - shared knowledge active")
+            initialized_count += 1
+        except ImportError as e:
+            self.logger.warning(f"[v100.0] ⚠️ TrinityKnowledgeGraph import failed: {e}")
+            failed_systems.append("KnowledgeGraph")
+        except Exception as e:
+            self.logger.warning(f"[v100.0] ⚠️ TrinityKnowledgeGraph initialization failed: {e}")
+            failed_systems.append("KnowledgeGraph")
+
+        # 3. Initialize Trinity Training Pipeline
+        try:
+            from backend.core.trinity_training_pipeline import get_training_pipeline
+
+            self._trinity_training_pipeline = get_training_pipeline()
+            await self._trinity_training_pipeline.start()
+
+            self.logger.info("[v100.0] ✅ TrinityTrainingPipeline initialized - JARVIS→Reactor→Prime active")
+            initialized_count += 1
+        except ImportError as e:
+            self.logger.warning(f"[v100.0] ⚠️ TrinityTrainingPipeline import failed: {e}")
+            failed_systems.append("TrainingPipeline")
+        except Exception as e:
+            self.logger.warning(f"[v100.0] ⚠️ TrinityTrainingPipeline initialization failed: {e}")
+            failed_systems.append("TrainingPipeline")
+
+        # 4. Initialize Trinity Monitoring
+        try:
+            from backend.core.trinity_monitoring import get_trinity_monitoring
+
+            self._trinity_monitoring = get_trinity_monitoring()
+            await self._trinity_monitoring.start()
+
+            self.logger.info("[v100.0] ✅ TrinityMonitoring initialized - observability active")
+            initialized_count += 1
+        except ImportError as e:
+            self.logger.warning(f"[v100.0] ⚠️ TrinityMonitoring import failed: {e}")
+            failed_systems.append("Monitoring")
+        except Exception as e:
+            self.logger.warning(f"[v100.0] ⚠️ TrinityMonitoring initialization failed: {e}")
+            failed_systems.append("Monitoring")
+
+        # Summary
+        if initialized_count == 4:
+            self.logger.info("=" * 60)
+            self.logger.info("[v100.0] TRINITY CORE SYSTEMS: FULLY INITIALIZED")
+            self.logger.info("   EventBus ✓ | KnowledgeGraph ✓ | TrainingPipeline ✓ | Monitoring ✓")
+            self.logger.info("=" * 60)
+            print(f"  {TerminalUI.GREEN}✓ Trinity Core Systems: All 4 systems initialized{TerminalUI.RESET}")
+        elif initialized_count > 0:
+            self.logger.info(f"[v100.0] Trinity Core Systems: {initialized_count}/4 initialized")
+            if failed_systems:
+                self.logger.info(f"   Failed: {', '.join(failed_systems)}")
+            print(f"  {TerminalUI.YELLOW}⚠️ Trinity Core Systems: {initialized_count}/4 initialized{TerminalUI.RESET}")
+        else:
+            self.logger.warning("[v100.0] Trinity Core Systems: None initialized (running in basic mode)")
+            print(f"  {TerminalUI.RED}✗ Trinity Core Systems: Not available{TerminalUI.RESET}")
+
+        # Start background monitoring task if monitoring is available
+        if self._trinity_monitoring:
+            async def _run_trinity_monitoring():
+                """Background task for Trinity system monitoring."""
+                try:
+                    while True:
+                        await asyncio.sleep(30)  # Check every 30 seconds
+
+                        # Record health metrics for each component
+                        if self._trinity_event_bus:
+                            stats = self._trinity_event_bus.get_stats()
+                            await self._trinity_monitoring.record_metric(
+                                name="trinity.event_bus.subscribers",
+                                value=stats.get("total_subscribers", 0),
+                                unit="count",
+                                component="event_bus"
+                            )
+                            await self._trinity_monitoring.record_metric(
+                                name="trinity.event_bus.events_published",
+                                value=stats.get("events_published", 0),
+                                unit="count",
+                                component="event_bus"
+                            )
+
+                        if self._trinity_knowledge_graph:
+                            stats = self._trinity_knowledge_graph.get_stats()
+                            await self._trinity_monitoring.record_metric(
+                                name="trinity.knowledge_graph.nodes",
+                                value=stats.get("total_nodes", 0),
+                                unit="count",
+                                component="knowledge_graph"
+                            )
+                            await self._trinity_monitoring.record_metric(
+                                name="trinity.knowledge_graph.edges",
+                                value=stats.get("total_edges", 0),
+                                unit="count",
+                                component="knowledge_graph"
+                            )
+
+                        if self._trinity_training_pipeline:
+                            stats = self._trinity_training_pipeline.get_stats()
+                            await self._trinity_monitoring.record_metric(
+                                name="trinity.training.experiences",
+                                value=stats.get("total_experiences", 0),
+                                unit="count",
+                                component="training_pipeline"
+                            )
+                            await self._trinity_monitoring.record_metric(
+                                name="trinity.training.active_jobs",
+                                value=stats.get("active_jobs", 0),
+                                unit="count",
+                                component="training_pipeline"
+                            )
+
+                except asyncio.CancelledError:
+                    pass
+                except Exception as e:
+                    self.logger.warning(f"[v100.0] Trinity monitoring task error: {e}")
+
+            self._trinity_core_systems_task = asyncio.create_task(_run_trinity_monitoring())
+            self.logger.info("[v100.0] Started Trinity Core Systems monitoring task")
 
     async def _initialize_v80_cross_repo_system(
         self,
