@@ -11577,6 +11577,9 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
             # v75.0: Start Trinity Health Monitor
             await self._start_trinity_health_monitor()
 
+            # v100.0: Initialize Unified AGI Orchestrator
+            await self._initialize_agi_orchestrator()
+
         except Exception as e:
             self.logger.warning(f"⚠️ Trinity component launch failed: {e}")
             self.logger.warning(f"   Trace ID: {trace_ctx.trace_id}")
@@ -12719,6 +12722,65 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
 
         return health_results
 
+    async def _initialize_agi_orchestrator(self) -> None:
+        """
+        v100.0: Initialize the Unified AGI Orchestrator.
+
+        The AGI Orchestrator provides:
+        - Unified event bus for cross-repo communication
+        - Persistent state management (survives restarts)
+        - Learning pipeline (JARVIS -> Reactor -> Prime)
+        - Agent registry and activation
+        - Cross-repo health aggregation
+        """
+        try:
+            from backend.core.unified_agi_orchestrator import (
+                get_agi_orchestrator,
+                start_agi_orchestrator,
+                AGIComponent,
+                AGIEvent,
+                EventPriority,
+            )
+
+            self.logger.info("🧠 [v100.0] Initializing AGI Orchestrator...")
+            print(f"  {TerminalUI.CYAN}🧠 Initializing AGI Orchestrator...{TerminalUI.RESET}")
+
+            # Start the orchestrator
+            success = await start_agi_orchestrator()
+
+            if success:
+                self.logger.info("   ✅ AGI Orchestrator v100.0 started")
+                print(f"  {TerminalUI.GREEN}✓ AGI Orchestrator ready{TerminalUI.RESET}")
+
+                # Get orchestrator instance and publish startup event
+                orchestrator = await get_agi_orchestrator()
+
+                # Publish Trinity startup event
+                await orchestrator.publish_event(AGIEvent(
+                    event_type="trinity.startup.complete",
+                    source=AGIComponent.JARVIS,
+                    priority=EventPriority.HIGH,
+                    payload={
+                        "jarvis_running": True,
+                        "prime_available": hasattr(self, '_jprime_orchestrator_process') and
+                                           self._jprime_orchestrator_process is not None,
+                        "reactor_available": hasattr(self, '_reactor_core_orchestrator_process') and
+                                             self._reactor_core_orchestrator_process is not None,
+                    }
+                ))
+
+                # Store reference for shutdown
+                self._agi_orchestrator = orchestrator
+            else:
+                self.logger.warning("   ⚠️ AGI Orchestrator failed to start")
+                print(f"  {TerminalUI.YELLOW}⚠️ AGI Orchestrator unavailable{TerminalUI.RESET}")
+
+        except ImportError as e:
+            self.logger.debug(f"   AGI Orchestrator module not available: {e}")
+        except Exception as e:
+            self.logger.warning(f"   AGI Orchestrator init failed: {e}")
+            # Non-fatal - continue without AGI orchestrator
+
     async def _shutdown_trinity_components(self) -> None:
         """
         v72.0: Gracefully shutdown Trinity component subprocesses.
@@ -12735,6 +12797,18 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
         5. Clean up process references
         """
         self.logger.info("🔗 Shutting down Trinity components...")
+
+        # v100.0: Shutdown AGI Orchestrator first
+        if hasattr(self, '_agi_orchestrator') and self._agi_orchestrator is not None:
+            try:
+                self.logger.info("   [v100.0] Stopping AGI Orchestrator...")
+                from backend.core.unified_agi_orchestrator import stop_agi_orchestrator
+                await stop_agi_orchestrator()
+                self.logger.info("   ✅ [v100.0] AGI Orchestrator stopped")
+            except Exception as e:
+                self.logger.debug(f"   AGI Orchestrator shutdown error: {e}")
+            finally:
+                self._agi_orchestrator = None
 
         # v81.0: Use TrinityIntegrator for coordinated phased shutdown
         if self._trinity_integrator is not None:
