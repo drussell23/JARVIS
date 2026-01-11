@@ -5482,29 +5482,31 @@ class SupervisorBootstrapper:
             except Exception as e:
                 self.logger.warning(f"⚠️ Infrastructure cleanup error: {e}")
 
-        # v87.0: Shutdown Trinity Voice Coordinator
+        # v100.0: Shutdown Trinity Voice Coordinator v100.0 (graceful with queue draining)
         try:
             if hasattr(self, '_trinity_voice_coordinator_instance') and self._trinity_voice_coordinator_instance:
-                self.logger.info("🎙️  Shutting down Trinity Voice Coordinator...")
+                self.logger.info("🎙️  Shutting down Trinity Voice Coordinator v100.0...")
 
-                # Final farewell announcement
+                # Final farewell announcement (CRITICAL priority to ensure it's spoken)
                 try:
                     from backend.core.trinity_voice_coordinator import announce, VoiceContext, VoicePriority
-                    await announce(
-                        message="JARVIS systems shutting down. Goodbye.",
+                    success, reason = await announce(
+                        message="JARVIS systems shutting down gracefully. Goodbye.",
                         context=VoiceContext.RUNTIME,
-                        priority=VoicePriority.HIGH,
+                        priority=VoicePriority.CRITICAL,
                         source="supervisor",
                         metadata={"event": "shutdown"}
                     )
-                    # Give time for final announcement
-                    await asyncio.sleep(2.0)
-                except:
-                    pass
+                    if success:
+                        # Give time for final announcement to be spoken
+                        await asyncio.sleep(3.0)
+                except Exception as e:
+                    self.logger.debug(f"Final announcement skipped: {e}")
 
-                # Stop the coordinator
-                await self._trinity_voice_coordinator_instance.stop()
-                self.logger.info("✅ Trinity Voice Coordinator stopped")
+                # Graceful shutdown with queue draining (v100.0 feature)
+                # This will process any remaining CRITICAL/HIGH announcements
+                await self._trinity_voice_coordinator_instance.shutdown()
+                self.logger.info("✅ Trinity Voice Coordinator v100.0 stopped (queue drained)")
         except Exception as e:
             self.logger.warning(f"⚠️ Trinity Voice Coordinator cleanup error: {e}")
 
@@ -9382,77 +9384,87 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
             return
 
         try:
-            self.logger.info("[v87.0] 🎙️  Initializing Trinity Voice Coordinator...")
+            self.logger.info("[v100.0] 🎙️  Initializing Trinity Voice Coordinator v100.0 (Ultra-Robust)...")
 
-            # Import and initialize the Trinity Voice Coordinator
+            # Import and initialize the Trinity Voice Coordinator v100.0
             try:
                 from backend.core.trinity_voice_coordinator import (
                     get_voice_coordinator,
                     announce,
                     VoiceContext,
                     VoicePriority,
+                    VoiceConfig,
+                    integrate_with_trinity_ipc,
                 )
 
-                # Get the global coordinator instance
+                # Get the global coordinator instance (auto-initializes)
                 coordinator = await get_voice_coordinator()
 
                 # Store reference for later use
                 self._trinity_voice_coordinator_instance = coordinator
 
-                # Test voice system is working
-                test_success = await announce(
-                    message="Trinity Voice Coordinator initialized. JARVIS systems online.",
+                # Integrate with Trinity IPC for cross-repo voice commands
+                try:
+                    await integrate_with_trinity_ipc()
+                    self.logger.info("[v100.0] ✅ Trinity IPC voice integration enabled")
+                except Exception as ipc_e:
+                    self.logger.warning(f"[v100.0] ⚠️ Trinity IPC integration skipped: {ipc_e}")
+
+                # Test voice system is working (now returns tuple)
+                test_success, test_reason = await announce(
+                    message="Trinity Voice Coordinator v100.0 initialized. JARVIS systems online.",
                     context=VoiceContext.STARTUP,
-                    priority=VoicePriority.HIGH,
+                    priority=VoicePriority.CRITICAL,
                     source="supervisor",
                     metadata={
                         "event": "coordinator_init",
                         "jprime_online": jprime_online,
                         "reactor_online": reactor_online,
+                        "version": "100.0",
                     }
                 )
 
                 if test_success:
                     self.logger.info(
-                        "[v87.0] ✅ Trinity Voice Coordinator active with UK Daniel voice"
+                        f"[v100.0] ✅ Trinity Voice Coordinator v100.0 active with UK Daniel voice "
+                        f"(reason={test_reason})"
                     )
                 else:
                     self.logger.warning(
-                        "[v87.0] ⚠️  Voice test queued but may be rate-limited/deduplicated"
+                        f"[v100.0] ⚠️  Voice test: {test_reason}"
                     )
 
-                # Announce component status
+                # Announce component status using convenience methods
                 if jprime_online:
-                    await announce(
-                        message="JARVIS Prime intelligence layer ready for local inference.",
-                        context=VoiceContext.TRINITY,
-                        priority=VoicePriority.NORMAL,
-                        source="supervisor",
-                        metadata={"component": "j_prime", "status": "online"}
-                    )
+                    await coordinator.announce_jarvis_prime_ready()
 
                 if reactor_online:
-                    await announce(
-                        message="Reactor Core self-improvement system ready for training.",
-                        context=VoiceContext.TRINITY,
-                        priority=VoicePriority.NORMAL,
-                        source="supervisor",
-                        metadata={"component": "reactor_core", "status": "online"}
-                    )
+                    await coordinator.announce_reactor_core_ready()
+
+                # If all components online, announce Trinity online
+                if jprime_online and reactor_online:
+                    await coordinator.announce_trinity_online()
+
+                # Get comprehensive status from v100.0 coordinator
+                coordinator_status = coordinator.get_status()
 
                 # Store status
                 self._trinity_voice_coordinator = {
                     "initialized": True,
-                    "running": coordinator._running,
-                    "queue_size": coordinator._queue.qsize() if coordinator._queue else 0,
-                    "engines_available": len([e for e in coordinator._engines if e.available]),
+                    "version": coordinator_status.get("version", "100.0"),
+                    "running": coordinator_status["running"],
+                    "queue_size": coordinator_status["queue"]["size"],
+                    "engines_available": coordinator_status["active_engines"],
+                    "workers": coordinator_status["workers"],
+                    "rate_limiter": coordinator_status["rate_limiter"],
                     "jprime_online": jprime_online,
                     "reactor_online": reactor_online,
                 }
 
                 self.logger.info(
-                    f"[v87.0] ✅ Trinity Voice Coordinator ready "
-                    f"({self._trinity_voice_coordinator['engines_available']} engines active)"
+                    f"[v100.0] ✅ Trinity Voice Coordinator v100.0 ready "
+                    f"({self._trinity_voice_coordinator['engines_available']} engines, "
+                    f"{self._trinity_voice_coordinator['workers']['count']} workers)"
                 )
 
             except ImportError as e:
