@@ -12119,16 +12119,18 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
 
                         if self._trinity_knowledge_graph and hasattr(self._trinity_knowledge_graph, 'get_stats'):
                             try:
-                                stats = self._trinity_knowledge_graph.get_stats()
+                                # v100.2: Properly await async get_stats method
+                                # GraphStats is a dataclass, so use getattr for attribute access
+                                stats = await self._trinity_knowledge_graph.get_stats()
                                 await self._trinity_monitoring.record_metric(
                                     name="trinity.knowledge_graph.nodes",
-                                    value=stats.get("total_nodes", 0),
+                                    value=getattr(stats, "total_nodes", 0),
                                     unit="count",
                                     component="knowledge_graph"
                                 )
                                 await self._trinity_monitoring.record_metric(
                                     name="trinity.knowledge_graph.edges",
-                                    value=stats.get("total_edges", 0),
+                                    value=getattr(stats, "total_edges", 0),
                                     unit="count",
                                     component="knowledge_graph"
                                 )
@@ -12137,16 +12139,17 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
 
                         if self._trinity_training_pipeline and hasattr(self._trinity_training_pipeline, 'get_stats'):
                             try:
+                                # PipelineStats is a dataclass, so use getattr for attribute access
                                 stats = self._trinity_training_pipeline.get_stats()
                                 await self._trinity_monitoring.record_metric(
                                     name="trinity.training.experiences",
-                                    value=stats.get("total_experiences", 0),
+                                    value=getattr(stats, "experiences_captured", 0),
                                     unit="count",
                                     component="training_pipeline"
                                 )
                                 await self._trinity_monitoring.record_metric(
                                     name="trinity.training.active_jobs",
-                                    value=stats.get("active_jobs", 0),
+                                    value=getattr(stats, "training_jobs_total", 0) - getattr(stats, "training_jobs_completed", 0),
                                     unit="count",
                                     component="training_pipeline"
                                 )

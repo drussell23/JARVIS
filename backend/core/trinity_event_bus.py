@@ -1,6 +1,6 @@
 """
-Trinity Event Bus v2.7 - Unified Cross-Repository Event Streaming
-=================================================================
+Trinity Event Bus v100.2 - Unified Cross-Repository Event Streaming
+====================================================================
 
 Provides RabbitMQ/NATS-style event streaming across Trinity repositories:
 - JARVIS (Body) - Main AI agent
@@ -488,6 +488,9 @@ class CrossRepoTransport:
     1. UDP multicast for local network discovery
     2. File-based sync for shared filesystem
     3. HTTP for remote repos
+
+    v100.2: Added circuit breaker pattern for multicast, graceful degradation,
+    and environment-driven configuration.
     """
 
     def __init__(self, local_repo: RepoType):
@@ -506,6 +509,13 @@ class CrossRepoTransport:
         self._processed_events: Set[str] = set()
         self._processed_lock = asyncio.Lock()
 
+        # v100.2: Multicast circuit breaker state
+        self._multicast_enabled = os.getenv("TRINITY_MULTICAST_ENABLED", "true").lower() == "true"
+        self._multicast_failed = False
+        self._multicast_fail_count = 0
+        self._multicast_max_failures = int(os.getenv("TRINITY_MULTICAST_MAX_FAILURES", "50"))
+        self._multicast_disabled_logged = False
+
     async def start(self) -> None:
         """Start the transport layer."""
         if self._running:
@@ -516,14 +526,19 @@ class CrossRepoTransport:
         # Start file-based sync (works across all platforms)
         self._sync_task = asyncio.create_task(self._file_sync_loop())
 
-        # Try to start UDP multicast (may fail on some networks)
-        try:
-            await self._setup_multicast()
-            self._receive_task = asyncio.create_task(self._receive_loop())
-        except Exception as e:
-            logger.warning(f"[Transport] Multicast not available: {e}")
+        # v100.2: Only try multicast if enabled via environment
+        if self._multicast_enabled:
+            try:
+                await self._setup_multicast()
+                self._receive_task = asyncio.create_task(self._receive_loop())
+                logger.info(f"[Transport] Multicast enabled for {self.local_repo.value}")
+            except Exception as e:
+                logger.info(f"[Transport] Multicast not available (using file sync): {e}")
+                self._multicast_failed = True
+        else:
+            logger.info(f"[Transport] Multicast disabled by config (TRINITY_MULTICAST_ENABLED=false)")
 
-        logger.info(f"[Transport] Started for {self.local_repo.value}")
+        logger.info(f"[Transport] Started for {self.local_repo.value} (file sync active)")
 
     async def stop(self) -> None:
         """Stop the transport layer."""
@@ -672,22 +687,33 @@ class CrossRepoTransport:
 
         v2.8 FIX: Uses asyncio's native sock_recvfrom() for non-blocking sockets
         instead of run_in_executor which causes EAGAIN (errno 35) errors.
-        Also implements proper backoff and error classification.
+
+        v100.2: Added circuit breaker pattern - if multicast continuously fails,
+        gracefully disable it and rely on file-based sync instead.
         """
         sock = self._sockets.get("multicast")
         if not sock:
             return
 
         loop = asyncio.get_event_loop()
-        consecutive_errors = 0
-        max_consecutive_errors = 10
         base_backoff = 0.1
         max_backoff = 5.0
 
         while self._running:
+            # v100.2: Circuit breaker - stop if multicast has failed too many times
+            if self._multicast_fail_count >= self._multicast_max_failures:
+                if not self._multicast_disabled_logged:
+                    logger.info(
+                        f"[Transport] Multicast disabled after {self._multicast_fail_count} failures. "
+                        f"File-based sync will handle cross-repo events."
+                    )
+                    self._multicast_disabled_logged = True
+                    self._multicast_failed = True
+                # Stop the receive loop entirely - file sync is handling events
+                break
+
             try:
                 # v2.8: Use asyncio's native non-blocking socket receive
-                # This properly integrates with the event loop without EAGAIN errors
                 try:
                     data, addr = await asyncio.wait_for(
                         loop.sock_recvfrom(sock, 65535),
@@ -695,11 +721,13 @@ class CrossRepoTransport:
                     )
                 except asyncio.TimeoutError:
                     # No data received within timeout - normal for UDP multicast
-                    consecutive_errors = 0  # Reset on successful poll
+                    # Gradually decrease fail count on successful polls (recovery)
+                    if self._multicast_fail_count > 0:
+                        self._multicast_fail_count = max(0, self._multicast_fail_count - 1)
                     continue
 
                 # Reset error counter on successful receive
-                consecutive_errors = 0
+                self._multicast_fail_count = 0
 
                 try:
                     event = TrinityEvent.from_bytes(data)
@@ -719,10 +747,10 @@ class CrossRepoTransport:
                         try:
                             await handler(event)
                         except Exception as e:
-                            logger.exception(f"[Transport] Handler error: {e}")
+                            logger.debug(f"[Transport] Handler error: {e}")
 
                 except Exception as e:
-                    logger.warning(f"[Transport] Failed to parse event: {e}")
+                    logger.debug(f"[Transport] Failed to parse event: {e}")
 
             except asyncio.CancelledError:
                 break
@@ -731,31 +759,28 @@ class CrossRepoTransport:
                 import errno
                 if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
                     # Resource temporarily unavailable - normal for non-blocking
-                    await asyncio.sleep(0.01)  # Small yield
+                    await asyncio.sleep(0.01)
                     continue
                 elif e.errno == errno.EBADF:
                     # Bad file descriptor - socket was closed
-                    logger.warning("[Transport] Multicast socket closed, stopping receive loop")
+                    logger.debug("[Transport] Multicast socket closed, stopping receive loop")
                     break
                 else:
-                    # Other socket error
-                    consecutive_errors += 1
-                    if self._running:
-                        logger.warning(f"[Transport] Socket error (errno={e.errno}): {e}")
-                    backoff = min(base_backoff * (2 ** consecutive_errors), max_backoff)
+                    # Other socket error - increment circuit breaker counter
+                    self._multicast_fail_count += 1
+                    # Only log first few errors, then go silent
+                    if self._multicast_fail_count <= 3:
+                        logger.debug(f"[Transport] Socket error (errno={e.errno}): {e}")
+                    backoff = min(base_backoff * (2 ** min(self._multicast_fail_count, 6)), max_backoff)
                     await asyncio.sleep(backoff)
             except Exception as e:
-                consecutive_errors += 1
-                if self._running and consecutive_errors <= max_consecutive_errors:
-                    logger.warning(f"[Transport] Receive error ({consecutive_errors}/{max_consecutive_errors}): {e}")
-                elif consecutive_errors > max_consecutive_errors:
-                    logger.error(f"[Transport] Too many consecutive errors, reducing log frequency")
-                    # Only log every 10th error after threshold
-                    if consecutive_errors % 10 == 0:
-                        logger.warning(f"[Transport] Receive errors continue: {e}")
+                self._multicast_fail_count += 1
+                # Only log first few errors to avoid spam
+                if self._multicast_fail_count <= 3:
+                    logger.debug(f"[Transport] Receive error: {e}")
 
                 # Exponential backoff with cap
-                backoff = min(base_backoff * (2 ** min(consecutive_errors, 6)), max_backoff)
+                backoff = min(base_backoff * (2 ** min(self._multicast_fail_count, 6)), max_backoff)
                 await asyncio.sleep(backoff)
 
     def on_event(self, handler: Callable[[TrinityEvent], Awaitable[None]]) -> None:

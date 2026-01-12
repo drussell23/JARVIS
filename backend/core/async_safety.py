@@ -949,8 +949,14 @@ class RetryEngine:
 # =============================================================================
 
 @dataclass
-class TimeoutConfig:
-    """Configuration for timeout behavior."""
+class TimeoutOptions:
+    """
+    Configuration for timeout behavior (used by TimeoutManager).
+
+    NOTE: This was renamed from TimeoutConfig to TimeoutOptions in v100.2
+    to avoid shadowing the main TimeoutConfig class which contains
+    environment-driven timeout constants like HEALTH_CHECK, API_CALL, etc.
+    """
     timeout_seconds: float
     on_timeout: Optional[Callable[[], Awaitable[Any]]] = None
     default_value: Optional[Any] = None
@@ -968,7 +974,7 @@ class TimeoutManager:
     - Full context preservation
     """
 
-    def __init__(self, config: TimeoutConfig):
+    def __init__(self, config: TimeoutOptions):
         self.config = config
 
     @asynccontextmanager
@@ -1563,6 +1569,7 @@ __all__ = [
 
     # Timeout
     "TimeoutConfig",
+    "TimeoutOptions",  # v100.2: Renamed from TimeoutConfig (dataclass for TimeoutManager)
     "TimeoutManager",
 
     # Backpressure
