@@ -74,7 +74,7 @@ langchain-experimental>=0.0.60
 langgraph>=0.2.0  # State machine for autonomous reasoning
 langgraph-checkpoint>=1.0.0  # Checkpointing for LangGraph
 duckduckgo-search==4.1.1
-numexpr==2.8.8  # For calculator tool
+numexpr==2.14.1  # For calculator tool
 wikipedia-api==0.6.0
 python-dotenv==1.0.0
 
