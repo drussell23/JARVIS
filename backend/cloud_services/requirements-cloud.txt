@@ -15,7 +15,7 @@ torch==2.1.2
 torchaudio==2.1.2
 speechbrain==1.0.0
 huggingface_hub>=0.20.0,<0.22.0
-numpy>=1.24.0,<2.0.0
+numpy>=1.24.0,<3.0.0
 
 # HTTP client (for health checks and speechbrain model fetching)
 aiohttp>=3.9.0
