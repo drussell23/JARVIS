@@ -231,6 +231,96 @@ if _sys.version_info < (3, 10):
 del _sys
 
 # =============================================================================
+# v93.0: PYTORCH/TRANSFORMERS COMPATIBILITY SHIM - MUST BE BEFORE ANY TORCH IMPORTS!
+# =============================================================================
+# Fix for: AttributeError: module 'torch.utils._pytree' has no attribute 'register_pytree_node'
+# Root cause: transformers 4.57+ expects public register_pytree_node but PyTorch 2.1.x
+# only exposes _register_pytree_node (private). This shim creates a wrapper that:
+# 1. Maps the private API to the public API name
+# 2. Filters out unsupported kwargs (like 'serialized_type_name' from transformers 4.57+)
+# =============================================================================
+def _apply_early_pytorch_compat():
+    """Apply PyTorch compatibility shim before any transformers imports."""
+    import os as _os
+    import sys as _sys
+
+    # Skip if torch not installed
+    try:
+        import torch.utils._pytree as _pytree
+    except ImportError:
+        return False
+
+    # Check if register_pytree_node already exists
+    if hasattr(_pytree, 'register_pytree_node'):
+        return False  # No shim needed
+
+    # Create wrapper that filters unsupported kwargs
+    if hasattr(_pytree, '_register_pytree_node'):
+        _original_register = _pytree._register_pytree_node
+
+        # Get supported kwargs from the original function signature
+        import inspect as _inspect
+        try:
+            _sig = _inspect.signature(_original_register)
+            _supported_kwargs = {
+                name for name, param in _sig.parameters.items()
+                if param.kind in (_inspect.Parameter.KEYWORD_ONLY, _inspect.Parameter.VAR_KEYWORD)
+            }
+        except (ValueError, TypeError):
+            # Fallback: known supported kwargs for PyTorch 2.1.x
+            _supported_kwargs = {'to_dumpable_context', 'from_dumpable_context'}
+
+        def _compat_register_pytree_node(
+            typ,
+            flatten_fn,
+            unflatten_fn,
+            *,
+            serialized_type_name=None,  # transformers 4.57+ passes this
+            to_dumpable_context=None,
+            from_dumpable_context=None,
+            **extra_kwargs  # Catch any other future kwargs
+        ):
+            """
+            v93.0: Compatibility wrapper for register_pytree_node.
+
+            Filters out unsupported kwargs (like serialized_type_name) that
+            transformers 4.57+ passes but PyTorch 2.1.x doesn't support.
+            """
+            # Build kwargs dict with only supported parameters
+            kwargs = {}
+            if to_dumpable_context is not None:
+                kwargs['to_dumpable_context'] = to_dumpable_context
+            if from_dumpable_context is not None:
+                kwargs['from_dumpable_context'] = from_dumpable_context
+
+            # Call original function with filtered kwargs
+            try:
+                return _original_register(typ, flatten_fn, unflatten_fn, **kwargs)
+            except TypeError as e:
+                # Last resort: try without any kwargs
+                if 'unexpected keyword argument' in str(e):
+                    return _original_register(typ, flatten_fn, unflatten_fn)
+                raise
+
+        _pytree.register_pytree_node = _compat_register_pytree_node
+        if _os.environ.get("JARVIS_DEBUG"):
+            print("[v93.0] ✓ Applied pytree compatibility wrapper (filters unsupported kwargs)", file=_sys.stderr)
+        return True
+
+    # Create no-op fallback to prevent crashes
+    def _noop_register(cls, flatten_fn, unflatten_fn, **kwargs):
+        """No-op pytree registration for compatibility."""
+        pass  # Silently ignore - prevents import errors
+
+    _pytree.register_pytree_node = _noop_register
+    if _os.environ.get("JARVIS_DEBUG"):
+        print("[v93.0] ⚠ Applied no-op pytree shim (limited functionality)", file=_sys.stderr)
+    return True
+
+_apply_early_pytorch_compat()
+del _apply_early_pytorch_compat
+
+# =============================================================================
 # SYSTEM RESOURCE OPTIMIZATION (v1.0)
 # =============================================================================
 # Critical for high-concurrency async operations.

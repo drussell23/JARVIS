@@ -60,6 +60,7 @@ class FocusState(Enum):
     DISTRACTED = "distracted"  # High switching, no clear focus
     IDLE = "idle"  # No activity detected
     BREAK = "break"  # Intentional rest period
+    UNKNOWN = "unknown"  # v93.0: Unknown/uninitialized state
 
 
 class SessionType(Enum):

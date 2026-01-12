@@ -71,6 +71,104 @@ if _IS_APPLE_SILICON:
     os.environ.setdefault('PYTORCH_ENABLE_MPS_FALLBACK', '1')
     os.environ.setdefault('PYTORCH_MPS_HIGH_WATERMARK_RATIO', '0.0')
 
+
+# ============================================================================
+# v93.0: PyTorch/Transformers Compatibility Shim
+# ============================================================================
+# Fix for: AttributeError: module 'torch.utils._pytree' has no attribute 'register_pytree_node'
+# Root cause: transformers 4.57+ expects public register_pytree_node but PyTorch 2.1.x
+# only exposes _register_pytree_node (private). This shim maps private to public API.
+# MUST run before ANY import of transformers, speechbrain, or huggingface_hub
+# ============================================================================
+
+def _apply_pytree_compatibility_shim() -> bool:
+    """
+    Apply PyTorch pytree compatibility shim for transformers compatibility.
+
+    Returns True if shim was applied, False if not needed.
+
+    Note: Uses print() instead of logger since this runs during module import
+    before logging is fully configured.
+
+    v93.0: Creates a wrapper that filters unsupported kwargs (like serialized_type_name)
+    that transformers 4.57+ passes but PyTorch 2.1.x doesn't support.
+    """
+    import sys
+    import inspect
+
+    def _log(msg: str, level: str = "INFO") -> None:
+        """Early logging before logger is available."""
+        if os.environ.get("JARVIS_DEBUG") or os.environ.get("DEBUG"):
+            print(f"[{level}] {msg}", file=sys.stderr)
+
+    try:
+        import torch.utils._pytree as _pytree
+
+        # Check if register_pytree_node already exists (newer PyTorch)
+        if hasattr(_pytree, 'register_pytree_node'):
+            _log("[v93.0] pytree.register_pytree_node already exists - no shim needed")
+            return False  # No shim needed
+
+        # Check if private _register_pytree_node exists
+        if hasattr(_pytree, '_register_pytree_node'):
+            _original_register = _pytree._register_pytree_node
+
+            def _compat_register_pytree_node(
+                typ,
+                flatten_fn,
+                unflatten_fn,
+                *,
+                serialized_type_name=None,  # transformers 4.57+ passes this
+                to_dumpable_context=None,
+                from_dumpable_context=None,
+                **extra_kwargs  # Catch any other future kwargs
+            ):
+                """
+                v93.0: Compatibility wrapper for register_pytree_node.
+
+                Filters out unsupported kwargs (like serialized_type_name) that
+                transformers 4.57+ passes but PyTorch 2.1.x doesn't support.
+                """
+                # Build kwargs dict with only supported parameters
+                kwargs = {}
+                if to_dumpable_context is not None:
+                    kwargs['to_dumpable_context'] = to_dumpable_context
+                if from_dumpable_context is not None:
+                    kwargs['from_dumpable_context'] = from_dumpable_context
+
+                # Call original function with filtered kwargs
+                try:
+                    return _original_register(typ, flatten_fn, unflatten_fn, **kwargs)
+                except TypeError as e:
+                    # Last resort: try without any kwargs
+                    if 'unexpected keyword argument' in str(e):
+                        return _original_register(typ, flatten_fn, unflatten_fn)
+                    raise
+
+            _pytree.register_pytree_node = _compat_register_pytree_node
+            _log("[v93.0] ✓ Applied pytree compatibility wrapper (filters unsupported kwargs)")
+            return True
+
+        # Neither exists - create a no-op fallback to prevent crashes
+        def _noop_register_pytree_node(cls, flatten_fn, unflatten_fn, **kwargs):
+            """No-op pytree node registration for compatibility."""
+            pass  # Silently ignore - prevents import errors
+
+        _pytree.register_pytree_node = _noop_register_pytree_node
+        _log("[v93.0] ⚠ Applied no-op pytree shim (limited functionality)", "WARN")
+        return True
+
+    except ImportError:
+        # torch not installed or not importable - nothing to patch
+        return False
+    except Exception as e:
+        _log(f"[v93.0] Failed to apply pytree compatibility shim: {e}", "ERROR")
+        return False
+
+# Apply shim immediately (before any transformers/speechbrain imports)
+_PYTREE_SHIM_APPLIED = _apply_pytree_compatibility_shim()
+
+
 T = TypeVar('T')
 
 
