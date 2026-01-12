@@ -25,6 +25,45 @@ from typing import Any, Callable, Coroutine, Dict, Optional, TypeVar
 
 logger = logging.getLogger(__name__)
 
+
+# Python 3.9 compatible async timeout context manager
+class _AsyncTimeoutCtx:
+    """Simple async timeout context manager for Python 3.9 compatibility."""
+
+    def __init__(self, seconds: float):
+        self.seconds = seconds
+        self._task: Optional[asyncio.Task] = None
+        self._timeout_handle: Optional[asyncio.TimerHandle] = None
+
+    async def __aenter__(self):
+        self._task = asyncio.current_task()
+        if self._task is not None and self.seconds > 0:
+            loop = asyncio.get_running_loop()
+            self._timeout_handle = loop.call_later(
+                self.seconds,
+                self._cancel_task
+            )
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        if self._timeout_handle is not None:
+            self._timeout_handle.cancel()
+            self._timeout_handle = None
+
+        if exc_type is asyncio.CancelledError and self._task is not None:
+            raise asyncio.TimeoutError()
+
+        return False
+
+    def _cancel_task(self):
+        if self._task is not None and not self._task.done():
+            self._task.cancel()
+
+
+def _timeout_ctx(seconds: float) -> _AsyncTimeoutCtx:
+    """Create a Python 3.9 compatible async timeout context manager."""
+    return _AsyncTimeoutCtx(seconds)
+
 T = TypeVar("T")
 
 
@@ -118,7 +157,7 @@ class TimeoutWrapper:
         self._active_timeouts[operation_name] = ctx
 
         try:
-            async with asyncio.timeout(timeout_seconds):
+            async with _timeout_ctx(timeout_seconds):  # Python 3.9 compatible
                 yield ctx
 
         except asyncio.TimeoutError:
@@ -131,7 +170,7 @@ class TimeoutWrapper:
             if cleanup:
                 try:
                     # Give cleanup a grace period
-                    async with asyncio.timeout(self.config.grace_period):
+                    async with _timeout_ctx(self.config.grace_period):  # Python 3.9 compatible
                         await cleanup()
                 except asyncio.TimeoutError:
                     logger.error(f"[TimeoutWrapper] Cleanup for {operation_name} also timed out")

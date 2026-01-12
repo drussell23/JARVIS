@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>JARVIS - Connecting...</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            background: linear-gradient(135deg, #0f0c29, #302b63, #24243e);
+            color: #00ffcc;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            overflow: hidden;
+        }
+        .container {
+            text-align: center;
+            padding: 40px;
+            background: rgba(0, 0, 0, 0.3);
+            border-radius: 20px;
+            border: 1px solid rgba(0, 255, 204, 0.3);
+            backdrop-filter: blur(10px);
+            max-width: 600px;
+        }
+        h1 {
+            font-size: 3em;
+            margin-bottom: 20px;
+            text-shadow: 0 0 20px rgba(0, 255, 204, 0.8);
+        }
+        .status {
+            font-size: 1.2em;
+            margin: 20px 0;
+            opacity: 0.8;
+        }
+        .spinner {
+            width: 80px;
+            height: 80px;
+            border: 8px solid rgba(0, 255, 204, 0.1);
+            border-top: 8px solid #00ffcc;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin: 30px auto;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        .message {
+            margin-top: 30px;
+            line-height: 1.6;
+        }
+        .retry-info {
+            margin-top: 20px;
+            font-size: 0.9em;
+            opacity: 0.6;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>JARVIS</h1>
+        <div class="spinner"></div>
+        <div class="status" id="status">Connecting to JARVIS...</div>
+        <div class="message">
+            <p>Loading server is temporarily unavailable.</p>
+            <p>Attempting to reconnect...</p>
+        </div>
+        <div class="retry-info" id="retry-info">
+            Next attempt in <span id="countdown">5</span>s
+        </div>
+    </div>
+
+    <script>
+        const BACKEND_PORT = 8010;
+        const LOADING_PORT = 3001;
+        const RETRY_INTERVAL = 5000; // 5 seconds
+
+        let retryCount = 0;
+        let countdown = 5;
+
+        function updateStatus(message) {
+            document.getElementById('status').textContent = message;
+        }
+
+        function updateCountdown() {
+            document.getElementById('countdown').textContent = countdown;
+            if (countdown > 0) {
+                countdown--;
+            } else {
+                countdown = 5;
+            }
+        }
+
+        async function checkServer() {
+            try {
+                retryCount++;
+                updateStatus(`Attempt #${retryCount} - Checking server...`);
+
+                // Try backend first
+                const backendUrl = `http://localhost:${BACKEND_PORT}/health`;
+                const response = await fetch(backendUrl, {
+                    method: 'GET',
+                    cache: 'no-cache',
+                    signal: AbortSignal.timeout(3000)
+                });
+
+                if (response.ok) {
+                    updateStatus('✅ JARVIS is online! Redirecting...');
+                    setTimeout(() => {
+                        window.location.href = `http://localhost:${BACKEND_PORT}/`;
+                    }, 500);
+                    return true;
+                }
+
+            } catch (error) {
+                console.debug('Server not available yet:', error.message);
+            }
+
+            // Try loading server as fallback
+            try {
+                const loadingUrl = `http://localhost:${LOADING_PORT}/health`;
+                const response = await fetch(loadingUrl, {
+                    method: 'GET',
+                    cache: 'no-cache',
+                    signal: AbortSignal.timeout(3000)
+                });
+
+                if (response.ok) {
+                    updateStatus('✅ Loading server online! Continuing startup...');
+                    setTimeout(() => {
+                        window.location.reload();
+                    }, 500);
+                    return true;
+                }
+
+            } catch (error) {
+                console.debug('Loading server not available:', error.message);
+            }
+
+            updateStatus(`Attempt #${retryCount} failed - Retrying in 5s...`);
+            return false;
+        }
+
+        // Initial check
+        checkServer();
+
+        // Periodic retry
+        setInterval(() => {
+            checkServer();
+        }, RETRY_INTERVAL);
+
+        // Countdown timer
+        setInterval(() => {
+            updateCountdown();
+        }, 1000);
+    </script>
+</body>
+</html>

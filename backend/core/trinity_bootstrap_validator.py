@@ -213,7 +213,7 @@ class Validatable(Protocol):
         ...
 
 
-@dataclass(slots=True, frozen=True)
+@dataclass(frozen=True)  # slots=True removed for Python 3.9 compatibility
 class ValidationIssue:
     """Immutable validation issue with full context."""
     category: ValidationCategory
@@ -401,8 +401,11 @@ class BaseValidator(ABC):
     async def validate(self, result: ValidationResult) -> None:
         """Run validation with timeout and error isolation."""
         try:
-            async with asyncio.timeout(ValidatorConfig.VALIDATION_TIMEOUT):
-                await self._run_checks(result)
+            # Python 3.9 compatible timeout (asyncio.timeout is 3.11+)
+            await asyncio.wait_for(
+                self._run_checks(result),
+                timeout=ValidatorConfig.VALIDATION_TIMEOUT
+            )
         except asyncio.TimeoutError:
             result.add_issue(
                 category=self.category,

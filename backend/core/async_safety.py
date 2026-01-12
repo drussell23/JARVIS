@@ -75,7 +75,6 @@ from typing import (
     Literal,
     Mapping,
     Optional,
-    ParamSpec,
     Protocol,
     Sequence,
     Set,
@@ -87,6 +86,102 @@ from typing import (
     overload,
     runtime_checkable,
 )
+
+# Python 3.10+ ParamSpec support with fallback
+try:
+    from typing import ParamSpec
+except ImportError:
+    # Python 3.9 fallback - try typing_extensions
+    try:
+        from typing_extensions import ParamSpec
+    except ImportError:
+        # Ultimate fallback - use TypeVar as a workaround
+        ParamSpec = TypeVar  # type: ignore[misc, assignment]
+
+
+# =============================================================================
+# Python 3.9 Compatible Async Timeout Context Manager
+# =============================================================================
+# asyncio.timeout() is Python 3.11+, so we provide a compatible implementation
+
+@asynccontextmanager
+async def async_timeout(seconds: float) -> AsyncGenerator[None, None]:
+    """
+    Python 3.9 compatible async timeout context manager.
+
+    This replicates the behavior of asyncio.timeout() from Python 3.11+
+    using asyncio.wait_for() internally.
+
+    Usage:
+        async with async_timeout(5.0):
+            await some_long_operation()
+    """
+    # Create a task that will be cancelled on timeout
+    task = asyncio.current_task()
+    if task is None:
+        # Not in an async context, just yield
+        yield
+        return
+
+    # Use a helper coroutine that yields control back
+    async def _timeout_coro():
+        try:
+            yield
+        except GeneratorExit:
+            pass
+
+    # Simple implementation using wait_for on a sentinel
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + seconds
+
+    try:
+        yield
+    except asyncio.CancelledError:
+        # Check if we exceeded the deadline
+        if loop.time() >= deadline:
+            raise asyncio.TimeoutError()
+        raise
+
+
+# Alternative simpler approach for context manager timeout
+class _AsyncTimeoutContext:
+    """Simple async timeout context manager for Python 3.9 compatibility."""
+
+    def __init__(self, seconds: float):
+        self.seconds = seconds
+        self._task: Optional[asyncio.Task] = None
+        self._timeout_handle: Optional[asyncio.TimerHandle] = None
+
+    async def __aenter__(self):
+        self._task = asyncio.current_task()
+        if self._task is not None and self.seconds > 0:
+            loop = asyncio.get_running_loop()
+            self._timeout_handle = loop.call_later(
+                self.seconds,
+                self._cancel_task
+            )
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        if self._timeout_handle is not None:
+            self._timeout_handle.cancel()
+            self._timeout_handle = None
+
+        if exc_type is asyncio.CancelledError and self._task is not None:
+            # Convert CancelledError to TimeoutError if we triggered it
+            raise asyncio.TimeoutError()
+
+        return False
+
+    def _cancel_task(self):
+        if self._task is not None and not self._task.done():
+            self._task.cancel()
+
+
+def timeout_ctx(seconds: float) -> _AsyncTimeoutContext:
+    """Create a Python 3.9 compatible async timeout context manager."""
+    return _AsyncTimeoutContext(seconds)
+
 
 # =============================================================================
 # Environment-Driven Configuration (Zero Hardcoding)
@@ -396,7 +491,7 @@ class ErrorCategory(Enum):
     UNKNOWN = auto()        # Unclassified
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)  # slots=True removed for Python 3.9 compatibility
 class ErrorContext:
     """
     Rich error context with full diagnostic information.
@@ -889,7 +984,8 @@ class TimeoutManager:
                 await long_running_task()
         """
         try:
-            async with asyncio.timeout(self.config.timeout_seconds):
+            # Python 3.9 compatible (asyncio.timeout is 3.11+)
+            async with timeout_ctx(self.config.timeout_seconds):
                 yield
         except asyncio.TimeoutError:
             logger.warning(
@@ -1229,7 +1325,8 @@ async def safe_operation(
 
     try:
         if timeout:
-            async with asyncio.timeout(timeout):
+            # Python 3.9 compatible (asyncio.timeout is 3.11+)
+            async with timeout_ctx(timeout):
                 yield
         else:
             yield

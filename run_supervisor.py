@@ -9651,9 +9651,22 @@ class SupervisorBootstrapper:
                             self._running = False
                             self._logger = logging.getLogger("NeuralMesh")
 
-                        def register_node(self, node: NeuralMeshNode) -> None:
-                            self._nodes[node.node_id] = node
-                            self._logger.debug(f"Node registered: {node.node_id}")
+                        async def register_node(self, node: NeuralMeshNode = None, node_name: str = None, node_type: str = None, capabilities: List[str] = None) -> bool:
+                            """Register a node (async to match NeuralMeshCoordinator interface)."""
+                            if node is not None:
+                                # NeuralMeshNode dataclass provided directly
+                                self._nodes[node.node_id] = node
+                                self._logger.debug(f"Node registered: {node.node_id}")
+                            elif node_name is not None:
+                                # Parameters provided directly (NeuralMeshCoordinator style)
+                                new_node = NeuralMeshNode(
+                                    node_id=node_name,
+                                    node_type=node_type or "unknown",
+                                    capabilities=capabilities or [],
+                                )
+                                self._nodes[node_name] = new_node
+                                self._logger.debug(f"Node registered: {node_name}")
+                            return True
 
                         async def broadcast(self, event_type: str, data: Dict[str, Any], source: str = None) -> None:
                             for subscriber in self._subscribers.get(event_type, []):
@@ -9665,8 +9678,10 @@ class SupervisorBootstrapper:
                                 except Exception as e:
                                     self._logger.warning(f"Subscriber error: {e}")
 
-                        def subscribe(self, event_type: str, callback: Callable) -> None:
+                        async def subscribe(self, event_type: str, callback: Callable) -> bool:
+                            """Subscribe to events (async to match NeuralMeshCoordinator interface)."""
                             self._subscribers[event_type].append(callback)
+                            return True
 
                         def get_active_nodes(self, node_type: str = None) -> List[NeuralMeshNode]:
                             nodes = list(self._nodes.values())
@@ -9691,14 +9706,14 @@ class SupervisorBootstrapper:
 
                     # Register core nodes
                     if initialized_systems["uae"]:
-                        self._neural_mesh.register_node(NeuralMeshNode(
+                        await self._neural_mesh.register_node(NeuralMeshNode(
                             node_id="uae-primary",
                             node_type="uae",
                             capabilities=["vision", "screen_capture", "element_detection"],
                         ))
 
                     if initialized_systems["sai"]:
-                        self._neural_mesh.register_node(NeuralMeshNode(
+                        await self._neural_mesh.register_node(NeuralMeshNode(
                             node_id="sai-primary",
                             node_type="sai",
                             capabilities=["window_tracking", "app_focus", "workspace_state"],
@@ -9978,9 +9993,10 @@ class SupervisorBootstrapper:
                         NeuralMeshNode = self._NeuralMeshNode
                         if hasattr(self._neural_mesh, 'register_node'):
                             # Check if it's the BasicNeuralMesh (takes NeuralMeshNode) or NeuralMeshCoordinator (takes params)
+                            # Register with Neural Mesh (both BasicNeuralMesh and NeuralMeshCoordinator are async)
                             if hasattr(self._neural_mesh, '_nodes'):
                                 # BasicNeuralMesh - uses NeuralMeshNode dataclass
-                                self._neural_mesh.register_node(NeuralMeshNode(
+                                await self._neural_mesh.register_node(NeuralMeshNode(
                                     node_id="mas-coordinator",
                                     node_type="mas",
                                     capabilities=["task_decomposition", "agent_spawning", "parallel_execution"],
@@ -10220,9 +10236,10 @@ class SupervisorBootstrapper:
                         # Register reactor-core as a Neural Mesh node
                         if hasattr(self, '_NeuralMeshNode'):
                             NeuralMeshNode = self._NeuralMeshNode
+                            # Register with Neural Mesh (both BasicNeuralMesh and NeuralMeshCoordinator are async)
                             if hasattr(self._neural_mesh, '_nodes'):
                                 # BasicNeuralMesh - uses NeuralMeshNode dataclass
-                                self._neural_mesh.register_node(NeuralMeshNode(
+                                await self._neural_mesh.register_node(NeuralMeshNode(
                                     node_id="reactor_core",
                                     node_type="reactor_core",
                                     capabilities=["training", "scraping", "model_deployment", "experience_collection"],
