@@ -1,0 +1,71 @@
+{
+  "workflow_name": "\ud83c\udfa8 Advanced Auto-Diagram Generator",
+  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/19720046484",
+  "branch": "cursor/explore-jarvis-claude-vision-integration-benefits-claude-4.5-sonnet-thinking-85ac",
+  "commit_sha": "6f8c567",
+  "run_number": 55,
+  "failed_count": 1,
+  "fix_branch": "fix/ci/advanced-auto-diagram-generator-run55-20251126-231618",
+  "pr_title": "\ud83d\udea8 Fix CI/CD: \ud83c\udfa8 Advanced Auto-Diagram Generator (Run #55)",
+  "analyses": [
+    {
+      "error_patterns": [
+        {
+          "pattern": "ERROR|Error|error",
+          "matches": [
+            {
+              "line_number": 82,
+              "content": "2025-11-26T23:15:05.1804606Z ##[error]Unable to process file command 'output' successfully.",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 83,
+              "content": "2025-11-26T23:15:05.1812770Z ##[error]Invalid format '  \"PRD_JARVIS_AUTONOMOUS_NEURAL_MESH.md\"'",
+              "severity": "high",
+              "emoji": "\u274c"
+            }
+          ],
+          "count": 2
+        },
+        {
+          "pattern": "FAIL|Failed|failed",
+          "matches": [
+            {
+              "line_number": 68,
+              "content": "2025-11-26T23:15:04.4224260Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}",
+              "severity": "high",
+              "emoji": "\ud83d\udca5"
+            },
+            {
+              "line_number": 93,
+              "content": "2025-11-26T23:15:05.3314464Z ##[warning]The process '/usr/bin/git' failed with exit code 128",
+              "severity": "high",
+              "emoji": "\ud83d\udca5"
+            }
+          ],
+          "count": 2
+        },
+        {
+          "pattern": "WARN|Warning|warning",
+          "matches": [
+            {
+              "line_number": 93,
+              "content": "2025-11-26T23:15:05.3314464Z ##[warning]The process '/usr/bin/git' failed with exit code 128",
+              "severity": "medium",
+              "emoji": "\u26a0\ufe0f"
+            }
+          ],
+          "count": 1
+        }
+      ],
+      "suggested_fixes": [
+        "Review the logs above for specific error messages"
+      ],
+      "severity": "high",
+      "category": "permission_error",
+      "similar_failures": []
+    }
+  ],
+  "timestamp": "2025-11-26T23:16:18.585720"
+}
