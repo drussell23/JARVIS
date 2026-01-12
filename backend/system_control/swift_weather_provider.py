@@ -100,7 +100,7 @@ class SwiftWeatherProvider:
                 try:
                     process.terminate()
                     await process.wait()
-                except:
+                except Exception:
                     pass
                 return None
             
@@ -112,9 +112,9 @@ class SwiftWeatherProvider:
                 try:
                     error_data = json.loads(stdout.decode('utf-8'))
                     logger.error(f"Error details: {error_data.get('message', 'Unknown error')}")
-                except:
+                except Exception:
                     pass
-                    
+
                 return None
             
             # Parse JSON response

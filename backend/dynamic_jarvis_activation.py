@@ -364,7 +364,7 @@ class DynamicJARVISActivation:
                 result = await self._init_service_with_recovery(service, {}, timeout=2.0)
                 initialized[f"enhancement_{service}"] = result
                 log.append(f"Added enhancement: {service}")
-            except:
+            except Exception:
                 pass  # Optional, so we don't care about failures
         
         return initialized
@@ -400,7 +400,7 @@ class DynamicJARVISActivation:
                     processor = RustVoiceProcessor()
                     health.capabilities = ['zero_copy', 'fast_processing', 'low_latency']
                     health.health_score = 1.0
-                except:
+                except Exception:
                     # Python fallback
                     health.capabilities = ['python_processing']
                     health.health_score = 0.6
@@ -438,7 +438,7 @@ class DynamicJARVISActivation:
                 result.name = f"{service}_fallback"  # Mark as fallback
                 self.performance_tracker['recovery_success'] += 1
                 return result
-            except:
+            except Exception:
                 continue
         
         # If all fallbacks fail, create a minimal service

@@ -369,7 +369,7 @@ Focus on safe, beneficial optimizations."""
                         confidence=0.5,
                         impact_prediction={}
                     )
-                except:
+                except Exception:
                     current_decision = None
                     
             elif current_decision:
@@ -377,13 +377,13 @@ Focus on safe, beneficial optimizations."""
                     action_str = line.split(':')[1].strip().upper()
                     try:
                         current_decision.action = ControlAction[action_str]
-                    except:
+                    except Exception:
                         pass
                 elif 'confidence:' in line_lower:
                     try:
                         conf = float(line.split(':')[1].strip().strip('%')) / 100
                         current_decision.confidence = conf
-                    except:
+                    except Exception:
                         pass
                 elif 'reasoning:' in line_lower:
                     current_decision.reasoning = line.split(':')[1].strip()

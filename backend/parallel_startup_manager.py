@@ -294,7 +294,7 @@ class ParallelStartupManager:
         try:
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=2)) as response:
                 return response.status == 200
-        except:
+        except Exception:
             return False
     
     async def _kill_process(self, service_id: str):

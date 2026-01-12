@@ -53,8 +53,17 @@ class DynamicVisionDiscovery:
     def _start_discovery_thread(self):
         """Start background thread for continuous discovery"""
         def discovery_loop():
+            # Maximum run time for discovery thread (default: 24 hours, configurable)
+            max_run_time = float(os.getenv("TIMEOUT_DISCOVERY_THREAD_MAX", "86400.0"))
+            start_time = time.monotonic()
+
             while True:
                 try:
+                    # Check if we've exceeded maximum run time
+                    if time.monotonic() - start_time > max_run_time:
+                        logger.info("Discovery thread max run time reached, exiting")
+                        break
+
                     self.discover_vision_components()
                     self.discover_websocket_endpoints()
                     self.discover_ml_models()
@@ -62,7 +71,7 @@ class DynamicVisionDiscovery:
                 except Exception as e:
                     logger.error(f"Discovery error: {e}")
                     time.sleep(60)  # Wait longer on error
-        
+
         thread = threading.Thread(target=discovery_loop, daemon=True)
         thread.start()
     
@@ -119,9 +128,9 @@ class DynamicVisionDiscovery:
                 item = getattr(module, item_name, None)
                 if item and any(keyword in item_name.lower() for keyword in vision_keywords):
                     return True
-        except:
+        except Exception:
             pass
-        
+
         return False
     
     def _extract_components(self, module_name: str, module: Any) -> Dict[str, Any]:
@@ -258,7 +267,7 @@ class DynamicVisionDiscovery:
                     "active": True,
                     "port": 8001
                 }
-        except:
+        except Exception:
             endpoints["typescript_router"] = {"active": False}
         
         # Check Python WebSocket endpoints
@@ -271,7 +280,7 @@ class DynamicVisionDiscovery:
                     "active": True,
                     "port": 8000
                 }
-        except:
+        except Exception:
             # Fallback: scan for WebSocket routes in loaded modules
             ws_routes = self._scan_websocket_routes()
             if ws_routes:
@@ -299,9 +308,9 @@ class DynamicVisionDiscovery:
                                     "module": name,
                                     "handler": item_name
                                 })
-            except:
+            except Exception:
                 continue
-        
+
         return routes
     
     def discover_ml_models(self) -> Dict[str, Any]:
@@ -482,9 +491,9 @@ class DynamicVisionDiscovery:
                 "open_files": len(process.open_files()),
                 "connections": len(process.connections())
             }
-        except:
+        except Exception:
             return {}
-    
+
     def register_component(self, name: str, component: Any, capabilities: Optional[List[str]] = None):
         """Manually register a component"""
         with self.discovery_lock:
@@ -546,7 +555,7 @@ async def get_vision_health():
             "health_percentage": status["health"]["health_percentage"],
             "active_components": status["health"]["active_components"]
         }
-    except:
+    except Exception:
         return {
             "healthy": False,
             "health_percentage": 0,

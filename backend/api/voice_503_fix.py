@@ -7,6 +7,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 import asyncio
 import logging
+import os
 import time
 import psutil
 
@@ -17,24 +18,34 @@ router = APIRouter()
 # Simple in-memory queue to prevent overload
 request_queue = asyncio.Queue(maxsize=50)
 processing = False
+_shutdown_event = asyncio.Event()
 
 async def process_queue():
     """Process queued requests with rate limiting"""
     global processing
-    while True:
+    # Maximum run time for queue processor (default: 24 hours, configurable)
+    max_run_time = float(os.getenv("TIMEOUT_QUEUE_PROCESSOR_MAX", "86400.0"))
+    start_time = time.monotonic()
+
+    while not _shutdown_event.is_set():
         try:
+            # Check if we've exceeded maximum run time
+            if time.monotonic() - start_time > max_run_time:
+                logger.info("Queue processor max run time reached, restarting")
+                break
+
             if request_queue.empty():
                 await asyncio.sleep(0.1)
                 continue
-                
+
             request_data = await request_queue.get()
-            
+
             # Simple processing with CPU check
             cpu = psutil.cpu_percent(interval=0.1)
             if cpu > 80:
                 # Throttle when CPU is high
                 await asyncio.sleep(0.5)
-            
+
             # Return success
             request_data['future'].set_result({
                 'status': 'activated',
@@ -42,7 +53,7 @@ async def process_queue():
                 'cpu_usage': f"{cpu:.1f}%",
                 'queue_size': request_queue.qsize()
             })
-            
+
         except Exception as e:
             logger.error(f"Queue processing error: {e}")
             await asyncio.sleep(1)

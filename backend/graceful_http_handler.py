@@ -86,7 +86,7 @@ class MLResponseGenerator:
                     # CRITICAL: Use .copy() to avoid memory corruption when tensor is GC'd
                     result = self.model(error_features)
                     return result.cpu().numpy().copy()
-            except:
+            except Exception:
                 pass
 
         # Fallback response distribution
@@ -117,11 +117,11 @@ class GracefulResponseHandler:
             try:
                 self.strategy_network = _nn_module.Sequential(
                     _nn_module.Linear(10, 16),
-                    _nn_module.ReLU(), 
+                    _nn_module.ReLU(),
                     _nn_module.Linear(16, 8),
                     _nn_module.Softmax(dim=-1)
                 )
-            except:
+            except Exception:
                 logger.warning("Failed to create strategy network")
         
         # Response types
@@ -186,7 +186,7 @@ class GracefulResponseHandler:
                     # CRITICAL: Use .copy() to avoid memory corruption when tensor is GC'd
                     strategy_weights = self.strategy_network(error_tensor).cpu().numpy().copy()
                     response_type = self.ml_generator.forward(error_tensor)
-            except:
+            except Exception:
                 # Fallback if torch fails
                 strategy_weights = np.array([0.3, 0.2, 0.2, 0.1, 0.1, 0.05, 0.05, 0])
                 response_type = np.array([0.7, 0.15, 0.05, 0.05, 0.03, 0.02, 0, 0])
@@ -262,7 +262,7 @@ class GracefulResponseHandler:
             result = await self._degraded_strategy(func, context)
             self.response_cache[context.get('cache_key', 'default')] = result['data']
             return result
-        except:
+        except Exception:
             return await self._mock_strategy(func, context)
     
     async def handle_error(self, error: Exception, func: Callable, context: Dict[str, Any]) -> Any:

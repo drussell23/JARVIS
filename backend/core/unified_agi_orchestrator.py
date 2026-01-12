@@ -89,6 +89,8 @@ from typing import (
     Type, TypeVar, Union, cast, overload, runtime_checkable,
 )
 
+from backend.core.async_safety import LazyAsyncLock, TimeoutConfig, get_shutdown_event
+
 logger = logging.getLogger(__name__)
 
 # Type Variables
@@ -750,13 +752,36 @@ class PersistentStateManager:
             logger.debug(f"[AGI State] Saved state v{self._state.version}")
 
     async def _sync_loop(self) -> None:
-        """Periodic sync loop."""
+        """Periodic sync loop with timeout protection."""
+        shutdown_event = get_shutdown_event()
+        max_iterations = int(os.getenv("AGI_SYNC_MAX_ITERATIONS", "0")) or None
+        iteration = 0
+
         while True:
+            # Check for shutdown
+            if shutdown_event.is_set():
+                logger.info("[AGI State] Sync loop stopped via shutdown event")
+                break
+
+            # Check max iterations (for testing/safety)
+            if max_iterations and iteration >= max_iterations:
+                logger.info(f"[AGI State] Sync loop reached max iterations ({max_iterations})")
+                break
+
+            iteration += 1
+
             try:
                 await asyncio.sleep(self.config.state_sync_interval_sec)
                 if self._dirty:
-                    await self._save_state()
+                    # Add timeout protection for save operation
+                    await asyncio.wait_for(
+                        self._save_state(),
+                        timeout=TimeoutConfig.DATABASE
+                    )
+            except asyncio.TimeoutError:
+                logger.warning(f"[AGI State] Sync timed out after {TimeoutConfig.DATABASE}s")
             except asyncio.CancelledError:
+                logger.info("[AGI State] Sync loop cancelled")
                 break
             except Exception as e:
                 logger.error(f"[AGI State] Sync error: {e}")
@@ -1237,12 +1262,35 @@ class CrossRepoHealthAggregator:
                 pass
 
     async def _health_check_loop(self) -> None:
-        """Periodic health check loop."""
+        """Periodic health check loop with timeout protection."""
+        shutdown_event = get_shutdown_event()
+        max_iterations = int(os.getenv("AGI_HEALTH_MAX_ITERATIONS", "0")) or None
+        iteration = 0
+
         while True:
+            # Check for shutdown
+            if shutdown_event.is_set():
+                logger.info("[AGI Health] Check loop stopped via shutdown event")
+                break
+
+            # Check max iterations (for testing/safety)
+            if max_iterations and iteration >= max_iterations:
+                logger.info(f"[AGI Health] Check loop reached max iterations ({max_iterations})")
+                break
+
+            iteration += 1
+
             try:
                 await asyncio.sleep(self.config.health_check_interval_sec)
-                await self._collect_health()
+                # Add timeout protection for health collection
+                await asyncio.wait_for(
+                    self._collect_health(),
+                    timeout=TimeoutConfig.HEALTH_CHECK
+                )
+            except asyncio.TimeoutError:
+                logger.warning(f"[AGI Health] Check timed out after {TimeoutConfig.HEALTH_CHECK}s")
             except asyncio.CancelledError:
+                logger.info("[AGI Health] Check loop cancelled")
                 break
             except Exception as e:
                 logger.error(f"[AGI Health] Check error: {e}")
@@ -1476,7 +1524,7 @@ class UnifiedAGIOrchestrator:
 # =============================================================================
 
 _agi_orchestrator: Optional[UnifiedAGIOrchestrator] = None
-_agi_lock = asyncio.Lock()
+_agi_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 async def get_agi_orchestrator() -> UnifiedAGIOrchestrator:

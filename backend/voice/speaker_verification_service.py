@@ -4031,7 +4031,7 @@ class SpeakerVerificationService:
                             has_nan = torch.isnan(embedding).any().item()
                         else:
                             has_nan = np.any(np.isnan(np.asarray(embedding)))
-                    except:
+                    except Exception:
                         has_nan = np.any(np.isnan(np.asarray(embedding).flatten()))
 
                     if has_nan:
@@ -4052,7 +4052,7 @@ class SpeakerVerificationService:
                         has_nan = torch.isnan(embedding).any().item()
                     else:
                         has_nan = np.any(np.isnan(np.asarray(embedding)))
-                except:
+                except Exception:
                     has_nan = np.any(np.isnan(np.asarray(embedding).flatten()))
 
                 if has_nan:

@@ -37,6 +37,8 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
+from backend.core.async_safety import LazyAsyncLock
+
 logger = logging.getLogger(__name__)
 
 
@@ -565,7 +567,7 @@ class ProgressiveFeedbackGenerator:
 # =============================================================================
 
 _generator_instance: Optional[ProgressiveFeedbackGenerator] = None
-_generator_lock = asyncio.Lock()
+_generator_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 async def get_progressive_feedback_generator() -> ProgressiveFeedbackGenerator:

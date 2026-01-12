@@ -180,7 +180,7 @@ class UnifiedRustService:
                 try:
                     self.services['phase2_system'] = Phase2IntegratedSystem()
                     logger.info("✅ Phase 2 system initialized")
-                except:
+                except Exception:
                     logger.warning("Phase 2 system not available")
             
             # Phase 3 system (if available)
@@ -191,7 +191,7 @@ class UnifiedRustService:
                     else:
                         self.services['phase3_system'] = Phase3ProductionSystem()
                     logger.info("✅ Phase 3 system initialized")
-                except:
+                except Exception:
                     logger.warning("Phase 3 system not available")
             
             # Start health monitoring

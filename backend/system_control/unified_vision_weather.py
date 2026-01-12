@@ -672,9 +672,9 @@ class UnifiedVisionWeather:
             end tell
             '''
             await self._run_applescript(script)
-        except:
+        except Exception:
             pass
-    
+
     async def _run_applescript(self, script: str) -> str:
         """Execute AppleScript with timeout"""
         try:

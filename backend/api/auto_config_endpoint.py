@@ -82,7 +82,7 @@ class AutoConfigService:
                     if port.isdigit():
                         expectations["expected_port"] = int(port)
                         break
-                except:
+                except Exception:
                     pass
         
         # Detect client type

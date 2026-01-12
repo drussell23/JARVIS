@@ -199,7 +199,7 @@ class IntegratedMLAudioHandler(MLAudioHandler):
         try:
             import psutil
             return psutil.cpu_percent(interval=0.1)
-        except:
+        except Exception:
             return 50.0
     
     def _get_error_rate(self) -> float:

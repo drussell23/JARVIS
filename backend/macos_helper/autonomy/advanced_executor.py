@@ -33,6 +33,7 @@ from datetime import datetime, timedelta
 from enum import Enum, auto
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
+from backend.core.async_safety import LazyAsyncLock
 from .action_registry import (
     ActionHandler,
     ActionMetadata,
@@ -1050,7 +1051,7 @@ class AdvancedActionExecutor:
 
 
 _executor_instance: Optional[AdvancedActionExecutor] = None
-_executor_lock = asyncio.Lock()
+_executor_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 def get_advanced_executor() -> AdvancedActionExecutor:

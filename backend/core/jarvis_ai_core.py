@@ -132,7 +132,7 @@ For opening applications, use intent="app_control" and action="open_app"."""
             # Parse Claude's response
             try:
                 analysis = json.loads(response)
-            except:
+            except Exception:
                 # Fallback if Claude doesn't return valid JSON
                 analysis = {
                     "intent": "unknown",
@@ -220,7 +220,7 @@ Respond in JSON format with 'execution_plan', 'issues', 'expected_outcome', and 
             
             try:
                 execution_plan = json.loads(response)
-            except:
+            except Exception:
                 execution_plan = {
                     "execution_plan": ["Unable to parse execution plan"],
                     "issues": ["Response parsing error"],
@@ -329,7 +329,7 @@ Respond in JSON with 'should_act' (boolean), 'confidence' (0-1), 'reasoning', an
         
         try:
             return json.loads(response)
-        except:
+        except Exception:
             return {"should_act": False, "confidence": 0, "reasoning": "Could not parse decision"}
     
     async def _process_notifications(self, notifications: List[Dict]):

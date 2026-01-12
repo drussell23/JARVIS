@@ -65,6 +65,8 @@ from typing import (
     Union,
 )
 
+from backend.core.async_safety import LazyAsyncLock
+
 try:
     import psutil
     PSUTIL_AVAILABLE = True
@@ -2197,7 +2199,7 @@ _health_verifier: Optional[DeepHealthVerifier] = None
 _rate_limiter: Optional[TrinityRateLimiter] = None
 _atomic_ipc: Optional[AtomicFileIPC] = None
 
-_init_lock = asyncio.Lock()
+_init_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 async def get_backpressure() -> AdaptiveBackpressure:

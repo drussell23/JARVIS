@@ -44,7 +44,7 @@ try:
     result = subprocess.run(["swift", "--version"], capture_output=True, text=True)
     if result.returncode == 0:
         SWIFT_AVAILABLE = True
-except:
+except Exception:
     pass
 
 

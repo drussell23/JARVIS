@@ -50,6 +50,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum, auto
 from typing import Any, Callable, Dict, List, Optional, Tuple
+
+from backend.core.async_safety import LazyAsyncLock
+
 import random
 
 logger = logging.getLogger(__name__)
@@ -4566,7 +4569,7 @@ class VoiceBiometricIntelligence:
 # SINGLETON
 # =============================================================================
 _voice_biometric_intelligence: Optional[VoiceBiometricIntelligence] = None
-_init_lock = asyncio.Lock()
+_init_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 async def get_voice_biometric_intelligence() -> VoiceBiometricIntelligence:

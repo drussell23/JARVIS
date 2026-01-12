@@ -37,6 +37,8 @@ from dataclasses import dataclass, field, asdict
 from collections import defaultdict
 import os
 
+from backend.core.async_safety import LazyAsyncLock
+
 logger = logging.getLogger(__name__)
 
 
@@ -1133,7 +1135,7 @@ class VoiceProfileLearningEngine:
 # GLOBAL INSTANCE & INTEGRATION
 # =============================================================================
 _learning_engine: Optional[VoiceProfileLearningEngine] = None
-_learning_lock = asyncio.Lock()
+_learning_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 async def get_learning_engine(speaker_name: str = "Derek J. Russell") -> VoiceProfileLearningEngine:

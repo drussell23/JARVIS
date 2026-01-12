@@ -849,14 +849,23 @@ class SharedKnowledgeGraph:
 
     async def _cleanup_expired_loop(self) -> None:
         """Periodically clean up expired entries."""
-        while True:
+        import os
+        max_runtime = float(os.getenv("TIMEOUT_KNOWLEDGE_CLEANUP_SESSION", "86400.0"))  # 24 hours
+        cleanup_timeout = float(os.getenv("TIMEOUT_KNOWLEDGE_CLEANUP_ITERATION", "60.0"))
+        start = time.time()
+
+        while time.time() - start < max_runtime:
             try:
                 await asyncio.sleep(self.config.cleanup_interval_seconds)
-                await self._cleanup_expired()
+                await asyncio.wait_for(self._cleanup_expired(), timeout=cleanup_timeout)
+            except asyncio.TimeoutError:
+                logger.warning("Knowledge cleanup iteration timed out")
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.exception("Error in cleanup loop: %s", e)
+
+        logger.info("Knowledge cleanup loop reached max runtime, exiting")
 
     async def _cleanup_expired(self) -> None:
         """Clean up expired entries."""

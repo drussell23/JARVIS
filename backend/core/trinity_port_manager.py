@@ -36,6 +36,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
+from backend.core.async_safety import LazyAsyncLock
+
 logger = logging.getLogger(__name__)
 
 
@@ -711,7 +713,7 @@ class TrinityPortManager:
 # =============================================================================
 
 _manager_instance: Optional[TrinityPortManager] = None
-_manager_lock = asyncio.Lock()
+_manager_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 async def get_trinity_port_manager(

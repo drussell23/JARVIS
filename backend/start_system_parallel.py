@@ -175,7 +175,7 @@ class JarvisParallelSystem:
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
                     return resp.status == 200
-        except:
+        except Exception:
             return False
     
     async def _check_websocket_router(self) -> bool:
@@ -187,7 +187,7 @@ class JarvisParallelSystem:
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
                     return resp.status == 200
-        except:
+        except Exception:
             return False
     
     async def _check_frontend_available(self) -> bool:

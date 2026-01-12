@@ -337,8 +337,17 @@ class UnifiedWebSocketManager:
 
     async def _health_monitoring_loop(self):
         """Continuous health monitoring with predictive healing"""
-        while True:
+        # Maximum run time for health monitoring (default: 24 hours, configurable)
+        max_run_time = float(os.getenv("TIMEOUT_HEALTH_MONITOR_MAX", "86400.0"))
+        start_time = time.time()
+
+        while not self._shutdown_event.is_set():
             try:
+                # Check if we've exceeded maximum run time
+                if time.time() - start_time > max_run_time:
+                    logger.info("[UNIFIED-WS] Health monitoring max run time reached, restarting")
+                    break
+
                 await asyncio.sleep(self.config["health_check_interval"])
 
                 current_time = time.time()
@@ -2201,14 +2210,24 @@ async def unified_websocket_endpoint(websocket: WebSocket):
         # Try to close websocket gracefully if not already closed
         try:
             await websocket.close(code=1011, reason="Connection failed")
-        except:
+        except Exception:
             pass
         return
 
+    # WebSocket idle timeout protection
+    idle_timeout = float(os.getenv("TIMEOUT_WEBSOCKET_IDLE", "300.0"))  # 5 min default
+
     try:
         while True:
-            # Receive message
-            data = await websocket.receive_json()
+            # Receive message with timeout protection
+            try:
+                data = await asyncio.wait_for(
+                    websocket.receive_json(),
+                    timeout=idle_timeout
+                )
+            except asyncio.TimeoutError:
+                logger.info(f"[UNIFIED-WS] WebSocket idle timeout for {client_id}, closing connection")
+                break
 
             # Update health metrics
             if client_id in manager.connection_health:

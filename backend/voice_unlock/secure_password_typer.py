@@ -474,7 +474,7 @@ class SecurePasswordTyper:
             try:
                 CoreGraphics.CFRelease(self.event_source)
                 logger.debug("🔐 CGEventSource released")
-            except:
+            except Exception:
                 pass
 
     async def __aenter__(self):
@@ -839,7 +839,7 @@ class SecurePasswordTyper:
             try:
                 if 'needs_shift' in locals() and needs_shift:
                     await self._release_shift()
-            except:
+            except Exception:
                 pass
             return False
 
@@ -1227,10 +1227,10 @@ class SecurePasswordTyper:
             try:
                 if 'needs_shift' in locals() and needs_shift:
                     await self._release_shift()
-            except:
+            except Exception:
                 pass
             return False
-    
+
     async def _press_return_secure(self, config: TypingConfig) -> bool:
         """Press return key securely with proper timing"""
         try:

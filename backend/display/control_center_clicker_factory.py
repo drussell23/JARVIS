@@ -61,17 +61,17 @@ def get_best_clicker(
         try:
             import backend.display.adaptive_control_center_clicker as acc
             acc._adaptive_clicker = None
-        except:
+        except Exception:
             pass
         try:
             import backend.display.sai_enhanced_control_center_clicker as sai
             sai._sai_clicker = None
-        except:
+        except Exception:
             pass
         try:
             import backend.display.uae_enhanced_control_center_clicker as uae_mod
             uae_mod._uae_clicker = None
-        except:
+        except Exception:
             pass
 
     # Try UAE-Enhanced (best option)
@@ -118,7 +118,7 @@ def get_best_clicker(
                 )
                 clicker_type = "sai_enhanced"
                 return clicker
-            except:
+            except Exception:
                 logger.info("[CLICKER-FACTORY] SAI not available, trying Adaptive...")
 
         except ImportError as e:
@@ -184,7 +184,7 @@ def get_clicker_info() -> dict:
         info['uae_available'] = uae is not None and uae.is_active
         if info['uae_available']:
             info['recommended'] = 'uae'
-    except:
+    except Exception:
         pass
 
     # Check SAI
@@ -194,7 +194,7 @@ def get_clicker_info() -> dict:
         info['sai_available'] = True
         if not info['uae_available']:
             info['recommended'] = 'sai'
-    except:
+    except Exception:
         pass
 
     # Check Adaptive
@@ -203,7 +203,7 @@ def get_clicker_info() -> dict:
         info['adaptive_available'] = True
         if not info['uae_available'] and not info['sai_available']:
             info['recommended'] = 'adaptive'
-    except:
+    except Exception:
         pass
 
     # Check Basic
@@ -212,7 +212,7 @@ def get_clicker_info() -> dict:
         info['basic_available'] = True
         if info['recommended'] == 'unknown':
             info['recommended'] = 'basic'
-    except:
+    except Exception:
         pass
 
     return info

@@ -13,9 +13,12 @@ import asyncio
 import json
 import base64
 import io
+import logging
 import os
 import sys
 from datetime import datetime
+
+logger = logging.getLogger(__name__)
 
 # Add graceful handler import
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -435,10 +438,20 @@ class VoiceAPI:
         await websocket.accept()
         self.websocket_clients.add(websocket)
 
+        # WebSocket idle timeout protection
+        idle_timeout = float(os.getenv("TIMEOUT_WEBSOCKET_IDLE", "300.0"))  # 5 min default
+
         try:
             while True:
-                # Receive audio data
-                data = await websocket.receive_json()
+                # Receive audio data with timeout
+                try:
+                    data = await asyncio.wait_for(
+                        websocket.receive_json(),
+                        timeout=idle_timeout
+                    )
+                except asyncio.TimeoutError:
+                    logger.info("Voice stream WebSocket idle timeout, closing connection")
+                    break
 
                 if data.get("type") == "audio":
                     # Process audio chunk

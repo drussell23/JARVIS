@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -336,15 +337,25 @@ async def broadcast_websocket(websocket: WebSocket):
         "connection_id": conn_id,
     })
     
+    # WebSocket idle timeout protection
+    idle_timeout = float(os.getenv("TIMEOUT_WEBSOCKET_IDLE", "300.0"))  # 5 min default
+
     try:
         while True:
-            # Keep connection alive, handle pings/pongs
-            data = await websocket.receive_json()
-            
+            # Keep connection alive, handle pings/pongs with timeout
+            try:
+                data = await asyncio.wait_for(
+                    websocket.receive_json(),
+                    timeout=idle_timeout
+                )
+            except asyncio.TimeoutError:
+                logger.info(f"Broadcast WebSocket idle timeout for {conn_id}, closing connection")
+                break
+
             # Handle ping/pong for keepalive
             if data.get("type") == "ping":
                 await manager.send_personal(websocket, {"type": "pong"})
-            
+
     except WebSocketDisconnect:
         await manager.disconnect(websocket)
     except Exception as e:

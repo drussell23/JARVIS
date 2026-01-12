@@ -44,6 +44,8 @@ from enum import Enum
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
 import uuid
 
+from backend.core.async_safety import LazyAsyncLock
+
 logger = logging.getLogger(__name__)
 
 
@@ -5375,7 +5377,7 @@ class AgenticTaskRunner:
 # =============================================================================
 
 _runner_instance: Optional[AgenticTaskRunner] = None
-_runner_lock = asyncio.Lock() if hasattr(asyncio, 'Lock') else None
+_runner_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 _runner_initializing: bool = False
 
 

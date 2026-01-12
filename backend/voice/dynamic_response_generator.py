@@ -385,7 +385,7 @@ class DynamicResponseGenerator:
             cpu_percent = psutil.cpu_percent(interval=0.1)
             memory_percent = psutil.virtual_memory().percent
             system_status = "optimal" if cpu_percent < 50 and memory_percent < 70 else "elevated"
-        except:
+        except Exception:
             system_status = "normal"
         
         # JARVIS-style sophisticated greetings

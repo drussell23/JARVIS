@@ -46,6 +46,8 @@ from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from datetime import datetime, timedelta
 
+from backend.core.async_safety import TimeoutConfig, get_shutdown_event
+
 logger = logging.getLogger(__name__)
 
 # =============================================================================
@@ -394,8 +396,24 @@ class CloudMLRouter:
         logger.info(f"🔄 Scale-to-zero monitor started (idle threshold: {self._idle_shutdown_minutes}min)")
 
     async def _scale_to_zero_loop(self):
-        """Background loop checking for idle VMs to shutdown"""
+        """Background loop checking for idle VMs to shutdown with timeout protection."""
+        shutdown_event = get_shutdown_event()
+        max_iterations = int(os.getenv("SCALE_TO_ZERO_MAX_ITERATIONS", "0")) or None
+        iteration = 0
+
         while True:
+            # Check for shutdown
+            if shutdown_event.is_set():
+                logger.info("Scale-to-zero monitor stopped via shutdown event")
+                break
+
+            # Check max iterations (for testing/safety)
+            if max_iterations and iteration >= max_iterations:
+                logger.info(f"Scale-to-zero monitor reached max iterations ({max_iterations})")
+                break
+
+            iteration += 1
+
             try:
                 await asyncio.sleep(SCALE_TO_ZERO_CHECK_INTERVAL)
 
@@ -413,8 +431,14 @@ class CloudMLRouter:
                             f"⏰ VM idle for {idle_minutes:.1f} minutes "
                             f"(threshold: {self._idle_shutdown_minutes}min) - initiating shutdown"
                         )
-                        await self._shutdown_idle_vm()
+                        # Add timeout protection for VM shutdown
+                        await asyncio.wait_for(
+                            self._shutdown_idle_vm(),
+                            timeout=TimeoutConfig.VM_OPERATION
+                        )
 
+            except asyncio.TimeoutError:
+                logger.warning(f"VM shutdown timed out after {TimeoutConfig.VM_OPERATION}s")
             except asyncio.CancelledError:
                 logger.info("Scale-to-zero monitor cancelled")
                 break

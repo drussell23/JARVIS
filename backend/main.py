@@ -5199,7 +5199,7 @@ async def health_check():
                 }
             else:
                 vision_details["orchestrator"] = {"enabled": False}
-        except:
+        except Exception:
             vision_details["orchestrator"] = {"enabled": False}
 
     # Check ML audio system status
@@ -5242,7 +5242,7 @@ async def health_check():
             "success_rate": health_report.get("success_rate", 0.0),
             "last_successful_build": health_report.get("last_successful_build"),
         }
-    except:
+    except Exception:
         self_healing_details = {"enabled": False}
 
     # Check voice unlock status
@@ -5257,7 +5257,7 @@ async def health_check():
                 "initialized": True,
                 "api_available": True,
             }
-        except:
+        except Exception:
             voice_unlock_details = {"enabled": False, "initialized": False}
     else:
         voice_unlock_details = {"enabled": False, "initialized": False}
@@ -6735,7 +6735,7 @@ async def ml_audio_websocket_compat(websocket: WebSocket):
         logger.error(f"ML Audio WebSocket error: {e}")
         try:
             await websocket.close()
-        except:
+        except Exception:
             pass
 
 

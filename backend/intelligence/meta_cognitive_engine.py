@@ -83,6 +83,8 @@ from typing import (
     Union,
 )
 
+from backend.core.async_safety import LazyAsyncLock
+
 # Environment-driven configuration
 META_COGNITIVE_DATA_DIR = Path(os.getenv(
     "META_COGNITIVE_DATA_DIR",
@@ -1458,7 +1460,7 @@ class MetaCognitiveEngine:
 
 # Global instance
 _meta_cognitive_engine: Optional[MetaCognitiveEngine] = None
-_lock = asyncio.Lock()
+_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 async def get_meta_cognitive_engine() -> MetaCognitiveEngine:

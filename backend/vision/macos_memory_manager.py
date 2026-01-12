@@ -16,6 +16,7 @@ Key Concepts:
 import asyncio
 import logging
 import os
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -140,7 +141,9 @@ class MacOSMemoryManager:
 
     async def _monitor_loop(self):
         """Continuous monitoring loop"""
-        while True:
+        max_runtime = float(os.getenv("TIMEOUT_VISION_SESSION", "3600.0"))  # 1 hour default
+        session_start = time.monotonic()
+        while time.monotonic() - session_start < max_runtime:
             try:
                 await self.check_pressure()
                 await asyncio.sleep(self.config.pressure_check_interval)
@@ -149,6 +152,8 @@ class MacOSMemoryManager:
             except Exception as e:
                 logger.error(f"Memory monitoring error: {e}")
                 await asyncio.sleep(self.config.pressure_check_interval)
+        else:
+            logger.info("Memory pressure monitoring session timeout, stopping")
 
     async def check_pressure(self) -> MemoryPressure:
         """

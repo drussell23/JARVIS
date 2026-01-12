@@ -1390,7 +1390,7 @@ class WhisperAudioHandler:
                 decoded = base64.b64decode(audio_data)
                 logger.debug("Successfully decoded base64 audio")
                 return decoded
-            except:
+            except Exception:
                 pass
 
             # Try URL-safe base64
@@ -1398,7 +1398,7 @@ class WhisperAudioHandler:
                 decoded = base64.urlsafe_b64decode(audio_data)
                 logger.debug("Successfully decoded URL-safe base64 audio")
                 return decoded
-            except:
+            except Exception:
                 pass
 
             # Try hex encoding
@@ -1406,7 +1406,7 @@ class WhisperAudioHandler:
                 decoded = bytes.fromhex(audio_data)
                 logger.debug("Successfully decoded hex audio")
                 return decoded
-            except:
+            except Exception:
                 pass
 
             # Try latin-1 encoding as last resort
@@ -1414,7 +1414,7 @@ class WhisperAudioHandler:
                 decoded = audio_data.encode('latin-1')
                 logger.debug("Encoded string as latin-1")
                 return decoded
-            except:
+            except Exception:
                 pass
 
         # If it's a numpy array
@@ -1427,7 +1427,7 @@ class WhisperAudioHandler:
         # Try to convert to bytes
         try:
             return bytes(audio_data)
-        except:
+        except Exception:
             logger.error(f"Cannot convert audio data of type {type(audio_data)} to bytes")
             raise ValueError(f"Unsupported audio data type: {type(audio_data)}")
 

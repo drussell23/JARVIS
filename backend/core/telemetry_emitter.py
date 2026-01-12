@@ -80,6 +80,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Callable, Awaitable
 
+from backend.core.async_safety import LazyAsyncLock
+
 logger = logging.getLogger(__name__)
 
 
@@ -765,7 +767,7 @@ class TelemetryEmitter:
 # =============================================================================
 
 _telemetry_emitter: Optional[TelemetryEmitter] = None
-_emitter_lock = asyncio.Lock()
+_emitter_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 async def get_telemetry_emitter(config: Optional[TelemetryConfig] = None) -> TelemetryEmitter:

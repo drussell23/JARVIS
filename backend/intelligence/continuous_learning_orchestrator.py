@@ -70,6 +70,8 @@ from typing import (
     TypeVar,
 )
 
+from backend.core.async_safety import LazyAsyncLock
+
 # Environment-driven configuration
 LEARNING_DATA_DIR = Path(os.getenv(
     "LEARNING_DATA_DIR",
@@ -681,6 +683,13 @@ class ContinuousLearningOrchestrator:
         # Callbacks
         self._on_training_complete: List[Callable] = []
         self._on_model_promoted: List[Callable] = []
+        self._on_experience_collected: List[Callable] = []
+        self._on_training_started: List[Callable] = []
+        self._on_ab_test_updated: List[Callable] = []
+
+        # Cross-repo forwarding (lazy-loaded)
+        self._experience_forwarder = None
+        self._cross_repo_enabled = os.getenv("CROSS_REPO_EXPERIENCE_FORWARDING", "true").lower() == "true"
 
         # Ensure data directory
         LEARNING_DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -700,7 +709,22 @@ class ContinuousLearningOrchestrator:
         else:
             self.logger.info("  Auto-training disabled")
 
+        # Connect to cross-repo experience forwarder
+        if self._cross_repo_enabled:
+            await self._connect_experience_forwarder()
+
         self.logger.info("ContinuousLearningOrchestrator ready")
+
+    async def _connect_experience_forwarder(self) -> None:
+        """Connect to the cross-repo experience forwarder."""
+        try:
+            from backend.intelligence.cross_repo_experience_forwarder import get_experience_forwarder
+            self._experience_forwarder = await get_experience_forwarder()
+            self.logger.info("  Connected to Cross-Repo Experience Forwarder")
+        except ImportError:
+            self.logger.debug("Cross-repo forwarder not available (import failed)")
+        except Exception as e:
+            self.logger.warning(f"Failed to connect to experience forwarder: {e}")
 
     async def stop(self) -> None:
         """Stop the orchestrator."""
@@ -733,7 +757,14 @@ class ContinuousLearningOrchestrator:
         session_id: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> str:
-        """Collect a learning experience."""
+        """
+        Collect a learning experience.
+
+        This method:
+        1. Creates and stores the experience locally
+        2. Triggers all registered callbacks (async, non-blocking)
+        3. Forwards to cross-repo forwarder for Reactor Core
+        """
         experience = Experience(
             experience_type=experience_type,
             input_data=input_data,
@@ -751,7 +782,42 @@ class ContinuousLearningOrchestrator:
         if added:
             self._metrics["experiences_collected"] += 1
 
+            # Trigger experience callbacks (non-blocking)
+            exp_dict = experience.to_dict()
+            asyncio.create_task(self._fire_experience_callbacks(exp_dict))
+
+            # Forward to cross-repo (non-blocking)
+            if self._experience_forwarder:
+                asyncio.create_task(self._forward_to_cross_repo(experience))
+
         return experience.experience_id
+
+    async def _fire_experience_callbacks(self, exp_dict: Dict[str, Any]) -> None:
+        """Fire all experience callbacks (async, non-blocking)."""
+        for callback in self._on_experience_collected:
+            try:
+                if asyncio.iscoroutinefunction(callback):
+                    await callback(exp_dict)
+                else:
+                    callback(exp_dict)
+            except Exception as e:
+                self.logger.debug(f"Experience callback error: {e}")
+
+    async def _forward_to_cross_repo(self, experience: Experience) -> None:
+        """Forward experience to cross-repo forwarder (non-blocking)."""
+        try:
+            await self._experience_forwarder.forward_experience(
+                experience_type=experience.experience_type.value,
+                input_data=experience.input_data,
+                output_data=experience.output_data,
+                quality_score=experience.quality_score,
+                confidence=experience.confidence,
+                success=experience.success,
+                component=experience.component,
+                metadata=experience.metadata,
+            )
+        except Exception as e:
+            self.logger.debug(f"Cross-repo forwarding error: {e}")
 
     async def add_feedback(
         self,
@@ -883,6 +949,23 @@ class ContinuousLearningOrchestrator:
         """Register model promoted callback."""
         self._on_model_promoted.append(callback)
 
+    def on_experience_collected(self, callback: Callable) -> None:
+        """
+        Register experience collection callback.
+
+        Callback signature: async def callback(experience_dict: Dict[str, Any]) -> None
+        Called after each experience is collected (non-blocking).
+        """
+        self._on_experience_collected.append(callback)
+
+    def on_training_started(self, callback: Callable) -> None:
+        """Register training started callback."""
+        self._on_training_started.append(callback)
+
+    def on_ab_test_updated(self, callback: Callable) -> None:
+        """Register A/B test update callback."""
+        self._on_ab_test_updated.append(callback)
+
     # Metrics
 
     def get_metrics(self) -> Dict[str, Any]:
@@ -1006,7 +1089,7 @@ class ContinuousLearningOrchestrator:
 
 # Global instance
 _orchestrator: Optional[ContinuousLearningOrchestrator] = None
-_lock = asyncio.Lock()
+_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 async def get_learning_orchestrator() -> ContinuousLearningOrchestrator:

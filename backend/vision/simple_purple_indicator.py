@@ -62,9 +62,9 @@ class SimplePurpleIndicator:
                         initial_output = self.capture_process.stdout.readline()
                         if initial_output:
                             logger.info(f"[PURPLE] Swift output: {initial_output.strip()}")
-                except:
+                except Exception:
                     pass
-                
+
                 # Start monitoring thread
                 monitor_thread = threading.Thread(target=self._monitor_process, daemon=True)
                 monitor_thread.start()
@@ -136,7 +136,7 @@ class SimplePurpleIndicator:
             self.capture_process.terminate()
             try:
                 self.capture_process.wait(timeout=5)
-            except:
+            except Exception:
                 self.capture_process.kill()
             self.capture_process = None
             self.is_capturing = False

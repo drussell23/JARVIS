@@ -119,7 +119,7 @@ class OCRProcessor:
         try:
             pytesseract.get_tesseract_version()
             self.tesseract_available = True
-        except:
+        except Exception:
             logger.error("Tesseract OCR not found. Please install tesseract-ocr.")
             self.tesseract_available = False
             
@@ -421,7 +421,7 @@ async def test_ocr_processor():
             font_large = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 36)
             font_medium = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 24)
             font_small = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 16)
-        except:
+        except Exception:
             font_large = ImageFont.load_default()
             font_medium = ImageFont.load_default()
             font_small = ImageFont.load_default()

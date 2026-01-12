@@ -311,7 +311,7 @@ class LivenessDetector:
             else:
                 formant_score = 0.0
                 
-        except:
+        except Exception:
             formant_score = 50.0
         
         # Check for pitch variations (natural speech has them)
@@ -576,7 +576,7 @@ class LivenessDetector:
             
             return 50.0
             
-        except:
+        except Exception:
             return 75.0  # Default if analysis fails
     
     def _detect_ai_voice_markers(self, audio: np.ndarray, sr: int) -> float:

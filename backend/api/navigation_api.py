@@ -502,14 +502,24 @@ async def navigation_websocket(websocket: WebSocket):
     """WebSocket endpoint for real-time navigation updates"""
     await ws_manager.connect(websocket)
 
+    # WebSocket idle timeout protection
+    idle_timeout = float(os.getenv("TIMEOUT_WEBSOCKET_IDLE", "300.0"))  # 5 min default
+
     try:
         # Start streaming workspace updates if navigation mode is active
         if navigation_state["mode_active"]:
             asyncio.create_task(_stream_workspace_updates(websocket))
 
         while True:
-            # Receive commands from client
-            data = await websocket.receive_json()
+            # Receive commands from client with timeout
+            try:
+                data = await asyncio.wait_for(
+                    websocket.receive_json(),
+                    timeout=idle_timeout
+                )
+            except asyncio.TimeoutError:
+                logger.info("Navigation WebSocket idle timeout, closing connection")
+                break
 
             if data.get("command") == "get_workspace_map":
                 if navigation_system.current_map:

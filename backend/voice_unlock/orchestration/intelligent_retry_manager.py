@@ -31,6 +31,8 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Any, Dict, List, Optional, Tuple
 
+from backend.core.async_safety import LazyAsyncLock
+
 logger = logging.getLogger(__name__)
 
 
@@ -595,7 +597,7 @@ class IntelligentRetryManager:
 # =============================================================================
 
 _manager_instance: Optional[IntelligentRetryManager] = None
-_manager_lock = asyncio.Lock()
+_manager_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 async def get_intelligent_retry_manager() -> IntelligentRetryManager:

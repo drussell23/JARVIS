@@ -717,11 +717,15 @@ class GhostPersistenceManager:
 
     async def _auto_save_loop(self) -> None:
         """Periodic auto-save."""
-        while True:
+        max_runtime = float(os.getenv("TIMEOUT_VISION_SESSION", "3600.0"))  # 1 hour default
+        session_start = time.monotonic()
+        while time.monotonic() - session_start < max_runtime:
             await asyncio.sleep(self.auto_save_interval)
             async with self._lock:
                 if self._dirty:
                     await self._save_state()
+        else:
+            logger.info("Ghost persistence auto-save loop timeout, stopping")
 
 
 # =============================================================================

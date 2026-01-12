@@ -244,7 +244,7 @@ class VisionConfig:
                 f"Vision process memory limit: {final_limit}MB (25% of {total_gb:.1f}GB total)"
             )
             return final_limit
-        except:
+        except Exception:
             return 2048  # Default 2GB
 
     @staticmethod
@@ -265,7 +265,7 @@ class VisionConfig:
             min_available = total_gb * 0.15
             # But at least 1GB and no more than 4GB
             return max(1.0, min(min_available, 4.0))
-        except:
+        except Exception:
             return 2.0  # Default 2GB
 
     # VSMS Core configuration
@@ -1642,7 +1642,7 @@ class ClaudeVisionAnalyzer:
                     if current_state:
                         context["active_app"] = current_state.active_application
                         context["goal"] = current_state.inferred_goal
-                except:
+                except Exception:
                     pass
 
         return engine.suggest_automation(context)
@@ -2001,7 +2001,7 @@ class ClaudeVisionAnalyzer:
                     try:
                         if hasattr(self.simplified_vision, "cleanup"):
                             await self.simplified_vision.cleanup()
-                    except:
+                    except Exception:
                         pass
                     self.simplified_vision = None
 
@@ -2622,7 +2622,7 @@ class ClaudeVisionAnalyzer:
                                         current_state.active_application
                                     )
                                     cache_context["goal"] = current_state.inferred_goal
-                            except:
+                            except Exception:
                                 pass
 
                         # Generate embedding for semantic search
@@ -3913,7 +3913,7 @@ class ClaudeVisionAnalyzer:
             # Try to use a small font (fallback to default if not available)
             try:
                 font = ImageFont.truetype("Arial", 10)
-            except:
+            except Exception:
                 font = ImageFont.load_default()
 
             # Add semi-transparent background for label
@@ -4521,7 +4521,7 @@ class ClaudeVisionAnalyzer:
                     memory_status = self.memory_monitor.get_memory_status()
                     rich_context["memory_pressure"] = memory_status.get("system_pressure", "normal")
                     rich_context["process_memory_mb"] = memory_status.get("process_memory_mb", 0)
-                except:
+                except Exception:
                     pass
 
             # Build multimodal content
@@ -6312,7 +6312,7 @@ For this query, provide a helpful response that leverages the multi-space inform
             if tmp_path and os.path.exists(tmp_path):
                 try:
                     os.unlink(tmp_path)
-                except:
+                except Exception:
                     pass
 
     async def _capture_pil_imagegrab(self) -> Optional[Image.Image]:
@@ -6515,7 +6515,7 @@ For this query, provide a helpful response that leverages the multi-space inform
                 extrema = image.convert("L").getextrema()
                 if extrema[0] == extrema[1]:  # All pixels same value
                     return False
-            except:
+            except Exception:
                 pass
             return True
 
@@ -6847,7 +6847,7 @@ For this query, provide a helpful response that leverages the multi-space inform
                 ).strip()
                 if existing_pids:
                     error_msg = "Failed to start video streaming - existing capture process detected. Please try again."
-            except:
+            except Exception:
                 pass
 
             return {"success": False, "error": error_msg}

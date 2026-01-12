@@ -32,6 +32,7 @@ from datetime import datetime, timedelta
 from enum import Enum, auto
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
+from backend.core.async_safety import LazyAsyncLock
 from .action_registry import ActionCategory, ActionRiskLevel, ActionType
 
 logger = logging.getLogger(__name__)
@@ -1100,7 +1101,7 @@ class PermissionSystem:
 
 
 _permission_system_instance: Optional[PermissionSystem] = None
-_permission_lock = asyncio.Lock()
+_permission_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 def get_permission_system() -> PermissionSystem:

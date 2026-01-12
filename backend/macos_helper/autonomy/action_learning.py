@@ -32,6 +32,7 @@ from datetime import datetime, timedelta
 from enum import Enum, auto
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from backend.core.async_safety import LazyAsyncLock
 from .action_registry import ActionCategory, ActionRiskLevel, ActionType
 
 logger = logging.getLogger(__name__)
@@ -875,7 +876,7 @@ class ActionLearningSystem:
 
 
 _learning_system_instance: Optional[ActionLearningSystem] = None
-_learning_lock = asyncio.Lock()
+_learning_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 def get_action_learning_system() -> ActionLearningSystem:

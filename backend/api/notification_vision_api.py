@@ -251,11 +251,21 @@ async def notification_websocket(websocket: WebSocket):
     """WebSocket endpoint for real-time notification updates"""
     await notification_ws_manager.connect(websocket)
     
+    # WebSocket idle timeout protection
+    idle_timeout = float(os.getenv("TIMEOUT_WEBSOCKET_IDLE", "300.0"))  # 5 min default
+
     try:
         while True:
-            # Keep connection alive and handle any client messages
-            data = await websocket.receive_json()
-            
+            # Keep connection alive and handle any client messages with timeout
+            try:
+                data = await asyncio.wait_for(
+                    websocket.receive_json(),
+                    timeout=idle_timeout
+                )
+            except asyncio.TimeoutError:
+                logger.info("Notification WebSocket idle timeout, closing connection")
+                break
+
             # Handle client commands
             if data.get("command") == "get_stats":
                 await websocket.send_json({
@@ -268,7 +278,7 @@ async def notification_websocket(websocket: WebSocket):
                     "type": "history_cleared",
                     "success": True
                 })
-                
+
     except WebSocketDisconnect:
         notification_ws_manager.disconnect(websocket)
     except Exception as e:

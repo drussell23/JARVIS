@@ -176,9 +176,9 @@ class WeatherSmartNavigator:
             if result.get('success'):
                 analysis = result.get('analysis', '').lower()
                 return 'toronto' in analysis or ('68' in analysis and 'canada' in analysis)
-        except:
+        except Exception:
             return False
-    
+
     async def _keyboard_navigate_to_top(self) -> bool:
         """Use keyboard to navigate to top of list (Toronto)"""
         script = '''

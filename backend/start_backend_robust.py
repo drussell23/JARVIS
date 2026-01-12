@@ -27,7 +27,7 @@ class RobustBackendStarter:
                 ["lsof", "-i", f":{port}", "-sTCP:LISTEN", "-t"], capture_output=True
             )
             return result.returncode == 0
-        except:
+        except Exception:
             return False
 
     def kill_port(self, port):
@@ -40,7 +40,7 @@ class RobustBackendStarter:
                 ["lsof", "-ti", f":{port}", "|", "xargs", "kill", "-9"], shell=True
             )
             time.sleep(1)
-        except:
+        except Exception:
             pass
 
     def ensure_dependencies(self):
@@ -186,10 +186,10 @@ class RobustBackendStarter:
             try:
                 process.terminate()
                 process.wait(timeout=5)
-            except:
+            except Exception:
                 try:
                     process.kill()
-                except:
+                except Exception:
                     pass
         print("✅ All processes stopped")
         sys.exit(0)

@@ -45,6 +45,8 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from uuid import uuid4
 
+from backend.core.async_safety import LazyAsyncLock
+
 try:
     import aiofiles
     AIOFILES_AVAILABLE = True
@@ -665,7 +667,7 @@ class ExperienceRecorder:
 # =============================================================================
 
 _recorder: Optional[ExperienceRecorder] = None
-_recorder_lock = asyncio.Lock()
+_recorder_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 def get_experience_recorder(

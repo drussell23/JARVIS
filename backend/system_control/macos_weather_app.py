@@ -244,7 +244,7 @@ class MacOSWeatherApp:
                             return f"{city}, {region}"
                         elif city:
                             return city
-        except:
+        except Exception:
             pass
         return "your location"
     

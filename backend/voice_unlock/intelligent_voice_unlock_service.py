@@ -1594,7 +1594,7 @@ class IntelligentVoiceUnlockService:
                         # Terminate caffeinate
                         try:
                             caffeinate_process.terminate()
-                        except:
+                        except Exception:
                             pass
 
                         return {
@@ -1670,7 +1670,7 @@ class IntelligentVoiceUnlockService:
                     # Terminate caffeinate
                     try:
                         caffeinate_process.terminate()
-                    except:
+                    except Exception:
                         pass
 
                     return {
@@ -1705,7 +1705,7 @@ class IntelligentVoiceUnlockService:
             logger.error(f"⏱️ TOTAL UNLOCK TIMEOUT: Processing exceeded {TOTAL_UNLOCK_TIMEOUT}s")
             try:
                 caffeinate_process.terminate()
-            except:
+            except Exception:
                 pass
             return await self._create_failure_response(
                 "total_timeout",
@@ -2456,7 +2456,7 @@ class IntelligentVoiceUnlockService:
                 try:
                     caffeinate_process.terminate()
                     logger.debug("🔋 Caffeinate terminated")
-                except:
+                except Exception:
                     pass
 
                 # Update speaker profile with continuous learning (if successful)
@@ -3066,7 +3066,7 @@ class IntelligentVoiceUnlockService:
                         try:
                             threshold = await self.speaker_engine._get_adaptive_threshold(target_name, target_profile)
                             diagnostics['threshold'] = f"{threshold:.2%}"
-                        except:
+                        except Exception:
                             pass
 
                 elif len(profiles) == 0:
@@ -3312,6 +3312,17 @@ class IntelligentVoiceUnlockService:
                 logger.error(f"❌ Unlock failed for {speaker_name} - password may be incorrect")
                 personalized_message = "Unlock failed - password may be incorrect"
 
+            # v100.0: Forward voice auth experience to ContinuousLearningOrchestrator
+            asyncio.create_task(
+                self._forward_voice_auth_experience(
+                    speaker_name=speaker_name,
+                    success=unlock_success,
+                    confidence=verification_score,
+                    unlock_type=unlock_type,
+                    display_context=display_context,
+                )
+            )
+
             return {
                 "success": unlock_success,
                 "message": personalized_message,
@@ -3320,6 +3331,56 @@ class IntelligentVoiceUnlockService:
         except Exception as e:
             logger.error(f"Unlock failed: {e}", exc_info=True)
             return {"success": False, "reason": "unlock_error", "message": str(e)}
+
+    async def _forward_voice_auth_experience(
+        self,
+        speaker_name: str,
+        success: bool,
+        confidence: float,
+        unlock_type: str,
+        display_context: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """
+        v100.0: Forward voice authentication experience to ContinuousLearningOrchestrator.
+
+        Non-blocking, fire-and-forget forwarding for voice auth ML improvements.
+        """
+        try:
+            from backend.intelligence.continuous_learning_orchestrator import (
+                get_learning_orchestrator,
+                ExperienceType,
+            )
+
+            orchestrator = await get_learning_orchestrator()
+            if orchestrator is None:
+                return
+
+            await orchestrator.collect_experience(
+                experience_type=ExperienceType.VOICE_AUTH,
+                input_data={
+                    "speaker": speaker_name,
+                    "unlock_type": unlock_type,
+                    "confidence": confidence,
+                },
+                output_data={
+                    "success": success,
+                    "display_context": display_context or {},
+                },
+                quality_score=confidence,
+                confidence=confidence,
+                success=success,
+                component="voice_unlock_service",
+                metadata={
+                    "source": "_perform_unlock",
+                    "speaker_name": speaker_name,
+                },
+            )
+            logger.debug(f"Voice auth experience forwarded: speaker={speaker_name}, success={success}")
+
+        except ImportError:
+            pass  # Orchestrator not available
+        except Exception as e:
+            logger.debug(f"Voice auth experience forwarding failed: {e}")
 
     async def _update_speaker_profile(
         self, speaker_name: str, audio_data: bytes, transcribed_text: str, success: bool
@@ -3652,7 +3713,7 @@ class IntelligentVoiceUnlockService:
 
             attempt_time = datetime.fromisoformat(attempt.get("timestamp", ""))
             return (datetime.now() - attempt_time) < timedelta(hours=hours)
-        except:
+        except Exception:
             return False
 
     def _detect_attempt_pattern(self, attempts: list) -> str:
@@ -3671,7 +3732,7 @@ class IntelligentVoiceUnlockService:
         try:
             if self.speaker_engine and self.speaker_engine.profiles:
                 return speaker_name in self.speaker_engine.profiles
-        except:
+        except Exception:
             pass
         return False
 
@@ -5142,12 +5203,12 @@ async def _decode_audio_robust(audio_base64: str, mime_type: str = "audio/webm")
             if temp_in and os.path.exists(temp_in.name):
                 try:
                     os.unlink(temp_in.name)
-                except:
+                except Exception:
                     pass
             if temp_out and os.path.exists(temp_out.name):
                 try:
                     os.unlink(temp_out.name)
-                except:
+                except Exception:
                     pass
 
     async def _raw_pcm_extraction_async() -> Tuple[Optional[bytes], Optional[str]]:
@@ -5651,7 +5712,7 @@ async def _execute_unlock_robust(
                     await progress_callback(data)
                 else:
                     progress_callback(data)
-            except:
+            except Exception:
                 pass
 
     try:
@@ -5783,7 +5844,7 @@ async def _execute_unlock_robust(
         if caffeinate_proc and caffeinate_proc.returncode is None:
             try:
                 caffeinate_proc.terminate()
-            except:
+            except Exception:
                 pass
 
 
@@ -5893,7 +5954,7 @@ async def _execute_unlock_applescript_fallback(
         # Clear password from environment immediately
         try:
             del env["JARVIS_SECURE_PASS"]
-        except:
+        except Exception:
             pass
 
         if process.returncode == 0:
@@ -6112,7 +6173,7 @@ async def process_voice_unlock_robust(
             try:
                 name = speaker or dynamic_owner_name
                 asyncio.create_task(voice.vbi_stage_feedback(stage, confidence, name))
-            except:
+            except Exception:
                 pass
 
     async def speak_and_wait(text: str, timeout: float = 8.0):
@@ -6433,7 +6494,7 @@ async def process_voice_unlock_robust(
                     await progress_callback(data)
                 else:
                     progress_callback(data)
-            except:
+            except Exception:
                 pass
 
     def result(success: bool, msg: str, speaker: str = "Unknown", conf: float = 0.0, err: str = None):

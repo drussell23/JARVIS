@@ -188,7 +188,7 @@ class SimpleChatbot:
                             response = math_response.strip()
                         else:
                             response = "I'd love to help with that calculation, but I need the language model to be loaded first. Try running: python setup_m1_optimized_llm.py"
-                    except:
+                    except Exception:
                         response = "I can help with math, but the calculation engine isn't available right now."
                 else:
                     response = "That's a great question! Based on what you're asking, I'd be happy to help explain or provide information."

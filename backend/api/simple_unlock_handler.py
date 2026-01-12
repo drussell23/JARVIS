@@ -15,6 +15,8 @@ import logging
 import subprocess
 from typing import Any, Dict, List, Tuple
 
+from backend.core.async_safety import LazyAsyncLock
+
 # Import async pipeline
 from core.async_pipeline import get_async_pipeline
 from core.transport_handlers import (
@@ -85,7 +87,7 @@ async def _preload_owner_name():
 
 # Pre-cached speaker verification service for fast path
 _speaker_service_cache = None
-_speaker_service_lock = asyncio.Lock()
+_speaker_service_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 async def _get_cached_speaker_service():
@@ -992,7 +994,7 @@ async def _try_unlock_methods(context: Dict[str, Any]) -> Dict[str, Any]:
                 "message": "Screen was already unlocked",
                 "method": "already_unlocked",
             }
-    except:
+    except Exception:
         pass
 
     # Extract audio data from jarvis_instance if available
@@ -1239,7 +1241,7 @@ async def _generate_command_error_response(
             error_response = response_gen.get_error_message(
                 "invalid_command", "I didn't understand that screen command"
             )
-        except:
+        except Exception:
             error_response = "I didn't understand that screen command."
     else:
         error_response = "I didn't understand that screen command."

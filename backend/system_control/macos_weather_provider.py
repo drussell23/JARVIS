@@ -173,7 +173,7 @@ class MacOSWeatherProvider:
                                     else:
                                         city_name = city
                                     return lat, lon, city_name
-                except:
+                except Exception:
                     continue
                     
         except Exception as e:
@@ -198,9 +198,9 @@ class MacOSWeatherProvider:
                                     return lat, lon, f"{city}, {region}"
                                 else:
                                     return lat, lon, city
-        except:
+        except Exception:
             pass
-        
+
         # Final fallback - return None to indicate failure
         return None, None, None
     

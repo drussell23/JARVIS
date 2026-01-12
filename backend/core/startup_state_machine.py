@@ -49,6 +49,8 @@ from enum import Enum
 from typing import Callable, Dict, List, Optional, Any, Set
 from contextlib import asynccontextmanager
 
+from backend.core.async_safety import LazyAsyncLock
+
 logger = logging.getLogger(__name__)
 
 
@@ -477,7 +479,7 @@ class StartupStateMachine:
 
 # Singleton instance
 _startup_state_machine: Optional[StartupStateMachine] = None
-_startup_lock = asyncio.Lock()
+_startup_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 async def get_startup_state_machine() -> StartupStateMachine:

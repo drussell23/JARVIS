@@ -1642,7 +1642,7 @@ class InfrastructureStatusChecker:
                                     "status": data.get("status", "unknown"),
                                 }
                             )
-                        except:
+                        except Exception:
                             return InfrastructureTrace(
                                 component="jarvis_backend",
                                 status=InfrastructureStatus.HEALTHY,
@@ -1731,7 +1731,7 @@ class InfrastructureStatusChecker:
                             try:
                                 data = await resp.json()
                                 details["response"] = data
-                            except:
+                            except Exception:
                                 pass
 
                             traces.append(InfrastructureTrace(
@@ -1808,7 +1808,7 @@ class InfrastructureStatusChecker:
                                     details["gpu"] = data.get("gpu", {})
                                     details["instance_type"] = data.get("instance_type", "unknown")
                                     details["preemptible"] = data.get("preemptible", True)
-                                except:
+                                except Exception:
                                     pass
 
                             traces.append(InfrastructureTrace(

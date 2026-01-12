@@ -40,6 +40,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from backend.core.async_safety import LazyAsyncLock
+
 logger = logging.getLogger(__name__)
 
 
@@ -651,7 +653,7 @@ class VoiceModelDeployer:
 # =============================================================================
 
 _deployer_instance: Optional[VoiceModelDeployer] = None
-_deployer_lock = asyncio.Lock()
+_deployer_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 async def get_voice_model_deployer() -> VoiceModelDeployer:

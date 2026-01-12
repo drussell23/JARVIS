@@ -967,7 +967,7 @@ class MacOSController:
                 try:
                     subprocess.run(["cliclick", f"c:{x},{y}"], check=True, capture_output=True)
                     return True, f"Clicked at ({x}, {y})"
-                except:
+                except Exception:
                     return False, f"Failed to click: {result}"
         except Exception as e:
             return False, f"Click error: {str(e)}"
@@ -1669,7 +1669,7 @@ class MacOSController:
                     timeout=2
                 )
                 has_password = (result.returncode == 0)
-            except:
+            except Exception:
                 has_password = False
 
             if not has_password:
@@ -1686,7 +1686,7 @@ class MacOSController:
                     with open(enrollment_file) as f:
                         enrollment = json.load(f)
                         enrollment_status = enrollment.get("status", "unknown")
-                except:
+                except Exception:
                     enrollment_status = "corrupted"
 
             if enrollment_status != "complete":

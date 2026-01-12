@@ -77,7 +77,7 @@ class LRUCache:
             try:
                 value_str = json.dumps(value, default=str)
                 size_bytes = len(value_str.encode("utf-8"))
-            except:
+            except Exception:
                 size_bytes = 1024  # Default size for non-serializable objects
 
             # Check if we need to evict entries

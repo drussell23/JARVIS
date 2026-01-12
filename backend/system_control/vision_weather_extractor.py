@@ -58,9 +58,9 @@ class VisionWeatherExtractor:
             '''
             result = await self._run_applescript(script)
             return result.strip().lower() == 'true'
-        except:
+        except Exception:
             return False
-    
+
     async def _open_weather_app(self):
         """Open Weather app"""
         try:

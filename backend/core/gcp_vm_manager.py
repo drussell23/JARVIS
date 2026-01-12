@@ -95,6 +95,8 @@ except ImportError:
     except ImportError:
         pass
 
+from backend.core.async_safety import LazyAsyncLock
+
 logger = logging.getLogger(__name__)
 
 # Type variable for generic retry decorator
@@ -1832,7 +1834,7 @@ class GCPVMManager:
 # ============================================================================
 
 _gcp_vm_manager: Optional[GCPVMManager] = None
-_manager_lock = asyncio.Lock()
+_manager_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 async def get_gcp_vm_manager(config: Optional[VMManagerConfig] = None) -> GCPVMManager:

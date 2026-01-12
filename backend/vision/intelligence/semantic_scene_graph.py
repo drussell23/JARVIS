@@ -577,7 +577,7 @@ class SceneGraphIntelligence:
         # Try to calculate eigenvector centrality (may fail on some graphs)
         try:
             eigenvector_centrality = nx.eigenvector_centrality(graph, max_iter=100)
-        except:
+        except Exception:
             eigenvector_centrality = {}
         
         # Combine scores
@@ -770,7 +770,7 @@ class SceneGraphIntelligence:
                     'cycles': cycles[:5],  # Limit to 5
                     'severity': 'high'
                 })
-        except:
+        except Exception:
             pass
         
         return anomalies

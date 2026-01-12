@@ -170,9 +170,9 @@ class WeatherSmartSelector:
             if result.get('success'):
                 analysis = result.get('analysis', '').lower()
                 return 'toronto' in analysis or 'canada' in analysis
-        except:
+        except Exception:
             return False
-    
+
     async def _try_direct_click(self) -> bool:
         """Simple direct click approach"""
         await self.controller.click_at(125, 65)

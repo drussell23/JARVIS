@@ -564,7 +564,7 @@ Include reasoning."""
             # Simple check for connected devices
             return 'Connected: Yes' in result.stdout
             
-        except:
+        except Exception:
             return True  # Assume needed if can't check
     
     async def _control_bluetooth(self, enable: bool) -> Dict[str, Any]:

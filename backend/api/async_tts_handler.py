@@ -160,7 +160,7 @@ class AsyncTTSHandler:
                 await self._run_subprocess_async(lame_cmd)
                 aiff_path.unlink()
                 return mp3_path, "audio/mpeg"
-            except:
+            except Exception:
                 # Use AIFF if conversion fails
                 logger.warning("Audio conversion failed, using AIFF format")
                 return aiff_path, "audio/aiff"
@@ -205,7 +205,7 @@ class AsyncTTSHandler:
         for key, metadata in sorted_entries[:to_remove]:
             try:
                 Path(metadata['path']).unlink()
-            except:
+            except Exception:
                 pass
             del self._cache_metadata[key]
     
@@ -287,9 +287,9 @@ class AsyncTTSHandler:
         for key, info in self._cache_metadata.items():
             try:
                 Path(info['path']).unlink()
-            except:
+            except Exception:
                 pass
-        
+
         self._cache_metadata.clear()
         self._save_cache_metadata()
         logger.info("TTS cache cleared")

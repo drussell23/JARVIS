@@ -44,6 +44,8 @@ from typing import (
 )
 import weakref
 
+from backend.core.async_safety import LazyAsyncLock
+
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
@@ -327,7 +329,7 @@ class PrioritySyncQueue:
                     self._queues[SyncPriority.DEFERRED].get_nowait()
                     queue.put_nowait(event)
                     return True
-                except:
+                except Exception:
                     pass
             return False
 
@@ -1095,7 +1097,7 @@ class TrinityIDESynchronizer:
 # =============================================================================
 
 _synchronizer: Optional[TrinityIDESynchronizer] = None
-_synchronizer_lock = asyncio.Lock()
+_synchronizer_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 async def get_trinity_synchronizer() -> TrinityIDESynchronizer:

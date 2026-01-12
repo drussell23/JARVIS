@@ -30,6 +30,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional
 
+from backend.core.async_safety import LazyAsyncLock
 from .action_registry import (
     ActionMetadata,
     ActionRegistry,
@@ -703,7 +704,7 @@ class AutonomyCoordinator:
 
 
 _coordinator_instance: Optional[AutonomyCoordinator] = None
-_coordinator_lock = asyncio.Lock()
+_coordinator_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 def get_autonomy_coordinator() -> AutonomyCoordinator:

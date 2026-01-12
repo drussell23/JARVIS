@@ -951,8 +951,8 @@ class ScreensaverIntegration:
             
             # Voice unlock works best with password + short delay
             return ask_for_password and delay <= 10
-            
-        except:
+
+        except Exception:
             return False
             
 

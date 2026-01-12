@@ -83,6 +83,7 @@ import logging
 import os
 import re
 import subprocess
+import time
 from dataclasses import dataclass, asdict, field
 from datetime import datetime
 from enum import Enum
@@ -4624,7 +4625,7 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
             if 'watcher' in locals() and watcher:
                 try:
                     await watcher.stop()
-                except:
+                except Exception:
                     pass
 
             return {
@@ -4643,7 +4644,7 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
             if 'watcher' in locals() and watcher:
                 try:
                     await watcher.stop()
-                except:
+                except Exception:
                     pass
 
             return {
@@ -10319,14 +10320,22 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
 
     async def _sync_state_loop(self):
         """Sync state to cross-repo file periodically."""
-        while True:
+        max_runtime = float(os.getenv("TIMEOUT_STATE_SYNC_SESSION", "86400.0"))  # 24 hours
+        sync_timeout = float(os.getenv("TIMEOUT_STATE_SYNC_ITERATION", "30.0"))
+        start = time.time()
+
+        while time.time() - start < max_runtime:
             try:
                 await asyncio.sleep(self.config.sync_interval_seconds)
-                await self._sync_state()
+                await asyncio.wait_for(self._sync_state(), timeout=sync_timeout)
+            except asyncio.TimeoutError:
+                logger.warning("State sync iteration timed out")
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Error in state sync: {e}")
+
+        logger.info("State sync loop reached max runtime, exiting")
 
     async def _sync_state(self):
         """Write current state to cross-repo file."""

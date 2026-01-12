@@ -170,9 +170,9 @@ class WeatherNavigationEnhanced:
                 await self.controller.click_at(125, 65)  # Release
                 await asyncio.sleep(1)
                 return True
-            except:
+            except Exception:
                 return False
-    
+
     async def _human_double_click_toronto(self) -> bool:
         """Double-click with human-like timing"""
         try:
@@ -217,9 +217,9 @@ class WeatherNavigationEnhanced:
                 await self.controller.click_at(125, 65)
                 await asyncio.sleep(1.5)
                 return True
-            except:
+            except Exception:
                 return False
-    
+
     async def _select_via_accessibility(self) -> bool:
         """Use accessibility features to select Toronto"""
         try:

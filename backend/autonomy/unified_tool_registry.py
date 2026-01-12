@@ -568,6 +568,7 @@ class UnifiedToolRegistry:
 
     async def _hot_reload_watcher(self) -> None:
         """Watch for tool file changes and reload."""
+        iteration_timeout = float(os.getenv("TIMEOUT_TOOL_RELOAD_CHECK", "30.0"))
         while True:
             try:
                 await asyncio.sleep(self.config.reload_check_interval)
@@ -587,10 +588,16 @@ class UnifiedToolRegistry:
                     if current_hash != registration.source_hash:
                         self.logger.info(f"[ToolRegistry] Reloading changed tool: {tool_id}")
 
-                        # Unregister and re-discover
-                        await self.unregister_tool(tool_id)
-                        await self._discover_from_path(
-                            os.path.dirname(registration.source_path)
+                        # Unregister and re-discover with timeout
+                        await asyncio.wait_for(
+                            self.unregister_tool(tool_id),
+                            timeout=iteration_timeout
+                        )
+                        await asyncio.wait_for(
+                            self._discover_from_path(
+                                os.path.dirname(registration.source_path)
+                            ),
+                            timeout=iteration_timeout
                         )
                         reloaded += 1
                         self._stats["hot_reloads"] += 1
@@ -598,6 +605,8 @@ class UnifiedToolRegistry:
                 if reloaded > 0:
                     self.logger.info(f"[ToolRegistry] Hot-reloaded {reloaded} tools")
 
+            except asyncio.TimeoutError:
+                self.logger.warning("[ToolRegistry] Hot-reload iteration timed out")
             except asyncio.CancelledError:
                 break
             except Exception as e:

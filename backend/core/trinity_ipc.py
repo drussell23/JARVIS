@@ -44,6 +44,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, TypeVar, Union
 
+from backend.core.async_safety import LazyAsyncLock
+
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
@@ -1154,7 +1156,7 @@ class TrinityIPCBus:
 # =============================================================================
 
 _ipc_bus: Optional[TrinityIPCBus] = None
-_ipc_lock = asyncio.Lock()
+_ipc_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 async def get_trinity_ipc_bus(
@@ -1646,7 +1648,7 @@ class ResilientTrinityIPCBus(TrinityIPCBus):
 # =============================================================================
 
 _resilient_ipc_bus: Optional[ResilientTrinityIPCBus] = None
-_resilient_ipc_lock = asyncio.Lock()
+_resilient_ipc_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 async def get_resilient_trinity_ipc_bus(

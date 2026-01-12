@@ -1543,7 +1543,7 @@ System Control Commands:
             try:
                 fallback_time = datetime.now().strftime("%-I:%M %p")
                 return f"It's {fallback_time}, {self.user_name}."
-            except:
+            except Exception:
                 # Ultimate fallback
                 return f"I'm having trouble accessing the time right now, {self.user_name}."
     
@@ -1694,7 +1694,7 @@ System Control Commands:
             # Countries that typically use 24-hour format
             if system_locale and any(country in system_locale for country in ['de', 'fr', 'es', 'it', 'ru', 'zh', 'jp', 'ko']):
                 return "%H:%M"
-        except:
+        except Exception:
             pass
         
         # Default to 12-hour format with AM/PM
@@ -1718,9 +1718,9 @@ System Control Commands:
                     return "%A, %-d %B"  # Monday, 9 September
                 elif any(eu in system_locale for eu in ['de', 'fr', 'es', 'it']):
                     return "%A %-d %B"  # Monday 9 September
-        except:
+        except Exception:
             pass
-        
+
         # Default format
         return "%A, %B %-d"  # Monday, September 9
     
@@ -1734,10 +1734,10 @@ System Control Commands:
                 output = result.stdout.strip()
                 if "Time Zone:" in output:
                     return output.split("Time Zone:")[1].strip()
-        except:
+        except Exception:
             pass
         return None
-    
+
     def _get_unix_timezone(self) -> Optional[str]:
         """Get timezone on Unix/Linux systems"""
         try:
@@ -1752,17 +1752,17 @@ System Control Commands:
                 tz_path = os.path.realpath('/etc/localtime')
                 if '/zoneinfo/' in tz_path:
                     return tz_path.split('/zoneinfo/')[-1]
-        except:
+        except Exception:
             pass
         return None
-    
+
     def _get_python_timezone(self) -> Optional[str]:
         """Get timezone using Python's time module"""
         try:
             import time
             if hasattr(time, 'tzname'):
                 return time.tzname[time.daylight]
-        except:
+        except Exception:
             pass
         return None
     
@@ -1915,9 +1915,9 @@ System Control Commands:
                 import subprocess
                 subprocess.run(['open', '-a', 'Weather'], check=False)
                 return f"I've opened the Weather app for you to check the forecast, {self.user_name if self.user_name else 'Sir'}."
-            except:
+            except Exception:
                 return f"I'm unable to check the weather at the moment, {self.user_name if self.user_name else 'Sir'}."
-                
+
         except asyncio.TimeoutError:
             logger.error("[WEATHER HANDLER] Weather request timed out")
             # Try to at least open the Weather app
@@ -1925,9 +1925,9 @@ System Control Commands:
                 import subprocess
                 subprocess.run(['open', '-a', 'Weather'], check=False)
                 return f"The weather service is taking longer than expected. I've opened the Weather app for you, {self.user_name if self.user_name else 'Sir'}."
-            except:
+            except Exception:
                 return f"I'm having trouble accessing weather information right now, {self.user_name if self.user_name else 'Sir'}."
-        
+
         except Exception as e:
             logger.error(f"[WEATHER HANDLER] Error processing weather command: {e}", exc_info=True)
             # Emergency fallback - try to open Weather app
@@ -1935,5 +1935,5 @@ System Control Commands:
                 import subprocess
                 subprocess.run(['open', '-a', 'Weather'], check=False)
                 return f"I encountered an error checking the weather. I've opened the Weather app for you, {self.user_name if self.user_name else 'Sir'}."
-            except:
+            except Exception:
                 return f"I'm unable to access weather information at the moment, {self.user_name if self.user_name else 'Sir'}."

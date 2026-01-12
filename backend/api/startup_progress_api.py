@@ -12,6 +12,7 @@ to the UnifiedStartupProgressHub as the single source of truth.
 
 import asyncio
 import logging
+import os
 import threading
 from typing import Dict, List, Optional, Set
 from datetime import datetime
@@ -254,14 +255,23 @@ async def startup_progress_websocket(websocket: WebSocket):
     """WebSocket endpoint for real-time startup progress updates"""
     await startup_progress_manager.connect(websocket)
 
+    # WebSocket idle timeout protection
+    idle_timeout = float(os.getenv("TIMEOUT_WEBSOCKET_IDLE", "300.0"))  # 5 min default
+
     try:
         # Keep connection alive and listen for pings
         while True:
             try:
-                data = await websocket.receive_text()
+                data = await asyncio.wait_for(
+                    websocket.receive_text(),
+                    timeout=idle_timeout
+                )
                 # Client can send "ping" to keep connection alive
                 if data == "ping":
                     await websocket.send_json({"type": "pong"})
+            except asyncio.TimeoutError:
+                logger.info("Startup progress WebSocket idle timeout, closing connection")
+                break
             except WebSocketDisconnect:
                 break
     except Exception as e:

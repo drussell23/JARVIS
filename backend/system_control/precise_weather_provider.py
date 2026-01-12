@@ -265,9 +265,9 @@ class PreciseWeatherProvider:
                             'coordinates': (data.get('latitude'), data.get('longitude')),
                             'source': 'IP'
                         }
-        except:
+        except Exception:
             pass
-            
+
         return None
 
 

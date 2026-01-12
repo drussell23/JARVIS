@@ -639,24 +639,34 @@ class GoalInferenceAgent(BaseNeuralMeshAgent):
     async def _periodic_goal_analysis(self) -> None:
         """Periodic background goal pattern analysis."""
         analysis_interval = float(os.getenv("GOAL_ANALYSIS_INTERVAL", "60.0"))
+        max_runtime = float(os.getenv("TIMEOUT_GOAL_ANALYSIS_SESSION", "86400.0"))  # 24 hours
+        iteration_timeout = float(os.getenv("TIMEOUT_GOAL_ANALYSIS_ITERATION", "30.0"))
+        start = time.monotonic()
 
-        while True:
+        while time.monotonic() - start < max_runtime:
             try:
                 await asyncio.sleep(analysis_interval)
 
-                # Analyze and consolidate patterns
-                if len(self._goal_history) > 10:
-                    # Find habitual patterns
-                    habitual = [
-                        g for g in self._goal_history
-                        if g.intent_level == IntentLevel.HABITUAL
-                    ]
-                    if habitual:
-                        logger.debug(
-                            f"GoalInference: {len(habitual)} habitual patterns detected"
-                        )
+                # Analyze and consolidate patterns with timeout protection
+                async def _analyze_patterns():
+                    if len(self._goal_history) > 10:
+                        # Find habitual patterns
+                        habitual = [
+                            g for g in self._goal_history
+                            if g.intent_level == IntentLevel.HABITUAL
+                        ]
+                        if habitual:
+                            logger.debug(
+                                f"GoalInference: {len(habitual)} habitual patterns detected"
+                            )
 
+                await asyncio.wait_for(_analyze_patterns(), timeout=iteration_timeout)
+
+            except asyncio.TimeoutError:
+                logger.warning("Goal analysis iteration timed out")
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.warning(f"Goal analysis error: {e}")
+
+        logger.info("Goal analysis loop reached max runtime, exiting")

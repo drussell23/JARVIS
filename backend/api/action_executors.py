@@ -72,9 +72,9 @@ class SystemUnlockExecutor(BaseActionExecutor):
             cmd = ['ioreg', '-n', 'Root', '-d1']
             result = subprocess.run(cmd, capture_output=True, text=True)
             return 'CGSSessionScreenIsLocked' in result.stdout
-        except:
+        except Exception:
             return False
-            
+
     async def _unlock_macos(self, context: ExecutionContext) -> Dict[str, Any]:
         """Unlock macOS screen"""
         try:
@@ -114,7 +114,7 @@ class SystemUnlockExecutor(BaseActionExecutor):
                 text=True
             )
             return 'Touch ID' in result.stdout
-        except:
+        except Exception:
             return False
 
 
@@ -208,7 +208,7 @@ class ApplicationLauncherExecutor(BaseActionExecutor):
             try:
                 subprocess.run(['open', f'/Applications/{app_name}.app'], check=True)
                 return {"status": "launched", "message": f"{app_name} launched via direct path"}
-            except:
+            except Exception:
                 raise Exception(f"Could not launch {app_name}")
                 
     async def _launch_generic_app(self, app_name: str, context: ExecutionContext) -> Dict[str, Any]:
@@ -225,9 +225,9 @@ class ApplicationLauncherExecutor(BaseActionExecutor):
                 try:
                     subprocess.Popen([cmd])
                     return {"status": "launched", "message": f"{app_name} launched"}
-                except:
+                except Exception:
                     continue
-                    
+
             raise Exception(f"Could not find launch command for {app_name}")
             
         except Exception as e:
@@ -534,7 +534,7 @@ class ResourceCheckerExecutor(BaseActionExecutor):
                 "status": "success",
                 "message": f"Opened {resource}"
             }
-        except:
+        except Exception:
             return {
                 "status": "unknown",
                 "message": f"Cannot check {resource}"

@@ -572,7 +572,7 @@ class VoiceUnlockMetricsMonitor:
                     if conn:
                         try:
                             conn.close()
-                        except:
+                        except Exception:
                             pass
                     if attempt < max_retries - 1:
                         await asyncio.sleep(retry_delay * (attempt + 1))
@@ -590,7 +590,7 @@ class VoiceUnlockMetricsMonitor:
                 if conn:
                     try:
                         conn.close()
-                    except:
+                    except Exception:
                         pass
 
     async def _send_macos_notification(self, title: str, message: str, subtitle: str = None, sound: bool = True, critical: bool = False):

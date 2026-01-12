@@ -58,6 +58,8 @@ except ImportError:
     CHROMADB_AVAILABLE = False
     logging.warning("ChromaDB not available - install with: pip install chromadb")
 
+from backend.core.async_safety import LazyAsyncLock
+
 logger = logging.getLogger(__name__)
 
 
@@ -2072,6 +2074,11 @@ class JARVISLearningDatabase:
         self.cloud_adapter: Optional["CloudDatabaseAdapter"] = None
         self._cloud_adapter_enabled = self.config.get("enable_cloud_adapter", True)
 
+        # v100.0: Continuous Learning Orchestrator integration
+        # Lazily-loaded reference for forwarding experiences to the learning pipeline
+        self._learning_orchestrator = None
+        self._orchestrator_enabled = self.config.get("enable_learning_orchestrator", True)
+
         logger.info(f"Advanced JARVIS Learning Database initializing at {self.db_dir}")
 
     async def initialize(self):
@@ -3502,6 +3509,19 @@ class JARVISLearningDatabase:
                         )
                     )
 
+                # v100.0: Forward experience to ContinuousLearningOrchestrator (non-blocking)
+                if self._orchestrator_enabled:
+                    asyncio.create_task(
+                        self._forward_to_learning_orchestrator(
+                            user_query=user_query,
+                            jarvis_response=jarvis_response,
+                            response_type=response_type,
+                            confidence_score=confidence_score,
+                            success=success,
+                            session_id=session_id,
+                        )
+                    )
+
                 logger.debug(
                     f"Recorded interaction {interaction_id}: '{user_query[:50]}...' -> '{jarvis_response[:50]}...'"
                 )
@@ -3511,6 +3531,70 @@ class JARVISLearningDatabase:
         except Exception as e:
             logger.error(f"Failed to record interaction: {e}")
             return -1
+
+    async def _forward_to_learning_orchestrator(
+        self,
+        user_query: str,
+        jarvis_response: str,
+        response_type: Optional[str] = None,
+        confidence_score: Optional[float] = None,
+        success: bool = True,
+        session_id: Optional[str] = None,
+    ) -> None:
+        """
+        v100.0: Forward interaction to ContinuousLearningOrchestrator.
+
+        Non-blocking, fire-and-forget forwarding with lazy orchestrator initialization.
+        """
+        try:
+            # Lazy-load the orchestrator
+            if self._learning_orchestrator is None:
+                try:
+                    from backend.intelligence.continuous_learning_orchestrator import (
+                        get_learning_orchestrator,
+                        ExperienceType,
+                    )
+                    self._learning_orchestrator = await get_learning_orchestrator()
+                except ImportError:
+                    logger.debug("ContinuousLearningOrchestrator not available")
+                    self._orchestrator_enabled = False
+                    return
+                except Exception as e:
+                    logger.debug(f"Failed to get learning orchestrator: {e}")
+                    return
+
+            if self._learning_orchestrator is None:
+                return
+
+            # Import ExperienceType here to avoid import cycles
+            from backend.intelligence.continuous_learning_orchestrator import ExperienceType
+
+            # Determine experience type based on response type
+            exp_type = ExperienceType.INTERACTION
+            if response_type:
+                if "command" in response_type.lower():
+                    exp_type = ExperienceType.COMMAND
+                elif "error" in response_type.lower():
+                    exp_type = ExperienceType.ERROR
+                elif "voice" in response_type.lower():
+                    exp_type = ExperienceType.VOICE_AUTH
+
+            # Collect the experience
+            await self._learning_orchestrator.collect_experience(
+                experience_type=exp_type,
+                input_data={"query": user_query, "type": response_type},
+                output_data={"response": jarvis_response[:500]},  # Truncate for efficiency
+                quality_score=confidence_score or 0.5,
+                confidence=confidence_score or 0.5,
+                success=success,
+                component="learning_database",
+                session_id=session_id,
+                metadata={"source": "record_interaction"},
+            )
+
+        except Exception as e:
+            # Non-critical: don't fail the main operation
+            logger.debug(f"Experience forwarding failed: {e}")
 
     async def record_correction(
         self,
@@ -7852,7 +7936,7 @@ class CrossRepoSync:
 
 # Global instance with async initialization
 _db_instance = None
-_db_lock = asyncio.Lock()
+_db_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 _cross_repo_sync = None
 
 

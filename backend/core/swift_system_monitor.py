@@ -776,7 +776,7 @@ class SwiftSystemMonitor:
                 return 'warn'
             else:
                 return 'normal'
-        except:
+        except Exception:
             pass
 
         return 'normal'

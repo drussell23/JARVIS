@@ -81,11 +81,11 @@ class MacOSLocationService:
                     "country": data.get("country", ""),
                     "method": "shortcuts"
                 }
-        except:
+        except Exception:
             pass
-        
+
         return None
-    
+
     async def _get_location_via_corelocation(self) -> Optional[Dict]:
         """Get location using CoreLocationCLI"""
         try:
@@ -182,11 +182,11 @@ class MacOSLocationService:
                     # Could use Wi-Fi SSID to infer location if it contains location info
                     # For now, continue to other methods
             
-        except:
+        except Exception:
             pass
-        
+
         return None
-    
+
     async def _get_location_via_apple_script(self) -> Optional[Dict]:
         """Get location using AppleScript and system services"""
         try:

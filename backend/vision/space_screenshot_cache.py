@@ -5,6 +5,7 @@ Implements predictive caching, pattern learning, and confidence scoring
 """
 
 import asyncio
+import os
 import time
 import logging
 import pickle
@@ -186,22 +187,26 @@ class SpaceScreenshotCache:
             
     async def _predictive_cache_loop(self):
         """Background loop for predictive caching"""
-        while True:
+        max_runtime = float(os.getenv("TIMEOUT_VISION_SESSION", "3600.0"))  # 1 hour default
+        session_start = time.monotonic()
+        while time.monotonic() - session_start < max_runtime:
             try:
                 # Check patterns every minute
                 await asyncio.sleep(60)
-                
+
                 # Get spaces likely to be needed soon
                 likely_spaces = self._get_likely_spaces()
-                
+
                 for space_id in likely_spaces[:3]:  # Pre-cache top 3
                     if space_id not in self.cache or self.cache[space_id].confidence_level() == CacheConfidence.OUTDATED:
                         logger.info(f"Predictive caching for space {space_id}")
                         # Request cache update (implementation depends on your capture method)
                         # await self.request_cache_update(space_id, "predictive")
-                        
+
             except Exception as e:
                 logger.error(f"Error in predictive cache loop: {e}")
+        else:
+            logger.info("Space screenshot predictive cache loop timeout, stopping")
                 
     def _get_likely_spaces(self) -> List[int]:
         """Get spaces likely to be needed soon"""

@@ -115,7 +115,7 @@ class AdaptiveQualityController:
         try:
             width, height = res_str.split('x')
             return (int(width), int(height))
-        except:
+        except Exception:
             return (1280, 720)  # Default fallback
     
     def calculate_quality_adjustment(self, metrics: StreamMetrics, 

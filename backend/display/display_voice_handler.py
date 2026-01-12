@@ -321,7 +321,7 @@ def create_voice_handler(voice_engine: Optional[Any] = None, voice_integration: 
             from engines.voice_engine import VoiceEngine
             voice_engine = VoiceEngine()
             logger.info("[DISPLAY VOICE] Auto-detected VoiceEngine")
-        except:
+        except Exception:
             pass
 
     # Don't auto-detect voice_integration for display monitor

@@ -329,7 +329,7 @@ class MemoryAwareScreenAnalyzer:
             else:
                 # Basic estimation
                 return 1024 * 1024  # Assume 1MB per capture
-        except:
+        except Exception:
             return 1024 * 1024  # Default 1MB
     
     async def _quick_screen_analysis(self) -> Dict[str, Any]:
@@ -412,7 +412,7 @@ Be concise but thorough.'''
                 key_time = int(key.split('_')[-1]) * self.config['cache_duration_seconds']
                 if force or (current_time - key_time > self.config['cache_duration_seconds'] * 2):
                     keys_to_remove.append(key)
-            except:
+            except Exception:
                 keys_to_remove.append(key)  # Remove malformed keys
         
         for key in keys_to_remove:
@@ -495,7 +495,7 @@ Be concise but thorough.'''
             try:
                 import json
                 apps = json.loads(app_patterns)
-            except:
+            except Exception:
                 apps = self._get_default_app_patterns()
         else:
             apps = self._get_default_app_patterns()

@@ -33,6 +33,7 @@ from enum import Enum, auto
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
+from backend.core.async_safety import LazyAsyncLock
 from .action_registry import ActionCategory, ActionMetadata, ActionRiskLevel, ActionType
 
 logger = logging.getLogger(__name__)
@@ -1003,7 +1004,7 @@ class SafetyValidator:
 
 
 _validator_instance: Optional[SafetyValidator] = None
-_validator_lock = asyncio.Lock()
+_validator_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 def get_safety_validator() -> SafetyValidator:

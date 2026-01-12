@@ -12,6 +12,7 @@ Features:
 """
 import asyncio
 import logging
+import os
 import time
 import random
 from typing import Dict, Any, Optional, List, Callable
@@ -21,6 +22,8 @@ from datetime import datetime, timedelta
 import httpx
 import yaml
 from pathlib import Path
+
+from backend.core.async_safety import TimeoutConfig, get_shutdown_event
 
 logger = logging.getLogger(__name__)
 
@@ -310,12 +313,35 @@ class HybridBackendClient:
         await self.client.aclose()
 
     async def _health_check_loop(self, interval: int):
-        """Periodic health check loop"""
+        """Periodic health check loop with timeout protection."""
+        shutdown_event = get_shutdown_event()
+        max_iterations = int(os.getenv("BACKEND_HEALTH_MAX_ITERATIONS", "0")) or None
+        iteration = 0
+
         while True:
+            # Check for shutdown
+            if shutdown_event.is_set():
+                logger.info("Backend health check loop stopped via shutdown event")
+                break
+
+            # Check max iterations (for testing/safety)
+            if max_iterations and iteration >= max_iterations:
+                logger.info(f"Backend health check loop reached max iterations ({max_iterations})")
+                break
+
+            iteration += 1
+
             try:
                 await asyncio.sleep(interval)
-                await self._check_all_backends()
+                # Add timeout protection for health check
+                await asyncio.wait_for(
+                    self._check_all_backends(),
+                    timeout=TimeoutConfig.HEALTH_CHECK
+                )
+            except asyncio.TimeoutError:
+                logger.warning(f"Backend health check timed out after {TimeoutConfig.HEALTH_CHECK}s")
             except asyncio.CancelledError:
+                logger.info("Backend health check loop cancelled")
                 break
             except Exception as e:
                 logger.error(f"Health check error: {e}")

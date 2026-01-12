@@ -354,9 +354,9 @@ class IntelligentMemoryOptimizer:
                 if hasattr(obj, 'cache_clear') and callable(obj.cache_clear):
                     try:
                         obj.cache_clear()
-                    except:
+                    except Exception:
                         pass
-        except:
+        except Exception:
             pass
 
         # Clear re caches
@@ -469,7 +469,7 @@ class IntelligentMemoryOptimizer:
                 freed_mb += proc.memory_mb
                 logger.info(f"Killed {proc.name} (freed {proc.memory_mb:.0f} MB)")
                 await asyncio.sleep(0.1)
-            except:
+            except Exception:
                 pass
 
         return freed_mb
@@ -547,13 +547,13 @@ class IntelligentMemoryOptimizer:
                             f"Gracefully closed {app.name}, freed {app.memory_mb:.0f} MB"
                         )
                         await asyncio.sleep(2)  # Give time to close
-                    except:
+                    except Exception:
                         # Fall back to terminate
                         try:
                             psutil.Process(app.pid).terminate()
                             freed_mb += app.memory_mb
                             closed_apps.append(app.name)
-                        except:
+                        except Exception:
                             pass
 
             elif "whatsapp" in app.name.lower():
@@ -563,7 +563,7 @@ class IntelligentMemoryOptimizer:
                     freed_mb += app.memory_mb
                     closed_apps.append(app.name)
                     logger.info(f"Closed {app.name}, freed {app.memory_mb:.0f} MB")
-                except:
+                except Exception:
                     pass
 
             elif "chrome" in app.name.lower() or "safari" in app.name.lower():
@@ -587,7 +587,7 @@ class IntelligentMemoryOptimizer:
                         freed_mb += app.memory_mb
                         closed_apps.append(app.name)
                         logger.info(f"Closed {app.name}, freed {app.memory_mb:.0f} MB")
-                    except:
+                    except Exception:
                         pass
 
             # Check if we've freed enough memory
@@ -634,7 +634,7 @@ class IntelligentMemoryOptimizer:
                     freed_mb += pinfo.memory_mb * 0.7  # Estimate 70% freed
                     logger.info(f"Suspended {pinfo.name}")
 
-            except:
+            except Exception:
                 continue
 
         return freed_mb
@@ -670,7 +670,7 @@ class IntelligentMemoryOptimizer:
                     )
                     freed_mb += 50  # Estimate
 
-            except:
+            except Exception:
                 pass
 
         return freed_mb
@@ -709,7 +709,7 @@ class IntelligentMemoryOptimizer:
             with open("/proc/sys/vm/drop_caches", "w", errors="ignore") as f:
                 f.write("1")
 
-        except:
+        except Exception:
             pass
 
         await asyncio.sleep(2)  # Wait for operations to complete
@@ -755,7 +755,7 @@ class IntelligentMemoryOptimizer:
                     suggestions.append(
                         f"Close {proc.info['name']} (using {proc.info['memory_percent']:.1f}% memory)"
                     )
-            except:
+            except Exception:
                 continue
 
         # Check browser tabs
@@ -775,7 +775,7 @@ class IntelligentMemoryOptimizer:
                     suggestions.append(
                         f"Close some Chrome tabs (currently {tab_count} open)"
                     )
-            except:
+            except Exception:
                 pass
 
         # Check for high-memory apps
@@ -796,7 +796,7 @@ class IntelligentMemoryOptimizer:
                         suggestions.append(
                             f"Close {name} (using {proc.info['memory_percent']:.1f}% memory)"
                         )
-            except:
+            except Exception:
                 continue
 
         return suggestions[:5]  # Return top 5 suggestions

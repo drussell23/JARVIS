@@ -374,7 +374,7 @@ class ActionExecutor:
         for app in sensitive_apps:
             try:
                 await self.macos_controller.hide_application(app)
-            except:
+            except Exception:
                 pass  # App might not be open
         
         # Open meeting app if needed

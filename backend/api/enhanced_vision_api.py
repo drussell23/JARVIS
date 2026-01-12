@@ -231,14 +231,24 @@ async def enhanced_vision_websocket(websocket: WebSocket):
     """Enhanced WebSocket endpoint for vision system"""
     await vision_ws_manager.connect(websocket)
     
+    # WebSocket idle timeout protection
+    idle_timeout = float(os.getenv("TIMEOUT_WEBSOCKET_IDLE", "300.0"))  # 5 min default
+
     try:
         while True:
-            # Receive message from client
-            data = await websocket.receive_json()
-            
+            # Receive message from client with timeout
+            try:
+                data = await asyncio.wait_for(
+                    websocket.receive_json(),
+                    timeout=idle_timeout
+                )
+            except asyncio.TimeoutError:
+                logger.info("Enhanced vision WebSocket idle timeout, closing connection")
+                break
+
             # Handle the command
             await vision_ws_manager.handle_command(websocket, data)
-            
+
     except WebSocketDisconnect:
         vision_ws_manager.disconnect(websocket)
     except Exception as e:

@@ -23,6 +23,7 @@ from enum import Enum, auto
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 from dataclasses import dataclass, field
 
+from backend.core.async_safety import LazyAsyncLock
 from pydantic import BaseModel, Field
 
 from .voice_auth_tools import (
@@ -1340,7 +1341,7 @@ class VoiceAuthOrchestrator:
 # =============================================================================
 
 _orchestrator_instance: Optional[VoiceAuthOrchestrator] = None
-_orchestrator_lock = asyncio.Lock()
+_orchestrator_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 async def get_voice_auth_orchestrator(

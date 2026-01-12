@@ -825,7 +825,7 @@ class RealTimeVoiceCommunicator:
                 import os
                 username = os.environ.get('USER', 'there')
                 return username.split('.')[0].title()
-            except:
+            except Exception:
                 return "there"
 
     async def speak_immediate(
@@ -944,7 +944,7 @@ class RealTimeVoiceCommunicator:
                     if self._current_speech_process:
                         self._current_speech_process.kill()
                     self._current_speech_process = None
-                except:
+                except Exception:
                     pass
                 self._is_speaking = False  # Always clear flag on error
                 self._current_message = None

@@ -128,7 +128,7 @@ class JARVISReloadManager:
             try:
                 with open(self.config_file, 'r') as f:
                     return json.load(f)
-            except:
+            except Exception:
                 pass
 
         # Default configuration
@@ -161,7 +161,7 @@ class JARVISReloadManager:
                 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                     s.bind(('', port))
                     return port
-            except:
+            except Exception:
                 continue
 
         raise RuntimeError(f"No available ports found between {start_port} and {max_port}")
@@ -182,7 +182,7 @@ class JARVISReloadManager:
                             file_hash = hashlib.md5(f.read()).hexdigest()
                             rel_path = str(file_path.relative_to(self.backend_dir))
                             hashes[rel_path] = file_hash
-                    except:
+                    except Exception:
                         continue
 
         return hashes
@@ -203,7 +203,7 @@ class JARVISReloadManager:
             try:
                 with open(self.code_hash_file, 'rb') as f:
                     previous_hashes = pickle.load(f)
-            except:
+            except Exception:
                 pass
 
         # Separate hot-reload from cold-restart files
@@ -339,7 +339,7 @@ class JARVISReloadManager:
                         jarvis_processes.append(proc)
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
-            except:
+            except Exception:
                 continue
 
         return jarvis_processes
@@ -513,7 +513,7 @@ class JARVISReloadManager:
             try:
                 import shutil
                 shutil.rmtree(cache_dir)
-            except:
+            except Exception:
                 pass
 
         # Clear sys.modules for our modules

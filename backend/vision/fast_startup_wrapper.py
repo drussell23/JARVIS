@@ -78,7 +78,7 @@ class FastStartupWrapper:
                     loader = get_component_loader()
                     if loader and loader._running:
                         await loader._check_all_components()
-                except:
+                except Exception:
                     pass
             else:
                 logger.info("⚠️ Rust build failed in background, continuing with Python implementations")

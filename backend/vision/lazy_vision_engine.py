@@ -265,7 +265,7 @@ class LazyDynamicVisionEngine:
             try:
                 from .screen_capture_fallback import capture_screen_simple
                 return await capture_screen_simple()
-            except:
+            except Exception:
                 return {"error": "Screen capture not available"}
                 
         self.register_capability(

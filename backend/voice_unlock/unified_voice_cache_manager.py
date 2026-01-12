@@ -52,6 +52,8 @@ from datetime import datetime, timedelta
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
+from backend.core.async_safety import LazyAsyncLock
+
 import numpy as np
 
 logger = logging.getLogger(__name__)
@@ -1414,7 +1416,7 @@ class UnifiedVoiceCacheManager:
                                 profile.last_verified = datetime.fromisoformat(
                                     updated_at.replace("Z", "+00:00")
                                 )
-                            except:
+                            except Exception:
                                 pass
 
                         self._preloaded_profiles[speaker_name] = profile
@@ -3316,7 +3318,7 @@ async def initialize_unified_cache(
 # =============================================================================
 # ASYNC GETTER WITH AUTO-INITIALIZATION
 # =============================================================================
-_init_lock = asyncio.Lock()
+_init_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 _initialized = False
 
 

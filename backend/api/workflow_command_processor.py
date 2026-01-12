@@ -402,7 +402,7 @@ Generate ONLY the response text, nothing else."""
                 return loop.run_until_complete(
                     self._generate_response_with_claude(workflow, result)
                 )
-        except:
+        except Exception:
             return self._generate_basic_response(workflow, result)
 
     async def get_workflow_examples(self) -> List[Dict[str, Any]]:

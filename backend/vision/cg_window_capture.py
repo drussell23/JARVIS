@@ -1467,7 +1467,7 @@ class AdvancedCGWindowCapture:
         # Try to load a font, fall back to default
         try:
             font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 16)
-        except:
+        except Exception:
             font = ImageFont.load_default()
 
         # Build annotation text

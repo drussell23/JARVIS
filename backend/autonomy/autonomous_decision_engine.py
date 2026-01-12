@@ -337,7 +337,7 @@ class PatternMatcher:
                     try:
                         minutes = int(match.group(1))
                         return True, minutes
-                    except:
+                    except Exception:
                         return True, None
         
         return False, None

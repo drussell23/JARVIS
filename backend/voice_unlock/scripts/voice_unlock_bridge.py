@@ -8,9 +8,11 @@ for the Objective-C Voice Unlock daemon.
 """
 
 import json
+import os
 import sys
 import logging
 import base64
+import time
 import numpy as np
 import asyncio
 import threading
@@ -389,26 +391,40 @@ class MessageHandler:
 def main():
     """Main entry point"""
     logger.info('JARVIS Voice Unlock Python Bridge started')
-    
+
     handler = MessageHandler()
-    
-    # Read messages from stdin
-    while True:
+
+    session_timeout = float(os.getenv("TIMEOUT_VOICE_SESSION", "3600.0"))  # 1 hour default
+    session_start = time.monotonic()
+    read_timeout = float(os.getenv("TIMEOUT_VOICE_READ", "60.0"))  # 60 second read timeout
+
+    # Read messages from stdin with timeout protection
+    while time.monotonic() - session_start < session_timeout:
         try:
+            # Use select for timeout on stdin read (Unix-like systems)
+            import select
+            ready, _, _ = select.select([sys.stdin], [], [], read_timeout)
+            if not ready:
+                logger.debug("Stdin read idle, continuing...")
+                continue
+
             line = sys.stdin.readline()
             if not line:
                 break
-                
+
             message = json.loads(line.strip())
             handler.process_message(message)
-            
+
         except json.JSONDecodeError as e:
             logger.error(f'Invalid JSON: {e}')
         except KeyboardInterrupt:
             break
         except Exception as e:
             logger.error(f'Unexpected error: {e}')
-            
+
+    if time.monotonic() - session_start >= session_timeout:
+        logger.warning('Voice unlock bridge session timeout reached')
+
     logger.info('JARVIS Voice Unlock Python Bridge stopped')
 
 

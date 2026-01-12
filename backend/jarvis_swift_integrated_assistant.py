@@ -212,9 +212,9 @@ class JARVISSwiftIntegratedAssistant(JARVISIntegratedAssistant):
             try:
                 swift_info = self.swift_bridge.get_statistics()
                 info['swift_stats'] = swift_info
-            except:
+            except Exception:
                 pass
-        
+
         return info
 
 async def test_swift_integration():

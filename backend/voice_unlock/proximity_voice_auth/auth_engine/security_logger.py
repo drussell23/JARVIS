@@ -150,7 +150,7 @@ class SecurityLogger:
                 event_time = datetime.fromisoformat(event['timestamp'])
                 if event_time > cutoff:
                     recent_events.append(event)
-            except:
+            except Exception:
                 continue
         
         # Analyze patterns

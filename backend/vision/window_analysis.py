@@ -274,7 +274,9 @@ class MemoryAwareWindowAnalyzer:
     
     async def _cleanup_loop(self):
         """Periodic cleanup of old cached data"""
-        while True:
+        max_runtime = float(os.getenv("TIMEOUT_VISION_SESSION", "3600.0"))  # 1 hour default
+        session_start = time.monotonic()
+        while time.monotonic() - session_start < max_runtime:
             try:
                 await asyncio.sleep(self.config['cleanup_interval_seconds'])
                 self._cleanup_old_cache()
@@ -283,6 +285,8 @@ class MemoryAwareWindowAnalyzer:
                 break
             except Exception as e:
                 logger.error(f"Error in cleanup loop: {e}")
+        else:
+            logger.info("Window analysis cleanup loop timeout, stopping")
     
     def _cleanup_old_cache(self):
         """Remove old entries from cache"""
@@ -483,7 +487,7 @@ class MemoryAwareWindowAnalyzer:
                     try:
                         count = int(match.group(1) or match.group(2))
                         notification['count'] = count
-                    except:
+                    except Exception:
                         pass
                         
                 notifications.append(notification)

@@ -500,7 +500,7 @@ class RealTimeInteractionHandler:
                     if json_match:
                         structured_response = json.loads(json_match.group())
                         return structured_response
-            except:
+            except Exception:
                 pass
                 
             # Otherwise, build response from analysis

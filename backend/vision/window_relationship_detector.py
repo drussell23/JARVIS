@@ -531,7 +531,7 @@ class ConfigurableWindowRelationshipDetector:
         if languages_json:
             try:
                 languages = json.loads(languages_json)
-            except:
+            except Exception:
                 languages = self._get_default_languages()
         else:
             languages = self._get_default_languages()

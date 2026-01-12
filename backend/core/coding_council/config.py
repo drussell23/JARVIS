@@ -33,6 +33,8 @@ from typing import Any, Callable, Dict, List, Optional, Set, TypeVar, Union
 from functools import lru_cache, cached_property
 import weakref
 
+from backend.core.async_safety import LazyAsyncLock
+
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
@@ -565,7 +567,7 @@ class UnifiedTrinityConfig:
 # =============================================================================
 
 _config: Optional[UnifiedTrinityConfig] = None
-_config_lock = asyncio.Lock()
+_config_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 def get_config() -> UnifiedTrinityConfig:

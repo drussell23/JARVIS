@@ -552,7 +552,7 @@ class MLEnhancedVoiceSystem:
                     svm_score = self.personalized_svm.decision_function([feature_vector])[0]
                     svm_prob = 1 / (1 + np.exp(-svm_score))  # Convert to probability
                     detections.append(('svm', svm_prob, svm_prob > thresholds.confidence_threshold))
-                except:
+                except Exception:
                     pass
             
             # 3. Neural network if available
@@ -734,7 +734,7 @@ class MLEnhancedVoiceSystem:
             feature_vector = self._prepare_feature_vector(features)
             prediction = self.anomaly_detector.predict([feature_vector])
             return prediction[0] == 1  # 1 = normal, -1 = anomaly
-        except:
+        except Exception:
             return True
     
     async def update_environmental_profile(self, audio_stream: np.ndarray):

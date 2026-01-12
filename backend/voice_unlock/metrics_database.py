@@ -3295,7 +3295,7 @@ class MetricsDatabase:
                     import time
                     boot_time = int(result.stdout.split('sec = ')[1].split(',')[0])
                     system_uptime = time.time() - boot_time
-            except:
+            except Exception:
                 pass
 
             # Check if screen is locked
@@ -3303,7 +3303,7 @@ class MetricsDatabase:
             try:
                 from voice_unlock.objc.server.screen_lock_detector import is_screen_locked
                 was_screen_locked = 1 if is_screen_locked() else 0
-            except:
+            except Exception:
                 pass
 
             cursor.execute("""

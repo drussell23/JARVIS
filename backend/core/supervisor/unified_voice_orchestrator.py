@@ -90,6 +90,8 @@ from datetime import datetime, timedelta
 from enum import Enum, auto
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
+from backend.core.async_safety import LazyAsyncLock
+
 logger = logging.getLogger(__name__)
 
 
@@ -1019,7 +1021,7 @@ class UnifiedVoiceOrchestrator:
 
 # Singleton instance
 _voice_orchestrator: Optional[UnifiedVoiceOrchestrator] = None
-_orchestrator_lock = asyncio.Lock()
+_orchestrator_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 def get_voice_orchestrator(config: Optional[VoiceConfig] = None) -> UnifiedVoiceOrchestrator:

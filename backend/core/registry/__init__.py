@@ -41,7 +41,18 @@ from .unified_agent_registry import (
     shutdown_agent_registry,
 )
 
+from .neural_mesh_bridge import (
+    NeuralMeshBridge,
+    AgentTranslator,
+    SyncDirection,
+    SyncResult,
+    BridgeMetrics,
+    get_registry_bridge,
+    shutdown_registry_bridge,
+)
+
 __all__ = [
+    # Unified Agent Registry
     "UnifiedAgentRegistry",
     "AgentInfo",
     "AgentStatus",
@@ -51,4 +62,12 @@ __all__ = [
     "RegistryMetrics",
     "get_agent_registry",
     "shutdown_agent_registry",
+    # Neural Mesh Bridge
+    "NeuralMeshBridge",
+    "AgentTranslator",
+    "SyncDirection",
+    "SyncResult",
+    "BridgeMetrics",
+    "get_registry_bridge",
+    "shutdown_registry_bridge",
 ]

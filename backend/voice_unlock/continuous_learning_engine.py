@@ -29,6 +29,8 @@ from pathlib import Path
 from dataclasses import dataclass, asdict
 import sqlite3
 
+from backend.core.async_safety import LazyAsyncLock
+
 logger = logging.getLogger(__name__)
 
 # Import advanced ML features
@@ -1018,8 +1020,8 @@ class ContinuousLearningEngine:
 
 # Singleton instance with thread safety
 _learning_engine = None
-_learning_engine_lock = asyncio.Lock()
-_initialization_lock = asyncio.Lock()
+_learning_engine_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
+_initialization_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 async def get_learning_engine() -> ContinuousLearningEngine:

@@ -1821,7 +1821,7 @@ class AsyncRestartManager:
                 sock.close()
                 if result != 0:  # Port is free
                     return self.config.primary_api_port
-            except:
+            except Exception:
                 pass
 
         # Try fallback ports
@@ -1835,7 +1835,7 @@ class AsyncRestartManager:
                 sock.close()
                 if result != 0:  # Port is free
                     return port
-            except:
+            except Exception:
                 continue
 
         return None
@@ -3831,7 +3831,7 @@ class ProcessCleanupManager:
         except RuntimeError:
             try:
                 port_status = asyncio.run(async_manager.verify_ports_free_async(ports_to_check))
-            except:
+            except Exception:
                 port_status = self._sync_verify_ports(ports_to_check, ue_detector)
 
         for port, status in port_status.items():
@@ -3854,7 +3854,7 @@ class ProcessCleanupManager:
         for module_name in to_remove:
             try:
                 del sys.modules[module_name]
-            except:
+            except Exception:
                 pass
 
         if to_remove:
@@ -3985,7 +3985,7 @@ class ProcessCleanupManager:
                         "cmdline": cmdline[:100],
                         "status": "shell_killed",
                     })
-                except:
+                except Exception:
                     logger.error(f"   ❌ Failed to kill {ptype} PID {proc.pid}: {e}")
 
         return cleaned
@@ -4720,7 +4720,7 @@ class ProcessCleanupManager:
                 pass
 
             return False
-        except:
+        except Exception:
             return False
 
     def calculate_cleanup_priority(self, proc_info: Dict) -> float:
@@ -5411,7 +5411,7 @@ class ProcessCleanupManager:
                     if "main.py" in cmdline:
                         age_hours = (time.time() - proc.create_time()) / 3600
                         return age_hours
-            except:  # nosec B112
+            except Exception:  # nosec B112
                 continue
         return None
 
@@ -5701,7 +5701,7 @@ class ProcessCleanupManager:
                                     results["ipc_cleaned"]["semaphores"] = (
                                         results["ipc_cleaned"].get("semaphores", 0) + 1
                                     )
-                                except:
+                                except Exception:
                                     pass
 
                 # Clean all shared memory
@@ -5717,7 +5717,7 @@ class ProcessCleanupManager:
                                     results["ipc_cleaned"]["shared_memory"] = (
                                         results["ipc_cleaned"].get("shared_memory", 0) + 1
                                     )
-                                except:
+                                except Exception:
                                     pass
 
         except Exception as e:
@@ -5729,7 +5729,7 @@ class ProcessCleanupManager:
             import multiprocessing
 
             multiprocessing.set_start_method("spawn", force=True)
-        except:
+        except Exception:
             pass
 
         # Step 5: Clean up CloudSQL connections
@@ -5778,7 +5778,7 @@ class ProcessCleanupManager:
             try:
                 self.code_state_file.unlink()
                 logger.info("Removed code state file for fresh start")
-            except:
+            except Exception:
                 pass
 
         # Step 7: Clean up ALL GCP VMs for this machine (synchronous)
@@ -5861,7 +5861,7 @@ class ProcessCleanupManager:
             if "leaked semaphore" in result.stdout.lower() or result.returncode != 0:
                 recovery_needed = True
                 logger.warning("Detected leaked semaphores - likely segfault or crash")
-        except:
+        except Exception:
             pass
 
         # Check for zombie Python processes
@@ -5871,7 +5871,7 @@ class ProcessCleanupManager:
                     recovery_needed = True
                     logger.warning(f"Found zombie Python process: PID {proc.pid}")
                     break
-            except:  # nosec B112
+            except Exception:  # nosec B112
                 continue
 
         # Check for stale lock files or PIDs
@@ -5888,7 +5888,7 @@ class ProcessCleanupManager:
                             recovery_needed = True
                             logger.warning(f"Found stale PID file: {pid_file}")
                             pid_file.unlink()  # Remove stale PID file
-                except:
+                except Exception:
                     pass
 
         if recovery_needed:

@@ -70,6 +70,8 @@ from typing import (
     Union,
 )
 
+from backend.core.async_safety import LazyAsyncLock
+
 # Environment-driven configuration
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 REDIS_STATE_DB = int(os.getenv("REDIS_STATE_DB", "2"))
@@ -1089,7 +1091,7 @@ class DistributedStateManager:
 
 # Global instance
 _state_manager: Optional[DistributedStateManager] = None
-_lock = asyncio.Lock()
+_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 async def get_state_manager() -> DistributedStateManager:

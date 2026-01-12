@@ -619,15 +619,26 @@ class CoreMLVoiceEngineBridge:
         """
         logger.info("[CoreML-ASYNC-WORKER] Started voice queue worker")
 
-        while True:
+        session_timeout = float(os.getenv("TIMEOUT_VOICE_SESSION", "300.0"))  # 5 min default
+        session_start = time.monotonic()
+
+        while time.monotonic() - session_start < session_timeout:
             try:
                 # Check if we have capacity
                 if len(self.voice_queue.in_flight) >= self.voice_queue.max_concurrent:
                     await asyncio.sleep(0.1)
                     continue
 
-                # Get next task
-                task = await self.voice_queue.dequeue()
+                # Get next task with timeout protection
+                try:
+                    task = await asyncio.wait_for(
+                        self.voice_queue.dequeue(),
+                        timeout=float(os.getenv("TIMEOUT_VOICE_READ", "10.0"))
+                    )
+                except asyncio.TimeoutError:
+                    logger.debug("[CoreML-ASYNC-WORKER] Queue idle, continuing...")
+                    continue
+
                 if not task:
                     await asyncio.sleep(0.1)
                     continue
@@ -644,6 +655,8 @@ class CoreMLVoiceEngineBridge:
             except Exception as e:
                 logger.error(f"[CoreML-ASYNC-WORKER] Worker error: {e}")
                 await asyncio.sleep(1)  # Backoff on errors
+
+        logger.info("[CoreML-ASYNC-WORKER] Session timeout reached - shutting down")
 
     async def _process_voice_task(self, task: VoiceTask):
         """Process a single voice task"""

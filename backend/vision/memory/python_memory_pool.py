@@ -41,7 +41,7 @@ class MemoryBuffer:
         """Ensure buffer is released."""
         try:
             self.release()
-        except:
+        except Exception:
             pass
 
 class PythonMemoryPool:

@@ -8,6 +8,7 @@ import io
 import os
 import re
 import logging
+import time
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Any
 import Quartz
@@ -496,7 +497,9 @@ class ScreenVisionSystem:
             callback: Function to call when updates are detected
             interval: Seconds between scans (default 5 minutes)
         """
-        while True:
+        max_runtime = float(os.getenv("TIMEOUT_VISION_SESSION", "3600.0"))  # 1 hour default
+        session_start = time.monotonic()
+        while time.monotonic() - session_start < max_runtime:
             try:
                 updates = await self.scan_for_updates()
                 if updates:
@@ -505,6 +508,8 @@ class ScreenVisionSystem:
                 print(f"Error during screen monitoring: {e}")
 
             await asyncio.sleep(interval)
+        else:
+            logger.info("Screen monitoring session timeout, stopping")
 
     async def get_screen_context(
         self, region: Optional[Tuple[int, int, int, int]] = None

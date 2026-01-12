@@ -7,6 +7,7 @@ Enhanced with YOLO-based UI element detection for automation support
 
 import asyncio
 import logging
+import os
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -219,8 +220,10 @@ class WindowDetector:
     async def monitor_windows(self, callback=None):
         """Monitor windows for changes in real-time"""
         previous_windows = []
+        max_runtime = float(os.getenv("TIMEOUT_VISION_SESSION", "3600.0"))  # 1 hour default
+        session_start = time.monotonic()
 
-        while True:
+        while time.monotonic() - session_start < max_runtime:
             try:
                 changes = self.detect_window_changes(previous_windows)
 
@@ -236,6 +239,8 @@ class WindowDetector:
                 logger.error(f"Error monitoring windows: {e}")
 
             await asyncio.sleep(self.update_interval)
+        else:
+            logger.info("Window monitoring session timeout, stopping")
 
     async def detect_window_ui_elements(
         self, window: WindowInfo, screenshot=None

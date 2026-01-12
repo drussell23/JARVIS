@@ -37,6 +37,8 @@ from contextlib import asynccontextmanager
 
 import numpy as np
 
+from backend.core.async_safety import LazyAsyncLock
+
 try:
     import chromadb
     from chromadb.config import Settings
@@ -1699,7 +1701,7 @@ class PersonalContextChallengeGenerator:
 # =============================================================================
 
 _memory_instance: Optional[VoicePatternMemory] = None
-_memory_lock = asyncio.Lock()
+_memory_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 async def get_voice_pattern_memory(

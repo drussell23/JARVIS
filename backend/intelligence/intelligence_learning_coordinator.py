@@ -46,6 +46,8 @@ from typing import Dict, List, Optional, Tuple, Any
 from pathlib import Path
 import json
 
+from backend.core.async_safety import LazyAsyncLock
+
 try:
     import numpy as np
     NUMPY_AVAILABLE = True
@@ -737,7 +739,7 @@ class IntelligenceLearningCoordinator:
 
 # Singleton instance
 _coordinator_instance: Optional[IntelligenceLearningCoordinator] = None
-_coordinator_lock = asyncio.Lock()
+_coordinator_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 async def get_learning_coordinator(config: Optional[Dict] = None) -> IntelligenceLearningCoordinator:

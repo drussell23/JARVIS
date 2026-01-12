@@ -33,6 +33,8 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
+from backend.core.async_safety import LazyAsyncLock
+
 logger = logging.getLogger(__name__)
 
 # Optional integrations
@@ -464,7 +466,7 @@ class VoicePatternStore:
                         timestamp_str = metadata.get('timestamp', '1970-01-01T00:00:00')
                         try:
                             timestamp = datetime.fromisoformat(timestamp_str)
-                        except:
+                        except Exception:
                             timestamp = datetime(1970, 1, 1)
                         patterns_with_time.append((pattern_id, timestamp))
 
@@ -494,7 +496,7 @@ class VoicePatternStore:
                     "similarity_threshold": self.config.pattern_similarity_threshold,
                 },
             }
-        except:
+        except Exception:
             return {"initialized": True, "error": "stats_unavailable"}
 
 
@@ -638,7 +640,7 @@ class AuthenticationAuditTrail:
         if self.langfuse:
             try:
                 self.langfuse.flush()
-            except:
+            except Exception:
                 pass
 
 
@@ -1166,7 +1168,7 @@ class VoiceAuthEnhancementManager:
 # =============================================================================
 
 _enhancement_manager: Optional[VoiceAuthEnhancementManager] = None
-_enhancement_lock = asyncio.Lock()
+_enhancement_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 async def get_voice_auth_enhancements(

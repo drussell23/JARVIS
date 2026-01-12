@@ -130,7 +130,7 @@ class ResourceMonitor:
                 thread_count = self.process.num_threads()
                 try:
                     open_files = len(self.process.open_files())
-                except:
+                except Exception:
                     open_files = 0
             
             # macOS specific
@@ -308,9 +308,9 @@ class ResourceMonitor:
             else:
                 return "nominal"
                 
-        except:
+        except Exception:
             return "nominal"
-    
+
     def _get_thermal_state(self) -> str:
         """Get macOS thermal state"""
         if not self._is_macos():
@@ -334,9 +334,9 @@ class ResourceMonitor:
             else:
                 return "nominal"
                 
-        except:
+        except Exception:
             return "nominal"
-    
+
     def _is_macos(self) -> bool:
         """Check if running on macOS"""
         import platform

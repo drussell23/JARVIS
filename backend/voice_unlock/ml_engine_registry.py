@@ -58,6 +58,8 @@ from typing import (
 from concurrent.futures import ThreadPoolExecutor
 import traceback
 
+from backend.core.async_safety import LazyAsyncLock
+
 logger = logging.getLogger(__name__)
 
 # =============================================================================
@@ -2392,7 +2394,7 @@ class MLEngineRegistry:
 # =============================================================================
 
 _registry: Optional[MLEngineRegistry] = None
-_registry_lock = asyncio.Lock()
+_registry_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 async def get_ml_registry() -> MLEngineRegistry:

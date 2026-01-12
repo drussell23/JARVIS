@@ -27,7 +27,7 @@ def _get_system_ram_gb() -> int:
     if PSUTIL_AVAILABLE:
         try:
             return int(psutil.virtual_memory().total / (1024**3))
-        except:
+        except Exception:
             pass
     return 16  # Default assumption
 

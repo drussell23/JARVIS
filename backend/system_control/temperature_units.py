@@ -23,9 +23,9 @@ def get_temperature_unit():
                 return 'F'
             elif unit.lower() == 'celsius':
                 return 'C'
-    except:
+    except Exception:
         pass
-    
+
     # Check locale
     try:
         result = subprocess.run(
@@ -38,9 +38,9 @@ def get_temperature_unit():
             # US, Liberia, Myanmar use Fahrenheit
             if any(country in locale_str for country in ['_US', '_LR', '_MM']):
                 return 'F'
-    except:
+    except Exception:
         pass
-    
+
     # Check measurement units
     try:
         result = subprocess.run(
@@ -52,9 +52,9 @@ def get_temperature_unit():
             units = result.stdout.strip()
             if units.lower() == 'inches':  # Imperial units
                 return 'F'
-    except:
+    except Exception:
         pass
-    
+
     # Default to Celsius for most of the world
     return 'C'
 

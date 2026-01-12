@@ -16,7 +16,7 @@ class CoordinateFixer:
         try:
             main_screen = NSScreen.mainScreen()
             return main_screen.backingScaleFactor()
-        except:
+        except Exception:
             return 1.0  # Default to no scaling
 
     @staticmethod

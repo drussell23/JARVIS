@@ -51,7 +51,7 @@ try:
                 def from_tensor_slices(*args, **kwargs):
                     return None
         tf.data = MockData()
-except:
+except Exception:
     pass
 
 try:
@@ -206,7 +206,7 @@ class WhisperSTT:
         try:
             audio_array, _ = sf.read(io.BytesIO(audio_bytes))
             return audio_array
-        except:
+        except Exception:
             # Fallback to raw PCM
             return np.frombuffer(audio_bytes, dtype=np.float32)
 
@@ -229,7 +229,7 @@ class NaturalTTS:
             engine = engines[TTSEngine.PYTTSX3]
             engine.setProperty('rate', int(200 * self.config.speech_rate))
             engine.setProperty('volume', self.config.volume)
-        except:
+        except Exception:
             print("Warning: pyttsx3 not available")
             
         # gTTS is initialized on-demand

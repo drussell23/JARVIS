@@ -79,6 +79,8 @@ from typing import (
     Union,
 )
 
+from backend.core.async_safety import LazyAsyncLock
+
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
@@ -1696,7 +1698,7 @@ Provide your analysis in JSON format with these fields:
 # =============================================================================
 
 _engine_instance: Optional[AnthropicUnifiedEngine] = None
-_engine_lock = asyncio.Lock()
+_engine_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 async def get_anthropic_engine() -> AnthropicUnifiedEngine:

@@ -56,6 +56,8 @@ from typing import (
 )
 from contextlib import asynccontextmanager
 
+from backend.core.async_safety import TimeoutConfig, LazyAsyncEvent, get_shutdown_event
+
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
@@ -441,12 +443,35 @@ class PrimeClient:
         logger.info("[PrimeClient] Closed")
 
     async def _health_monitor_loop(self) -> None:
-        """Background health monitoring loop."""
+        """Background health monitoring loop with timeout protection."""
+        shutdown_event = get_shutdown_event()
+        max_iterations = int(os.getenv("PRIME_HEALTH_MAX_ITERATIONS", "0")) or None
+        iteration = 0
+
         while True:
+            # Check for shutdown
+            if shutdown_event.is_set():
+                logger.info("[PrimeClient] Health monitor stopped via shutdown event")
+                break
+
+            # Check max iterations (for testing/safety)
+            if max_iterations and iteration >= max_iterations:
+                logger.info(f"[PrimeClient] Health monitor reached max iterations ({max_iterations})")
+                break
+
+            iteration += 1
+
             try:
                 await asyncio.sleep(self._config.health_check_interval)
-                await self._check_health()
+                # Add timeout protection for health check
+                await asyncio.wait_for(
+                    self._check_health(),
+                    timeout=TimeoutConfig.HEALTH_CHECK
+                )
+            except asyncio.TimeoutError:
+                logger.warning(f"[PrimeClient] Health check timed out after {TimeoutConfig.HEALTH_CHECK}s")
             except asyncio.CancelledError:
+                logger.info("[PrimeClient] Health monitor cancelled")
                 break
             except Exception as e:
                 logger.debug(f"[PrimeClient] Health check error: {e}")

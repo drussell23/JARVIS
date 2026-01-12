@@ -617,7 +617,7 @@ class WeatherBridge:
                 try:
                     subprocess.run(['open', '-a', 'Weather'], check=True)
                     return "I've opened the Weather app for you"
-                except:
+                except Exception:
                     return "I couldn't open the Weather app. Please try opening it manually"
             
             # First, try to get weather from macOS Weather app directly

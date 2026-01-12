@@ -716,12 +716,18 @@ class MemoryManager:
 
     async def _consolidation_loop(self) -> None:
         """Background consolidation loop."""
+        consolidation_timeout = float(os.getenv("TIMEOUT_MEMORY_CONSOLIDATION", "60.0"))
         while True:
             try:
                 await asyncio.sleep(self.consolidation_interval)
-                count = await self.consolidate()
+                count = await asyncio.wait_for(
+                    self.consolidate(),
+                    timeout=consolidation_timeout
+                )
                 if count > 0:
                     self.logger.info(f"Consolidated {count} memories")
+            except asyncio.TimeoutError:
+                self.logger.warning("Memory consolidation timed out")
             except asyncio.CancelledError:
                 break
             except Exception as e:

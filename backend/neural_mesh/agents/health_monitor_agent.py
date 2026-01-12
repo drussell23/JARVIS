@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import psutil
+import time
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
@@ -245,11 +247,18 @@ class HealthMonitorAgent(BaseNeuralMeshAgent):
 
     async def _monitoring_loop(self) -> None:
         """Background health monitoring loop."""
-        while True:
+        max_runtime = float(os.getenv("TIMEOUT_HEALTH_MONITORING_SESSION", "86400.0"))  # 24 hours
+        health_check_timeout = float(os.getenv("TIMEOUT_HEALTH_CHECK_ITERATION", "30.0"))
+        start = time.monotonic()
+
+        while time.monotonic() - start < max_runtime:
             try:
                 await asyncio.sleep(self._check_interval)
 
-                health = await self._check_health()
+                health = await asyncio.wait_for(
+                    self._check_health(),
+                    timeout=health_check_timeout,
+                )
 
                 # Create alerts for issues
                 for issue in health.get("issues", []):
@@ -270,7 +279,11 @@ class HealthMonitorAgent(BaseNeuralMeshAgent):
                         f"{len(health.get('issues', []))} issues"
                     )
 
+            except asyncio.TimeoutError:
+                logger.warning("Health check iteration timed out")
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.exception(f"Error in health monitoring: {e}")
+
+        logger.info("Health monitoring loop reached max runtime, exiting")

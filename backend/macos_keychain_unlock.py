@@ -24,6 +24,8 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 from enum import Enum
 
+from backend.core.async_safety import LazyAsyncLock
+
 logger = logging.getLogger(__name__)
 
 
@@ -832,7 +834,7 @@ class MacOSKeychainUnlock:
 # =============================================================================
 
 _keychain_unlock_instance: Optional[MacOSKeychainUnlock] = None
-_instance_lock = asyncio.Lock()
+_instance_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 async def get_keychain_unlock_service() -> MacOSKeychainUnlock:

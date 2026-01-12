@@ -618,7 +618,7 @@ class DisplayDetector:
                         width, height = resolution.replace(" ", "").split("x")[:2]
                         width = int(width)
                         height = int(height.split("@")[0]) if "@" in height else int(height)
-                    except:
+                    except Exception:
                         width, height = 0, 0
 
                     is_builtin = "built-in" in name.lower() or "retina" in name.lower()

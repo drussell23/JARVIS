@@ -854,9 +854,9 @@ class MinimalToFullUpgrader:
                         if resp.status in [200, 404]:  # 404 if endpoint doesn't exist
                             logger.info("Requested graceful shutdown")
                             await asyncio.sleep(2)
-                except:
+                except Exception:
                     pass
-                    
+
             # Kill process on port
             if sys.platform == "darwin":
                 cmd = f"lsof -ti:{self.main_port} | xargs kill -15"  # SIGTERM first
@@ -977,16 +977,16 @@ class MinimalToFullUpgrader:
                             # If we have most components active, we're ready
                             if active_count >= total_count * 0.8:
                                 return True
-            except Exception as e:
+            except Exception:
                 # Expected during startup
                 checks_done += 1
                 if checks_done % 5 == 0:  # Log every 10 seconds
                     logger.info(f"   ⏳ Still initializing... ({elapsed:.0f}s elapsed)")
-                
+
             await asyncio.sleep(check_interval)
-            
+
         return False
-            
+
     async def _restart_minimal_backend(self):
         """Restart minimal backend as fallback."""
         logger.info("Restarting minimal backend as fallback...")
@@ -1026,9 +1026,9 @@ class MinimalToFullUpgrader:
             writer.close()
             await writer.wait_closed()
             return False  # Port is in use
-        except:
+        except Exception:
             return True  # Port is available
-            
+
     async def _wait_for_backend(self, timeout: int = 30) -> bool:
         """Wait for backend to be ready."""
         start_time = time.time()
@@ -1042,11 +1042,11 @@ class MinimalToFullUpgrader:
                     ) as resp:
                         if resp.status == 200:
                             return True
-            except:
+            except Exception:
                 pass
-                
+
             await asyncio.sleep(2)
-            
+
         return False
 
     async def _pre_upgrade_validation(self) -> bool:
@@ -1197,9 +1197,9 @@ class MinimalToFullUpgrader:
                 ) as resp:
                     if resp.status == 200:
                         return  # Already running
-        except:
+        except Exception:
             pass
-            
+
         # Start minimal backend
         await self._restart_minimal_backend()
 

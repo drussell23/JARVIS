@@ -303,7 +303,7 @@ class VoiceUnlockWebSocketServer:
         try:
             result = subprocess.run(["pgrep", "-f", "JARVISVoiceUnlockDaemon"], capture_output=True)
             return result.returncode == 0
-        except:
+        except Exception:
             return False
 
     def get_enrolled_users(self) -> list:
@@ -313,7 +313,7 @@ class VoiceUnlockWebSocketServer:
                 with open(self.enrolled_users_file) as f:
                     users = json.load(f)
                     return [user.get("name", "unknown") for user in users.values()]
-        except:
+        except Exception:
             pass
         return []
 
@@ -353,7 +353,7 @@ class VoiceUnlockWebSocketServer:
         try:
             subprocess.run(["pkill", "-f", "JARVISVoiceUnlockDaemon"])
             return True
-        except:
+        except Exception:
             return False
 
     async def websocket_handler(self, websocket, path):

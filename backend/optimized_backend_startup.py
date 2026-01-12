@@ -223,7 +223,7 @@ class OptimizedBackendStartup:
         try:
             if os.path.exists('voice'):
                 voice_components['available'] = True
-        except:
+        except Exception:
             voice_components['available'] = False
         
         return voice_components
@@ -317,19 +317,19 @@ class StartupOptimizer:
             try:
                 async with aiofiles.open(filepath, 'r') as f:
                     return await f.read()
-            except:
+            except Exception:
                 return None
-        
+
         results = await asyncio.gather(
             *[load_file(f) for f in cache_files],
             return_exceptions=True
         )
-        
+
         for filepath, content in zip(cache_files, results):
             if content and not isinstance(content, Exception):
                 try:
                     cache_data[filepath] = json.loads(content)
-                except:
+                except Exception:
                     pass
         
         return cache_data

@@ -78,7 +78,7 @@ class NLPEngine:
                 "sentiment-analysis", 
                 model="distilbert-base-uncased-finetuned-sst-2-english"
             )
-        except:
+        except Exception:
             self.sentiment_analyzer = None
             print("Warning: Sentiment model not found. Sentiment analysis will be limited.")
         
@@ -267,9 +267,9 @@ class NLPEngine:
                     return {"positive": score, "negative": 1 - score, "neutral": 0}
                 else:
                     return {"positive": 1 - score, "negative": score, "neutral": 0}
-            except:
+            except Exception:
                 pass
-        
+
         # Fallback to simple rule-based sentiment
         positive_words = ['good', 'great', 'excellent', 'happy', 'love', 'wonderful', 'fantastic']
         negative_words = ['bad', 'terrible', 'hate', 'awful', 'horrible', 'disappointing']

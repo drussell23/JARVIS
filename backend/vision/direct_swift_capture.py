@@ -45,7 +45,7 @@ class DirectSwiftCapture:
                     logger.info(f"[DIRECT] Found existing Swift capture process: {pid}, terminating...")
                     try:
                         os.kill(int(pid), signal.SIGTERM)
-                    except:
+                    except Exception:
                         pass
             
             # Give processes time to terminate

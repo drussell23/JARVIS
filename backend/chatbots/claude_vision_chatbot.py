@@ -729,7 +729,7 @@ class ClaudeVisionChatbot:
             screenshot_path = capture_screen_native()
             if screenshot_path:
                 return Image.open(screenshot_path)
-        except:
+        except Exception:
             pass
         return None
 
@@ -768,7 +768,7 @@ class ClaudeVisionChatbot:
                 img.close()
                 try:
                     os.unlink(tmp_path)
-                except:
+                except Exception:
                     pass
                 return img_copy
         except Exception as e:
@@ -794,7 +794,7 @@ class ClaudeVisionChatbot:
 
                 if result.returncode == 0:
                     return Image.open(tmp.name)
-        except:
+        except Exception:
             pass
         return None
 
@@ -804,7 +804,7 @@ class ClaudeVisionChatbot:
             from PIL import ImageGrab
 
             return await asyncio.to_thread(ImageGrab.grab)
-        except:
+        except Exception:
             return None
 
     async def _capture_linux(self) -> Optional[Image.Image]:
@@ -822,7 +822,7 @@ class ClaudeVisionChatbot:
 
                     if result.returncode == 0:
                         return Image.open(tmp.name)
-            except:
+            except Exception:
                 continue
         return None
 
@@ -1019,7 +1019,7 @@ class ClaudeVisionChatbot:
             elif os.path.exists("/etc/timezone"):
                 with open("/etc/timezone", "r") as f:
                     return f.read().strip()
-        except:
+        except Exception:
             pass
         return None
 
@@ -2704,9 +2704,9 @@ Note: The current date and time is {current_datetime}. Always use this as the re
                 try:
                     Image.new("RGB", (1, 1)).save(io.BytesIO(), format=fmt)
                     formats.append(fmt)
-                except:
+                except Exception:
                     pass
-        except:
+        except Exception:
             pass
 
         return formats

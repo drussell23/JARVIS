@@ -558,7 +558,7 @@ class MLModelManager:
             try:
                 # Use memory mapping for large files
                 return joblib.load(model_path, mmap_mode='r')
-            except:
+            except Exception:
                 return joblib.load(model_path)
         else:
             return joblib.load(model_path)
@@ -604,15 +604,15 @@ class MLModelManager:
             # For sklearn models
             if hasattr(model, '__sizeof__'):
                 return model.__sizeof__()
-                
+
             # For numpy arrays
             if hasattr(model, 'nbytes'):
                 return model.nbytes
-                
+
             # Estimate using pickle
             import pickle
             return len(pickle.dumps(model))
-        except:
+        except Exception:
             # Default estimate
             return 10 * 1024 * 1024  # 10MB
             

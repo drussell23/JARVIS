@@ -281,7 +281,7 @@ class AdvancedProcessSelfHealer:
                             data = await resp.json()
                             if data.get('status') == 'healthy':
                                 result.healthy = True
-                        except:
+                        except Exception:
                             # Even without JSON, 200 OK is good
                             result.healthy = True
 
@@ -1095,7 +1095,7 @@ class ProcessIsolatedMLLoader:
             if os.path.exists(result_file):
                 try:
                     os.remove(result_file)
-                except:
+                except Exception:
                     pass
 
     async def load_generic(
@@ -1166,7 +1166,7 @@ class ProcessIsolatedMLLoader:
             if os.path.exists(result_file):
                 try:
                     os.remove(result_file)
-                except:
+                except Exception:
                     pass
 
     async def _wait_for_process(

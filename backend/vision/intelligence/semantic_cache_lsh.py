@@ -17,6 +17,7 @@ import hashlib
 import logging
 import os
 import pickle  # nosec B403 - Used only for internal cache serialization, not untrusted data
+import time
 from abc import ABC, abstractmethod
 from collections import OrderedDict, defaultdict
 from dataclasses import dataclass, field
@@ -601,7 +602,9 @@ class L4PredictiveCache(BaseCacheLayer):
 
     async def _prediction_loop(self):
         """Background loop for predictive caching"""
-        while True:
+        max_runtime = float(os.getenv("TIMEOUT_VISION_SESSION", "3600.0"))  # 1 hour default
+        session_start = time.monotonic()
+        while time.monotonic() - session_start < max_runtime:
             try:
                 # Get prediction request
                 prediction_request = await self.pre_compute_queue.get()
@@ -631,6 +634,8 @@ class L4PredictiveCache(BaseCacheLayer):
             except Exception as e:
                 logger.error(f"Prediction loop error: {e}")
                 await asyncio.sleep(5)
+        else:
+            logger.info("Semantic cache prediction loop timeout, stopping")
 
     async def get(self, key: str, **kwargs) -> Optional[CacheEntry]:
         """Get predictive entry from cache"""
@@ -801,8 +806,10 @@ class SemanticCacheWithLSH:
 
     async def _monitor_memory_pressure(self):
         """Monitor memory pressure and trigger evictions when needed"""
+        max_runtime = float(os.getenv("TIMEOUT_VISION_SESSION", "3600.0"))  # 1 hour default
+        session_start = time.monotonic()
         try:
-            while True:
+            while time.monotonic() - session_start < max_runtime:
                 await asyncio.sleep(10)  # Check every 10 seconds
 
                 if not self.memory_manager:
@@ -817,6 +824,8 @@ class SemanticCacheWithLSH:
                     logger.info(f"⚠️ Memory pressure {pressure.value} - triggering cache evictions")
                     for layer in self.cache_layers:
                         await layer.evict_to_pressure_limit()
+            else:
+                logger.info("Semantic cache memory pressure monitoring timeout, stopping")
 
         except asyncio.CancelledError:
             pass

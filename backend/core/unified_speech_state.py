@@ -70,6 +70,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Set
+
+from backend.core.async_safety import LazyAsyncLock
 import difflib
 
 logger = logging.getLogger(__name__)
@@ -588,7 +590,7 @@ class UnifiedSpeechStateManager:
 # =============================================================================
 
 _manager_instance: Optional[UnifiedSpeechStateManager] = None
-_manager_lock = asyncio.Lock()
+_manager_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 _broadcast_registered = False
 
 

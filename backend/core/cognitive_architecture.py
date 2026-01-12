@@ -69,6 +69,8 @@ from typing import (
     Union,
 )
 
+from backend.core.async_safety import LazyAsyncLock
+
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
@@ -4473,7 +4475,7 @@ class CognitiveSystem:
 # =============================================================================
 
 _cognitive_system: Optional[CognitiveSystem] = None
-_cognitive_lock = asyncio.Lock()
+_cognitive_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 async def get_cognitive_system() -> CognitiveSystem:

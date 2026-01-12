@@ -59,9 +59,9 @@ class VoiceIntegrationHandler:
         if cues_json:
             try:
                 return json.loads(cues_json)
-            except:
+            except Exception:
                 pass
-                
+
         return default_cues
         
     async def start(self):

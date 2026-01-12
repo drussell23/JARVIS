@@ -704,7 +704,7 @@ class WorkflowExecutionEngine:
             # Simplified - in production, use proper system metrics
             import psutil
             return psutil.cpu_percent(interval=0.1) / 100.0
-        except:
+        except Exception:
             return 0.5  # Default medium load
             
     def _get_parallel_capacity(self, system_load: float) -> int:

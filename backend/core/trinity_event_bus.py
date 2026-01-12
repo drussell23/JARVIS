@@ -96,6 +96,8 @@ import re
 
 import aiofiles
 
+from backend.core.async_safety import LazyAsyncLock
+
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
@@ -1161,7 +1163,7 @@ class TrinityEventBus:
 # =============================================================================
 
 _bus: Optional[TrinityEventBus] = None
-_bus_lock = asyncio.Lock()
+_bus_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 async def get_trinity_event_bus(

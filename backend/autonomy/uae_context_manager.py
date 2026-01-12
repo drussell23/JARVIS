@@ -257,13 +257,19 @@ class UAEContextManager:
 
     async def _update_loop(self) -> None:
         """Continuous context update loop."""
+        iteration_timeout = float(os.getenv("TIMEOUT_UAE_CONTEXT_ITERATION", "30.0"))
         while True:
             try:
                 if not self._paused:
-                    await self._update_context()
+                    await asyncio.wait_for(
+                        self._update_context(),
+                        timeout=iteration_timeout
+                    )
 
                 await asyncio.sleep(self.config.update_interval)
 
+            except asyncio.TimeoutError:
+                self.logger.warning("[UAEContext] Update iteration timed out")
             except asyncio.CancelledError:
                 break
             except Exception as e:

@@ -25,6 +25,8 @@ from enum import Enum, auto
 from collections import defaultdict
 import hashlib
 
+from backend.core.async_safety import LazyAsyncLock
+
 logger = logging.getLogger(__name__)
 
 
@@ -1310,7 +1312,7 @@ class JARVISCommandHandler:
 # =============================================================================
 
 _handler_instance: Optional[JARVISCommandHandler] = None
-_handler_lock = asyncio.Lock()
+_handler_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 async def get_command_handler() -> JARVISCommandHandler:

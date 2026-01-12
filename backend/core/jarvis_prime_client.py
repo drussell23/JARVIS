@@ -756,11 +756,20 @@ class JarvisPrimeClient:
                 enable_cross_repo=self.config.enable_cross_repo_context,
             )
 
+        # v100.0: Unified Model Serving Integration (Prime + Claude fallback)
+        # - When enabled, routes through UnifiedModelServing for enhanced fallback
+        # - Maintains backward compatibility with existing routing modes
+        # - Lazy-loaded to avoid circular imports
+        self._unified_model_serving = None
+        self._use_unified_serving = os.getenv("USE_UNIFIED_MODEL_SERVING", "true").lower() == "true"
+        self._unified_serving_initialized = False
+
         logger.info(
             f"[JarvisPrimeClient] Initialized with thresholds: "
             f"local>{self.config.memory_threshold_local_gb}GB, "
             f"cloud>{self.config.memory_threshold_cloud_gb}GB, "
-            f"repo_map={'enabled' if self._repo_enricher else 'disabled'}"
+            f"repo_map={'enabled' if self._repo_enricher else 'disabled'}, "
+            f"unified_serving={'enabled' if self._use_unified_serving else 'disabled'}"
         )
 
     async def _get_http_client(self):
@@ -785,6 +794,49 @@ class JarvisPrimeClient:
             except ImportError:
                 logger.warning("[JarvisPrimeClient] httpx not available")
         return self._http_client
+
+    async def _get_unified_model_serving(self):
+        """
+        Lazy load UnifiedModelServing for enhanced fallback chain.
+
+        v100.0: Provides Prime + Claude fallback with circuit breaker pattern.
+        Falls back to legacy routing if UnifiedModelServing is unavailable.
+        """
+        if not self._use_unified_serving:
+            return None
+
+        if self._unified_model_serving is not None:
+            return self._unified_model_serving
+
+        if self._unified_serving_initialized:
+            # Already tried and failed
+            return None
+
+        try:
+            from backend.intelligence.unified_model_serving import get_model_serving
+
+            self._unified_model_serving = await get_model_serving()
+            self._unified_serving_initialized = True
+
+            # Get stats for logging
+            stats = self._unified_model_serving.get_stats()
+            providers = stats.get("providers_available", [])
+
+            logger.info(
+                f"[JarvisPrimeClient] UnifiedModelServing initialized: "
+                f"providers={providers}"
+            )
+
+            return self._unified_model_serving
+
+        except ImportError as e:
+            logger.debug(f"[JarvisPrimeClient] UnifiedModelServing not available: {e}")
+            self._unified_serving_initialized = True
+            return None
+        except Exception as e:
+            logger.warning(f"[JarvisPrimeClient] UnifiedModelServing init failed: {e}")
+            self._unified_serving_initialized = True
+            return None
 
     # =========================================================================
     # Mode Selection
@@ -998,7 +1050,63 @@ class JarvisPrimeClient:
             except Exception as e:
                 logger.warning(f"[JarvisPrimeClient] Repo enrichment failed: {e}")
 
-        # Decide initial mode
+        # v100.0: Try UnifiedModelServing first (Prime + Claude fallback)
+        # This provides enhanced fallback with circuit breaker pattern
+        unified_serving = await self._get_unified_model_serving()
+        if unified_serving is not None:
+            try:
+                from backend.intelligence.unified_model_serving import ModelRequest, TaskType
+
+                # Build messages list
+                msgs = []
+                if messages:
+                    msgs = [{"role": m.role, "content": m.content} for m in messages]
+                else:
+                    if system_prompt:
+                        msgs.append({"role": "system", "content": system_prompt})
+                    msgs.append({"role": "user", "content": prompt})
+
+                request = ModelRequest(
+                    messages=msgs,
+                    system_prompt=system_prompt,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    task_type=TaskType.CHAT,
+                )
+
+                response = await unified_serving.generate(request)
+
+                if response.success:
+                    logger.info(
+                        f"[JarvisPrimeClient] UnifiedModelServing success: "
+                        f"provider={response.provider.value}, latency={response.latency_ms:.0f}ms"
+                    )
+
+                    result = CompletionResponse(
+                        success=True,
+                        content=response.content,
+                        backend=f"unified:{response.provider.value}",
+                        latency_ms=response.latency_ms,
+                        tokens_used=response.tokens_used,
+                        cost_usd=response.estimated_cost_usd,
+                    )
+
+                    if enrichment_metadata:
+                        result.metadata["enrichment"] = enrichment_metadata
+                    result.metadata["unified_serving"] = True
+                    result.metadata["fallback_used"] = response.fallback_used
+
+                    return result
+                else:
+                    logger.warning(
+                        f"[JarvisPrimeClient] UnifiedModelServing failed: {response.error}, "
+                        f"falling back to legacy routing"
+                    )
+
+            except Exception as e:
+                logger.warning(f"[JarvisPrimeClient] UnifiedModelServing error: {e}, falling back")
+
+        # Legacy routing: Decide initial mode
         mode, reason = self.decide_mode()
         logger.info(f"[JarvisPrimeClient] Mode: {mode.value} ({reason})")
 

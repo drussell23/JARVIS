@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import time
 from collections import defaultdict
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Set
@@ -360,22 +362,32 @@ class CoordinatorAgent(BaseNeuralMeshAgent):
 
     async def _process_task_queue(self) -> None:
         """Background task processor."""
-        while True:
+        max_runtime = float(os.getenv("TIMEOUT_TASK_QUEUE_SESSION", "86400.0"))  # 24 hours
+        queue_timeout = float(os.getenv("TIMEOUT_TASK_QUEUE_GET", "1.0"))
+        task_timeout = float(os.getenv("TIMEOUT_TASK_PROCESSING", "30.0"))
+        start = time.monotonic()
+
+        while time.monotonic() - start < max_runtime:
             try:
                 message = await asyncio.wait_for(
                     self._task_queue.get(),
-                    timeout=1.0
+                    timeout=queue_timeout
                 )
-                # Process the message
+                # Process the message with timeout protection
                 capability = message.content.get("capability")
                 if capability:
-                    await self._delegate_task({
-                        "capability": capability,
-                        "task_payload": message.content,
-                    })
+                    await asyncio.wait_for(
+                        self._delegate_task({
+                            "capability": capability,
+                            "task_payload": message.content,
+                        }),
+                        timeout=task_timeout,
+                    )
             except asyncio.TimeoutError:
                 continue
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.exception(f"Error processing task: {e}")
+
+        logger.info("Task queue processor reached max runtime, exiting")

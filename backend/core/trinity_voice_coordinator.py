@@ -50,6 +50,8 @@ import threading
 import queue as thread_queue
 import json
 
+from backend.core.async_safety import LazyAsyncLock
+
 # Optional TTS engines (graceful degradation if not available)
 try:
     import pyttsx3
@@ -1083,7 +1085,7 @@ class Pyttsx3Engine(TTSEngine):
                                 if personality.voice_name.lower() in voice.name.lower():
                                     self._engine.setProperty('voice', voice.id)
                                     break
-                        except:
+                        except Exception:
                             pass
 
                         self._engine.say(message)
@@ -1169,7 +1171,7 @@ class EdgeTTSEngine(TTSEngine):
                 # Clean up temp file
                 try:
                     os.unlink(temp_path)
-                except:
+                except Exception:
                     pass
 
         except Exception as e:
@@ -2278,7 +2280,7 @@ class TrinityVoiceCoordinator:
 # =============================================================================
 
 _coordinator: Optional[TrinityVoiceCoordinator] = None
-_coordinator_lock = asyncio.Lock()
+_coordinator_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 async def get_voice_coordinator(

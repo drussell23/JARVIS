@@ -298,7 +298,7 @@ class MultiModelValidator:
         try:
             std_x = statistics.stdev(x_vals)
             std_y = statistics.stdev(y_vals)
-        except:
+        except Exception:
             return coords_list
         
         # Filter outliers (beyond threshold * std)

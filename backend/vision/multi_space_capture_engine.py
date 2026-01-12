@@ -434,7 +434,7 @@ class MultiSpaceCaptureEngine:
         try:
             result = subprocess.run(["which", "screencapture"], capture_output=True)
             methods[CaptureMethod.SCREENCAPTURE_API] = result.returncode == 0
-        except:
+        except Exception:
             methods[CaptureMethod.SCREENCAPTURE_API] = False
 
         # Check for Swift capture (if implemented)
@@ -668,7 +668,7 @@ class MultiSpaceCaptureEngine:
             detector = MultiSpaceWindowDetector()
             window_data = detector.get_all_windows_across_spaces()
             current_space_id = window_data.get("current_space", {}).get("id", 1)
-        except:
+        except Exception:
             pass
 
         # Smart method selection based on whether we're capturing current or other space
@@ -848,7 +848,7 @@ class MultiSpaceCaptureEngine:
                 # Clean up temp file
                 try:
                     Path(temp_path).unlink()
-                except:
+                except Exception:
                     pass
 
                 return screenshot
@@ -860,13 +860,13 @@ class MultiSpaceCaptureEngine:
             if temp_fd is not None:
                 try:
                     os.close(temp_fd)
-                except:
+                except Exception:
                     pass
             # Clean up temp file if it exists
             if temp_path and Path(temp_path).exists():
                 try:
                     Path(temp_path).unlink()
-                except:
+                except Exception:
                     pass
 
         return None
@@ -1257,8 +1257,10 @@ class MultiSpaceCaptureEngine:
     async def monitor_space_changes(self, callback: Callable, interval: int = 5):
         """Monitor spaces for changes and trigger captures"""
         last_space_count = len(await self.enumerate_spaces())
+        max_runtime = float(os.getenv("TIMEOUT_VISION_SESSION", "3600.0"))  # 1 hour default
+        session_start = time.monotonic()
 
-        while True:
+        while time.monotonic() - session_start < max_runtime:
             try:
                 await asyncio.sleep(interval)
 
@@ -1273,6 +1275,8 @@ class MultiSpaceCaptureEngine:
 
             except Exception as e:
                 logger.error(f"Error monitoring spaces: {e}")
+        else:
+            logger.info("Space monitoring session timeout, stopping")
 
     async def start_monitoring_session(self) -> bool:
         """Start monitoring session with purple indicator"""

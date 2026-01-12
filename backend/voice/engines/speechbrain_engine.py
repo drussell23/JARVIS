@@ -1850,7 +1850,7 @@ __all__ = ["EncoderDecoderASR"]
                 if detected_format:
                     try:
                         audio_segment = AudioSegment.from_file(audio_io, format=detected_format)
-                    except:
+                    except Exception:
                         # Reset stream and try without format hint
                         audio_io.seek(0)
                         audio_segment = AudioSegment.from_file(audio_io)

@@ -570,7 +570,7 @@ class MonitorSpaceMapper:
                     monitors[0].spaces = [
                         s.get("index", s.get("id", i + 1)) for i, s in enumerate(spaces)
                     ]
-                except:
+                except Exception:
                     pass
             return monitors
 

@@ -1375,20 +1375,71 @@ class TrinityCircuitBreakerState(Enum):
 
 class TrinityCircuitBreaker:
     """
-    Circuit breaker for Trinity component launch.
+    Circuit breaker for Trinity component launch with PERSISTENT STATE.
     Prevents cascade failures by stopping launch attempts after repeated failures.
+
+    v100.1: Added state persistence across restarts to prevent infinite retry loops.
+    State is saved to ~/.jarvis/state/circuit_breakers/ and loaded on init.
     """
 
     def __init__(self, name: str, config: TrinityLaunchConfig):
         self.name = name
         self.config = config
-        self.state = TrinityCircuitBreakerState.CLOSED
-        self.failure_count = 0
-        self.success_count = 0
-        self.last_failure_time: Optional[float] = None
-        self.last_state_change: float = time.time()
         self.half_open_calls = 0
         self._logger = logging.getLogger(f"TrinityCircuitBreaker.{name}")
+
+        # v100.1: Persistent state file
+        self._state_dir = Path.home() / ".jarvis" / "state" / "circuit_breakers"
+        self._state_file = self._state_dir / f"{name}.json"
+
+        # Load persisted state or initialize fresh
+        loaded_state = self._load_state()
+        self.state = loaded_state.get("state", TrinityCircuitBreakerState.CLOSED)
+        if isinstance(self.state, str):
+            self.state = TrinityCircuitBreakerState(self.state)
+        self.failure_count = loaded_state.get("failure_count", 0)
+        self.success_count = loaded_state.get("success_count", 0)
+        self.last_failure_time = loaded_state.get("last_failure_time")
+        self.last_state_change = loaded_state.get("last_state_change", time.time())
+        self.total_failures = loaded_state.get("total_failures", 0)
+        self.total_successes = loaded_state.get("total_successes", 0)
+
+        # Check if OPEN state has timed out
+        if self.state == TrinityCircuitBreakerState.OPEN and self.last_failure_time:
+            elapsed = time.time() - self.last_failure_time
+            if elapsed > self.config.circuit_breaker_timeout_sec:
+                self._transition_to(TrinityCircuitBreakerState.HALF_OPEN)
+                self._logger.info(f"[{name}] OPEN → HALF_OPEN (timeout elapsed during restart)")
+
+    def _load_state(self) -> Dict[str, Any]:
+        """Load circuit breaker state from disk."""
+        if not self._state_file.exists():
+            return {}
+        try:
+            with open(self._state_file) as f:
+                return json.load(f)
+        except Exception as e:
+            self._logger.warning(f"Failed to load circuit breaker state: {e}")
+            return {}
+
+    def _save_state(self) -> None:
+        """Persist circuit breaker state to disk (v100.1)."""
+        try:
+            self._state_dir.mkdir(parents=True, exist_ok=True)
+            state_data = {
+                "state": self.state.value if isinstance(self.state, TrinityCircuitBreakerState) else self.state,
+                "failure_count": self.failure_count,
+                "success_count": self.success_count,
+                "last_failure_time": self.last_failure_time,
+                "last_state_change": self.last_state_change,
+                "total_failures": self.total_failures,
+                "total_successes": self.total_successes,
+                "updated_at": time.time(),
+            }
+            with open(self._state_file, "w") as f:
+                json.dump(state_data, f, indent=2)
+        except Exception as e:
+            self._logger.warning(f"Failed to save circuit breaker state: {e}")
 
     def can_execute(self) -> bool:
         """Check if execution is allowed."""
@@ -1410,20 +1461,26 @@ class TrinityCircuitBreaker:
     def record_success(self) -> None:
         """Record a successful execution."""
         self.success_count += 1
+        self.total_successes += 1
         self.failure_count = max(0, self.failure_count - 1)
 
         if self.state == TrinityCircuitBreakerState.HALF_OPEN:
             self._transition_to(TrinityCircuitBreakerState.CLOSED)
+        else:
+            self._save_state()  # v100.1: Persist state
 
     def record_failure(self) -> None:
         """Record a failed execution."""
         self.failure_count += 1
+        self.total_failures += 1
         self.last_failure_time = time.time()
 
         if self.state == TrinityCircuitBreakerState.HALF_OPEN:
             self._transition_to(TrinityCircuitBreakerState.OPEN)
         elif self.failure_count >= self.config.circuit_breaker_failure_threshold:
             self._transition_to(TrinityCircuitBreakerState.OPEN)
+        else:
+            self._save_state()  # v100.1: Persist state
 
     def _transition_to(self, new_state: TrinityCircuitBreakerState) -> None:
         """Transition to a new state."""
@@ -1433,7 +1490,10 @@ class TrinityCircuitBreaker:
 
         if new_state == TrinityCircuitBreakerState.HALF_OPEN:
             self.half_open_calls = 0
+        elif new_state == TrinityCircuitBreakerState.CLOSED:
+            self.failure_count = 0  # Reset on recovery
 
+        self._save_state()  # v100.1: Persist on every state transition
         self._logger.info(f"[{self.name}] {old_state.value} → {new_state.value}")
 
     def get_status(self) -> Dict[str, Any]:
@@ -3421,6 +3481,39 @@ class SupervisorBootstrapper:
         self._distributed_state_manager = None
         self._state_manager_enabled = os.getenv("DISTRIBUTED_STATE_MANAGER_ENABLED", "true").lower() == "true"
 
+        # v100.0: Continuous Learning Orchestrator (Unified Learning Pipeline)
+        # - Experience aggregation from all JARVIS components
+        # - Intelligent training job scheduling
+        # - A/B testing with automatic promotion/rollback
+        # - Model performance tracking and validation
+        # - Cross-repo experience forwarding to Reactor Core
+        self._continuous_learning_orchestrator = None
+        self._continuous_learning_enabled = os.getenv("CONTINUOUS_LEARNING_ENABLED", "true").lower() == "true"
+
+        # v100.0: Neural Mesh Registry Bridge (Cross-System Sync)
+        # - Bidirectional sync between UnifiedAgentRegistry and Neural Mesh
+        # - Data model translation (AgentInfo formats)
+        # - Unified capability queries across both systems
+        # - Cross-system event propagation
+        self._neural_mesh_bridge = None
+        self._neural_mesh_bridge_enabled = os.getenv("NEURAL_MESH_BRIDGE_ENABLED", "true").lower() == "true"
+
+        # v100.0: Learning State Connector (State-Learning Integration)
+        # - Training job state persistence across restarts
+        # - A/B test state synchronization
+        # - Experience buffer coordination
+        # - Cross-instance training coordination via leader election
+        self._learning_state_connector = None
+        self._learning_state_connector_enabled = os.getenv("LEARNING_STATE_CONNECTOR_ENABLED", "true").lower() == "true"
+
+        # v100.0: Cross-Repo Experience Forwarder (JARVIS ↔ Reactor Core)
+        # - Forwards learning experiences to Reactor Core
+        # - Batch forwarding with retry and backoff
+        # - File-based fallback when event bus unavailable
+        # - Distributed model training coordination
+        self._experience_forwarder = None
+        self._experience_forwarder_enabled = os.getenv("CROSS_REPO_EXPERIENCE_FORWARDING", "true").lower() == "true"
+
         # v85.0: Unified State Coordination - Atomic locks with process cookies
         # - Prevents race conditions between run_supervisor.py and start_system.py
         # - Uses fcntl locks with TTL-based expiration
@@ -3714,6 +3807,7 @@ class SupervisorBootstrapper:
     async def _execute_preflight_checks_internal(self) -> bool:
         """
         v88.2: Internal preflight check implementation with parallel execution.
+        v100.1: Integrated TrinityBootstrapValidator for comprehensive pre-flight validation.
 
         Runs independent checks in parallel for 30%+ faster startup,
         with individual timeout protection for each check.
@@ -3721,6 +3815,57 @@ class SupervisorBootstrapper:
         warnings: List[str] = []
         critical_failures: List[str] = []
         coord = None
+
+        # v100.1: Run TrinityBootstrapValidator first (comprehensive validation)
+        trinity_validation_enabled = os.environ.get(
+            "TRINITY_BOOTSTRAP_VALIDATION", "true"
+        ).lower() in ("1", "true", "yes")
+
+        if trinity_validation_enabled:
+            try:
+                from backend.core.trinity_bootstrap_validator import (
+                    TrinityBootstrapValidator,
+                    ValidationSeverity,
+                )
+                validator = TrinityBootstrapValidator()
+                validation_result = await validator.validate_all()
+
+                # Log validation results
+                if validation_result.critical_issues:
+                    for issue in validation_result.critical_issues:
+                        critical_failures.append(f"[v100.1] {issue.message}")
+                        self.logger.error(f"[v100.1 CRITICAL] {issue}")
+                        if issue.fix_suggestion:
+                            self.logger.error(f"    Fix: {issue.fix_suggestion}")
+
+                if validation_result.errors:
+                    for issue in validation_result.errors:
+                        warnings.append(f"[v100.1] {issue.message}")
+                        self.logger.warning(f"[v100.1 ERROR] {issue}")
+
+                if validation_result.warnings:
+                    for issue in validation_result.warnings:
+                        self.logger.info(f"[v100.1 WARNING] {issue}")
+
+                # Report validation summary
+                self.logger.info(
+                    f"[v100.1] Validation complete: {len(validation_result.issues)} issues "
+                    f"({len(validation_result.critical_issues)} critical, "
+                    f"{len(validation_result.errors)} errors, "
+                    f"{len(validation_result.warnings)} warnings) "
+                    f"in {validation_result.duration_ms:.0f}ms"
+                )
+
+                if not validation_result.passed:
+                    TerminalUI.print_error("[v100.1] Bootstrap validation FAILED - critical issues found")
+                    # Don't block startup for now, let existing checks run too
+                else:
+                    TerminalUI.print_success("[v100.1] Bootstrap validation passed")
+
+            except ImportError as e:
+                self.logger.debug(f"[v100.1] TrinityBootstrapValidator not available: {e}")
+            except Exception as e:
+                self.logger.warning(f"[v100.1] Validation error (non-blocking): {e}")
 
         # v88.2: Get adaptive base timeout
         base_check_timeout = float(os.environ.get("JARVIS_V87_CHECK_TIMEOUT", "5.0"))
@@ -7122,6 +7267,54 @@ class SupervisorBootstrapper:
             self.logger.warning("⚠️ Distributed State Manager shutdown timed out")
         except Exception as e:
             self.logger.warning(f"⚠️ Distributed State Manager cleanup error: {e}")
+
+        # v100.0: Shutdown Continuous Learning Orchestrator
+        try:
+            if self._continuous_learning_orchestrator:
+                self.logger.info("📚 Shutting down Continuous Learning Orchestrator...")
+                await asyncio.wait_for(self._continuous_learning_orchestrator.stop(), timeout=15.0)
+                self._continuous_learning_orchestrator = None
+                self.logger.info("✅ Continuous Learning Orchestrator stopped")
+        except asyncio.TimeoutError:
+            self.logger.warning("⚠️ Continuous Learning Orchestrator shutdown timed out")
+        except Exception as e:
+            self.logger.warning(f"⚠️ Continuous Learning Orchestrator cleanup error: {e}")
+
+        # v100.0: Shutdown Neural Mesh Registry Bridge
+        try:
+            if self._neural_mesh_bridge:
+                self.logger.info("🔗 Shutting down Neural Mesh Registry Bridge...")
+                await asyncio.wait_for(self._neural_mesh_bridge.stop(), timeout=10.0)
+                self._neural_mesh_bridge = None
+                self.logger.info("✅ Neural Mesh Registry Bridge stopped")
+        except asyncio.TimeoutError:
+            self.logger.warning("⚠️ Neural Mesh Registry Bridge shutdown timed out")
+        except Exception as e:
+            self.logger.warning(f"⚠️ Neural Mesh Registry Bridge cleanup error: {e}")
+
+        # v100.0: Shutdown Learning State Connector
+        try:
+            if self._learning_state_connector:
+                self.logger.info("💾 Shutting down Learning State Connector...")
+                await asyncio.wait_for(self._learning_state_connector.stop(), timeout=10.0)
+                self._learning_state_connector = None
+                self.logger.info("✅ Learning State Connector stopped")
+        except asyncio.TimeoutError:
+            self.logger.warning("⚠️ Learning State Connector shutdown timed out")
+        except Exception as e:
+            self.logger.warning(f"⚠️ Learning State Connector cleanup error: {e}")
+
+        # v100.0: Shutdown Cross-Repo Experience Forwarder
+        try:
+            if self._experience_forwarder:
+                self.logger.info("🔄 Shutting down Experience Forwarder...")
+                await asyncio.wait_for(self._experience_forwarder.stop(), timeout=15.0)
+                self._experience_forwarder = None
+                self.logger.info("✅ Experience Forwarder stopped")
+        except asyncio.TimeoutError:
+            self.logger.warning("⚠️ Experience Forwarder shutdown timed out")
+        except Exception as e:
+            self.logger.warning(f"⚠️ Experience Forwarder cleanup error: {e}")
 
         # Cleanup JARVIS-Prime
         try:
@@ -11411,6 +11604,30 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
         if self._state_manager_enabled:
             await self._initialize_distributed_state_manager()
 
+        # =====================================================================
+        # PHASE 8: Initialize Continuous Learning Orchestrator (v100.0)
+        # =====================================================================
+        if self._continuous_learning_enabled:
+            await self._initialize_continuous_learning_orchestrator()
+
+        # =====================================================================
+        # PHASE 9: Initialize Neural Mesh Registry Bridge (v100.0)
+        # =====================================================================
+        if self._neural_mesh_bridge_enabled:
+            await self._initialize_neural_mesh_bridge()
+
+        # =====================================================================
+        # PHASE 10: Initialize Learning State Connector (v100.0)
+        # =====================================================================
+        if self._learning_state_connector_enabled:
+            await self._initialize_learning_state_connector()
+
+        # =====================================================================
+        # PHASE 11: Initialize Cross-Repo Experience Forwarder (v100.0)
+        # =====================================================================
+        if self._experience_forwarder_enabled:
+            await self._initialize_experience_forwarder()
+
     async def _initialize_agi_orchestrator(self) -> None:
         """
         v100.0: Initialize AGI Orchestrator - Unified Cognitive Architecture.
@@ -11602,6 +11819,288 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
         except Exception as e:
             self.logger.warning(f"[v100.0] ⚠️ Distributed State Manager initialization failed: {e}")
             print(f"  {TerminalUI.YELLOW}⚠️ State Manager: Failed to initialize{TerminalUI.RESET}")
+
+    async def _initialize_continuous_learning_orchestrator(self) -> None:
+        """
+        v100.0: Initialize Continuous Learning Orchestrator - Unified Learning Pipeline.
+
+        This initializes the continuous learning system that provides:
+        1. Experience aggregation from all JARVIS components
+        2. Intelligent training job scheduling with priority queues
+        3. A/B testing with statistical significance analysis
+        4. Model performance tracking with trend detection
+        5. Cross-repo experience forwarding to Reactor Core
+        6. Automatic model promotion/rollback based on performance
+        """
+        self.logger.info("=" * 60)
+        self.logger.info("[v100.0] Initializing Continuous Learning Orchestrator")
+        self.logger.info("=" * 60)
+
+        print(f"  {TerminalUI.CYAN}📚 Learning Orchestrator: Initializing continuous learning...{TerminalUI.RESET}")
+
+        try:
+            from backend.intelligence.continuous_learning_orchestrator import (
+                get_learning_orchestrator
+            )
+
+            self._continuous_learning_orchestrator = await get_learning_orchestrator()
+
+            # Get status
+            stats = await self._continuous_learning_orchestrator.get_stats()
+            metrics = stats.get("metrics", {})
+            experiences_collected = metrics.get("experiences_collected", 0)
+            training_jobs_completed = metrics.get("training_jobs_completed", 0)
+            auto_training = stats.get("aggregator", {}).get("buffer_size", 0)
+
+            self.logger.info(f"[v100.0] ✅ Continuous Learning Orchestrator initialized")
+            self.logger.info(f"   Experiences: {experiences_collected}, Jobs: {training_jobs_completed}")
+
+            # Display status
+            print(f"  {TerminalUI.GREEN}✓ Learning Orchestrator: ready{TerminalUI.RESET}")
+            print(f"  {TerminalUI.GREEN}   ├─ Experience aggregation active{TerminalUI.RESET}")
+            print(f"  {TerminalUI.GREEN}   ├─ Training scheduler ready{TerminalUI.RESET}")
+            print(f"  {TerminalUI.GREEN}   ├─ A/B testing coordinator ready{TerminalUI.RESET}")
+            print(f"  {TerminalUI.GREEN}   └─ Performance tracking enabled{TerminalUI.RESET}")
+
+            # Connect to Trinity systems for experience forwarding
+            await self._connect_learning_to_trinity()
+
+        except ImportError as e:
+            self.logger.warning(f"[v100.0] ⚠️ Continuous Learning Orchestrator import failed: {e}")
+            print(f"  {TerminalUI.YELLOW}⚠️ Learning Orchestrator: Not available{TerminalUI.RESET}")
+        except Exception as e:
+            self.logger.warning(f"[v100.0] ⚠️ Continuous Learning Orchestrator initialization failed: {e}")
+            print(f"  {TerminalUI.YELLOW}⚠️ Learning Orchestrator: Failed to initialize{TerminalUI.RESET}")
+
+    async def _connect_learning_to_trinity(self) -> None:
+        """
+        Connect Continuous Learning Orchestrator to Trinity systems for cross-repo experience forwarding.
+        """
+        try:
+            # Connect to Trinity Event Bus for experience streaming
+            if self._trinity_event_bus:
+                from backend.intelligence.continuous_learning_orchestrator import ExperienceType
+
+                async def on_trinity_event(event):
+                    """Forward Trinity events to learning orchestrator."""
+                    if not self._continuous_learning_orchestrator:
+                        return
+
+                    event_type = event.get("type", "")
+                    data = event.get("data", {})
+
+                    # Map Trinity events to learning experiences
+                    if "voice" in event_type or "auth" in event_type:
+                        exp_type = ExperienceType.VOICE_AUTH
+                    elif "inference" in event_type:
+                        exp_type = ExperienceType.INFERENCE
+                    elif "error" in event_type:
+                        exp_type = ExperienceType.ERROR
+                    else:
+                        exp_type = ExperienceType.INTERACTION
+
+                    await self._continuous_learning_orchestrator.collect_experience(
+                        experience_type=exp_type,
+                        input_data=data.get("input", {}),
+                        output_data=data.get("output", {}),
+                        quality_score=data.get("quality", 0.5),
+                        confidence=data.get("confidence", 0.5),
+                        success=data.get("success", True),
+                        component=data.get("component", "trinity"),
+                    )
+
+                # Subscribe to Trinity events
+                await self._trinity_event_bus.subscribe("jarvis.*", on_trinity_event)
+                await self._trinity_event_bus.subscribe("prime.*", on_trinity_event)
+                await self._trinity_event_bus.subscribe("reactor.*", on_trinity_event)
+
+                self.logger.info("[v100.0] Connected learning orchestrator to Trinity Event Bus")
+
+        except Exception as e:
+            self.logger.warning(f"[v100.0] Failed to connect learning to Trinity: {e}")
+
+    async def _initialize_neural_mesh_bridge(self) -> None:
+        """
+        v100.0: Initialize Neural Mesh Registry Bridge.
+
+        Creates bidirectional synchronization between UnifiedAgentRegistry and
+        Neural Mesh AgentRegistry for unified agent management.
+
+        Features:
+        - Automatic agent synchronization between registries
+        - Data model translation (AgentInfo ↔ NeuralMeshAgentInfo)
+        - Unified capability queries across both systems
+        - Cross-system event propagation
+        - Health status harmonization
+        """
+        self.logger.info("=" * 60)
+        self.logger.info("[v100.0] Initializing Neural Mesh Registry Bridge")
+        self.logger.info("=" * 60)
+
+        print(f"  {TerminalUI.CYAN}🔗 Registry Bridge: Connecting registries...{TerminalUI.RESET}")
+
+        try:
+            from backend.core.registry.neural_mesh_bridge import get_registry_bridge
+
+            self._neural_mesh_bridge = await get_registry_bridge()
+
+            # Get metrics
+            metrics = self._neural_mesh_bridge.get_metrics()
+            unified_connected = metrics.get("unified_connected", False)
+            mesh_connected = metrics.get("mesh_connected", False)
+
+            status_parts = []
+            if unified_connected:
+                status_parts.append("UnifiedRegistry")
+            if mesh_connected:
+                status_parts.append("NeuralMesh")
+
+            if status_parts:
+                connections = " + ".join(status_parts)
+                print(f"  {TerminalUI.GREEN}✅ Registry Bridge: Connected to {connections}{TerminalUI.RESET}")
+                self.logger.info(f"[v100.0] ✅ Neural Mesh Registry Bridge connected to: {connections}")
+
+                # Perform initial sync
+                sync_results = await self._neural_mesh_bridge.sync_all()
+                total_synced = sum(r.agents_synced for r in sync_results)
+                if total_synced > 0:
+                    print(f"  {TerminalUI.GREEN}   └─ Initial sync: {total_synced} agents synchronized{TerminalUI.RESET}")
+                    self.logger.info(f"[v100.0] Initial sync: {total_synced} agents synchronized")
+            else:
+                print(f"  {TerminalUI.YELLOW}⚠️ Registry Bridge: No registries connected{TerminalUI.RESET}")
+                self.logger.warning("[v100.0] ⚠️ Neural Mesh Registry Bridge: No registries connected")
+
+        except ImportError as e:
+            self.logger.warning(f"[v100.0] ⚠️ Neural Mesh Registry Bridge import failed: {e}")
+            print(f"  {TerminalUI.YELLOW}⚠️ Registry Bridge: Not available{TerminalUI.RESET}")
+        except Exception as e:
+            self.logger.warning(f"[v100.0] ⚠️ Neural Mesh Registry Bridge initialization failed: {e}")
+            print(f"  {TerminalUI.YELLOW}⚠️ Registry Bridge: Failed to initialize{TerminalUI.RESET}")
+
+    async def _initialize_learning_state_connector(self) -> None:
+        """
+        v100.0: Initialize Learning State Connector.
+
+        Connects ContinuousLearningOrchestrator with DistributedStateManager for:
+        1. Training job state persistence across restarts
+        2. A/B test state synchronization
+        3. Experience buffer coordination
+        4. Cross-instance training coordination via leader election
+        """
+        self.logger.info("=" * 60)
+        self.logger.info("[v100.0] Initializing Learning State Connector")
+        self.logger.info("=" * 60)
+
+        print(f"  {TerminalUI.CYAN}💾 State Connector: Connecting learning systems...{TerminalUI.RESET}")
+
+        try:
+            from backend.intelligence.learning_state_connector import get_learning_state_connector
+
+            self._learning_state_connector = await get_learning_state_connector()
+
+            # Connect to learning orchestrator if available
+            if self._continuous_learning_orchestrator:
+                await self._learning_state_connector.connect_orchestrator(
+                    self._continuous_learning_orchestrator
+                )
+
+            # Get metrics
+            metrics = self._learning_state_connector.get_metrics()
+            is_leader = metrics.get("is_leader", False)
+            state_connected = metrics.get("state_manager_connected", False)
+
+            status_parts = []
+            if state_connected:
+                status_parts.append("StateManager")
+            if self._continuous_learning_orchestrator:
+                status_parts.append("LearningOrchestrator")
+
+            if status_parts:
+                connections = " + ".join(status_parts)
+                leader_status = " (training leader)" if is_leader else ""
+                print(f"  {TerminalUI.GREEN}✅ State Connector: Connected to {connections}{leader_status}{TerminalUI.RESET}")
+                self.logger.info(f"[v100.0] ✅ Learning State Connector connected to: {connections}")
+            else:
+                print(f"  {TerminalUI.YELLOW}⚠️ State Connector: No systems connected{TerminalUI.RESET}")
+                self.logger.warning("[v100.0] ⚠️ Learning State Connector: No systems connected")
+
+        except ImportError as e:
+            self.logger.warning(f"[v100.0] ⚠️ Learning State Connector import failed: {e}")
+            print(f"  {TerminalUI.YELLOW}⚠️ State Connector: Not available{TerminalUI.RESET}")
+        except Exception as e:
+            self.logger.warning(f"[v100.0] ⚠️ Learning State Connector initialization failed: {e}")
+            print(f"  {TerminalUI.YELLOW}⚠️ State Connector: Failed to initialize{TerminalUI.RESET}")
+
+    async def _initialize_experience_forwarder(self) -> None:
+        """
+        v100.0: Initialize Cross-Repo Experience Forwarder.
+
+        Forwards learning experiences to Reactor Core for:
+        1. Distributed model training across repos
+        2. Experience aggregation at scale
+        3. Cross-repo model performance tracking
+        4. Coordinated A/B testing
+        """
+        self.logger.info("=" * 60)
+        self.logger.info("[v100.0] Initializing Cross-Repo Experience Forwarder")
+        self.logger.info("=" * 60)
+
+        print(f"  {TerminalUI.CYAN}🔄 Experience Forwarder: Connecting to Reactor Core...{TerminalUI.RESET}")
+
+        try:
+            from backend.intelligence.cross_repo_experience_forwarder import get_experience_forwarder
+
+            self._experience_forwarder = await get_experience_forwarder()
+
+            # Get metrics
+            metrics = self._experience_forwarder.get_metrics()
+            reactor_available = metrics.get("reactor_core_available", False)
+            event_bus_connected = metrics.get("event_bus_connected", False)
+
+            if reactor_available:
+                transport = "EventBus" if event_bus_connected else "FileFallback"
+                print(f"  {TerminalUI.GREEN}✅ Experience Forwarder: Reactor Core connected via {transport}{TerminalUI.RESET}")
+                self.logger.info(f"[v100.0] ✅ Experience Forwarder connected to Reactor Core via {transport}")
+
+                # Connect to learning orchestrator for automatic forwarding
+                if self._continuous_learning_orchestrator:
+                    await self._connect_forwarder_to_learning()
+            else:
+                print(f"  {TerminalUI.YELLOW}⚠️ Experience Forwarder: Reactor Core not available (queuing enabled){TerminalUI.RESET}")
+                self.logger.warning("[v100.0] ⚠️ Experience Forwarder: Reactor Core not available")
+
+        except ImportError as e:
+            self.logger.warning(f"[v100.0] ⚠️ Experience Forwarder import failed: {e}")
+            print(f"  {TerminalUI.YELLOW}⚠️ Experience Forwarder: Not available{TerminalUI.RESET}")
+        except Exception as e:
+            self.logger.warning(f"[v100.0] ⚠️ Experience Forwarder initialization failed: {e}")
+            print(f"  {TerminalUI.YELLOW}⚠️ Experience Forwarder: Failed to initialize{TerminalUI.RESET}")
+
+    async def _connect_forwarder_to_learning(self) -> None:
+        """Connect the experience forwarder to the learning orchestrator."""
+        try:
+            if not self._continuous_learning_orchestrator or not self._experience_forwarder:
+                return
+
+            # Subscribe to experience collection events
+            if hasattr(self._continuous_learning_orchestrator, 'on_experience_collected'):
+                async def on_experience(exp_data: dict):
+                    await self._experience_forwarder.forward_experience(
+                        experience_type=exp_data.get("type", "interaction"),
+                        input_data=exp_data.get("input", {}),
+                        output_data=exp_data.get("output", {}),
+                        quality_score=exp_data.get("quality_score", 0.5),
+                        confidence=exp_data.get("confidence", 0.5),
+                        success=exp_data.get("success", True),
+                        component=exp_data.get("component", "learning_orchestrator"),
+                        metadata=exp_data.get("metadata", {}),
+                    )
+
+                self._continuous_learning_orchestrator.on_experience_collected(on_experience)
+                self.logger.info("[v100.0] Connected experience forwarder to learning orchestrator")
+
+        except Exception as e:
+            self.logger.warning(f"[v100.0] Failed to connect forwarder to learning: {e}")
 
     async def _initialize_v80_cross_repo_system(
         self,
@@ -12111,6 +12610,10 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
             if self._state_manager_enabled:
                 await self._initialize_distributed_state_manager()
 
+            # v100.0: Initialize Continuous Learning Orchestrator
+            if self._continuous_learning_enabled:
+                await self._initialize_continuous_learning_orchestrator()
+
         except Exception as e:
             self.logger.warning(f"⚠️ Trinity component launch failed: {e}")
             self.logger.warning(f"   Trace ID: {trace_ctx.trace_id}")
@@ -12258,9 +12761,34 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
                         state = json.load(f)
                     heartbeat_age = time_module.time() - state.get("timestamp", 0)
                     if heartbeat_age < 30:
-                        self.logger.info(f"   🧠 J-Prime already running (heartbeat: {jprime_state_file.name})")
-                        print(f"  {TerminalUI.GREEN}✓ J-Prime: Already running (heartbeat: {heartbeat_age:.1f}s ago){TerminalUI.RESET}")
-                        return
+                        # v100.1: FIX RACE CONDITION - Validate process is actually running
+                        pid = state.get("pid")
+                        if pid:
+                            try:
+                                import psutil
+                                proc = psutil.Process(pid)
+                                if proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE:
+                                    # Process exists and is not zombie
+                                    self.logger.info(f"   🧠 J-Prime already running (heartbeat: {jprime_state_file.name}, PID: {pid})")
+                                    print(f"  {TerminalUI.GREEN}✓ J-Prime: Already running (heartbeat: {heartbeat_age:.1f}s ago, PID: {pid}){TerminalUI.RESET}")
+                                    return
+                                else:
+                                    self.logger.warning(f"   J-Prime PID {pid} exists but is zombie/stopped - relaunching")
+                            except (ImportError, Exception) as e:
+                                # psutil not available or process doesn't exist
+                                # Fall back to os.kill check
+                                try:
+                                    os.kill(pid, 0)  # Just checks if process exists
+                                    self.logger.info(f"   🧠 J-Prime already running (heartbeat: {jprime_state_file.name}, PID: {pid})")
+                                    print(f"  {TerminalUI.GREEN}✓ J-Prime: Already running (heartbeat: {heartbeat_age:.1f}s ago){TerminalUI.RESET}")
+                                    return
+                                except OSError:
+                                    self.logger.warning(f"   J-Prime PID {pid} no longer exists - relaunching")
+                        else:
+                            # No PID in state but heartbeat recent - trust it for now
+                            self.logger.info(f"   🧠 J-Prime appears running (heartbeat: {jprime_state_file.name})")
+                            print(f"  {TerminalUI.GREEN}✓ J-Prime: Already running (heartbeat: {heartbeat_age:.1f}s ago){TerminalUI.RESET}")
+                            return
                 except Exception as e:
                     self.logger.debug(f"   Could not read J-Prime state from {jprime_state_file}: {e}")
 
@@ -12297,9 +12825,11 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
                     env["PYTHONPATH"] = str(self._jprime_repo_path)
                     env["TRINITY_ENABLED"] = "true"
 
-                    # Open log files
-                    stdout_file = open(stdout_log, "w")
-                    stderr_file = open(stderr_log, "w")
+                    # v100.1: FIX FILE DESCRIPTOR LEAK
+                    # Store file handles as instance variables for proper cleanup
+                    # These will be closed in _cleanup_trinity_components()
+                    self._jprime_stdout_file = open(stdout_log, "w")
+                    self._jprime_stderr_file = open(stderr_log, "w")
 
                     # Launch subprocess
                     self._jprime_orchestrator_process = await asyncio.create_subprocess_exec(
@@ -12307,8 +12837,8 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
                         str(script_path),
                         cwd=str(self._jprime_repo_path),
                         env=env,
-                        stdout=stdout_file,
-                        stderr=stderr_file,
+                        stdout=self._jprime_stdout_file,
+                        stderr=self._jprime_stderr_file,
                         start_new_session=True,  # Detach from parent process group
                     )
 
@@ -12320,6 +12850,11 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
                     break
 
                 except Exception as e:
+                    # v100.1: Clean up file handles on error
+                    if hasattr(self, '_jprime_stdout_file') and self._jprime_stdout_file:
+                        self._jprime_stdout_file.close()
+                    if hasattr(self, '_jprime_stderr_file') and self._jprime_stderr_file:
+                        self._jprime_stderr_file.close()
                     self.logger.warning(f"   Failed to launch J-Prime: {e}")
                     print(f"  {TerminalUI.YELLOW}⚠️ J-Prime launch failed: {e}{TerminalUI.RESET}")
 
@@ -12363,9 +12898,32 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
                     state = json.load(f)
                 heartbeat_age = time_module.time() - state.get("timestamp", 0)
                 if heartbeat_age < 30:
-                    self.logger.info("   ⚡ Reactor-Core already running (heartbeat detected)")
-                    print(f"  {TerminalUI.GREEN}✓ Reactor-Core: Already running (heartbeat: {heartbeat_age:.1f}s ago){TerminalUI.RESET}")
-                    return
+                    # v100.1: FIX RACE CONDITION - Validate process is actually running
+                    pid = state.get("pid")
+                    if pid:
+                        try:
+                            import psutil
+                            proc = psutil.Process(pid)
+                            if proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE:
+                                self.logger.info(f"   ⚡ Reactor-Core already running (heartbeat detected, PID: {pid})")
+                                print(f"  {TerminalUI.GREEN}✓ Reactor-Core: Already running (heartbeat: {heartbeat_age:.1f}s ago, PID: {pid}){TerminalUI.RESET}")
+                                return
+                            else:
+                                self.logger.warning(f"   Reactor-Core PID {pid} exists but is zombie/stopped - relaunching")
+                        except (ImportError, Exception):
+                            # psutil not available, fall back to os.kill check
+                            try:
+                                os.kill(pid, 0)
+                                self.logger.info(f"   ⚡ Reactor-Core already running (heartbeat detected, PID: {pid})")
+                                print(f"  {TerminalUI.GREEN}✓ Reactor-Core: Already running (heartbeat: {heartbeat_age:.1f}s ago){TerminalUI.RESET}")
+                                return
+                            except OSError:
+                                self.logger.warning(f"   Reactor-Core PID {pid} no longer exists - relaunching")
+                    else:
+                        # No PID but recent heartbeat - trust it
+                        self.logger.info("   ⚡ Reactor-Core appears running (heartbeat detected)")
+                        print(f"  {TerminalUI.GREEN}✓ Reactor-Core: Already running (heartbeat: {heartbeat_age:.1f}s ago){TerminalUI.RESET}")
+                        return
             except Exception as e:
                 self.logger.debug(f"   Could not read Reactor-Core state: {e}")
 
@@ -12395,9 +12953,10 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
                 env["PYTHONPATH"] = str(self._reactor_core_repo_path)
                 env["TRINITY_ENABLED"] = "true"
 
-                # Open log files
-                stdout_file = open(stdout_log, "w")
-                stderr_file = open(stderr_log, "w")
+                # v100.1: FIX FILE DESCRIPTOR LEAK
+                # Store file handles as instance variables for proper cleanup
+                self._reactor_stdout_file = open(stdout_log, "w")
+                self._reactor_stderr_file = open(stderr_log, "w")
 
                 # v74.0: Direct execution - trinity_orchestrator.py now has __main__ block
                 # No need for inline runner script anymore
@@ -12406,8 +12965,8 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
                     str(orchestrator_module),
                     cwd=str(self._reactor_core_repo_path),
                     env=env,
-                    stdout=stdout_file,
-                    stderr=stderr_file,
+                    stdout=self._reactor_stdout_file,
+                    stderr=self._reactor_stderr_file,
                     start_new_session=True,  # Detach from parent process group
                 )
 
@@ -12416,6 +12975,11 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
                 print(f"  {TerminalUI.GREEN}✓ Reactor-Core launched (PID: {self._reactor_core_orchestrator_process.pid}){TerminalUI.RESET}")
 
             except Exception as e:
+                # v100.1: Clean up file handles on error
+                if hasattr(self, '_reactor_stdout_file') and self._reactor_stdout_file:
+                    self._reactor_stdout_file.close()
+                if hasattr(self, '_reactor_stderr_file') and self._reactor_stderr_file:
+                    self._reactor_stderr_file.close()
                 self.logger.warning(f"   Failed to launch Reactor-Core: {e}")
                 print(f"  {TerminalUI.YELLOW}⚠️ Reactor-Core launch failed: {e}{TerminalUI.RESET}")
         else:
@@ -13425,6 +13989,25 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
                 self.logger.debug(f"   Reactor-Core shutdown error: {e}")
             finally:
                 self._reactor_core_orchestrator_process = None
+
+        # v100.1: Close file handles to prevent resource leaks
+        file_handles_to_close = [
+            ('_jprime_stdout_file', 'J-Prime stdout'),
+            ('_jprime_stderr_file', 'J-Prime stderr'),
+            ('_reactor_stdout_file', 'Reactor-Core stdout'),
+            ('_reactor_stderr_file', 'Reactor-Core stderr'),
+        ]
+        for attr_name, description in file_handles_to_close:
+            if hasattr(self, attr_name):
+                try:
+                    file_handle = getattr(self, attr_name)
+                    if file_handle and not file_handle.closed:
+                        file_handle.close()
+                        self.logger.debug(f"   ✅ [v100.1] Closed {description} file handle")
+                except Exception as e:
+                    self.logger.debug(f"   Error closing {description} file handle: {e}")
+                finally:
+                    setattr(self, attr_name, None)
 
         # v75.0: Stop Trinity Health Monitor
         await self._stop_trinity_health_monitor()

@@ -376,6 +376,7 @@ class ErrorRecoveryOrchestrator:
         backoff = self.config.initial_backoff
         start_time = time.time()
 
+        iteration_timeout = float(os.getenv("TIMEOUT_ERROR_RECOVERY_ITERATION", "60.0"))
         while True:
             try:
                 # Check circuit breaker
@@ -400,8 +401,11 @@ class ErrorRecoveryOrchestrator:
                         duration=time.time() - start_time,
                     )
 
-                # Execute operation
-                result = await operation(*args, **kwargs)
+                # Execute operation with timeout
+                result = await asyncio.wait_for(
+                    operation(*args, **kwargs),
+                    timeout=iteration_timeout
+                )
 
                 # Success - reset circuit breaker
                 self._record_success(component)

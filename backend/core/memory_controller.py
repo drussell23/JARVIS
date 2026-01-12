@@ -127,7 +127,7 @@ class MemoryController:
                         'name': proc.info['name'],
                         'memory_percent': proc.info['memory_percent']
                     })
-            except:
+            except Exception:
                 continue
                 
         top_processes.sort(key=lambda x: x['memory_percent'], reverse=True)

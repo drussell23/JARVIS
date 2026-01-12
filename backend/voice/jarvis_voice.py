@@ -1722,7 +1722,7 @@ class EnhancedVoiceEngine:
                 # Store noise profile for future noise reduction
                 self.noise_profile = audio.get_raw_data()
                 print("✅ Calibration complete. Noise profile created.")
-            except:
+            except Exception:
                 print("✅ Calibration complete.")
 
     def listen_with_confidence(
@@ -1846,7 +1846,7 @@ class EnhancedVoiceEngine:
                 base_confidence *= 0.8
 
             return min(base_confidence, 1.0)
-        except:
+        except Exception:
             return base_confidence
 
     def detect_intent(self, text: str) -> str:

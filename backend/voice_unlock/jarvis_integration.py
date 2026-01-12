@@ -33,7 +33,7 @@ def check_voice_unlock_requirements() -> Dict[str, bool]:
         import sounddevice as sd
         devices = sd.query_devices()
         requirements['microphone'] = any(d['max_input_channels'] > 0 for d in devices)
-    except:
+    except Exception:
         pass
         
     # Check dependencies
@@ -41,7 +41,7 @@ def check_voice_unlock_requirements() -> Dict[str, bool]:
         from backend.voice_unlock import check_dependencies
         deps = check_dependencies()
         requirements['dependencies'] = all(deps.values())
-    except:
+    except Exception:
         pass
         
     # Check permissions (macOS)
@@ -53,7 +53,7 @@ def check_voice_unlock_requirements() -> Dict[str, bool]:
     try:
         import bleak
         requirements['apple_watch'] = True
-    except:
+    except Exception:
         pass
         
     # Check memory
@@ -61,7 +61,7 @@ def check_voice_unlock_requirements() -> Dict[str, bool]:
         import psutil
         vm = psutil.virtual_memory()
         requirements['memory'] = vm.available > 2 * 1024 * 1024 * 1024  # 2GB available
-    except:
+    except Exception:
         pass
         
     return requirements

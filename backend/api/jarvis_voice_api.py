@@ -276,7 +276,7 @@ async def async_subprocess_run(cmd, timeout: float = 10.0) -> tuple:
         try:
             process.kill()
             await process.wait()
-        except:
+        except Exception:
             pass
         return b"", b"Timeout", -1
 
@@ -570,10 +570,10 @@ class DynamicErrorHandler:
                 for key, value in kwargs.items():
                     try:
                         setattr(obj, key, value)
-                    except:
+                    except Exception:
                         pass
                 return obj
-            except:
+            except Exception:
                 # Return a SimpleNamespace as fallback
                 from types import SimpleNamespace
 
@@ -790,7 +790,7 @@ class JARVISVoiceAPI:
                 monitor = get_display_monitor()
                 if monitor and hasattr(monitor, "get_active_applications"):
                     context["active_apps"] = await monitor.get_active_applications()
-            except:
+            except Exception:
                 pass
 
             # Try to get current Space
@@ -809,7 +809,7 @@ class JARVISVoiceAPI:
                 )
                 if result.returncode == 0:
                     context["current_space"] = result.stdout.strip()
-            except:
+            except Exception:
                 pass
 
             # Get system state from JARVIS if available
@@ -820,7 +820,7 @@ class JARVISVoiceAPI:
                         context["system_state"]["user_preferences"] = personality.user_preferences
                     if hasattr(personality, "context"):
                         context["system_state"]["conversation_context"] = personality.context[-5:]
-                except:
+                except Exception:
                     pass
 
             return context
@@ -2131,7 +2131,7 @@ class JARVISVoiceAPI:
                             logger.info(
                                 f"[JARVIS API] Got weather system from app state, vision: {vision_available}"
                             )
-                    except:
+                    except Exception:
                         pass
 
                     # Fallback to get_weather_system
@@ -2346,7 +2346,7 @@ class JARVISVoiceAPI:
                     try:
                         success = await async_open_app("Weather")
                         response = "I'm having trouble reading the weather data. I've opened the Weather app for you to check directly, Sir."
-                    except:
+                    except Exception:
                         response = "I'm experiencing a delay accessing the weather information. Please check the Weather app directly, Sir."
                 else:
                     response = "I apologize, but that request is taking too long to process. Please try again, Sir."
@@ -2509,7 +2509,7 @@ class JARVISVoiceAPI:
                             # Last resort: use AIFF
                             mp3_path = tmp_path
                             media_type = "audio/aiff"
-                    except:
+                    except Exception:
                         # Last resort: use AIFF
                         mp3_path = tmp_path
                         media_type = "audio/aiff"
@@ -2882,7 +2882,7 @@ class JARVISVoiceAPI:
 
                 generator = get_response_generator(user_name)
                 startup_greeting = generator.generate_startup_greeting()
-            except:
+            except Exception:
                 # Fallback if generator not available
                 startup_greeting = f"JARVIS online. How may I assist you, {user_name}?"
 
@@ -2894,9 +2894,19 @@ class JARVISVoiceAPI:
                 }
             )
 
+            # WebSocket idle timeout protection
+            idle_timeout = float(os.getenv("TIMEOUT_WEBSOCKET_IDLE", "300.0"))  # 5 min default
+
             while True:
-                # Receive data from client
-                data = await websocket.receive_json()
+                # Receive data from client with timeout protection
+                try:
+                    data = await asyncio.wait_for(
+                        websocket.receive_json(),
+                        timeout=idle_timeout
+                    )
+                except asyncio.TimeoutError:
+                    logger.info("JARVIS voice WebSocket idle timeout, closing connection")
+                    break
 
                 # Handle ping/pong for health monitoring
                 if data.get("type") == "ping":
@@ -2956,7 +2966,7 @@ class JARVISVoiceAPI:
                                     )
                                     await asyncio.wait_for(proc.communicate(), timeout=timeout)
                                     return proc.returncode == 0
-                                except:
+                                except Exception:
                                     return False
 
                             lock_success = False
@@ -3662,7 +3672,7 @@ class JARVISVoiceAPI:
                                         logger.info(
                                             f"[JARVIS WS] Got weather system from app state, vision: {vision_available}"
                                         )
-                                except:
+                                except Exception:
                                     pass
 
                                 # Fallback to get_weather_system
@@ -3746,7 +3756,7 @@ class JARVISVoiceAPI:
                                 try:
                                     await async_open_app("Weather")
                                     response = "I encountered an error accessing the weather system. I've opened the Weather app for manual viewing."
-                                except:
+                                except Exception:
                                     response = "I'm having difficulty accessing weather data at the moment."
                         elif "time" in data["text"].lower():
                             response = f"The current time is {datetime.now().strftime('%I:%M %p')}."
@@ -3997,7 +4007,7 @@ class JARVISVoiceAPI:
             logger.error(f"Error in JARVIS WebSocket: {e}")
             try:
                 await websocket.send_json({"type": "error", "message": str(e)})
-            except:
+            except Exception:
                 pass  # Client might already be disconnected
         finally:
             # Remove connection from tracking

@@ -30,7 +30,7 @@ try:
     import spacy
     nlp = spacy.load("en_core_web_sm")
     SPACY_AVAILABLE = True
-except:
+except Exception:
     SPACY_AVAILABLE = False
 
 try:
@@ -38,7 +38,7 @@ try:
     from nltk.tokenize import word_tokenize
     from nltk.tag import pos_tag
     NLTK_AVAILABLE = True
-except:
+except Exception:
     NLTK_AVAILABLE = False
 
 logger = logging.getLogger(__name__)

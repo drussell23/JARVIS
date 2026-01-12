@@ -42,6 +42,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from backend.core.async_safety import LazyAsyncLock
+
 logger = logging.getLogger(__name__)
 
 
@@ -833,7 +835,7 @@ class ABTestingManager:
 # =============================================================================
 
 _manager_instance: Optional[ABTestingManager] = None
-_manager_lock = asyncio.Lock()
+_manager_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 async def get_ab_testing_manager() -> ABTestingManager:

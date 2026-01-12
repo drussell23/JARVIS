@@ -42,6 +42,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 
+from backend.core.async_safety import LazyAsyncLock
+
 if TYPE_CHECKING:
     from .advanced_startup_orchestrator import (
         DependencyGraphOrchestrator,
@@ -593,7 +595,7 @@ class OrchestratorHooks:
 # =============================================================================
 
 _hooks_instance: Optional[OrchestratorHooks] = None
-_hooks_lock = asyncio.Lock()
+_hooks_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 async def get_orchestrator_hooks(

@@ -1429,7 +1429,7 @@ class UnifiedCommandProcessor:
                 # Get owner name for personalized response (fast, cached)
                 from api.simple_unlock_handler import _get_owner_name
                 speaker_name = await asyncio.wait_for(_get_owner_name(), timeout=1.0)
-            except:
+            except Exception:
                 speaker_name = "there"
 
             # Execute lock command directly
@@ -3297,7 +3297,7 @@ class UnifiedCommandProcessor:
                 )
                 if result.returncode == 0:
                     active_apps = result.stdout.strip().split(", ")
-            except:
+            except Exception:
                 pass
 
             return {
@@ -5238,7 +5238,7 @@ class UnifiedCommandProcessor:
                 return "chrome"
             elif "firefox" in result.stdout.lower():
                 return "firefox"
-        except:
+        except Exception:
             pass
 
         # Default fallback

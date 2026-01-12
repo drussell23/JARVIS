@@ -81,6 +81,8 @@ from typing import (
     Union,
 )
 
+from backend.core.async_safety import LazyAsyncLock
+
 import numpy as np
 
 # Environment-driven configuration
@@ -1088,7 +1090,7 @@ class MultiModalPerceptionFusion:
 
 # Global instance
 _perception_fusion: Optional[MultiModalPerceptionFusion] = None
-_lock = asyncio.Lock()
+_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 async def get_perception_fusion() -> MultiModalPerceptionFusion:

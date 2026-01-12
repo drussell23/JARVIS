@@ -1630,7 +1630,7 @@ def register_coding_council_routes(app):
                         "message": f"Connection error: {e}",
                         "fatal": True,
                     })
-            except:
+            except Exception:
                 pass
         finally:
             # Cleanup

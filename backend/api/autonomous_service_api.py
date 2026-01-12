@@ -8,6 +8,7 @@ from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 import asyncio
 import logging
+import time
 from typing import Dict, List, Any, Optional
 from datetime import datetime
 import json
@@ -261,10 +262,17 @@ async def service_monitor_websocket(websocket: WebSocket):
         }
         await websocket.send_json(services_data)
         
-        # Monitor for changes
+        # Monitor for changes with connection timeout protection
         last_state = services_data["services"].copy()
-        
+        connection_start = time.monotonic()
+        max_connection_time = float(os.getenv("TIMEOUT_SSE_CONNECTION", "3600.0"))  # 1 hour default
+
         while True:
+            # Check connection timeout
+            if time.monotonic() - connection_start > max_connection_time:
+                logger.info("Autonomous service WebSocket connection timeout, closing")
+                break
+
             await asyncio.sleep(2)  # Check every 2 seconds
             
             current_state = {

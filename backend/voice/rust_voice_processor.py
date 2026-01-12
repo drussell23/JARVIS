@@ -312,7 +312,7 @@ class RustMLAudioBridge:
         try:
             import psutil
             return psutil.cpu_percent(interval=0.1)
-        except:
+        except Exception:
             return 50.0  # Default estimate
     
     def integrate_with_ml_handler(self, ml_handler):

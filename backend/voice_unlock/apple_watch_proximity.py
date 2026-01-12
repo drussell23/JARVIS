@@ -8,6 +8,7 @@ seamless integration with voice authentication.
 
 import asyncio
 import logging
+import os
 import threading
 import time
 from datetime import datetime, timedelta
@@ -217,19 +218,29 @@ class AppleWatchProximityDetector:
         """Continuous scanning loop for bleak"""
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        
-        while self.is_scanning:
+
+        session_timeout = float(os.getenv("TIMEOUT_VOICE_SESSION", "3600.0"))  # 1 hour default
+        session_start = time.monotonic()
+
+        while self.is_scanning and (time.monotonic() - session_start < session_timeout):
             try:
                 loop.run_until_complete(self._bleak_scan_devices())
                 time.sleep(0.1)  # Brief pause between scans
             except Exception as e:
                 logger.error(f"Scan loop error: {e}")
                 time.sleep(1)
+
+        if time.monotonic() - session_start >= session_timeout:
+            logger.info("Bleak scan loop session timeout reached")
+            self.is_scanning = False
                 
     def _corebluetooth_scan_loop(self):
         """Continuous scanning loop for CoreBluetooth"""
         # Simplified implementation - in reality would use CBCentralManager
-        while self.is_scanning:
+        session_timeout = float(os.getenv("TIMEOUT_VOICE_SESSION", "3600.0"))  # 1 hour default
+        session_start = time.monotonic()
+
+        while self.is_scanning and (time.monotonic() - session_start < session_timeout):
             try:
                 # Simulate device detection
                 if self.paired_watch_id:
@@ -237,7 +248,7 @@ class AppleWatchProximityDetector:
                     import random
                     rssi = -60 + random.randint(-10, 10)
                     distance = self._estimate_distance(rssi)
-                    
+
                     watch = AppleWatchDevice(
                         identifier=self.paired_watch_id,
                         name="John's Apple Watch",
@@ -247,15 +258,19 @@ class AppleWatchProximityDetector:
                         is_paired=True,
                         is_unlocked=True  # Would check actual state
                     )
-                    
+
                     self.detected_watches[self.paired_watch_id] = watch
                     self._handle_watch_proximity(watch)
-                    
+
                 time.sleep(self.config['scan_interval'])
-                
+
             except Exception as e:
                 logger.error(f"CoreBluetooth scan error: {e}")
                 time.sleep(1)
+
+        if time.monotonic() - session_start >= session_timeout:
+            logger.info("CoreBluetooth scan loop session timeout reached")
+            self.is_scanning = False
                 
     def _is_apple_watch(self, device, adv_data) -> bool:
         """Check if device is an Apple Watch"""

@@ -77,9 +77,9 @@ class RustManager:
             try:
                 subprocess.run([sys.executable, "-m", "pip", "install", "maturin"], check=True)
                 return True
-            except:
+            except Exception:
                 return False
-                
+
     def _check_git(self) -> bool:
         try:
             result = subprocess.run(["git", "--version"], capture_output=True)

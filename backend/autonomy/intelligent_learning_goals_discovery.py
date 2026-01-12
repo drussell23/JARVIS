@@ -62,6 +62,8 @@ from enum import Enum, auto
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
+from backend.core.async_safety import LazyAsyncLock
+
 logger = logging.getLogger(__name__)
 
 
@@ -1145,7 +1147,7 @@ class IntelligentLearningGoalsDiscovery:
 # =============================================================================
 
 _goals_discovery_instance: Optional[IntelligentLearningGoalsDiscovery] = None
-_goals_discovery_lock = asyncio.Lock()
+_goals_discovery_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 async def get_goals_discovery_async() -> IntelligentLearningGoalsDiscovery:

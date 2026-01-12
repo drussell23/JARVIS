@@ -68,7 +68,7 @@ class PythonCoreMLVAD:
                 text=True
             )
             return result.stdout.split()[0]
-        except:
+        except Exception:
             return "unknown"
 
     def detect_voice(self, audio: np.ndarray) -> Tuple[bool, float]:

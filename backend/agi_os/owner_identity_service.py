@@ -43,6 +43,8 @@ from datetime import datetime, timedelta
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from backend.core.async_safety import LazyAsyncLock
+
 logger = logging.getLogger(__name__)
 
 
@@ -600,7 +602,7 @@ class OwnerIdentityService:
 
 # Singleton management
 _identity_service: Optional[OwnerIdentityService] = None
-_identity_lock = asyncio.Lock()
+_identity_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 async def get_owner_identity(

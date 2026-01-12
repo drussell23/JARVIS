@@ -248,7 +248,7 @@ Provide analysis as JSON with these keys:
             try:
                 scaled_features = model_data['scaler'].transform([features])
                 confidence = model_data['classifier'].predict_proba(scaled_features)[0].max()
-            except:
+            except Exception:
                 pass
         
         # Enhance with Claude's analysis
@@ -487,7 +487,7 @@ Provide: estimated_minutes, bottlenecks[], next_steps[]"""
             # Parse response (simplified)
             estimate = 30  # Default estimate
             
-        except:
+        except Exception:
             estimate = 30
         
         return DynamicPrediction(

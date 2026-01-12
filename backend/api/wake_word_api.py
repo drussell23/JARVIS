@@ -5,10 +5,13 @@ Wake Word API
 REST and WebSocket API endpoints for wake word detection.
 """
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect, HTTPException
-from typing import Dict, Any, Optional
-import logging
+import asyncio
 import json
+import logging
+import os
+from typing import Dict, Any, Optional
+
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, HTTPException
 
 logger = logging.getLogger(__name__)
 
@@ -209,27 +212,36 @@ async def wake_word_websocket(websocket: WebSocket):
     original_callback = wake_service.activation_callback
     wake_service.activation_callback = send_event
     
+    # WebSocket idle timeout protection
+    idle_timeout = float(os.getenv("TIMEOUT_WEBSOCKET_IDLE", "300.0"))  # 5 min default
+
     try:
         while True:
-            # Receive messages from client
+            # Receive messages from client with timeout
             try:
-                message = await websocket.receive_json()
-                
+                message = await asyncio.wait_for(
+                    websocket.receive_json(),
+                    timeout=idle_timeout
+                )
+
                 if message.get('type') == 'ping':
                     await websocket.send_json({'type': 'pong'})
-                
+
                 elif message.get('type') == 'command_received':
                     await wake_service.handle_command_received()
-                
+
                 elif message.get('type') == 'command_complete':
                     await wake_service.handle_command_complete()
-                
+
+            except asyncio.TimeoutError:
+                logger.info("Wake word WebSocket idle timeout, closing connection")
+                break
             except json.JSONDecodeError:
                 await websocket.send_json({
                     'type': 'error',
                     'message': 'Invalid JSON message'
                 })
-                
+
     except WebSocketDisconnect:
         logger.info("Wake word WebSocket disconnected")
     finally:

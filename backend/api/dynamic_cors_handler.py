@@ -85,9 +85,9 @@ class DynamicCORSMiddleware:
                 parsed = urlparse(referer)
                 if parsed.port:
                     return parsed.port
-            except:
+            except Exception:
                 pass
-                
+
         # Check origin header
         origin = request.headers.get("origin", "")
         if origin:
@@ -95,7 +95,7 @@ class DynamicCORSMiddleware:
                 parsed = urlparse(origin)
                 if parsed.port:
                     return parsed.port
-            except:
+            except Exception:
                 pass
                 
         return None
@@ -152,9 +152,9 @@ class DynamicCORSMiddleware:
                 if parsed.port and str(parsed.port) != actual_port:
                     response.headers["X-Port-Mismatch-Warning"] = f"Client expects port {parsed.port}, API is on port {actual_port}"
                     response.headers["X-Correct-Base-URL"] = f"http://localhost:{actual_port}"
-            except:
+            except Exception:
                 pass
-            
+
         return response
 
 
@@ -268,9 +268,9 @@ class AutoPortDiscovery:
                         "url": f"http://localhost:{port}",
                         "status": "active"
                     }
-            except:
+            except Exception:
                 pass
-                
+
         return services
     
     @staticmethod

@@ -840,7 +840,7 @@ class VisionNavigationSystem:
                 main_screen = NSScreen.mainScreen()
                 frame = main_screen.frame()
                 return (0, 0, int(frame.size.width), int(frame.size.height))
-            except:
+            except Exception:
                 pass
                 
         # Default fallback

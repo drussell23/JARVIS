@@ -270,7 +270,7 @@ class MacUnlockService:
         try:
             voiceprints = self.keychain.list_voiceprints()
             status['enrolled_users_count'] = len(voiceprints)
-        except:
+        except Exception:
             status['enrolled_users_count'] = 0
             
         return status

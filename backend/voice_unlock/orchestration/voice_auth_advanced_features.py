@@ -33,6 +33,8 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
+from backend.core.async_safety import LazyAsyncLock
+
 logger = logging.getLogger(__name__)
 
 # Optional ML dependencies
@@ -1096,7 +1098,7 @@ class AdvancedFeaturesManager:
 # =============================================================================
 
 _advanced_features: Optional[AdvancedFeaturesManager] = None
-_advanced_lock = asyncio.Lock()
+_advanced_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 async def get_advanced_features(

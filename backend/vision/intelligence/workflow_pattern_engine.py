@@ -17,9 +17,11 @@ All patterns are learned dynamically from observation - no hardcoded rules.
 import asyncio
 import json
 import logging
+import os
 import pickle
 import hashlib
 import statistics
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -1474,10 +1476,12 @@ class WorkflowPatternEngine:
     
     async def _periodic_cleanup(self):
         """Periodic cleanup of old data"""
-        while True:
+        max_runtime = float(os.getenv("TIMEOUT_VISION_SESSION", "3600.0"))  # 1 hour default
+        session_start = time.monotonic()
+        while time.monotonic() - session_start < max_runtime:
             try:
                 await asyncio.sleep(self.pattern_cleanup_interval)
-                
+
                 # Clean up old prediction cache
                 current_time = datetime.now()
                 expired_keys = [
@@ -1486,29 +1490,31 @@ class WorkflowPatternEngine:
                 ]
                 for key in expired_keys:
                     del self.pattern_application.prediction_cache[key]
-                
+
                 # Clean up low-confidence patterns
                 low_confidence_patterns = [
                     pid for pid, pattern in self.learned_patterns.items()
-                    if pattern.confidence == PatternConfidence.EXPLORING and 
+                    if pattern.confidence == PatternConfidence.EXPLORING and
                        (current_time - pattern.discovered_at) > timedelta(days=7)
                 ]
-                
+
                 for pid in low_confidence_patterns:
                     if pid in self.learned_patterns:
                         del self.learned_patterns[pid]
                     if pid in self.pattern_application.active_patterns:
                         del self.pattern_application.active_patterns[pid]
-                
+
                 # Save state periodically
                 await self._save_patterns()
-                
+
                 logger.debug(f"Cleanup complete. Active patterns: {len(self.learned_patterns)}")
-                
+
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Error in periodic cleanup: {e}")
+        else:
+            logger.info("Workflow pattern cleanup session timeout, stopping")
     
     async def _save_patterns(self):
         """Save learned patterns to disk"""

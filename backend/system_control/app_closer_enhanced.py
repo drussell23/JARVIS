@@ -153,7 +153,7 @@ class EnhancedAppCloser:
                     try:
                         os.kill(pid, signal.SIGKILL)
                         logger.info(f"Sent SIGKILL to PID {pid}")
-                    except:
+                    except Exception:
                         pass
                 
                 time.sleep(0.5)
@@ -219,7 +219,7 @@ class EnhancedAppCloser:
             
             return result.stdout.strip() == "true"
             
-        except:
+        except Exception:
             # Fallback to ps
             try:
                 result = subprocess.run(
@@ -228,7 +228,7 @@ class EnhancedAppCloser:
                     timeout=1
                 )
                 return result.returncode == 0
-            except:
+            except Exception:
                 return False
     
     def _find_pids(self, app_name: str) -> List[int]:
@@ -261,13 +261,13 @@ class EnhancedAppCloser:
                     if len(parts) > 1:
                         try:
                             pids.append(int(parts[1]))
-                        except:
+                        except Exception:
                             pass
             
             # Remove duplicates
             return list(set(pids))
             
-        except:
+        except Exception:
             return []
 
 # Global instance

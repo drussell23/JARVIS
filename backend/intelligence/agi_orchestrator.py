@@ -78,6 +78,8 @@ from typing import (
     Union,
 )
 
+from backend.core.async_safety import LazyAsyncLock
+
 # Environment-driven configuration
 AGI_DATA_DIR = Path(os.getenv(
     "AGI_DATA_DIR",
@@ -903,7 +905,7 @@ class AGIOrchestrator:
 
 # Global instance
 _agi_orchestrator: Optional[AGIOrchestrator] = None
-_lock = asyncio.Lock()
+_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 async def get_agi_orchestrator() -> AGIOrchestrator:

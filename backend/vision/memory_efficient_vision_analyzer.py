@@ -573,16 +573,16 @@ class MemoryEfficientVisionAnalyzer:
             json_match = re.search(r'\{.*\}', response, re.DOTALL)
             if json_match:
                 return json.loads(json_match.group())
-        except:
+        except Exception:
             pass
-        
+
         return {
             "description": response,
             "has_updates": "update" in response.lower(),
             "applications_mentioned": self._extract_app_names(response),
             "actions_suggested": self._extract_actions(response)
         }
-    
+
     def _extract_app_names(self, text: str) -> List[str]:
         """Extract application names from Claude's response"""
         # Load app list from environment or use defaults
@@ -590,20 +590,20 @@ class MemoryEfficientVisionAnalyzer:
         if apps_json:
             try:
                 common_apps = json.loads(apps_json)
-            except:
+            except Exception:
                 common_apps = self._get_default_apps()
         else:
             common_apps = self._get_default_apps()
-        
+
         found_apps = []
         text_lower = text.lower()
-        
+
         for app in common_apps:
             if app.lower() in text_lower:
                 found_apps.append(app)
-        
+
         return found_apps
-    
+
     def _get_default_apps(self) -> List[str]:
         """Get default app list"""
         return [
@@ -611,7 +611,7 @@ class MemoryEfficientVisionAnalyzer:
             "VS Code", "Xcode", "Terminal", "Finder", "System Preferences",
             "App Store", "Activity Monitor", "Spotify", "Discord"
         ]
-    
+
     def _extract_actions(self, text: str) -> List[str]:
         """Extract suggested actions from Claude's response"""
         # Load action keywords from environment or use defaults
@@ -619,7 +619,7 @@ class MemoryEfficientVisionAnalyzer:
         if keywords_json:
             try:
                 action_keywords = json.loads(keywords_json)
-            except:
+            except Exception:
                 action_keywords = self._get_default_action_keywords()
         else:
             action_keywords = self._get_default_action_keywords()

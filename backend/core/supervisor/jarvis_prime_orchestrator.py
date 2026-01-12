@@ -60,6 +60,8 @@ try:
 except ImportError:
     INTELLIGENT_PORT_MANAGER_AVAILABLE = False
 
+from backend.core.async_safety import LazyAsyncLock
+
 logger = logging.getLogger(__name__)
 
 
@@ -1366,13 +1368,13 @@ class JarvisPrimeOrchestrator:
                                     def terminate(self):
                                         try:
                                             self._proc.terminate()
-                                        except:
+                                        except Exception:
                                             pass
 
                                     def kill(self):
                                         try:
                                             self._proc.kill()
-                                        except:
+                                        except Exception:
                                             pass
 
                                     async def wait(self):
@@ -1384,7 +1386,7 @@ class JarvisPrimeOrchestrator:
                                                 if not self._proc.is_running():
                                                     self.returncode = 0
                                                     return
-                                            except:
+                                            except Exception:
                                                 self.returncode = 0
                                                 return
                                             await asyncio.sleep(0.1)
@@ -2400,7 +2402,7 @@ class JarvisPrimeOrchestrator:
 # =============================================================================
 
 _orchestrator_instance: Optional[JarvisPrimeOrchestrator] = None
-_orchestrator_lock = asyncio.Lock()
+_orchestrator_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 def get_jarvis_prime_orchestrator(

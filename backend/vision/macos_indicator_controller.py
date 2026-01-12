@@ -238,7 +238,7 @@ class MacOSIndicatorController:
                         logger.info(f"[MACOS] Killing stale process: {pid}")
                         try:
                             os.kill(int(pid), 15)  # SIGTERM
-                        except:
+                        except Exception:
                             pass
                 
                 # Wait for cleanup

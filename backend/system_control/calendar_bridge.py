@@ -126,7 +126,7 @@ class CalendarBridge:
                     output_data = json.loads(stdout.decode())
                     if 'error' in output_data:
                         logger.warning(f"Calendar access issue: {output_data['error']}")
-                except:
+                except Exception:
                     logger.error(f"Calendar provider error: {error_output}")
                 return None
             

@@ -86,6 +86,8 @@ from typing import (
 
 import numpy as np
 
+from backend.core.async_safety import LazyAsyncLock
+
 # Environment-driven configuration
 IMPROVEMENT_DATA_DIR = Path(os.getenv(
     "IMPROVEMENT_DATA_DIR",
@@ -1119,7 +1121,7 @@ class ContinuousImprovementEngine:
 
 # Global instance
 _improvement_engine: Optional[ContinuousImprovementEngine] = None
-_lock = asyncio.Lock()
+_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 async def get_improvement_engine() -> ContinuousImprovementEngine:

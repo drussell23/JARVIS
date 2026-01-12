@@ -30,6 +30,8 @@ from pathlib import Path
 from collections import defaultdict, deque
 import numpy as np
 
+from backend.core.async_safety import LazyAsyncLock
+
 logger = logging.getLogger(__name__)
 
 
@@ -495,7 +497,7 @@ class UnlockPatternTracker:
 # GLOBAL INSTANCE
 # =============================================================================
 _tracker: Optional[UnlockPatternTracker] = None
-_tracker_lock = asyncio.Lock()
+_tracker_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 async def get_unlock_pattern_tracker() -> UnlockPatternTracker:

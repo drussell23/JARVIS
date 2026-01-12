@@ -52,6 +52,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional, AsyncGenerator
 
+from backend.core.async_safety import LazyAsyncLock
+
 logger = logging.getLogger(__name__)
 
 # =============================================================================
@@ -609,7 +611,7 @@ class PrimeRouter:
 # =============================================================================
 
 _prime_router: Optional[PrimeRouter] = None
-_router_lock = asyncio.Lock()
+_router_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 async def get_prime_router(config: Optional[PrimeRouterConfig] = None) -> PrimeRouter:

@@ -164,7 +164,7 @@ class ResourceManager:
         try:
             process = psutil.Process()
             jarvis_memory = process.memory_info().rss / (1024 * 1024)  # MB
-        except:
+        except Exception:
             jarvis_memory = 0
             
         # Count loaded ML models

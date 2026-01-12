@@ -178,9 +178,9 @@ class CalendarManager:
                     # Remove time from title
                     title = text.replace(time_str, "").strip()
                     break
-                except:
+                except Exception:
                     pass
-                    
+
         if not start_time:
             # Default to tomorrow at 9 AM
             start_time = datetime.now().replace(hour=9, minute=0, second=0) + timedelta(days=1)
@@ -703,9 +703,9 @@ class TaskExecutor:
             # Remove from scheduler if scheduled
             try:
                 self.scheduler.remove_job(f"task_{task_id}")
-            except:
+            except Exception:
                 pass
-                
+
             # Update status
             task.status = TaskStatus.CANCELLED
             

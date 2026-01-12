@@ -67,6 +67,8 @@ from typing import (
     Union,
 )
 
+from backend.core.async_safety import LazyAsyncLock
+
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
@@ -1122,7 +1124,7 @@ Complete the code:"""
 # =============================================================================
 
 _ide_bridge: Optional[IDEBridge] = None
-_ide_bridge_lock = asyncio.Lock()
+_ide_bridge_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 async def get_ide_bridge() -> IDEBridge:

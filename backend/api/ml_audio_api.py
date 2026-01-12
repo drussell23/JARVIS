@@ -140,14 +140,14 @@ class MLAudioSystemState:
             # Try CUDA
             import torch
             return torch.cuda.is_available()
-        except:
+        except Exception:
             pass
-            
+
         try:
             # Try Metal (Apple Silicon)
             import torch
             return torch.backends.mps.is_available()
-        except:
+        except Exception:
             pass
             
         return False
@@ -975,7 +975,7 @@ def get_dynamic_config(request: Request) -> Dict[str, Any]:
         import netifaces
         interfaces = netifaces.interfaces()
         network_available = len(interfaces) > 1
-    except:
+    except Exception:
         network_available = True
     
     # Build dynamic config
@@ -1547,7 +1547,7 @@ async def get_ml_audio_status():
             "bytes_recv_mb": round(net_io.bytes_recv / 1024 / 1024, 1),
             "packets_dropped": net_io.dropin + net_io.dropout
         }
-    except:
+    except Exception:
         network_stats = {"status": "unavailable"}
     
     return {
@@ -1616,11 +1616,20 @@ async def ml_audio_websocket(websocket: WebSocket):
             "metrics": metrics
         })
         
-        # Keep connection alive
+        # Keep connection alive with timeout protection
+        idle_timeout = float(os.getenv("TIMEOUT_WEBSOCKET_IDLE", "300.0"))  # 5 min default
+
         while True:
-            # Receive messages from client
-            data = await websocket.receive_json()
-            
+            # Receive messages from client with timeout
+            try:
+                data = await asyncio.wait_for(
+                    websocket.receive_json(),
+                    timeout=idle_timeout
+                )
+            except asyncio.TimeoutError:
+                logger.info("ML audio WebSocket idle timeout, closing connection")
+                break
+
             if data.get("type") == "telemetry":
                 # Process telemetry
                 event_data = data.get("data", {})

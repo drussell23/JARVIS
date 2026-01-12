@@ -31,7 +31,7 @@ class PythonBuffer:
         """Ensure buffer is released when garbage collected."""
         try:
             self.release()
-        except:
+        except Exception:
             pass
 
 class PythonZeroCopyPool:

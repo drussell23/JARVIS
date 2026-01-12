@@ -483,7 +483,7 @@ class UnifiedContextBridge:
                                 "has_ocr_text": ocr_text is not None,
                             }
                         )
-                    except:
+                    except Exception:
                         pass
 
                 return context_id
@@ -543,7 +543,7 @@ class UnifiedContextBridge:
         if self._telemetry and count > 0:
             try:
                 await self._telemetry.track_event("follow_up.contexts_expired", {"count": count})
-            except:
+            except Exception:
                 pass  # Telemetry is optional
 
         return count

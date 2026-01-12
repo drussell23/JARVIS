@@ -50,6 +50,8 @@ from typing import (
     Union,
 )
 
+from backend.core.async_safety import LazyAsyncLock
+
 import numpy as np
 
 # ChromaDB imports with new API
@@ -1229,14 +1231,22 @@ class SemanticMemory:
 
     async def _consolidation_loop(self):
         """Periodically consolidate memories."""
-        while True:
+        max_runtime = float(os.getenv("TIMEOUT_MEMORY_CONSOLIDATION_SESSION", "86400.0"))  # 24 hours
+        consolidation_timeout = float(os.getenv("TIMEOUT_MEMORY_CONSOLIDATION_ITERATION", "120.0"))
+        start = time.time()
+
+        while time.time() - start < max_runtime:
             try:
                 await asyncio.sleep(self._consolidation_interval)
-                await self._consolidate_memories()
+                await asyncio.wait_for(self._consolidate_memories(), timeout=consolidation_timeout)
+            except asyncio.TimeoutError:
+                logger.warning("Memory consolidation iteration timed out")
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.exception(f"Error in consolidation loop: {e}")
+
+        logger.info("Memory consolidation loop reached max runtime, exiting")
 
     async def _consolidate_memories(self):
         """
@@ -1283,14 +1293,22 @@ class SemanticMemory:
 
     async def _pruning_loop(self):
         """Periodically prune low-relevance memories."""
-        while True:
+        max_runtime = float(os.getenv("TIMEOUT_MEMORY_PRUNING_SESSION", "86400.0"))  # 24 hours
+        pruning_timeout = float(os.getenv("TIMEOUT_MEMORY_PRUNING_ITERATION", "120.0"))
+        start = time.time()
+
+        while time.time() - start < max_runtime:
             try:
                 await asyncio.sleep(self._consolidation_interval * 2)  # Less frequent than consolidation
-                await self._prune_memories()
+                await asyncio.wait_for(self._prune_memories(), timeout=pruning_timeout)
+            except asyncio.TimeoutError:
+                logger.warning("Memory pruning iteration timed out")
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.exception(f"Error in pruning loop: {e}")
+
+        logger.info("Memory pruning loop reached max runtime, exiting")
 
     async def _prune_memories(self):
         """Prune memories with very low relevance."""
@@ -1408,7 +1426,7 @@ class SemanticMemory:
 # =============================================================================
 
 _semantic_memory_instance: Optional[SemanticMemory] = None
-_semantic_memory_lock = asyncio.Lock()
+_semantic_memory_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 async def get_semantic_memory() -> SemanticMemory:

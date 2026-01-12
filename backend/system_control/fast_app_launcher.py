@@ -94,7 +94,7 @@ class FastAppLauncher:
         """Wait for process completion in background"""
         try:
             await asyncio.wait_for(process.communicate(), timeout=2.0)
-        except:
+        except Exception:
             pass
     
     def is_common_app(self, app_name: str) -> bool:

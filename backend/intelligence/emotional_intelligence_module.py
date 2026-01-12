@@ -73,6 +73,8 @@ from typing import (
     Tuple,
 )
 
+from backend.core.async_safety import LazyAsyncLock
+
 # Environment-driven configuration
 EMOTIONAL_DATA_DIR = Path(os.getenv(
     "EMOTIONAL_DATA_DIR",
@@ -941,7 +943,7 @@ class EmotionalIntelligenceModule:
 
 # Global instance
 _emotional_intelligence: Optional[EmotionalIntelligenceModule] = None
-_lock = asyncio.Lock()
+_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 async def get_emotional_intelligence() -> EmotionalIntelligenceModule:

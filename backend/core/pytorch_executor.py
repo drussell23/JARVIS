@@ -214,7 +214,7 @@ class PyTorchExecutor:
             if self._executor is not None:
                 try:
                     self._executor.shutdown(wait=False)
-                except:
+                except Exception:
                     pass
 
             self._executor = ThreadPoolExecutor(
@@ -249,7 +249,7 @@ class PyTorchExecutor:
                 import psutil
                 mem = psutil.Process().memory_info()
                 memory_info = f", memory={mem.rss / 1024 / 1024:.1f}MB"
-            except:
+            except Exception:
                 pass
 
             logger.info(
@@ -314,7 +314,7 @@ class PyTorchExecutor:
         try:
             import psutil
             return psutil.Process().memory_info().rss / 1024 / 1024
-        except:
+        except Exception:
             return None
 
     def _calculate_timeout(self, op_type: str, base_timeout: Optional[float]) -> float:
@@ -530,7 +530,7 @@ class PyTorchExecutor:
                 logger.info("🛑 Shutting down PyTorch executor...")
                 try:
                     self._executor.shutdown(wait=wait)
-                except:
+                except Exception:
                     pass
                 self._executor = None
                 self._thread_healthy = False

@@ -23,6 +23,8 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Callable, Coroutine, Deque, Dict, Optional, TypeVar
 
+from backend.core.async_safety import LazyAsyncLock
+
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
@@ -338,7 +340,7 @@ class RateLimiter:
 
 # Global registry
 _rate_limiters: Dict[str, RateLimiter] = {}
-_registry_lock = asyncio.Lock()
+_registry_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 async def get_rate_limiter(name: str, **kwargs) -> RateLimiter:

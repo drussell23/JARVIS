@@ -70,6 +70,8 @@ from enum import Enum, auto
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 import weakref
 
+from backend.core.async_safety import LazyAsyncLock
+
 logger = logging.getLogger(__name__)
 
 
@@ -797,7 +799,7 @@ class UnifiedStartupVoiceCoordinator:
 # =============================================================================
 
 _coordinator_instance: Optional[UnifiedStartupVoiceCoordinator] = None
-_coordinator_lock = asyncio.Lock()
+_coordinator_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 async def get_startup_voice_coordinator() -> UnifiedStartupVoiceCoordinator:

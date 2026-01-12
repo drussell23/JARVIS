@@ -702,7 +702,7 @@ class ConversationSummarizer:
             # Return top topics
             return [noun for noun, _ in noun_freq.most_common(5)]
             
-        except:
+        except Exception:
             # Fallback to simple word frequency
             words = text.lower().split()
             word_freq = Counter(words)

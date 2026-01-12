@@ -75,6 +75,8 @@ from typing import (
     Union,
 )
 
+from backend.core.async_safety import LazyAsyncLock
+
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
@@ -206,7 +208,7 @@ class CodingCouncilConfig:
 
 # Global pending approvals storage (in-memory with cleanup)
 _pending_approvals: Dict[str, Tuple["EvolutionRequest", float]] = {}
-_pending_approvals_lock = asyncio.Lock()
+_pending_approvals_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 async def store_pending_approval(request: "EvolutionRequest") -> str:

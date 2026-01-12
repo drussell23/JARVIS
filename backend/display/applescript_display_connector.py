@@ -364,7 +364,7 @@ class AppleScriptDisplayConnector:
             self.logger.error(f"AppleScript timed out after {timeout}s")
             try:
                 proc.kill()
-            except:
+            except Exception:
                 pass
             return None
         except Exception as e:

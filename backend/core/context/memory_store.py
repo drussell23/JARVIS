@@ -19,11 +19,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from collections import OrderedDict
 from datetime import datetime
 from typing import Any
 
 from backend.core.models.context_envelope import ContextEnvelope, ContextPayload, ContextState
+from backend.core.async_safety import TimeoutConfig, get_shutdown_event
 from .store_interface import ContextStore, ContextQuery
 
 logger = logging.getLogger(__name__)
@@ -98,20 +100,43 @@ class InMemoryContextStore(ContextStore):
     async def _auto_cleanup_loop(self) -> None:
         """
         Background loop for periodic cleanup of expired contexts.
-        
-        Runs continuously until cancelled, sleeping for the cleanup interval
+
+        Runs continuously until cancelled or shutdown, sleeping for the cleanup interval
         between runs. Logs any cleanup activity and handles exceptions gracefully.
-        
+
         Raises:
             asyncio.CancelledError: When the task is cancelled during shutdown.
         """
+        shutdown_event = get_shutdown_event()
+        max_iterations = int(os.getenv("CONTEXT_CLEANUP_MAX_ITERATIONS", "0")) or None
+        iteration = 0
+
         while True:
+            # Check for shutdown
+            if shutdown_event.is_set():
+                logger.info("Context auto-cleanup stopped via shutdown event")
+                break
+
+            # Check max iterations (for testing/safety)
+            if max_iterations and iteration >= max_iterations:
+                logger.info(f"Context auto-cleanup reached max iterations ({max_iterations})")
+                break
+
+            iteration += 1
+
             try:
                 await asyncio.sleep(self._cleanup_interval)
-                removed = await self.clear_expired()
+                # Add timeout protection for cleanup operation
+                removed = await asyncio.wait_for(
+                    self.clear_expired(),
+                    timeout=TimeoutConfig.CLEANUP
+                )
                 if removed > 0:
                     logger.debug(f"Auto-cleanup removed {removed} expired contexts")
+            except asyncio.TimeoutError:
+                logger.warning(f"Context auto-cleanup timed out after {TimeoutConfig.CLEANUP}s")
             except asyncio.CancelledError:
+                logger.info("Context auto-cleanup cancelled")
                 break
             except Exception as e:
                 logger.error(f"Auto-cleanup error: {e}", exc_info=True)
@@ -301,7 +326,7 @@ class InMemoryContextStore(ContextStore):
                     "follow_up.contexts_expired",
                     {"count": len(to_remove)}
                 )
-            except:
+            except Exception:
                 pass  # Telemetry is optional
 
         return len(to_remove)

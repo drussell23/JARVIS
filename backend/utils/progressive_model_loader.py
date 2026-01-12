@@ -240,7 +240,7 @@ class DynamicModelDiscovery:
                     # Must have at least one field defined
                     if hasattr(obj, "__fields__") and not obj.__fields__:
                         return False
-        except:
+        except Exception:
             pass
 
         # Skip if it's from external libraries
@@ -276,7 +276,7 @@ class DynamicModelDiscovery:
             is_abstract = hasattr(obj, "__abstractmethods__") and obj.__abstractmethods__
             if is_abstract:
                 return False
-        except:
+        except Exception:
             has_init = False
 
         return has_indicator and has_init and not name.startswith("_")

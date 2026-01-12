@@ -246,7 +246,7 @@ Do not include any other text or explanation."""
                 from AppKit import NSScreen
                 main_screen = NSScreen.mainScreen()
                 dpi_scale = main_screen.backingScaleFactor()
-            except:
+            except Exception:
                 dpi_scale = 1.0
                 logger.warning("[DIRECT CLICKER] Could not detect DPI scale, assuming 1.0x")
 

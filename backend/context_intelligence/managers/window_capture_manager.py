@@ -195,7 +195,7 @@ class PermissionChecker:
             # Clean up test file
             try:
                 os.remove("/tmp/jarvis_permission_test.png")
-            except:
+            except Exception:
                 pass
 
             message = "Screen recording enabled" if has_permission else \

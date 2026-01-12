@@ -2231,8 +2231,19 @@ async def websocket_authenticate(websocket: WebSocket):
             "config": ws_config,
         })
 
+        # WebSocket idle timeout protection
+        idle_timeout = float(os.getenv("TIMEOUT_WEBSOCKET_IDLE", "300.0"))  # 5 min default
+
         while True:
-            data = await websocket.receive_json()
+            try:
+                data = await asyncio.wait_for(
+                    websocket.receive_json(),
+                    timeout=idle_timeout
+                )
+            except asyncio.TimeoutError:
+                logger.info("Voice authentication WebSocket idle timeout, closing connection")
+                break
+
             msg_type = data.get("type")
 
             if msg_type == "audio":
@@ -2338,7 +2349,7 @@ async def websocket_authenticate(websocket: WebSocket):
                 "type": "error",
                 "message": str(e)
             })
-        except:
+        except Exception:
             pass
 
 

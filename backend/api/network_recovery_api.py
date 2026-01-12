@@ -261,7 +261,7 @@ class NetworkRecoveryAPI:
                         results["latency"][endpoint] = latency
                         if response.status == 200:
                             results["overall"] = True
-            except:
+            except Exception:
                 results["endpoints"][endpoint] = False
                 results["latency"][endpoint] = -1
         
@@ -308,9 +308,19 @@ async def audio_proxy_stream(websocket):
             "message": "Audio proxy stream connected"
         })
         
+        # WebSocket idle timeout protection
+        idle_timeout = float(os.getenv("TIMEOUT_WEBSOCKET_IDLE", "300.0"))  # 5 min default
+
         while True:
-            data = await websocket.receive_json()
-            
+            try:
+                data = await asyncio.wait_for(
+                    websocket.receive_json(),
+                    timeout=idle_timeout
+                )
+            except asyncio.TimeoutError:
+                logger.info("Audio proxy WebSocket idle timeout, closing connection")
+                break
+
             if data.get("type") == "audio":
                 # Process audio through backend speech recognition
                 # This would use server-side speech recognition

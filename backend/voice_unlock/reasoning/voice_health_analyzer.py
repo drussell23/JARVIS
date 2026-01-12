@@ -31,6 +31,9 @@ import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
+
+from backend.core.async_safety import LazyAsyncLock
+
 import numpy as np
 
 logger = logging.getLogger(__name__)
@@ -780,7 +783,7 @@ class VoiceHealthAnalyzer:
 # =============================================================================
 
 _analyzer_instance: Optional[VoiceHealthAnalyzer] = None
-_analyzer_lock = asyncio.Lock()
+_analyzer_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 async def get_voice_health_analyzer() -> VoiceHealthAnalyzer:

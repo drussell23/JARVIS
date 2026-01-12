@@ -377,7 +377,7 @@ class ErrorRecoveryManager:
         for callback in self.error_callbacks:
             try:
                 await callback(error_record, shutdown=True)
-            except:
+            except Exception:
                 pass  # Ignore errors during shutdown
                 
     async def _mark_resolved(self, error_record: ErrorRecord, resolution: str):

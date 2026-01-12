@@ -525,16 +525,16 @@ class RustSelfHealer:
                 self._test_rust_import
             )
             return result
-        except:
+        except Exception:
             return False
-    
+
     def _test_rust_import(self) -> bool:
         """Test if we can import Rust components."""
         try:
             sys.path.insert(0, str(self.rust_core_dir / "target" / "release"))
             import jarvis_rust_core
             return hasattr(jarvis_rust_core, 'RustAdvancedMemoryPool')
-        except:
+        except Exception:
             return False
         finally:
             if str(self.rust_core_dir / "target" / "release") in sys.path:

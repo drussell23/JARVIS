@@ -621,9 +621,19 @@ async def training_websocket(websocket: WebSocket):
             "timestamp": datetime.now().isoformat(),
         })
 
-        # Keep connection alive
+        # Keep connection alive with timeout protection
+        idle_timeout = float(os.getenv("TIMEOUT_WEBSOCKET_IDLE", "300.0"))  # 5 min default
+
         while True:
-            data = await websocket.receive_json()
+            try:
+                data = await asyncio.wait_for(
+                    websocket.receive_json(),
+                    timeout=idle_timeout
+                )
+            except asyncio.TimeoutError:
+                logger.info("Reactor-Core WebSocket idle timeout, closing connection")
+                break
+
             msg_type = data.get("type", "")
 
             if msg_type == "ping":

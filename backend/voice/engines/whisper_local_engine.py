@@ -53,7 +53,7 @@ def _lazy_import_whisper():
         try:
             import numba
             _ = numba.__version__
-        except:
+        except Exception:
             pass
 
         import whisper

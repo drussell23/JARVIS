@@ -921,7 +921,7 @@ class MemoryPressureMonitor:
         """Get available memory in MB"""
         try:
             return psutil.virtual_memory().available // (1024 * 1024)
-        except:
+        except Exception:
             return 4096  # Default to 4GB if can't read
 
     async def start_monitoring(self, interval: float = 1.0):
@@ -981,7 +981,7 @@ class ARM64Optimizer:
             result = subprocess.run(['sysctl', '-n', 'machdep.cpu.brand_string'],
                                    capture_output=True, text=True)
             return 'Apple' in result.stdout
-        except:
+        except Exception:
             return False
 
     def _check_neural_engine(self) -> bool:

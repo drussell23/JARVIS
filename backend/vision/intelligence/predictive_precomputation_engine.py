@@ -865,7 +865,7 @@ class PredictivePrecomputationEngine:
         """Estimate size of cached result"""
         try:
             return len(pickle.dumps(result))
-        except:
+        except Exception:
             return 1024  # Default estimate
 
     async def get_prediction(

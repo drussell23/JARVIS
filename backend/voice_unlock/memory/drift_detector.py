@@ -31,6 +31,8 @@ from .schemas import (
     DriftType,
 )
 
+from backend.core.async_safety import LazyAsyncLock
+
 logger = logging.getLogger(__name__)
 
 
@@ -1218,7 +1220,7 @@ async def _load_baseline_from_chromadb(
 # =============================================================================
 
 _detector_instance: Optional[VoiceDriftDetector] = None
-_detector_lock = asyncio.Lock()
+_detector_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 async def get_drift_detector() -> VoiceDriftDetector:

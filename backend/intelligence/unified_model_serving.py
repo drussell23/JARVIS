@@ -72,6 +72,8 @@ from typing import (
     Union,
 )
 
+from backend.core.async_safety import LazyAsyncLock
+
 # Environment-driven configuration
 MODEL_SERVING_DATA_DIR = Path(os.getenv(
     "MODEL_SERVING_DATA_DIR",
@@ -910,7 +912,7 @@ class UnifiedModelServing:
 
 # Global instance
 _model_serving: Optional[UnifiedModelServing] = None
-_lock = asyncio.Lock()
+_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 async def get_model_serving() -> UnifiedModelServing:

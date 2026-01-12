@@ -664,11 +664,21 @@ async def vision_websocket_endpoint(websocket: WebSocket):
     """WebSocket endpoint for real-time vision updates"""
     await ws_manager.connect(websocket)
     
+    # WebSocket idle timeout protection
+    idle_timeout = float(os.getenv("TIMEOUT_WEBSOCKET_IDLE", "300.0"))  # 5 min default
+
     try:
         while True:
-            # Receive messages from client
-            data = await websocket.receive_json()
-            
+            # Receive messages from client with timeout
+            try:
+                data = await asyncio.wait_for(
+                    websocket.receive_json(),
+                    timeout=idle_timeout
+                )
+            except asyncio.TimeoutError:
+                logger.info("Vision WebSocket idle timeout, closing connection")
+                break
+
             # Handle different message types
             if data.get("type") == "set_interval":
                 # Update monitoring interval

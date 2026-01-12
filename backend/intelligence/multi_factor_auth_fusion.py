@@ -32,6 +32,8 @@ from enum import Enum
 from typing import Dict, List, Optional, Tuple
 import numpy as np
 
+from backend.core.async_safety import LazyAsyncLock
+
 logger = logging.getLogger(__name__)
 
 
@@ -707,7 +709,7 @@ class MultiFactorAuthFusion:
 
 # Singleton instance
 _fusion_instance: Optional[MultiFactorAuthFusion] = None
-_fusion_lock = asyncio.Lock()
+_fusion_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 async def get_fusion_engine(config: Optional[FusionConfig] = None) -> MultiFactorAuthFusion:

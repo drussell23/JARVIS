@@ -65,7 +65,7 @@ class HybridVisionRouter:
             try:
                 with open(db_path, 'r') as f:
                     return json.load(f)
-            except:
+            except Exception:
                 pass
         return {
             "patterns": {},
@@ -563,7 +563,7 @@ class DynamicVisionExecutor:
                 "low_confidence": True,
                 "success": True
             }
-        except:
+        except Exception:
             return response + "\n\nI'm having trouble accessing the vision system.", {
                 "intent": intent,
                 "low_confidence": True,

@@ -5,6 +5,9 @@ Vision WebSocket Endpoint
 Provides /vision/ws/vision endpoint for vision-related WebSocket connections.
 """
 
+import asyncio
+import os
+
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 import logging
 import json
@@ -118,7 +121,7 @@ class VisionWebSocketManager:
         for client_id, websocket in self.active_connections.items():
             try:
                 await websocket.send_json(message)
-            except:
+            except Exception:
                 disconnected.append(client_id)
                 
         # Clean up disconnected clients
@@ -143,17 +146,27 @@ async def vision_websocket_endpoint(websocket: WebSocket):
     # Connect
     await vision_ws_manager.connect(websocket, client_id)
     
+    # WebSocket idle timeout protection
+    idle_timeout = float(os.getenv("TIMEOUT_WEBSOCKET_IDLE", "300.0"))  # 5 min default
+
     try:
         while True:
-            # Receive message
-            data = await websocket.receive_json()
-            
+            # Receive message with timeout
+            try:
+                data = await asyncio.wait_for(
+                    websocket.receive_json(),
+                    timeout=idle_timeout
+                )
+            except asyncio.TimeoutError:
+                logger.info(f"Vision WebSocket idle timeout for {client_id}, closing connection")
+                break
+
             # Handle message
             response = await vision_ws_manager.handle_message(websocket, data)
-            
+
             # Send response
             await websocket.send_json(response)
-            
+
     except WebSocketDisconnect:
         vision_ws_manager.disconnect(client_id)
     except Exception as e:
@@ -161,7 +174,7 @@ async def vision_websocket_endpoint(websocket: WebSocket):
         vision_ws_manager.disconnect(client_id)
         try:
             await websocket.close()
-        except:
+        except Exception:
             pass
 
 def set_vision_analyzer(analyzer):

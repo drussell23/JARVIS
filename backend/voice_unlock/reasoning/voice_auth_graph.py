@@ -45,6 +45,8 @@ from typing import (
 from dataclasses import dataclass, field
 from functools import lru_cache
 
+from backend.core.async_safety import LazyAsyncLock
+
 try:
     from langgraph.graph import StateGraph, END
     from langgraph.graph.state import CompiledStateGraph
@@ -1181,7 +1183,7 @@ class VoiceAuthenticationReasoningGraph:
 
 # Singleton instance
 _graph_instance: Optional[VoiceAuthenticationReasoningGraph] = None
-_graph_lock = asyncio.Lock()
+_graph_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 async def get_voice_auth_reasoning_graph(

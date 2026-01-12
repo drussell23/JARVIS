@@ -41,6 +41,8 @@ from datetime import datetime
 from typing import Dict, Optional, Any, Callable
 from dataclasses import dataclass, field
 
+from backend.core.async_safety import LazyAsyncLock
+
 logger = logging.getLogger(__name__)
 
 # =============================================================================
@@ -101,7 +103,7 @@ class PrewarmStatus:
 
 # Global prewarm status
 _prewarm_status = PrewarmStatus()
-_prewarm_lock = asyncio.Lock()
+_prewarm_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 def get_prewarm_status() -> PrewarmStatus:

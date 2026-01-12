@@ -42,6 +42,8 @@ from typing import (
     Union,
 )
 
+from backend.core.async_safety import LazyAsyncLock
+
 logger = logging.getLogger(__name__)
 
 
@@ -1746,7 +1748,7 @@ class ActionRegistry:
 
 
 _registry_instance: Optional[ActionRegistry] = None
-_registry_lock = asyncio.Lock()
+_registry_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 def get_action_registry() -> ActionRegistry:

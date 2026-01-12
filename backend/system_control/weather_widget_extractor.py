@@ -417,7 +417,7 @@ class WeatherWidgetExtractor:
                 city_match = re.search(r'"name" = "([^"]+)"', output)
                 if city_match:
                     return city_match.group(1)
-        except:
+        except Exception:
             pass
-        
+
         return None

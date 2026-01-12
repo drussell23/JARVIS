@@ -2813,7 +2813,7 @@ class AdvancedAsyncPipeline:
                             f"{datetime.now().isoformat()} | TIMEOUT | {action_type} | "
                             f"{elapsed:.1f}s | {text} | {user_name}\n"
                         )
-                except:
+                except Exception:
                     pass
 
         # Start monitoring task
@@ -3188,7 +3188,7 @@ class AdvancedAsyncPipeline:
                             f"{datetime.now().isoformat()} | TIMEOUT-60s | {action_type} | "
                             f"60.0s | {text} | {user_name}\n"
                         )
-                except:
+                except Exception:
                     pass
 
                 return {
@@ -3349,7 +3349,7 @@ class AdvancedAsyncPipeline:
                         f"{datetime.now().isoformat()} | ERROR | {action_type} | "
                         f"{elapsed_ms:.0f}ms | {str(e)} | {text} | {user_name}\n"
                     )
-            except:
+            except Exception:
                 pass
 
             return {

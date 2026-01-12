@@ -1798,7 +1798,7 @@ Be SPECIFIC and DETAILED. Use the actual window titles to infer what work is bei
                     try:
                         from core.secret_manager import get_anthropic_key
                         api_key = get_anthropic_key()
-                    except:
+                    except Exception:
                         api_key = os.getenv("ANTHROPIC_API_KEY")
 
                     if api_key:
@@ -2375,7 +2375,7 @@ Provide a comprehensive analysis of what you see in Space {space_id}."""
             try:
                 from core.secret_manager import get_anthropic_key
                 api_key = get_anthropic_key()
-            except:
+            except Exception:
                 api_key = os.getenv("ANTHROPIC_API_KEY")
 
             if not api_key:

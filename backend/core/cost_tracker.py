@@ -52,6 +52,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Set
 
+from backend.core.async_safety import TimeoutConfig, get_shutdown_event
+
 logger = logging.getLogger(__name__)
 
 # Redis channel names for Pub/Sub
@@ -1240,12 +1242,32 @@ class CostTracker:
             return results
 
     async def _auto_cleanup_loop(self):
-        """Background task for automatic cleanup"""
+        """Background task for automatic cleanup with timeout protection."""
+        shutdown_event = get_shutdown_event()
+        max_iterations = int(os.getenv("COST_CLEANUP_MAX_ITERATIONS", "0")) or None
+        iteration = 0
+
         while True:
+            # Check for shutdown
+            if shutdown_event.is_set():
+                logger.info("Auto-cleanup loop stopped via shutdown event")
+                break
+
+            # Check max iterations (for testing/safety)
+            if max_iterations and iteration >= max_iterations:
+                logger.info(f"Auto-cleanup loop reached max iterations ({max_iterations})")
+                break
+
+            iteration += 1
+
             try:
                 await asyncio.sleep(self.config.cleanup_check_interval_hours * 3600)
                 logger.info("🔄 Running scheduled orphaned VM cleanup...")
-                results = await self.cleanup_orphaned_vms()
+                # Add timeout protection for cleanup operation
+                results = await asyncio.wait_for(
+                    self.cleanup_orphaned_vms(),
+                    timeout=TimeoutConfig.VM_OPERATION
+                )
 
                 if results["orphaned_vms_deleted"] > 0:
                     await self._log_alert(
@@ -1255,6 +1277,8 @@ class CostTracker:
                         results,
                     )
 
+            except asyncio.TimeoutError:
+                logger.warning(f"Auto-cleanup timed out after {TimeoutConfig.VM_OPERATION}s")
             except asyncio.CancelledError:
                 logger.info("Auto-cleanup loop cancelled")
                 break

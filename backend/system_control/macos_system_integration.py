@@ -232,9 +232,9 @@ class MacOSSystemIntegration:
                                 "country": data.get("country"),
                                 "source": "IP geolocation"
                             }
-            except:
+            except Exception:
                 pass
-            
+
         except Exception as e:
             logger.error(f"Error getting location: {e}")
         
@@ -270,7 +270,7 @@ class MacOSSystemIntegration:
             if result.returncode == 0:
                 unit = result.stdout.strip()
                 weather_data["preferred_unit"] = "F" if unit.lower() == 'fahrenheit' else "C"
-        except:
+        except Exception:
             # Check locale for US/Imperial
             locale_result = subprocess.run(
                 ['defaults', 'read', '-g', 'AppleLocale'],

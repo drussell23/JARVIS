@@ -159,7 +159,7 @@ class VisionActionHandler:
                 instance = cls(api_key=os.getenv("ANTHROPIC_API_KEY"))
             else:
                 instance = cls()
-        except:
+        except Exception:
             # If we can't instantiate, analyze static/class methods
             pass
             
@@ -508,10 +508,10 @@ class VisionActionHandler:
                 data=response.data,
                 confidence=response.confidence
             )
-        except:
+        except Exception:
             # Fallback to direct processing
             return await self.process_vision_action("describe_screen", params)
-        
+
     async def analyze_window(self, params: Dict[str, Any] = None) -> VisionActionResult:
         """Analyze window - routes through Vision System v2.0"""
         params = params or {}
@@ -546,10 +546,10 @@ class VisionActionHandler:
                 data=response.data,
                 confidence=response.confidence
             )
-        except:
+        except Exception:
             # Fallback to direct processing
             return await self.process_vision_action("analyze_window", params)
-        
+
     async def check_screen(self, params: Dict[str, Any] = None) -> VisionActionResult:
         """Check screen - routes through Vision System v2.0"""
         params = params or {}
@@ -584,10 +584,10 @@ class VisionActionHandler:
                 data=response.data,
                 confidence=response.confidence
             )
-        except:
+        except Exception:
             # Fallback to direct processing
             return await self.process_vision_action("check_screen", params)
-    
+
     def _is_multi_window_query(self, params: Dict[str, Any]) -> bool:
         """Check if the query is asking about multiple windows"""
         query = params.get('query', '').lower()

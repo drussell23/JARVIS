@@ -63,6 +63,8 @@ from datetime import datetime, timedelta
 from enum import Enum, auto
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from backend.core.async_safety import LazyAsyncLock
+
 import numpy as np
 
 logger = logging.getLogger(__name__)
@@ -1487,7 +1489,10 @@ class CloudECAPAClient:
 
     async def _idle_check_loop(self):
         """Background task to check for idle Spot VMs."""
-        while True:
+        session_timeout = float(os.getenv("TIMEOUT_VOICE_SESSION", "3600.0"))  # 1 hour default for background tasks
+        session_start = time.monotonic()
+
+        while time.monotonic() - session_start < session_timeout:
             try:
                 await asyncio.sleep(60)  # Check every minute
 
@@ -1498,6 +1503,8 @@ class CloudECAPAClient:
                 break
             except Exception as e:
                 logger.error(f"Idle check loop error: {e}")
+
+        logger.info("Idle check loop session timeout reached")
 
     async def _select_backend(self) -> Tuple[BackendType, Optional[str]]:
         """
@@ -1706,7 +1713,10 @@ class CloudECAPAClient:
 
     async def _health_check_loop(self):
         """Background task to monitor endpoint health."""
-        while True:
+        session_timeout = float(os.getenv("TIMEOUT_VOICE_SESSION", "3600.0"))  # 1 hour default for background tasks
+        session_start = time.monotonic()
+
+        while time.monotonic() - session_start < session_timeout:
             try:
                 await asyncio.sleep(CloudECAPAClientConfig.HEALTH_CHECK_INTERVAL)
 
@@ -1726,6 +1736,8 @@ class CloudECAPAClient:
                 break
             except Exception as e:
                 logger.error(f"Health check loop error: {e}")
+
+        logger.info("Health check loop session timeout reached")
 
     async def close(self):
         """Close the client and cleanup resources."""
@@ -2842,7 +2854,7 @@ class CloudECAPAClient:
 # =============================================================================
 
 _client_instance: Optional[CloudECAPAClient] = None
-_client_lock = asyncio.Lock()
+_client_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 async def get_cloud_ecapa_client() -> CloudECAPAClient:

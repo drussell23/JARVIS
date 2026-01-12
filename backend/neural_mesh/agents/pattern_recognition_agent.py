@@ -11,7 +11,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import os
 import statistics
+import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -677,21 +679,33 @@ class PatternRecognitionAgent(BaseNeuralMeshAgent):
 
     async def _periodic_analysis(self) -> None:
         """Periodically analyze collected data for patterns."""
-        while True:
+        max_runtime = float(os.getenv("TIMEOUT_PATTERN_ANALYSIS_SESSION", "86400.0"))  # 24 hours
+        analysis_interval = float(os.getenv("PATTERN_ANALYSIS_INTERVAL", "300.0"))  # 5 minutes
+        iteration_timeout = float(os.getenv("TIMEOUT_PATTERN_ANALYSIS_ITERATION", "60.0"))
+        start = time.monotonic()
+
+        while time.monotonic() - start < max_runtime:
             try:
-                await asyncio.sleep(300)  # Every 5 minutes
+                await asyncio.sleep(analysis_interval)
 
                 if len(self._event_history) >= 20:
-                    # Run pattern detection on recent events
+                    # Run pattern detection on recent events with timeout
                     recent = self._event_history[-100:]
-                    await self._detect_patterns({
-                        "data": recent,
-                        "pattern_types": ["temporal", "sequential", "frequency"],
-                    })
+                    await asyncio.wait_for(
+                        self._detect_patterns({
+                            "data": recent,
+                            "pattern_types": ["temporal", "sequential", "frequency"],
+                        }),
+                        timeout=iteration_timeout,
+                    )
 
                     logger.debug(f"Periodic analysis complete - {len(self._patterns)} patterns")
 
+            except asyncio.TimeoutError:
+                logger.warning("Pattern analysis iteration timed out")
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.exception(f"Error in periodic pattern analysis: {e}")
+
+        logger.info("Pattern analysis loop reached max runtime, exiting")

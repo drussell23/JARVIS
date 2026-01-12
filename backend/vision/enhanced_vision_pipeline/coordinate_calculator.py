@@ -232,7 +232,7 @@ class CoordinateCalculator:
         try:
             import pyautogui
             self.screen_width, self.screen_height = pyautogui.size()
-        except:
+        except Exception:
             # Fallback
             self.screen_width = 1440
             self.screen_height = 900

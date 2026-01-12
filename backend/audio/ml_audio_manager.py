@@ -212,7 +212,7 @@ class AudioPatternLearner:
             features_scaled = self.scaler.transform(features)
             prediction = self.anomaly_detector.predict(features_scaled)
             return prediction[0] == -1  # -1 indicates anomaly
-        except:
+        except Exception:
             return False
     
     def get_recovery_strategy(self, error_code: str, context: Dict[str, Any]) -> Dict[str, Any]:

@@ -13,10 +13,13 @@ Enterprise-grade multi-transport communication layer with:
 
 import asyncio
 import logging
+import os
 import time
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional
+
+from backend.core.async_safety import TimeoutConfig, get_shutdown_event
 
 logger = logging.getLogger(__name__)
 
@@ -337,8 +340,24 @@ class TransportManager:
         return await asyncio.wait_for(handler(action, context, **kwargs), timeout=timeout)
 
     async def _health_monitor_loop(self):
-        """Background task to monitor transport health and reset circuit breakers"""
+        """Background task to monitor transport health and reset circuit breakers with timeout protection."""
+        shutdown_event = get_shutdown_event()
+        max_iterations = int(os.getenv("TRANSPORT_HEALTH_MAX_ITERATIONS", "0")) or None
+        iteration = 0
+
         while True:
+            # Check for shutdown
+            if shutdown_event.is_set():
+                logger.info("[TRANSPORT] Health monitor stopped via shutdown event")
+                break
+
+            # Check max iterations (for testing/safety)
+            if max_iterations and iteration >= max_iterations:
+                logger.info(f"[TRANSPORT] Health monitor reached max iterations ({max_iterations})")
+                break
+
+            iteration += 1
+
             try:
                 await asyncio.sleep(self.config.health_check_interval)
 
@@ -355,6 +374,7 @@ class TransportManager:
                 self._log_health_summary()
 
             except asyncio.CancelledError:
+                logger.info("[TRANSPORT] Health monitor cancelled")
                 break
             except Exception as e:
                 logger.error(f"[TRANSPORT] Health monitor error: {e}", exc_info=True)

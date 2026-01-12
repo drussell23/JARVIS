@@ -189,9 +189,9 @@ class WeatherHumanClicker:
             if result.get('success'):
                 analysis = result.get('analysis', '').lower()
                 return 'toronto' in analysis or 'canada' in analysis
-        except:
+        except Exception:
             pass
-            
+
         return False
 
 

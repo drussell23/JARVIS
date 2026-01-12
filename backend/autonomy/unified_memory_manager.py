@@ -728,13 +728,19 @@ class UnifiedMemoryManager:
 
     async def _auto_save_loop(self) -> None:
         """Periodically save memory to disk."""
+        save_timeout = float(os.getenv("TIMEOUT_MEMORY_SAVE", "30.0"))
         while True:
             try:
                 await asyncio.sleep(self.config.auto_save_interval)
 
                 if self._dirty:
-                    await self._save_to_disk()
+                    await asyncio.wait_for(
+                        self._save_to_disk(),
+                        timeout=save_timeout
+                    )
 
+            except asyncio.TimeoutError:
+                self.logger.warning("[MemoryManager] Auto-save timed out")
             except asyncio.CancelledError:
                 break
             except Exception as e:

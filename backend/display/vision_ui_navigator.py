@@ -465,7 +465,7 @@ class VisionUINavigator:
                 result = subprocess.run(['system_profiler', 'SPDisplaysDataType'],
                                       capture_output=True, text=True, timeout=2)
                 self.edge_cases['retina_display'] = 'Retina' in result.stdout
-            except:
+            except Exception:
                 self.edge_cases['retina_display'] = False
 
             # Detect dark mode (macOS specific)
@@ -474,7 +474,7 @@ class VisionUINavigator:
                 result = subprocess.run(['defaults', 'read', '-g', 'AppleInterfaceStyle'],
                                       capture_output=True, text=True, timeout=1)
                 self.edge_cases['dark_mode'] = 'Dark' in result.stdout
-            except:
+            except Exception:
                 self.edge_cases['dark_mode'] = False  # Light mode or unable to detect
 
             logger.info(f"[VISION NAV] 🔍 Edge cases detected: {self.edge_cases}")

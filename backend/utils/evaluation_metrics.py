@@ -67,7 +67,7 @@ class ModelEvaluator:
             nltk.download('punkt', quiet=True)
             nltk.download('wordnet', quiet=True)
             nltk.download('stopwords', quiet=True)
-        except:
+        except Exception:
             pass
             
     def evaluate_model(
@@ -269,7 +269,7 @@ class ModelEvaluator:
                 'rouge-2': scores['rouge-2']['f'],
                 'rouge-l': scores['rouge-l']['f']
             }
-        except:
+        except Exception:
             return {'rouge-1': 0.0, 'rouge-2': 0.0, 'rouge-l': 0.0}
             
     def _compute_distinct_n(self, texts: List[str], n: int) -> float:

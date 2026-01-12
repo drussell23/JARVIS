@@ -372,13 +372,19 @@ class InterventionOrchestrator:
 
     async def _process_loop(self) -> None:
         """Main processing loop for interventions."""
+        iteration_timeout = float(os.getenv("TIMEOUT_INTERVENTION_ITERATION", "30.0"))
         while True:
             try:
                 if not self._paused and self._queue:
-                    await self._process_next()
+                    await asyncio.wait_for(
+                        self._process_next(),
+                        timeout=iteration_timeout
+                    )
 
                 await asyncio.sleep(1.0)
 
+            except asyncio.TimeoutError:
+                self.logger.warning("[Intervention] Processing iteration timed out")
             except asyncio.CancelledError:
                 break
             except Exception as e:

@@ -64,6 +64,8 @@ from datetime import datetime
 from enum import Enum, auto
 from typing import Any, Callable, Deque, Dict, List, Optional, Tuple, TypeVar
 
+from backend.core.async_safety import LazyAsyncLock, get_shutdown_event
+
 logger = logging.getLogger(__name__)
 
 T = TypeVar('T')
@@ -165,38 +167,44 @@ class TokenBucket:
     
     async def acquire(self, tokens: float = 1.0, timeout: float = 30.0) -> bool:
         """
-        Acquire tokens from the bucket.
-        
+        Acquire tokens from the bucket with shutdown protection.
+
         Args:
             tokens: Number of tokens to acquire
             timeout: Maximum time to wait for tokens
-            
+
         Returns:
-            True if tokens acquired, False if timeout
+            True if tokens acquired, False if timeout or shutdown
         """
         start_time = time.time()
-        
+        shutdown_event = get_shutdown_event()
+
         while True:
+            # Check for shutdown
+            if shutdown_event.is_set():
+                logger.debug("Token bucket acquire cancelled due to shutdown")
+                return False
+
             async with self._lock:
                 # Refill tokens based on elapsed time
                 now = time.time()
                 elapsed = now - self.last_refill
                 self.tokens = min(self.capacity, self.tokens + elapsed * self.refill_rate)
                 self.last_refill = now
-                
+
                 # Check if we have enough tokens
                 if self.tokens >= tokens:
                     self.tokens -= tokens
                     return True
-                
+
                 # Calculate wait time for enough tokens
                 tokens_needed = tokens - self.tokens
                 wait_time = tokens_needed / self.refill_rate
-            
+
             # Check timeout
             if time.time() - start_time + wait_time > timeout:
                 return False
-            
+
             # Wait for tokens to refill
             await asyncio.sleep(min(wait_time, 0.1))
     
@@ -902,7 +910,7 @@ class QuotaExceededError(Exception):
 # =============================================================================
 
 _manager_instance: Optional[GCPRateLimitManager] = None
-_manager_lock = asyncio.Lock()
+_manager_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 async def get_rate_limit_manager() -> GCPRateLimitManager:

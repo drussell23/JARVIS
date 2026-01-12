@@ -2572,7 +2572,9 @@ class GhostDisplayManager:
             return  # Already running
 
         async def monitor_loop():
-            while True:
+            max_runtime = float(os.getenv("TIMEOUT_VISION_SESSION", "3600.0"))  # 1 hour default
+            session_start = time.monotonic()
+            while time.monotonic() - session_start < max_runtime:
                 try:
                     await asyncio.sleep(self.config.health_check_interval_seconds)
                     await self._health_check(yabai_detector)
@@ -2580,6 +2582,8 @@ class GhostDisplayManager:
                     break
                 except Exception as e:
                     logger.debug(f"[GhostManager] Health check error: {e}")
+            else:
+                logger.info("[GhostManager] Health monitoring session timeout, stopping")
 
         self._monitoring_task = asyncio.create_task(monitor_loop())
         logger.debug("[GhostManager] 🏥 Health monitoring started")
@@ -3968,7 +3972,9 @@ class YabaiSpaceDetector:
         interval = interval_seconds or self.config.health_check_interval_seconds
 
         async def _monitor():
-            while True:
+            max_runtime = float(os.getenv("TIMEOUT_VISION_SESSION", "3600.0"))  # 1 hour default
+            session_start = time.monotonic()
+            while time.monotonic() - session_start < max_runtime:
                 try:
                     await asyncio.sleep(interval)
                     was_running = self._health.is_running
@@ -3991,6 +3997,8 @@ class YabaiSpaceDetector:
                     break
                 except Exception as e:
                     logger.error(f"[YABAI] Health monitoring error: {e}")
+            else:
+                logger.info("[YABAI] Health monitoring session timeout, stopping")
 
         self._health_check_task = asyncio.create_task(_monitor())
         logger.info(f"[YABAI] Started health monitoring (interval: {interval}s)")
@@ -10654,7 +10662,7 @@ class YabaiSpaceDetector:
                     refresh_info = await get_window_info_async()
                     if refresh_info:
                         window_pid = refresh_info.get("pid")
-                except:
+                except Exception:
                     pass
 
             last_resort_strategies = [

@@ -1024,7 +1024,7 @@ async def check_screen_lock_detector_health(detector) -> bool:
     try:
         result = await detector.is_screen_locked()
         return isinstance(result, bool)
-    except:
+    except Exception:
         return False
 
 
@@ -1095,7 +1095,7 @@ async def load_ecapa_prewarmer():
         try:
             from core.vbi_debug_tracer import ECAPAPreWarmer
             return ECAPAPreWarmer()
-        except:
+        except Exception:
             return None
         
     except ImportError as e:
@@ -1287,7 +1287,7 @@ async def check_voice_auth_health(service) -> bool:
             try:
                 profiles = await service.learning_db.get_all_speaker_profiles()
                 has_profiles = len(profiles) > 0
-            except:
+            except Exception:
                 pass
 
         # 🔐 Check unified voice cache for preloaded profiles (critical for fast unlock!)
@@ -1299,7 +1299,7 @@ async def check_voice_auth_health(service) -> bool:
             if cache:
                 cache_profile_count = cache.profiles_loaded
                 has_cache_profiles = cache_profile_count > 0
-        except:
+        except Exception:
             pass
 
         # 🧠 Check VBI is ready - get it directly, don't rely on service attribute
@@ -1382,7 +1382,7 @@ async def check_compound_parser_health(parser) -> bool:
     try:
         result = await parser.parse("open safari")
         return result is not None
-    except:
+    except Exception:
         return False
 
 
@@ -1411,7 +1411,7 @@ async def load_yabai_detector():
     try:
         from vision.yabai_space_detector import YabaiSpaceDetector
         return YabaiSpaceDetector()
-    except:
+    except Exception:
         logger.debug("[WARMUP] Yabai detector not available")
         return None
 
@@ -1426,7 +1426,7 @@ async def load_window_detector():
     try:
         from vision.multi_space_window_detector import MultiSpaceWindowDetector
         return MultiSpaceWindowDetector()
-    except:
+    except Exception:
         return None
 
 
@@ -1448,7 +1448,7 @@ async def check_database_health(db) -> bool:
         return False
     try:
         return hasattr(db, "store_command_execution")
-    except:
+    except Exception:
         return False
 
 
@@ -1466,7 +1466,7 @@ async def load_action_query_handler():
                 context_graph=None, implicit_resolver=get_implicit_resolver()
             )
         return handler
-    except:
+    except Exception:
         return None
 
 
@@ -1481,7 +1481,7 @@ async def load_predictive_handler():
         if handler is None:
             handler = initialize_predictive_handler()
         return handler
-    except:
+    except Exception:
         return None
 
 
@@ -1492,7 +1492,7 @@ async def load_multi_space_handler():
             get_multi_space_query_handler,
         )
         return get_multi_space_query_handler()
-    except:
+    except Exception:
         return None
 
 

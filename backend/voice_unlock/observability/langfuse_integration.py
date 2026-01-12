@@ -29,6 +29,8 @@ from dataclasses import dataclass, field
 from contextlib import asynccontextmanager
 from functools import wraps
 
+from backend.core.async_safety import LazyAsyncLock
+
 from pydantic import BaseModel, Field
 
 try:
@@ -807,7 +809,7 @@ class VoiceAuthLangfuseTracer:
 # =============================================================================
 
 _tracer_instance: Optional[VoiceAuthLangfuseTracer] = None
-_tracer_lock = asyncio.Lock()
+_tracer_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 async def get_langfuse_tracer() -> VoiceAuthLangfuseTracer:

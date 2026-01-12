@@ -31,6 +31,8 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import hashlib
 
+from backend.core.async_safety import LazyAsyncLock
+
 logger = logging.getLogger(__name__)
 
 
@@ -180,13 +182,20 @@ class DeviceStateMonitor:
 
     async def _background_monitor(self):
         """Background task to periodically check device state."""
+        iteration_timeout = float(os.getenv("TIMEOUT_DEVICE_STATE_CHECK", "30.0"))
         while True:
             try:
                 await asyncio.sleep(self.config.movement_check_interval_seconds)
 
                 # Check if displays or USB devices changed (indicates docking/undocking)
-                current_displays = await self._get_display_hash()
-                current_usb = await self._get_usb_hash()
+                current_displays = await asyncio.wait_for(
+                    self._get_display_hash(),
+                    timeout=iteration_timeout
+                )
+                current_usb = await asyncio.wait_for(
+                    self._get_usb_hash(),
+                    timeout=iteration_timeout
+                )
 
                 if (self.last_display_hash != current_displays or
                     self.last_usb_hash != current_usb):
@@ -197,6 +206,8 @@ class DeviceStateMonitor:
                     # Record state change
                     await self._record_state_change("docking_change")
 
+            except asyncio.TimeoutError:
+                logger.warning("Device state check iteration timed out")
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -788,7 +799,7 @@ class DeviceStateMonitor:
 
 # Singleton instance
 _monitor_instance: Optional[DeviceStateMonitor] = None
-_monitor_lock = asyncio.Lock()
+_monitor_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error
 
 
 async def get_device_monitor(config: Optional[DeviceStateConfig] = None) -> DeviceStateMonitor:

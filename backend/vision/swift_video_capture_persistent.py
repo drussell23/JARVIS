@@ -57,9 +57,9 @@ class PersistentSwiftVideoCapture:
         try:
             response = await self._send_command("PING")
             return response == "OK:PONG"
-        except:
+        except Exception:
             return False
-    
+
     async def _send_command(self, command: str) -> str:
         """Send command to Swift server"""
         try:
@@ -114,16 +114,16 @@ class PersistentSwiftVideoCapture:
                 logger.info("✅ Video capture stopped - purple indicator should disappear")
                 
             return success
-        except:
+        except Exception:
             return False
-    
+
     async def is_capturing(self) -> bool:
         """Check if currently capturing"""
         try:
             response = await self._send_command("STATUS")
             if response.startswith("OK:CAPTURING="):
                 return response.split("=")[1] == "true"
-        except:
+        except Exception:
             pass
         return False
     

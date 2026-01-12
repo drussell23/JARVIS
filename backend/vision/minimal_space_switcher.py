@@ -249,9 +249,9 @@ class MinimalSpaceSwitcher:
                     'defaults', 'write', 'com.apple.dock',
                     'workspaces-swoosh-animation-off', '-bool', 'YES'
                 ], capture_output=True)
-            except:
+            except Exception:
                 pass
-                
+
         # Small delay to prepare
         await asyncio.sleep(self.pre_switch_delay)
         
@@ -376,9 +376,9 @@ class MinimalSpaceSwitcher:
                     require_permission=False
                 )
                 await self.switch_to_space(return_request)
-            except:
+            except Exception:
                 pass
-                
+
             return None
             
     def restore_animation_settings(self):
@@ -393,7 +393,7 @@ class MinimalSpaceSwitcher:
                 
                 # Restart Dock to apply changes
                 subprocess.run(['killall', 'Dock'], capture_output=True)
-            except:
+            except Exception:
                 pass
 
 # Integration helper for vision system

@@ -458,12 +458,21 @@ class CloudSQLProxyManager:
         consecutive_failures = 0
         last_check_time = time.time()
 
+        health_check_timeout = float(os.getenv("TIMEOUT_PROXY_HEALTH_CHECK", "30.0"))
         while True:
             try:
                 await asyncio.sleep(check_interval)
 
-                # Health check
-                is_healthy = self.is_running()
+                # Health check with timeout
+                try:
+                    is_healthy = await asyncio.wait_for(
+                        asyncio.get_event_loop().run_in_executor(None, self.is_running),
+                        timeout=health_check_timeout
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning("[CloudSQL] Health check timed out")
+                    is_healthy = False
+
                 current_time = time.time()
                 elapsed = current_time - last_check_time
                 last_check_time = current_time
@@ -781,12 +790,12 @@ WantedBy=default.target
                         if cursor:
                             try:
                                 cursor.close()
-                            except:
+                            except Exception:
                                 pass
                         if conn:
                             try:
                                 conn.close()
-                            except:
+                            except Exception:
                                 pass
                         conn = None
                         cursor = None

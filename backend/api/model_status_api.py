@@ -9,6 +9,7 @@ from fastapi.responses import JSONResponse
 from typing import Dict, List, Any
 import asyncio
 import logging
+import time
 from datetime import datetime
 import json
 
@@ -83,9 +84,18 @@ async def model_status_websocket(websocket: WebSocket):
     """WebSocket endpoint for real-time model loading updates"""
     await status_manager.connect(websocket)
     
+    # Connection timeout protection (SSE-style long connection)
+    connection_start = time.monotonic()
+    max_connection_time = float(os.getenv("TIMEOUT_SSE_CONNECTION", "3600.0"))  # 1 hour default
+
     try:
         # Keep connection alive and send periodic updates
         while True:
+            # Check connection timeout
+            if time.monotonic() - connection_start > max_connection_time:
+                logger.info("Model status WebSocket connection timeout, closing")
+                break
+
             # Wait for client messages or send updates
             try:
                 # Check for client messages (with timeout)
@@ -93,7 +103,7 @@ async def model_status_websocket(websocket: WebSocket):
                     websocket.receive_text(),
                     timeout=1.0
                 )
-                
+
                 # Handle client commands
                 if message == "get_status":
                     status = get_loader_status()
@@ -101,12 +111,12 @@ async def model_status_websocket(websocket: WebSocket):
                         "type": "status_response",
                         "data": status
                     })
-                    
+
             except asyncio.TimeoutError:
                 # Send periodic status updates
                 status = get_loader_status()
                 await status_manager.broadcast_status(status)
-                
+
     except WebSocketDisconnect:
         status_manager.disconnect(websocket)
     except Exception as e:

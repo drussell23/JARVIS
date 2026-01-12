@@ -305,7 +305,7 @@ class VoiceUnlockMLSystem:
         try:
             report_path = Path(self.config.security.audit_path).parent / 'final_report.json'
             self.monitor.export_report(str(report_path))
-        except:
+        except Exception:
             pass
             
         # Clean up ML manager

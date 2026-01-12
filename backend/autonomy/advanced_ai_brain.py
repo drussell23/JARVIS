@@ -973,7 +973,7 @@ Return only one of: focused, stressed, relaxed, frustrated, energetic, tired, ne
                                 plan['confidence'] = float(conf_str.strip('%')) / 100
                             else:
                                 plan['confidence'] = float(conf_str)
-                    except:
+                    except Exception:
                         pass
         
         return plan

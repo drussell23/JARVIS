@@ -483,7 +483,7 @@ class PureVisionIntelligence:
                         "has_ocr_text": ocr_text is not None,
                     },
                 )
-            except:
+            except Exception:
                 pass  # Telemetry is optional
 
             return context_id

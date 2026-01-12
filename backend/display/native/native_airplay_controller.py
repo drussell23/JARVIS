@@ -275,7 +275,7 @@ class SwiftBridgeManager:
                 # Try to parse error as JSON
                 try:
                     return json.loads(stdout.decode('utf-8', errors='ignore'))
-                except:
+                except Exception:
                     return {
                         "success": False,
                         "message": error_msg or "Unknown error",

@@ -484,29 +484,29 @@ class IntegrationOrchestrator:
             try:
                 from .activity_recognition_engine import get_activity_recognizer
                 self.components['activity_recognition'] = get_activity_recognizer()
-            except:
+            except Exception:
                 pass
-        
+
         if self.components['activity_recognition']:
             try:
                 activity = await self.components['activity_recognition'].recognize(state)
                 intelligence_result['activity'] = activity
-            except:
+            except Exception:
                 pass
-        
+
         # Goal inference
         if self.components['goal_inference'] is None and self.system_mode == SystemMode.NORMAL:
             try:
                 from .goal_inference_system import get_goal_inference
                 self.components['goal_inference'] = get_goal_inference()
-            except:
+            except Exception:
                 pass
-        
+
         if self.components['goal_inference']:
             try:
                 goals = await self.components['goal_inference'].infer_goals(state)
                 intelligence_result['goals'] = goals
-            except:
+            except Exception:
                 pass
         
         return intelligence_result
@@ -519,12 +519,12 @@ class IntegrationOrchestrator:
             try:
                 from vision.bloom_filter_network import get_bloom_filter_network
                 self.components['bloom_filter'] = get_bloom_filter_network()
-            except:
+            except Exception:
                 pass
-        
+
         # Generate cache key
         cache_key = self._generate_cache_key(frame, intelligence)
-        
+
         # Check bloom filter first
         if self.components['bloom_filter']:
             if self.components['bloom_filter'].check_duplicate(cache_key):
@@ -533,33 +533,33 @@ class IntegrationOrchestrator:
                     try:
                         from .semantic_cache_lsh import get_semantic_cache
                         self.components['semantic_cache'] = await get_semantic_cache()
-                    except:
+                    except Exception:
                         pass
-                
+
                 if self.components['semantic_cache']:
                     result = await self.components['semantic_cache'].get(cache_key)
                     if result:
                         return result[0]  # Return cached value
-        
+
         return None
-    
+
     async def _generate_predictions(self, state: Dict[str, Any], intelligence: Dict[str, Any],
                                   metrics: ProcessingMetrics) -> Optional[Dict[str, Any]]:
         """Stage 6: Generate predictions"""
         if self.system_mode in [SystemMode.CRITICAL, SystemMode.EMERGENCY]:
             return None
-        
+
         if self.components['predictive_engine'] is None:
             try:
                 from .predictive_precomputation_engine import get_predictive_engine
                 self.components['predictive_engine'] = await get_predictive_engine()
-            except:
+            except Exception:
                 return None
-        
+
         try:
             prediction = await self.components['predictive_engine'].predict(state, intelligence)
             return prediction
-        except:
+        except Exception:
             return None
     
     async def _make_api_decision(self, frame: np.ndarray, spatial: Dict[str, Any],
@@ -604,26 +604,26 @@ class IntegrationOrchestrator:
             try:
                 from .multi_modal_anomaly_detector import get_anomaly_detector
                 self.components['anomaly_detection'] = get_anomaly_detector()
-            except:
+            except Exception:
                 pass
-        
+
         if self.components['anomaly_detection']:
             try:
                 anomalies = await self.components['anomaly_detection'].detect(result)
                 result['anomalies'] = anomalies
-                
+
                 # Intervention if needed
                 if anomalies and self.components['intervention_engine'] is None:
                     try:
                         from .intelligent_intervention_engine import get_intervention_engine
                         self.components['intervention_engine'] = get_intervention_engine()
-                    except:
+                    except Exception:
                         pass
-                
+
                 if anomalies and self.components['intervention_engine']:
                     interventions = await self.components['intervention_engine'].decide(anomalies)
                     result['interventions'] = interventions
-            except:
+            except Exception:
                 pass
         
         return result
