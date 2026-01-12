@@ -106,6 +106,6 @@ Pillow>=10.0.0  # For image manipulation
 pyobjc-core==10.1  # Core PyObjC for macOS - specific version for miniforge compatibility
 pyobjc-framework-Cocoa==12.0  # Required base framework
 pyobjc-framework-Quartz==10.1  # For macOS screen capture (includes CoreGraphics)
-pyobjc-framework-Vision==10.1  # For macOS Vision framework
+pyobjc-framework-Vision==12.1  # For macOS Vision framework
 pyobjc-framework-CoreML==10.1  # Required by Vision framework
 # Note: PyAutoGUI removed due to compatibility issues with miniforge - using native macOS APIs instead
