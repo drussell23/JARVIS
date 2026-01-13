@@ -290,6 +290,11 @@ class VMManagerConfig:
     No hardcoding - fully configurable at runtime.
     """
 
+    # GCP Enabled Flag - set to false to disable GCP features entirely
+    enabled: bool = field(
+        default_factory=lambda: os.getenv("GCP_ENABLED", "false").lower() == "true"
+    )
+
     # GCP Configuration (all from environment)
     project_id: str = field(
         default_factory=lambda: os.getenv("GCP_PROJECT_ID", os.getenv("GOOGLE_CLOUD_PROJECT", ""))
@@ -400,22 +405,29 @@ class VMManagerConfig:
 
     def __post_init__(self):
         """Validate configuration after initialization"""
-        if not self.project_id:
+        # Only warn about missing project_id if GCP is explicitly enabled
+        if self.enabled and not self.project_id:
             logger.warning(
-                "⚠️  GCP_PROJECT_ID not set. Set via environment variable or provide in config."
+                "⚠️  GCP_ENABLED=true but GCP_PROJECT_ID not set. "
+                "Set via environment variable or provide in config."
             )
-        
-        # Log configuration summary
-        logger.debug(f"VMManagerConfig loaded:")
-        logger.debug(f"  Project: {self.project_id}")
-        logger.debug(f"  Zone: {self.zone}")
-        logger.debug(f"  Machine Type: {self.machine_type}")
-        logger.debug(f"  Use Spot: {self.use_spot}")
-        logger.debug(f"  Daily Budget: ${self.daily_budget_usd}")
+        elif not self.enabled:
+            logger.debug("GCP VM Manager disabled (GCP_ENABLED=false or not set)")
+            return  # Skip rest of validation if disabled
+
+        # Log configuration summary (only if enabled)
+        if self.enabled:
+            logger.info(f"GCP VM Manager enabled:")
+            logger.info(f"  Project: {self.project_id}")
+            logger.info(f"  Zone: {self.zone}")
+            logger.info(f"  Machine Type: {self.machine_type}")
+            logger.info(f"  Use Spot: {self.use_spot}")
+            logger.info(f"  Daily Budget: ${self.daily_budget_usd}")
 
     def to_dict(self) -> Dict[str, Any]:
         """Export configuration as dictionary"""
         return {
+            "enabled": self.enabled,
             "project_id": self.project_id,
             "region": self.region,
             "zone": self.zone,

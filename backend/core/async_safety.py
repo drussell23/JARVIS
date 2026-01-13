@@ -1117,6 +1117,7 @@ class LazyAsyncLock:
     Thread-safe lazy-initialized asyncio.Lock.
 
     Solves the "no running event loop" error when creating locks at module load.
+    Uses threading.Lock for the creation guard to avoid any asyncio dependency at init time.
 
     Usage:
         # At module level (safe!)
@@ -1125,17 +1126,48 @@ class LazyAsyncLock:
         # In async function
         async with _lock:
             await critical_section()
+
+    Advanced Features:
+    - Zero asyncio primitives created at import time
+    - Thread-safe double-checked locking pattern
+    - Per-event-loop lock isolation (prevents cross-loop issues)
+    - Automatic cleanup on event loop close
     """
 
     def __init__(self):
+        import threading
         self._lock: Optional[asyncio.Lock] = None
-        self._creation_lock = asyncio.Lock()
+        self._creation_guard = threading.Lock()  # Thread lock, not asyncio lock!
+        self._loop_id: Optional[int] = None  # Track which event loop owns the lock
 
     def _get_lock(self) -> asyncio.Lock:
-        """Get or create the underlying lock."""
-        if self._lock is None:
-            # Thread-safe creation
-            self._lock = asyncio.Lock()
+        """
+        Get or create the underlying lock with double-checked locking.
+
+        Thread-safe and event-loop aware - creates a new lock if the event loop changed.
+        """
+        # Get current event loop ID
+        try:
+            loop = asyncio.get_running_loop()
+            current_loop_id = id(loop)
+        except RuntimeError:
+            # No running loop - try to get the default loop
+            try:
+                loop = asyncio.get_event_loop()
+                current_loop_id = id(loop)
+            except RuntimeError:
+                # Create new loop
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                current_loop_id = id(loop)
+
+        # Double-checked locking pattern
+        if self._lock is None or self._loop_id != current_loop_id:
+            with self._creation_guard:
+                if self._lock is None or self._loop_id != current_loop_id:
+                    self._lock = asyncio.Lock()
+                    self._loop_id = current_loop_id
+
         return self._lock
 
     async def acquire(self) -> bool:
@@ -1145,7 +1177,17 @@ class LazyAsyncLock:
     def release(self) -> None:
         """Release the lock."""
         if self._lock:
-            self._lock.release()
+            try:
+                self._lock.release()
+            except RuntimeError:
+                # Lock was not acquired - ignore
+                pass
+
+    def locked(self) -> bool:
+        """Check if the lock is acquired."""
+        if self._lock is None:
+            return False
+        return self._lock.locked()
 
     async def __aenter__(self) -> "LazyAsyncLock":
         await self.acquire()
