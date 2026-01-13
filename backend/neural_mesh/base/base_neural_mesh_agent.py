@@ -107,6 +107,8 @@ class BaseNeuralMeshAgent(ABC):
         version: str = "1.0.0",
         dependencies: Optional[Set[str]] = None,
         config: Optional[BaseAgentConfig] = None,
+        description: Optional[str] = None,
+        **kwargs,  # Accept additional kwargs for forward compatibility
     ) -> None:
         """Initialize the base agent.
 
@@ -118,6 +120,8 @@ class BaseNeuralMeshAgent(ABC):
             version: Agent version
             dependencies: Other agents this agent depends on
             config: Agent configuration
+            description: Human-readable description of agent's purpose
+            **kwargs: Additional keyword arguments for forward compatibility
         """
         self.agent_name = agent_name
         self.agent_type = agent_type
@@ -126,6 +130,11 @@ class BaseNeuralMeshAgent(ABC):
         self.version = version
         self.dependencies = dependencies or set()
         self.config = config or get_config().base_agent
+        self.description = description or f"{agent_name} ({agent_type})"
+
+        # Log any unexpected kwargs for debugging (but don't fail)
+        if kwargs:
+            logger.debug(f"[{agent_name}] Ignoring unexpected kwargs: {list(kwargs.keys())}")
 
         # Neural Mesh components (lazy loaded)
         self.message_bus: Optional[AgentCommunicationBus] = None
@@ -151,10 +160,11 @@ class BaseNeuralMeshAgent(ABC):
         self._task_queue_size = 0
 
         logger.info(
-            "Created agent: %s (type=%s, capabilities=%s)",
+            "Created agent: %s (type=%s, capabilities=%s, description=%s)",
             agent_name,
             agent_type,
             ", ".join(capabilities),
+            self.description[:80] if self.description else "N/A",
         )
 
     async def initialize(

@@ -737,6 +737,23 @@ class AgenticTaskRunner:
                     if not is_uae_initialized():
                         self.logger.info("[AgenticRunner] UAE not yet initialized - performing lazy initialization...")
                         try:
+                            # Create voice callback using Trinity Voice Coordinator
+                            async def _voice_callback(text: str):
+                                """Voice callback for proactive suggestions via Trinity Voice Coordinator."""
+                                try:
+                                    from core.trinity_voice_coordinator import get_voice_coordinator, VoiceContext
+                                    coordinator = await get_voice_coordinator()
+                                    if coordinator:
+                                        await coordinator.announce(text, context=VoiceContext.RUNTIME)
+                                        self.logger.debug(f"[AgenticRunner-Voice] Spoke: {text[:50]}...")
+                                except Exception as e:
+                                    self.logger.debug(f"[AgenticRunner-Voice] Error: {e}")
+
+                            # Create notification callback
+                            async def _notification_callback(title: str, message: str, priority: str = "low"):
+                                """Notification callback for proactive suggestions."""
+                                self.logger.info(f"[AgenticRunner-Notify] [{priority.upper()}] {title}: {message}")
+
                             await initialize_uae(
                                 vision_analyzer=None,  # Will be connected later if needed
                                 sai_monitoring_interval=5.0,
@@ -746,8 +763,10 @@ class AgenticTaskRunner:
                                 enable_proactive_intelligence=True,  # v75.0: Enable proactive intelligence for natural communication
                                 enable_chain_of_thought=True,
                                 enable_unified_orchestrator=True,
+                                voice_callback=_voice_callback,  # v100.2: Add voice callback for proactive communication
+                                notification_callback=_notification_callback,  # v100.2: Add notification callback
                             )
-                            self.logger.info("[AgenticRunner] ✓ UAE lazy initialization complete")
+                            self.logger.info("[AgenticRunner] ✓ UAE lazy initialization complete with voice support")
                         except Exception as init_err:
                             self.logger.warning(f"[AgenticRunner] UAE lazy initialization failed: {init_err}")
 

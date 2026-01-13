@@ -1708,11 +1708,30 @@ async def get_anthropic_engine() -> AnthropicUnifiedEngine:
     if _engine_instance is None:
         async with _engine_lock:
             if _engine_instance is None:
-                # Determine repo root
-                repo_root = Path(os.getenv(
-                    "JARVIS_REPO_PATH",
-                    str(Path(__file__).parent.parent.parent.parent)
-                ))
+                # Determine repo root by walking up to find .git directory
+                # Path hierarchy: anthropic_engine.py -> adapters -> coding_council -> core -> backend -> JARVIS-AI-Agent
+                script_path = Path(__file__).resolve()
+                repo_root = None
+
+                # First check environment variable
+                env_path = os.getenv("JARVIS_REPO_PATH")
+                if env_path:
+                    repo_root = Path(env_path)
+                else:
+                    # Walk up directory tree to find .git (proper repo root detection)
+                    current = script_path.parent
+                    for _ in range(10):  # Max 10 levels up
+                        if (current / ".git").exists():
+                            repo_root = current
+                            break
+                        if current.parent == current:
+                            break
+                        current = current.parent
+
+                    # Fallback if .git not found
+                    if repo_root is None:
+                        # 5 parents up: adapters -> coding_council -> core -> backend -> project_root
+                        repo_root = script_path.parent.parent.parent.parent.parent
 
                 _engine_instance = AnthropicUnifiedEngine(repo_root)
                 await _engine_instance.initialize()
