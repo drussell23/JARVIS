@@ -116,6 +116,16 @@ class TrinityIntent(Enum):
     EVOLUTION_COMPLETE = "evolution_complete"
     EVOLUTION_ROLLBACK = "evolution_rollback"
 
+    # v101.0: Model Lifecycle commands (Trinity Loop - closes the loop!)
+    MODEL_READY = "model_ready"  # New model ready for hot-swap
+    MODEL_LOADING = "model_loading"  # Model loading in progress
+    MODEL_UNLOADED = "model_unloaded"  # Model unloaded
+    MODEL_FAILED = "model_failed"  # Model loading failed
+    MODEL_VALIDATED = "model_validated"  # Model passed validation
+    MODEL_ROLLBACK = "model_rollback"  # Rollback to previous model
+    HOT_SWAP_MODEL = "hot_swap_model"  # Request to hot-swap model
+    UPDATE_MODEL_ROUTING = "update_model_routing"  # Update routing to new model
+
 
 @dataclass
 class TrinityCommand:

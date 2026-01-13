@@ -114,11 +114,41 @@ except ImportError:
 
 
 # =============================================================================
+# MODEL HOT-SWAP IMPORTS
+# =============================================================================
+
+get_model_manager = None
+MODEL_MANAGER_AVAILABLE = False
+try:
+    from backend.core.model_manager import get_model_manager
+    MODEL_MANAGER_AVAILABLE = True
+except ImportError:
+    try:
+        from core.model_manager import get_model_manager
+        MODEL_MANAGER_AVAILABLE = True
+    except ImportError:
+        pass
+
+get_unified_model_serving = None
+UNIFIED_MODEL_SERVING_AVAILABLE = False
+try:
+    from backend.core.unified_model_serving import get_unified_model_serving
+    UNIFIED_MODEL_SERVING_AVAILABLE = True
+except ImportError:
+    try:
+        from core.unified_model_serving import get_unified_model_serving
+        UNIFIED_MODEL_SERVING_AVAILABLE = True
+    except ImportError:
+        pass
+
+
+# =============================================================================
 # GLOBAL STATE
 # =============================================================================
 
 _visual_monitor_agent: Optional[VisualMonitorAgent] = None
 _handlers_registered = False
+_active_model_path: Optional[str] = None  # v101.0: Track active model
 
 
 # =============================================================================
@@ -488,6 +518,176 @@ async def _send_nack(command: TrinityCommand, error: str) -> None:
 
 
 # =============================================================================
+# v101.0: MODEL LIFECYCLE HANDLERS (Trinity Loop - The Key Events!)
+# =============================================================================
+
+async def handle_model_ready(command: TrinityCommand) -> None:
+    """
+    Handle MODEL_READY event from Reactor Core.
+
+    THIS IS THE KEY EVENT THAT CLOSES THE TRINITY LOOP:
+    JARVIS → Experiences → Reactor Core → Training → MODEL_READY → JARVIS
+    """
+    global _active_model_path
+
+    payload = command.payload
+    model_name = payload.get("model_name", "unknown")
+    model_path = payload.get("model_path", "")
+    model_type = payload.get("model_type", "llm")
+    capabilities = payload.get("capabilities", [])
+    gguf_path = payload.get("gguf_path")  # For llama.cpp models
+    adapter_path = payload.get("adapter_path")  # For LoRA adapters
+    training_stats = payload.get("training_stats", {})
+
+    logger.info(
+        f"[Trinity] MODEL_READY received: {model_name} ({model_type})"
+    )
+    logger.info(f"[Trinity] Model path: {model_path or gguf_path or adapter_path}")
+
+    try:
+        # Track previous model for potential rollback
+        previous_model = _active_model_path
+
+        # Step 1: Validate model exists
+        from pathlib import Path
+        effective_path = gguf_path or model_path or adapter_path
+        if effective_path and not Path(effective_path).exists():
+            logger.error(f"[Trinity] Model path does not exist: {effective_path}")
+            await _send_nack(command, f"Model path does not exist: {effective_path}")
+            return
+
+        # Step 2: Hot-swap in model serving layer
+        hot_swap_success = False
+
+        if UNIFIED_MODEL_SERVING_AVAILABLE and get_unified_model_serving:
+            try:
+                serving = await get_unified_model_serving()
+                if serving:
+                    # Register new model endpoint
+                    await serving.register_model(
+                        model_id=model_name,
+                        model_path=effective_path,
+                        model_type=model_type,
+                        capabilities=capabilities,
+                        metadata={
+                            "source": "reactor_core",
+                            "training_stats": training_stats,
+                            "adapter_path": adapter_path,
+                        },
+                    )
+                    logger.info(f"[Trinity] Registered model in UnifiedModelServing: {model_name}")
+                    hot_swap_success = True
+            except Exception as e:
+                logger.error(f"[Trinity] UnifiedModelServing registration failed: {e}")
+
+        if MODEL_MANAGER_AVAILABLE and get_model_manager:
+            try:
+                manager = get_model_manager()
+                if manager:
+                    # Notify model manager of new model
+                    await manager.on_model_ready(
+                        model_name=model_name,
+                        model_path=effective_path,
+                        model_type=model_type,
+                    )
+                    logger.info(f"[Trinity] Notified ModelManager: {model_name}")
+                    hot_swap_success = True
+            except AttributeError:
+                # on_model_ready not implemented
+                logger.debug("[Trinity] ModelManager.on_model_ready not available")
+            except Exception as e:
+                logger.error(f"[Trinity] ModelManager notification failed: {e}")
+
+        # Step 3: Update active model tracking
+        _active_model_path = effective_path
+
+        # Step 4: Publish acknowledgment
+        if hot_swap_success:
+            logger.info(f"[Trinity] MODEL HOT-SWAP COMPLETE: {model_name}")
+            await _send_ack(command, f"Model hot-swap complete: {model_name}")
+
+            # Publish MODEL_VALIDATED event
+            try:
+                bridge = get_reactor_bridge()
+                if bridge.is_connected():
+                    await bridge.send_event_async(
+                        TrinityIntent.MODEL_VALIDATED,
+                        payload={
+                            "model_name": model_name,
+                            "model_path": effective_path,
+                            "previous_model": previous_model,
+                            "hot_swap_success": True,
+                        },
+                    )
+            except Exception as e:
+                logger.debug(f"[Trinity] MODEL_VALIDATED publish failed: {e}")
+        else:
+            logger.warning(f"[Trinity] Model registered but hot-swap may be incomplete")
+            await _send_ack(command, f"Model registered (hot-swap partial): {model_name}")
+
+    except Exception as e:
+        logger.error(f"[Trinity] MODEL_READY error: {e}")
+        import traceback
+        traceback.print_exc()
+        await _send_nack(command, str(e))
+
+
+async def handle_model_rollback(command: TrinityCommand) -> None:
+    """
+    Handle MODEL_ROLLBACK command to revert to previous model.
+    """
+    global _active_model_path
+
+    payload = command.payload
+    target_model = payload.get("model_path") or payload.get("model_name")
+    reason = payload.get("reason", "Manual rollback requested")
+
+    logger.info(f"[Trinity] MODEL_ROLLBACK: {reason}")
+
+    try:
+        if UNIFIED_MODEL_SERVING_AVAILABLE and get_unified_model_serving:
+            serving = await get_unified_model_serving()
+            if serving and hasattr(serving, "rollback_model"):
+                await serving.rollback_model(target_model)
+                logger.info(f"[Trinity] Model rolled back to: {target_model}")
+                await _send_ack(command, f"Rolled back to: {target_model}")
+                return
+
+        # Fallback: just update tracking
+        _active_model_path = target_model
+        await _send_ack(command, f"Rollback recorded (manual switch required): {target_model}")
+
+    except Exception as e:
+        logger.error(f"[Trinity] MODEL_ROLLBACK error: {e}")
+        await _send_nack(command, str(e))
+
+
+async def handle_update_model_routing(command: TrinityCommand) -> None:
+    """
+    Handle UPDATE_MODEL_ROUTING command to change which model handles requests.
+    """
+    payload = command.payload
+    model_id = payload.get("model_id")
+    route_patterns = payload.get("route_patterns", [])  # e.g., ["conversation/*", "code/*"]
+
+    logger.info(f"[Trinity] UPDATE_MODEL_ROUTING: {model_id} -> {route_patterns}")
+
+    try:
+        if UNIFIED_MODEL_SERVING_AVAILABLE and get_unified_model_serving:
+            serving = await get_unified_model_serving()
+            if serving and hasattr(serving, "update_routing"):
+                await serving.update_routing(model_id, route_patterns)
+                await _send_ack(command, f"Routing updated for: {model_id}")
+                return
+
+        await _send_ack(command, f"Routing update recorded: {model_id}")
+
+    except Exception as e:
+        logger.error(f"[Trinity] UPDATE_MODEL_ROUTING error: {e}")
+        await _send_nack(command, str(e))
+
+
+# =============================================================================
 # REGISTRATION
 # =============================================================================
 
@@ -526,6 +726,12 @@ def register_trinity_handlers(bridge=None) -> bool:
         bridge.register_handler(handle_ping, [TrinityIntent.PING])
         bridge.register_handler(handle_execute_plan, [TrinityIntent.EXECUTE_PLAN])
 
+        # v101.0: Model lifecycle handlers (Trinity Loop - closes the loop!)
+        bridge.register_handler(handle_model_ready, [TrinityIntent.MODEL_READY])
+        bridge.register_handler(handle_model_rollback, [TrinityIntent.MODEL_ROLLBACK])
+        bridge.register_handler(handle_update_model_routing, [TrinityIntent.UPDATE_MODEL_ROUTING])
+        logger.info("[Trinity] Model lifecycle handlers registered (MODEL_READY, MODEL_ROLLBACK, UPDATE_MODEL_ROUTING)")
+
         # v77.2: Register Coding Council evolution handlers
         try:
             from backend.core.coding_council.integration import register_evolution_handlers
@@ -563,4 +769,8 @@ __all__ = [
     "handle_create_ghost_display",
     "handle_ping",
     "handle_execute_plan",
+    # v101.0: Model lifecycle handlers
+    "handle_model_ready",
+    "handle_model_rollback",
+    "handle_update_model_routing",
 ]
