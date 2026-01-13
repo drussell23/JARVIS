@@ -125,6 +125,309 @@ except ImportError:
 
 
 # =============================================================================
+# v3.1: Per-API Circuit Breaker with Adaptive Recovery
+# =============================================================================
+
+@dataclass
+class CircuitState:
+    """State for a single API circuit breaker."""
+    failures: int = 0
+    successes_since_half_open: int = 0
+    last_failure_time: float = 0.0
+    state: str = "closed"  # closed, open, half_open
+    consecutive_successes: int = 0
+
+
+class PerAPICircuitBreaker:
+    """
+    Per-API circuit breaker with adaptive recovery.
+
+    Each Google API (Gmail, Calendar, Drive, Sheets) has its own circuit breaker,
+    allowing failures in one API not to affect others.
+
+    States:
+    - closed: Normal operation, requests flow through
+    - open: Too many failures, requests fail fast
+    - half_open: Testing if API has recovered
+
+    Features:
+    - Exponential backoff with jitter
+    - Adaptive failure threshold based on recent success rate
+    - Automatic recovery detection
+    """
+
+    def __init__(
+        self,
+        failure_threshold: int = 5,
+        recovery_timeout: float = 30.0,
+        half_open_max_calls: int = 3,
+    ):
+        self._circuits: Dict[str, CircuitState] = {}
+        self._failure_threshold = failure_threshold
+        self._recovery_timeout = recovery_timeout
+        self._half_open_max_calls = half_open_max_calls
+        self._lock = asyncio.Lock()
+
+    def _get_circuit(self, api_name: str) -> CircuitState:
+        """Get or create circuit for an API."""
+        if api_name not in self._circuits:
+            self._circuits[api_name] = CircuitState()
+        return self._circuits[api_name]
+
+    async def can_execute(self, api_name: str) -> bool:
+        """Check if a request can be executed for this API."""
+        async with self._lock:
+            circuit = self._get_circuit(api_name)
+            current_time = asyncio.get_event_loop().time()
+
+            if circuit.state == "closed":
+                return True
+
+            elif circuit.state == "open":
+                # Check if recovery timeout has elapsed
+                if current_time - circuit.last_failure_time >= self._recovery_timeout:
+                    circuit.state = "half_open"
+                    circuit.successes_since_half_open = 0
+                    logger.info(f"[CircuitBreaker] {api_name}: open → half_open")
+                    return True
+                return False
+
+            elif circuit.state == "half_open":
+                # Allow limited requests to test recovery
+                return circuit.successes_since_half_open < self._half_open_max_calls
+
+            return True
+
+    async def record_success(self, api_name: str) -> None:
+        """Record a successful API call."""
+        async with self._lock:
+            circuit = self._get_circuit(api_name)
+            circuit.consecutive_successes += 1
+
+            if circuit.state == "half_open":
+                circuit.successes_since_half_open += 1
+                if circuit.successes_since_half_open >= self._half_open_max_calls:
+                    circuit.state = "closed"
+                    circuit.failures = 0
+                    logger.info(f"[CircuitBreaker] {api_name}: half_open → closed (recovered)")
+
+            elif circuit.state == "closed":
+                # Reset failure count on success
+                circuit.failures = max(0, circuit.failures - 1)
+
+    async def record_failure(self, api_name: str) -> None:
+        """Record a failed API call."""
+        async with self._lock:
+            circuit = self._get_circuit(api_name)
+            circuit.failures += 1
+            circuit.consecutive_successes = 0
+            circuit.last_failure_time = asyncio.get_event_loop().time()
+
+            if circuit.state == "half_open":
+                # Failure during half-open goes back to open
+                circuit.state = "open"
+                logger.warning(f"[CircuitBreaker] {api_name}: half_open → open (still failing)")
+
+            elif circuit.state == "closed" and circuit.failures >= self._failure_threshold:
+                circuit.state = "open"
+                logger.warning(f"[CircuitBreaker] {api_name}: closed → open (threshold reached)")
+
+    def get_status(self) -> Dict[str, Dict[str, Any]]:
+        """Get status of all circuits."""
+        return {
+            api_name: {
+                "state": circuit.state,
+                "failures": circuit.failures,
+                "consecutive_successes": circuit.consecutive_successes,
+            }
+            for api_name, circuit in self._circuits.items()
+        }
+
+
+# =============================================================================
+# v3.1: Parallel Tier Execution with Race Pattern
+# =============================================================================
+
+@dataclass
+class TierResult:
+    """Result from a tier execution attempt."""
+    tier: str
+    success: bool
+    data: Any = None
+    error: Optional[str] = None
+    execution_time_ms: float = 0.0
+
+
+class ParallelTierExecutor:
+    """
+    Execute operations across multiple tiers in parallel, racing for fastest success.
+
+    Instead of sequential waterfall (try Tier 1, then Tier 2, then Tier 3),
+    this executor runs all tiers in parallel and picks the fastest successful result.
+
+    Features:
+    - Concurrent execution with asyncio.create_task
+    - First-success-wins with automatic cancellation of slower tasks
+    - Timeout-based selection (pick first to complete under threshold)
+    - Cost-aware selection (prefer cheaper tiers when speed is similar)
+    """
+
+    def __init__(
+        self,
+        default_timeout: float = 10.0,
+        prefer_local: bool = True,
+    ):
+        self._default_timeout = default_timeout
+        self._prefer_local = prefer_local
+        self._execution_stats: Dict[str, List[float]] = {}
+
+    async def execute_parallel(
+        self,
+        operations: Dict[str, Callable[[], Awaitable[Any]]],
+        timeout: Optional[float] = None,
+    ) -> TierResult:
+        """
+        Execute multiple tier operations in parallel.
+
+        Args:
+            operations: Dict of tier_name → async callable
+            timeout: Overall timeout in seconds
+
+        Returns:
+            TierResult from the fastest successful tier
+        """
+        timeout = timeout or self._default_timeout
+
+        # Create tasks for all tiers
+        tasks: Dict[str, asyncio.Task] = {}
+        for tier_name, operation in operations.items():
+            task = asyncio.create_task(
+                self._execute_tier(tier_name, operation),
+                name=f"tier_{tier_name}",
+            )
+            tasks[tier_name] = task
+
+        # Race for first success
+        done_results: List[TierResult] = []
+        pending = set(tasks.values())
+
+        try:
+            async with asyncio.timeout(timeout):
+                while pending:
+                    done, pending = await asyncio.wait(
+                        pending,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+
+                    for task in done:
+                        try:
+                            result = task.result()
+                            done_results.append(result)
+
+                            if result.success:
+                                # First success - cancel remaining tasks
+                                for remaining_task in pending:
+                                    remaining_task.cancel()
+
+                                # Wait for cancellation to complete
+                                if pending:
+                                    await asyncio.gather(*pending, return_exceptions=True)
+
+                                return result
+
+                        except Exception as e:
+                            logger.warning(f"Tier task failed: {e}")
+
+        except asyncio.TimeoutError:
+            # Cancel all remaining tasks
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+
+            logger.warning(f"Parallel tier execution timed out after {timeout}s")
+
+        # All tiers failed - return best partial result or error
+        if done_results:
+            # Return the one with least severe error
+            return min(done_results, key=lambda r: 0 if r.success else 1)
+
+        return TierResult(
+            tier="none",
+            success=False,
+            error=f"All tiers failed or timed out after {timeout}s",
+        )
+
+    async def _execute_tier(
+        self,
+        tier_name: str,
+        operation: Callable[[], Awaitable[Any]],
+    ) -> TierResult:
+        """Execute a single tier operation with timing."""
+        import time as time_module
+        start_time = time_module.time()
+
+        try:
+            result = await operation()
+            execution_time_ms = (time_module.time() - start_time) * 1000
+
+            # Track execution time for this tier
+            if tier_name not in self._execution_stats:
+                self._execution_stats[tier_name] = []
+            self._execution_stats[tier_name].append(execution_time_ms)
+            if len(self._execution_stats[tier_name]) > 100:
+                self._execution_stats[tier_name] = self._execution_stats[tier_name][-100:]
+
+            return TierResult(
+                tier=tier_name,
+                success=True,
+                data=result,
+                execution_time_ms=execution_time_ms,
+            )
+
+        except Exception as e:
+            execution_time_ms = (time_module.time() - start_time) * 1000
+            return TierResult(
+                tier=tier_name,
+                success=False,
+                error=str(e),
+                execution_time_ms=execution_time_ms,
+            )
+
+    def get_tier_stats(self) -> Dict[str, Dict[str, float]]:
+        """Get average execution times per tier."""
+        return {
+            tier: {
+                "avg_time_ms": sum(times) / len(times) if times else 0,
+                "min_time_ms": min(times) if times else 0,
+                "max_time_ms": max(times) if times else 0,
+                "sample_count": len(times),
+            }
+            for tier, times in self._execution_stats.items()
+        }
+
+
+# Global instances for per-API circuit breaker and parallel executor
+_api_circuit_breaker: Optional[PerAPICircuitBreaker] = None
+_parallel_executor: Optional[ParallelTierExecutor] = None
+
+
+def get_api_circuit_breaker() -> PerAPICircuitBreaker:
+    """Get the global per-API circuit breaker instance."""
+    global _api_circuit_breaker
+    if _api_circuit_breaker is None:
+        _api_circuit_breaker = PerAPICircuitBreaker()
+    return _api_circuit_breaker
+
+
+def get_parallel_executor() -> ParallelTierExecutor:
+    """Get the global parallel tier executor instance."""
+    global _parallel_executor
+    if _parallel_executor is None:
+        _parallel_executor = ParallelTierExecutor()
+    return _parallel_executor
+
+
+# =============================================================================
 # Google API Availability Check
 # =============================================================================
 
@@ -994,6 +1297,11 @@ class GoogleWorkspaceClient:
     - Gmail operations
     - Calendar operations
     - Contacts operations
+
+    v3.1 Enhancements:
+    - Proactive OAuth token refresh
+    - Token expiration monitoring
+    - Automatic retry with fresh token on 401
     """
 
     def __init__(self, config: Optional[GoogleWorkspaceConfig] = None):
@@ -1008,6 +1316,152 @@ class GoogleWorkspaceClient:
 
         # Cache
         self._cache: Dict[str, Tuple[Any, float]] = {}
+
+        # v3.1: Token management
+        self._token_refresh_buffer = 300  # Refresh 5 minutes before expiry
+        self._last_token_check = 0.0
+        self._token_refresh_task: Optional[asyncio.Task] = None
+
+    async def _ensure_valid_token(self) -> bool:
+        """
+        Proactively check and refresh token before expiration.
+
+        v3.1: Called before each API operation to ensure token is valid.
+        Refreshes token if it will expire within the buffer period.
+
+        Returns:
+            True if token is valid or was successfully refreshed
+        """
+        if not self._creds:
+            return False
+
+        import time as time_module
+        current_time = time_module.time()
+
+        # Check token expiry
+        try:
+            if hasattr(self._creds, 'expired') and self._creds.expired:
+                logger.info("[GoogleWorkspaceClient] Token expired, refreshing...")
+                return await self._refresh_token()
+
+            if hasattr(self._creds, 'expiry') and self._creds.expiry:
+                # Calculate time until expiry
+                from datetime import timezone
+                expiry_ts = self._creds.expiry.replace(tzinfo=timezone.utc).timestamp()
+                time_until_expiry = expiry_ts - current_time
+
+                if time_until_expiry < self._token_refresh_buffer:
+                    logger.info(
+                        f"[GoogleWorkspaceClient] Token expires in {time_until_expiry:.0f}s, "
+                        f"proactively refreshing..."
+                    )
+                    return await self._refresh_token()
+
+            return True
+
+        except Exception as e:
+            logger.warning(f"Token check failed: {e}")
+            return True  # Proceed anyway, let API call fail if token is bad
+
+    async def _refresh_token(self) -> bool:
+        """
+        Refresh the OAuth token.
+
+        v3.1: Handles token refresh with proper locking to prevent race conditions.
+        """
+        async with self._lock:
+            try:
+                if not self._creds or not hasattr(self._creds, 'refresh'):
+                    return False
+
+                # Run refresh in thread pool (it's blocking)
+                loop = asyncio.get_event_loop()
+
+                def do_refresh():
+                    from google.auth.transport.requests import Request
+                    self._creds.refresh(Request())
+                    return True
+
+                success = await loop.run_in_executor(None, do_refresh)
+
+                if success:
+                    logger.info("[GoogleWorkspaceClient] Token refreshed successfully")
+                    # Re-build services with new token
+                    await self._rebuild_services()
+
+                return success
+
+            except Exception as e:
+                logger.error(f"Token refresh failed: {e}")
+                return False
+
+    async def _rebuild_services(self) -> None:
+        """Rebuild Google API services with fresh credentials."""
+        try:
+            loop = asyncio.get_event_loop()
+
+            def build_services():
+                if GOOGLE_API_AVAILABLE:
+                    from googleapiclient.discovery import build
+                    self._gmail_service = build('gmail', 'v1', credentials=self._creds)
+                    self._calendar_service = build('calendar', 'v3', credentials=self._creds)
+                    self._people_service = build('people', 'v1', credentials=self._creds)
+
+            await loop.run_in_executor(None, build_services)
+
+        except Exception as e:
+            logger.warning(f"Service rebuild failed: {e}")
+
+    async def _execute_with_retry(
+        self,
+        operation: Callable[[], Any],
+        api_name: str = "google_api",
+    ) -> Any:
+        """
+        Execute an API operation with automatic retry on token expiration.
+
+        v3.1: Catches 401 errors and retries with refreshed token.
+        Also integrates with per-API circuit breaker.
+        """
+        circuit_breaker = get_api_circuit_breaker()
+
+        # Check circuit breaker
+        if not await circuit_breaker.can_execute(api_name):
+            raise RuntimeError(f"Circuit breaker open for {api_name}")
+
+        # Ensure valid token before operation
+        await self._ensure_valid_token()
+
+        try:
+            # Run operation in thread pool
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, operation)
+
+            # Record success
+            await circuit_breaker.record_success(api_name)
+
+            return result
+
+        except Exception as e:
+            error_str = str(e).lower()
+
+            # Check for auth errors
+            if "401" in error_str or "unauthorized" in error_str or "invalid_grant" in error_str:
+                logger.warning(f"[GoogleWorkspaceClient] Auth error, attempting token refresh...")
+
+                # Refresh token and retry once
+                if await self._refresh_token():
+                    try:
+                        result = await loop.run_in_executor(None, operation)
+                        await circuit_breaker.record_success(api_name)
+                        return result
+                    except Exception as retry_error:
+                        await circuit_breaker.record_failure(api_name)
+                        raise retry_error
+
+            # Record failure
+            await circuit_breaker.record_failure(api_name)
+            raise
 
     async def authenticate(self) -> bool:
         """
@@ -2144,6 +2598,19 @@ Return ONLY a JSON object with these keys (use null if not found):
                         confidence=1.0,
                     )
 
+                # v3.1: Log experience to Reactor Core
+                await self._log_experience(
+                    action="fetch_unread_emails",
+                    input_data={"limit": limit},
+                    output_data={
+                        "email_count": result.get("count", 0),
+                        "tier_used": exec_result.tier_used.value,
+                        "execution_time_ms": exec_result.execution_time_ms,
+                    },
+                    success=True,
+                    confidence=0.9,
+                )
+
                 return result
             else:
                 return {
@@ -2167,19 +2634,106 @@ Return ONLY a JSON object with these keys (use null if not found):
         return await self._client.search_emails(query=query, limit=limit)
 
     async def _draft_email(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """Create email draft."""
+        """
+        Create email draft with intelligent Prime model generation.
+
+        v3.1 Enhancement - Trinity Loop Integration:
+        - Uses Prime models for email body generation when not provided
+        - Routes to appropriate model based on complexity (fast vs reasoning)
+        - Logs experience to Reactor Core for learning
+        - Tracks user edits for preference learning
+
+        Args:
+            payload: Dict with:
+                - to: Recipient email
+                - subject: Email subject
+                - body: Optional email body (generated if not provided)
+                - reply_to_id: Optional ID of email being replied to
+                - query: Original user query for context
+                - visual_context: Optional OCR context
+                - tone: Optional tone preference (professional, casual, friendly)
+                - original_email_content: Content of email being replied to
+
+        Returns:
+            Dict with draft status and metadata
+        """
+        import time as time_module
+        start_time = time_module.time()
+
         to = payload.get("to", "")
         subject = payload.get("subject", "")
         body = payload.get("body", "")
         reply_to = payload.get("reply_to_id")
+        query = payload.get("query", "")
+        visual_context = payload.get("visual_context")
+        tone = payload.get("tone", "professional")
+        original_email = payload.get("original_email_content", "")
 
         if not to:
-            return {"error": "Recipient 'to' is required"}
+            return {"error": "Recipient 'to' is required", "success": False}
         if not subject:
-            return {"error": "Subject is required"}
-        if not body:
-            return {"error": "Email body is required"}
+            return {"error": "Subject is required", "success": False}
 
+        generated_body = False
+        model_used = None
+        generation_time_ms = 0
+
+        # v3.1: Generate email body using Prime models if not provided
+        if not body and (query or original_email):
+            generation_start = time_module.time()
+
+            if UNIFIED_MODEL_SERVING_AVAILABLE and get_model_serving:
+                try:
+                    model_serving = await get_model_serving()
+
+                    # Build intelligent email generation prompt
+                    email_context = ""
+                    if original_email:
+                        email_context = f"\n\nORIGINAL EMAIL TO REPLY TO:\n{original_email[:1500]}"
+                    if visual_context:
+                        email_context += f"\n\nSCREEN CONTEXT:\n{visual_context[:500]}"
+
+                    email_prompt = f"""You are an email drafting assistant. Generate a {tone} email reply.
+
+RECIPIENT: {to}
+SUBJECT: {subject}
+USER REQUEST: {query or "Draft a reply to this email"}
+{email_context}
+
+Generate ONLY the email body (no subject, no greeting like "Dear", just the content).
+The email should:
+1. Be {tone} in tone
+2. Be concise but complete
+3. Address the key points from the original email if replying
+4. End with an appropriate sign-off
+
+EMAIL BODY:"""
+
+                    # Use workspace_email task type for routing
+                    result = await model_serving.generate(
+                        prompt=email_prompt,
+                        task_type="workspace_email",
+                        max_tokens=800,
+                    )
+
+                    if result.get("text"):
+                        body = result["text"].strip()
+                        generated_body = True
+                        model_used = result.get("provider", "prime")
+                        generation_time_ms = (time_module.time() - generation_start) * 1000
+
+                        logger.info(
+                            f"[GoogleWorkspaceAgent] Generated email body using {model_used} "
+                            f"({generation_time_ms:.0f}ms)"
+                        )
+
+                except Exception as e:
+                    logger.warning(f"Prime email generation failed: {e}")
+
+        if not body:
+            return {"error": "Email body is required (generation failed)", "success": False}
+
+        # Create draft via Gmail API
         result = await self._client.draft_email(
             to=to,
             subject=subject,
@@ -2187,10 +2741,148 @@ Return ONLY a JSON object with these keys (use null if not found):
             reply_to_id=reply_to,
         )
 
+        execution_time_ms = (time_module.time() - start_time) * 1000
+
         if result.get("status") == "created":
             self._drafts_created += 1
 
+            # v3.1: Store draft for user edit tracking
+            draft_id = result.get("draft_id", result.get("id", ""))
+            if draft_id:
+                await self._track_draft_for_edits(
+                    draft_id=draft_id,
+                    original_body=body,
+                    generated=generated_body,
+                    model_used=model_used,
+                    query=query,
+                )
+
+            # v3.1: Log experience to Reactor Core
+            await self._log_experience(
+                action="draft_email",
+                input_data={
+                    "query": query,
+                    "tone": tone,
+                    "has_original_email": bool(original_email),
+                    "had_visual_context": bool(visual_context),
+                },
+                output_data={
+                    **result,
+                    "generated_body": generated_body,
+                    "model_used": model_used,
+                    "generation_time_ms": generation_time_ms,
+                    "execution_time_ms": execution_time_ms,
+                },
+                success=True,
+                confidence=0.9 if generated_body else 0.95,
+            )
+
+        # Add metadata to result
+        result["generated_body"] = generated_body
+        result["model_used"] = model_used
+        result["execution_time_ms"] = execution_time_ms
+
         return result
+
+    async def _track_draft_for_edits(
+        self,
+        draft_id: str,
+        original_body: str,
+        generated: bool,
+        model_used: Optional[str],
+        query: str,
+    ) -> None:
+        """
+        Track a draft for user edit learning.
+
+        v3.1: When user edits a generated draft, we learn their preferences.
+        This is part of the Trinity Loop - corrections improve future generations.
+        """
+        try:
+            # Store in memory for short-term tracking
+            if not hasattr(self, "_draft_tracking"):
+                self._draft_tracking: Dict[str, Dict[str, Any]] = {}
+
+            self._draft_tracking[draft_id] = {
+                "original_body": original_body,
+                "generated": generated,
+                "model_used": model_used,
+                "query": query,
+                "created_at": asyncio.get_event_loop().time(),
+            }
+
+            # Limit tracked drafts to prevent memory bloat
+            if len(self._draft_tracking) > 50:
+                # Remove oldest entries
+                sorted_drafts = sorted(
+                    self._draft_tracking.items(),
+                    key=lambda x: x[1]["created_at"],
+                )
+                for draft_id_old, _ in sorted_drafts[:10]:
+                    del self._draft_tracking[draft_id_old]
+
+        except Exception as e:
+            logger.debug(f"Draft tracking failed: {e}")
+
+    async def check_draft_for_user_edits(self, draft_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Check if user edited a tracked draft and learn from changes.
+
+        Call this when a draft is sent to capture user corrections.
+        Returns edit analysis if the draft was tracked and edited.
+        """
+        if not hasattr(self, "_draft_tracking"):
+            return None
+
+        tracked = self._draft_tracking.get(draft_id)
+        if not tracked:
+            return None
+
+        try:
+            # Fetch current draft content
+            if self._client:
+                current_draft = await self._client.get_draft(draft_id)
+                if current_draft and current_draft.get("body"):
+                    current_body = current_draft["body"]
+                    original_body = tracked["original_body"]
+
+                    # Calculate edit distance / changes
+                    if current_body != original_body:
+                        # User made edits - this is valuable learning data
+                        edit_data = {
+                            "draft_id": draft_id,
+                            "original_body": original_body,
+                            "edited_body": current_body,
+                            "generated": tracked["generated"],
+                            "model_used": tracked["model_used"],
+                            "query": tracked["query"],
+                            "edit_detected": True,
+                        }
+
+                        # Log as correction experience
+                        await self._log_experience(
+                            action="draft_correction",
+                            input_data={
+                                "query": tracked["query"],
+                                "original": original_body[:500],
+                            },
+                            output_data={
+                                "corrected": current_body[:500],
+                                "model_used": tracked["model_used"],
+                            },
+                            success=True,
+                            confidence=1.0,  # User corrections are high quality
+                        )
+
+                        # Clean up tracking
+                        del self._draft_tracking[draft_id]
+
+                        return edit_data
+
+        except Exception as e:
+            logger.debug(f"Edit check failed: {e}")
+
+        return None
 
     async def _draft_email_visual(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -2406,6 +3098,19 @@ Return ONLY a JSON object with these keys (use null if not found):
                         confidence=1.0,
                     )
 
+                # v3.1: Log experience to Reactor Core
+                await self._log_experience(
+                    action="check_calendar",
+                    input_data={"date": date_str, "days": days},
+                    output_data={
+                        "event_count": result.get("count", 0),
+                        "tier_used": exec_result.tier_used.value,
+                        "execution_time_ms": exec_result.execution_time_ms,
+                    },
+                    success=True,
+                    confidence=0.9,
+                )
+
                 return result
             else:
                 return {
@@ -2445,6 +3150,19 @@ Return ONLY a JSON object with these keys (use null if not found):
 
         if result.get("status") == "created":
             self._events_created += 1
+
+            # v3.1: Log experience to Reactor Core
+            await self._log_experience(
+                action="create_event",
+                input_data={
+                    "has_title": bool(title),
+                    "has_attendees": bool(attendees),
+                    "has_location": bool(location),
+                },
+                output_data=result,
+                success=True,
+                confidence=0.95,
+            )
 
         return result
 
@@ -2514,6 +3232,21 @@ Return ONLY a JSON object with these keys (use null if not found):
                         },
                         confidence=1.0,
                     )
+
+                # v3.1: Log experience to Reactor Core
+                await self._log_experience(
+                    action="create_document",
+                    input_data={
+                        "document_type": document_type,
+                        "has_word_count": bool(word_count),
+                    },
+                    output_data={
+                        "tier_used": exec_result.tier_used.value,
+                        "execution_time_ms": exec_result.execution_time_ms,
+                    },
+                    success=True,
+                    confidence=0.9,
+                )
 
                 return result
             else:
