@@ -230,7 +230,48 @@ class ModelClient(ABC):
 
 
 class PrimeLocalClient(ModelClient):
-    """Client for local JARVIS Prime model inference."""
+    """
+    Client for local JARVIS Prime model inference.
+
+    Features:
+    - Intelligent model discovery across multiple directories
+    - Optional auto-download from Hugging Face
+    - Graceful degradation (warns once, not repeatedly)
+    - Fallback model support
+    """
+
+    # Class-level flag to prevent repeated warnings
+    _warned_missing_model: bool = False
+    _warned_missing_llama: bool = False
+
+    # Common model search directories
+    MODEL_SEARCH_PATHS = [
+        Path.home() / "models",
+        Path.home() / ".jarvis" / "models",
+        Path.home() / ".cache" / "huggingface" / "hub",
+        Path.home() / "Documents" / "models",
+        Path("/usr/local/share/jarvis/models"),
+        Path("/opt/jarvis/models"),
+    ]
+
+    # Model name aliases for flexible discovery
+    MODEL_ALIASES = {
+        "prime-7b-chat-v1.Q4_K_M.gguf": [
+            "prime-7b-chat-v1.Q4_K_M.gguf",
+            "prime-7b-chat.Q4_K_M.gguf",
+            "mistral-7b-instruct-v0.2.Q4_K_M.gguf",
+            "mistral-7b-instruct.Q4_K_M.gguf",
+            "llama-2-7b-chat.Q4_K_M.gguf",
+            "dolphin-2.6-mistral-7b.Q4_K_M.gguf",
+            "openhermes-2.5-mistral-7b.Q4_K_M.gguf",
+        ],
+    }
+
+    # Hugging Face repo mappings for auto-download
+    HF_MODEL_REPOS = {
+        "mistral-7b-instruct-v0.2.Q4_K_M.gguf": "TheBloke/Mistral-7B-Instruct-v0.2-GGUF",
+        "llama-2-7b-chat.Q4_K_M.gguf": "TheBloke/Llama-2-7B-Chat-GGUF",
+    }
 
     def __init__(self):
         self.logger = logging.getLogger("PrimeLocalClient")
@@ -238,16 +279,162 @@ class PrimeLocalClient(ModelClient):
         self._model_path: Optional[Path] = None
         self._lock = asyncio.Lock()
         self._loaded = False
+        self._discovery_attempted = False
+
+    def _discover_model(self, model_name: str) -> Optional[Path]:
+        """
+        Discover a model file by searching multiple directories.
+
+        Args:
+            model_name: Name of the model file to find
+
+        Returns:
+            Path to the model if found, None otherwise
+        """
+        # Get aliases for this model
+        aliases = self.MODEL_ALIASES.get(model_name, [model_name])
+
+        # Build search paths from environment + defaults
+        search_paths = []
+
+        # Add configured models dir first
+        if PRIME_MODELS_DIR.exists():
+            search_paths.append(PRIME_MODELS_DIR)
+
+        # Add environment-configured additional paths
+        extra_paths = os.getenv("JARVIS_MODEL_SEARCH_PATHS", "")
+        if extra_paths:
+            for p in extra_paths.split(":"):
+                path = Path(p)
+                if path.exists() and path not in search_paths:
+                    search_paths.append(path)
+
+        # Add default search paths
+        for path in self.MODEL_SEARCH_PATHS:
+            if path.exists() and path not in search_paths:
+                search_paths.append(path)
+
+        # Search for model in all paths with all aliases
+        for search_dir in search_paths:
+            for alias in aliases:
+                # Direct file
+                model_path = search_dir / alias
+                if model_path.exists():
+                    self.logger.debug(f"Found model: {model_path}")
+                    return model_path
+
+                # Check subdirectories (e.g., huggingface cache structure)
+                for subdir in search_dir.iterdir() if search_dir.is_dir() else []:
+                    if subdir.is_dir():
+                        model_path = subdir / alias
+                        if model_path.exists():
+                            self.logger.debug(f"Found model in subdir: {model_path}")
+                            return model_path
+
+        # Also scan for any .gguf files as fallback
+        for search_dir in search_paths:
+            if search_dir.is_dir():
+                gguf_files = list(search_dir.glob("*.gguf"))
+                if gguf_files:
+                    # Prefer larger files (likely better quality)
+                    gguf_files.sort(key=lambda p: p.stat().st_size, reverse=True)
+                    self.logger.info(f"Using fallback GGUF model: {gguf_files[0].name}")
+                    return gguf_files[0]
+
+        return None
+
+    async def _auto_download_model(self, model_name: str) -> Optional[Path]:
+        """
+        Attempt to auto-download a model from Hugging Face.
+
+        Args:
+            model_name: Name of the model to download
+
+        Returns:
+            Path to downloaded model, or None if download failed/disabled
+        """
+        # Check if auto-download is enabled
+        auto_download = os.getenv("JARVIS_PRIME_AUTO_DOWNLOAD", "false").lower() == "true"
+        if not auto_download:
+            return None
+
+        # Get HF repo for this model
+        repo_id = self.HF_MODEL_REPOS.get(model_name)
+        if not repo_id:
+            # Try to find a matching repo from aliases
+            aliases = self.MODEL_ALIASES.get(PRIME_DEFAULT_MODEL, [])
+            for alias in aliases:
+                if alias in self.HF_MODEL_REPOS:
+                    repo_id = self.HF_MODEL_REPOS[alias]
+                    model_name = alias
+                    break
+
+        if not repo_id:
+            self.logger.debug(f"No HuggingFace repo configured for {model_name}")
+            return None
+
+        try:
+            from huggingface_hub import hf_hub_download
+
+            self.logger.info(f"Auto-downloading model {model_name} from {repo_id}...")
+
+            # Ensure download directory exists
+            download_dir = PRIME_MODELS_DIR
+            download_dir.mkdir(parents=True, exist_ok=True)
+
+            # Download model
+            loop = asyncio.get_event_loop()
+            model_path = await loop.run_in_executor(
+                None,
+                lambda: hf_hub_download(
+                    repo_id=repo_id,
+                    filename=model_name,
+                    local_dir=str(download_dir),
+                    local_dir_use_symlinks=False,
+                )
+            )
+
+            self.logger.info(f"Downloaded model to: {model_path}")
+            return Path(model_path)
+
+        except ImportError:
+            self.logger.debug("huggingface_hub not installed, can't auto-download")
+            return None
+        except Exception as e:
+            self.logger.warning(f"Auto-download failed: {e}")
+            return None
 
     async def load_model(self, model_name: Optional[str] = None) -> bool:
-        """Load a Prime model."""
+        """
+        Load a Prime model with intelligent discovery.
+
+        Args:
+            model_name: Optional model name to load
+
+        Returns:
+            True if model loaded successfully
+        """
         if model_name is None:
             model_name = PRIME_DEFAULT_MODEL
 
-        model_path = PRIME_MODELS_DIR / model_name
+        # Try to discover the model
+        model_path = self._discover_model(model_name)
 
-        if not model_path.exists():
-            self.logger.warning(f"Model not found: {model_path}")
+        # If not found, try auto-download
+        if model_path is None and not self._discovery_attempted:
+            self._discovery_attempted = True
+            model_path = await self._auto_download_model(model_name)
+
+        if model_path is None:
+            # Only warn once to avoid log spam
+            if not PrimeLocalClient._warned_missing_model:
+                PrimeLocalClient._warned_missing_model = True
+                self.logger.warning(
+                    f"Model not found: {model_name}. "
+                    f"Searched: {[str(p) for p in self.MODEL_SEARCH_PATHS if p.exists()]}. "
+                    f"Set JARVIS_PRIME_AUTO_DOWNLOAD=true to enable auto-download, "
+                    f"or manually download a GGUF model to {PRIME_MODELS_DIR}"
+                )
             return False
 
         async with self._lock:
@@ -263,14 +450,19 @@ class PrimeLocalClient(ModelClient):
                 )
                 self._model_path = model_path
                 self._loaded = True
-                self.logger.info(f"Loaded Prime model: {model_name}")
+                self.logger.info(f"Loaded Prime model: {model_path.name}")
                 return True
 
             except ImportError:
-                self.logger.warning("llama-cpp-python not installed")
+                if not PrimeLocalClient._warned_missing_llama:
+                    PrimeLocalClient._warned_missing_llama = True
+                    self.logger.warning(
+                        "llama-cpp-python not installed. "
+                        "Install with: pip install llama-cpp-python"
+                    )
                 return False
             except Exception as e:
-                self.logger.error(f"Failed to load model: {e}")
+                self.logger.error(f"Failed to load model {model_path}: {e}")
                 return False
 
     async def generate(self, request: ModelRequest) -> ModelResponse:
