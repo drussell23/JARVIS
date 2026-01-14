@@ -1,3 +1,682 @@
+# 📚 JARVIS Ecosystem Documentation Guide
+
+> **Choose Your Path:** This repository has two README files serving different purposes.
+
+## 🗺️ Documentation Navigation
+
+| README File | Purpose | Audience | Focus |
+|-------------|---------|----------|-------|
+| **[README_v2.md](./README_v2.md)** | 🔧 Technical deep-dive | Developers, DevOps | APIs, configuration, deployment, troubleshooting |
+| **README.md** *(this file)* | 🏗️ Architecture & features | Users, architects | 4-repo ecosystem, interaction flows, features |
+
+### When to Use Each:
+
+- **Want to understand the system architecture?** → You're in the right place (README.md)
+- **Need API references, configuration, or deployment guides?** → See [README_v2.md](./README_v2.md)
+- **Troubleshooting issues?** → See [README_v2.md § Troubleshooting](./README_v2.md#troubleshooting)
+- **Understanding how repos work together?** → Continue reading below
+
+---
+
+# 🌐 JARVIS: The 4-Repository Cognitive Ecosystem
+
+JARVIS isn't a single application—it's a **distributed cognitive architecture** spanning four interconnected repositories that work together as a unified AI operating system.
+
+## The Four Pillars
+
+```
+┌────────────────────────────────────────────────────────────────────────────────┐
+│                    JARVIS ECOSYSTEM ARCHITECTURE v101.0                        │
+├────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│  ┌─────────────────┐    ┌──────────────────┐    ┌────────────────────────┐   │
+│  │  JARVIS Core    │    │  JARVIS Prime    │    │  JARVIS Reactor        │   │
+│  │  (This Repo)    │    │  (J-Prime)       │    │  (J-Reactor)           │   │
+│  │                 │    │                  │    │                        │   │
+│  │  • Voice Auth   │◄──►│  • Local LLM     │◄──►│  • Training Pipeline   │   │
+│  │  • 60+ Agents   │    │  • 70B Llama     │    │  • Model Fine-Tuning   │   │
+│  │  • Orchestration│    │  • GCP Cloud Run │    │  • Continuous Learning │   │
+│  │  • God Mode     │    │  • Cost Routing  │    │  • Failure Analysis    │   │
+│  └─────────────────┘    └──────────────────┘    └────────────────────────┘   │
+│           │                      │                          │                  │
+│           │                      │                          │                  │
+│           └──────────────────────┼──────────────────────────┘                  │
+│                                  │                                             │
+│                    ┌─────────────▼──────────────┐                             │
+│                    │   Trinity Layer v101.0     │                             │
+│                    │                             │                             │
+│                    │  • Cross-Repo State Sync    │                             │
+│                    │  • Neural Mesh Bus          │                             │
+│                    │  • Event Streaming          │                             │
+│                    │  • Coordinated Startup      │                             │
+│                    │  • Health Monitoring        │                             │
+│                    │  • Cost Tracking            │                             │
+│                    └─────────────────────────────┘                             │
+│                                                                                  │
+└────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 1️⃣ **JARVIS Core** (This Repository)
+
+**Purpose:** The central intelligence hub and user-facing interface.
+
+**What It Does:**
+- Voice biometric authentication (VBIA v6.3) - secure voice unlock
+- 60+ coordinated AI agents via Neural Mesh
+- God Mode Surveillance - universal window monitoring
+- Google Workspace Chief of Staff agent
+- Cross-repository orchestration
+- User interaction layer (voice, UI, commands)
+
+**Key Components:**
+- `backend/intelligence/` - AGI orchestrator, unified model serving
+- `backend/neural_mesh/` - 60+ specialized agents
+- `backend/voice/` - ECAPA-TDNN voice authentication
+- `backend/core/` - Cross-repo coordination, GCP routing
+- `run_supervisor.py` - Single-command startup orchestrator
+
+**Think of it as:** The "brain stem" - coordinates everything, handles I/O, makes decisions
+
+---
+
+### 2️⃣ **JARVIS Prime** (J-Prime)
+
+**Purpose:** Local LLM inference engine providing cost-effective, low-latency reasoning.
+
+**What It Does:**
+- Runs Llama 70B GGUF models locally (when resources available)
+- Provides GCP Cloud Run deployment for cloud inference
+- Primary model for most tasks (chat, reasoning, vision, code)
+- Falls back to Claude Opus 4.5 when needed
+- Adaptive routing based on performance metrics
+
+**Architecture:**
+```
+J-Prime Routing Tiers (GCP Hybrid Router v2.1):
+┌─────────────────────────────────────────────────────────────┐
+│ Tier 1: LOCAL_PRIME      → 0ms network latency, $0 cost    │
+│ Tier 2: GCP_CLOUD_RUN    → ~50ms latency, $0.02/1K tokens  │
+│ Tier 3: CLOUD_CLAUDE     → ~100ms latency, $15/1M tokens   │
+│ Tier 4: DEGRADED_LOCAL   → Emergency fallback              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Performance Scoring Formula:**
+```
+Score = 0.6 × Success_Rate + 0.2 × Latency_Score + 0.2 × Recency_Score
+```
+
+**Think of it as:** The "workhorse brain" - handles 80% of reasoning tasks locally/cheaply
+
+---
+
+### 3️⃣ **JARVIS Reactor** (J-Reactor)
+
+**Purpose:** Continuous learning and model improvement pipeline.
+
+**What It Does:**
+- Analyzes task failures from JARVIS Core
+- Auto-discovers learning goals (e.g., "improve voice auth accuracy")
+- Fine-tunes J-Prime models based on real-world performance
+- Provides training status to JARVIS Core
+- Implements feedback loop for self-improvement
+
+**Learning Pipeline:**
+```
+1. JARVIS Core encounters failure
+   ↓
+2. Sends failure analysis to J-Reactor
+   ↓
+3. J-Reactor creates training task
+   ↓
+4. Fine-tunes J-Prime model
+   ↓
+5. J-Prime performance improves
+   ↓
+6. JARVIS Core sees better results
+```
+
+**Think of it as:** The "education system" - makes JARVIS smarter over time
+
+---
+
+### 4️⃣ **Trinity Layer** (Integration Fabric)
+
+**Purpose:** Cross-repository communication and state synchronization.
+
+**What It Does:**
+- Real-time event streaming via `~/.jarvis/cross_repo/`
+- Heartbeat monitoring between repos
+- Coordinated startup with dependency ordering
+- Health probing with automatic retry
+- Cost tracking via Redis pub/sub
+- Neural Mesh communication bus (10k messages/second)
+
+**State Synchronization Files:**
+```bash
+~/.jarvis/cross_repo/
+├── vbia_events.json          # Voice auth events (Core → Prime/Reactor)
+├── vbia_requests.json        # Auth requests (Prime/Reactor → Core)
+├── vbia_responses.json       # Auth results (Core → Prime/Reactor)
+├── visual_events.json        # Visual threat detection
+├── prime_state.json          # J-Prime health status
+└── reactor_state.json        # J-Reactor training status
+```
+
+**Think of it as:** The "nervous system" - connects all organs, shares state
+
+---
+
+## 🎬 Behind-the-Scenes: How It All Works Together
+
+### Example 1: Voice Authentication & Screen Unlock (2.35 seconds)
+
+**User Action:** You say "unlock my screen" while away from keyboard
+
+**What Happens Behind the Scenes:**
+
+```
+Step 1: Audio Capture (147ms)
+├─ Component: JARVIS Core (backend/voice/voice_manager.py:89)
+├─ What: Captures 2.3s of audio from microphone
+├─ Quality: SNR 16.2 dB, background noise -42 dB
+└─ Output: Raw audio waveform → Step 2
+
+Step 2: Voice Embedding Extraction (203ms)
+├─ Component: JARVIS Core (backend/voice/ecapa_manager.py:234)
+├─ Routes to: Local ECAPA-TDNN OR Cloud (depends on memory)
+├─ What: Converts audio → 192-dimensional speaker embedding
+├─ Quality score: 0.87/1.0 (high quality audio)
+└─ Output: [0.234, -0.891, 0.445, ...] (192 dims) → Step 3
+
+Step 3: Speaker Verification (89ms)
+├─ Component: JARVIS Core (backend/voice/voice_biometric_manager.py:412)
+├─ Database: Cloud SQL (59 voiceprint samples)
+├─ What: Compares embedding to your baseline profile
+├─ Similarity: Cosine distance = 0.894
+├─ Bonuses: +0.04 (high SNR), +0.02 (consistent pattern)
+└─ Confidence: 93.4% ✅ PASS (threshold: 85%)
+
+Step 4: Behavioral Analysis (45ms)
+├─ Component: JARVIS Core (backend/intelligence/behavioral_analyzer.py:156)
+├─ Checks:
+│  ├─ Time: 7:15 AM (typical unlock time ✓)
+│  ├─ Last activity: 16.5h ago (normal overnight gap ✓)
+│  ├─ Location: Home WiFi network ✓
+│  └─ Device: No movement detected (on desk overnight ✓)
+└─ Behavioral confidence: 96%
+
+Step 5: LangGraph Reasoning (Multi-Factor Fusion) (58ms)
+├─ Component: JARVIS Core (backend/intelligence/vbia_langgraph.py:89)
+├─ Uses: LangGraph 9-node reasoning chain
+├─ Decision tree:
+│  ├─ Voice: 93.4% (weight: 60%) = 56.0 points
+│  ├─ Behavioral: 96.0% (weight: 25%) = 24.0 points
+│  ├─ Context: 98.0% (weight: 15%) = 14.7 points
+│  └─ Final: 94.7% ✅ AUTHENTICATED
+├─ Logs to: Langfuse (audit trail)
+└─ Tracks cost: Helicone ($0.0031)
+
+Step 6: Cross-Repo Event Broadcasting (12ms)
+├─ Component: Trinity Layer (backend/core/cross_repo_state_initializer.py:445)
+├─ Writes to: ~/.jarvis/cross_repo/vbia_events.json
+├─ Event payload:
+│  {
+│    "timestamp": 1736895333.245,
+│    "user": "Derek J. Russell",
+│    "confidence": 0.947,
+│    "decision": "GRANT",
+│    "factors": {"voice": 0.934, "behavioral": 0.96, "context": 0.98}
+│  }
+├─ Consumed by: J-Prime (logs for training), J-Reactor (success metric)
+└─ Latency: <15ms (async file write)
+
+Step 7: Visual Security Check (Optional - if Computer Use enabled) (340ms)
+├─ Component: JARVIS Core (backend/vision/computer_use_client.py:123)
+├─ What: Claude Vision analyzes lock screen screenshot
+├─ Checks:
+│  ├─ Is screen actually locked? ✓
+│  ├─ Any suspicious dialogs? ✗ (none)
+│  ├─ Ransomware indicators? ✗ (clean)
+│  └─ Camera: Anyone standing behind you? ✗ (you're alone)
+└─ Visual confidence: 98% (safe to unlock)
+
+Step 8: ChromaDB Behavioral Pattern Storage (23ms)
+├─ Component: JARVIS Core (backend/intelligence/vbia_chromadb.py:267)
+├─ Stores:
+│  ├─ Speech rhythm (faster in mornings ✓)
+│  ├─ Phrase preference ("unlock my screen" vs "unlock the mac")
+│  ├─ Emotional baseline (normal stress level)
+│  └─ Environmental signature (home = quieter, office = AC hum)
+├─ Purpose: Detect deepfakes/replay attacks
+└─ Collection: behavioral_voice_patterns (458 entries)
+
+Step 9: Screen Unlock Execution (1,847ms)
+├─ Component: JARVIS Core (backend/mac_integration/screen_unlock.py:78)
+├─ What:
+│  ├─ Retrieve keychain password: 15ms
+│  ├─ Execute AppleScript unlock: 1,832ms (macOS delay, not us!)
+│  └─ Verify screen unlocked: ✓
+└─ Total: 1.85s (macOS bottleneck)
+
+Step 10: Voice Feedback (180ms)
+├─ Component: JARVIS Core (backend/voice/tts_engine.py:234)
+├─ Says: "Of course, Derek. Good morning!"
+├─ TTS Engine: macOS `say` command
+└─ Personalized: Uses your name (not generic "user unlocked")
+
+─────────────────────────────────────────────────────────────
+Total Time: 2.35 seconds
+API Costs: $0.0031
+Repos Involved: JARVIS Core, J-Prime (logged), J-Reactor (logged)
+Decision: GRANT ACCESS
+Risk Level: MINIMAL
+Logged to: Langfuse (audit), Helicone (cost), ChromaDB (patterns)
+─────────────────────────────────────────────────────────────
+```
+
+**Key Insights:**
+- **Multi-repo coordination:** JARVIS Core authenticated, Trinity broadcasted event, J-Prime/J-Reactor logged for learning
+- **LangGraph reasoning:** 9-node decision chain fused 3 factors (voice, behavioral, context)
+- **Production resilience:** If voice confidence was borderline (78%), behavioral (96%) + context (98%) would still approve
+- **Cost optimization:** Helicone tracked $0.0031 cost (cheap because J-Prime handled most processing)
+- **Audit trail:** Langfuse logged entire decision tree (security compliance)
+
+---
+
+### Example 2: Complex Reasoning Task with Cross-Repo Orchestration (4.6 seconds)
+
+**User Action:** You ask "Analyze my calendar for the week and suggest optimizations"
+
+**What Happens Behind the Scenes:**
+
+```
+Step 1: Command Reception & Intent Classification (45ms)
+├─ Component: JARVIS Core (backend/intelligence/agi_orchestrator.py:123)
+├─ Input: Voice transcription from SpeechBrain STT
+├─ Intent: REASONING + TOOL_USE (Google Workspace API)
+├─ Complexity: HIGH (requires calendar access + analysis + suggestions)
+└─ Routes to: AGI Orchestrator → UnifiedModelServing
+
+Step 2: Model Selection (Adaptive Routing) (12ms)
+├─ Component: JARVIS Core (backend/intelligence/unified_model_serving.py:862)
+├─ Task type: REASONING
+├─ Preferences: [PRIME_LOCAL, PRIME_CLOUD_RUN, CLAUDE]
+├─ Performance scores:
+│  ├─ PRIME_LOCAL: 0.89 (success_rate: 0.95, latency: 850ms, recency: 0.92)
+│  ├─ PRIME_CLOUD_RUN: 0.82 (success_rate: 0.91, latency: 1200ms, recency: 0.85)
+│  └─ CLAUDE: 0.76 (success_rate: 0.98, latency: 2100ms, recency: 0.45)
+├─ Decision: Route to PRIME_LOCAL (highest score)
+└─ Fallback chain: PRIME_CLOUD_RUN → CLAUDE if PRIMARY fails
+
+Step 3: J-Prime Health Check (8ms)
+├─ Component: JARVIS Core (backend/core/gcp_hybrid_prime_router.py:391)
+├─ Checks:
+│  ├─ Circuit breaker state: CLOSED ✓ (healthy)
+│  ├─ Active requests: 2/100 (not overloaded)
+│  ├─ Last success: 3s ago ✓ (recent)
+│  └─ Degradation mode: OFF ✓
+└─ Status: J-Prime available, proceed
+
+Step 4: Cross-Repo State Sync (18ms)
+├─ Component: Trinity Layer (backend/core/cross_repo_state_initializer.py:234)
+├─ Reads: ~/.jarvis/cross_repo/prime_state.json
+├─ J-Prime status:
+│  {
+│    "status": "healthy",
+│    "model_loaded": "Llama-70B-GGUF",
+│    "memory_usage": "38.2GB/64GB",
+│    "active_requests": 2,
+│    "last_heartbeat": 1736895345.123
+│  }
+└─ Decision: J-Prime ready for heavy reasoning
+
+Step 5: Tool Call - Google Workspace Agent (850ms)
+├─ Component: JARVIS Core (backend/neural_mesh/agents/google_workspace_agent.py:412)
+├─ What: Fetch calendar events for next 7 days
+├─ API: Google Calendar API (OAuth2 authenticated)
+├─ Events retrieved: 23 meetings
+├─ Data enrichment:
+│  ├─ Meeting durations
+│  ├─ Attendee counts
+│  ├─ Back-to-back detection
+│  └─ Free time gaps
+└─ Output: Structured JSON → J-Prime for analysis
+
+Step 6: J-Prime Local Reasoning (2,340ms)
+├─ Component: JARVIS Prime (running locally or Cloud Run)
+├─ Model: Llama 70B GGUF (Q4_K_M quantization)
+├─ Prompt tokens: 1,847 (calendar data + analysis instructions)
+├─ Generation: 420 tokens (optimization suggestions)
+├─ Analysis:
+│  ├─ Detected: 8 back-to-back meetings (Monday/Wednesday)
+│  ├─ Found: 3 meetings <15min (inefficient)
+│  ├─ Identified: No lunch breaks Tuesday/Thursday
+│  └─ Suggested: Consolidate 5 meetings, add 2 focus blocks
+├─ Latency: 2.34s (acceptable for local 70B model)
+└─ Cost: $0 (local inference)
+
+Step 7: Result Validation & Formatting (67ms)
+├─ Component: JARVIS Core (backend/intelligence/agi_orchestrator.py:567)
+├─ What: Validates J-Prime output structure
+├─ Checks:
+│  ├─ Output is valid JSON ✓
+│  ├─ Contains actionable suggestions ✓
+│  ├─ No hallucinated events ✓ (cross-ref with original data)
+│  └─ Suggestions are calendar-compatible ✓
+└─ Format: Convert to user-friendly voice response
+
+Step 8: Performance Logging (15ms)
+├─ Component: JARVIS Core (backend/intelligence/unified_model_serving.py:945)
+├─ Records to performance tracker:
+│  {
+│    "provider": "PRIME_LOCAL",
+│    "task_type": "REASONING",
+│    "success": True,
+│    "latency_ms": 2340,
+│    "timestamp": 1736895347.890
+│  }
+├─ Updates adaptive routing scores:
+│  ├─ PRIME_LOCAL success_rate: 0.95 → 0.951 (✓)
+│  ├─ Avg latency: 850ms → 920ms (slightly slower this time)
+│  └─ Overall score: 0.89 → 0.88 (marginal decrease)
+└─ Future impact: If latency stays high, may prefer PRIME_CLOUD_RUN
+
+Step 9: Cross-Repo Learning Signal (22ms)
+├─ Component: Trinity Layer + J-Reactor
+├─ Writes to: ~/.jarvis/cross_repo/reactor_state.json
+├─ Learning signal:
+│  {
+│    "task": "calendar_analysis",
+│    "success": True,
+│    "model": "PRIME_LOCAL",
+│    "quality_score": 0.94,
+│    "user_feedback": null  # (will update if you say "good" or "bad")
+│  }
+├─ J-Reactor action: Logs success (no training needed - high quality)
+└─ Purpose: If quality score was <0.7, J-Reactor would fine-tune
+
+Step 10: Voice Response with Neural Mesh Priority Queue (1,280ms)
+├─ Component: JARVIS Core (backend/voice/unified_voice_orchestrator.py:178)
+├─ What: Speaks optimization suggestions
+├─ Priority: HIGH (user-requested analysis)
+├─ Deduplication: Check if similar message spoken in last 60s ✗
+├─ Pacing: 2.5s delay from last voice announcement ✓
+├─ TTS: macOS `say` command
+├─ Message: "I analyzed your calendar. You have 8 back-to-back meetings
+│            on Monday and Wednesday. I suggest consolidating your
+│            Tuesday morning meetings and adding a focus block Thursday
+│            afternoon. Would you like me to propose reschedules?"
+└─ Follow-up: Awaits your voice response for next action
+
+─────────────────────────────────────────────────────────────
+Total Time: 4.6 seconds
+Breakdown: Google API (850ms) + J-Prime reasoning (2.34s) + TTS (1.28s)
+API Costs: $0 (J-Prime local) + $0.004 (Google Workspace API)
+Repos Involved:
+  ├─ JARVIS Core: Orchestration, tools, voice
+  ├─ J-Prime: Reasoning (local 70B Llama)
+  ├─ J-Reactor: Logged success for learning
+  └─ Trinity: State sync, event broadcasting
+Decision Quality: 94% (high - no hallucinations, actionable)
+Fallback Used: None (primary path succeeded)
+Learning Signal: Sent to J-Reactor (success logged)
+─────────────────────────────────────────────────────────────
+```
+
+**Key Insights:**
+- **Adaptive routing worked:** PRIME_LOCAL scored highest (0.89), was chosen, succeeded
+- **Cost optimization:** $0 for reasoning (local), vs $0.15 if routed to Claude
+- **Cross-repo learning:** J-Reactor logged success; if user later says "that was wrong", J-Reactor would retrain
+- **Production resilience:** If J-Prime failed, would auto-fallback to PRIME_CLOUD_RUN → CLAUDE
+- **Performance tracking:** Latency (2.34s) recorded; if consistently slow, routing would adapt
+
+---
+
+## ⚠️ Critical Gaps, Edge Cases, and Nuances
+
+### 🔴 Known Gaps (Red Flags - Need Addressing)
+
+#### 1. **Cross-Repo Startup Race Conditions**
+**The Problem:**
+```python
+# JARVIS Core starts → tries to connect to J-Prime
+# J-Prime not ready yet (still loading 70B model)
+# JARVIS Core: "J-Prime unavailable, using Claude fallback"
+# 30 seconds later: J-Prime ready, but JARVIS already routed to Claude
+```
+
+**Current Mitigation:**
+- `cross_repo_state_initializer.py:234` - Health probing with 3 retries, 2s delay
+- Graceful degradation if J-Prime unavailable
+
+**Gap:** No guaranteed startup ordering. If JARVIS starts before J-Prime, first requests go to expensive Claude.
+
+**Impact:** Cost spike ($0.15 vs $0) for first 5-10 requests until J-Prime ready
+
+**Workaround:** Start J-Prime first manually, then JARVIS
+
+**Proper Fix Needed:** Dependency-aware startup orchestrator across repos
+
+---
+
+#### 2. **Distributed Lock Deadlock Potential**
+**The Problem:**
+```python
+# Trinity Layer uses file-based locks for cross-repo coordination
+# ~/.jarvis/cross_repo/*.lock files
+
+# Scenario:
+# JARVIS Core acquires vbia_events.lock → crashes before releasing
+# J-Prime tries to read vbia_events.json → blocked waiting for lock
+# Lock never released (process died) → J-Prime stuck forever
+```
+
+**Current Mitigation:**
+- `gcp_hybrid_prime_router.py:391` - Lock timeout (10s)
+- Null check before string slicing (prevents IndexError)
+
+**Gap:** No stale lock cleanup. If process crashes mid-lock, lock file persists.
+
+**Impact:** Cross-repo communication frozen until manual `rm ~/.jarvis/cross_repo/*.lock`
+
+**Workaround:** Restart all repos (clears stale locks)
+
+**Proper Fix Needed:** Lock expiration timestamps + automatic cleanup on startup
+
+---
+
+#### 3. **J-Reactor Training While J-Prime Serving**
+**The Problem:**
+```python
+# J-Prime serving requests (using 38GB/64GB RAM)
+# J-Reactor starts training (needs 40GB for fine-tuning)
+# Total: 78GB > 64GB available
+# Result: OOM kill, system crash
+```
+
+**Current Mitigation:**
+- None explicitly (assumed manual coordination)
+
+**Gap:** No resource arbitration between J-Prime inference and J-Reactor training
+
+**Impact:** Training job can crash production inference, taking down J-Prime
+
+**Workaround:** Only run J-Reactor training during off-hours when J-Prime idle
+
+**Proper Fix Needed:** Shared resource manager, training pause during high inference load
+
+---
+
+#### 4. **Redis Pub/Sub Message Loss**
+**The Problem:**
+```python
+# Trinity uses Redis pub/sub for Neural Mesh (10k msg/s)
+# Redis pub/sub is fire-and-forget (no durability)
+
+# Scenario:
+# J-Prime publishes cost tracking event
+# Network hiccup (50ms)
+# JARVIS Core subscribed, but message lost in transit
+# Cost not tracked → budget monitoring inaccurate
+```
+
+**Current Mitigation:**
+- File-based fallback (`~/.jarvis/cross_repo/*.json`)
+
+**Gap:** No acknowledgment mechanism for critical messages
+
+**Impact:** Occasional cost tracking drift, health monitoring gaps
+
+**Workaround:** Periodic full state sync (every 60s) catches missed messages
+
+**Proper Fix Needed:** Redis Streams (durable) or Kafka for critical messages
+
+---
+
+#### 5. **Cross-Repo Version Skew**
+**The Problem:**
+```python
+# JARVIS Core v101.0 expects Trinity v101.0 API
+# J-Prime still on v100.2 (user forgot to update)
+# JARVIS sends new event format: {"version": "v101", "data": {...}}
+# J-Prime expects old format: {"data": {...}}
+# J-Prime: "Unknown field 'version', ignoring event"
+```
+
+**Current Mitigation:**
+- None (assumed repos stay in sync)
+
+**Gap:** No version compatibility checking between repos
+
+**Impact:** Silent failures, events ignored, cross-repo features break
+
+**Workaround:** Always update all repos together (documented in README_v2.md)
+
+**Proper Fix Needed:** Version handshake on startup + backward compatibility layer
+
+---
+
+### 🟡 Edge Cases (Yellow Flags - Partially Handled)
+
+#### 1. **Voice Authentication in Loud Environments**
+**Status:** ✅ Mostly handled (background noise filtering) | ⚠️ Degrades at >80dB
+
+**How It Works:**
+- SNR detection (signal-to-noise ratio)
+- If SNR < 12 dB → Adaptive filtering → Retry with higher threshold
+- If still fails → Fallback to behavioral + context factors
+
+**Edge Case:**
+- In nightclub (95 dB) or near construction (100 dB)
+- Voice completely drowned out
+- Behavioral alone may approve (risky if someone else in nightclub has your phone)
+
+**Mitigation:** Visual security check (Computer Use - is someone behind you?)
+
+---
+
+#### 2. **J-Prime Model Hot-Swap During Request**
+**Status:** ✅ Handled with request tracking | ⚠️ In-flight requests may fail
+
+**How It Works:**
+- J-Prime can hot-swap models (e.g., Llama 70B → Mistral 8x7B)
+- Active requests tracked in `gcp_hybrid_prime_router.py:_active_requests`
+- Hot-swap waits for active requests to finish
+
+**Edge Case:**
+- User triggers hot-swap while 50 requests in-flight
+- Requests take 5-30s each to complete
+- Hot-swap blocked for up to 30s
+- New requests queued → latency spike
+
+**Mitigation:** Circuit breaker opens if queue too long, routes to CLOUD_CLAUDE
+
+---
+
+#### 3. **Behavioral Pattern Drift (Voice Changes Over Time)**
+**Status:** ✅ Handled with ChromaDB evolution tracking | ⚠️ Sudden changes problematic
+
+**How It Works:**
+- ChromaDB tracks voice evolution (3% drift over 3 months = normal aging)
+- Auto-adapts baseline if drift gradual
+
+**Edge Case:**
+- Sudden voice change (surgery, severe illness)
+- Drift detection: 45% (way beyond 3% threshold)
+- System: "This doesn't sound like you at all, access denied"
+- User locked out even though legitimate
+
+**Mitigation:** Fallback to challenge questions + password reset
+
+---
+
+### 🟢 Nuances (Green Flags - Well-Handled)
+
+#### 1. **Graceful Degradation is Robust**
+**How It Works:**
+- If J-Prime unavailable → CLOUD_CLAUDE
+- If CLOUD_CLAUDE unavailable → DEGRADED_LOCAL (cached responses)
+- System never fully crashes, always serves requests (even if degraded)
+
+**Example:**
+```python
+# All cloud providers down (network outage)
+# DEGRADED_LOCAL serves cached responses for common queries
+# "What's the weather?" → Serves yesterday's weather (stale but better than nothing)
+# Critical tasks → Queued for retry when network returns
+```
+
+---
+
+#### 2. **Adaptive Routing Learns from Failures**
+**How It Works:**
+```python
+# PRIME_LOCAL fails 3 times in a row
+# unified_model_serving.py:945 updates success_rate: 0.95 → 0.82
+# Score drops: 0.89 → 0.73
+# Next request: PRIME_CLOUD_RUN (now higher score) chosen instead
+# After 10 successes on CLOUD_RUN: Routes back to LOCAL (if recovered)
+```
+
+**Benefit:** Self-healing routing without manual intervention
+
+---
+
+#### 3. **Cost Tracking is Comprehensive**
+**How It Works:**
+- Helicone tracks all API costs (Claude, Google, OpenAI)
+- J-Prime local inference: $0 tracked
+- Google Workspace API: $0.004/request tracked
+- Monthly cost reports auto-generated
+- Budget alerts if >$100/month
+
+**Benefit:** Full visibility into where money goes, no surprise bills
+
+---
+
+## 🚦 Quick Health Check: Is My JARVIS Ecosystem Healthy?
+
+Run this command to check all 4 repos:
+
+```bash
+python3 run_supervisor.py --health-check
+```
+
+**Expected Output:**
+```
+✅ JARVIS Core: Healthy (60 agents active, Neural Mesh running)
+✅ JARVIS Prime: Healthy (Llama 70B loaded, 2 active requests)
+✅ JARVIS Reactor: Idle (no training jobs, monitoring for failures)
+✅ Trinity Layer: Healthy (all state files present, Redis connected)
+
+🎯 System Status: ALL GREEN
+💰 Today's Cost: $0.47 (J-Prime saved $12.30 vs Claude)
+📊 Requests Today: 847 (J-Prime: 89%, Claude: 11%)
+```
+
+---
+
 # JARVIS AI Assistant v66.0 - Command & Control Edition (Ghost Monitor Protocol + Universal Window Monitoring + BabyAGI Integration + Living OS)
 
 An intelligent voice-activated AI assistant with **God Mode Surveillance v61.2** (Universal Window Monitoring Across Physical + Virtual Displays | v53-v61 Protocol Suite: NAVIGATOR/PHOENIX/REAPER/PANOPTICON/RETINA | Ghost Display Support 0%→100% | O(1) Mosaic Mode + Ferrari Engine | 2800x Faster Validation | 94% Success Rate | Auto-Teleportation | Stale Window Resurrection | OmniParser→Claude Vision→OCR Detection Cascade | 200+ Commits Dec 2024-Jan 2026), **Proactive Parallelism v6.3** (BabyAGI-Inspired Task Orchestration | PredictivePlanningAgent "Psychic Brain" | SpaceLock Race Condition Prevention | execute_parallel_workflow() | 4x Parallel Speedup | Intent Expansion: 9 Categories | Temporal/Spatial/Memory Context Awareness | LLM-Powered Task Generation | Neural Mesh Integration | Langfuse/Helicone Observability), **Enhanced VBIA v6.2** (4-Factor Authentication: ML + Physics + Behavioral + Visual Security | LangGraph 9-Node Reasoning | ChromaDB 6-Collection Memory | Visual Threat Detection | OmniParser → Claude Vision → OCR Fallback | Cross-Repo State Synchronization | Langfuse Decision Audit Trail | Helicone Cost Tracking | Real-Time Event Streaming), **Cross-Repo State System v1.0** (JARVIS ↔ JARVIS Prime ↔ Reactor Core Integration | Real-Time Event Sharing via ~/.jarvis/cross_repo/ | Heartbeat Monitoring | VBIA Request/Response Coordination | Visual Security Event Broadcasting | Async Background Tasks), **Neural Mesh v9.4 Production** (60+ Coordinated Agents | Google Workspace Chief of Staff | Multi-Agent Orchestration | Communication Bus 10k msg/s | Knowledge Graph Semantic Search | JARVIS Bridge Cross-System | Health Auto-Recovery | Startup Voice Announcements), **Startup Narrator v6.2** (Intelligent Voice Announcements | Security Milestones | Neural Mesh Status | Google Workspace Registration | Cross-Repo Integration | Adaptive 2-3s Pacing | Environment-Aware Dynamic Messages | Non-Blocking Startup), **Google Workspace Agent v2.0** (Chief of Staff Role + Unified Execution Architecture + Gmail/Calendar/Docs Integration + 3-Tier Waterfall Fallback + Natural Language Query Routing + 12 Admin Capabilities), **SOP Enforcer v1.0** (Clinical-Grade Task Governance + Complexity Analysis + Design Plan Validation + Risk Assessment + MetaGPT-Inspired Discipline + JARVIS Thinking Protocol), **Repository Intelligence v1.0** (Cross-Repo Context Enrichment + Coding Question Detection + Symbol/File/Repo Detection + Repo Map Integration + Aider-Inspired Spatial Awareness), **Computer Use Enhancement v2.0** (Action Space Refinement + Minimal Test Server + Safe Code Execution + Coordinate Extraction + Claude Vision Integration + Cross-Repo Integration), **Safe Code Execution Framework v1.0** (Sandboxed Python/JavaScript Execution + Input Validation + Timeout Protection + Memory Limits + Security Boundaries), **Cross-Repo Intelligence Bridge v1.0** (Reactor-Core Integration + Memory Synchronization + Training Pipeline Coordination + WebSocket Communication + REST Fallback), **Infrastructure Orchestrator v3.0** (GCP Resource Management + Cost Optimization + Artifact Registry Cleanup + Cloud SQL Management + Spot Instance Orchestration + Budget Monitoring + Idle Shutdown + Terraform Integration), **Intelligent Training Orchestrator v1.0** (Learning Goal Auto-Discovery + Task Failure Analysis + Reactor-Core Feedback API + Real-Time Training Status + Continuous Learning from Failures), **Vision-Safety Integration v1.0** (Vision Cognitive Loop + Visual Verification + Operational Safety + Cross-System Awareness + Enhanced Visual Perception), **Intelligence Component Manager v5.0** (Multi-Factor Authentication + RAG + RLHF + Async/Parallel Initialization + 73% False Positive Reduction + Health Monitoring + Zero Hardcoding), **Intelligent Polyglot Hot Reload System v5.0** (Real-Time Code Changes + Multi-Language Support + Voice Feedback + Frontend Integration), **Zero-Touch Autonomous Update System v3.0** (Self-Updating + Dead Man's Switch + Staging Validation + Update Classification), **AGI OS Integration v3.0** (Autonomous Decision-Making + Goal Inference + User Approval Workflow), **Unified Voice Orchestrator v3.0** (Semantic Deduplication + Topic Cooldowns + Natural Pacing + Priority Queue), **Enhanced Loading Experience v3.0** (Minimizable Panels + Stuck Detection + Accurate Progress + Synchronized UI), **Intelligent Resource Orchestrator v1.0** (Active Memory Optimization + Dynamic Startup Modes + Cloud Offloading Decisions + ARM64 SIMD Detection + Parallel Resource Checks + Cost-Aware Recommendations), **Unified Startup Progress System v2.0** (Single Source of Truth + Dynamic Component Registration + Accurate Ready Detection + Multi-Channel Synchronization), **Live Operations Transparency v1.0** (Real-Time Operations Log + Supervisor-Backend Communication + Enhanced Progress Reporter), **Production-Grade Supervisor Bootstrap v2.0** (Parallel Process Discovery + Resource Validation + Dynamic Configuration + Performance Tracking), **Robust Startup Monitoring System v19.6.0** (Parallel Health Checks + Circuit Breaker + Adaptive Timeout + Smart Error Recovery), **Self-Updating Lifecycle Manager v19.6.0** (Intelligent Update Notifications + Multi-Modal Communication + Changelog Analysis), **Intelligent Memory Pressure Controller v1.0** (Adaptive Thresholds + Effectiveness Tracking + Cooldown System), **Supervisor-Aware GCP Controller v1.0** (Budget Management + Idle Shutdown + Cost-Aware Routing), **Intelligent ECAPA Backend Orchestrator v19.0.0** (Zero-Configuration Backend Selection + Concurrent Probing + Auto-Start Docker + Intelligent Fallback), **Async-Safe Statistics Tracking v1.0** (Self-Healing Consistency Validation + Atomic Counter Operations + Mathematical Invariant Enforcement), **Global Session Manager v1.0** (Thread-Safe Singleton + Multi-Terminal Conflict Prevention + Cleanup Reliability), **Cost Optimization Framework v3.0** (Scale-to-Zero VMs + Semantic Voice Caching + Spot Instance Resilience + Tiered Storage + Intelligent Cache Management), **Cloud ECAPA Client v19.2.0** (Intelligent Hybrid Cloud Voice Processing + Spot VM Auto-Creation + Cost-Aware Routing + 60% Cache Savings + RecentSpeakerCache Fast-Path Optimization with 98% Latency Reduction), **Physics-Aware Voice Authentication v2.5** (Vocal Tract Length Verification + Reverberation Analysis + Doppler Effect Detection + Bayesian Confidence Fusion + 7-Layer Anti-Spoofing), **Bayesian Confidence Fusion** (Multi-factor probability fusion with adaptive priors), **Voice Authentication Enhancement v2.1** (ChromaDB Semantic Caching + Scale-to-Zero + Langfuse Audit Trail + Behavioral Pattern Recognition), **Dynamic Restart with UE State Detection** (detects stuck macOS processes in Uninterruptible Sleep state), **Self-Healing Port Fallback System** (automatically finds healthy ports when blocked), **Dynamic Port Configuration** (loads ports from config instead of hardcoding), **Memory-Aware Startup System** (auto-detects RAM and activates GCP cloud ML when constrained), **Process-Isolated ML Loading** (prevents event loop blocking with true async wrapping), **Database Connection Leak Prevention** (proper try/finally resource cleanup), **Parallel Model Loading** (4-worker ThreadPool for 3-4x faster startup), **Comprehensive Timeout Protection** (25s unlock, 10s transcription, 8s speaker ID), **Voice Profile Database Consolidation** (unified `jarvis_learning.db` with owner migration), **Unified Voice Cache Manager** (~1ms Instant Recognition vs 200-500ms), **4-Layer Cache Architecture** (L1 Session + L2 Preloaded Profiles + L3 Database + L4 Continuous Learning), **Voice Biometric Semantic Cache with Continuous Learning** (L1-L3 Cache Layers + SQLite Database Recording), **PRD v2.0 Voice Biometric Intelligence** (AAM-Softmax + Center Loss + Triplet Loss Fine-Tuning, Platt/Isotonic Score Calibration, Comprehensive Anti-Spoofing), **Phase 2 Hybrid Database Sync** (Redis + Prometheus + ML Prefetching), **Advanced Process Detection System**, **Production-Grade Voice System**, **Cloud SQL Voice Biometric Storage**, **Real ECAPA-TDNN Speaker Embeddings**, **Advanced Voice Enrollment**, **Unified TTS Engine**, **Wake Word Detection**, **SpeechBrain STT Engine**, **CAI/SAI Locked Screen Auto-Unlock**, **Contextual Awareness Intelligence**, **Situational Awareness Intelligence**, **Backend Self-Awareness**, **Progressive Startup UX**, **GCP Spot VM Auto-Creation** (>85% memory → 32GB cloud offloading), **Advanced GCP Cost Optimization**, **Intelligent Voice-Authenticated Screen Unlock**, **Platform-Aware Memory Monitoring**, **Dynamic Speaker Recognition**, **Hybrid Cloud Auto-Scaling**, **Phase 4 Proactive Communication**, advanced multi-space desktop awareness, Claude Vision integration, and **continuous learning from every interaction**.

@@ -1,5 +1,5 @@
 """
-Cross-Repo State Initialization for JARVIS Enhanced VBIA v6.2
+Cross-Repo State Initialization for JARVIS Enhanced VBIA v6.4
 =================================================================
 
 Centralized state initialization module that sets up the cross-repository
@@ -23,6 +23,9 @@ Features:
 - v6.3: Health probing for external repos (JARVIS-Prime, Reactor-Core)
 - v6.3: Timeout handling with graceful degradation
 - v6.3: Cross-repo connection validation
+- v6.4: Distributed lock manager with automatic expiration
+- v6.4: Stale lock detection and cleanup
+- v6.4: Deadlock prevention with TTL-based locks
 
 Architecture:
     ┌──────────────────────────────────────────────────────────┐
@@ -33,11 +36,15 @@ Architecture:
     │  ├── vbia_state.json        (JARVIS state broadcast)    │
     │  ├── prime_state.json       (JARVIS Prime status)       │
     │  ├── reactor_state.json     (Reactor Core status)       │
-    │  └── heartbeat.json         (Cross-repo health)         │
+    │  ├── heartbeat.json         (Cross-repo health)         │
+    │  └── locks/                 (Distributed lock files)    │
+    │      ├── vbia_events.lock   (Lock with TTL metadata)    │
+    │      ├── prime_state.lock                               │
+    │      └── reactor_state.lock                             │
     └──────────────────────────────────────────────────────────┘
 
 Author: JARVIS AI System
-Version: 6.3.0
+Version: 6.4.0
 """
 
 from __future__ import annotations
@@ -57,6 +64,9 @@ from uuid import uuid4
 
 import aiofiles
 import aiofiles.os
+
+# v6.4: Import distributed lock manager for cross-process locking
+from backend.core.distributed_lock_manager import get_lock_manager, DistributedLockManager
 
 logger = logging.getLogger(__name__)
 
@@ -324,11 +334,10 @@ class CrossRepoStateInitializer:
             "heartbeat": self.config.base_dir / "heartbeat.json",
         }
 
-        # File locks for atomic read-modify-write operations (one per file)
-        # This prevents race conditions when multiple coroutines write to the same file
-        self._file_locks: Dict[str, asyncio.Lock] = {
-            key: asyncio.Lock() for key in self._state_files.keys()
-        }
+        # v6.4: Use distributed lock manager for cross-process locking
+        # Replaces in-memory asyncio.Lock with file-based locks that work across processes
+        # Prevents deadlock scenarios where crashed processes leave locks hanging
+        self._lock_manager: Optional[DistributedLockManager] = None
 
         # Background tasks
         self._heartbeat_task: Optional[asyncio.Task] = None
@@ -361,6 +370,10 @@ class CrossRepoStateInitializer:
 
         try:
             logger.info("[CrossRepoState] Starting initialization...")
+
+            # v6.4: Initialize distributed lock manager
+            self._lock_manager = await get_lock_manager()
+            logger.info("[CrossRepoState] Distributed lock manager initialized")
 
             # Create directory structure
             await self._create_directory_structure()
@@ -530,8 +543,12 @@ class CrossRepoStateInitializer:
         try:
             events_file = self._state_files["vbia_events"]
 
-            # Acquire lock for atomic read-modify-write
-            async with self._file_locks["vbia_events"]:
+            # v6.4: Acquire distributed lock for atomic read-modify-write
+            # This lock works across processes (not just coroutines)
+            async with self._lock_manager.acquire("vbia_events", timeout=5.0, ttl=10.0) as acquired:
+                if not acquired:
+                    logger.warning("Could not acquire vbia_events lock, skipping emit")
+                    return
                 # Read existing events
                 events = await self._read_json_file(events_file, default=[])
 
@@ -598,7 +615,11 @@ class CrossRepoStateInitializer:
     async def _write_jarvis_state(self) -> None:
         """Write JARVIS state to vbia_state.json (thread-safe)."""
         state_file = self._state_files["vbia_state"]
-        async with self._file_locks["vbia_state"]:
+        # v6.4: Use distributed lock
+        async with self._lock_manager.acquire("vbia_state", timeout=5.0, ttl=10.0) as acquired:
+            if not acquired:
+                logger.warning("Could not acquire vbia_state lock")
+                return
             self._jarvis_state.last_update = datetime.now().isoformat()
             await self._write_json_file(state_file, asdict(self._jarvis_state))
 
@@ -654,10 +675,14 @@ class CrossRepoStateInitializer:
 
         while self._running:
             try:
-                # Update heartbeat file with lock for atomic read-modify-write
+                # v6.4: Update heartbeat file with distributed lock for atomic read-modify-write
                 heartbeat_file = self._state_files["heartbeat"]
 
-                async with self._file_locks["heartbeat"]:
+                async with self._lock_manager.acquire("heartbeat", timeout=5.0, ttl=10.0) as acquired:
+                    if not acquired:
+                        logger.debug("Could not acquire heartbeat lock, skipping update")
+                        continue
+
                     heartbeats = await self._read_json_file(heartbeat_file, default={})
 
                     heartbeats["jarvis"] = asdict(Heartbeat(
@@ -975,7 +1000,11 @@ class CrossRepoStateInitializer:
     async def _update_prime_state(self, status: StateStatus) -> None:
         """Update JARVIS Prime state file."""
         prime_file = self._state_files["prime_state"]
-        async with self._file_locks["prime_state"]:
+        # v6.4: Use distributed lock
+        async with self._lock_manager.acquire("prime_state", timeout=5.0, ttl=10.0) as acquired:
+            if not acquired:
+                logger.warning("Could not acquire prime_state lock")
+                return
             prime_state = await self._read_json_file(prime_file, default={})
             prime_state["status"] = status.value
             prime_state["last_update"] = datetime.now().isoformat()
@@ -984,7 +1013,11 @@ class CrossRepoStateInitializer:
     async def _update_reactor_state(self, status: StateStatus) -> None:
         """Update Reactor Core state file."""
         reactor_file = self._state_files["reactor_state"]
-        async with self._file_locks["reactor_state"]:
+        # v6.4: Use distributed lock
+        async with self._lock_manager.acquire("reactor_state", timeout=5.0, ttl=10.0) as acquired:
+            if not acquired:
+                logger.warning("Could not acquire reactor_state lock")
+                return
             reactor_state = await self._read_json_file(reactor_file, default={})
             reactor_state["status"] = status.value
             reactor_state["last_update"] = datetime.now().isoformat()

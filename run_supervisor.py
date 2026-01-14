@@ -3857,6 +3857,22 @@ class SupervisorBootstrapper:
         self._gcp_hybrid_router = None
         self._gcp_hybrid_router_enabled = os.getenv("GCP_HYBRID_ROUTER_ENABLED", "true").lower() == "true"
 
+        # v102.0: Trinity Integration Coordinator (Advanced Cross-Repo Orchestration)
+        # - Causal event delivery with vector clocks
+        # - Distributed locking for model hot-swap
+        # - Health monitoring with auto-recovery
+        # - Experience validation and schema enforcement
+        # - Directory lifecycle management
+        self._trinity_integration_coordinator = None
+        self._trinity_integration_coordinator_enabled = os.getenv("TRINITY_INTEGRATION_COORDINATOR_ENABLED", "true").lower() == "true"
+
+        # v102.0: Reactor Core Bridge (Training Pipeline Integration)
+        # - MODEL_READY event publishing from Reactor Core
+        # - Experience batch receiving and validation
+        # - Training pipeline lifecycle hooks
+        self._reactor_core_bridge = None
+        self._reactor_core_bridge_enabled = os.getenv("REACTOR_CORE_BRIDGE_ENABLED", "true").lower() == "true"
+
         # v85.0: Unified State Coordination - Atomic locks with process cookies
         # - Prevents race conditions between run_supervisor.py and start_system.py
         # - Uses fcntl locks with TTL-based expiration
@@ -11992,6 +12008,14 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
             self._trinity_knowledge_indexer = None
 
         # =====================================================================
+        # PHASE 0: Initialize Trinity Directory Lifecycle (v102.0) - MUST BE FIRST
+        # Creates all required directories for cross-repo communication BEFORE
+        # any component tries to use them.
+        # =====================================================================
+        if self._trinity_integration_coordinator_enabled:
+            await self._initialize_directory_lifecycle()
+
+        # =====================================================================
         # PHASE 2: Start ServiceRegistry for cross-repo health monitoring
         # =====================================================================
         try:
@@ -12555,6 +12579,204 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
         except Exception as e:
             self.logger.error(f"[v101.0] ❌ Hybrid Router initialization failed: {e}")
             print(f"  {TerminalUI.RED}✗ Hybrid Router: Failed - {e}{TerminalUI.RESET}")
+
+        # =====================================================================
+        # PHASE 16: Initialize Trinity Integration Coordinator (v102.0)
+        # Advanced cross-repo orchestration with causal event delivery
+        # =====================================================================
+        if self._trinity_integration_coordinator_enabled:
+            await self._initialize_trinity_integration_coordinator()
+
+        # =====================================================================
+        # PHASE 17: Initialize Reactor Core Bridge (v102.0)
+        # Training pipeline integration for MODEL_READY events
+        # =====================================================================
+        if self._reactor_core_bridge_enabled:
+            await self._initialize_reactor_core_bridge()
+
+    async def _initialize_directory_lifecycle(self) -> None:
+        """
+        v102.0: Initialize Trinity Directory Lifecycle - MUST BE FIRST.
+
+        Creates all required directories for cross-repo IPC:
+        - ~/.jarvis/trinity/events/ (JARVIS → Reactor Core events)
+        - ~/.jarvis/trinity/state/ (Shared state)
+        - ~/.jarvis/trinity/models/ (Model artifacts)
+        - ~/.jarvis/reactor/events/ (Reactor Core → JARVIS events)
+        - ~/.jarvis/cross_repo/ (Cross-repo coordination)
+
+        This MUST run before any other component tries to use these directories.
+        """
+        self.logger.info("=" * 60)
+        self.logger.info("[v102.0] Initializing Trinity Directory Lifecycle")
+        self.logger.info("=" * 60)
+
+        print(f"  {TerminalUI.CYAN}📁 Directory Lifecycle: Creating cross-repo directories...{TerminalUI.RESET}")
+
+        try:
+            from backend.core.trinity.integration_coordinator import DirectoryLifecycleManager
+
+            directory_manager = DirectoryLifecycleManager()
+            success, errors = await directory_manager.initialize()
+
+            if success:
+                print(f"  {TerminalUI.GREEN}✅ Directory Lifecycle: All directories created{TerminalUI.RESET}")
+                self.logger.info("[v102.0] ✅ Directory Lifecycle: All directories initialized")
+
+                # Cleanup old files
+                removed = await directory_manager.cleanup_old_files()
+                if removed > 0:
+                    self.logger.info(f"[v102.0] Cleaned up {removed} old event files")
+            else:
+                print(f"  {TerminalUI.YELLOW}⚠️ Directory Lifecycle: Partial initialization{TerminalUI.RESET}")
+                for error in errors:
+                    self.logger.warning(f"[v102.0] Directory error: {error}")
+
+        except ImportError as e:
+            self.logger.warning(f"[v102.0] ⚠️ Directory Lifecycle import failed: {e}")
+            print(f"  {TerminalUI.YELLOW}⚠️ Directory Lifecycle: Not available{TerminalUI.RESET}")
+        except Exception as e:
+            self.logger.error(f"[v102.0] ❌ Directory Lifecycle initialization failed: {e}")
+            print(f"  {TerminalUI.RED}✗ Directory Lifecycle: Failed - {e}{TerminalUI.RESET}")
+
+    async def _initialize_trinity_integration_coordinator(self) -> None:
+        """
+        v102.0: Initialize Trinity Integration Coordinator - Advanced Cross-Repo Orchestration.
+
+        This is the central coordinator for all cross-repo communication with:
+        1. Causal event delivery with vector clocks
+        2. Distributed locking for model hot-swap operations
+        3. Health monitoring with auto-recovery
+        4. Experience validation and schema enforcement
+        5. Event sequencing with gap detection
+
+        Architecture:
+            JARVIS ←──────────────────────────────────────────────→ Reactor Core
+                    │   TrinityIntegrationCoordinator           │
+                    │   ├── EventSequencer (sequence + gaps)    │
+                    │   ├── CausalDelivery (ordering)           │
+                    │   ├── HealthMonitor (auto-recovery)       │
+                    │   ├── HotSwapManager (model swap)         │
+                    │   └── ExperienceValidator (validation)    │
+                    ←──────────────────────────────────────────────→
+        """
+        self.logger.info("=" * 60)
+        self.logger.info("[v102.0] Initializing Trinity Integration Coordinator")
+        self.logger.info("=" * 60)
+
+        print(f"  {TerminalUI.CYAN}🔄 Integration Coordinator: Initializing cross-repo orchestration...{TerminalUI.RESET}")
+
+        try:
+            from backend.core.trinity.integration_coordinator import get_trinity_coordinator
+
+            # Get Redis client if available
+            redis_client = None
+            if hasattr(self, '_redis_client') and self._redis_client:
+                redis_client = self._redis_client
+
+            self._trinity_integration_coordinator = await get_trinity_coordinator(
+                repo_id="jarvis",
+                redis_client=redis_client,
+            )
+
+            # Get metrics
+            metrics = self._trinity_integration_coordinator.get_metrics()
+            health_status = metrics.get("health", {}).get("overall_status", "unknown")
+
+            if health_status == "healthy":
+                print(f"  {TerminalUI.GREEN}✅ Integration Coordinator: Fully operational{TerminalUI.RESET}")
+                self.logger.info("[v102.0] ✅ Integration Coordinator: All components healthy")
+            else:
+                print(f"  {TerminalUI.YELLOW}⚠️ Integration Coordinator: Status - {health_status}{TerminalUI.RESET}")
+                self.logger.warning(f"[v102.0] ⚠️ Integration Coordinator: {health_status}")
+
+            # Log component status
+            self.logger.info(f"[v102.0] Events sent: {metrics.get('events_sent', 0)}")
+            self.logger.info(f"[v102.0] Events received: {metrics.get('events_received', 0)}")
+
+        except ImportError as e:
+            self.logger.warning(f"[v102.0] ⚠️ Integration Coordinator import failed: {e}")
+            print(f"  {TerminalUI.YELLOW}⚠️ Integration Coordinator: Not available{TerminalUI.RESET}")
+        except Exception as e:
+            self.logger.error(f"[v102.0] ❌ Integration Coordinator initialization failed: {e}")
+            print(f"  {TerminalUI.RED}✗ Integration Coordinator: Failed - {e}{TerminalUI.RESET}")
+
+    async def _initialize_reactor_core_bridge(self) -> None:
+        """
+        v102.0: Initialize Reactor Core Bridge - Training Pipeline Integration.
+
+        Provides integration with Reactor Core for:
+        1. Publishing MODEL_READY events when training completes
+        2. Receiving experience batches from JARVIS
+        3. Training pipeline lifecycle coordination
+        4. Model artifact management
+
+        This component should also be deployed to Reactor Core repo to enable
+        bidirectional communication.
+
+        Architecture:
+            Reactor Core Training Pipeline
+                    │
+                    ▼
+            ReactorCoreBridge.training.on_training_complete()
+                    │
+                    ▼
+            ReactorCorePublisher.publish_model_ready()
+                    │
+                    ▼
+            ~/.jarvis/reactor/events/MODEL_READY_*.json
+                    │
+                    ▼
+            TrinityBridgeAdapter (JARVIS)
+                    │
+                    ▼
+            UnifiedModelServing.hot_swap_model()
+        """
+        self.logger.info("=" * 60)
+        self.logger.info("[v102.0] Initializing Reactor Core Bridge")
+        self.logger.info("=" * 60)
+
+        print(f"  {TerminalUI.CYAN}🌉 Reactor Bridge: Connecting to training pipeline...{TerminalUI.RESET}")
+
+        try:
+            from backend.core.trinity.reactor_bridge import get_reactor_bridge
+
+            # Get Redis client if available
+            redis_client = None
+            if hasattr(self, '_redis_client') and self._redis_client:
+                redis_client = self._redis_client
+
+            self._reactor_core_bridge = await get_reactor_bridge(redis_client=redis_client)
+
+            # Register experience callback to forward to training pipeline
+            if self._trinity_training_pipeline:
+                async def on_experience_batch(experiences):
+                    """Forward validated experiences to training pipeline."""
+                    try:
+                        for exp in experiences:
+                            await self._trinity_training_pipeline.add_experience(
+                                query=exp.get("query", ""),
+                                response=exp.get("response", ""),
+                                feedback=exp.get("feedback"),
+                                context=exp.get("context"),
+                                metadata=exp.get("metadata"),
+                            )
+                        self.logger.debug(f"[v102.0] Forwarded {len(experiences)} experiences to training pipeline")
+                    except Exception as e:
+                        self.logger.error(f"[v102.0] Experience forwarding failed: {e}")
+
+                self._reactor_core_bridge.on_experience_batch(on_experience_batch)
+                self.logger.info("[v102.0] Experience callback registered with training pipeline")
+
+            print(f"  {TerminalUI.GREEN}✅ Reactor Bridge: Training pipeline connected{TerminalUI.RESET}")
+            self.logger.info("[v102.0] ✅ Reactor Bridge: Ready for training events")
+
+        except ImportError as e:
+            self.logger.warning(f"[v102.0] ⚠️ Reactor Bridge import failed: {e}")
+            print(f"  {TerminalUI.YELLOW}⚠️ Reactor Bridge: Not available{TerminalUI.RESET}")
+        except Exception as e:
+            self.logger.error(f"[v102.0] ❌ Reactor Bridge initialization failed: {e}")
+            print(f"  {TerminalUI.RED}✗ Reactor Bridge: Failed - {e}{TerminalUI.RESET}")
 
     async def _initialize_agi_orchestrator(self) -> None:
         """
