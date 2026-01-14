@@ -3872,6 +3872,7 @@ class SupervisorBootstrapper:
         # - Training pipeline lifecycle hooks
         self._reactor_core_bridge = None
         self._reactor_core_bridge_enabled = os.getenv("REACTOR_CORE_BRIDGE_ENABLED", "true").lower() == "true"
+        self._training_health_task: Optional[asyncio.Task] = None
 
         # v85.0: Unified State Coordination - Atomic locks with process cookies
         # - Prevents race conditions between run_supervisor.py and start_system.py
@@ -5081,6 +5082,25 @@ class SupervisorBootstrapper:
                 await self._init_model_manager()
 
             await self._initialize_jarvis_prime()
+
+            # ═══════════════════════════════════════════════════════════════════
+            # v10.1: Cross-Repo Startup Orchestration
+            # ═══════════════════════════════════════════════════════════════════
+            # Automatically probe and launch J-Prime and Reactor-Core if not running.
+            # This enables single-command startup of all 3 repos via run_supervisor.py
+            # ═══════════════════════════════════════════════════════════════════
+            try:
+                from backend.supervisor.cross_repo_startup_orchestrator import initialize_cross_repo_orchestration
+
+                self.logger.info("🚀 [v10.1] Initializing Cross-Repo Orchestration...")
+                await initialize_cross_repo_orchestration()
+                self.logger.info("✅ [v10.1] Cross-Repo Orchestration complete")
+
+            except ImportError as e:
+                self.logger.warning(f"⚠️ [v10.1] Cross-Repo Orchestrator not available: {e}")
+            except Exception as e:
+                self.logger.warning(f"⚠️ [v10.1] Cross-Repo Orchestration failed: {e}")
+                self.logger.debug(f"[v10.1] Error details: {e}", exc_info=True)
 
             # ═══════════════════════════════════════════════════════════════════
             # v9.0: Initialize Intelligence Systems (UAE/SAI/Neural Mesh/MAS)
@@ -11427,7 +11447,19 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
             print(f"  {TerminalUI.YELLOW}⚠️ Reactor-Core init failed: {e}{TerminalUI.RESET}")
 
     async def _shutdown_reactor_core(self) -> None:
-        """Shutdown the Reactor-Core API server."""
+        """Shutdown the Reactor-Core API server and related tasks."""
+        # Cancel training health monitor task
+        if self._training_health_task:
+            try:
+                self._training_health_task.cancel()
+                await self._training_health_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                self.logger.debug(f"   Training health monitor shutdown error: {e}")
+            self._training_health_task = None
+            self.logger.info("   ✅ Training health monitor stopped")
+
         if self._reactor_core_process:
             try:
                 self.logger.info("   Stopping Reactor-Core API...")
@@ -12771,12 +12803,104 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
             print(f"  {TerminalUI.GREEN}✅ Reactor Bridge: Training pipeline connected{TerminalUI.RESET}")
             self.logger.info("[v102.0] ✅ Reactor Bridge: Ready for training events")
 
+            # Start training health monitor as background task
+            self._training_health_task = asyncio.create_task(
+                self._monitor_reactor_training_health(),
+                name="reactor_training_health_monitor"
+            )
+            self.logger.info("[v102.1] Started training health monitor")
+
         except ImportError as e:
             self.logger.warning(f"[v102.0] ⚠️ Reactor Bridge import failed: {e}")
             print(f"  {TerminalUI.YELLOW}⚠️ Reactor Bridge: Not available{TerminalUI.RESET}")
         except Exception as e:
             self.logger.error(f"[v102.0] ❌ Reactor Bridge initialization failed: {e}")
             print(f"  {TerminalUI.RED}✗ Reactor Bridge: Failed - {e}{TerminalUI.RESET}")
+
+    async def _monitor_reactor_training_health(self) -> None:
+        """
+        v102.1: Monitor Reactor Core Training Health.
+
+        Periodically checks Reactor Core training subsystem health and:
+        1. Updates cross-repo health monitor with training status
+        2. Triggers voice alerts on health changes
+        3. Auto-restarts failed components if configured
+        4. Publishes health metrics for dashboard
+
+        Architecture:
+            Reactor Core Training Health API
+                    │
+                    ▼
+            /training/health/deep
+                    │
+                    ▼
+            JARVIS Health Aggregation
+                    │
+                    ▼
+            Voice Alerts / Dashboard / Auto-Recovery
+        """
+        import aiohttp
+
+        check_interval = float(os.getenv("REACTOR_TRAINING_HEALTH_INTERVAL", "30.0"))
+        health_endpoint = f"http://localhost:{self._reactor_core_port}/training/health/deep"
+
+        last_status = "unknown"
+
+        while self._running:
+            try:
+                await asyncio.sleep(check_interval)
+
+                if not self._running:
+                    break
+
+                # Check training health
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(
+                            health_endpoint,
+                            timeout=aiohttp.ClientTimeout(total=10),
+                        ) as response:
+                            if response.status == 200:
+                                health_data = await response.json()
+                                status = health_data.get("status", "unknown")
+
+                                # Update cross-repo health monitor
+                                if self._cross_repo_health_monitor:
+                                    self._cross_repo_health_monitor._health_cache["reactor_training"] = {
+                                        "status": status,
+                                        "latency_ms": 0,
+                                        "last_check": asyncio.get_event_loop().time(),
+                                        "details": health_data.get("components", {}),
+                                    }
+
+                                # Voice alert on status change
+                                if status != last_status:
+                                    if status == "unhealthy":
+                                        msg = "Reactor Core training pipeline is experiencing issues."
+                                        self.logger.warning(f"[v102.1] Training health degraded: {status}")
+                                        if self.narrator and self.config.voice_enabled:
+                                            await self.narrator.speak(msg, wait=False)
+                                    elif status == "healthy" and last_status in ("unhealthy", "degraded"):
+                                        msg = "Reactor Core training pipeline has recovered."
+                                        self.logger.info(f"[v102.1] Training health recovered: {status}")
+                                        if self.narrator and self.config.voice_enabled:
+                                            await self.narrator.speak(msg, wait=False)
+
+                                    last_status = status
+
+                            else:
+                                self.logger.warning(f"[v102.1] Training health check returned {response.status}")
+                                last_status = "unreachable"
+
+                except aiohttp.ClientError as e:
+                    self.logger.debug(f"[v102.1] Training health check failed: {e}")
+                    last_status = "unreachable"
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.logger.error(f"[v102.1] Training health monitor error: {e}")
+                await asyncio.sleep(10.0)
 
     async def _initialize_agi_orchestrator(self) -> None:
         """

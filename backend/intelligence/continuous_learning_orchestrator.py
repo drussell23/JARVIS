@@ -1015,37 +1015,168 @@ class ContinuousLearningOrchestrator:
                 await asyncio.sleep(60)
 
     async def _execute_training(self, job: TrainingJob) -> None:
-        """Execute a training job."""
+        """
+        Execute a training job via Advanced Training Coordinator.
+
+        v2.0: Uses production-grade coordinator with resource negotiation,
+        distributed locking, streaming status, and intelligent failover.
+        """
         self.logger.info(f"Executing training job: {job.job_id}")
         job.status = TrainingStatus.TRAINING
 
         try:
-            # Simulate training (in real implementation, call Reactor Core)
-            await asyncio.sleep(5)
+            # Import advanced training coordinator
+            from backend.intelligence.advanced_training_coordinator import (
+                AdvancedTrainingCoordinator, TrainingPriority, ReactorCoreClient,
+                AdvancedTrainingConfig
+            )
 
-            # Generate version
-            job.model_version = f"{job.model_type.value}-v{int(time.time())}"
-            job.metrics = {
-                "loss": 0.1,
-                "accuracy": 0.95,
+            # Determine priority based on model type
+            priority_map = {
+                ModelType.VOICE: TrainingPriority.CRITICAL,  # Security impact
+                ModelType.NLU: TrainingPriority.HIGH,  # User experience
+                ModelType.VISION: TrainingPriority.NORMAL,
+                ModelType.EMBEDDING: TrainingPriority.LOW,
             }
+            priority = priority_map.get(job.model_type, TrainingPriority.NORMAL)
 
-            await self._scheduler.complete_job(job.job_id, True, job.metrics)
-            self._metrics["training_jobs_completed"] += 1
+            # Get experiences for this model type
+            exp_type_map = {
+                ModelType.VOICE: ExperienceType.VOICE_AUTH,
+                ModelType.NLU: ExperienceType.COMMAND,
+                ModelType.VISION: ExperienceType.VISION,
+            }
+            exp_type = exp_type_map.get(job.model_type, ExperienceType.INTERACTION)
+            experiences = await self._aggregator.get_experiences(experience_type=exp_type)
 
-            # Fire callbacks
-            for callback in self._on_training_complete:
-                try:
-                    if asyncio.iscoroutinefunction(callback):
-                        await callback(job)
-                    else:
-                        callback(job)
-                except Exception as e:
-                    self.logger.error(f"Callback error: {e}")
+            # Convert experiences to dict format
+            experience_dicts = [
+                {
+                    "type": exp.experience_type.value,
+                    "input": exp.input,
+                    "expected_output": exp.expected_output,
+                    "actual_output": exp.actual_output,
+                    "success": exp.success,
+                    "confidence": exp.confidence,
+                    "metadata": exp.metadata,
+                    "timestamp": exp.timestamp,
+                }
+                for exp in experiences
+            ]
+
+            self.logger.info(
+                f"Training {job.model_type.value} with {len(experience_dicts)} experiences "
+                f"(priority: {priority.name})"
+            )
+
+            # Create Advanced Training Coordinator
+            coordinator = await AdvancedTrainingCoordinator.create()
+
+            # Submit training job to coordinator
+            submitted_job = await coordinator.submit_training(
+                model_type=job.model_type,
+                experiences=experience_dicts,
+                priority=priority,
+                epochs=job.epochs,
+                config=job.config
+            )
+
+            # Execute training with advanced coordinator
+            # This handles:
+            # - Resource negotiation (waits for J-Prime idle)
+            # - Distributed locking (prevents concurrent training)
+            # - Streaming status updates
+            # - Automatic checkpointing
+            result_job = await coordinator.execute_next_training()
+
+            if result_job and result_job.status == TrainingStatus.COMPLETED:
+                # Training succeeded
+                job.model_version = result_job.model_version
+                job.metrics = result_job.metrics
+                job.status = TrainingStatus.COMPLETED
+
+                await self._scheduler.complete_job(job.job_id, True, job.metrics)
+                self._metrics["training_jobs_completed"] += 1
+
+                self.logger.info(
+                    f"Training completed: {job.job_id} - Version: {job.model_version}, "
+                    f"Metrics: {job.metrics}"
+                )
+
+                # Fire callbacks
+                for callback in self._on_training_complete:
+                    try:
+                        if asyncio.iscoroutinefunction(callback):
+                            await callback(job)
+                        else:
+                            callback(job)
+                    except Exception as e:
+                        self.logger.error(f"Callback error: {e}")
+
+            else:
+                # Training failed
+                raise Exception(result_job.error if result_job else "Training returned None")
+
+        except ImportError as e:
+            # Fallback: Advanced coordinator not available, use Reactor Core client directly
+            self.logger.warning(
+                f"Advanced coordinator unavailable ({e}), using direct Reactor Core API"
+            )
+
+            try:
+                # Direct Reactor Core API call (fallback)
+                from backend.intelligence.advanced_training_coordinator import (
+                    ReactorCoreClient, AdvancedTrainingConfig
+                )
+
+                config = AdvancedTrainingConfig()
+
+                # Get experiences
+                exp_type = exp_type_map.get(job.model_type, ExperienceType.INTERACTION)
+                experiences = await self._aggregator.get_experiences(experience_type=exp_type)
+                experience_dicts = [
+                    {
+                        "type": exp.experience_type.value,
+                        "input": exp.input,
+                        "expected_output": exp.expected_output,
+                        "actual_output": exp.actual_output,
+                        "success": exp.success,
+                        "confidence": exp.confidence,
+                        "metadata": exp.metadata,
+                        "timestamp": exp.timestamp,
+                    }
+                    for exp in experiences
+                ]
+
+                # Call Reactor Core directly
+                async with ReactorCoreClient(config) as client:
+                    response = await client.start_training(job, experience_dicts)
+
+                    # Poll for completion (simplified, no streaming)
+                    while True:
+                        status = await client.get_training_status(job.job_id)
+
+                        if status.get("status") == "completed":
+                            job.model_version = status.get("model_version")
+                            job.metrics = status.get("metrics", {})
+                            job.status = TrainingStatus.COMPLETED
+                            break
+                        elif status.get("status") == "failed":
+                            raise Exception(status.get("error", "Training failed"))
+
+                        await asyncio.sleep(10)  # Poll every 10s
+
+                    await self._scheduler.complete_job(job.job_id, True, job.metrics)
+                    self._metrics["training_jobs_completed"] += 1
+
+            except Exception as fallback_error:
+                self.logger.error(f"Fallback training also failed: {fallback_error}")
+                raise
 
         except Exception as e:
-            self.logger.error(f"Training job failed: {e}")
+            self.logger.error(f"Training job failed: {e}", exc_info=True)
             job.error = str(e)
+            job.status = TrainingStatus.FAILED
             await self._scheduler.complete_job(job.job_id, False)
 
     async def _check_auto_training(self) -> None:
