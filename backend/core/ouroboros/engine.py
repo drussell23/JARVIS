@@ -525,35 +525,125 @@ class OpenCodeIntegration:
     """
     Integration with OpenCode CLI for AI-assisted code editing.
 
-    Configures OpenCode to use JARVIS Prime as the backend.
+    v2.0 Enhancement: Uses IntelligentOuroborosModelSelector for dynamic
+    model selection based on code complexity and available models.
+
+    Configures OpenCode to use:
+    1. Dynamically discovered JARVIS Prime models
+    2. Fallback Ollama models
+    3. Cloud API models (if configured)
     """
 
     def __init__(self):
         self.config_path = OuroborosConfig.OPENCODE_CONFIG_PATH
         self.opencode_path = OuroborosConfig.OPENCODE_PATH
+        self._model_discovery = None
+        self._last_config_hash: Optional[str] = None
 
-    async def ensure_configured(self) -> bool:
-        """Ensure OpenCode is properly configured."""
+    async def _get_model_discovery(self):
+        """Lazy load model discovery."""
+        if self._model_discovery is None:
+            try:
+                from backend.core.ouroboros.integration import JarvisPrimeModelDiscovery
+                self._model_discovery = JarvisPrimeModelDiscovery()
+            except ImportError:
+                logger.warning("JarvisPrimeModelDiscovery not available")
+        return self._model_discovery
+
+    async def ensure_configured(self, force_refresh: bool = False) -> bool:
+        """
+        Ensure OpenCode is properly configured with dynamic model discovery.
+
+        v2.0: Discovers available models from JARVIS Prime and configures
+        OpenCode with all available models for intelligent selection.
+        """
         # Create config directory
         self.config_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Create/update configuration
+        # Discover available JARVIS Prime models
+        discovered_models = []
+        discovery = await self._get_model_discovery()
+        if discovery:
+            try:
+                models = await discovery.discover_models(force_refresh=force_refresh)
+                discovered_models = [m["id"] for m in models]
+                logger.info(f"Discovered {len(discovered_models)} JARVIS Prime models")
+            except Exception as e:
+                logger.warning(f"Model discovery failed: {e}")
+
+        # Build provider configurations
+        providers = {}
+
+        # JARVIS Prime provider with discovered models
+        prime_models = discovered_models if discovered_models else [OuroborosConfig.PRIME_MODEL]
+        providers["jarvis-prime"] = {
+            "type": "openai-compatible",
+            "api_base": OuroborosConfig.PRIME_API_BASE,
+            "api_key": OuroborosConfig.PRIME_API_KEY,
+            "models": prime_models,
+            "priority": 1,  # Highest priority
+        }
+
+        # Ollama provider (fallback)
+        ollama_api_base = os.getenv("OLLAMA_API_BASE", "http://localhost:11434/v1")
+        ollama_models = os.getenv("OLLAMA_MODELS", "codellama,llama3,deepseek-coder").split(",")
+        providers["ollama"] = {
+            "type": "openai-compatible",
+            "api_base": ollama_api_base,
+            "api_key": "ollama",
+            "models": [m.strip() for m in ollama_models],
+            "priority": 2,
+        }
+
+        # Cloud providers (if API keys configured)
+        anthropic_key = os.getenv("ANTHROPIC_API_KEY")
+        if anthropic_key:
+            providers["anthropic"] = {
+                "type": "anthropic",
+                "api_key": anthropic_key,
+                "models": ["claude-3-haiku-20240307", "claude-3-sonnet-20240229"],
+                "priority": 3,
+            }
+
+        openai_key = os.getenv("OPENAI_API_KEY")
+        if openai_key:
+            providers["openai"] = {
+                "type": "openai",
+                "api_key": openai_key,
+                "models": ["gpt-4o-mini", "gpt-4o"],
+                "priority": 4,
+            }
+
+        # Select default model (prefer local with largest context)
+        default_model = f"jarvis-prime/{prime_models[0]}" if prime_models else "ollama/codellama"
+
+        # Create configuration
         config = {
-            "provider": {
-                "jarvis-prime": {
-                    "type": "openai-compatible",
-                    "api_base": OuroborosConfig.PRIME_API_BASE,
-                    "api_key": OuroborosConfig.PRIME_API_KEY,
-                    "models": [
-                        OuroborosConfig.PRIME_MODEL,
-                        "jarvis-prime-v1",
-                    ],
-                }
-            },
-            "default_model": f"jarvis-prime/{OuroborosConfig.PRIME_MODEL}",
+            "provider": providers,
+            "default_model": default_model,
             "auto_context": True,
             "max_context_files": 10,
+            "intelligent_selection": {
+                "enabled": True,
+                "prefer_local": True,
+                "context_aware": True,
+                "fallback_chain": ["jarvis-prime", "ollama", "anthropic", "openai"],
+            },
+            "discovery": {
+                "last_updated": time.time(),
+                "discovered_models": discovered_models,
+            },
         }
+
+        # Check if config changed
+        config_str = json.dumps(config, sort_keys=True)
+        config_hash = hashlib.md5(config_str.encode()).hexdigest()
+
+        if not force_refresh and self._last_config_hash == config_hash:
+            logger.debug("OpenCode config unchanged, skipping write")
+            return True
+
+        self._last_config_hash = config_hash
 
         await asyncio.to_thread(
             self.config_path.write_text,
@@ -561,6 +651,9 @@ class OpenCodeIntegration:
         )
 
         logger.info(f"OpenCode configured at {self.config_path}")
+        logger.info(f"  Default model: {default_model}")
+        logger.info(f"  Discovered models: {len(discovered_models)}")
+        logger.info(f"  Providers: {list(providers.keys())}")
         return True
 
     async def is_installed(self) -> bool:
@@ -576,21 +669,60 @@ class OpenCodeIntegration:
         except Exception:
             return False
 
+    async def select_model_for_code(self, code: str, task_type: str = "code_improvement") -> str:
+        """
+        Select the best model for a code improvement task.
+
+        v2.0: Uses intelligent model selection based on code complexity.
+        """
+        try:
+            from backend.core.ouroboros.integration import get_intelligent_ouroboros_selector
+            selector = get_intelligent_ouroboros_selector()
+            selection = await selector.select_model_for_code(
+                code=code,
+                task_type=task_type,
+                prefer_local=True,
+            )
+            return f"{selection['provider']}/{selection['model']}"
+        except Exception as e:
+            logger.warning(f"Intelligent model selection failed: {e}")
+            return f"jarvis-prime/{OuroborosConfig.PRIME_MODEL}"
+
     async def run_improvement(
         self,
         target_file: Path,
         instruction: str,
         timeout: float = OuroborosConfig.LLM_TIMEOUT,
+        model: Optional[str] = None,
     ) -> Tuple[bool, str]:
         """
         Run OpenCode to improve a file.
+
+        v2.0: Supports model selection parameter for intelligent model routing.
+
+        Args:
+            target_file: Path to the file to improve
+            instruction: Improvement instruction
+            timeout: Timeout in seconds
+            model: Optional specific model to use (auto-selected if not provided)
 
         Returns:
             (success, output)
         """
         try:
-            # Build command
+            # Auto-select model if not provided
+            if not model:
+                try:
+                    code = await asyncio.to_thread(target_file.read_text)
+                    model = await self.select_model_for_code(code, "code_improvement")
+                except Exception as e:
+                    logger.warning(f"Model selection failed: {e}")
+                    model = f"jarvis-prime/{OuroborosConfig.PRIME_MODEL}"
+
+            # Build command with model specification
             cmd = f'{self.opencode_path} --file "{target_file}" --prompt "{instruction}"'
+            if model:
+                cmd += f' --model "{model}"'
 
             result = await asyncio.create_subprocess_shell(
                 cmd,
@@ -615,6 +747,15 @@ class OpenCodeIntegration:
 
         except Exception as e:
             return False, f"OpenCode error: {e}"
+
+    def get_config(self) -> Optional[Dict[str, Any]]:
+        """Get current OpenCode configuration."""
+        if self.config_path.exists():
+            try:
+                return json.loads(self.config_path.read_text())
+            except Exception:
+                pass
+        return None
 
 
 # =============================================================================
