@@ -1,0 +1,243 @@
+#!/usr/bin/env python3
+"""
+JARVIS Improve - AI-Powered Code Enhancement
+=============================================
+
+A simple CLI wrapper for the Ouroboros Self-Improvement Engine.
+
+Usage:
+    jarvis-improve <target_file> <goal> [--test <test_command>] [--strategy <strategy>]
+
+Examples:
+    jarvis-improve backend/core/utils.py "Add type hints to all functions"
+    jarvis-improve src/api.py "Fix the authentication bug" --test "pytest tests/test_api.py"
+    jarvis-improve lib/sort.py "Optimize sorting algorithm to O(n log n)" --strategy genetic
+
+Author: Trinity System
+Version: 2.0.0
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import logging
+import os
+import sys
+from pathlib import Path
+
+# Add project root to path
+PROJECT_ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
+
+def setup_logging(verbose: bool = False) -> None:
+    """Setup logging configuration."""
+    level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+
+async def main() -> int:
+    """Main entry point."""
+    parser = argparse.ArgumentParser(
+        description="JARVIS Improve - AI-Powered Code Enhancement",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  jarvis-improve backend/core/utils.py "Add type hints"
+  jarvis-improve src/api.py "Fix auth bug" --test "pytest tests/"
+  jarvis-improve lib/sort.py "Optimize to O(n log n)" --strategy genetic
+
+Strategies:
+  single    - One improvement attempt at a time (default)
+  parallel  - Multiple parallel attempts with different approaches
+  genetic   - Genetic algorithm with selection pressure
+  consensus - Multiple models vote on best solution
+        """,
+    )
+
+    parser.add_argument(
+        "target_file",
+        help="Path to the file to improve",
+    )
+
+    parser.add_argument(
+        "goal",
+        help="Description of the improvement goal",
+    )
+
+    parser.add_argument(
+        "--test", "-t",
+        dest="test_command",
+        help="Test command to validate the improvement",
+    )
+
+    parser.add_argument(
+        "--strategy", "-s",
+        choices=["single", "parallel", "genetic", "consensus"],
+        default="parallel",
+        help="Evolution strategy (default: parallel)",
+    )
+
+    parser.add_argument(
+        "--max-retries", "-r",
+        type=int,
+        default=5,
+        help="Maximum retry attempts (default: 5)",
+    )
+
+    parser.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        help="Enable verbose logging",
+    )
+
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be done without making changes",
+    )
+
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Disable response caching",
+    )
+
+    args = parser.parse_args()
+
+    # Setup logging
+    setup_logging(args.verbose)
+
+    # Validate target file
+    target_path = Path(args.target_file)
+    if not target_path.exists():
+        print(f"❌ Error: File not found: {args.target_file}")
+        return 1
+
+    if not target_path.suffix == ".py":
+        print(f"⚠️  Warning: Not a Python file: {args.target_file}")
+
+    # Print banner
+    print("=" * 60)
+    print("🐍 JARVIS IMPROVE - AI-Powered Code Enhancement")
+    print("=" * 60)
+    print(f"  Target:   {args.target_file}")
+    print(f"  Goal:     {args.goal}")
+    print(f"  Strategy: {args.strategy}")
+    if args.test_command:
+        print(f"  Test:     {args.test_command}")
+    print("=" * 60)
+    print()
+
+    if args.dry_run:
+        print("🔍 DRY RUN - No changes will be made")
+        print()
+        print("Would improve file with goal:")
+        print(f"  {args.goal}")
+        return 0
+
+    try:
+        # Try advanced orchestrator first
+        try:
+            from backend.core.ouroboros.advanced_orchestrator import (
+                get_advanced_orchestrator,
+            )
+
+            orchestrator = get_advanced_orchestrator()
+            if not orchestrator._running:
+                print("🚀 Initializing Advanced Ouroboros Orchestrator...")
+                await orchestrator.initialize()
+
+            result = await orchestrator.improve_code(
+                file_path=target_path,
+                goal=args.goal,
+                test_command=args.test_command,
+            )
+
+            if result["success"]:
+                print()
+                print("=" * 60)
+                print("✅ IMPROVEMENT SUCCESSFUL!")
+                print("=" * 60)
+                print(f"  Provider:   {result.get('provider_used', 'unknown')}")
+                print(f"  Iterations: {result.get('iterations', 0)}")
+                print(f"  Cached:     {result.get('cached', False)}")
+                return 0
+            else:
+                print()
+                print("=" * 60)
+                print("❌ IMPROVEMENT FAILED")
+                print("=" * 60)
+                print(f"  Error: {result.get('error', 'Unknown error')}")
+                return 1
+
+        except ImportError:
+            # Fall back to basic engine
+            from backend.core.ouroboros.engine import (
+                get_ouroboros_engine,
+                ImprovementRequest,
+                EvolutionStrategy,
+            )
+
+            strategy_map = {
+                "single": EvolutionStrategy.SINGLE_PATH,
+                "parallel": EvolutionStrategy.PARALLEL_PATHS,
+                "genetic": EvolutionStrategy.GENETIC,
+                "consensus": EvolutionStrategy.CONSENSUS,
+            }
+
+            engine = get_ouroboros_engine()
+            if not engine._running:
+                print("🚀 Initializing Ouroboros Engine...")
+                await engine.initialize()
+
+            request = ImprovementRequest(
+                target_file=target_path,
+                goal=args.goal,
+                test_command=args.test_command,
+                strategy=strategy_map[args.strategy],
+                max_retries=args.max_retries,
+            )
+
+            print("🔄 Running improvement loop...")
+            result = await engine.improve(request)
+
+            if result.success:
+                print()
+                print("=" * 60)
+                print("✅ IMPROVEMENT SUCCESSFUL!")
+                print("=" * 60)
+                print(f"  Iterations: {result.iterations}")
+                print(f"  Time:       {result.total_time:.2f}s")
+                if result.final_candidate and result.final_candidate.changes:
+                    print(f"  Changes:")
+                    print(result.final_candidate.changes[0].diff[:500])
+                return 0
+            else:
+                print()
+                print("=" * 60)
+                print("❌ IMPROVEMENT FAILED")
+                print("=" * 60)
+                print(f"  Iterations: {result.iterations}")
+                if result.error_history:
+                    print(f"  Last error: {result.error_history[-1][:200]}")
+                return 1
+
+    except KeyboardInterrupt:
+        print("\n⚠️  Interrupted by user")
+        return 130
+    except Exception as e:
+        print(f"\n❌ Unexpected error: {e}")
+        if args.verbose:
+            import traceback
+            traceback.print_exc()
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(asyncio.run(main()))

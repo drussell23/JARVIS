@@ -95,6 +95,44 @@ from backend.core.ouroboros.protector import (
     RestorePoint,
 )
 
+from backend.core.ouroboros.integration import (
+    EnhancedOuroborosIntegration,
+    MultiProviderLLMClient,
+    CircuitBreaker,
+    SandboxExecutor,
+    ReactorCoreExperiencePublisher,
+    ProviderStatus,
+    CircuitState,
+    get_ouroboros_integration,
+    shutdown_ouroboros_integration,
+)
+
+from backend.core.ouroboros.advanced_orchestrator import (
+    AdvancedOuroborosOrchestrator,
+    TokenBucketRateLimiter,
+    SemanticCache,
+    SyntaxValidator,
+    GitStateManager,
+    FileLockManager,
+    ResourceMonitor,
+    HealthMonitor,
+    ProviderStarter,
+    get_advanced_orchestrator,
+    shutdown_advanced_orchestrator,
+    jarvis_improve,
+)
+
+from backend.core.ouroboros.cross_repo import (
+    CrossRepoOrchestrator,
+    CrossRepoEventBus,
+    RepoConnector,
+    CrossRepoEvent,
+    RepoType,
+    EventType,
+    get_cross_repo_orchestrator,
+    shutdown_cross_repo,
+)
+
 __all__ = [
     # Core Engine
     "OuroborosEngine",
@@ -124,4 +162,36 @@ __all__ = [
     "RollbackProtector",
     "Snapshot",
     "RestorePoint",
+    # Integration Layer
+    "EnhancedOuroborosIntegration",
+    "MultiProviderLLMClient",
+    "CircuitBreaker",
+    "SandboxExecutor",
+    "ReactorCoreExperiencePublisher",
+    "ProviderStatus",
+    "CircuitState",
+    "get_ouroboros_integration",
+    "shutdown_ouroboros_integration",
+    # Advanced Orchestrator
+    "AdvancedOuroborosOrchestrator",
+    "TokenBucketRateLimiter",
+    "SemanticCache",
+    "SyntaxValidator",
+    "GitStateManager",
+    "FileLockManager",
+    "ResourceMonitor",
+    "HealthMonitor",
+    "ProviderStarter",
+    "get_advanced_orchestrator",
+    "shutdown_advanced_orchestrator",
+    "jarvis_improve",
+    # Cross-Repo Integration
+    "CrossRepoOrchestrator",
+    "CrossRepoEventBus",
+    "RepoConnector",
+    "CrossRepoEvent",
+    "RepoType",
+    "EventType",
+    "get_cross_repo_orchestrator",
+    "shutdown_cross_repo",
 ]

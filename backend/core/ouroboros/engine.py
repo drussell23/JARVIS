@@ -59,9 +59,13 @@ from typing import (
     Tuple,
     TypeVar,
     Union,
+    TYPE_CHECKING,
 )
 
 import aiohttp
+
+if TYPE_CHECKING:
+    from backend.core.ouroboros.integration import EnhancedOuroborosIntegration
 
 logger = logging.getLogger("Ouroboros")
 
@@ -628,12 +632,22 @@ class OuroborosEngine:
     4. Select best candidates for next generation
     5. If all fail, learn from errors and retry
     6. Commit successful improvements
+
+    Enhanced with:
+    - Multi-provider LLM fallback (Prime -> Ollama -> Anthropic)
+    - Circuit breakers for fault isolation
+    - Sandbox execution for safety
+    - Experience publishing to Reactor Core
     """
 
-    def __init__(self):
+    def __init__(self, use_enhanced_integration: bool = True):
         self.logger = logging.getLogger("Ouroboros.Engine")
 
-        # Components
+        # Enhanced integration layer (lazy loaded)
+        self._use_enhanced_integration = use_enhanced_integration
+        self._integration: Optional["EnhancedOuroborosIntegration"] = None
+
+        # Legacy components (fallback if integration unavailable)
         self._llm_client = JarvisPrimeClient()
         self._opencode = OpenCodeIntegration()
         self._memory = LearningMemory()
@@ -650,6 +664,8 @@ class OuroborosEngine:
             "failed_improvements": 0,
             "total_iterations": 0,
             "patterns_learned": 0,
+            "experiences_published": 0,
+            "provider_used": {},
         }
 
     async def initialize(self) -> bool:
@@ -663,18 +679,34 @@ class OuroborosEngine:
         # Configure OpenCode
         await self._opencode.ensure_configured()
 
-        # Check JARVIS Prime connectivity
-        try:
-            response = await self._llm_client.generate(
-                "Say 'JARVIS Prime online' if you can read this.",
-                max_tokens=20,
-            )
-            if "online" in response.lower() or "jarvis" in response.lower():
-                self.logger.info("JARVIS Prime connection verified")
-            else:
-                self.logger.warning(f"Unexpected JARVIS Prime response: {response}")
-        except Exception as e:
-            self.logger.warning(f"JARVIS Prime not available: {e}")
+        # Initialize enhanced integration layer if enabled
+        if self._use_enhanced_integration:
+            try:
+                from backend.core.ouroboros.integration import EnhancedOuroborosIntegration
+                self._integration = EnhancedOuroborosIntegration()
+                integration_ok = await self._integration.initialize()
+                if integration_ok:
+                    self.logger.info("Enhanced integration layer initialized with multi-provider fallback")
+                else:
+                    self.logger.warning("Enhanced integration initialization returned false, using legacy client")
+                    self._integration = None
+            except Exception as e:
+                self.logger.warning(f"Enhanced integration not available: {e}, falling back to legacy client")
+                self._integration = None
+
+        # Fallback: Check JARVIS Prime connectivity directly
+        if not self._integration:
+            try:
+                response = await self._llm_client.generate(
+                    "Say 'JARVIS Prime online' if you can read this.",
+                    max_tokens=20,
+                )
+                if "online" in response.lower() or "jarvis" in response.lower():
+                    self.logger.info("JARVIS Prime connection verified (legacy mode)")
+                else:
+                    self.logger.warning(f"Unexpected JARVIS Prime response: {response}")
+            except Exception as e:
+                self.logger.warning(f"JARVIS Prime not available: {e}")
 
         self._running = True
         self.logger.info("Ouroboros Engine initialized")
@@ -683,8 +715,18 @@ class OuroborosEngine:
     async def shutdown(self) -> None:
         """Shutdown the engine."""
         self._running = False
+
+        # Shutdown enhanced integration if active
+        if self._integration:
+            await self._integration.shutdown()
+            self._integration = None
+
+        # Close legacy client
         await self._llm_client.close()
+
+        # Save learning memory
         await self._memory.save()
+
         self.logger.info("Ouroboros Engine shutdown")
 
     async def improve(self, request: ImprovementRequest) -> ImprovementResult:
@@ -759,6 +801,24 @@ class OuroborosEngine:
                                     solution_pattern=candidate.changes[0].diff if candidate.changes else None,
                                     success=True,
                                 )
+
+                            # Publish experience to Reactor Core for training
+                            if self._integration and candidate.changes:
+                                change = candidate.changes[0]
+                                try:
+                                    event_id = await self._integration.publish_experience(
+                                        original_code=change.original_content,
+                                        improved_code=change.modified_content,
+                                        goal=request.goal,
+                                        success=True,
+                                        iterations=iteration + 1,
+                                        error_history=error_history,
+                                    )
+                                    if event_id:
+                                        self._metrics["experiences_published"] += 1
+                                        self.logger.info(f"Published improvement experience: {event_id}")
+                                except Exception as e:
+                                    self.logger.warning(f"Failed to publish experience: {e}")
 
                             return ImprovementResult(
                                 success=True,
@@ -881,6 +941,41 @@ class OuroborosEngine:
 
         return "\n".join(context_parts) if context_parts else ""
 
+    async def _generate_code_improvement(
+        self,
+        original_content: str,
+        goal: str,
+        error_log: Optional[str] = None,
+        context: Optional[str] = None,
+        constraints: Optional[List[str]] = None,
+    ) -> Tuple[str, str]:
+        """
+        Generate improved code using best available provider.
+
+        Returns:
+            (improved_code, provider_name)
+        """
+        # Use enhanced integration if available
+        if self._integration:
+            improved_code = await self._integration.generate_improvement(
+                original_code=original_content,
+                goal=goal,
+                error_log=error_log,
+                context=context,
+            )
+            if improved_code:
+                return improved_code, "integration"
+
+        # Fallback to legacy client
+        improved_code = await self._llm_client.generate_code_improvement(
+            original_code=original_content,
+            goal=goal,
+            error_log=error_log,
+            context=context,
+            constraints=constraints,
+        )
+        return improved_code, "legacy"
+
     async def _generate_single_candidate(
         self,
         request: ImprovementRequest,
@@ -891,13 +986,16 @@ class OuroborosEngine:
         """Generate a single improvement candidate."""
         error_log = error_history[-1] if error_history else None
 
-        improved_code = await self._llm_client.generate_code_improvement(
-            original_code=original_content,
+        improved_code, provider = await self._generate_code_improvement(
+            original_content=original_content,
             goal=request.goal,
             error_log=error_log,
             context=context,
             constraints=request.constraints,
         )
+
+        # Track provider usage
+        self._metrics["provider_used"][provider] = self._metrics["provider_used"].get(provider, 0) + 1
 
         change = CodeChange(
             file_path=request.target_file,
@@ -934,13 +1032,16 @@ class OuroborosEngine:
             ])
 
         async def generate_candidate(goal: str, idx: int) -> EvolutionCandidate:
-            improved_code = await self._llm_client.generate_code_improvement(
-                original_code=original_content,
+            improved_code, provider = await self._generate_code_improvement(
+                original_content=original_content,
                 goal=goal,
                 error_log=error_log,
                 context=context,
                 constraints=request.constraints,
             )
+
+            # Track provider usage
+            self._metrics["provider_used"][provider] = self._metrics["provider_used"].get(provider, 0) + 1
 
             change = CodeChange(
                 file_path=request.target_file,
@@ -999,13 +1100,16 @@ class OuroborosEngine:
             Try a variation of this approach that might work better.
             """
 
-            improved_code = await self._llm_client.generate_code_improvement(
-                original_code=original_content,
+            improved_code, provider = await self._generate_code_improvement(
+                original_content=original_content,
                 goal=mutation_prompt,
                 error_log=error_history[-1] if error_history else None,
                 context=context,
                 constraints=request.constraints,
             )
+
+            # Track provider usage
+            self._metrics["provider_used"][provider] = self._metrics["provider_used"].get(provider, 0) + 1
 
             change = CodeChange(
                 file_path=request.target_file,
@@ -1060,12 +1164,15 @@ class OuroborosEngine:
         Output only the final improved code.
         """
 
-        improved_code = await self._llm_client.generate_code_improvement(
-            original_code=original_content,
+        improved_code, provider = await self._generate_code_improvement(
+            original_content=original_content,
             goal=synthesis_prompt,
             context=context,
             constraints=request.constraints,
         )
+
+        # Track provider usage
+        self._metrics["provider_used"][provider] = self._metrics["provider_used"].get(provider, 0) + 1
 
         change = CodeChange(
             file_path=request.target_file,

@@ -605,6 +605,222 @@ class TestTrinityIPCHub:
 
 
 # =============================================================================
+# Trinity State Manager Tests (Category 2: State Management)
+# =============================================================================
+
+class TestTrinityStateManager:
+    """Test Trinity State Manager - All 8 state management gaps."""
+
+    @pytest.mark.asyncio
+    async def test_state_manager_initialization(self):
+        """Test state manager initializes correctly."""
+        from backend.core.trinity_state_manager import (
+            TrinityStateManager,
+            StateManagerConfig
+        )
+
+        config = StateManagerConfig()
+        manager = await TrinityStateManager.create(config, "test-node")
+
+        try:
+            assert manager._started is True
+            assert manager.node_id == "test-node"
+
+            metrics = manager.get_metrics()
+            assert "node_id" in metrics
+            assert "state_entries" in metrics
+        finally:
+            await manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_state_set_and_get(self):
+        """Test basic state operations."""
+        from backend.core.trinity_state_manager import (
+            TrinityStateManager,
+            StateManagerConfig,
+            StateNamespace
+        )
+
+        config = StateManagerConfig()
+        manager = await TrinityStateManager.create(config, "test-node")
+
+        try:
+            # Set a value
+            entry = await manager.set("test_key", "test_value", StateNamespace.SHARED)
+            assert entry.key == "test_key"
+            assert entry.value == "test_value"
+            assert entry.version == 1
+
+            # Get the value
+            value = await manager.get("test_key", StateNamespace.SHARED)
+            assert value == "test_value"
+
+            # Update the value
+            entry2 = await manager.set("test_key", "updated_value", StateNamespace.SHARED)
+            assert entry2.version == 2
+
+            # Get updated value
+            value2 = await manager.get("test_key", StateNamespace.SHARED)
+            assert value2 == "updated_value"
+        finally:
+            await manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_vector_clock(self):
+        """Test vector clock for conflict resolution."""
+        from backend.core.trinity_state_manager import VectorClock
+
+        clock1 = VectorClock()
+        clock1 = clock1.increment("node_a")
+        clock1 = clock1.increment("node_a")
+
+        clock2 = VectorClock()
+        clock2 = clock2.increment("node_b")
+
+        # clock1 and clock2 are concurrent (neither happened-before)
+        assert clock1.is_concurrent(clock2) is True
+
+        # Merge clocks
+        merged = clock1.merge(clock2)
+        assert merged.clocks["node_a"] == 2
+        assert merged.clocks["node_b"] == 1
+
+    @pytest.mark.asyncio
+    async def test_gcounter_crdt(self):
+        """Test grow-only counter CRDT."""
+        from backend.core.trinity_state_manager import GCounter
+
+        counter1 = GCounter()
+        counter1 = counter1.increment("node_a", 5)
+        counter1 = counter1.increment("node_a", 3)
+
+        counter2 = GCounter()
+        counter2 = counter2.increment("node_b", 4)
+
+        # Merge counters
+        merged = counter1.merge(counter2)
+        assert merged.value() == 12  # 8 (node_a) + 4 (node_b)
+
+    @pytest.mark.asyncio
+    async def test_state_versioning(self):
+        """Test state versioning and history (Gap 3)."""
+        from backend.core.trinity_state_manager import (
+            TrinityStateManager,
+            StateManagerConfig,
+            StateNamespace
+        )
+
+        config = StateManagerConfig()
+        config.enable_versioning = True
+        manager = await TrinityStateManager.create(config, "test-node")
+
+        try:
+            # Create multiple versions
+            await manager.set("versioned_key", "v1", StateNamespace.SHARED)
+            await manager.set("versioned_key", "v2", StateNamespace.SHARED)
+            await manager.set("versioned_key", "v3", StateNamespace.SHARED)
+
+            # Get history
+            history = await manager.get_history("versioned_key", StateNamespace.SHARED)
+            assert len(history) >= 3
+
+            # Rollback to version 1
+            entry = await manager.rollback("versioned_key", 1, StateNamespace.SHARED)
+            assert entry is not None
+            assert entry.value == "v1"
+        finally:
+            await manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_state_partitioning(self):
+        """Test state partitioning by namespace (Gap 6)."""
+        from backend.core.trinity_state_manager import (
+            TrinityStateManager,
+            StateManagerConfig,
+            StateNamespace
+        )
+
+        config = StateManagerConfig()
+        manager = await TrinityStateManager.create(config, "test-node")
+
+        try:
+            # Set values in different namespaces
+            await manager.set("key1", "jarvis_value", StateNamespace.JARVIS_BODY)
+            await manager.set("key1", "prime_value", StateNamespace.JARVIS_PRIME)
+            await manager.set("key1", "reactor_value", StateNamespace.REACTOR_CORE)
+
+            # Values should be independent
+            v1 = await manager.get("key1", StateNamespace.JARVIS_BODY)
+            v2 = await manager.get("key1", StateNamespace.JARVIS_PRIME)
+            v3 = await manager.get("key1", StateNamespace.REACTOR_CORE)
+
+            assert v1 == "jarvis_value"
+            assert v2 == "prime_value"
+            assert v3 == "reactor_value"
+        finally:
+            await manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_compression_engine(self):
+        """Test state compression (Gap 7)."""
+        from backend.core.trinity_state_manager import (
+            CompressionEngine,
+            CompressionType,
+            StateManagerConfig
+        )
+
+        config = StateManagerConfig()
+        config.compression_threshold = 100  # Low threshold for testing
+
+        engine = CompressionEngine(config)
+
+        # Create compressible data
+        data = b"x" * 1000  # 1KB of repetitive data
+
+        compressed, comp_type = engine.compress(data)
+
+        # Should be compressed
+        assert comp_type in (CompressionType.ZLIB, CompressionType.LZ4)
+        assert len(compressed) < len(data)
+
+        # Decompress
+        decompressed = engine.decompress(compressed, comp_type)
+        assert decompressed == data
+
+    @pytest.mark.asyncio
+    async def test_access_control(self):
+        """Test role-based access control (Gap 8)."""
+        from backend.core.trinity_state_manager import (
+            AccessController,
+            AccessLevel,
+            StateNamespace,
+            StateManagerConfig
+        )
+
+        config = StateManagerConfig()
+        controller = AccessController(config)
+
+        # Create read-only token
+        token = controller.create_token(
+            "test-node",
+            {StateNamespace.SHARED},
+            AccessLevel.READ
+        )
+
+        assert token.can_read(StateNamespace.SHARED) is True
+        assert token.can_write(StateNamespace.SHARED) is False
+
+        # Create admin token
+        admin_token = controller.create_token(
+            "admin-node",
+            {StateNamespace.SYSTEM},
+            AccessLevel.ADMIN
+        )
+
+        assert admin_token.can_admin(StateNamespace.SYSTEM) is True
+
+
+# =============================================================================
 # Run Tests
 # =============================================================================
 

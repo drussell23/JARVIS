@@ -2092,6 +2092,85 @@ class TrinityIPCHub:
             }
         }
 
+    def get_metrics(self) -> Dict[str, Any]:
+        """
+        Get comprehensive metrics for all IPC components.
+
+        Returns metrics for all 10 communication channels plus infrastructure.
+        """
+        return {
+            # Gap 1: Command Channel
+            "command_channel": {
+                "running": self._started,
+                "pending_requests": len(self.reactor._pending_requests) if hasattr(self.reactor, '_pending_requests') else 0,
+                "circuit_breaker_state": self.reactor._circuit_breaker.state.value if hasattr(self.reactor, '_circuit_breaker') else "unknown"
+            },
+
+            # Gap 2: Status Push
+            "status_push": {
+                "running": self._started,
+                "handlers_registered": len(self.status._handlers),
+                "history_size": len(self.status._status_history)
+            },
+
+            # Gap 3: Feedback Channel
+            "feedback_channel": {
+                "running": self.feedback._flush_task is not None if hasattr(self.feedback, '_flush_task') else False,
+                "buffer_size": len(self.feedback._feedback_buffer) if hasattr(self.feedback, '_feedback_buffer') else 0
+            },
+
+            # Gap 4: Training Pipeline
+            "training_pipeline": {
+                "initialized": self._started,
+                "interactions_buffered": len(self.pipeline._interaction_buffer) if hasattr(self.pipeline, '_interaction_buffer') else 0,
+                "batches_sent": getattr(self.pipeline, '_batches_sent', 0)
+            },
+
+            # Gap 5: Model Registry
+            "model_registry": {
+                "models_registered": len(self.models._models) if hasattr(self.models, '_models') else 0,
+                "watchers_active": 0
+            },
+
+            # Gap 6: Query Interface
+            "query_interface": {
+                "connected": self._started,
+                "queries_processed": getattr(self.query, '_queries_processed', 0)
+            },
+
+            # Gap 7: Event Stream
+            "event_stream": {
+                "running": self._started,
+                "subscribers": len(self.stream._subscribers) if hasattr(self.stream, '_subscribers') else 0
+            },
+
+            # Gap 8: RPC Layer
+            "rpc_layer": {
+                "running": self._started,
+                "pending_calls": len(self.rpc._pending_calls) if hasattr(self.rpc, '_pending_calls') else 0
+            },
+
+            # Gap 9: Event Bus
+            "event_bus": {
+                "running": self._started,
+                "topics": len(self.events._subscriptions) if hasattr(self.events, '_subscriptions') else 0,
+                "total_subscribers": sum(len(s) for s in self.events._subscriptions.values()) if hasattr(self.events, '_subscriptions') else 0
+            },
+
+            # Gap 10: Message Queue
+            "message_queue": {
+                "queues_active": len(self.queue._queues) if hasattr(self.queue, '_queues') else 0,
+                "messages_pending": sum(len(q) for q in self.queue._queues.values()) if hasattr(self.queue, '_queues') else 0,
+                "dead_letter_count": len(self.queue._dlq) if hasattr(self.queue, '_dlq') else 0
+            },
+
+            # Infrastructure
+            "message_bus": {
+                "running": self.bus._worker_task is not None if hasattr(self.bus, '_worker_task') else False,
+                "messages_processed": getattr(self.bus, '_messages_processed', 0)
+            }
+        }
+
 
 # =============================================================================
 # Convenience Functions
