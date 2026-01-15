@@ -140,6 +140,11 @@ class BridgeMetrics:
     files_processed: int = 0
     last_event_time: Optional[float] = None
     events_by_type: Dict[str, int] = field(default_factory=dict)
+    # Connection state metrics
+    event_bus_connected: bool = False
+    event_bus_last_check: Optional[float] = None
+    watchers_active: int = 0
+    cross_repo_connections: int = 0
 
 
 # =============================================================================
@@ -306,6 +311,14 @@ class TrinityBridgeAdapter:
             # ===== FALLBACK MODE: Use basic watchdog =====
             await self._start_fallback_watchers()
 
+        # Update watcher count in metrics
+        self._metrics.watchers_active = (
+            len(self._file_guards) if self._use_resilience else len(self._observers)
+        )
+
+        # ===== PROACTIVE EVENT BUS CONNECTION =====
+        await self._establish_event_bus_connection()
+
         # Start health monitoring task
         self._health_task = asyncio.create_task(
             self._health_monitor_loop(),
@@ -316,13 +329,85 @@ class TrinityBridgeAdapter:
         await self._process_existing_files()
 
         mode = "RESILIENT" if self._use_resilience else "FALLBACK"
-        watch_count = len(self._file_guards) if self._use_resilience else len(self._observers)
+        watch_count = self._metrics.watchers_active
 
         self.logger.info(
             f"TrinityBridgeAdapter v2.0 ready [{mode} mode] "
-            f"(watching {watch_count} directories)"
+            f"(watching {watch_count} directories, event_bus={self._metrics.event_bus_connected})"
         )
         return True
+
+    async def _establish_event_bus_connection(self) -> bool:
+        """
+        Proactively establish connection to TrinityEventBus.
+
+        This ensures the event bus is connected BEFORE we start processing events,
+        fixing the "Initialized but no connections" issue.
+        """
+        try:
+            # Import TrinityEventBus - try multiple function names for compatibility
+            event_bus = None
+            try:
+                from backend.core.trinity_event_bus import (
+                    get_trinity_event_bus,
+                    get_event_bus_if_exists,
+                    is_event_bus_running,
+                )
+                # Try to get existing bus first, then initialize if needed
+                event_bus = get_event_bus_if_exists()
+                if event_bus is None:
+                    event_bus = await get_trinity_event_bus()
+            except ImportError:
+                try:
+                    from core.trinity_event_bus import (
+                        get_trinity_event_bus,
+                        get_event_bus_if_exists,
+                    )
+                    event_bus = get_event_bus_if_exists()
+                    if event_bus is None:
+                        event_bus = await get_trinity_event_bus()
+                except ImportError:
+                    self.logger.warning("TrinityEventBus module not found")
+                    self._metrics.event_bus_connected = False
+                    return False
+
+            if event_bus:
+                self._metrics.event_bus_connected = True
+                self._metrics.event_bus_last_check = time.time()
+
+                # Subscribe to bridge heartbeat for keepalive
+                async def on_bridge_heartbeat(data: Dict[str, Any]):
+                    """Handle heartbeat events to maintain connection."""
+                    self._metrics.event_bus_last_check = time.time()
+
+                try:
+                    await event_bus.subscribe("bridge.heartbeat", on_bridge_heartbeat)
+                except Exception:
+                    pass  # Non-critical
+
+                # Check for cross-repo connections if available
+                if hasattr(event_bus, 'get_connection_count'):
+                    try:
+                        self._metrics.cross_repo_connections = await event_bus.get_connection_count()
+                    except Exception:
+                        self._metrics.cross_repo_connections = 0
+
+                # Check if multicast is enabled for cross-repo
+                if hasattr(event_bus, '_multicast_enabled'):
+                    if event_bus._multicast_enabled:
+                        self._metrics.cross_repo_connections += 1
+
+                self.logger.info("TrinityEventBus connection established")
+                return True
+            else:
+                self.logger.warning("TrinityEventBus not available")
+                self._metrics.event_bus_connected = False
+                return False
+
+        except Exception as e:
+            self.logger.error(f"Failed to establish event bus connection: {e}")
+            self._metrics.event_bus_connected = False
+            return False
 
     async def _start_resilient_watchers(self) -> None:
         """Start resilient file watchers using FileWatchGuard."""
@@ -410,8 +495,10 @@ class TrinityBridgeAdapter:
             try:
                 await asyncio.sleep(30.0)  # Check every 30 seconds
 
+                # ===== WATCHER HEALTH CHECK =====
                 if self._use_resilience:
                     # Check FileWatchGuard health
+                    healthy_guards = 0
                     for guard in self._file_guards:
                         if not guard.is_healthy:
                             self.logger.warning(
@@ -419,8 +506,12 @@ class TrinityBridgeAdapter:
                             )
                             await guard.stop()
                             await guard.start()
+                        else:
+                            healthy_guards += 1
+                    self._metrics.watchers_active = healthy_guards
                 else:
                     # Check watchdog observer health
+                    healthy_observers = 0
                     for observer in self._observers:
                         if not observer.is_alive():
                             self.logger.warning("Watchdog observer died, restarting...")
@@ -428,6 +519,13 @@ class TrinityBridgeAdapter:
                             await self._stop_fallback_watchers()
                             await self._start_fallback_watchers()
                             break
+                        else:
+                            healthy_observers += 1
+                    self._metrics.watchers_active = healthy_observers
+
+                # ===== EVENT BUS CONNECTION CHECK =====
+                # Re-check event bus connection periodically
+                await self._refresh_event_bus_connection()
 
                 # Reset error count on successful health check
                 self._consecutive_errors = 0
@@ -436,6 +534,61 @@ class TrinityBridgeAdapter:
                 break
             except Exception as e:
                 self.logger.error(f"Health monitor error: {e}")
+
+    async def _refresh_event_bus_connection(self) -> None:
+        """Refresh event bus connection status."""
+        try:
+            # Import TrinityEventBus - try multiple function names for compatibility
+            event_bus = None
+            try:
+                from backend.core.trinity_event_bus import (
+                    get_trinity_event_bus,
+                    get_event_bus_if_exists,
+                    is_event_bus_running,
+                )
+                # First check if event bus exists and is running
+                if is_event_bus_running():
+                    event_bus = get_event_bus_if_exists()
+                else:
+                    # Try to initialize if not running
+                    event_bus = await get_trinity_event_bus()
+            except ImportError:
+                try:
+                    from core.trinity_event_bus import (
+                        get_trinity_event_bus,
+                        get_event_bus_if_exists,
+                    )
+                    event_bus = get_event_bus_if_exists()
+                    if event_bus is None:
+                        event_bus = await get_trinity_event_bus()
+                except ImportError:
+                    self._metrics.event_bus_connected = False
+                    return
+
+            if event_bus:
+                self._metrics.event_bus_connected = True
+                self._metrics.event_bus_last_check = time.time()
+
+                # Update cross-repo connection count
+                if hasattr(event_bus, 'get_connection_count'):
+                    try:
+                        self._metrics.cross_repo_connections = await event_bus.get_connection_count()
+                    except Exception:
+                        pass
+
+                # Check multicast for cross-repo
+                if hasattr(event_bus, '_multicast_enabled'):
+                    if event_bus._multicast_enabled and self._metrics.cross_repo_connections == 0:
+                        self._metrics.cross_repo_connections = 1
+            else:
+                # Try to re-establish connection
+                self.logger.warning("Event bus disconnected, attempting reconnection...")
+                self._metrics.event_bus_connected = False
+                await self._establish_event_bus_connection()
+
+        except Exception as e:
+            self.logger.debug(f"Event bus refresh failed: {e}")
+            self._metrics.event_bus_connected = False
 
     async def stop(self) -> None:
         """Stop the bridge adapter."""
@@ -676,14 +829,29 @@ class TrinityBridgeAdapter:
     async def _dispatch_to_event_bus(self, event: Dict[str, Any]) -> None:
         """Dispatch event to TrinityEventBus."""
         try:
-            # Import TrinityEventBus
+            # Import TrinityEventBus - try multiple function names for compatibility
+            event_bus = None
             try:
-                from backend.core.trinity_event_bus import get_event_bus
+                from backend.core.trinity_event_bus import (
+                    get_trinity_event_bus,
+                    get_event_bus_if_exists,
+                )
+                event_bus = get_event_bus_if_exists()
+                if event_bus is None:
+                    event_bus = await get_trinity_event_bus()
             except ImportError:
-                from core.trinity_event_bus import get_event_bus
-
-            # Get event bus instance
-            event_bus = await get_event_bus()
+                try:
+                    from core.trinity_event_bus import (
+                        get_trinity_event_bus,
+                        get_event_bus_if_exists,
+                    )
+                    event_bus = get_event_bus_if_exists()
+                    if event_bus is None:
+                        event_bus = await get_trinity_event_bus()
+                except ImportError:
+                    self.logger.warning("TrinityEventBus module not found")
+                    self._metrics.event_bus_connected = False
+                    return
 
             if event_bus:
                 # Use publish_raw for dict events
@@ -691,17 +859,28 @@ class TrinityBridgeAdapter:
                     topic=f"reactor.{event.get('event_type', 'event')}",
                     data=event,
                 )
+                # Update connection status on successful dispatch
+                self._metrics.event_bus_connected = True
+                self._metrics.event_bus_last_check = time.time()
             else:
                 self.logger.warning("TrinityEventBus not available")
+                self._metrics.event_bus_connected = False
 
         except ImportError:
             self.logger.warning("TrinityEventBus module not found")
+            self._metrics.event_bus_connected = False
         except Exception as e:
             self.logger.error(f"EventBus dispatch failed: {e}")
+            self._metrics.event_bus_connected = False
             raise
 
     def get_metrics(self) -> Dict[str, Any]:
-        """Get bridge metrics including resilience status."""
+        """Get bridge metrics including resilience status and connection state."""
+        # Calculate active watchers count
+        watchers_active = (
+            len(self._file_guards) if self._use_resilience else len(self._observers)
+        )
+
         base_metrics = {
             "version": "2.0.0",
             "events_received": self._metrics.events_received,
@@ -714,6 +893,15 @@ class TrinityBridgeAdapter:
             "watch_dirs": [str(d) for d in self._watch_dirs],
             "consecutive_errors": self._consecutive_errors,
             "last_error": str(self._last_error) if self._last_error else None,
+            # ===== CONNECTION STATE METRICS (Required by run_supervisor.py) =====
+            "event_bus_connected": self._metrics.event_bus_connected,
+            "event_bus_last_check": self._metrics.event_bus_last_check,
+            "watchers_active": watchers_active,
+            "cross_repo_connections": self._metrics.cross_repo_connections,
+            # ===== WATCHED DIRECTORIES (for logging) =====
+            "reactor_events_dir": str(REACTOR_EVENTS_DIR),
+            "trinity_events_dir": str(TRINITY_EVENTS_DIR),
+            "cross_repo_events_dir": str(CROSS_REPO_EVENTS_DIR),
         }
 
         # Add resilience-specific metrics

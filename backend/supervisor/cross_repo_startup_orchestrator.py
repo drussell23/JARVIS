@@ -1,11 +1,11 @@
 """
-Cross-Repo Startup Orchestrator v3.0 - Enterprise-Grade Process Lifecycle Manager
+Cross-Repo Startup Orchestrator v3.1 - Enterprise-Grade Process Lifecycle Manager
 ===================================================================================
 
 Dynamic service discovery and self-healing process orchestration for JARVIS ecosystem.
 Eliminates hardcoded ports, implements auto-healing, and provides real-time process monitoring.
 
-Features (v3.0):
+Features (v3.1):
 - 🔍 Dynamic Service Discovery via Service Registry (zero hardcoded ports)
 - 🔄 Auto-Healing with exponential backoff (dead process detection & restart)
 - 📡 Real-Time Output Streaming (stdout/stderr prefixed per service)
@@ -13,10 +13,13 @@ Features (v3.0):
 - 🛡️ Graceful Shutdown Handlers (SIGINT/SIGTERM cleanup)
 - 🧹 Automatic Zombie Process Cleanup
 - 📊 Service Health Monitoring with heartbeats
+- 🐍 Module-based entry points (python -m module.path)
+- 🦄 Uvicorn support for FastAPI applications
+- 📁 Nested script path discovery
 
 Architecture:
     ┌──────────────────────────────────────────────────────────────────┐
-    │         Cross-Repo Orchestrator v3.0 - Process Manager           │
+    │         Cross-Repo Orchestrator v3.1 - Process Manager           │
     ├──────────────────────────────────────────────────────────────────┤
     │                                                                   │
     │  Service Registry: ~/.jarvis/registry/services.json              │
@@ -143,7 +146,11 @@ class ServiceStatus(Enum):
 
 @dataclass
 class ServiceDefinition:
-    """Definition of a service to manage."""
+    """
+    Definition of a service to manage.
+
+    v3.1: Added module_path and nested_scripts for advanced service discovery.
+    """
     name: str
     repo_path: Path
     script_name: str = "main.py"
@@ -152,6 +159,18 @@ class ServiceDefinition:
     health_endpoint: str = "/health"
     startup_timeout: float = 60.0
     environment: Dict[str, str] = field(default_factory=dict)
+
+    # v3.1: Module-based entry points (e.g., "reactor_core.api.server")
+    # When set, spawns with: python -m <module_path>
+    module_path: Optional[str] = None
+
+    # v3.1: Nested script paths to search (relative to repo_path)
+    # e.g., ["reactor_core/api/server.py", "src/main.py"]
+    nested_scripts: List[str] = field(default_factory=list)
+
+    # v3.1: Use uvicorn for FastAPI apps
+    use_uvicorn: bool = False
+    uvicorn_app: Optional[str] = None  # e.g., "reactor_core.api.server:app"
 
 
 @dataclass
@@ -271,32 +290,63 @@ class ProcessOrchestrator:
             ))
 
         if self.config.reactor_core_enabled:
+            # v3.1: Reactor-Core uses uvicorn with FastAPI server at reactor_core.api.server:app
             definitions.append(ServiceDefinition(
                 name="reactor-core",
                 repo_path=self.config.reactor_core_path,
                 script_name="main.py",
                 fallback_scripts=["server.py", "app.py"],
                 default_port=self.config.reactor_core_default_port,
-                health_endpoint="/api/health",
+                health_endpoint="/health",  # FastAPI default
                 startup_timeout=self.config.startup_timeout,
+                # v3.1: Use uvicorn for the FastAPI app
+                use_uvicorn=True,
+                uvicorn_app="reactor_core.api.server:app",
+                # Alternative: module-based entry
+                # module_path="reactor_core.api.server",
+                # Fallback nested scripts if uvicorn fails
+                nested_scripts=["reactor_core/api/server.py"],
             ))
 
         return definitions
 
     def _find_script(self, definition: ServiceDefinition) -> Optional[Path]:
-        """Find the startup script for a service."""
+        """
+        Find the startup script for a service.
+
+        v3.1: Enhanced discovery with nested script paths and module detection.
+
+        Search order:
+        1. Module path (returns None but module_path is used directly in spawn)
+        2. Uvicorn app (returns None but uvicorn is used in spawn)
+        3. Nested scripts (e.g., "reactor_core/api/server.py")
+        4. Root scripts (main.py, server.py, etc.)
+        """
         repo_path = definition.repo_path
 
         if not repo_path.exists():
             logger.warning(f"Repository not found: {repo_path}")
             return None
 
-        # Try main script first
+        # v3.1: If module_path or uvicorn_app is set, we don't need a script file
+        # The spawn method will handle these directly
+        if definition.module_path or definition.uvicorn_app:
+            logger.debug(f"Service {definition.name} uses module/uvicorn entry point")
+            return Path("__module__")  # Sentinel value
+
+        # v3.1: Try nested scripts first (more specific paths)
+        for nested in definition.nested_scripts:
+            script_path = repo_path / nested
+            if script_path.exists():
+                logger.debug(f"Found nested script: {script_path}")
+                return script_path
+
+        # Try main script in root
         script_path = repo_path / definition.script_name
         if script_path.exists():
             return script_path
 
-        # Try fallback scripts
+        # Try fallback scripts in root
         for fallback in definition.fallback_scripts:
             script_path = repo_path / fallback
             if script_path.exists():
@@ -500,6 +550,8 @@ class ProcessOrchestrator:
         """
         Spawn a service process using asyncio.create_subprocess_exec.
 
+        v3.1: Enhanced with module-based and uvicorn spawning support.
+
         Returns True if spawn and health check succeeded.
         """
         definition = managed.definition
@@ -511,7 +563,6 @@ class ProcessOrchestrator:
             return False
 
         managed.status = ServiceStatus.STARTING
-        logger.info(f"🚀 Spawning {definition.name} from {script_path}...")
 
         try:
             # Build environment
@@ -522,10 +573,32 @@ class ProcessOrchestrator:
             env["SERVICE_PORT"] = str(definition.default_port)
             env["SERVICE_NAME"] = definition.name
 
+            # v3.1: Build command based on entry point type
+            cmd: List[str] = []
+
+            if definition.use_uvicorn and definition.uvicorn_app:
+                # Uvicorn-based FastAPI app
+                cmd = [
+                    sys.executable, "-m", "uvicorn",
+                    definition.uvicorn_app,
+                    "--host", "0.0.0.0",
+                    "--port", str(definition.default_port),
+                ]
+                logger.info(f"🚀 Spawning {definition.name} via uvicorn: {definition.uvicorn_app}")
+
+            elif definition.module_path:
+                # Module-based entry point (python -m)
+                cmd = [sys.executable, "-m", definition.module_path]
+                logger.info(f"🚀 Spawning {definition.name} via module: {definition.module_path}")
+
+            else:
+                # Traditional script-based entry point
+                cmd = [sys.executable, str(script_path)]
+                logger.info(f"🚀 Spawning {definition.name} from script: {script_path}")
+
             # Spawn process
             managed.process = await asyncio.create_subprocess_exec(
-                sys.executable,
-                str(script_path),
+                *cmd,
                 cwd=str(definition.repo_path),
                 stdout=asyncio.subprocess.PIPE if self.config.stream_output else asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE if self.config.stream_output else asyncio.subprocess.DEVNULL,

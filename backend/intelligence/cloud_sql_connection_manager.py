@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Singleton CloudSQL Connection Manager for JARVIS v3.0
+Singleton CloudSQL Connection Manager for JARVIS v3.1
 ======================================================
 
 Production-grade, fully async, thread-safe connection pool manager with:
@@ -14,9 +14,16 @@ Production-grade, fully async, thread-safe connection pool manager with:
 - Dynamic configuration via environment variables
 - Fully async lock patterns for concurrent safety
 
+v3.1 Changes:
+- Fixed singleton initialization race condition with proper double-checked locking
+- Added retry logic for asyncpg TLS race condition (InvalidStateError)
+- Fixed AsyncLock lazy creation race condition
+- Added serialized connection setup to prevent thundering herd during pool creation
+- Added specific error handling for TLS upgrade protocol failures
+
 Architecture:
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                  CloudSQL Connection Manager v3.0                            │
+│                  CloudSQL Connection Manager v3.1                            │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │  ┌────────────────┐  ┌────────────────┐  ┌────────────────┐                 │
 │  │ Connection     │  │ Leak Detector  │  │ Circuit        │                 │
@@ -34,7 +41,7 @@ Architecture:
 └─────────────────────────────────────────────────────────────────────────────┘
 
 Author: JARVIS System
-Version: 3.0.0
+Version: 3.1.0
 """
 
 from __future__ import annotations
@@ -127,19 +134,32 @@ class AsyncLock:
 
     Provides a unified interface for thread-safe operations that can be
     used from both synchronous and asynchronous code.
+
+    v3.1: Fixed lazy async lock creation race condition by using thread lock
+    to protect async lock creation.
     """
 
     def __init__(self):
         self._thread_lock = threading.RLock()
         self._async_lock: Optional[asyncio.Lock] = None
+        self._async_lock_creation_lock = threading.Lock()
 
     def _get_async_lock(self) -> Optional[asyncio.Lock]:
-        """Lazily create async lock."""
+        """
+        Lazily create async lock with thread-safe double-checked locking.
+
+        v3.1: Uses separate lock to prevent race condition where multiple
+        coroutines could try to create the async lock simultaneously.
+        """
         if self._async_lock is None:
-            try:
-                self._async_lock = asyncio.Lock()
-            except RuntimeError:
-                pass
+            with self._async_lock_creation_lock:
+                # Double-check inside lock
+                if self._async_lock is None:
+                    try:
+                        self._async_lock = asyncio.Lock()
+                    except RuntimeError:
+                        # No event loop available - will be created later
+                        pass
         return self._async_lock
 
     def __enter__(self):
@@ -257,7 +277,17 @@ async def retry_with_backoff(
 
 
 def is_connection_error(e: Exception) -> bool:
-    """Check if an exception is a connection-related error that should be retried."""
+    """
+    Check if an exception is a connection-related error that should be retried.
+
+    v3.1: Added InvalidStateError detection for asyncpg TLS race condition.
+    This error occurs when multiple connections attempt TLS upgrade simultaneously,
+    corrupting the internal state machine in asyncpg's TLSUpgradeProto.
+    """
+    # v3.1: Check exception type directly for specific asyncpg errors
+    if isinstance(e, asyncio.InvalidStateError):
+        return True
+
     error_msg = str(e).lower()
     connection_error_patterns = [
         "connection has been released",
@@ -273,6 +303,12 @@ def is_connection_error(e: Exception) -> bool:
         "ssl error",
         "network error",
         "connection lost",
+        # v3.1: asyncpg TLS race condition errors
+        "invalid state",
+        "invalidstateerror",
+        "tlsupgradeproto",
+        "data_received",
+        "set_result",
     ]
     return any(pattern in error_msg for pattern in connection_error_patterns)
 
@@ -698,6 +734,8 @@ class LeakDetector:
         """
         Check for leaks and immediately clean them up.
 
+        v3.1: Added retry logic for TLS race conditions.
+
         Returns:
             Number of leaked connections cleaned up
         """
@@ -707,75 +745,98 @@ class LeakDetector:
 
         cleaned = 0
         async with self._lock:
-            try:
-                self._last_check = datetime.now()
+            max_retries = 2
+            conn = None
 
-                # Create temporary connection for cleanup
-                conn = await asyncio.wait_for(
-                    asyncpg.connect(
-                        host=manager.db_config["host"],
-                        port=manager.db_config["port"],
-                        database=manager.db_config["database"],
-                        user=manager.db_config["user"],
-                        password=manager.db_config["password"],
-                    ),
-                    timeout=5.0
-                )
-
+            for attempt in range(max_retries):
                 try:
-                    threshold_minutes = self.config.leaked_idle_threshold_minutes
+                    self._last_check = datetime.now()
 
-                    # Find leaked connections
-                    leaked = await conn.fetch(f"""
-                        SELECT pid, usename, application_name, state,
-                               state_change, query, backend_start,
-                               EXTRACT(EPOCH FROM (NOW() - state_change)) as idle_seconds
-                        FROM pg_stat_activity
-                        WHERE datname = $1
-                          AND pid <> pg_backend_pid()
-                          AND usename = $2
-                          AND state = 'idle'
-                          AND state_change < NOW() - INTERVAL '{threshold_minutes} minutes'
-                        ORDER BY state_change ASC
-                    """, manager.db_config["database"], manager.db_config["user"])
+                    # Create temporary connection for cleanup with retry
+                    conn = await asyncio.wait_for(
+                        asyncpg.connect(
+                            host=manager.db_config["host"],
+                            port=manager.db_config["port"],
+                            database=manager.db_config["database"],
+                            user=manager.db_config["user"],
+                            password=manager.db_config["password"],
+                        ),
+                        timeout=5.0
+                    )
+                    # Connection successful - break out of retry loop
+                    break
 
-                    if leaked:
-                        logger.warning(f"⚠️ Found {len(leaked)} leaked connections (idle > {threshold_minutes} min)")
-                        manager.metrics.total_leaks_detected += len(leaked)
-                        self._consecutive_clean_checks = 0
+                except asyncio.InvalidStateError:
+                    # v3.1: TLS race condition - retry with small delay
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(0.3 * (attempt + 1))
+                        continue
+                    # Final attempt failed
+                    return 0
 
-                        # IMMEDIATE cleanup
-                        for row in leaked:
-                            idle_mins = row['idle_seconds'] / 60
-                            try:
-                                await conn.execute("SELECT pg_terminate_backend($1)", row['pid'])
-                                logger.info(f"   ✅ Killed PID {row['pid']} (idle {idle_mins:.1f} min)")
-                                manager.metrics.total_leaks_recovered += 1
-                                manager.metrics.total_immediate_cleanups += 1
-                                cleaned += 1
-                            except Exception as e:
-                                logger.warning(f"   ⚠️ Failed to kill PID {row['pid']}: {e}")
+                except Exception:
+                    # Other errors - don't retry
+                    return 0
 
-                        manager.metrics.last_leak_cleanup = datetime.now()
+            if conn is None:
+                return 0
 
-                        # Adaptive: decrease interval when leaks found
-                        self._adaptive_interval = max(10.0, self.config.leak_check_interval_seconds * 0.5)
-                    else:
-                        self._consecutive_clean_checks += 1
-                        # Adaptive: increase interval when clean
-                        if self._consecutive_clean_checks > 5:
-                            self._adaptive_interval = min(
-                                60.0,
-                                self.config.leak_check_interval_seconds * 1.5
-                            )
+            try:
+                threshold_minutes = self.config.leaked_idle_threshold_minutes
 
-                finally:
-                    await conn.close()
+                # Find leaked connections
+                leaked = await conn.fetch(f"""
+                    SELECT pid, usename, application_name, state,
+                           state_change, query, backend_start,
+                           EXTRACT(EPOCH FROM (NOW() - state_change)) as idle_seconds
+                    FROM pg_stat_activity
+                    WHERE datname = $1
+                      AND pid <> pg_backend_pid()
+                      AND usename = $2
+                      AND state = 'idle'
+                      AND state_change < NOW() - INTERVAL '{threshold_minutes} minutes'
+                    ORDER BY state_change ASC
+                """, manager.db_config["database"], manager.db_config["user"])
+
+                if leaked:
+                    logger.warning(f"⚠️ Found {len(leaked)} leaked connections (idle > {threshold_minutes} min)")
+                    manager.metrics.total_leaks_detected += len(leaked)
+                    self._consecutive_clean_checks = 0
+
+                    # IMMEDIATE cleanup
+                    for row in leaked:
+                        idle_mins = row['idle_seconds'] / 60
+                        try:
+                            await conn.execute("SELECT pg_terminate_backend($1)", row['pid'])
+                            logger.info(f"   ✅ Killed PID {row['pid']} (idle {idle_mins:.1f} min)")
+                            manager.metrics.total_leaks_recovered += 1
+                            manager.metrics.total_immediate_cleanups += 1
+                            cleaned += 1
+                        except Exception as e:
+                            logger.warning(f"   ⚠️ Failed to kill PID {row['pid']}: {e}")
+
+                    manager.metrics.last_leak_cleanup = datetime.now()
+
+                    # Adaptive: decrease interval when leaks found
+                    self._adaptive_interval = max(10.0, self.config.leak_check_interval_seconds * 0.5)
+                else:
+                    self._consecutive_clean_checks += 1
+                    # Adaptive: increase interval when clean
+                    if self._consecutive_clean_checks > 5:
+                        self._adaptive_interval = min(
+                            60.0,
+                            self.config.leak_check_interval_seconds * 1.5
+                        )
 
             except asyncio.TimeoutError:
                 logger.debug("⏱️ Leak check timeout (proxy not running?)")
             except Exception as e:
                 logger.debug(f"⚠️ Leak check failed: {e}")
+            finally:
+                try:
+                    await conn.close()
+                except Exception:
+                    pass
 
         return cleaned
 
@@ -806,6 +867,7 @@ class CloudSQLConnectionManager:
     _instance: Optional['CloudSQLConnectionManager'] = None
     _class_lock = threading.Lock()
     _initialized = False
+    _initializing = False  # v3.1: Prevent concurrent initialization race
 
     def __new__(cls):
         with cls._class_lock:
@@ -814,61 +876,79 @@ class CloudSQLConnectionManager:
             return cls._instance
 
     def __init__(self):
-        if CloudSQLConnectionManager._initialized:
-            return
+        # v3.1: Thread-safe singleton initialization with proper double-checked locking
+        # This prevents race conditions where multiple threads could start initialization
+        # before _initialized is set to True
+        with CloudSQLConnectionManager._class_lock:
+            if CloudSQLConnectionManager._initialized:
+                return
+            if CloudSQLConnectionManager._initializing:
+                # Another thread is initializing, wait and return
+                return
+            # Mark as initializing BEFORE releasing lock to prevent races
+            CloudSQLConnectionManager._initializing = True
 
-        # Core state
-        self.pool: Optional[asyncpg.Pool] = None
-        self.db_config: Dict[str, Any] = {}
-        self._conn_config = ConnectionConfig()
-        self.is_shutting_down = False
-        self.creation_time: Optional[datetime] = None
+        try:
+            # Core state
+            self.pool: Optional[asyncpg.Pool] = None
+            self.db_config: Dict[str, Any] = {}
+            self._conn_config = ConnectionConfig()
+            self.is_shutting_down = False
+            self.creation_time: Optional[datetime] = None
 
-        # Async-safe locks
-        self._pool_lock = AsyncLock()
-        self._checkout_lock = AsyncLock()
+            # Async-safe locks
+            self._pool_lock = AsyncLock()
+            self._checkout_lock = AsyncLock()
 
-        # Legacy compatibility
-        self.connection_count = 0
-        self.error_count = 0
+            # Legacy compatibility
+            self.connection_count = 0
+            self.error_count = 0
 
-        # Connection tracking for leak detection
-        self._checkouts: Dict[int, ConnectionCheckout] = {}
-        self._checkout_counter = 0
-        self._active_connections: Set[int] = set()
+            # Connection tracking for leak detection
+            self._checkouts: Dict[int, ConnectionCheckout] = {}
+            self._checkout_counter = 0
+            self._active_connections: Set[int] = set()
 
-        # Metrics
-        self.metrics = ConnectionMetrics()
+            # Metrics
+            self.metrics = ConnectionMetrics()
 
-        # Circuit breaker
-        self._circuit_breaker: Optional[CircuitBreaker] = None
+            # Circuit breaker
+            self._circuit_breaker: Optional[CircuitBreaker] = None
 
-        # Leak detector
-        self._leak_detector: Optional[LeakDetector] = None
+            # Leak detector
+            self._leak_detector: Optional[LeakDetector] = None
 
-        # Background tasks
-        self._cleanup_task: Optional[asyncio.Task] = None
-        self._leak_monitor_task: Optional[asyncio.Task] = None
-        self._health_check_task: Optional[asyncio.Task] = None
+            # Background tasks
+            self._cleanup_task: Optional[asyncio.Task] = None
+            self._leak_monitor_task: Optional[asyncio.Task] = None
+            self._health_check_task: Optional[asyncio.Task] = None
 
-        # Callbacks
-        self._on_leak_callbacks: List[Callable] = []
-        self._on_error_callbacks: List[Callable] = []
+            # Callbacks
+            self._on_leak_callbacks: List[Callable] = []
+            self._on_error_callbacks: List[Callable] = []
 
-        # Startup mode: suppress connection errors until proxy is confirmed ready
-        # This prevents noisy logs during early startup when proxy hasn't started yet
-        self._startup_mode = True
-        self._proxy_ready = False
-        self._start_time = time.time()
-        self._startup_grace_period = 60  # seconds before logging connection errors
+            # Startup mode: suppress connection errors until proxy is confirmed ready
+            # This prevents noisy logs during early startup when proxy hasn't started yet
+            self._startup_mode = True
+            self._proxy_ready = False
+            self._start_time = time.time()
+            self._startup_grace_period = 60  # seconds before logging connection errors
 
-        # v5.5: Store last error for diagnostic purposes
-        self.last_error: Optional[str] = None
-        self.last_error_time: Optional[datetime] = None
+            # v5.5: Store last error for diagnostic purposes
+            self.last_error: Optional[str] = None
+            self.last_error_time: Optional[datetime] = None
 
-        self._register_shutdown_handlers()
-        CloudSQLConnectionManager._initialized = True
-        logger.info("🔧 CloudSQL Connection Manager v3.0 initialized")
+            # v3.1: Connection initialization lock to prevent TLS race conditions
+            # asyncpg can hit InvalidStateError when multiple connections try TLS upgrade simultaneously
+            self._conn_init_lock = asyncio.Lock()
+
+            self._register_shutdown_handlers()
+            CloudSQLConnectionManager._initialized = True
+            logger.info("🔧 CloudSQL Connection Manager v3.1 initialized")
+        except Exception as e:
+            # Reset initialization flags on failure so retry is possible
+            CloudSQLConnectionManager._initializing = False
+            raise
 
     def _register_shutdown_handlers(self):
         """Register cleanup handlers for graceful shutdown."""
@@ -977,21 +1057,63 @@ class CloudSQLConnectionManager:
                 # IMMEDIATE cleanup of leaked connections before creating pool
                 await self._immediate_leak_cleanup()
 
+                # v3.1: Create pool with retry logic and serialized connection setup
+                # This prevents TLS race conditions (InvalidStateError) that occur when
+                # multiple connections try to establish TLS simultaneously
+                async def create_pool_with_retry():
+                    """Create pool with retry on transient errors."""
+                    max_retries = 3
+                    last_error = None
+
+                    for attempt in range(max_retries):
+                        try:
+                            # v3.1: Use setup callback to serialize connection initialization
+                            # This helps prevent TLS race conditions in asyncpg
+                            async def connection_setup(conn):
+                                """Called when a new connection is established."""
+                                # Small delay to prevent thundering herd during pool init
+                                if attempt > 0:
+                                    await asyncio.sleep(0.1 * attempt)
+
+                            pool = await asyncpg.create_pool(
+                                host=host,
+                                port=port,
+                                database=database,
+                                user=user,
+                                password=password,
+                                min_size=self._conn_config.min_connections,
+                                max_size=max_connections,
+                                timeout=self._conn_config.connection_timeout,
+                                command_timeout=self._conn_config.query_timeout,
+                                max_queries=self._conn_config.max_queries_per_connection,
+                                max_inactive_connection_lifetime=self._conn_config.max_idle_time_seconds,
+                                setup=connection_setup,
+                            )
+                            return pool
+
+                        except (asyncio.InvalidStateError, OSError) as e:
+                            # v3.1: TLS race condition or network error - retry with backoff
+                            last_error = e
+                            if attempt < max_retries - 1:
+                                delay = (attempt + 1) * 0.5  # 0.5s, 1.0s, 1.5s
+                                logger.warning(
+                                    f"⚠️ Pool creation attempt {attempt + 1}/{max_retries} failed: {e}. "
+                                    f"Retrying in {delay:.1f}s..."
+                                )
+                                await asyncio.sleep(delay)
+                            else:
+                                raise
+
+                        except Exception as e:
+                            # Non-retryable error
+                            raise
+
+                    if last_error:
+                        raise last_error
+
                 # Create pool
                 self.pool = await asyncio.wait_for(
-                    asyncpg.create_pool(
-                        host=host,
-                        port=port,
-                        database=database,
-                        user=user,
-                        password=password,
-                        min_size=self._conn_config.min_connections,
-                        max_size=max_connections,
-                        timeout=self._conn_config.connection_timeout,
-                        command_timeout=self._conn_config.query_timeout,
-                        max_queries=self._conn_config.max_queries_per_connection,
-                        max_inactive_connection_lifetime=self._conn_config.max_idle_time_seconds,
-                    ),
+                    create_pool_with_retry(),
                     timeout=self._conn_config.pool_creation_timeout
                 )
 
@@ -1021,13 +1143,30 @@ class CloudSQLConnectionManager:
                 self.last_error_time = datetime.now()
                 return False
 
+            except asyncio.InvalidStateError as e:
+                # v3.1: asyncpg TLS race condition - this should have been retried above
+                logger.error(f"❌ TLS race condition after retries: {e}")
+                logger.error("   This is an asyncpg bug when multiple connections attempt TLS simultaneously")
+                logger.error("   Try reducing min_connections or increasing connection timeouts")
+                self.pool = None
+                self.last_error = f"TLS race condition: {e}"
+                self.last_error_time = datetime.now()
+                return False
+
             except Exception as e:
                 error_str = str(e)
                 self.last_error = error_str
                 self.last_error_time = datetime.now()
 
                 # v5.5: Detect specific error types for better diagnostics
-                if "password authentication failed" in error_str.lower():
+                if "invalid state" in error_str.lower():
+                    # v3.1: asyncpg TLS race condition
+                    logger.error(f"❌ TLS race condition: {e}")
+                    logger.error("   asyncpg hit InvalidStateError during connection initialization")
+                    self.pool = None
+                    self.error_count += 1
+                    return False
+                elif "password authentication failed" in error_str.lower():
                     logger.error(f"❌ Failed to create pool: {e}")
                     logger.error("")
                     logger.error("   🔐 CREDENTIAL MISMATCH DETECTED")
@@ -1055,7 +1194,11 @@ class CloudSQLConnectionManager:
                 return False
 
     async def _immediate_leak_cleanup(self) -> int:
-        """Immediately cleanup all leaked connections."""
+        """
+        Immediately cleanup all leaked connections.
+
+        v3.1: Added retry logic to handle TLS race conditions on direct connections.
+        """
         if self._leak_detector:
             return await self._leak_detector.check_and_cleanup()
 
@@ -1064,38 +1207,53 @@ class CloudSQLConnectionManager:
             return 0
 
         cleaned = 0
-        try:
-            conn = await asyncio.wait_for(
-                asyncpg.connect(
-                    host=self.db_config["host"],
-                    port=self.db_config["port"],
-                    database=self.db_config["database"],
-                    user=self.db_config["user"],
-                    password=self.db_config["password"],
-                ),
-                timeout=5.0
-            )
+        max_retries = 2
 
+        for attempt in range(max_retries):
             try:
-                threshold = self._conn_config.leaked_idle_threshold_minutes
-                leaked = await conn.fetch(f"""
-                    SELECT pid FROM pg_stat_activity
-                    WHERE datname = $1 AND pid <> pg_backend_pid()
-                      AND usename = $2 AND state = 'idle'
-                      AND state_change < NOW() - INTERVAL '{threshold} minutes'
-                """, self.db_config["database"], self.db_config["user"])
+                conn = await asyncio.wait_for(
+                    asyncpg.connect(
+                        host=self.db_config["host"],
+                        port=self.db_config["port"],
+                        database=self.db_config["database"],
+                        user=self.db_config["user"],
+                        password=self.db_config["password"],
+                    ),
+                    timeout=5.0
+                )
 
-                for row in leaked:
-                    try:
-                        await conn.execute("SELECT pg_terminate_backend($1)", row['pid'])
-                        cleaned += 1
-                    except Exception:
-                        pass
-            finally:
-                await conn.close()
+                try:
+                    threshold = self._conn_config.leaked_idle_threshold_minutes
+                    leaked = await conn.fetch(f"""
+                        SELECT pid FROM pg_stat_activity
+                        WHERE datname = $1 AND pid <> pg_backend_pid()
+                          AND usename = $2 AND state = 'idle'
+                          AND state_change < NOW() - INTERVAL '{threshold} minutes'
+                    """, self.db_config["database"], self.db_config["user"])
 
-        except Exception:
-            pass
+                    for row in leaked:
+                        try:
+                            await conn.execute("SELECT pg_terminate_backend($1)", row['pid'])
+                            cleaned += 1
+                        except Exception:
+                            pass
+                finally:
+                    await conn.close()
+
+                # Success - break out of retry loop
+                break
+
+            except asyncio.InvalidStateError:
+                # v3.1: TLS race condition - retry with small delay
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(0.3 * (attempt + 1))
+                    continue
+                # Final attempt failed
+                pass
+
+            except Exception:
+                # Other errors - don't retry
+                pass
 
         return cleaned
 

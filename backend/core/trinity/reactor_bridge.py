@@ -35,7 +35,7 @@ Architecture:
     └─────────────────────────────────────────────────────────────┘
 
 Author: Trinity System
-Version: 2.0.0
+Version: 2.1.0
 """
 
 from __future__ import annotations
@@ -444,19 +444,65 @@ class ReactorCoreReceiver:
         )
 
     async def start(self) -> None:
-        """Start watching for events."""
+        """
+        Start watching for events.
+
+        v2.1: Added guard against duplicate fsevents watches and graceful error handling.
+        Multiple components may try to watch the same directory, which causes
+        "Cannot add watch - it is already scheduled" errors on macOS fsevents.
+        """
+        if self._running:
+            logger.debug("ReactorCoreReceiver already running, skipping start")
+            return
+
         self._running = True
 
         # Process existing files
         await self._process_existing_files()
 
-        # Start file watcher
-        event_handler = _FileWatchHandler(self._on_file_created)
-        self._observer = Observer()
-        self._observer.schedule(event_handler, str(self._watch_dir), recursive=False)
-        self._observer.start()
+        # Stop any existing observer before creating a new one
+        if self._observer is not None:
+            try:
+                self._observer.stop()
+                self._observer.join(timeout=2)
+            except Exception:
+                pass
+            self._observer = None
 
-        logger.info(f"ReactorCoreReceiver started watching {self._watch_dir}")
+        # Start file watcher with graceful error handling
+        try:
+            event_handler = _FileWatchHandler(self._on_file_created)
+            self._observer = Observer()
+            self._observer.schedule(event_handler, str(self._watch_dir), recursive=False)
+            self._observer.start()
+            logger.info(f"ReactorCoreReceiver started watching {self._watch_dir}")
+        except RuntimeError as e:
+            if "already scheduled" in str(e):
+                # Another component is already watching this directory - that's OK
+                # We can share the directory watching through the other component
+                logger.warning(
+                    f"Directory {self._watch_dir} already being watched by another component. "
+                    "Using shared watch mode (events will still be processed via file polling)."
+                )
+                # Start a polling task as fallback
+                asyncio.create_task(self._fallback_poll_loop())
+            else:
+                raise
+
+    async def _fallback_poll_loop(self) -> None:
+        """Fallback polling loop when watchdog watch fails."""
+        logger.info("ReactorCoreReceiver using fallback polling mode")
+        poll_interval = FILE_WATCH_POLL_INTERVAL
+
+        while self._running:
+            try:
+                await self._process_existing_files()
+                await asyncio.sleep(poll_interval)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.debug(f"Poll loop error: {e}")
+                await asyncio.sleep(poll_interval)
 
     async def stop(self) -> None:
         """Stop watching for events."""

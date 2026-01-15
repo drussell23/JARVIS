@@ -5702,6 +5702,90 @@ class SupervisorBootstrapper:
             self.logger.info("[Phase 3.1] Resource Management disabled")
             print(f"  {TerminalUI.DIM}○ Resource Management: Disabled{TerminalUI.RESET}")
 
+        # ═══════════════════════════════════════════════════════════════════
+        # 5. Initialize Security System
+        # ═══════════════════════════════════════════════════════════════════
+        security_enabled = os.environ.get(
+            "JARVIS_SECURITY_ENABLED", "true"
+        ).lower() in ("1", "true", "yes")
+
+        if security_enabled:
+            try:
+                from backend.core.security import (
+                    initialize_security_supervisor,
+                    get_security_status,
+                )
+
+                result = await initialize_security_supervisor()
+
+                if result.success:
+                    self.logger.info(
+                        f"[Phase 3.1] ✅ Security System initialized: "
+                        f"{len(result.components_initialized)} components in {result.initialization_time_ms:.1f}ms"
+                    )
+                    print(f"  {TerminalUI.GREEN}✓ Security System: {len(result.components_initialized)} components{TerminalUI.RESET}")
+                else:
+                    self.logger.warning(
+                        f"[Phase 3.1] ⚠️ Security System degraded: {result.error_message}"
+                    )
+                    print(f"  {TerminalUI.YELLOW}⚠️ Security System: Degraded{TerminalUI.RESET}")
+                    if result.error_message:
+                        errors.append(result.error_message)
+
+            except ImportError as e:
+                self.logger.debug(f"[Phase 3.1] Security System not available: {e}")
+                print(f"  {TerminalUI.DIM}○ Security System: Not available{TerminalUI.RESET}")
+            except Exception as e:
+                error_msg = f"Security System init failed: {e}"
+                self.logger.warning(f"[Phase 3.1] {error_msg}")
+                print(f"  {TerminalUI.YELLOW}⚠️ Security System: {e}{TerminalUI.RESET}")
+                errors.append(error_msg)
+        else:
+            self.logger.info("[Phase 3.1] Security System disabled")
+            print(f"  {TerminalUI.DIM}○ Security System: Disabled{TerminalUI.RESET}")
+
+        # ═══════════════════════════════════════════════════════════════════
+        # 6. Initialize Configuration Management System
+        # ═══════════════════════════════════════════════════════════════════
+        config_mgmt_enabled = os.environ.get(
+            "JARVIS_CONFIG_MANAGEMENT_ENABLED", "true"
+        ).lower() in ("1", "true", "yes")
+
+        if config_mgmt_enabled:
+            try:
+                from backend.core.configuration import (
+                    initialize_config_supervisor,
+                    get_config_status,
+                )
+
+                result = await initialize_config_supervisor()
+
+                if result.success:
+                    self.logger.info(
+                        f"[Phase 3.1] ✅ Configuration Management initialized: "
+                        f"{len(result.components_initialized)} components in {result.initialization_time_ms:.1f}ms"
+                    )
+                    print(f"  {TerminalUI.GREEN}✓ Configuration Management: {len(result.components_initialized)} components{TerminalUI.RESET}")
+                else:
+                    self.logger.warning(
+                        f"[Phase 3.1] ⚠️ Configuration Management degraded: {result.error_message}"
+                    )
+                    print(f"  {TerminalUI.YELLOW}⚠️ Configuration Management: Degraded{TerminalUI.RESET}")
+                    if result.error_message:
+                        errors.append(result.error_message)
+
+            except ImportError as e:
+                self.logger.debug(f"[Phase 3.1] Configuration Management not available: {e}")
+                print(f"  {TerminalUI.DIM}○ Configuration Management: Not available{TerminalUI.RESET}")
+            except Exception as e:
+                error_msg = f"Configuration Management init failed: {e}"
+                self.logger.warning(f"[Phase 3.1] {error_msg}")
+                print(f"  {TerminalUI.YELLOW}⚠️ Configuration Management: {e}{TerminalUI.RESET}")
+                errors.append(error_msg)
+        else:
+            self.logger.info("[Phase 3.1] Configuration Management disabled")
+            print(f"  {TerminalUI.DIM}○ Configuration Management: Disabled{TerminalUI.RESET}")
+
         self.perf.end("enterprise_systems")
 
         # Report summary
@@ -5762,6 +5846,26 @@ class SupervisorBootstrapper:
             pass  # Not available
         except Exception as e:
             self.logger.debug(f"[Shutdown] Resource Management shutdown error (non-fatal): {e}")
+
+        # Shutdown Security System
+        try:
+            from backend.core.security import shutdown_security_supervisor
+            await shutdown_security_supervisor()
+            self.logger.info("[Shutdown] ✅ Security System shutdown complete")
+        except ImportError:
+            pass  # Not available
+        except Exception as e:
+            self.logger.debug(f"[Shutdown] Security shutdown error (non-fatal): {e}")
+
+        # Shutdown Configuration Management System
+        try:
+            from backend.core.configuration import shutdown_config_supervisor
+            await shutdown_config_supervisor()
+            self.logger.info("[Shutdown] ✅ Configuration Management shutdown complete")
+        except ImportError:
+            pass  # Not available
+        except Exception as e:
+            self.logger.debug(f"[Shutdown] Configuration Management shutdown error (non-fatal): {e}")
 
         self.logger.info("[Shutdown] Enterprise Systems shutdown complete")
 
