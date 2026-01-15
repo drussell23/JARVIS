@@ -790,8 +790,9 @@ class NativeSelfImprovement:
         self._rate_limiter: Optional[asyncio.Semaphore] = None
         self._last_request_time = 0.0
 
-        # Cached integration reference
-        self._integration = None
+        # Cached integration reference - Trinity is the preferred integration layer
+        self._trinity_integration = None
+        self._legacy_integration = None  # Fallback for older integration.py
         self._brain_orchestrator = None
 
     async def initialize(self) -> None:
@@ -806,19 +807,37 @@ class NativeSelfImprovement:
         for name in provider_names:
             self._circuit_breakers[name] = ImprovedCircuitBreaker(name)
 
-        # Connect to brain orchestrator if available
+        # Try Trinity Integration first (preferred - production-grade)
         try:
-            from backend.core.ouroboros.brain_orchestrator import get_brain_orchestrator
-            self._brain_orchestrator = get_brain_orchestrator()
-        except ImportError:
-            self.logger.warning("Brain orchestrator not available")
+            from backend.core.ouroboros.trinity_integration import (
+                get_trinity_integration,
+                initialize_trinity_integration,
+            )
+            self._trinity_integration = get_trinity_integration()
+            await initialize_trinity_integration()
+            self.logger.info("✅ Connected to Trinity Integration (production-grade)")
+        except ImportError as e:
+            self.logger.warning(f"Trinity Integration not available: {e}")
+        except Exception as e:
+            self.logger.warning(f"Trinity Integration init failed: {e}")
 
-        # Connect to integration layer if available
-        try:
-            from backend.core.ouroboros.integration import get_ouroboros_integration
-            self._integration = get_ouroboros_integration()
-        except ImportError:
-            self.logger.warning("Integration layer not available")
+        # Connect to brain orchestrator if available (fallback)
+        if not self._trinity_integration:
+            try:
+                from backend.core.ouroboros.brain_orchestrator import get_brain_orchestrator
+                self._brain_orchestrator = get_brain_orchestrator()
+                self.logger.info("✅ Connected to Brain Orchestrator (fallback)")
+            except ImportError:
+                self.logger.warning("Brain orchestrator not available")
+
+        # Connect to legacy integration layer if available (final fallback)
+        if not self._trinity_integration and not self._brain_orchestrator:
+            try:
+                from backend.core.ouroboros.integration import get_ouroboros_integration
+                self._legacy_integration = get_ouroboros_integration()
+                self.logger.info("✅ Connected to Legacy Integration (fallback)")
+            except ImportError:
+                self.logger.warning("Legacy integration layer not available")
 
         self._running = True
         self.logger.info("Native Self-Improvement Engine initialized")
@@ -1050,6 +1069,8 @@ class NativeSelfImprovement:
                     request.goal,
                     success=True,
                     iterations=iteration,
+                    provider_used=provider_used,
+                    duration_seconds=time.time() - start_time,
                 )
 
                 # Complete!
@@ -1098,25 +1119,37 @@ class NativeSelfImprovement:
         error_log: Optional[str],
         context: Optional[str],
     ) -> Tuple[Optional[str], str]:
-        """Generate improved code using available providers."""
+        """Generate improved code using available providers.
+
+        Provider hierarchy (graceful degradation):
+        1. Trinity Integration (preferred) - UnifiedModelServing + Neural Mesh
+        2. Brain Orchestrator - Direct Ollama/Provider access
+        3. Legacy Integration - Original integration.py
+        """
         # Build prompt
         prompt = self._build_improvement_prompt(original_code, goal, error_log, context)
+        system_prompt = (
+            "You are an expert Python developer. You improve code based on goals "
+            "and fix errors. Return ONLY valid Python code in ```python blocks."
+        )
 
-        # Try integration layer first
-        if self._integration:
+        # Strategy 1: Trinity Integration (preferred - production-grade)
+        if self._trinity_integration:
             try:
-                result = await self._integration.generate_improvement(
-                    original_code=original_code,
-                    goal=goal,
-                    error_log=error_log,
-                    context=context,
+                content, provider = await self._trinity_integration.generate_improvement(
+                    prompt=prompt,
+                    system_prompt=system_prompt,
+                    temperature=0.3,
+                    max_tokens=4096,
                 )
-                if result:
-                    return result, "integration"
+                if content:
+                    extracted = self._extract_code(content)
+                    if extracted:
+                        return extracted, f"trinity:{provider}"
             except Exception as e:
-                self.logger.warning(f"Integration layer failed: {e}")
+                self.logger.warning(f"Trinity Integration failed: {e}")
 
-        # Try brain orchestrator
+        # Strategy 2: Brain Orchestrator (fallback)
         if self._brain_orchestrator:
             provider = self._brain_orchestrator.get_best_provider()
             if provider and provider.is_healthy:
@@ -1128,9 +1161,25 @@ class NativeSelfImprovement:
                             prompt,
                         )
                         await circuit.record_success()
-                        return self._extract_code(result), provider.name
+                        extracted = self._extract_code(result)
+                        if extracted:
+                            return extracted, f"brain:{provider.name}"
                     except Exception as e:
                         await circuit.record_failure(str(e))
+
+        # Strategy 3: Legacy Integration (final fallback)
+        if self._legacy_integration:
+            try:
+                result = await self._legacy_integration.generate_improvement(
+                    original_code=original_code,
+                    goal=goal,
+                    error_log=error_log,
+                    context=context,
+                )
+                if result:
+                    return result, "legacy"
+            except Exception as e:
+                self.logger.warning(f"Legacy integration failed: {e}")
 
         return None, ""
 
@@ -1364,11 +1413,35 @@ class NativeSelfImprovement:
         goal: str,
         success: bool,
         iterations: int,
+        provider_used: str = "",
+        duration_seconds: float = 0.0,
     ) -> None:
-        """Publish improvement experience to Reactor Core."""
-        if self._integration:
+        """Publish improvement experience to Reactor Core.
+
+        Uses multi-channel publishing for reliability:
+        1. Trinity Integration (preferred) - CrossRepoExperienceForwarder + Neural Mesh
+        2. Legacy Integration (fallback) - Original integration.py
+        """
+        # Strategy 1: Trinity Integration (preferred - multi-channel)
+        if self._trinity_integration:
             try:
-                await self._integration.publish_experience(
+                await self._trinity_integration.publish_experience(
+                    original_code=original_code,
+                    improved_code=improved_code,
+                    goal=goal,
+                    success=success,
+                    iterations=iterations,
+                    provider_used=provider_used,
+                    duration_seconds=duration_seconds,
+                )
+                return  # Success - Trinity handles fallbacks internally
+            except Exception as e:
+                self.logger.warning(f"Trinity experience publish failed: {e}")
+
+        # Strategy 2: Legacy Integration (fallback)
+        if self._legacy_integration:
+            try:
+                await self._legacy_integration.publish_experience(
                     original_code=original_code,
                     improved_code=improved_code,
                     goal=goal,
@@ -1376,7 +1449,7 @@ class NativeSelfImprovement:
                     iterations=iterations,
                 )
             except Exception as e:
-                self.logger.warning(f"Failed to publish experience: {e}")
+                self.logger.warning(f"Legacy experience publish failed: {e}")
 
     def _generate_diff(self, original: str, modified: str) -> str:
         """Generate a simple diff."""
@@ -1391,7 +1464,7 @@ class NativeSelfImprovement:
 
     def get_status(self) -> Dict[str, Any]:
         """Get engine status."""
-        return {
+        status = {
             "running": self._running,
             "active_tasks": len(self._active_tasks),
             "metrics": self._metrics.snapshot(),
@@ -1399,7 +1472,21 @@ class NativeSelfImprovement:
                 name: cb.get_status()
                 for name, cb in self._circuit_breakers.items()
             },
+            "integration": {
+                "trinity_available": self._trinity_integration is not None,
+                "brain_orchestrator_available": self._brain_orchestrator is not None,
+                "legacy_integration_available": self._legacy_integration is not None,
+            },
         }
+
+        # Add Trinity Integration status if available
+        if self._trinity_integration:
+            try:
+                status["trinity"] = self._trinity_integration.get_status()
+            except Exception:
+                status["trinity"] = {"error": "Unable to retrieve status"}
+
+        return status
 
 
 # =============================================================================

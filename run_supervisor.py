@@ -3942,6 +3942,7 @@ class SupervisorBootstrapper:
         self._native_self_improvement = None  # v107.0: Native Self-Improvement (Motor Function)
         self._neural_mesh = None  # v107.0: Cross-Repo Neural Mesh
         self._ouroboros_ui_controller = None  # v107.0: UI Integration
+        self._ouroboros_trinity = None  # v107.0: Trinity Integration (Unified Layer)
 
         # v85.0: Unified State Coordination - Atomic locks with process cookies
         # - Prevents race conditions between run_supervisor.py and start_system.py
@@ -8055,6 +8056,21 @@ class SupervisorBootstrapper:
                 self.logger.warning("⚠️ UI Integration shutdown timed out")
             except Exception as e:
                 self.logger.warning(f"⚠️ UI Integration cleanup error: {e}")
+
+        # v107.0: Shutdown Trinity Integration (unified layer)
+        if self._ouroboros_trinity is not None:
+            try:
+                from backend.core.ouroboros.trinity_integration import shutdown_trinity_integration
+                await asyncio.wait_for(
+                    shutdown_trinity_integration(),
+                    timeout=10.0
+                )
+                self._ouroboros_trinity = None
+                self.logger.info("✅ Trinity Integration shutdown complete")
+            except asyncio.TimeoutError:
+                self.logger.warning("⚠️ Trinity Integration shutdown timed out")
+            except Exception as e:
+                self.logger.warning(f"⚠️ Trinity Integration cleanup error: {e}")
 
         # v107.0: Shutdown Neural Mesh
         if self._neural_mesh is not None:
@@ -13376,11 +13392,38 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
                     connect_ouroboros_ui,
                 )
                 self._ouroboros_ui_controller = await connect_ouroboros_ui()
-                print(f"  {TerminalUI.GREEN}    └─ UI Integration: Ready (Progress Broadcasting){TerminalUI.RESET}")
+                print(f"  {TerminalUI.GREEN}    ├─ UI Integration: Ready (Progress Broadcasting){TerminalUI.RESET}")
                 self.logger.info("[v107.0] ✅ Ouroboros UI Integration connected")
             except Exception as e:
                 self._ouroboros_ui_controller = None
                 self.logger.warning(f"[v107.0] ⚠️ UI integration unavailable: {e}")
+
+            # v107.0: Initialize Trinity Integration (Unified Layer)
+            try:
+                from backend.core.ouroboros.trinity_integration import (
+                    get_trinity_integration,
+                    initialize_trinity_integration,
+                )
+                self._ouroboros_trinity = get_trinity_integration()
+                trinity_ok = await initialize_trinity_integration()
+                if trinity_ok:
+                    print(f"  {TerminalUI.GREEN}    └─ Trinity Integration: Ready (Unified Layer){TerminalUI.RESET}")
+                    self.logger.info("[v107.0] ✅ Trinity Integration initialized")
+
+                    # Log Trinity health status
+                    trinity_status = self._ouroboros_trinity.get_status()
+                    health = trinity_status.get("health", {})
+                    overall_health = health.get("overall", "unknown")
+                    self.logger.info(f"[v107.0] Trinity health: {overall_health}")
+                    for comp, status in health.get("components", {}).items():
+                        status_icon = "✅" if status == "healthy" else ("⚠️" if status == "degraded" else "❌")
+                        self.logger.info(f"[v107.0]   {status_icon} {comp}: {status}")
+                else:
+                    print(f"  {TerminalUI.YELLOW}    └─ Trinity Integration: Degraded mode{TerminalUI.RESET}")
+                    self.logger.warning("[v107.0] ⚠️ Trinity Integration running in degraded mode")
+            except Exception as e:
+                self._ouroboros_trinity = None
+                self.logger.warning(f"[v107.0] ⚠️ Trinity Integration unavailable: {e}")
 
             # Note about auto-improvement
             if self._ouroboros_auto_improve:

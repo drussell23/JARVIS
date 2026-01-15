@@ -191,6 +191,19 @@ from backend.core.ouroboros.neural_mesh import (
     shutdown_neural_mesh,
 )
 
+from backend.core.ouroboros.trinity_integration import (
+    TrinityIntegration,
+    TrinityModelClient,
+    TrinityExperiencePublisher,
+    TrinityHealthMonitor,
+    TrinityConfig,
+    ComponentHealth,
+    HealthStatus,
+    get_trinity_integration,
+    initialize_trinity_integration,
+    shutdown_trinity_integration,
+)
+
 __all__ = [
     # Core Engine
     "OuroborosEngine",
@@ -302,4 +315,15 @@ __all__ = [
     "get_neural_mesh",
     "initialize_neural_mesh",
     "shutdown_neural_mesh",
+    # Trinity Integration (Unified Layer)
+    "TrinityIntegration",
+    "TrinityModelClient",
+    "TrinityExperiencePublisher",
+    "TrinityHealthMonitor",
+    "TrinityConfig",
+    "ComponentHealth",
+    "HealthStatus",
+    "get_trinity_integration",
+    "initialize_trinity_integration",
+    "shutdown_trinity_integration",
 ]
