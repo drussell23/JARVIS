@@ -433,6 +433,178 @@ class TestFullPipeline:
 
 
 # =============================================================================
+# Trinity IPC Hub Tests
+# =============================================================================
+
+class TestTrinityIPCHub:
+    """Tests for the Trinity IPC Hub v4.0."""
+
+    @pytest.fixture
+    def temp_ipc_dir(self, tmp_path):
+        """Create a temporary IPC directory."""
+        return tmp_path / "trinity" / "ipc"
+
+    @pytest.mark.asyncio
+    async def test_ipc_hub_initialization(self, temp_ipc_dir):
+        """Test IPC Hub initialization."""
+        from backend.core.trinity_ipc_hub import TrinityIPCHub, TrinityIPCConfig
+
+        config = TrinityIPCConfig(ipc_base_dir=temp_ipc_dir)
+        hub = TrinityIPCHub(config)
+
+        await hub.start()
+
+        # Verify hub is started
+        health = await hub.get_health()
+        assert health["status"] == "healthy"
+
+        await hub.stop()
+
+    @pytest.mark.asyncio
+    async def test_model_registry(self, temp_ipc_dir):
+        """Test model registry (Gap 5)."""
+        from backend.core.trinity_ipc_hub import TrinityIPCHub, TrinityIPCConfig
+
+        config = TrinityIPCConfig(ipc_base_dir=temp_ipc_dir)
+        hub = TrinityIPCHub(config)
+        await hub.start()
+
+        # Register a model
+        model = await hub.models.register_model(
+            model_id="test-model-v1",
+            version="1.0.0",
+            model_type="test",
+            capabilities=["test_capability"],
+            metrics={"accuracy": 0.95}
+        )
+
+        assert model.model_id == "test-model-v1"
+        assert model.version == "1.0.0"
+
+        # List models
+        models = await hub.models.list_models()
+        assert len(models) == 1
+
+        # Find best model
+        best = await hub.models.find_best_model("test", "accuracy")
+        assert best.model_id == "test-model-v1"
+
+        await hub.stop()
+
+    @pytest.mark.asyncio
+    async def test_event_bus(self, temp_ipc_dir):
+        """Test Pub/Sub event bus (Gap 9)."""
+        from backend.core.trinity_ipc_hub import TrinityIPCHub, TrinityIPCConfig
+
+        config = TrinityIPCConfig(ipc_base_dir=temp_ipc_dir)
+        hub = TrinityIPCHub(config)
+        await hub.start()
+
+        received_events = []
+
+        async def handler(event):
+            received_events.append(event)
+
+        # Subscribe to events
+        unsubscribe = hub.events.subscribe("test.*", handler)
+
+        # Publish event
+        await hub.events.publish("test.event", {"data": "hello"})
+
+        # Wait for event delivery
+        await asyncio.sleep(0.1)
+
+        assert len(received_events) == 1
+        assert received_events[0].topic == "test.event"
+
+        unsubscribe()
+        await hub.stop()
+
+    @pytest.mark.asyncio
+    async def test_message_queue(self, temp_ipc_dir):
+        """Test reliable message queue (Gap 10)."""
+        from backend.core.trinity_ipc_hub import (
+            TrinityIPCHub,
+            TrinityIPCConfig,
+            DeliveryGuarantee
+        )
+
+        config = TrinityIPCConfig(ipc_base_dir=temp_ipc_dir)
+        hub = TrinityIPCHub(config)
+        await hub.start()
+
+        # Enqueue a message
+        msg_id = await hub.queue.enqueue(
+            "test_queue",
+            {"task": "process_data"},
+            delivery=DeliveryGuarantee.AT_LEAST_ONCE
+        )
+
+        assert msg_id is not None
+
+        # Dequeue the message
+        message = await hub.queue.dequeue("test_queue", timeout=1.0)
+        assert message is not None
+
+        # Acknowledge
+        await hub.queue.ack(message.message_id)
+
+        # Queue should be empty now
+        empty_msg = await hub.queue.dequeue("test_queue", timeout=0.1)
+        assert empty_msg is None
+
+        await hub.stop()
+
+    @pytest.mark.asyncio
+    async def test_training_pipeline(self, temp_ipc_dir):
+        """Test training data pipeline (Gap 4)."""
+        from backend.core.trinity_ipc_hub import TrinityIPCHub, TrinityIPCConfig
+
+        config = TrinityIPCConfig(ipc_base_dir=temp_ipc_dir)
+        hub = TrinityIPCHub(config)
+        await hub.start()
+
+        # Submit training interaction
+        await hub.pipeline.submit_interaction(
+            user_input="Hello, how are you?",
+            assistant_response="I'm doing well, thank you!",
+            reward=1.0,
+            model_type="general"
+        )
+
+        # Check pipeline stats
+        stats = await hub.pipeline.get_pipeline_stats()
+        assert stats["buffer_size"] == 1
+
+        await hub.stop()
+
+    @pytest.mark.asyncio
+    async def test_circuit_breaker(self):
+        """Test circuit breaker resilience pattern."""
+        from backend.core.trinity_ipc_hub import CircuitBreaker, CircuitOpenError
+
+        breaker = CircuitBreaker(threshold=3, timeout=1.0)
+
+        # Initially closed
+        assert await breaker.can_execute() is True
+
+        # Record failures to open circuit
+        await breaker.record_failure()
+        await breaker.record_failure()
+        await breaker.record_failure()
+
+        # Circuit should be open
+        assert breaker.is_open is True
+        assert await breaker.can_execute() is False
+
+        # Wait for timeout
+        await asyncio.sleep(1.1)
+
+        # Should be half-open now
+        assert await breaker.can_execute() is True
+
+
+# =============================================================================
 # Run Tests
 # =============================================================================
 

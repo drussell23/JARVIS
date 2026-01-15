@@ -224,6 +224,37 @@ class ProcessOrchestrator:
                 logger.warning("Service registry not available")
         return self._registry
 
+    def add_service(self, definition: ServiceDefinition) -> None:
+        """
+        Add a service definition to the orchestrator.
+
+        This allows dynamic addition of services beyond the default configuration.
+
+        Args:
+            definition: Service definition to add
+        """
+        if definition.name in self.processes:
+            logger.warning(f"Service {definition.name} already exists, updating definition")
+
+        self.processes[definition.name] = ManagedProcess(definition=definition)
+        logger.debug(f"Added service: {definition.name}")
+
+    def remove_service(self, name: str) -> bool:
+        """
+        Remove a service from the orchestrator.
+
+        Args:
+            name: Service name to remove
+
+        Returns:
+            True if service was removed
+        """
+        if name in self.processes:
+            del self.processes[name]
+            logger.debug(f"Removed service: {name}")
+            return True
+        return False
+
     def _get_service_definitions(self) -> List[ServiceDefinition]:
         """Get service definitions based on configuration."""
         definitions = []
