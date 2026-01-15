@@ -59,9 +59,9 @@ logger = logging.getLogger("Ouroboros.CrossRepo")
 class CrossRepoConfig:
     """Cross-repository configuration."""
 
-    # Repository paths
+    # Repository paths - CRITICAL: Each repo must point to its correct location
     JARVIS_REPO = Path(os.getenv("JARVIS_REPO", Path.home() / "Documents/repos/JARVIS-AI-Agent"))
-    PRIME_REPO = Path(os.getenv("PRIME_REPO", Path.home() / "Documents/repos/JARVIS-AI-Agent"))
+    PRIME_REPO = Path(os.getenv("PRIME_REPO", Path.home() / "Documents/repos/jarvis-prime"))
     REACTOR_REPO = Path(os.getenv("REACTOR_REPO", Path.home() / "Documents/repos/reactor-core"))
 
     # Event bus configuration
@@ -350,6 +350,117 @@ class RepoConnector:
     def get_state(self) -> RepoState:
         """Get current repository state."""
         return self._state
+
+    async def pull_changes(self) -> Tuple[bool, Optional[str]]:
+        """
+        Pull latest changes from remote.
+
+        Returns (success, error_message).
+        """
+        try:
+            result = await asyncio.create_subprocess_exec(
+                "git", "pull", "--ff-only",
+                cwd=self.path,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(result.communicate(), timeout=30.0)
+
+            if result.returncode == 0:
+                self._state.last_sync = time.time()
+                return True, None
+            else:
+                return False, stderr.decode().strip()
+
+        except asyncio.TimeoutError:
+            return False, "Pull operation timed out"
+        except Exception as e:
+            return False, str(e)
+
+    async def push_changes(self, message: str = "Auto-sync from Ouroboros") -> Tuple[bool, Optional[str]]:
+        """
+        Commit and push pending changes.
+
+        Returns (success, error_message).
+        """
+        try:
+            # Check for changes
+            status_result = await asyncio.create_subprocess_exec(
+                "git", "status", "--porcelain",
+                cwd=self.path,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await status_result.communicate()
+
+            if not stdout.strip():
+                # No changes to push
+                return True, None
+
+            # Add all changes
+            add_result = await asyncio.create_subprocess_exec(
+                "git", "add", "-A",
+                cwd=self.path,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await add_result.communicate()
+
+            # Commit
+            commit_result = await asyncio.create_subprocess_exec(
+                "git", "commit", "-m", message,
+                cwd=self.path,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await commit_result.communicate()
+
+            if commit_result.returncode != 0:
+                return False, f"Commit failed: {stderr.decode()}"
+
+            # Push
+            push_result = await asyncio.create_subprocess_exec(
+                "git", "push",
+                cwd=self.path,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(push_result.communicate(), timeout=60.0)
+
+            if push_result.returncode == 0:
+                self._state.last_sync = time.time()
+                return True, None
+            else:
+                return False, f"Push failed: {stderr.decode()}"
+
+        except asyncio.TimeoutError:
+            return False, "Push operation timed out"
+        except Exception as e:
+            return False, str(e)
+
+    async def sync_file(
+        self,
+        relative_path: str,
+        target_connector: "RepoConnector"
+    ) -> Tuple[bool, Optional[str]]:
+        """
+        Sync a specific file to another repository.
+
+        Returns (success, error_message).
+        """
+        try:
+            content = await self.get_file_content(relative_path)
+            if content is None:
+                return False, f"Source file not found: {relative_path}"
+
+            success = await target_connector.write_file_content(relative_path, content)
+            if success:
+                return True, None
+            else:
+                return False, "Failed to write to target repository"
+
+        except Exception as e:
+            return False, str(e)
 
 
 # =============================================================================

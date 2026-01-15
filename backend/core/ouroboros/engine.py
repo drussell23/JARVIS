@@ -136,6 +136,14 @@ class ValidationStatus(Enum):
     ERROR = "error"
 
 
+class CodeChangeType(Enum):
+    """Type of code change - supports file creation as a first-class operation."""
+    MODIFICATION = "modification"  # Modify existing file
+    CREATION = "creation"          # Create new file from scratch
+    DELETION = "deletion"          # Delete file (rare, requires confirmation)
+    RENAME = "rename"              # Rename/move file
+
+
 # =============================================================================
 # DATA STRUCTURES
 # =============================================================================
@@ -161,30 +169,134 @@ class ImprovementRequest:
 
 
 @dataclass
+class FileCreationRequest:
+    """
+    Request for creating a new file from scratch.
+
+    This is a first-class operation in Ouroboros v2.0, enabling JARVIS to:
+    - Generate complete new files based on natural language descriptions
+    - Create files with proper structure, imports, and documentation
+    - Optionally generate accompanying test files
+    - Validate against existing codebase patterns
+    """
+    target_path: Path  # Where to create the file
+    description: str   # Natural language description of what to create
+    file_type: str = "python"  # python, javascript, typescript, etc.
+    template_hints: List[str] = field(default_factory=list)  # Patterns to follow
+    reference_files: List[Path] = field(default_factory=list)  # Files to use as reference
+    generate_tests: bool = True  # Generate accompanying test file
+    validate_imports: bool = True  # Verify all imports are available
+    follow_project_style: bool = True  # Match existing code style
+    parent_module: Optional[str] = None  # If part of a package, the parent module
+    exports: List[str] = field(default_factory=list)  # Functions/classes to export
+    strategy: EvolutionStrategy = EvolutionStrategy.PARALLEL_PATHS
+
+    def __post_init__(self):
+        self.target_path = Path(self.target_path)
+        self.reference_files = [Path(f) for f in self.reference_files]
+
+    @property
+    def target_dir(self) -> Path:
+        """Get the directory where the file will be created."""
+        return self.target_path.parent
+
+    @property
+    def filename(self) -> str:
+        """Get the filename without path."""
+        return self.target_path.name
+
+    @property
+    def module_name(self) -> str:
+        """Get the Python module name from the filename."""
+        return self.target_path.stem
+
+
+@dataclass
+class MultiFileRequest:
+    """
+    Request for orchestrated changes across multiple files.
+
+    Enables atomic multi-file operations with rollback capability.
+    """
+    files: List[Union[ImprovementRequest, FileCreationRequest]]
+    description: str
+    atomic: bool = True  # All succeed or all fail
+    parallel: bool = True  # Process files in parallel where possible
+    dependency_order: bool = True  # Respect file dependencies
+
+
+@dataclass
 class CodeChange:
-    """Represents a code change."""
+    """
+    Represents a code change with support for file creation, modification, and deletion.
+
+    This is the core data structure for tracking all file operations in Ouroboros.
+    File creation is now a first-class operation, enabling JARVIS to write new files from scratch.
+    """
     file_path: Path
-    original_content: str
+    original_content: str  # Empty string for new file creation
     modified_content: str
+    change_type: CodeChangeType = CodeChangeType.MODIFICATION
     diff: str = ""
     line_changes: int = 0
     semantic_description: str = ""
     timestamp: float = field(default_factory=time.time)
+    # For rename operations
+    new_path: Optional[Path] = None
+    # Directory creation tracking
+    directories_created: List[Path] = field(default_factory=list)
+    # Validation metadata
+    ast_valid: bool = False
+    imports_valid: bool = False
+    symbols_resolved: bool = False
+
+    @property
+    def is_creation(self) -> bool:
+        """Check if this is a file creation operation."""
+        return self.change_type == CodeChangeType.CREATION
+
+    @property
+    def is_modification(self) -> bool:
+        """Check if this is a file modification operation."""
+        return self.change_type == CodeChangeType.MODIFICATION
 
     def compute_diff(self) -> str:
         """Compute unified diff between original and modified."""
         import difflib
-        original_lines = self.original_content.splitlines(keepends=True)
-        modified_lines = self.modified_content.splitlines(keepends=True)
-        diff = difflib.unified_diff(
-            original_lines,
-            modified_lines,
-            fromfile=f"a/{self.file_path.name}",
-            tofile=f"b/{self.file_path.name}",
-        )
+
+        if self.is_creation:
+            # For new files, show as addition from /dev/null
+            original_lines = []
+            modified_lines = self.modified_content.splitlines(keepends=True)
+            diff = difflib.unified_diff(
+                original_lines,
+                modified_lines,
+                fromfile="/dev/null",
+                tofile=f"b/{self.file_path.name}",
+            )
+        else:
+            original_lines = self.original_content.splitlines(keepends=True)
+            modified_lines = self.modified_content.splitlines(keepends=True)
+            diff = difflib.unified_diff(
+                original_lines,
+                modified_lines,
+                fromfile=f"a/{self.file_path.name}",
+                tofile=f"b/{self.file_path.name}",
+            )
+
         self.diff = "".join(diff)
-        self.line_changes = abs(len(modified_lines) - len(original_lines))
+        self.line_changes = len(modified_lines) - len(original_lines) if not self.is_creation else len(modified_lines)
         return self.diff
+
+    def validate_syntax(self) -> Tuple[bool, Optional[str]]:
+        """Validate Python syntax of the modified content."""
+        try:
+            ast.parse(self.modified_content)
+            self.ast_valid = True
+            return True, None
+        except SyntaxError as e:
+            self.ast_valid = False
+            return False, f"Syntax error at line {e.lineno}: {e.msg}"
 
 
 @dataclass
@@ -820,7 +932,18 @@ class OuroborosEngine:
         # State
         self._running = False
         self._current_request: Optional[ImprovementRequest] = None
-        self._lock = asyncio.Lock()
+
+        # Per-file locking instead of global lock for parallel file operations
+        # This allows simultaneous improvements to different files
+        self._file_locks: Dict[Path, asyncio.Lock] = {}
+        self._file_locks_lock = asyncio.Lock()  # Lock for the locks dictionary itself
+
+        # Task management for parallel operations
+        self._active_tasks: Dict[str, asyncio.Task] = {}
+        self._task_semaphore = asyncio.Semaphore(OuroborosConfig.POPULATION_SIZE * 2)
+
+        # Progress callbacks for real-time streaming
+        self._progress_callbacks: List[Callable[[str, Dict], None]] = []
 
         # Metrics
         self._metrics = {
@@ -835,6 +958,10 @@ class OuroborosEngine:
             "blast_radius_warnings": 0,
             "watcher_validations": 0,
             "watcher_errors_prevented": 0,
+            # New metrics for v2.0
+            "files_created": 0,
+            "parallel_validations": 0,
+            "rollback_operations": 0,
             "simulator_validations": 0,
             "simulator_predictions": 0,
         }
@@ -983,13 +1110,497 @@ class OuroborosEngine:
 
         self.logger.info("Ouroboros Engine shutdown")
 
+    # =========================================================================
+    # PER-FILE LOCKING AND RESOURCE MANAGEMENT
+    # =========================================================================
+
+    async def _get_file_lock(self, path: Path) -> asyncio.Lock:
+        """
+        Get or create a lock for a specific file path.
+
+        This enables parallel operations on different files while ensuring
+        atomic operations on individual files.
+        """
+        async with self._file_locks_lock:
+            resolved_path = path.resolve()
+            if resolved_path not in self._file_locks:
+                self._file_locks[resolved_path] = asyncio.Lock()
+            return self._file_locks[resolved_path]
+
+    async def _cleanup_file_lock(self, path: Path) -> None:
+        """Remove a file lock after operations complete to prevent memory leaks."""
+        async with self._file_locks_lock:
+            resolved_path = path.resolve()
+            if resolved_path in self._file_locks:
+                lock = self._file_locks[resolved_path]
+                # Only remove if not currently held
+                if not lock.locked():
+                    del self._file_locks[resolved_path]
+
+    def _emit_progress(self, event_type: str, data: Dict[str, Any]) -> None:
+        """Emit progress event to all registered callbacks."""
+        for callback in self._progress_callbacks:
+            try:
+                callback(event_type, data)
+            except Exception as e:
+                self.logger.debug(f"Progress callback error: {e}")
+
+    def register_progress_callback(self, callback: Callable[[str, Dict], None]) -> None:
+        """Register a callback for progress events."""
+        self._progress_callbacks.append(callback)
+
+    # =========================================================================
+    # FILE CREATION (NEW IN v2.0)
+    # =========================================================================
+
+    async def create_file(self, request: FileCreationRequest) -> ImprovementResult:
+        """
+        Create a new file from scratch based on natural language description.
+
+        This is a first-class operation in Ouroboros v2.0, enabling:
+        - Complete file generation from descriptions
+        - Style-aware code generation that matches project conventions
+        - Automatic test file generation
+        - Import validation against existing codebase
+        - Integration with Oracle for structural awareness
+
+        Args:
+            request: FileCreationRequest with target path and description
+
+        Returns:
+            ImprovementResult with the created file as a CodeChange
+        """
+        file_lock = await self._get_file_lock(request.target_path)
+
+        async with file_lock:
+            start_time = time.time()
+            self._metrics["total_improvements"] += 1
+
+            self.logger.info(f"Creating new file: {request.target_path}")
+            self.logger.info(f"Description: {request.description}")
+
+            self._emit_progress("file_creation_started", {
+                "path": str(request.target_path),
+                "description": request.description,
+            })
+
+            try:
+                # Check if file already exists
+                if request.target_path.exists():
+                    return ImprovementResult(
+                        success=False,
+                        request=ImprovementRequest(
+                            target_file=request.target_path,
+                            goal=request.description,
+                        ),
+                        error_history=[f"File already exists: {request.target_path}"],
+                        total_time=time.time() - start_time,
+                    )
+
+                # Ensure parent directory exists
+                directories_created = []
+                if not request.target_dir.exists():
+                    request.target_dir.mkdir(parents=True, exist_ok=True)
+                    directories_created.append(request.target_dir)
+                    self.logger.info(f"Created directory: {request.target_dir}")
+
+                # Build context from reference files and project style
+                context = await self._build_creation_context(request)
+
+                # Generate file content using LLM
+                content = await self._generate_file_content(request, context)
+
+                if not content:
+                    return ImprovementResult(
+                        success=False,
+                        request=ImprovementRequest(
+                            target_file=request.target_path,
+                            goal=request.description,
+                        ),
+                        error_history=["Failed to generate file content"],
+                        total_time=time.time() - start_time,
+                    )
+
+                # Create the CodeChange for the new file
+                change = CodeChange(
+                    file_path=request.target_path,
+                    original_content="",  # Empty for new file
+                    modified_content=content,
+                    change_type=CodeChangeType.CREATION,
+                    semantic_description=request.description,
+                    directories_created=directories_created,
+                )
+
+                # Validate syntax
+                syntax_valid, syntax_error = change.validate_syntax()
+                if not syntax_valid:
+                    self.logger.warning(f"Generated code has syntax error: {syntax_error}")
+                    # Try to fix the syntax error
+                    content = await self._fix_syntax_error(content, syntax_error, request)
+                    change.modified_content = content
+                    syntax_valid, syntax_error = change.validate_syntax()
+                    if not syntax_valid:
+                        return ImprovementResult(
+                            success=False,
+                            request=ImprovementRequest(
+                                target_file=request.target_path,
+                                goal=request.description,
+                            ),
+                            error_history=[f"Syntax error: {syntax_error}"],
+                            total_time=time.time() - start_time,
+                        )
+
+                # Validate imports if requested
+                if request.validate_imports and self._watcher_integration:
+                    try:
+                        import_result = await self._watcher_integration.verify_symbol_references(
+                            content, request.target_path
+                        )
+                        if import_result.get("unresolved_symbols"):
+                            self.logger.warning(
+                                f"Unresolved symbols: {import_result['unresolved_symbols']}"
+                            )
+                    except Exception as e:
+                        self.logger.debug(f"Import validation failed: {e}")
+
+                # Write the file
+                await self._write_file(request.target_path, content)
+                self.logger.info(f"Created file: {request.target_path}")
+
+                # Update Oracle graph with new file if available
+                if self._oracle:
+                    try:
+                        await self._oracle.index_file(request.target_path)
+                        self.logger.debug(f"Indexed new file in Oracle: {request.target_path}")
+                    except Exception as e:
+                        self.logger.debug(f"Failed to index new file: {e}")
+
+                # Generate test file if requested
+                test_change = None
+                if request.generate_tests:
+                    test_change = await self._generate_test_file(request, content)
+
+                change.compute_diff()
+                self._metrics["files_created"] += 1
+
+                self._emit_progress("file_creation_complete", {
+                    "path": str(request.target_path),
+                    "lines": len(content.splitlines()),
+                    "test_generated": test_change is not None,
+                })
+
+                # Create result
+                candidate = EvolutionCandidate(
+                    id=f"create_{uuid.uuid4().hex[:8]}",
+                    changes=[change] + ([test_change] if test_change else []),
+                    fitness_score=1.0,
+                    validation=ValidationResult(status=ValidationStatus.PASSED),
+                )
+
+                return ImprovementResult(
+                    success=True,
+                    request=ImprovementRequest(
+                        target_file=request.target_path,
+                        goal=request.description,
+                    ),
+                    final_candidate=candidate,
+                    all_candidates=[candidate],
+                    iterations=1,
+                    total_time=time.time() - start_time,
+                )
+
+            except Exception as e:
+                self.logger.error(f"File creation failed: {e}")
+                self._metrics["failed_improvements"] += 1
+                return ImprovementResult(
+                    success=False,
+                    request=ImprovementRequest(
+                        target_file=request.target_path,
+                        goal=request.description,
+                    ),
+                    error_history=[str(e)],
+                    total_time=time.time() - start_time,
+                )
+
+            finally:
+                await self._cleanup_file_lock(request.target_path)
+
+    async def _build_creation_context(self, request: FileCreationRequest) -> str:
+        """Build context for file creation from reference files and project style."""
+        context_parts = []
+
+        # Add project structure information from Oracle
+        if self._oracle_integration:
+            try:
+                structure = await self._oracle_integration.get_project_structure(
+                    request.target_dir
+                )
+                if structure:
+                    context_parts.append("## Project Structure\n")
+                    context_parts.append(f"```\n{structure}\n```\n")
+            except Exception as e:
+                self.logger.debug(f"Oracle project structure failed: {e}")
+
+        # Add reference files
+        for ref_file in request.reference_files:
+            if ref_file.exists():
+                try:
+                    content = await self._read_file(ref_file)
+                    context_parts.append(f"## Reference: {ref_file.name}\n")
+                    context_parts.append(f"```python\n{content[:2000]}\n```\n")
+                except Exception as e:
+                    self.logger.debug(f"Failed to read reference file {ref_file}: {e}")
+
+        # Add similar files from the same directory for style reference
+        if request.follow_project_style and request.target_dir.exists():
+            try:
+                similar_files = list(request.target_dir.glob(f"*.{request.file_type}"))[:3]
+                for sf in similar_files:
+                    content = await self._read_file(sf)
+                    context_parts.append(f"## Style Reference: {sf.name}\n")
+                    context_parts.append(f"```python\n{content[:1000]}\n```\n")
+            except Exception as e:
+                self.logger.debug(f"Failed to read style reference: {e}")
+
+        return "\n".join(context_parts)
+
+    async def _generate_file_content(
+        self,
+        request: FileCreationRequest,
+        context: str
+    ) -> Optional[str]:
+        """Generate file content using LLM."""
+        prompt = f"""Create a complete Python file based on this description:
+
+## Description
+{request.description}
+
+## File Path
+{request.target_path}
+
+{f"## Module: {request.parent_module}" if request.parent_module else ""}
+
+## Template Hints
+{chr(10).join(f"- {hint}" for hint in request.template_hints) if request.template_hints else "None"}
+
+## Exports
+{chr(10).join(f"- {exp}" for exp in request.exports) if request.exports else "Determine from description"}
+
+{context}
+
+## Requirements
+1. Generate a complete, working Python file
+2. Include proper docstrings and type hints
+3. Follow PEP 8 style guidelines
+4. Include necessary imports
+5. Make it production-ready
+
+Return ONLY the Python code, no explanations or markdown blocks.
+"""
+
+        try:
+            if self._integration:
+                response = await self._integration.generate_improvement(
+                    prompt=prompt,
+                    temperature=0.3,
+                )
+                return self._extract_code_from_response(response)
+            else:
+                response = await self._llm_client.generate(prompt)
+                return self._extract_code_from_response(response)
+        except Exception as e:
+            self.logger.error(f"LLM generation failed: {e}")
+            return None
+
+    async def _generate_test_file(
+        self,
+        request: FileCreationRequest,
+        source_content: str
+    ) -> Optional[CodeChange]:
+        """Generate a test file for the newly created file."""
+        test_path = request.target_dir / f"test_{request.filename}"
+
+        if test_path.exists():
+            return None
+
+        prompt = f"""Create a comprehensive test file for the following Python module:
+
+## Source File
+```python
+{source_content}
+```
+
+## Test File Path
+{test_path}
+
+## Requirements
+1. Use pytest framework
+2. Test all public functions and classes
+3. Include edge cases and error conditions
+4. Use descriptive test names
+5. Include docstrings explaining each test
+
+Return ONLY the Python test code, no explanations.
+"""
+
+        try:
+            if self._integration:
+                response = await self._integration.generate_improvement(
+                    prompt=prompt,
+                    temperature=0.3,
+                )
+            else:
+                response = await self._llm_client.generate(prompt)
+
+            test_content = self._extract_code_from_response(response)
+            if test_content:
+                await self._write_file(test_path, test_content)
+
+                return CodeChange(
+                    file_path=test_path,
+                    original_content="",
+                    modified_content=test_content,
+                    change_type=CodeChangeType.CREATION,
+                    semantic_description=f"Test file for {request.filename}",
+                )
+        except Exception as e:
+            self.logger.debug(f"Test file generation failed: {e}")
+
+        return None
+
+    async def _fix_syntax_error(
+        self,
+        content: str,
+        error: str,
+        request: FileCreationRequest
+    ) -> str:
+        """Attempt to fix a syntax error in generated code."""
+        prompt = f"""Fix the syntax error in this Python code:
+
+## Error
+{error}
+
+## Code
+```python
+{content}
+```
+
+Return ONLY the corrected Python code, no explanations.
+"""
+
+        try:
+            if self._integration:
+                response = await self._integration.generate_improvement(
+                    prompt=prompt,
+                    temperature=0.1,
+                )
+            else:
+                response = await self._llm_client.generate(prompt)
+
+            return self._extract_code_from_response(response) or content
+        except Exception as e:
+            self.logger.debug(f"Syntax fix failed: {e}")
+            return content
+
+    def _extract_code_from_response(self, response: str) -> str:
+        """Extract Python code from LLM response, handling various formats."""
+        if not response:
+            return ""
+
+        # Try to extract from markdown code blocks
+        import re
+        code_block_match = re.search(r'```(?:python)?\n(.*?)```', response, re.DOTALL)
+        if code_block_match:
+            return code_block_match.group(1).strip()
+
+        # If no code block, assume the entire response is code
+        # Remove any leading/trailing explanations
+        lines = response.strip().split('\n')
+        code_lines = []
+        in_code = False
+
+        for line in lines:
+            # Skip obvious non-code lines at the beginning
+            if not in_code and (
+                line.startswith('Here') or
+                line.startswith('I ') or
+                line.startswith('This') or
+                line.startswith('The following')
+            ):
+                continue
+
+            # Start capturing at first import, class, def, or #
+            if not in_code and (
+                line.startswith('import') or
+                line.startswith('from') or
+                line.startswith('class') or
+                line.startswith('def') or
+                line.startswith('#') or
+                line.startswith('"""') or
+                line.startswith("'''")
+            ):
+                in_code = True
+
+            if in_code:
+                code_lines.append(line)
+
+        return '\n'.join(code_lines) if code_lines else response.strip()
+
+    # =========================================================================
+    # PARALLEL VALIDATION
+    # =========================================================================
+
+    async def _validate_candidates_parallel(
+        self,
+        request: ImprovementRequest,
+        candidates: List[EvolutionCandidate],
+    ) -> List[EvolutionCandidate]:
+        """
+        Validate multiple candidates in parallel.
+
+        This significantly speeds up the improvement loop by running
+        test validation concurrently rather than sequentially.
+        """
+        if not candidates:
+            return []
+
+        self._metrics["parallel_validations"] += 1
+
+        # Create validation tasks
+        async def validate_with_semaphore(candidate: EvolutionCandidate) -> EvolutionCandidate:
+            async with self._task_semaphore:
+                validation = await self._validate_candidate(request, candidate)
+                candidate.validation = validation
+                return candidate
+
+        # Run all validations in parallel
+        tasks = [validate_with_semaphore(c) for c in candidates]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Filter out exceptions and return valid results
+        validated = []
+        for result in results:
+            if isinstance(result, EvolutionCandidate):
+                validated.append(result)
+            elif isinstance(result, Exception):
+                self.logger.warning(f"Candidate validation failed: {result}")
+
+        return validated
+
+    # =========================================================================
+    # IMPROVEMENT (UPDATED TO USE PER-FILE LOCKING)
+    # =========================================================================
+
     async def improve(self, request: ImprovementRequest) -> ImprovementResult:
         """
         Execute an improvement request.
 
         This is the main entry point for code improvement.
+        v2.0: Uses per-file locking for parallel file operations.
         """
-        async with self._lock:
+        file_lock = await self._get_file_lock(request.target_file)
+
+        async with file_lock:
             self._current_request = request
             self._metrics["total_improvements"] += 1
 
