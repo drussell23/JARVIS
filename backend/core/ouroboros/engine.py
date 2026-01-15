@@ -774,19 +774,27 @@ class OuroborosEngine:
     5. If all fail, learn from errors and retry
     6. Commit successful improvements
 
-    Enhanced with:
+    v2.0 "God Mode" Enhanced with:
+    - The Oracle (GraphRAG) for structural understanding
+    - Blast radius analysis before applying changes
     - Multi-provider LLM fallback (Prime -> Ollama -> Anthropic)
     - Circuit breakers for fault isolation
     - Sandbox execution for safety
     - Experience publishing to Reactor Core
+    - Dependency-aware test selection
     """
 
-    def __init__(self, use_enhanced_integration: bool = True):
+    def __init__(self, use_enhanced_integration: bool = True, use_oracle: bool = True):
         self.logger = logging.getLogger("Ouroboros.Engine")
 
         # Enhanced integration layer (lazy loaded)
         self._use_enhanced_integration = use_enhanced_integration
         self._integration: Optional["EnhancedOuroborosIntegration"] = None
+
+        # The Oracle - GraphRAG structural understanding (lazy loaded)
+        self._use_oracle = use_oracle
+        self._oracle = None
+        self._oracle_integration = None
 
         # Legacy components (fallback if integration unavailable)
         self._llm_client = JarvisPrimeClient()
@@ -807,6 +815,8 @@ class OuroborosEngine:
             "patterns_learned": 0,
             "experiences_published": 0,
             "provider_used": {},
+            "oracle_queries": 0,
+            "blast_radius_warnings": 0,
         }
 
     async def initialize(self) -> bool:
@@ -819,6 +829,21 @@ class OuroborosEngine:
 
         # Configure OpenCode
         await self._opencode.ensure_configured()
+
+        # Initialize The Oracle (GraphRAG) for structural understanding
+        if self._use_oracle:
+            try:
+                from backend.core.ouroboros.oracle import get_oracle, OuroborosOracleIntegration
+                self._oracle = get_oracle()
+                await self._oracle.initialize()
+                self._oracle_integration = OuroborosOracleIntegration(self._oracle)
+                self.logger.info("The Oracle initialized - structural understanding enabled")
+                self.logger.info(f"  Graph: {self._oracle._graph._metrics['total_nodes']} nodes, "
+                               f"{self._oracle._graph._metrics['total_edges']} edges")
+            except Exception as e:
+                self.logger.warning(f"Oracle not available: {e}, proceeding without structural awareness")
+                self._oracle = None
+                self._oracle_integration = None
 
         # Initialize enhanced integration layer if enabled
         if self._use_enhanced_integration:
@@ -856,6 +881,16 @@ class OuroborosEngine:
     async def shutdown(self) -> None:
         """Shutdown the engine."""
         self._running = False
+
+        # Shutdown The Oracle if active
+        if self._oracle:
+            try:
+                from backend.core.ouroboros.oracle import shutdown_oracle
+                await shutdown_oracle()
+            except Exception as e:
+                self.logger.warning(f"Oracle shutdown error: {e}")
+            self._oracle = None
+            self._oracle_integration = None
 
         # Shutdown enhanced integration if active
         if self._integration:
@@ -1067,9 +1102,69 @@ class OuroborosEngine:
         return True
 
     async def _build_context(self, request: ImprovementRequest) -> str:
-        """Build context string from related files."""
+        """
+        Build rich context string from related files and structural analysis.
+
+        v2.0 "God Mode": Uses The Oracle for structural understanding:
+        - Finds related files through call/import graph
+        - Includes blast radius warnings
+        - Discovers dependencies mentioned in goal
+        """
         context_parts = []
 
+        # v2.0: Use Oracle for structural context if available
+        oracle_context = None
+        if self._oracle_integration:
+            try:
+                oracle_context = await self._oracle_integration.get_improvement_context(
+                    target_file=request.target_file,
+                    goal=request.goal,
+                )
+                self._metrics["oracle_queries"] += 1
+
+                # Add structural insights
+                if oracle_context.get("found"):
+                    context_parts.append("## Structural Analysis (from The Oracle)\n")
+
+                    # Blast radius warning
+                    risk = oracle_context.get("risk_assessment", {})
+                    if risk.get("risk_level") in ("high", "critical"):
+                        self._metrics["blast_radius_warnings"] += 1
+                        context_parts.append(
+                            f"WARNING: {risk.get('risk_level', 'unknown').upper()} RISK change!\n"
+                            f"This modification affects {risk.get('total_affected', 0)} other components.\n"
+                            f"Recommendation: {risk.get('recommendation', 'Proceed with caution.')}\n\n"
+                        )
+
+                    # Related files from structural analysis
+                    related_files = oracle_context.get("related_files", [])
+                    if related_files:
+                        context_parts.append(f"### Structurally Related Files\n")
+                        context_parts.append(f"The following files are connected through imports/calls:\n")
+                        for f in related_files[:5]:
+                            context_parts.append(f"- {f}\n")
+                        context_parts.append("\n")
+
+                    # Dependencies
+                    deps = oracle_context.get("dependencies", [])
+                    if deps:
+                        context_parts.append(f"### Dependencies (this file imports/calls)\n")
+                        for dep in deps[:5]:
+                            context_parts.append(f"- {dep.get('name', 'unknown')}\n")
+                        context_parts.append("\n")
+
+                    # Dependents (what might break)
+                    dependents = oracle_context.get("dependents", [])
+                    if dependents:
+                        context_parts.append(f"### Dependents (will need testing)\n")
+                        for dep in dependents[:5]:
+                            context_parts.append(f"- {dep.get('name', 'unknown')}\n")
+                        context_parts.append("\n")
+
+            except Exception as e:
+                self.logger.debug(f"Oracle context failed: {e}")
+
+        # Include explicitly specified context files
         for context_file in request.context_files:
             if context_file.exists():
                 content = await self._read_file(context_file)
@@ -1079,6 +1174,19 @@ class OuroborosEngine:
         if request.test_file and request.test_file.exists():
             content = await self._read_file(request.test_file)
             context_parts.append(f"### Test File: {request.test_file.name}\n```python\n{content}\n```\n")
+
+        # v2.0: Auto-discover test files using Oracle
+        if self._oracle_integration and not request.test_file:
+            try:
+                suggested_tests = await self._oracle_integration.suggest_test_files(request.target_file)
+                if suggested_tests:
+                    context_parts.append(f"### Suggested Test Files (from Oracle)\n")
+                    context_parts.append(f"The following tests should be run after modification:\n")
+                    for test_file in suggested_tests[:3]:
+                        context_parts.append(f"- {test_file}\n")
+                    context_parts.append("\n")
+            except Exception as e:
+                self.logger.debug(f"Oracle test suggestion failed: {e}")
 
         return "\n".join(context_parts) if context_parts else ""
 
@@ -1462,7 +1570,7 @@ class OuroborosEngine:
 
     def get_status(self) -> Dict[str, Any]:
         """Get current engine status."""
-        return {
+        status = {
             "running": self._running,
             "current_request": {
                 "file": str(self._current_request.target_file) if self._current_request else None,
@@ -1475,7 +1583,27 @@ class OuroborosEngine:
                 "max_retries": OuroborosConfig.MAX_RETRIES,
                 "population_size": OuroborosConfig.POPULATION_SIZE,
             },
+            "god_mode": {
+                "oracle_enabled": self._oracle is not None,
+                "oracle_queries": self._metrics.get("oracle_queries", 0),
+                "blast_radius_warnings": self._metrics.get("blast_radius_warnings", 0),
+            },
         }
+
+        # Add Oracle-specific status if available
+        if self._oracle:
+            try:
+                oracle_status = self._oracle.get_status()
+                status["god_mode"]["oracle"] = {
+                    "total_nodes": oracle_status.get("metrics", {}).get("total_nodes", 0),
+                    "total_edges": oracle_status.get("metrics", {}).get("total_edges", 0),
+                    "files_indexed": oracle_status.get("metrics", {}).get("files_indexed", 0),
+                    "repos_indexed": oracle_status.get("metrics", {}).get("repos_indexed", []),
+                }
+            except Exception:
+                pass
+
+        return status
 
 
 # =============================================================================
