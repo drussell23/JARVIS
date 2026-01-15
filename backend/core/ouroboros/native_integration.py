@@ -1704,6 +1704,30 @@ async def shutdown_native_self_improvement() -> None:
         _native_engine = None
 
 
+def is_native_self_improvement_running() -> bool:
+    """
+    Check if the native self-improvement engine exists and is running
+    WITHOUT creating a new instance.
+
+    This is critical for probes/health checks that need to verify state
+    without side effects.
+
+    Returns:
+        True if engine exists and is running, False otherwise
+    """
+    return _native_engine is not None and getattr(_native_engine, '_running', False)
+
+
+def get_native_self_improvement_if_exists() -> Optional[NativeSelfImprovement]:
+    """
+    Get the native self-improvement instance if it exists, without creating a new one.
+
+    Returns:
+        The existing engine instance or None if not initialized
+    """
+    return _native_engine
+
+
 async def execute_self_improvement(
     target: Union[str, Path],
     goal: str,

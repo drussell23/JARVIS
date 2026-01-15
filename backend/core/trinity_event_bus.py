@@ -1313,3 +1313,26 @@ async def shutdown_trinity_event_bus() -> None:
         if _bus:
             await _bus.stop()
             _bus = None
+
+
+def is_event_bus_running() -> bool:
+    """
+    Check if the event bus exists and is running WITHOUT creating a new instance.
+
+    This is critical for probes/health checks that need to verify state
+    without side effects.
+
+    Returns:
+        True if bus exists and is running, False otherwise
+    """
+    return _bus is not None and getattr(_bus, '_running', False)
+
+
+def get_event_bus_if_exists() -> Optional[TrinityEventBus]:
+    """
+    Get the event bus instance if it exists, without creating a new one.
+
+    Returns:
+        The existing bus instance or None if not initialized
+    """
+    return _bus

@@ -2113,3 +2113,27 @@ async def shutdown_trinity_integration() -> None:
     if _trinity_integration:
         await _trinity_integration.shutdown()
         _trinity_integration = None
+
+
+def is_trinity_integration_running() -> bool:
+    """
+    Check if the Trinity integration exists and is running
+    WITHOUT creating a new instance.
+
+    This is critical for probes/health checks that need to verify state
+    without side effects.
+
+    Returns:
+        True if integration exists and is running, False otherwise
+    """
+    return _trinity_integration is not None and getattr(_trinity_integration, '_running', False)
+
+
+def get_trinity_integration_if_exists() -> Optional[TrinityIntegration]:
+    """
+    Get the Trinity integration instance if it exists, without creating a new one.
+
+    Returns:
+        The existing integration instance or None if not initialized
+    """
+    return _trinity_integration

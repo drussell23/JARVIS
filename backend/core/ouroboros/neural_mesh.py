@@ -978,3 +978,26 @@ async def shutdown_neural_mesh() -> None:
     if _neural_mesh:
         await _neural_mesh.shutdown()
         _neural_mesh = None
+
+
+def is_neural_mesh_running() -> bool:
+    """
+    Check if the neural mesh exists and is running WITHOUT creating a new instance.
+
+    This is critical for probes/health checks that need to verify state
+    without side effects.
+
+    Returns:
+        True if mesh exists and is running, False otherwise
+    """
+    return _neural_mesh is not None and getattr(_neural_mesh, '_running', False)
+
+
+def get_neural_mesh_if_exists() -> Optional[NeuralMesh]:
+    """
+    Get the neural mesh instance if it exists, without creating a new one.
+
+    Returns:
+        The existing mesh instance or None if not initialized
+    """
+    return _neural_mesh

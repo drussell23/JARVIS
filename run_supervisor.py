@@ -5619,6 +5619,89 @@ class SupervisorBootstrapper:
             self.logger.info("[Phase 3.1] Data Management disabled")
             print(f"  {TerminalUI.DIM}○ Data Management: Disabled{TerminalUI.RESET}")
 
+        # ═══════════════════════════════════════════════════════════════════
+        # 3. Initialize Model Management System
+        # ═══════════════════════════════════════════════════════════════════
+        model_mgmt_enabled = os.environ.get(
+            "JARVIS_MODEL_MANAGEMENT_ENABLED", "true"
+        ).lower() in ("1", "true", "yes")
+
+        if model_mgmt_enabled:
+            try:
+                from backend.core.model_management import (
+                    initialize_model_management_supervisor,
+                    get_model_management_status,
+                )
+
+                result = await initialize_model_management_supervisor()
+
+                if result.success:
+                    self.logger.info(
+                        f"[Phase 3.1] ✅ Model Management initialized: "
+                        f"{len(result.components)} components in {result.duration_seconds:.2f}s"
+                    )
+                    print(f"  {TerminalUI.GREEN}✓ Model Management: {len(result.components)} components{TerminalUI.RESET}")
+                else:
+                    self.logger.warning(
+                        f"[Phase 3.1] ⚠️ Model Management degraded: {result.errors}"
+                    )
+                    print(f"  {TerminalUI.YELLOW}⚠️ Model Management: Degraded ({len(result.errors)} errors){TerminalUI.RESET}")
+                    errors.extend(result.errors)
+
+            except ImportError as e:
+                self.logger.debug(f"[Phase 3.1] Model Management not available: {e}")
+                print(f"  {TerminalUI.DIM}○ Model Management: Not available{TerminalUI.RESET}")
+            except Exception as e:
+                error_msg = f"Model Management init failed: {e}"
+                self.logger.warning(f"[Phase 3.1] {error_msg}")
+                print(f"  {TerminalUI.YELLOW}⚠️ Model Management: {e}{TerminalUI.RESET}")
+                errors.append(error_msg)
+        else:
+            self.logger.info("[Phase 3.1] Model Management disabled")
+            print(f"  {TerminalUI.DIM}○ Model Management: Disabled{TerminalUI.RESET}")
+
+        # ═══════════════════════════════════════════════════════════════════
+        # 4. Initialize Resource Management System
+        # ═══════════════════════════════════════════════════════════════════
+        resource_mgmt_enabled = os.environ.get(
+            "JARVIS_RESOURCE_MANAGEMENT_ENABLED", "true"
+        ).lower() in ("1", "true", "yes")
+
+        if resource_mgmt_enabled:
+            try:
+                from backend.core.resource_management import (
+                    initialize_resource_management_supervisor,
+                    get_resource_management_status,
+                )
+
+                result = await initialize_resource_management_supervisor()
+
+                if result.success:
+                    self.logger.info(
+                        f"[Phase 3.1] ✅ Resource Management initialized: "
+                        f"{len(result.components_initialized)} components in {result.initialization_time_ms:.1f}ms"
+                    )
+                    print(f"  {TerminalUI.GREEN}✓ Resource Management: {len(result.components_initialized)} components{TerminalUI.RESET}")
+                else:
+                    self.logger.warning(
+                        f"[Phase 3.1] ⚠️ Resource Management degraded: {result.error_message}"
+                    )
+                    print(f"  {TerminalUI.YELLOW}⚠️ Resource Management: Degraded{TerminalUI.RESET}")
+                    if result.error_message:
+                        errors.append(result.error_message)
+
+            except ImportError as e:
+                self.logger.debug(f"[Phase 3.1] Resource Management not available: {e}")
+                print(f"  {TerminalUI.DIM}○ Resource Management: Not available{TerminalUI.RESET}")
+            except Exception as e:
+                error_msg = f"Resource Management init failed: {e}"
+                self.logger.warning(f"[Phase 3.1] {error_msg}")
+                print(f"  {TerminalUI.YELLOW}⚠️ Resource Management: {e}{TerminalUI.RESET}")
+                errors.append(error_msg)
+        else:
+            self.logger.info("[Phase 3.1] Resource Management disabled")
+            print(f"  {TerminalUI.DIM}○ Resource Management: Disabled{TerminalUI.RESET}")
+
         self.perf.end("enterprise_systems")
 
         # Report summary
@@ -5659,6 +5742,26 @@ class SupervisorBootstrapper:
             pass  # Not available
         except Exception as e:
             self.logger.debug(f"[Shutdown] Data Management shutdown error (non-fatal): {e}")
+
+        # Shutdown Model Management System
+        try:
+            from backend.core.model_management import shutdown_model_management_supervisor
+            await shutdown_model_management_supervisor()
+            self.logger.info("[Shutdown] ✅ Model Management shutdown complete")
+        except ImportError:
+            pass  # Not available
+        except Exception as e:
+            self.logger.debug(f"[Shutdown] Model Management shutdown error (non-fatal): {e}")
+
+        # Shutdown Resource Management System
+        try:
+            from backend.core.resource_management import shutdown_resource_management_supervisor
+            await shutdown_resource_management_supervisor()
+            self.logger.info("[Shutdown] ✅ Resource Management shutdown complete")
+        except ImportError:
+            pass  # Not available
+        except Exception as e:
+            self.logger.debug(f"[Shutdown] Resource Management shutdown error (non-fatal): {e}")
 
         self.logger.info("[Shutdown] Enterprise Systems shutdown complete")
 

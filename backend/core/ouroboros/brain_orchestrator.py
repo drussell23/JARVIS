@@ -870,6 +870,30 @@ async def shutdown_brains() -> None:
         _orchestrator = None
 
 
+def is_brain_orchestrator_running() -> bool:
+    """
+    Check if the brain orchestrator exists and is running
+    WITHOUT creating a new instance.
+
+    This is critical for probes/health checks that need to verify state
+    without side effects.
+
+    Returns:
+        True if orchestrator exists and is running, False otherwise
+    """
+    return _orchestrator is not None and getattr(_orchestrator, '_running', False)
+
+
+def get_brain_orchestrator_if_exists() -> Optional[BrainOrchestrator]:
+    """
+    Get the brain orchestrator instance if it exists, without creating a new one.
+
+    Returns:
+        The existing orchestrator instance or None if not initialized
+    """
+    return _orchestrator
+
+
 # =============================================================================
 # CLI
 # =============================================================================
