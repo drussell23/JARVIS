@@ -784,7 +784,12 @@ class OuroborosEngine:
     - Dependency-aware test selection
     """
 
-    def __init__(self, use_enhanced_integration: bool = True, use_oracle: bool = True):
+    def __init__(
+        self,
+        use_enhanced_integration: bool = True,
+        use_oracle: bool = True,
+        use_watcher: bool = True,
+    ):
         self.logger = logging.getLogger("Ouroboros.Engine")
 
         # Enhanced integration layer (lazy loaded)
@@ -795,6 +800,11 @@ class OuroborosEngine:
         self._use_oracle = use_oracle
         self._oracle = None
         self._oracle_integration = None
+
+        # The Watcher - LSP precision verification (lazy loaded)
+        self._use_watcher = use_watcher
+        self._watcher = None
+        self._watcher_integration = None
 
         # Legacy components (fallback if integration unavailable)
         self._llm_client = JarvisPrimeClient()
@@ -817,6 +827,8 @@ class OuroborosEngine:
             "provider_used": {},
             "oracle_queries": 0,
             "blast_radius_warnings": 0,
+            "watcher_validations": 0,
+            "watcher_errors_prevented": 0,
         }
 
     async def initialize(self) -> bool:
@@ -844,6 +856,26 @@ class OuroborosEngine:
                 self.logger.warning(f"Oracle not available: {e}, proceeding without structural awareness")
                 self._oracle = None
                 self._oracle_integration = None
+
+        # Initialize The Watcher (LSP) for precision verification
+        if self._use_watcher:
+            try:
+                from backend.core.ouroboros.watcher import get_watcher, OuroborosWatcherIntegration
+                self._watcher = get_watcher()
+                watcher_ok = await self._watcher.initialize()
+                if watcher_ok:
+                    self._watcher_integration = OuroborosWatcherIntegration(self._watcher)
+                    self.logger.info("The Watcher initialized - LSP precision verification enabled")
+                    self.logger.info(f"  Server: {self._watcher._server_name}")
+                    self.logger.info(f"  Capabilities: {', '.join(self._watcher._capabilities)}")
+                else:
+                    self.logger.warning("Watcher initialization failed - no LSP server available")
+                    self._watcher = None
+                    self._watcher_integration = None
+            except Exception as e:
+                self.logger.warning(f"Watcher not available: {e}, proceeding without LSP verification")
+                self._watcher = None
+                self._watcher_integration = None
 
         # Initialize enhanced integration layer if enabled
         if self._use_enhanced_integration:
@@ -891,6 +923,16 @@ class OuroborosEngine:
                 self.logger.warning(f"Oracle shutdown error: {e}")
             self._oracle = None
             self._oracle_integration = None
+
+        # Shutdown The Watcher if active
+        if self._watcher:
+            try:
+                from backend.core.ouroboros.watcher import shutdown_watcher
+                await shutdown_watcher()
+            except Exception as e:
+                self.logger.warning(f"Watcher shutdown error: {e}")
+            self._watcher = None
+            self._watcher_integration = None
 
         # Shutdown enhanced integration if active
         if self._integration:
@@ -1444,7 +1486,13 @@ class OuroborosEngine:
         request: ImprovementRequest,
         candidate: EvolutionCandidate,
     ) -> ValidationResult:
-        """Validate a candidate by running tests."""
+        """
+        Validate a candidate by running tests.
+
+        v2.0 "God Mode": Uses The Watcher (LSP) for pre-validation
+        to catch errors BEFORE running tests. This prevents wasting
+        time running tests on code that won't even compile.
+        """
         if not candidate.changes:
             return ValidationResult(
                 status=ValidationStatus.ERROR,
@@ -1453,6 +1501,37 @@ class OuroborosEngine:
 
         change = candidate.changes[0]
         original_content = change.original_content
+
+        # v2.0: Use Watcher for pre-validation (LSP verification)
+        if self._watcher_integration:
+            try:
+                self._metrics["watcher_validations"] += 1
+                watcher_result = await self._watcher_integration.validate_improvement(
+                    target_file=change.file_path,
+                    original_code=original_content,
+                    improved_code=change.modified_content,
+                )
+
+                if not watcher_result["valid"]:
+                    # LSP found errors - reject before running tests
+                    self._metrics["watcher_errors_prevented"] += 1
+                    error_messages = [str(e) for e in watcher_result.get("errors", [])]
+                    self.logger.warning(
+                        f"Watcher pre-validation FAILED: {len(error_messages)} errors found"
+                    )
+                    return ValidationResult(
+                        status=ValidationStatus.FAILED,
+                        error_message=(
+                            f"LSP Pre-validation failed with {len(error_messages)} errors:\n"
+                            + "\n".join(error_messages[:5])
+                        ),
+                    )
+
+                self.logger.debug("Watcher pre-validation PASSED")
+
+            except Exception as e:
+                self.logger.debug(f"Watcher pre-validation failed: {e}")
+                # Continue without LSP validation if it fails
 
         try:
             # Apply the change temporarily
@@ -1587,6 +1666,9 @@ class OuroborosEngine:
                 "oracle_enabled": self._oracle is not None,
                 "oracle_queries": self._metrics.get("oracle_queries", 0),
                 "blast_radius_warnings": self._metrics.get("blast_radius_warnings", 0),
+                "watcher_enabled": self._watcher is not None,
+                "watcher_validations": self._metrics.get("watcher_validations", 0),
+                "watcher_errors_prevented": self._metrics.get("watcher_errors_prevented", 0),
             },
         }
 
@@ -1599,6 +1681,19 @@ class OuroborosEngine:
                     "total_edges": oracle_status.get("metrics", {}).get("total_edges", 0),
                     "files_indexed": oracle_status.get("metrics", {}).get("files_indexed", 0),
                     "repos_indexed": oracle_status.get("metrics", {}).get("repos_indexed", []),
+                }
+            except Exception:
+                pass
+
+        # Add Watcher-specific status if available
+        if self._watcher:
+            try:
+                watcher_status = self._watcher.get_status()
+                status["god_mode"]["watcher"] = {
+                    "server": watcher_status.get("server"),
+                    "capabilities": watcher_status.get("capabilities", []),
+                    "connected": watcher_status.get("connected", False),
+                    "open_documents": watcher_status.get("open_documents", 0),
                 }
             except Exception:
                 pass
