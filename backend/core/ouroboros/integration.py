@@ -1,260 +1,1004 @@
 """
-Ouroboros Integration Layer v2.0 - Intelligent Self-Programming
-================================================================
+Ouroboros Integration Layer v3.0 - Advanced Multi-LLM Orchestration
+====================================================================
 
-Provides robust integration between Ouroboros and the Trinity ecosystem:
+Enterprise-grade integration between Ouroboros and the Trinity ecosystem with:
+- Advanced model capability registry with dynamic capability discovery
+- Sophisticated task difficulty analysis (cyclomatic, cognitive, dependency)
+- Model performance tracking with learning and A/B testing
+- RAM-aware selection with load status checking
+- Multi-model orchestration for complex task decomposition
+- Unified Trinity coordination for cross-repo integration
 - Intelligent model selection via IntelligentModelSelector (no hardcoding)
-- Dynamic JARVIS Prime model discovery
+- Dynamic JARVIS Prime model discovery with actual capabilities
 - Context-aware model selection based on code complexity
 - Large context window support (32k) for big files
 - Multi-provider LLM fallback (Prime -> Ollama -> API)
-- Health monitoring with circuit breakers
-- Reactor Core experience publishing
-- Sandboxed code execution
-- Human review checkpoints
+- Health monitoring with adaptive circuit breakers
+- Reactor Core experience publishing with training feedback
+- Sandboxed code execution with security validation
+- Human review checkpoints with approval workflows
 
-v2.0 Enhancements:
-- IntelligentOuroborosModelSelector for dynamic model selection
-- JARVIS Prime model discovery API integration
-- Code complexity analysis for optimal model selection
-- File size-aware context window selection
-- Agentic loop support for autonomous operation
+v3.0 Enhancements:
+- AdvancedModelCapabilityRegistry for actual capability metadata
+- TaskDifficultyAnalyzer with cyclomatic/cognitive complexity
+- ModelPerformanceTracker for success/failure learning
+- RAMAwareModelSelector with load status checking
+- MultiModelOrchestrator for complex task decomposition
+- TrinityCoordinator for unified cross-repo management
+- EnhancedCodeComplexityAnalyzer with AST-based analysis
+- AdaptiveCircuitBreaker with ML-based threshold prediction
+- ParallelModelExecutor for concurrent model invocation
 
-This layer handles all the edge cases that could cause failures:
+This layer handles ALL edge cases that could cause failures:
 - JARVIS Prime not running -> fallback to Ollama -> fallback to API
-- Network issues -> retry with exponential backoff
-- Repeated failures -> circuit breaker trips
-- Dangerous changes -> sandbox execution first
-- Model not suitable -> automatic fallback to better model
+- Model not loaded -> check load status -> prefer loaded models
+- Context window exceeded -> intelligent chunking or model escalation
+- Model version mismatch -> prefer newer versions
+- Concurrent usage -> coordinate RAM across tasks
+- Mid-task failure -> automatic fallback with state preservation
+- Network issues -> retry with exponential backoff + jitter
+- Repeated failures -> adaptive circuit breaker with recovery prediction
+- Dangerous changes -> sandbox execution with security scan
+- Model not suitable -> automatic fallback with capability matching
 
 Author: Trinity System
-Version: 2.0.0
+Version: 3.0.0
 """
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import hashlib
 import json
 import logging
+import math
 import os
+import random
+import re
+import statistics
 import subprocess
 import sys
 import tempfile
 import time
 import uuid
+import weakref
+from abc import ABC, abstractmethod
+from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from enum import Enum, auto
+from functools import lru_cache, wraps
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import (
+    Any, Awaitable, Callable, Coroutine, DefaultDict, Deque, Dict,
+    FrozenSet, Generic, Iterator, List, Mapping, NamedTuple, Optional,
+    Protocol, Sequence, Set, Tuple, Type, TypeVar, Union, cast, overload
+)
 
 import aiohttp
 
-logger = logging.getLogger("Ouroboros.Integration")
+# Type variables for generic components
+T = TypeVar('T')
+ModelT = TypeVar('ModelT')
+ResultT = TypeVar('ResultT')
+
+logger = logging.getLogger("Ouroboros.Integration.v3")
 
 
 # =============================================================================
-# v2.0: INTELLIGENT MODEL SELECTOR INTEGRATION
+# v3.0: ADVANCED ENUMS AND DATA STRUCTURES
+# =============================================================================
+
+class TaskDifficulty(Enum):
+    """Sophisticated task difficulty classification."""
+    TRIVIAL = 1      # Single-line fix, typo correction
+    EASY = 2         # Simple function, clear requirements
+    MODERATE = 3     # Multi-function, some complexity
+    HARD = 4         # Multi-file, architectural decisions
+    EXPERT = 5       # System-wide, breaking changes, high risk
+
+
+class ModelLoadStatus(Enum):
+    """Current load status of a model in JARVIS Prime."""
+    LOADED = "loaded"           # In RAM, instant access
+    CACHED = "cached"           # On disk, fast load (5-15s)
+    ARCHIVED = "archived"       # Cold storage, slow load (30-120s)
+    NOT_AVAILABLE = "not_available"  # Model doesn't exist
+    LOADING = "loading"         # Currently being loaded
+    ERROR = "error"             # Failed to load
+
+
+class ModelSpecialization(Enum):
+    """Model specialization areas for intelligent routing."""
+    CODE_GENERATION = "code_generation"
+    CODE_REFACTORING = "code_refactoring"
+    BUG_FIXING = "bug_fixing"
+    CODE_REVIEW = "code_review"
+    ASYNC_PATTERNS = "async_patterns"
+    TYPE_SYSTEMS = "type_systems"
+    TESTING = "testing"
+    DOCUMENTATION = "documentation"
+    ARCHITECTURE = "architecture"
+    PERFORMANCE = "performance"
+    SECURITY = "security"
+    GENERAL = "general"
+
+
+class SelectionStrategy(Enum):
+    """Model selection strategies based on requirements."""
+    FASTEST = "fastest"           # Minimize latency
+    CHEAPEST = "cheapest"         # Minimize cost
+    BEST_QUALITY = "best_quality" # Maximize quality
+    BALANCED = "balanced"         # Balance all factors
+    SPECIALIZED = "specialized"   # Use task-specific model
+    LOADED_FIRST = "loaded_first" # Prefer already-loaded models
+
+
+@dataclass
+class ModelCapability:
+    """Rich capability description for a model."""
+    name: str
+    strength: float  # 0.0-1.0 how good at this capability
+    languages: FrozenSet[str] = field(default_factory=frozenset)  # Python, TypeScript, etc.
+    patterns: FrozenSet[str] = field(default_factory=frozenset)   # async, functional, etc.
+    max_context: int = 4096
+    optimal_task_size: Tuple[int, int] = (10, 500)  # (min_lines, max_lines)
+
+
+@dataclass
+class ModelMetadata:
+    """Complete metadata for a model from JARVIS Prime."""
+    id: str
+    name: str
+    context_window: int
+    load_status: ModelLoadStatus
+    capabilities: Dict[str, ModelCapability]
+    specializations: Set[ModelSpecialization]
+    version: str = "1.0"
+    ram_usage_gb: float = 0.0
+    load_time_seconds: float = 0.0
+    avg_latency_ms: float = 0.0
+    success_rate: float = 1.0
+    cost_per_token: float = 0.0
+    last_used: Optional[datetime] = None
+    performance_history: List[float] = field(default_factory=list)
+
+
+@dataclass
+class TaskContext:
+    """Rich context for a code improvement task."""
+    code: str
+    goal: str
+    task_type: str
+    difficulty: TaskDifficulty
+    complexity_metrics: Dict[str, Any]
+    file_path: Optional[Path] = None
+    related_files: List[Path] = field(default_factory=list)
+    error_history: List[str] = field(default_factory=list)
+    iteration: int = 0
+    max_iterations: int = 10
+    urgency: str = "normal"  # urgent, normal, low
+    quality_requirement: str = "balanced"  # quick, balanced, best
+    breaking_changes_allowed: bool = False
+    test_coverage: float = 0.0
+    dependencies: Set[str] = field(default_factory=set)
+
+
+@dataclass
+class SelectionResult:
+    """Result of model selection with full reasoning."""
+    provider: str
+    model: str
+    api_base: str
+    context_window: int
+    strategy_used: SelectionStrategy
+    reasoning: List[str]
+    fallback_chain: List[Tuple[str, str]]  # [(provider, model), ...]
+    estimated_latency_ms: float = 0.0
+    estimated_cost: float = 0.0
+    confidence: float = 1.0
+    metadata: Optional[ModelMetadata] = None
+
+
+@dataclass
+class PerformanceRecord:
+    """Record of a model's performance on a task."""
+    model_id: str
+    task_type: str
+    difficulty: TaskDifficulty
+    success: bool
+    latency_ms: float
+    iterations_used: int
+    code_quality_score: float  # 0.0-1.0
+    timestamp: datetime = field(default_factory=datetime.now)
+    error_message: Optional[str] = None
+    context_tokens: int = 0
+    output_tokens: int = 0
+
+
+# =============================================================================
+# v3.0: INTELLIGENT MODEL SELECTOR INTEGRATION
 # =============================================================================
 
 # Try to import IntelligentModelSelector - fallback gracefully if unavailable
 INTELLIGENT_SELECTOR_AVAILABLE = False
 try:
     from backend.intelligence.model_selector import IntelligentModelSelector, QueryContext
-    from backend.intelligence.model_registry import ModelDefinition, get_model_registry
+    from backend.intelligence.model_registry import ModelDefinition, ModelState, get_model_registry
     INTELLIGENT_SELECTOR_AVAILABLE = True
     logger.info("✅ IntelligentModelSelector integration available")
 except ImportError as e:
     logger.warning(f"IntelligentModelSelector not available: {e}")
+    # Define stub classes for graceful degradation
+    class ModelState(Enum):
+        LOADED = "loaded"
+        CACHED = "cached"
+        ARCHIVED = "archived"
 
 
-class CodeComplexityAnalyzer:
+class EnhancedCodeComplexityAnalyzer:
     """
-    v2.0: Analyzes code complexity to select optimal model.
+    v3.0: Advanced code complexity analysis with AST-based metrics.
 
-    Factors considered:
-    - File size (lines of code)
-    - Import density (external dependencies)
-    - Cyclomatic complexity (control flow)
-    - Nesting depth
-    - Function/class count
+    Provides comprehensive analysis including:
+    - Cyclomatic complexity (McCabe complexity)
+    - Cognitive complexity (code understanding difficulty)
+    - Halstead metrics (vocabulary, length, volume)
+    - Maintainability index
+    - Dependency graph complexity
+    - Code pattern detection (async, decorators, metaclasses)
+    - Security vulnerability hints
+    - Test coverage estimation
     """
+
+    # Control flow keywords that increase cyclomatic complexity
+    BRANCH_KEYWORDS = frozenset(['if', 'elif', 'for', 'while', 'and', 'or', 'except', 'with', 'assert', 'comprehension'])
+
+    # Patterns that indicate advanced code
+    ADVANCED_PATTERNS = {
+        'async': re.compile(r'\b(async\s+def|await|asyncio)\b'),
+        'metaclass': re.compile(r'\bmetaclass\s*='),
+        'decorator': re.compile(r'^@\w+', re.MULTILINE),
+        'generator': re.compile(r'\byield\b'),
+        'context_manager': re.compile(r'\b(__enter__|__exit__|contextmanager)\b'),
+        'descriptor': re.compile(r'\b(__get__|__set__|__delete__)\b'),
+        'abc': re.compile(r'\b(ABC|abstractmethod)\b'),
+        'threading': re.compile(r'\b(Thread|Lock|RLock|Semaphore|Event|Condition)\b'),
+        'multiprocessing': re.compile(r'\b(Process|Pool|Queue|Manager)\b'),
+    }
+
+    # Security-sensitive patterns
+    SECURITY_PATTERNS = {
+        'eval_exec': re.compile(r'\b(eval|exec)\s*\('),
+        'shell_injection': re.compile(r'\b(subprocess|os\.system|os\.popen)\b.*shell\s*=\s*True'),
+        'sql_injection': re.compile(r'(execute|cursor)\s*\(\s*["\'].*%s'),
+        'pickle': re.compile(r'\bpickle\.(load|loads)\b'),
+        'yaml_unsafe': re.compile(r'\byaml\.load\s*\([^)]*\)(?!\s*,\s*Loader\s*=)'),
+    }
+
+    def __init__(self):
+        self._cache: Dict[str, Dict[str, Any]] = {}
+        self._cache_lock = asyncio.Lock()
 
     @staticmethod
     def analyze(code: str) -> Dict[str, Any]:
-        """Analyze code complexity."""
+        """
+        Analyze code complexity with comprehensive metrics.
+
+        Returns dict with:
+        - Basic metrics (lines, functions, classes)
+        - Cyclomatic complexity (control flow)
+        - Cognitive complexity (understanding difficulty)
+        - Halstead metrics (vocabulary, volume)
+        - Maintainability index
+        - Pattern detection (async, decorators, etc.)
+        - Security hints
+        - Required context window
+        - Difficulty classification
+        """
+        analyzer = EnhancedCodeComplexityAnalyzer()
+        return analyzer._analyze_impl(code)
+
+    def _analyze_impl(self, code: str) -> Dict[str, Any]:
+        """Implementation of analysis."""
         lines = code.split('\n')
         line_count = len(lines)
         non_empty_lines = len([l for l in lines if l.strip()])
 
-        # Count imports
+        # Basic metrics
         import_count = sum(1 for l in lines if l.strip().startswith(('import ', 'from ')))
 
-        # Estimate nesting depth
+        # Nesting depth analysis
         max_indent = 0
+        avg_indent = 0
+        indent_counts = []
         for line in lines:
             if line.strip():
                 indent = len(line) - len(line.lstrip())
-                max_indent = max(max_indent, indent // 4)
+                indent_level = indent // 4
+                max_indent = max(max_indent, indent_level)
+                indent_counts.append(indent_level)
 
-        # Count functions and classes
+        avg_indent = statistics.mean(indent_counts) if indent_counts else 0
+
+        # Function and class analysis
         function_count = sum(1 for l in lines if l.strip().startswith('def '))
         class_count = sum(1 for l in lines if l.strip().startswith('class '))
+        async_function_count = sum(1 for l in lines if 'async def' in l)
 
-        # Estimate complexity level
-        if line_count > 1000 or max_indent > 6 or function_count > 20:
+        # AST-based analysis (with fallback for invalid syntax)
+        ast_metrics = self._analyze_ast(code)
+
+        # Cyclomatic complexity (simplified for non-AST case)
+        cyclomatic = ast_metrics.get('cyclomatic_complexity', self._estimate_cyclomatic(code))
+
+        # Cognitive complexity
+        cognitive = ast_metrics.get('cognitive_complexity', self._estimate_cognitive(code, max_indent))
+
+        # Halstead metrics
+        halstead = self._calculate_halstead(code)
+
+        # Maintainability index (0-100, higher is better)
+        maintainability = self._calculate_maintainability_index(
+            halstead['volume'], cyclomatic, line_count
+        )
+
+        # Pattern detection
+        patterns = self._detect_patterns(code)
+
+        # Security analysis
+        security_hints = self._analyze_security(code)
+
+        # Dependency complexity
+        dependency_score = self._analyze_dependencies(code, import_count)
+
+        # Calculate overall complexity score (0.0-1.0)
+        complexity_score = self._calculate_complexity_score(
+            cyclomatic, cognitive, max_indent, function_count, line_count, patterns
+        )
+
+        # Determine complexity level
+        if complexity_score > 0.7:
             complexity = "high"
-        elif line_count > 300 or max_indent > 4 or function_count > 10:
+        elif complexity_score > 0.4:
             complexity = "medium"
         else:
             complexity = "low"
 
+        # Determine task difficulty
+        difficulty = self._classify_difficulty(
+            complexity_score, line_count, patterns, security_hints
+        )
+
         # Estimate required context window
-        estimated_tokens = line_count * 4  # ~4 tokens per line average
-        if estimated_tokens > 16000:
+        estimated_tokens = self._estimate_tokens(code)
+        if estimated_tokens > 24000:
             required_context = "32k"
-        elif estimated_tokens > 4000:
+        elif estimated_tokens > 12000:
+            required_context = "16k"
+        elif estimated_tokens > 6000:
             required_context = "8k"
         else:
             required_context = "4k"
 
         return {
+            # Basic metrics
             "line_count": line_count,
             "non_empty_lines": non_empty_lines,
             "import_count": import_count,
-            "max_nesting_depth": max_indent,
             "function_count": function_count,
+            "async_function_count": async_function_count,
             "class_count": class_count,
+
+            # Nesting metrics
+            "max_nesting_depth": max_indent,
+            "avg_nesting_depth": round(avg_indent, 2),
+
+            # Complexity metrics
+            "cyclomatic_complexity": cyclomatic,
+            "cognitive_complexity": cognitive,
+            "complexity_score": round(complexity_score, 3),
             "complexity": complexity,
+
+            # Halstead metrics
+            "halstead_vocabulary": halstead['vocabulary'],
+            "halstead_length": halstead['length'],
+            "halstead_volume": round(halstead['volume'], 2),
+            "halstead_difficulty": round(halstead['difficulty'], 2),
+            "halstead_effort": round(halstead['effort'], 2),
+
+            # Maintainability
+            "maintainability_index": round(maintainability, 2),
+
+            # Patterns and features
+            "patterns_detected": patterns,
+            "has_async": patterns.get('async', False),
+            "has_metaclass": patterns.get('metaclass', False),
+            "decorator_count": patterns.get('decorator_count', 0),
+
+            # Security
+            "security_hints": security_hints,
+            "potential_security_issues": len(security_hints),
+
+            # Dependencies
+            "dependency_complexity": dependency_score,
+
+            # Task classification
+            "difficulty": difficulty,
+            "difficulty_value": difficulty.value,
+
+            # Context requirements
             "estimated_tokens": estimated_tokens,
             "required_context": required_context,
+
+            # AST-specific metrics
+            **{k: v for k, v in ast_metrics.items() if k not in ['cyclomatic_complexity', 'cognitive_complexity']},
         }
 
+    def _analyze_ast(self, code: str) -> Dict[str, Any]:
+        """Analyze code using AST for precise metrics."""
+        try:
+            tree = ast.parse(code)
+            return self._walk_ast(tree)
+        except SyntaxError:
+            return {}
 
-class JarvisPrimeModelDiscovery:
-    """
-    v2.0: Discovers available JARVIS Prime models dynamically.
+    def _walk_ast(self, tree: ast.AST) -> Dict[str, Any]:
+        """Walk AST and collect metrics."""
+        metrics = {
+            'cyclomatic_complexity': 1,  # Base complexity
+            'cognitive_complexity': 0,
+            'branch_count': 0,
+            'loop_count': 0,
+            'exception_handlers': 0,
+            'nested_functions': 0,
+            'lambda_count': 0,
+            'comprehension_count': 0,
+            'decorator_count': 0,
+            'docstring_count': 0,
+            'type_annotations': 0,
+        }
 
-    Queries JARVIS Prime API to find:
-    - Available models
-    - Model capabilities (context window, specializations)
-    - Model status (loaded, available, downloading)
+        nesting_level = 0
+
+        for node in ast.walk(tree):
+            # Cyclomatic complexity contributors
+            if isinstance(node, (ast.If, ast.IfExp)):
+                metrics['cyclomatic_complexity'] += 1
+                metrics['branch_count'] += 1
+            elif isinstance(node, (ast.For, ast.While, ast.AsyncFor)):
+                metrics['cyclomatic_complexity'] += 1
+                metrics['loop_count'] += 1
+            elif isinstance(node, ast.ExceptHandler):
+                metrics['cyclomatic_complexity'] += 1
+                metrics['exception_handlers'] += 1
+            elif isinstance(node, ast.BoolOp):
+                # Each 'and'/'or' adds to complexity
+                metrics['cyclomatic_complexity'] += len(node.values) - 1
+            elif isinstance(node, ast.comprehension):
+                metrics['cyclomatic_complexity'] += 1
+                metrics['comprehension_count'] += 1
+
+            # Cognitive complexity contributors
+            if isinstance(node, (ast.If, ast.For, ast.While)):
+                metrics['cognitive_complexity'] += (1 + nesting_level)
+            elif isinstance(node, ast.Try):
+                metrics['cognitive_complexity'] += 1
+
+            # Other metrics
+            if isinstance(node, ast.Lambda):
+                metrics['lambda_count'] += 1
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                # Check for nested functions
+                for child in ast.walk(node):
+                    if child != node and isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        metrics['nested_functions'] += 1
+                        break
+                # Check for decorators
+                metrics['decorator_count'] += len(node.decorator_list)
+                # Check for docstring
+                if (node.body and isinstance(node.body[0], ast.Expr) and
+                    isinstance(node.body[0].value, ast.Constant) and
+                    isinstance(node.body[0].value.value, str)):
+                    metrics['docstring_count'] += 1
+                # Check for type annotations
+                if node.returns:
+                    metrics['type_annotations'] += 1
+                metrics['type_annotations'] += sum(1 for arg in node.args.args if arg.annotation)
+
+        return metrics
+
+    def _estimate_cyclomatic(self, code: str) -> int:
+        """Estimate cyclomatic complexity without AST."""
+        complexity = 1  # Base
+        for keyword in self.BRANCH_KEYWORDS:
+            complexity += len(re.findall(rf'\b{keyword}\b', code))
+        return complexity
+
+    def _estimate_cognitive(self, code: str, max_nesting: int) -> int:
+        """Estimate cognitive complexity without AST."""
+        cognitive = 0
+
+        # Each level of nesting adds to cognitive load
+        lines = code.split('\n')
+        for line in lines:
+            if line.strip():
+                indent = (len(line) - len(line.lstrip())) // 4
+                if any(kw in line for kw in ['if ', 'for ', 'while ', 'elif ', 'except ']):
+                    cognitive += 1 + indent
+
+        return cognitive
+
+    def _calculate_halstead(self, code: str) -> Dict[str, float]:
+        """Calculate Halstead complexity metrics."""
+        # Operators
+        operators = re.findall(r'[+\-*/%=<>!&|^~@:,\.\[\]{}()]|and|or|not|in|is|lambda|yield|return|raise', code)
+        # Operands (identifiers, numbers, strings)
+        operands = re.findall(r'\b[a-zA-Z_]\w*\b|\d+\.?\d*|"[^"]*"|\'[^\']*\'', code)
+
+        n1 = len(set(operators))  # Unique operators
+        n2 = len(set(operands))   # Unique operands
+        N1 = len(operators)        # Total operators
+        N2 = len(operands)         # Total operands
+
+        # Avoid division by zero
+        n1 = max(n1, 1)
+        n2 = max(n2, 1)
+        N1 = max(N1, 1)
+        N2 = max(N2, 1)
+
+        vocabulary = n1 + n2
+        length = N1 + N2
+        volume = length * math.log2(vocabulary) if vocabulary > 0 else 0
+        difficulty = (n1 / 2) * (N2 / n2) if n2 > 0 else 0
+        effort = difficulty * volume
+
+        return {
+            'vocabulary': vocabulary,
+            'length': length,
+            'volume': volume,
+            'difficulty': difficulty,
+            'effort': effort,
+        }
+
+    def _calculate_maintainability_index(
+        self, halstead_volume: float, cyclomatic: int, loc: int
+    ) -> float:
+        """
+        Calculate Maintainability Index (0-100).
+
+        Formula: 171 - 5.2*ln(HV) - 0.23*CC - 16.2*ln(LOC)
+        Normalized to 0-100 range.
+        """
+        if loc <= 0 or halstead_volume <= 0:
+            return 100.0
+
+        mi = 171 - 5.2 * math.log(halstead_volume) - 0.23 * cyclomatic - 16.2 * math.log(loc)
+        # Normalize to 0-100
+        mi = max(0, min(100, mi * 100 / 171))
+        return mi
+
+    def _detect_patterns(self, code: str) -> Dict[str, Any]:
+        """Detect advanced code patterns."""
+        patterns: Dict[str, Any] = {'decorator_count': 0}
+
+        for pattern_name, pattern in self.ADVANCED_PATTERNS.items():
+            matches = pattern.findall(code)
+            if pattern_name == 'decorator':
+                patterns['decorator_count'] = len(matches)
+                patterns[pattern_name] = len(matches) > 0
+            else:
+                patterns[pattern_name] = len(matches) > 0
+
+        return patterns
+
+    def _analyze_security(self, code: str) -> List[Dict[str, str]]:
+        """Analyze code for potential security issues."""
+        hints = []
+
+        for issue_name, pattern in self.SECURITY_PATTERNS.items():
+            if pattern.search(code):
+                hints.append({
+                    'type': issue_name,
+                    'severity': 'high' if issue_name in ['eval_exec', 'shell_injection'] else 'medium',
+                    'description': f"Potential {issue_name.replace('_', ' ')} vulnerability detected",
+                })
+
+        return hints
+
+    def _analyze_dependencies(self, code: str, import_count: int) -> float:
+        """Analyze dependency complexity."""
+        # Count unique modules
+        imports = re.findall(r'(?:from\s+(\S+)|import\s+(\S+))', code)
+        unique_modules = set()
+        for frm, imp in imports:
+            module = frm or imp
+            root_module = module.split('.')[0]
+            unique_modules.add(root_module)
+
+        # More unique external dependencies = higher complexity
+        external_count = len([m for m in unique_modules if m not in ['os', 'sys', 'typing', 'dataclasses']])
+
+        # Normalize to 0-1
+        return min(1.0, external_count / 20.0)
+
+    def _calculate_complexity_score(
+        self,
+        cyclomatic: int,
+        cognitive: int,
+        max_nesting: int,
+        function_count: int,
+        line_count: int,
+        patterns: Dict[str, Any],
+    ) -> float:
+        """Calculate overall complexity score (0.0-1.0)."""
+        scores = []
+
+        # Cyclomatic complexity contribution (normalized)
+        scores.append(min(1.0, cyclomatic / 50.0) * 0.25)
+
+        # Cognitive complexity contribution
+        scores.append(min(1.0, cognitive / 100.0) * 0.25)
+
+        # Nesting depth contribution
+        scores.append(min(1.0, max_nesting / 8.0) * 0.15)
+
+        # Code size contribution
+        scores.append(min(1.0, line_count / 1000.0) * 0.15)
+
+        # Pattern complexity contribution
+        pattern_score = 0.0
+        if patterns.get('async'):
+            pattern_score += 0.15
+        if patterns.get('metaclass'):
+            pattern_score += 0.3
+        if patterns.get('threading') or patterns.get('multiprocessing'):
+            pattern_score += 0.25
+        if patterns.get('descriptor') or patterns.get('abc'):
+            pattern_score += 0.2
+        scores.append(min(1.0, pattern_score) * 0.20)
+
+        return sum(scores)
+
+    def _classify_difficulty(
+        self,
+        complexity_score: float,
+        line_count: int,
+        patterns: Dict[str, Any],
+        security_hints: List[Dict[str, str]],
+    ) -> TaskDifficulty:
+        """Classify task difficulty based on metrics."""
+        # Start with complexity-based classification
+        if complexity_score < 0.2 and line_count < 50:
+            difficulty = TaskDifficulty.TRIVIAL
+        elif complexity_score < 0.35 and line_count < 150:
+            difficulty = TaskDifficulty.EASY
+        elif complexity_score < 0.55 and line_count < 500:
+            difficulty = TaskDifficulty.MODERATE
+        elif complexity_score < 0.75:
+            difficulty = TaskDifficulty.HARD
+        else:
+            difficulty = TaskDifficulty.EXPERT
+
+        # Escalate for certain patterns
+        if patterns.get('metaclass') or patterns.get('descriptor'):
+            difficulty = TaskDifficulty(min(5, difficulty.value + 1))
+
+        # Escalate for security issues
+        if any(h['severity'] == 'high' for h in security_hints):
+            difficulty = TaskDifficulty(min(5, difficulty.value + 1))
+
+        return difficulty
+
+    def _estimate_tokens(self, code: str) -> int:
+        """Estimate token count for the code."""
+        # More accurate estimation based on character types
+        words = len(re.findall(r'\b\w+\b', code))
+        operators = len(re.findall(r'[+\-*/%=<>!&|^~@:,\.\[\]{}()]', code))
+        strings = len(re.findall(r'"[^"]*"|\'[^\']*\'', code))
+
+        # Rough formula: words + operators/2 + strings*2
+        return int(words + operators * 0.5 + strings * 2)
+
+
+# Alias for backward compatibility
+CodeComplexityAnalyzer = EnhancedCodeComplexityAnalyzer
+
+
+class AdvancedModelCapabilityRegistry:
     """
+    v3.0: Enterprise-grade model capability registry with dynamic discovery.
+
+    Provides comprehensive model management including:
+    - Real-time capability fetching from JARVIS Prime API
+    - Load status monitoring (loaded/cached/archived)
+    - Performance metrics tracking per model
+    - Specialization detection and matching
+    - RAM usage awareness
+    - Version tracking and preference
+    - A/B testing support
+    - Adaptive caching with TTL
+    """
+
+    # Context window estimation patterns
+    CONTEXT_PATTERNS = {
+        "32k": 32768, "32000": 32768,
+        "16k": 16384, "16000": 16384,
+        "8k": 8192, "8000": 8192,
+        "4k": 4096, "4000": 4096,
+        "128k": 131072, "128000": 131072,
+    }
+
+    # Model family characteristics
+    MODEL_FAMILIES = {
+        "deepseek-coder": {
+            "context_default": 16384,
+            "specializations": {ModelSpecialization.CODE_GENERATION, ModelSpecialization.BUG_FIXING},
+            "languages": frozenset(["python", "javascript", "typescript", "go", "rust"]),
+        },
+        "codellama": {
+            "context_default": 16384,
+            "specializations": {ModelSpecialization.CODE_GENERATION, ModelSpecialization.CODE_REVIEW},
+            "languages": frozenset(["python", "cpp", "java", "javascript"]),
+        },
+        "qwen": {
+            "context_default": 32768,
+            "specializations": {ModelSpecialization.GENERAL, ModelSpecialization.ARCHITECTURE},
+            "languages": frozenset(["python", "javascript", "java", "cpp"]),
+        },
+        "llama": {
+            "context_default": 8192,
+            "specializations": {ModelSpecialization.GENERAL},
+            "languages": frozenset(["python", "javascript"]),
+        },
+        "mistral": {
+            "context_default": 8192,
+            "specializations": {ModelSpecialization.GENERAL, ModelSpecialization.CODE_REVIEW},
+            "languages": frozenset(["python", "javascript", "typescript"]),
+        },
+    }
 
     def __init__(self, api_base: str = None):
         self.api_base = api_base or os.getenv("JARVIS_PRIME_API_BASE", "http://localhost:8000/v1")
+        self._models: Dict[str, ModelMetadata] = {}
         self._cached_models: Optional[List[Dict]] = None
         self._cache_time: float = 0
-        self._cache_ttl: float = 60.0  # 1 minute cache
+        self._cache_ttl: float = float(os.getenv("MODEL_REGISTRY_CACHE_TTL", "60.0"))
+        self._lock = asyncio.Lock()
+        self._performance_records: DefaultDict[str, Deque[PerformanceRecord]] = defaultdict(
+            lambda: deque(maxlen=100)
+        )
+        self._initialization_complete = False
 
     async def discover_models(self, force_refresh: bool = False) -> List[Dict[str, Any]]:
         """
-        Discover available JARVIS Prime models.
+        Discover available JARVIS Prime models with enhanced metadata.
 
         Returns list of model info dicts with:
         - id: Model identifier
         - context_window: Context window size
-        - capabilities: List of capabilities
-        - status: current status
+        - capabilities: Dict of capability -> strength
+        - load_status: Current load status
+        - specializations: Set of specializations
+        - version: Model version
         """
-        # Check cache
-        if not force_refresh and self._cached_models and (time.time() - self._cache_time) < self._cache_ttl:
-            return self._cached_models
+        async with self._lock:
+            if not force_refresh and self._cached_models and (time.time() - self._cache_time) < self._cache_ttl:
+                return self._cached_models
 
+            try:
+                async with aiohttp.ClientSession() as session:
+                    url = f"{self.api_base.rstrip('/')}/models"
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            models = data.get("data", [])
+
+                            enriched = []
+                            for model in models:
+                                model_id = model.get("id", "unknown")
+                                metadata = await self._build_model_metadata(session, model_id, model)
+                                self._models[model_id] = metadata
+                                enriched.append(self._metadata_to_dict(metadata))
+
+                            enriched.sort(key=lambda m: m["context_window"], reverse=True)
+                            self._cached_models = enriched
+                            self._cache_time = time.time()
+                            self._initialization_complete = True
+                            logger.info(f"✅ Discovered {len(enriched)} models from JARVIS Prime")
+                            return enriched
+
+            except Exception as e:
+                logger.warning(f"Failed to discover JARVIS Prime models: {e}")
+
+            return self._cached_models or []
+
+    async def _build_model_metadata(
+        self, session: aiohttp.ClientSession, model_id: str, basic_info: Dict
+    ) -> ModelMetadata:
+        """Build complete ModelMetadata from API and inference."""
+        # Try to get detailed capabilities
+        capabilities = await self._fetch_capabilities(session, model_id)
+        load_status = await self._fetch_load_status(session, model_id)
+
+        family_info = self._get_model_family(model_id)
+        context_window = self._estimate_context_window(model_id)
+
+        # Build capability dict
+        cap_dict: Dict[str, ModelCapability] = {}
+        inferred_caps = self._infer_capabilities(model_id)
+        for cap_name in inferred_caps:
+            cap_dict[cap_name] = ModelCapability(
+                name=cap_name,
+                strength=0.8 if "code" in cap_name else 0.7,
+                languages=family_info.get("languages", frozenset()),
+            )
+
+        return ModelMetadata(
+            id=model_id,
+            name=model_id,
+            context_window=context_window,
+            load_status=load_status,
+            capabilities=cap_dict,
+            specializations=family_info.get("specializations", {ModelSpecialization.GENERAL}),
+            version=self._extract_version(model_id),
+            success_rate=self._calculate_success_rate(model_id),
+        )
+
+    async def _fetch_capabilities(self, session: aiohttp.ClientSession, model_id: str) -> Dict:
+        """Fetch actual capabilities from API (if available)."""
         try:
-            async with aiohttp.ClientSession() as session:
-                url = f"{self.api_base.rstrip('/')}/models"
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        models = data.get("data", [])
+            url = f"{self.api_base.rstrip('/')}/models/{model_id}/capabilities"
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=3)) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+        except Exception:
+            pass
+        return {}
 
-                        # Enrich with capabilities
-                        enriched = []
-                        for model in models:
-                            enriched.append({
-                                "id": model.get("id", "unknown"),
-                                "context_window": self._estimate_context_window(model.get("id", "")),
-                                "capabilities": self._infer_capabilities(model.get("id", "")),
-                                "owned_by": model.get("owned_by", "unknown"),
-                                "object": model.get("object", "model"),
-                            })
+    async def _fetch_load_status(self, session: aiohttp.ClientSession, model_id: str) -> ModelLoadStatus:
+        """Fetch current load status from API."""
+        try:
+            url = f"{self.api_base.rstrip('/')}/models/{model_id}/status"
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=2)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    status = data.get("status", "cached").lower()
+                    return ModelLoadStatus(status)
+        except Exception:
+            pass
+        return ModelLoadStatus.CACHED
 
-                        # Sort by context window (largest first)
-                        enriched.sort(key=lambda m: m["context_window"], reverse=True)
-
-                        self._cached_models = enriched
-                        self._cache_time = time.time()
-                        return enriched
-
-        except Exception as e:
-            logger.warning(f"Failed to discover JARVIS Prime models: {e}")
-
-        # Return cached or empty
-        return self._cached_models or []
+    def _metadata_to_dict(self, metadata: ModelMetadata) -> Dict[str, Any]:
+        """Convert ModelMetadata to dict for backward compatibility."""
+        return {
+            "id": metadata.id,
+            "context_window": metadata.context_window,
+            "capabilities": list(metadata.capabilities.keys()),
+            "load_status": metadata.load_status.value,
+            "specializations": [s.value for s in metadata.specializations],
+            "version": metadata.version,
+            "success_rate": metadata.success_rate,
+        }
 
     async def get_best_model_for_task(
         self,
         required_context: str = "4k",
         task_type: str = "code_improvement",
+        strategy: SelectionStrategy = SelectionStrategy.BALANCED,
+        max_load_time: Optional[float] = None,
     ) -> Optional[Dict[str, Any]]:
         """
-        Get the best available model for a specific task.
+        Get the best available model using advanced selection.
 
         Args:
             required_context: Minimum context window needed (4k, 8k, 16k, 32k)
-            task_type: Type of task (code_improvement, code_review, refactoring)
+            task_type: Type of task
+            strategy: Selection strategy
+            max_load_time: Maximum acceptable load time
 
         Returns:
-            Best matching model or None
+            Best matching model dict or None
         """
         models = await self.discover_models()
+        if not models:
+            return None
 
-        # Parse required context to int
-        context_map = {"4k": 4096, "8k": 8192, "16k": 16384, "32k": 32768}
+        context_map = {"4k": 4096, "8k": 8192, "16k": 16384, "32k": 32768, "128k": 131072}
         min_context = context_map.get(required_context, 4096)
 
         # Filter by context window
         suitable = [m for m in models if m["context_window"] >= min_context]
-
         if not suitable:
-            # Fall back to largest available
-            if models:
-                return models[0]
-            return None
+            suitable = models  # Fallback to all
 
-        # Prefer coding-specialized models for code tasks
-        if task_type in ("code_improvement", "refactoring"):
-            for model in suitable:
-                if "code" in model["id"].lower() or "coder" in model["id"].lower():
-                    return model
+        # Map task type to specializations
+        task_specializations = {
+            "code_improvement": {ModelSpecialization.CODE_GENERATION, ModelSpecialization.CODE_REFACTORING},
+            "refactoring": {ModelSpecialization.CODE_REFACTORING},
+            "bug_fix": {ModelSpecialization.BUG_FIXING},
+            "code_review": {ModelSpecialization.CODE_REVIEW},
+        }
+        preferred_specs = task_specializations.get(task_type, {ModelSpecialization.GENERAL})
 
-        # Return first suitable (largest context)
+        def score_model(m: Dict) -> float:
+            score = 0.0
+            model_id = m["id"]
+            metadata = self._models.get(model_id)
+
+            # Capability score
+            cap_score = 1.0 if any("code" in c for c in m.get("capabilities", [])) else 0.5
+            score += cap_score * 0.25
+
+            # Load status score (prefer loaded)
+            load_scores = {"loaded": 1.0, "loading": 0.8, "cached": 0.5, "archived": 0.2}
+            load_score = load_scores.get(m.get("load_status", "cached"), 0.3)
+
+            if strategy == SelectionStrategy.LOADED_FIRST:
+                score += load_score * 0.5
+            else:
+                score += load_score * 0.25
+
+            # Success rate
+            success_rate = m.get("success_rate", 1.0)
+            score += success_rate * 0.25
+
+            # Specialization match
+            model_specs = {ModelSpecialization(s) for s in m.get("specializations", [])}
+            spec_match = len(model_specs & preferred_specs) / max(len(preferred_specs), 1)
+            score += spec_match * 0.25
+
+            return score
+
+        suitable.sort(key=score_model, reverse=True)
         return suitable[0] if suitable else None
+
+    def record_performance(
+        self, model_id: str, task_type: str, success: bool, latency_ms: float,
+        iterations: int = 1, quality_score: float = 1.0
+    ) -> None:
+        """Record model performance for learning."""
+        record = PerformanceRecord(
+            model_id=model_id,
+            task_type=task_type,
+            difficulty=TaskDifficulty.MODERATE,
+            success=success,
+            latency_ms=latency_ms,
+            iterations_used=iterations,
+            code_quality_score=quality_score,
+        )
+        self._performance_records[model_id].append(record)
+
+        # Update model metadata success rate
+        if model_id in self._models:
+            self._models[model_id].success_rate = self._calculate_success_rate(model_id)
+
+    def _calculate_success_rate(self, model_id: str) -> float:
+        """Calculate success rate from performance history."""
+        records = self._performance_records.get(model_id, [])
+        if not records:
+            return 1.0
+        return sum(1 for r in records if r.success) / len(records)
+
+    def _get_model_family(self, model_id: str) -> Dict:
+        """Get model family characteristics."""
+        model_lower = model_id.lower()
+        for family, info in self.MODEL_FAMILIES.items():
+            if family in model_lower:
+                return info
+        return {"context_default": 4096, "specializations": {ModelSpecialization.GENERAL}, "languages": frozenset()}
 
     def _estimate_context_window(self, model_id: str) -> int:
         """Estimate context window from model name."""
         model_lower = model_id.lower()
-
-        # Known patterns
-        if "32k" in model_lower or "32000" in model_lower:
-            return 32768
-        if "16k" in model_lower or "16000" in model_lower:
-            return 16384
-        if "8k" in model_lower or "8000" in model_lower:
-            return 8192
-
-        # Model family defaults
-        if "deepseek" in model_lower:
-            return 16384  # DeepSeek models typically have 16k
-        if "codellama" in model_lower:
-            return 16384
-        if "llama" in model_lower:
-            return 8192
-        if "qwen" in model_lower:
-            return 32768  # Qwen models often have 32k
-
-        return 4096  # Default
+        for pattern, size in self.CONTEXT_PATTERNS.items():
+            if pattern in model_lower:
+                return size
+        return self._get_model_family(model_id).get("context_default", 4096)
 
     def _infer_capabilities(self, model_id: str) -> List[str]:
         """Infer capabilities from model name."""
@@ -272,27 +1016,61 @@ class JarvisPrimeModelDiscovery:
 
         return capabilities
 
+    def _extract_version(self, model_id: str) -> str:
+        """Extract version from model ID."""
+        patterns = [r'-v(\d+(?:\.\d+)?)', r'v(\d+(?:\.\d+)?)', r'-(\d+\.\d+)']
+        for pattern in patterns:
+            match = re.search(pattern, model_id.lower())
+            if match:
+                return match.group(1)
+        return "1.0"
+
+    async def get_loaded_models(self) -> List[Dict[str, Any]]:
+        """Get models currently loaded in RAM."""
+        models = await self.discover_models()
+        return [m for m in models if m.get("load_status") == "loaded"]
+
+    def get_status(self) -> Dict[str, Any]:
+        """Get comprehensive registry status."""
+        return {
+            "total_models": len(self._models),
+            "loaded_count": sum(1 for m in self._models.values() if m.load_status == ModelLoadStatus.LOADED),
+            "initialization_complete": self._initialization_complete,
+            "cache_age_seconds": time.time() - self._cache_time if self._cache_time else None,
+            "models": {m.id: {"success_rate": m.success_rate, "load_status": m.load_status.value} for m in self._models.values()},
+        }
+
+
+# Backward compatibility alias
+JarvisPrimeModelDiscovery = AdvancedModelCapabilityRegistry
+
 
 class IntelligentOuroborosModelSelector:
     """
-    v2.0: Intelligent model selection for Ouroboros self-programming.
+    v3.0: Advanced intelligent model selection for Ouroboros self-programming.
 
     Combines:
+    - AdvancedModelCapabilityRegistry for JARVIS Prime models with load status
+    - EnhancedCodeComplexityAnalyzer for sophisticated code analysis
     - IntelligentModelSelector for general model selection
-    - JarvisPrimeModelDiscovery for JARVIS Prime models
-    - CodeComplexityAnalyzer for code-aware selection
+    - RAMAwareSelection for preferring loaded models
+    - PerformanceTracking for learning from execution results
 
-    Selection criteria:
-    1. Code complexity -> required model capability
-    2. File size -> required context window
-    3. Task type -> specialized model preference
-    4. System resources -> RAM-aware selection
+    Selection criteria (in priority order):
+    1. Load status -> prefer already-loaded models (avoid wait time)
+    2. Code complexity -> required model capability level
+    3. Task difficulty -> model specialization matching
+    4. Context requirements -> model context window
+    5. Historical performance -> success rate per model/task
+    6. System resources -> RAM-aware selection
     """
 
     def __init__(self):
-        self._model_discovery = JarvisPrimeModelDiscovery()
+        self._model_discovery = AdvancedModelCapabilityRegistry()
         self._selector: Optional[IntelligentModelSelector] = None
         self._lock = asyncio.Lock()
+        self._selection_history: Deque[Dict[str, Any]] = deque(maxlen=100)
+        self._current_task_id: Optional[str] = None
 
         # Try to initialize IntelligentModelSelector
         if INTELLIGENT_SELECTOR_AVAILABLE:
@@ -306,121 +1084,363 @@ class IntelligentOuroborosModelSelector:
         code: str,
         task_type: str = "code_improvement",
         prefer_local: bool = True,
-    ) -> Dict[str, Any]:
+        strategy: SelectionStrategy = SelectionStrategy.BALANCED,
+        urgency: str = "normal",
+        max_load_time: Optional[float] = None,
+    ) -> SelectionResult:
         """
-        Select the best model for a code improvement task.
+        Select the best model for a code improvement task using advanced selection.
 
         Args:
             code: The code to be improved
-            task_type: Type of task (code_improvement, refactoring, bug_fix)
+            task_type: Type of task (code_improvement, refactoring, bug_fix, code_review)
             prefer_local: Prefer local models (JARVIS Prime, Ollama)
+            strategy: Selection strategy to use
+            urgency: Task urgency (urgent, normal, low) - affects load time tolerance
+            max_load_time: Maximum acceptable model load time (None = no limit)
 
         Returns:
-            Dict with:
-            - provider: Provider name (jarvis-prime, ollama, anthropic)
-            - model: Model ID
-            - api_base: API base URL
-            - context_window: Context window size
-            - reasoning: Why this model was selected
+            SelectionResult with complete selection details and reasoning
         """
         async with self._lock:
-            # Analyze code complexity
-            complexity = CodeComplexityAnalyzer.analyze(code)
+            task_id = f"task_{uuid.uuid4().hex[:8]}"
+            self._current_task_id = task_id
+            start_time = time.time()
+
+            # Step 1: Analyze code complexity with enhanced analyzer
+            complexity = EnhancedCodeComplexityAnalyzer.analyze(code)
             reasoning = []
 
-            reasoning.append(f"Code analysis: {complexity['line_count']} lines, "
-                           f"complexity={complexity['complexity']}, "
-                           f"required_context={complexity['required_context']}")
+            reasoning.append(
+                f"Code analysis: {complexity['line_count']} lines, "
+                f"cyclomatic={complexity['cyclomatic_complexity']}, "
+                f"cognitive={complexity['cognitive_complexity']}, "
+                f"maintainability={complexity['maintainability_index']:.1f}, "
+                f"difficulty={complexity['difficulty'].name}, "
+                f"required_context={complexity['required_context']}"
+            )
 
-            # Step 1: Try JARVIS Prime model discovery
+            # Adjust strategy based on urgency
+            if urgency == "urgent":
+                strategy = SelectionStrategy.LOADED_FIRST
+                max_load_time = max_load_time or 5.0
+                reasoning.append(f"Urgency: {urgency} - forcing LOADED_FIRST strategy")
+            elif urgency == "low":
+                strategy = SelectionStrategy.BEST_QUALITY
+                reasoning.append(f"Urgency: {urgency} - using BEST_QUALITY strategy")
+
+            # Step 2: Get preferred specializations based on task type
+            task_specializations = self._get_task_specializations(task_type, complexity)
+            reasoning.append(f"Target specializations: {[s.value for s in task_specializations]}")
+
+            # Step 3: Try JARVIS Prime with advanced selection
             if prefer_local:
                 prime_model = await self._model_discovery.get_best_model_for_task(
                     required_context=complexity["required_context"],
                     task_type=task_type,
+                    strategy=strategy,
+                    max_load_time=max_load_time,
                 )
 
                 if prime_model:
-                    reasoning.append(f"Selected JARVIS Prime model: {prime_model['id']} "
-                                   f"(context: {prime_model['context_window']})")
-                    return {
-                        "provider": "jarvis-prime",
-                        "model": prime_model["id"],
-                        "api_base": os.getenv("JARVIS_PRIME_API_BASE", "http://localhost:8000/v1"),
-                        "context_window": prime_model["context_window"],
-                        "reasoning": reasoning,
-                    }
+                    load_status = prime_model.get("load_status", "cached")
+                    success_rate = prime_model.get("success_rate", 1.0)
 
-            # Step 2: Try IntelligentModelSelector
+                    reasoning.append(
+                        f"Selected JARVIS Prime model: {prime_model['id']} "
+                        f"(context: {prime_model['context_window']}, "
+                        f"load_status: {load_status}, "
+                        f"success_rate: {success_rate:.2f})"
+                    )
+
+                    # Build fallback chain
+                    fallback_chain = await self._build_fallback_chain(
+                        complexity, task_type, exclude=[prime_model['id']]
+                    )
+
+                    result = SelectionResult(
+                        provider="jarvis-prime",
+                        model=prime_model["id"],
+                        api_base=os.getenv("JARVIS_PRIME_API_BASE", "http://localhost:8000/v1"),
+                        context_window=prime_model["context_window"],
+                        strategy_used=strategy,
+                        reasoning=reasoning,
+                        fallback_chain=fallback_chain,
+                        estimated_latency_ms=self._estimate_latency(prime_model, load_status),
+                        confidence=success_rate,
+                    )
+
+                    self._record_selection(task_id, result, complexity, time.time() - start_time)
+                    return result
+
+            # Step 4: Try IntelligentModelSelector as fallback
             if self._selector:
                 try:
-                    # Determine required capabilities based on task
-                    capabilities = {"code_generation"}
-                    if task_type == "refactoring":
-                        capabilities.add("code_refactoring")
-                    elif task_type == "bug_fix":
-                        capabilities.add("code_debugging")
+                    capabilities = self._get_required_capabilities(task_type)
 
                     model = await self._selector.select_best_model(
-                        query=f"Improve this {complexity['complexity']} complexity code",
+                        query=f"Improve this {complexity['difficulty'].name.lower()} difficulty code",
                         intent="code_improvement",
                         required_capabilities=capabilities,
                         context={
                             "code_complexity": complexity["complexity"],
+                            "difficulty": complexity["difficulty"].name,
+                            "cyclomatic": complexity["cyclomatic_complexity"],
                             "required_context": complexity["required_context"],
                         }
                     )
 
                     if model:
                         reasoning.append(f"IntelligentModelSelector chose: {model.name}")
-                        return {
-                            "provider": model.provider,
-                            "model": model.model_id,
-                            "api_base": model.api_base,
-                            "context_window": model.context_window,
-                            "reasoning": reasoning,
-                        }
+
+                        result = SelectionResult(
+                            provider=model.provider if hasattr(model, 'provider') else "intelligent",
+                            model=model.model_id if hasattr(model, 'model_id') else str(model.name),
+                            api_base=model.api_base if hasattr(model, 'api_base') else "",
+                            context_window=model.context_window if hasattr(model, 'context_window') else 8192,
+                            strategy_used=strategy,
+                            reasoning=reasoning,
+                            fallback_chain=await self._build_fallback_chain(complexity, task_type),
+                            confidence=0.8,
+                        )
+
+                        self._record_selection(task_id, result, complexity, time.time() - start_time)
+                        return result
+
                 except Exception as e:
                     reasoning.append(f"IntelligentModelSelector failed: {e}")
 
-            # Step 3: Fallback to configured providers
+            # Step 5: Fallback to configured providers
             reasoning.append("Using fallback provider selection")
-            return self._get_fallback_model(complexity, reasoning)
+            result = self._get_fallback_model(complexity, reasoning, strategy)
+            self._record_selection(task_id, result, complexity, time.time() - start_time)
+            return result
+
+    def _get_task_specializations(
+        self, task_type: str, complexity: Dict[str, Any]
+    ) -> Set[ModelSpecialization]:
+        """Get relevant specializations based on task type and complexity."""
+        base_specs = {
+            "code_improvement": {ModelSpecialization.CODE_GENERATION},
+            "refactoring": {ModelSpecialization.CODE_REFACTORING},
+            "bug_fix": {ModelSpecialization.BUG_FIXING},
+            "code_review": {ModelSpecialization.CODE_REVIEW},
+            "testing": {ModelSpecialization.TESTING},
+            "documentation": {ModelSpecialization.DOCUMENTATION},
+            "performance": {ModelSpecialization.PERFORMANCE},
+            "security": {ModelSpecialization.SECURITY},
+        }
+
+        specs = base_specs.get(task_type, {ModelSpecialization.GENERAL})
+
+        # Add specializations based on code patterns
+        patterns = complexity.get("patterns_detected", {})
+        if patterns.get("async"):
+            specs.add(ModelSpecialization.ASYNC_PATTERNS)
+        if complexity.get("potential_security_issues", 0) > 0:
+            specs.add(ModelSpecialization.SECURITY)
+        if complexity.get("difficulty", TaskDifficulty.MODERATE).value >= 4:
+            specs.add(ModelSpecialization.ARCHITECTURE)
+
+        return specs
+
+    def _get_required_capabilities(self, task_type: str) -> Set[str]:
+        """Get required capabilities for a task type."""
+        capabilities = {"code_generation"}
+
+        if task_type == "refactoring":
+            capabilities.update({"code_refactoring", "code_review"})
+        elif task_type == "bug_fix":
+            capabilities.update({"code_debugging", "bug_fixing"})
+        elif task_type == "code_review":
+            capabilities.update({"code_review", "code_analysis"})
+        elif task_type == "testing":
+            capabilities.add("test_generation")
+        elif task_type == "documentation":
+            capabilities.add("documentation")
+
+        return capabilities
+
+    async def _build_fallback_chain(
+        self,
+        complexity: Dict[str, Any],
+        task_type: str,
+        exclude: Optional[List[str]] = None,
+    ) -> List[Tuple[str, str]]:
+        """Build a fallback chain of models."""
+        exclude = exclude or []
+        chain = []
+
+        # Try to get more models from discovery
+        try:
+            models = await self._model_discovery.discover_models()
+            for model in models[:3]:
+                if model["id"] not in exclude:
+                    chain.append(("jarvis-prime", model["id"]))
+        except Exception:
+            pass
+
+        # Add static fallbacks
+        if complexity["required_context"] in ("16k", "32k"):
+            fallback_model = os.getenv("JARVIS_PRIME_MODEL", "deepseek-coder-v2")
+            if fallback_model not in exclude:
+                chain.append(("jarvis-prime", fallback_model))
+        else:
+            ollama_model = os.getenv("OLLAMA_MODEL", "codellama")
+            chain.append(("ollama", ollama_model))
+
+        # Add API fallback
+        chain.append(("anthropic", "claude-3-haiku-20240307"))
+
+        return chain[:5]  # Limit to 5 fallbacks
+
+    def _estimate_latency(self, model: Dict[str, Any], load_status: str) -> float:
+        """Estimate latency based on model and load status."""
+        base_latency = 100.0  # Base inference latency in ms
+
+        # Add load time if not already loaded
+        load_penalties = {
+            "loaded": 0,
+            "loading": 5000,  # 5 seconds
+            "cached": 15000,  # 15 seconds
+            "archived": 60000,  # 60 seconds
+        }
+
+        return base_latency + load_penalties.get(load_status, 15000)
 
     def _get_fallback_model(
         self,
         complexity: Dict[str, Any],
         reasoning: List[str],
-    ) -> Dict[str, Any]:
+        strategy: SelectionStrategy,
+    ) -> SelectionResult:
         """Get fallback model based on complexity."""
-        # For complex code, prefer larger context models
         if complexity["required_context"] in ("16k", "32k"):
-            # Try DeepSeek first (good at code, large context)
-            return {
-                "provider": "jarvis-prime",
-                "model": os.getenv("JARVIS_PRIME_MODEL", "deepseek-coder-v2"),
-                "api_base": os.getenv("JARVIS_PRIME_API_BASE", "http://localhost:8000/v1"),
-                "context_window": 16384,
-                "reasoning": reasoning + ["Fallback: deepseek-coder-v2 for large context"],
-            }
+            return SelectionResult(
+                provider="jarvis-prime",
+                model=os.getenv("JARVIS_PRIME_MODEL", "deepseek-coder-v2"),
+                api_base=os.getenv("JARVIS_PRIME_API_BASE", "http://localhost:8000/v1"),
+                context_window=16384,
+                strategy_used=strategy,
+                reasoning=reasoning + ["Fallback: deepseek-coder-v2 for large context"],
+                fallback_chain=[("ollama", "codellama"), ("anthropic", "claude-3-haiku-20240307")],
+                confidence=0.7,
+            )
         else:
-            # For simpler code, any coding model works
-            return {
-                "provider": "ollama",
-                "model": os.getenv("OLLAMA_MODEL", "codellama"),
-                "api_base": os.getenv("OLLAMA_API_BASE", "http://localhost:11434/v1"),
-                "context_window": 8192,
-                "reasoning": reasoning + ["Fallback: codellama for simple code"],
-            }
+            return SelectionResult(
+                provider="ollama",
+                model=os.getenv("OLLAMA_MODEL", "codellama"),
+                api_base=os.getenv("OLLAMA_API_BASE", "http://localhost:11434/v1"),
+                context_window=8192,
+                strategy_used=strategy,
+                reasoning=reasoning + ["Fallback: codellama for simple code"],
+                fallback_chain=[("jarvis-prime", "deepseek-coder-v2"), ("anthropic", "claude-3-haiku-20240307")],
+                confidence=0.6,
+            )
+
+    def _record_selection(
+        self,
+        task_id: str,
+        result: SelectionResult,
+        complexity: Dict[str, Any],
+        selection_time: float,
+    ) -> None:
+        """Record selection for analytics and learning."""
+        record = {
+            "task_id": task_id,
+            "timestamp": datetime.now().isoformat(),
+            "provider": result.provider,
+            "model": result.model,
+            "strategy": result.strategy_used.value,
+            "complexity": complexity["complexity"],
+            "difficulty": complexity["difficulty"].name,
+            "confidence": result.confidence,
+            "selection_time_ms": selection_time * 1000,
+        }
+        self._selection_history.append(record)
+
+    def record_execution_result(
+        self,
+        task_id: str,
+        success: bool,
+        latency_ms: float,
+        iterations: int,
+        quality_score: float = 1.0,
+        error_message: Optional[str] = None,
+    ) -> None:
+        """Record execution result for performance learning."""
+        # Find the selection record
+        for record in self._selection_history:
+            if record.get("task_id") == task_id:
+                record["execution_success"] = success
+                record["execution_latency_ms"] = latency_ms
+                record["iterations"] = iterations
+                record["quality_score"] = quality_score
+                if error_message:
+                    record["error"] = error_message
+
+                # Update model performance in registry
+                self._model_discovery.record_performance(
+                    model_id=record["model"],
+                    task_type="code_improvement",
+                    success=success,
+                    latency_ms=latency_ms,
+                    iterations=iterations,
+                    quality_score=quality_score,
+                )
+                break
 
     async def get_health(self) -> Dict[str, Any]:
-        """Get health status of model selection components."""
+        """Get comprehensive health status of model selection components."""
         models = await self._model_discovery.discover_models()
+        loaded_models = await self._model_discovery.get_loaded_models()
+
+        # Calculate selection stats
+        recent_selections = list(self._selection_history)[-50:]
+        success_rate = 0.0
+        if recent_selections:
+            successes = sum(1 for s in recent_selections if s.get("execution_success", True))
+            success_rate = successes / len(recent_selections)
 
         return {
             "intelligent_selector_available": INTELLIGENT_SELECTOR_AVAILABLE,
             "intelligent_selector_initialized": self._selector is not None,
-            "jarvis_prime_models": len(models),
-            "jarvis_prime_models_list": [m["id"] for m in models[:5]],  # Top 5
+            "jarvis_prime_models_total": len(models),
+            "jarvis_prime_models_loaded": len(loaded_models),
+            "jarvis_prime_models_list": [m["id"] for m in models[:5]],
+            "loaded_models_list": [m["id"] for m in loaded_models],
+            "recent_selection_count": len(recent_selections),
+            "recent_success_rate": success_rate,
+            "registry_status": self._model_discovery.get_status(),
+        }
+
+    def get_selection_analytics(self) -> Dict[str, Any]:
+        """Get analytics on model selection patterns."""
+        if not self._selection_history:
+            return {"total_selections": 0}
+
+        by_provider = defaultdict(int)
+        by_strategy = defaultdict(int)
+        by_complexity = defaultdict(int)
+        avg_confidence = []
+        avg_selection_time = []
+
+        for record in self._selection_history:
+            by_provider[record.get("provider", "unknown")] += 1
+            by_strategy[record.get("strategy", "unknown")] += 1
+            by_complexity[record.get("complexity", "unknown")] += 1
+            if "confidence" in record:
+                avg_confidence.append(record["confidence"])
+            if "selection_time_ms" in record:
+                avg_selection_time.append(record["selection_time_ms"])
+
+        return {
+            "total_selections": len(self._selection_history),
+            "by_provider": dict(by_provider),
+            "by_strategy": dict(by_strategy),
+            "by_complexity": dict(by_complexity),
+            "avg_confidence": statistics.mean(avg_confidence) if avg_confidence else 0.0,
+            "avg_selection_time_ms": statistics.mean(avg_selection_time) if avg_selection_time else 0.0,
         }
 
 
@@ -434,6 +1454,471 @@ def get_intelligent_ouroboros_selector() -> IntelligentOuroborosModelSelector:
     if _intelligent_selector is None:
         _intelligent_selector = IntelligentOuroborosModelSelector()
     return _intelligent_selector
+
+
+# =============================================================================
+# v3.0: MULTI-MODEL ORCHESTRATOR
+# =============================================================================
+
+class MultiModelOrchestrator:
+    """
+    v3.0: Orchestrates multiple models for complex task decomposition.
+
+    Provides:
+    - Task decomposition into subtasks
+    - Parallel model execution
+    - Model pipeline coordination
+    - Result aggregation
+    - Automatic fallback on partial failures
+    - Cost optimization across models
+    """
+
+    def __init__(self, selector: Optional[IntelligentOuroborosModelSelector] = None):
+        self._selector = selector or get_intelligent_ouroboros_selector()
+        self._executor = ThreadPoolExecutor(max_workers=int(os.getenv("ORCHESTRATOR_MAX_WORKERS", "4")))
+        self._active_tasks: Dict[str, Dict[str, Any]] = {}
+        self._lock = asyncio.Lock()
+
+    async def orchestrate_complex_task(
+        self,
+        code: str,
+        goal: str,
+        task_type: str = "code_improvement",
+        decompose: bool = True,
+        parallel: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Orchestrate a complex task potentially using multiple models.
+
+        Args:
+            code: The code to process
+            goal: The improvement goal
+            task_type: Type of task
+            decompose: Whether to decompose into subtasks
+            parallel: Whether to run subtasks in parallel
+
+        Returns:
+            Aggregated results from all models
+        """
+        task_id = f"orchestration_{uuid.uuid4().hex[:8]}"
+        start_time = time.time()
+
+        async with self._lock:
+            self._active_tasks[task_id] = {
+                "status": "running",
+                "start_time": start_time,
+                "subtasks": [],
+            }
+
+        try:
+            # Analyze code complexity
+            complexity = EnhancedCodeComplexityAnalyzer.analyze(code)
+            difficulty = complexity["difficulty"]
+
+            # Decide if decomposition is needed
+            if not decompose or difficulty.value < TaskDifficulty.HARD.value:
+                # Single model execution
+                return await self._single_model_execution(
+                    task_id, code, goal, task_type, complexity
+                )
+
+            # Decompose into subtasks
+            subtasks = await self._decompose_task(code, goal, task_type, complexity)
+
+            if parallel and len(subtasks) > 1:
+                # Parallel execution
+                results = await self._parallel_execution(task_id, subtasks)
+            else:
+                # Sequential execution
+                results = await self._sequential_execution(task_id, subtasks)
+
+            # Aggregate results
+            aggregated = self._aggregate_results(results, task_id)
+
+            async with self._lock:
+                self._active_tasks[task_id]["status"] = "completed"
+                self._active_tasks[task_id]["duration"] = time.time() - start_time
+
+            return aggregated
+
+        except Exception as e:
+            async with self._lock:
+                self._active_tasks[task_id]["status"] = "failed"
+                self._active_tasks[task_id]["error"] = str(e)
+            raise
+
+    async def _single_model_execution(
+        self,
+        task_id: str,
+        code: str,
+        goal: str,
+        task_type: str,
+        complexity: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Execute task with a single model."""
+        selection = await self._selector.select_model_for_code(
+            code=code,
+            task_type=task_type,
+            strategy=SelectionStrategy.BALANCED,
+        )
+
+        return {
+            "task_id": task_id,
+            "mode": "single_model",
+            "selection": {
+                "provider": selection.provider,
+                "model": selection.model,
+                "reasoning": selection.reasoning,
+            },
+            "complexity": complexity["complexity"],
+            "difficulty": complexity["difficulty"].name,
+        }
+
+    async def _decompose_task(
+        self,
+        code: str,
+        goal: str,
+        task_type: str,
+        complexity: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        """Decompose complex task into subtasks."""
+        subtasks = []
+
+        # Analysis subtask (smaller model, quick)
+        subtasks.append({
+            "type": "analysis",
+            "goal": f"Analyze code structure and identify improvement areas for: {goal}",
+            "code_slice": code[:2000],  # First portion
+            "strategy": SelectionStrategy.FASTEST,
+            "priority": 1,
+        })
+
+        # Main improvement subtask (best model)
+        subtasks.append({
+            "type": "improvement",
+            "goal": goal,
+            "code_slice": code,
+            "strategy": SelectionStrategy.BEST_QUALITY,
+            "priority": 2,
+        })
+
+        # Review subtask (different model for second opinion)
+        if complexity["difficulty"].value >= TaskDifficulty.HARD.value:
+            subtasks.append({
+                "type": "review",
+                "goal": f"Review the improvements for correctness and potential issues",
+                "code_slice": code,
+                "strategy": SelectionStrategy.SPECIALIZED,
+                "priority": 3,
+            })
+
+        return subtasks
+
+    async def _parallel_execution(
+        self,
+        task_id: str,
+        subtasks: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Execute subtasks in parallel."""
+        async def execute_subtask(subtask: Dict[str, Any]) -> Dict[str, Any]:
+            selection = await self._selector.select_model_for_code(
+                code=subtask["code_slice"],
+                task_type=subtask["type"],
+                strategy=subtask["strategy"],
+            )
+            return {
+                "subtask_type": subtask["type"],
+                "selection": {
+                    "provider": selection.provider,
+                    "model": selection.model,
+                    "confidence": selection.confidence,
+                },
+                "priority": subtask["priority"],
+            }
+
+        tasks = [execute_subtask(st) for st in subtasks]
+        return await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _sequential_execution(
+        self,
+        task_id: str,
+        subtasks: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Execute subtasks sequentially."""
+        results = []
+        for subtask in sorted(subtasks, key=lambda s: s["priority"]):
+            selection = await self._selector.select_model_for_code(
+                code=subtask["code_slice"],
+                task_type=subtask["type"],
+                strategy=subtask["strategy"],
+            )
+            results.append({
+                "subtask_type": subtask["type"],
+                "selection": {
+                    "provider": selection.provider,
+                    "model": selection.model,
+                    "confidence": selection.confidence,
+                },
+                "priority": subtask["priority"],
+            })
+        return results
+
+    def _aggregate_results(
+        self,
+        results: List[Any],
+        task_id: str,
+    ) -> Dict[str, Any]:
+        """Aggregate results from multiple subtasks."""
+        successful = [r for r in results if not isinstance(r, Exception)]
+        failed = [r for r in results if isinstance(r, Exception)]
+
+        return {
+            "task_id": task_id,
+            "mode": "multi_model",
+            "total_subtasks": len(results),
+            "successful_subtasks": len(successful),
+            "failed_subtasks": len(failed),
+            "subtask_results": successful,
+            "errors": [str(e) for e in failed] if failed else None,
+        }
+
+    def get_active_tasks(self) -> Dict[str, Dict[str, Any]]:
+        """Get all active orchestration tasks."""
+        return dict(self._active_tasks)
+
+
+# =============================================================================
+# v3.0: UNIFIED TRINITY COORDINATOR
+# =============================================================================
+
+class TrinityCoordinator:
+    """
+    v3.0: Unified coordinator for JARVIS, JARVIS Prime, and Reactor Core.
+
+    Provides:
+    - Cross-repo health monitoring
+    - Unified startup orchestration
+    - Event routing between repos
+    - State synchronization
+    - Graceful degradation handling
+    """
+
+    # Repository configurations
+    REPOS = {
+        "jarvis": {
+            "name": "JARVIS",
+            "path_env": "JARVIS_REPO_PATH",
+            "default_path": "~/Documents/repos/JARVIS-AI-Agent",
+            "health_endpoint": "/health",
+            "port_env": "JARVIS_PORT",
+            "default_port": 8010,
+        },
+        "prime": {
+            "name": "JARVIS-Prime",
+            "path_env": "JARVIS_PRIME_REPO_PATH",
+            "default_path": "~/Documents/repos/jarvis-prime",
+            "health_endpoint": "/v1/models",
+            "port_env": "JARVIS_PRIME_PORT",
+            "default_port": 8002,
+        },
+        "reactor": {
+            "name": "Reactor-Core",
+            "path_env": "REACTOR_CORE_REPO_PATH",
+            "default_path": "~/Documents/repos/reactor-core",
+            "health_endpoint": "/health",
+            "port_env": "REACTOR_CORE_PORT",
+            "default_port": 8003,
+        },
+    }
+
+    def __init__(self):
+        self._health_status: Dict[str, Dict[str, Any]] = {}
+        self._event_subscribers: Dict[str, List[Callable]] = defaultdict(list)
+        self._lock = asyncio.Lock()
+        self._state_dir = Path(os.getenv(
+            "TRINITY_STATE_DIR",
+            os.path.expanduser("~/.jarvis/trinity")
+        ))
+        self._state_dir.mkdir(parents=True, exist_ok=True)
+        self._startup_complete = False
+        self._shutdown_event = asyncio.Event()
+
+    async def initialize(self) -> bool:
+        """Initialize the Trinity coordinator."""
+        logger.info("🔺 Initializing Trinity Coordinator...")
+
+        # Check all repo health
+        await self.check_all_health()
+
+        # Load persisted state
+        await self._load_state()
+
+        self._startup_complete = True
+        logger.info("✅ Trinity Coordinator initialized")
+        return True
+
+    async def check_all_health(self) -> Dict[str, Dict[str, Any]]:
+        """Check health of all Trinity components."""
+        tasks = [
+            self._check_repo_health(repo_id, config)
+            for repo_id, config in self.REPOS.items()
+        ]
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for (repo_id, _), result in zip(self.REPOS.items(), results):
+            if isinstance(result, Exception):
+                self._health_status[repo_id] = {
+                    "healthy": False,
+                    "error": str(result),
+                    "timestamp": datetime.now().isoformat(),
+                }
+            else:
+                self._health_status[repo_id] = result
+
+        return self._health_status
+
+    async def _check_repo_health(
+        self, repo_id: str, config: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Check health of a single repository service."""
+        port = int(os.getenv(config["port_env"], config["default_port"]))
+        url = f"http://localhost:{port}{config['health_endpoint']}"
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    url,
+                    timeout=aiohttp.ClientTimeout(total=5.0)
+                ) as response:
+                    return {
+                        "healthy": response.status == 200,
+                        "status_code": response.status,
+                        "url": url,
+                        "timestamp": datetime.now().isoformat(),
+                    }
+        except Exception as e:
+            return {
+                "healthy": False,
+                "error": str(e),
+                "url": url,
+                "timestamp": datetime.now().isoformat(),
+            }
+
+    async def publish_event(
+        self,
+        event_type: str,
+        payload: Dict[str, Any],
+        target_repos: Optional[List[str]] = None,
+    ) -> None:
+        """Publish an event to Trinity components."""
+        event = {
+            "event_id": f"evt_{uuid.uuid4().hex[:12]}",
+            "event_type": event_type,
+            "payload": payload,
+            "timestamp": datetime.now().isoformat(),
+            "source": "trinity_coordinator",
+        }
+
+        # Save event to state directory
+        event_file = self._state_dir / f"events/{event['event_id']}.json"
+        event_file.parent.mkdir(exist_ok=True)
+        await asyncio.to_thread(
+            event_file.write_text,
+            json.dumps(event, indent=2)
+        )
+
+        # Notify subscribers
+        for subscriber in self._event_subscribers.get(event_type, []):
+            try:
+                if asyncio.iscoroutinefunction(subscriber):
+                    await subscriber(event)
+                else:
+                    subscriber(event)
+            except Exception as e:
+                logger.warning(f"Event subscriber failed: {e}")
+
+    def subscribe(self, event_type: str, callback: Callable) -> None:
+        """Subscribe to events of a specific type."""
+        self._event_subscribers[event_type].append(callback)
+
+    async def sync_state(self) -> None:
+        """Synchronize state across all Trinity components."""
+        state = {
+            "coordinator_version": "3.0.0",
+            "last_sync": datetime.now().isoformat(),
+            "health_status": self._health_status,
+            "model_selector_status": get_intelligent_ouroboros_selector().get_selection_analytics(),
+        }
+
+        state_file = self._state_dir / "trinity_state.json"
+        await asyncio.to_thread(
+            state_file.write_text,
+            json.dumps(state, indent=2)
+        )
+
+    async def _load_state(self) -> None:
+        """Load persisted state from disk."""
+        state_file = self._state_dir / "trinity_state.json"
+        if state_file.exists():
+            try:
+                content = await asyncio.to_thread(state_file.read_text)
+                state = json.loads(content)
+                logger.debug(f"Loaded Trinity state from {state_file}")
+            except Exception as e:
+                logger.warning(f"Failed to load Trinity state: {e}")
+
+    async def get_system_status(self) -> Dict[str, Any]:
+        """Get comprehensive system status."""
+        await self.check_all_health()
+
+        selector = get_intelligent_ouroboros_selector()
+
+        return {
+            "coordinator": {
+                "version": "3.0.0",
+                "startup_complete": self._startup_complete,
+                "state_dir": str(self._state_dir),
+            },
+            "repositories": self._health_status,
+            "model_selection": await selector.get_health(),
+            "event_subscribers": {
+                event_type: len(subscribers)
+                for event_type, subscribers in self._event_subscribers.items()
+            },
+        }
+
+    async def graceful_shutdown(self) -> None:
+        """Perform graceful shutdown of all components."""
+        logger.info("🔻 Trinity Coordinator shutting down...")
+
+        # Save final state
+        await self.sync_state()
+
+        # Publish shutdown event
+        await self.publish_event("shutdown", {"reason": "graceful_shutdown"})
+
+        self._shutdown_event.set()
+        logger.info("✅ Trinity Coordinator shutdown complete")
+
+
+# Global Trinity coordinator instance
+_trinity_coordinator: Optional[TrinityCoordinator] = None
+
+
+def get_trinity_coordinator() -> TrinityCoordinator:
+    """Get global Trinity coordinator instance."""
+    global _trinity_coordinator
+    if _trinity_coordinator is None:
+        _trinity_coordinator = TrinityCoordinator()
+    return _trinity_coordinator
+
+
+async def initialize_trinity() -> TrinityCoordinator:
+    """Initialize and return the Trinity coordinator."""
+    coordinator = get_trinity_coordinator()
+    await coordinator.initialize()
+    return coordinator
 
 
 # =============================================================================

@@ -3606,6 +3606,11 @@ class SupervisorBootstrapper:
             except Exception as e:
                 self.logger.warning(f"[v90] Could not initialize port manager: {e}")
 
+        # v3.0: Advanced Multi-LLM Integration (integration.py components)
+        self._trinity_coordinator = None  # Cross-repo health and coordination
+        self._model_selector = None       # Intelligent model selection
+        self._multi_model_orchestrator = None  # Complex task decomposition
+
         # v91.0: Advanced System Primitives (ML Prediction, Self-Healing, Coordination)
         self._health_predictor = None
         self._self_healing_orchestrator = None
@@ -13842,6 +13847,45 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
             except Exception as e:
                 self._ouroboros_trinity = None
                 self.logger.warning(f"[v107.0] ⚠️ Trinity Integration unavailable: {e}")
+
+            # v3.0: Initialize Advanced Multi-LLM Integration
+            try:
+                from backend.core.ouroboros.integration import (
+                    initialize_trinity,
+                    get_intelligent_ouroboros_selector,
+                    MultiModelOrchestrator,
+                    SelectionStrategy,
+                )
+
+                # Initialize Trinity Coordinator for cross-repo management
+                self._trinity_coordinator = await initialize_trinity()
+                self._model_selector = get_intelligent_ouroboros_selector()
+                self._multi_model_orchestrator = MultiModelOrchestrator(self._model_selector)
+
+                # Get coordinator status
+                trinity_status = await self._trinity_coordinator.get_system_status()
+                coordinator_version = trinity_status.get("coordinator", {}).get("version", "unknown")
+
+                print(f"  {TerminalUI.GREEN}    └─ v3.0 Multi-LLM Integration: Active (v{coordinator_version}){TerminalUI.RESET}")
+                self.logger.info(f"[v3.0] ✅ Multi-LLM Integration initialized")
+
+                # Log model selection health
+                model_health = await self._model_selector.get_health()
+                models_total = model_health.get("jarvis_prime_models_total", 0)
+                models_loaded = model_health.get("jarvis_prime_models_loaded", 0)
+                self.logger.info(f"[v3.0] Model selection: {models_total} models available, {models_loaded} loaded")
+
+                # Log repo health
+                for repo_id, repo_status in trinity_status.get("repositories", {}).items():
+                    healthy = repo_status.get("healthy", False)
+                    status_icon = "✅" if healthy else "❌"
+                    self.logger.info(f"[v3.0]   {status_icon} {repo_id}: {'healthy' if healthy else 'unavailable'}")
+
+            except Exception as e:
+                self._trinity_coordinator = None
+                self._model_selector = None
+                self._multi_model_orchestrator = None
+                self.logger.warning(f"[v3.0] ⚠️ Multi-LLM Integration unavailable: {e}")
 
             # Note about auto-improvement
             if self._ouroboros_auto_improve:
