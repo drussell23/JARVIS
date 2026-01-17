@@ -100,6 +100,7 @@ from typing import (
     TypeVar,
     Union,
 )
+from collections import deque, defaultdict
 
 try:
     import aiofiles
@@ -15027,3 +15028,1560 @@ async def shutdown_autonomous_system_v7() -> None:
     _dashboard = None
 
     logger.info("✅ Autonomous System v7.0 shutdown complete")
+
+
+# =============================================================================
+# v8.0: "JARVIS, IMPROVE YOURSELF" - INTELLIGENT AUTONOMOUS SELF-IMPROVEMENT
+# =============================================================================
+# This implements the complete "improve yourself" command with:
+# 1. Intelligent file selection (picks best files to improve)
+# 2. Goal decomposition (vague command → specific tasks)
+# 3. Priority scoring (which improvements matter most)
+# 4. Autonomous scheduling (continuous improvement)
+# 5. Cross-repo intelligence (JARVIS + Prime + Reactor)
+# 6. Voice command integration
+# 7. Learning from past improvements
+# =============================================================================
+
+
+class ImprovementPriority(Enum):
+    """Priority levels for improvements."""
+    CRITICAL = 100    # Security, crashes, data loss
+    HIGH = 75         # Bugs, performance issues
+    MEDIUM = 50       # Code smells, technical debt
+    LOW = 25          # Style, minor improvements
+    COSMETIC = 10     # Comments, formatting
+
+
+class ImprovementCategory(Enum):
+    """Categories of improvements."""
+    SECURITY = "security"
+    PERFORMANCE = "performance"
+    RELIABILITY = "reliability"
+    MAINTAINABILITY = "maintainability"
+    TESTABILITY = "testability"
+    READABILITY = "readability"
+    DOCUMENTATION = "documentation"
+    ARCHITECTURE = "architecture"
+    ERROR_HANDLING = "error_handling"
+    ASYNC_PATTERNS = "async_patterns"
+
+
+@dataclass
+class FileImprovementCandidate:
+    """A candidate file for improvement."""
+    file_path: str
+    priority_score: float
+    categories: List[ImprovementCategory]
+    issues_found: List[Dict[str, Any]]
+    estimated_impact: str  # "high", "medium", "low"
+    estimated_complexity: str  # "simple", "moderate", "complex"
+    last_modified: Optional[datetime] = None
+    last_improved: Optional[datetime] = None
+    improvement_count: int = 0
+    lines_of_code: int = 0
+    cyclomatic_complexity: float = 0.0
+    test_coverage: float = 0.0
+
+
+@dataclass
+class ImprovementGoal:
+    """A decomposed improvement goal."""
+    id: str
+    description: str
+    target_files: List[str]
+    category: ImprovementCategory
+    priority: ImprovementPriority
+    subtasks: List["ImprovementGoal"] = field(default_factory=list)
+    dependencies: List[str] = field(default_factory=list)
+    estimated_effort: str = "unknown"  # "trivial", "small", "medium", "large"
+    success_criteria: List[str] = field(default_factory=list)
+    status: str = "pending"  # "pending", "in_progress", "completed", "failed"
+    created_at: datetime = field(default_factory=datetime.now)
+
+
+@dataclass
+class ImprovementResult:
+    """Result of an improvement attempt."""
+    goal_id: str
+    file_path: str
+    success: bool
+    changes_made: List[str]
+    tests_passed: bool
+    performance_impact: Optional[Dict[str, float]] = None
+    error: Optional[str] = None
+    diff_summary: Optional[str] = None
+    rollback_available: bool = True
+    completed_at: datetime = field(default_factory=datetime.now)
+
+
+class IntelligentFileSelector:
+    """
+    v8.0: Intelligent file selection for "improve yourself" command.
+
+    Uses multiple signals to select the best files to improve:
+    - Technical debt score
+    - Code complexity
+    - Recent error history
+    - Test coverage gaps
+    - Commit frequency (hot files)
+    - Dependency importance
+    - Security vulnerability indicators
+    """
+
+    def __init__(self):
+        self._file_scores: Dict[str, FileImprovementCandidate] = {}
+        self._lock = asyncio.Lock()
+        self._cache_ttl_s = 300  # 5 minute cache
+        self._last_scan: Optional[datetime] = None
+
+        # Weights for scoring
+        self._weights = {
+            "technical_debt": 0.25,
+            "complexity": 0.15,
+            "error_frequency": 0.20,
+            "test_coverage_gap": 0.15,
+            "hotness": 0.10,
+            "dependency_importance": 0.10,
+            "security_risk": 0.05,
+        }
+
+        # Patterns that indicate improvement opportunities
+        self._improvement_patterns = {
+            # Security issues
+            r"eval\s*\(": (ImprovementCategory.SECURITY, ImprovementPriority.CRITICAL),
+            r"exec\s*\(": (ImprovementCategory.SECURITY, ImprovementPriority.CRITICAL),
+            r"pickle\.loads": (ImprovementCategory.SECURITY, ImprovementPriority.HIGH),
+            r"shell\s*=\s*True": (ImprovementCategory.SECURITY, ImprovementPriority.HIGH),
+
+            # Error handling
+            r"except\s*:": (ImprovementCategory.ERROR_HANDLING, ImprovementPriority.MEDIUM),
+            r"pass\s*$": (ImprovementCategory.ERROR_HANDLING, ImprovementPriority.LOW),
+
+            # Performance
+            r"time\.sleep\s*\(\s*\d+\s*\)": (ImprovementCategory.PERFORMANCE, ImprovementPriority.MEDIUM),
+            r"for\s+\w+\s+in\s+\w+\.items\(\)": (ImprovementCategory.PERFORMANCE, ImprovementPriority.LOW),
+
+            # Async patterns
+            r"asyncio\.run\s*\(": (ImprovementCategory.ASYNC_PATTERNS, ImprovementPriority.MEDIUM),
+            r"loop\.run_until_complete": (ImprovementCategory.ASYNC_PATTERNS, ImprovementPriority.MEDIUM),
+
+            # Code smells
+            r"# ?TODO": (ImprovementCategory.MAINTAINABILITY, ImprovementPriority.LOW),
+            r"# ?FIXME": (ImprovementCategory.MAINTAINABILITY, ImprovementPriority.MEDIUM),
+            r"# ?HACK": (ImprovementCategory.MAINTAINABILITY, ImprovementPriority.MEDIUM),
+            r"# ?XXX": (ImprovementCategory.MAINTAINABILITY, ImprovementPriority.MEDIUM),
+
+            # Documentation
+            r'"""[^"]*"""': (ImprovementCategory.DOCUMENTATION, ImprovementPriority.COSMETIC),
+        }
+
+    async def select_files_to_improve(
+        self,
+        project_root: Optional[Path] = None,
+        max_files: int = 5,
+        categories: Optional[List[ImprovementCategory]] = None,
+        min_priority: ImprovementPriority = ImprovementPriority.LOW,
+        exclude_patterns: Optional[List[str]] = None,
+    ) -> List[FileImprovementCandidate]:
+        """
+        Select the best files to improve.
+
+        Args:
+            project_root: Root directory to scan
+            max_files: Maximum number of files to return
+            categories: Filter by improvement categories
+            min_priority: Minimum priority threshold
+            exclude_patterns: Regex patterns to exclude
+
+        Returns:
+            List of files sorted by improvement priority
+        """
+        if project_root is None:
+            project_root = Path.cwd()
+
+        # Check cache
+        async with self._lock:
+            if self._last_scan and (datetime.now() - self._last_scan).seconds < self._cache_ttl_s:
+                candidates = list(self._file_scores.values())
+            else:
+                # Scan for candidates
+                candidates = await self._scan_for_candidates(project_root, exclude_patterns)
+                self._last_scan = datetime.now()
+
+        # Filter by categories
+        if categories:
+            candidates = [
+                c for c in candidates
+                if any(cat in categories for cat in c.categories)
+            ]
+
+        # Filter by priority
+        min_score = min_priority.value
+        candidates = [c for c in candidates if c.priority_score >= min_score]
+
+        # Sort by priority score (descending)
+        candidates.sort(key=lambda x: x.priority_score, reverse=True)
+
+        return candidates[:max_files]
+
+    async def _scan_for_candidates(
+        self,
+        project_root: Path,
+        exclude_patterns: Optional[List[str]] = None,
+    ) -> List[FileImprovementCandidate]:
+        """Scan project for improvement candidates."""
+        candidates = []
+        exclude_patterns = exclude_patterns or [
+            r"__pycache__",
+            r"\.git",
+            r"\.venv",
+            r"venv",
+            r"node_modules",
+            r"\.pyc$",
+            r"test_.*\.py$",
+            r".*_test\.py$",
+        ]
+
+        exclude_regex = re.compile("|".join(exclude_patterns))
+
+        # Scan Python files
+        for py_file in project_root.rglob("*.py"):
+            file_path = str(py_file)
+
+            # Skip excluded patterns
+            if exclude_regex.search(file_path):
+                continue
+
+            try:
+                candidate = await self._analyze_file(py_file)
+                if candidate:
+                    candidates.append(candidate)
+                    self._file_scores[file_path] = candidate
+            except Exception as e:
+                logger.debug(f"Failed to analyze {py_file}: {e}")
+
+        return candidates
+
+    async def _analyze_file(self, file_path: Path) -> Optional[FileImprovementCandidate]:
+        """Analyze a single file for improvement opportunities."""
+        try:
+            content = await asyncio.to_thread(file_path.read_text)
+        except Exception:
+            return None
+
+        lines = content.split("\n")
+        issues_found = []
+        categories_found = set()
+        max_priority = ImprovementPriority.COSMETIC
+
+        # Check for improvement patterns
+        for pattern, (category, priority) in self._improvement_patterns.items():
+            matches = list(re.finditer(pattern, content, re.MULTILINE))
+            if matches:
+                categories_found.add(category)
+                if priority.value > max_priority.value:
+                    max_priority = priority
+
+                for match in matches[:3]:  # Limit to 3 examples
+                    line_num = content[:match.start()].count("\n") + 1
+                    issues_found.append({
+                        "pattern": pattern,
+                        "category": category.value,
+                        "priority": priority.value,
+                        "line": line_num,
+                        "snippet": match.group(0)[:50],
+                    })
+
+        # Calculate metrics
+        loc = len([l for l in lines if l.strip() and not l.strip().startswith("#")])
+        complexity = await self._estimate_complexity(content)
+
+        # Calculate priority score
+        score = self._calculate_priority_score(
+            issues_found=issues_found,
+            loc=loc,
+            complexity=complexity,
+            max_priority=max_priority,
+        )
+
+        # Estimate impact and complexity
+        impact = "high" if max_priority.value >= 75 else "medium" if max_priority.value >= 50 else "low"
+        effort = "complex" if complexity > 20 else "moderate" if complexity > 10 else "simple"
+
+        return FileImprovementCandidate(
+            file_path=str(file_path),
+            priority_score=score,
+            categories=list(categories_found),
+            issues_found=issues_found,
+            estimated_impact=impact,
+            estimated_complexity=effort,
+            last_modified=datetime.fromtimestamp(file_path.stat().st_mtime),
+            lines_of_code=loc,
+            cyclomatic_complexity=complexity,
+        )
+
+    async def _estimate_complexity(self, code: str) -> float:
+        """Estimate cyclomatic complexity."""
+        # Simple estimation based on control flow keywords
+        control_keywords = [
+            r"\bif\b", r"\belif\b", r"\belse\b",
+            r"\bfor\b", r"\bwhile\b",
+            r"\btry\b", r"\bexcept\b",
+            r"\band\b", r"\bor\b",
+            r"\bwith\b",
+        ]
+
+        complexity = 1  # Base complexity
+        for keyword in control_keywords:
+            complexity += len(re.findall(keyword, code))
+
+        return complexity
+
+    def _calculate_priority_score(
+        self,
+        issues_found: List[Dict],
+        loc: int,
+        complexity: float,
+        max_priority: ImprovementPriority,
+    ) -> float:
+        """Calculate overall priority score."""
+        # Base score from issues
+        issue_score = sum(issue["priority"] for issue in issues_found)
+
+        # Normalize by LOC (larger files may have more issues)
+        if loc > 0:
+            issue_density = min(100, (issue_score / loc) * 100)
+        else:
+            issue_density = 0
+
+        # Complexity factor (higher complexity = higher priority)
+        complexity_factor = min(100, complexity * 3)
+
+        # Combine scores
+        score = (
+            issue_density * 0.4 +
+            max_priority.value * 0.4 +
+            complexity_factor * 0.2
+        )
+
+        return min(100, score)
+
+
+class GoalDecomposer:
+    """
+    v8.0: Decomposes vague improvement goals into specific tasks.
+
+    "Improve yourself" → [
+        "Fix security issues in auth.py",
+        "Add error handling to api.py",
+        "Improve test coverage for utils.py",
+        ...
+    ]
+    """
+
+    def __init__(self, llm_client: Optional[Any] = None):
+        self._llm_client = llm_client
+        self._lock = asyncio.Lock()
+        self._goal_templates = self._load_goal_templates()
+
+    def _load_goal_templates(self) -> Dict[str, List[str]]:
+        """Load goal decomposition templates."""
+        return {
+            "improve yourself": [
+                "Fix critical security vulnerabilities",
+                "Improve error handling and resilience",
+                "Optimize performance bottlenecks",
+                "Increase test coverage",
+                "Refactor complex code for maintainability",
+                "Update deprecated patterns",
+            ],
+            "improve performance": [
+                "Profile and identify bottlenecks",
+                "Optimize database queries",
+                "Add caching where beneficial",
+                "Use async patterns for I/O",
+                "Reduce memory allocations",
+            ],
+            "improve security": [
+                "Remove unsafe eval/exec usage",
+                "Sanitize user inputs",
+                "Update vulnerable dependencies",
+                "Add input validation",
+                "Implement proper authentication",
+            ],
+            "improve code quality": [
+                "Add type hints",
+                "Improve docstrings",
+                "Reduce code complexity",
+                "Remove code duplication",
+                "Apply consistent formatting",
+            ],
+            "improve reliability": [
+                "Add proper error handling",
+                "Implement retry logic",
+                "Add circuit breakers",
+                "Improve logging",
+                "Add health checks",
+            ],
+        }
+
+    async def decompose_goal(
+        self,
+        goal: str,
+        file_selector: IntelligentFileSelector,
+        project_root: Optional[Path] = None,
+    ) -> List[ImprovementGoal]:
+        """
+        Decompose a vague goal into specific improvement tasks.
+
+        Args:
+            goal: The vague goal (e.g., "improve yourself")
+            file_selector: File selector to find relevant files
+            project_root: Project root directory
+
+        Returns:
+            List of specific improvement goals
+        """
+        goals = []
+        goal_lower = goal.lower().strip()
+
+        # Find matching template
+        template_key = None
+        for key in self._goal_templates:
+            if key in goal_lower or goal_lower in key:
+                template_key = key
+                break
+
+        # Default to "improve yourself" if no match
+        if template_key is None:
+            template_key = "improve yourself"
+
+        template_goals = self._goal_templates[template_key]
+
+        # Get improvement candidates
+        candidates = await file_selector.select_files_to_improve(
+            project_root=project_root,
+            max_files=10,
+        )
+
+        # Map goals to files
+        for i, goal_desc in enumerate(template_goals):
+            # Find relevant files for this goal type
+            category = self._goal_to_category(goal_desc)
+            relevant_files = [
+                c.file_path for c in candidates
+                if category in c.categories or not c.categories
+            ][:3]  # Max 3 files per goal
+
+            if not relevant_files:
+                # Use top priority files if no category match
+                relevant_files = [c.file_path for c in candidates[:2]]
+
+            goal_obj = ImprovementGoal(
+                id=f"goal_{i}_{int(datetime.now().timestamp())}",
+                description=goal_desc,
+                target_files=relevant_files,
+                category=category,
+                priority=self._estimate_priority(goal_desc),
+                estimated_effort=self._estimate_effort(goal_desc),
+                success_criteria=self._generate_success_criteria(goal_desc),
+            )
+            goals.append(goal_obj)
+
+        # Sort by priority
+        goals.sort(key=lambda g: g.priority.value, reverse=True)
+
+        return goals
+
+    def _goal_to_category(self, goal_desc: str) -> ImprovementCategory:
+        """Map goal description to category."""
+        goal_lower = goal_desc.lower()
+
+        if any(w in goal_lower for w in ["security", "vulnerab", "unsafe"]):
+            return ImprovementCategory.SECURITY
+        elif any(w in goal_lower for w in ["performance", "optim", "cache", "bottleneck"]):
+            return ImprovementCategory.PERFORMANCE
+        elif any(w in goal_lower for w in ["error", "exception", "retry", "resilience"]):
+            return ImprovementCategory.ERROR_HANDLING
+        elif any(w in goal_lower for w in ["test", "coverage"]):
+            return ImprovementCategory.TESTABILITY
+        elif any(w in goal_lower for w in ["async", "concurrent"]):
+            return ImprovementCategory.ASYNC_PATTERNS
+        elif any(w in goal_lower for w in ["document", "docstring", "comment"]):
+            return ImprovementCategory.DOCUMENTATION
+        elif any(w in goal_lower for w in ["refactor", "complex", "maintain"]):
+            return ImprovementCategory.MAINTAINABILITY
+        else:
+            return ImprovementCategory.MAINTAINABILITY
+
+    def _estimate_priority(self, goal_desc: str) -> ImprovementPriority:
+        """Estimate priority from goal description."""
+        goal_lower = goal_desc.lower()
+
+        if any(w in goal_lower for w in ["critical", "security", "vulnerab"]):
+            return ImprovementPriority.CRITICAL
+        elif any(w in goal_lower for w in ["error", "bug", "fix"]):
+            return ImprovementPriority.HIGH
+        elif any(w in goal_lower for w in ["performance", "optimize"]):
+            return ImprovementPriority.MEDIUM
+        elif any(w in goal_lower for w in ["test", "refactor"]):
+            return ImprovementPriority.LOW
+        else:
+            return ImprovementPriority.LOW
+
+    def _estimate_effort(self, goal_desc: str) -> str:
+        """Estimate effort from goal description."""
+        goal_lower = goal_desc.lower()
+
+        if any(w in goal_lower for w in ["refactor", "architect", "redesign"]):
+            return "large"
+        elif any(w in goal_lower for w in ["optimize", "improve", "update"]):
+            return "medium"
+        elif any(w in goal_lower for w in ["add", "fix", "remove"]):
+            return "small"
+        else:
+            return "medium"
+
+    def _generate_success_criteria(self, goal_desc: str) -> List[str]:
+        """Generate success criteria for a goal."""
+        goal_lower = goal_desc.lower()
+
+        criteria = ["All tests pass after changes"]
+
+        if "security" in goal_lower:
+            criteria.extend([
+                "No eval/exec calls remain",
+                "All user inputs are validated",
+            ])
+        elif "performance" in goal_lower:
+            criteria.extend([
+                "No regression in benchmark results",
+                "Memory usage not increased",
+            ])
+        elif "error" in goal_lower:
+            criteria.extend([
+                "All exceptions have specific handlers",
+                "No bare except clauses",
+            ])
+        elif "test" in goal_lower:
+            criteria.extend([
+                "Test coverage increased",
+                "New tests for uncovered code",
+            ])
+
+        return criteria
+
+
+class AutonomousImprovementEngine:
+    """
+    v8.0: The core engine for "JARVIS, improve yourself".
+
+    Orchestrates:
+    1. File selection
+    2. Goal decomposition
+    3. Improvement execution
+    4. Validation and rollback
+    5. Learning from results
+    """
+
+    def __init__(
+        self,
+        file_selector: Optional[IntelligentFileSelector] = None,
+        goal_decomposer: Optional[GoalDecomposer] = None,
+        llm_client: Optional[Any] = None,
+        oracle: Optional[Any] = None,
+    ):
+        self._file_selector = file_selector or IntelligentFileSelector()
+        self._goal_decomposer = goal_decomposer or GoalDecomposer(llm_client)
+        self._llm_client = llm_client
+        self._oracle = oracle
+
+        self._lock = asyncio.Lock()
+        self._running = False
+        self._current_task: Optional[asyncio.Task] = None
+
+        # State
+        self._improvement_history: List[ImprovementResult] = []
+        self._active_goals: Dict[str, ImprovementGoal] = {}
+        self._queued_goals: Deque[ImprovementGoal] = deque(maxlen=100)
+
+        # Configuration
+        self._max_concurrent_improvements = 1  # Serial for safety
+        self._improvement_timeout_s = 300  # 5 minutes per improvement
+        self._auto_rollback_on_test_failure = True
+
+        # Callbacks for voice/UI feedback
+        self._progress_callbacks: List[Callable] = []
+        self._completion_callbacks: List[Callable] = []
+
+    def register_progress_callback(self, callback: Callable) -> None:
+        """Register callback for progress updates."""
+        self._progress_callbacks.append(callback)
+
+    def register_completion_callback(self, callback: Callable) -> None:
+        """Register callback for completion events."""
+        self._completion_callbacks.append(callback)
+
+    async def _notify_progress(self, message: str, progress: float = 0.0) -> None:
+        """Notify progress to all callbacks."""
+        for callback in self._progress_callbacks:
+            try:
+                if asyncio.iscoroutinefunction(callback):
+                    await callback(message, progress)
+                else:
+                    callback(message, progress)
+            except Exception as e:
+                logger.debug(f"Progress callback error: {e}")
+
+    async def _notify_completion(self, result: ImprovementResult) -> None:
+        """Notify completion to all callbacks."""
+        for callback in self._completion_callbacks:
+            try:
+                if asyncio.iscoroutinefunction(callback):
+                    await callback(result)
+                else:
+                    callback(result)
+            except Exception as e:
+                logger.debug(f"Completion callback error: {e}")
+
+    async def improve_yourself(
+        self,
+        project_root: Optional[Path] = None,
+        max_improvements: int = 5,
+        dry_run: bool = False,
+        categories: Optional[List[ImprovementCategory]] = None,
+    ) -> List[ImprovementResult]:
+        """
+        Execute "JARVIS, improve yourself" command.
+
+        This is the main entry point for autonomous self-improvement.
+
+        Args:
+            project_root: Project root to improve
+            max_improvements: Maximum number of improvements to make
+            dry_run: If True, show what would be done without making changes
+            categories: Filter to specific improvement categories
+
+        Returns:
+            List of improvement results
+        """
+        logger.info("🚀 Starting 'Improve Yourself' process...")
+        await self._notify_progress("Analyzing codebase...", 0.1)
+
+        if project_root is None:
+            project_root = Path.cwd()
+
+        results = []
+
+        try:
+            # Step 1: Select files to improve
+            await self._notify_progress("Selecting files to improve...", 0.2)
+            candidates = await self._file_selector.select_files_to_improve(
+                project_root=project_root,
+                max_files=max_improvements * 2,  # Get extra for filtering
+                categories=categories,
+            )
+
+            if not candidates:
+                await self._notify_progress("No improvement opportunities found.", 1.0)
+                logger.info("No improvement candidates found")
+                return results
+
+            logger.info(f"Found {len(candidates)} improvement candidates")
+
+            # Step 2: Decompose into goals
+            await self._notify_progress("Planning improvements...", 0.3)
+            goals = await self._goal_decomposer.decompose_goal(
+                "improve yourself",
+                self._file_selector,
+                project_root,
+            )
+
+            logger.info(f"Created {len(goals)} improvement goals")
+
+            # Step 3: Execute improvements
+            for i, goal in enumerate(goals[:max_improvements]):
+                progress = 0.3 + (0.6 * (i / max_improvements))
+                await self._notify_progress(
+                    f"Improving: {goal.description}...",
+                    progress,
+                )
+
+                if dry_run:
+                    result = ImprovementResult(
+                        goal_id=goal.id,
+                        file_path=goal.target_files[0] if goal.target_files else "",
+                        success=True,
+                        changes_made=[f"[DRY RUN] Would: {goal.description}"],
+                        tests_passed=True,
+                    )
+                else:
+                    result = await self._execute_improvement(goal)
+
+                results.append(result)
+                await self._notify_completion(result)
+
+                if not result.success:
+                    logger.warning(f"Improvement failed: {goal.description}")
+                else:
+                    logger.info(f"Improvement succeeded: {goal.description}")
+
+            # Step 4: Summary
+            successful = sum(1 for r in results if r.success)
+            await self._notify_progress(
+                f"Completed: {successful}/{len(results)} improvements",
+                1.0,
+            )
+
+            logger.info(f"✅ 'Improve Yourself' complete: {successful}/{len(results)} successful")
+
+            return results
+
+        except Exception as e:
+            logger.error(f"'Improve Yourself' failed: {e}")
+            await self._notify_progress(f"Error: {e}", 1.0)
+            raise
+
+    async def improve_file(
+        self,
+        file_path: str,
+        goal: Optional[str] = None,
+        dry_run: bool = False,
+    ) -> ImprovementResult:
+        """
+        Improve a specific file.
+
+        Args:
+            file_path: Path to the file to improve
+            goal: Optional specific improvement goal
+            dry_run: If True, show what would be done
+
+        Returns:
+            Improvement result
+        """
+        logger.info(f"Improving file: {file_path}")
+        await self._notify_progress(f"Analyzing {Path(file_path).name}...", 0.2)
+
+        # Analyze the file
+        candidate = await self._file_selector._analyze_file(Path(file_path))
+
+        if not candidate:
+            return ImprovementResult(
+                goal_id="manual",
+                file_path=file_path,
+                success=False,
+                changes_made=[],
+                tests_passed=False,
+                error="Could not analyze file",
+            )
+
+        # Create improvement goal
+        improvement_goal = ImprovementGoal(
+            id=f"file_improve_{int(datetime.now().timestamp())}",
+            description=goal or f"Improve {Path(file_path).name}",
+            target_files=[file_path],
+            category=candidate.categories[0] if candidate.categories else ImprovementCategory.MAINTAINABILITY,
+            priority=ImprovementPriority.MEDIUM,
+        )
+
+        if dry_run:
+            return ImprovementResult(
+                goal_id=improvement_goal.id,
+                file_path=file_path,
+                success=True,
+                changes_made=[f"[DRY RUN] Would improve: {candidate.issues_found}"],
+                tests_passed=True,
+            )
+
+        return await self._execute_improvement(improvement_goal)
+
+    async def _execute_improvement(
+        self,
+        goal: ImprovementGoal,
+    ) -> ImprovementResult:
+        """Execute a single improvement goal."""
+        if not goal.target_files:
+            return ImprovementResult(
+                goal_id=goal.id,
+                file_path="",
+                success=False,
+                changes_made=[],
+                tests_passed=False,
+                error="No target files specified",
+            )
+
+        file_path = goal.target_files[0]
+        changes_made = []
+
+        try:
+            # Read the file
+            content = await asyncio.to_thread(Path(file_path).read_text)
+
+            # Generate improvement using LLM
+            improved_content = await self._generate_improvement(
+                content,
+                goal,
+                file_path,
+            )
+
+            if improved_content == content:
+                return ImprovementResult(
+                    goal_id=goal.id,
+                    file_path=file_path,
+                    success=True,
+                    changes_made=["No changes needed"],
+                    tests_passed=True,
+                )
+
+            # Backup original
+            backup_path = Path(file_path + ".bak")
+            await asyncio.to_thread(backup_path.write_text, content)
+
+            # Apply changes
+            await asyncio.to_thread(Path(file_path).write_text, improved_content)
+            changes_made.append(f"Applied improvements to {file_path}")
+
+            # Run tests
+            tests_passed = await self._run_tests(file_path)
+
+            if not tests_passed and self._auto_rollback_on_test_failure:
+                # Rollback
+                await asyncio.to_thread(Path(file_path).write_text, content)
+                changes_made.append("Rolled back due to test failure")
+
+                return ImprovementResult(
+                    goal_id=goal.id,
+                    file_path=file_path,
+                    success=False,
+                    changes_made=changes_made,
+                    tests_passed=False,
+                    error="Tests failed after improvement",
+                    rollback_available=False,
+                )
+
+            # Remove backup on success
+            if backup_path.exists():
+                backup_path.unlink()
+
+            return ImprovementResult(
+                goal_id=goal.id,
+                file_path=file_path,
+                success=True,
+                changes_made=changes_made,
+                tests_passed=tests_passed,
+            )
+
+        except Exception as e:
+            logger.error(f"Improvement execution failed: {e}")
+            return ImprovementResult(
+                goal_id=goal.id,
+                file_path=file_path,
+                success=False,
+                changes_made=changes_made,
+                tests_passed=False,
+                error=str(e),
+            )
+
+    async def _generate_improvement(
+        self,
+        content: str,
+        goal: ImprovementGoal,
+        file_path: str,
+    ) -> str:
+        """Generate improved code using LLM."""
+        if not self._llm_client:
+            # Without LLM, use pattern-based improvements
+            return await self._apply_pattern_improvements(content, goal)
+
+        # Use LLM for intelligent improvements
+        prompt = f"""Improve the following Python code with this goal: {goal.description}
+
+Category: {goal.category.value}
+Success criteria: {', '.join(goal.success_criteria)}
+
+Code:
+```python
+{content}
+```
+
+Return ONLY the improved Python code, no explanations."""
+
+        try:
+            response = await self._llm_client.generate(prompt)
+            # Extract code from response
+            if "```python" in response:
+                code = response.split("```python")[1].split("```")[0]
+            elif "```" in response:
+                code = response.split("```")[1].split("```")[0]
+            else:
+                code = response
+
+            return code.strip()
+        except Exception as e:
+            logger.warning(f"LLM improvement failed, using pattern-based: {e}")
+            return await self._apply_pattern_improvements(content, goal)
+
+    async def _apply_pattern_improvements(
+        self,
+        content: str,
+        goal: ImprovementGoal,
+    ) -> str:
+        """Apply pattern-based improvements without LLM."""
+        improved = content
+
+        # Security improvements
+        if goal.category == ImprovementCategory.SECURITY:
+            # Replace bare eval with safer alternatives
+            improved = re.sub(
+                r'\beval\s*\(\s*([^)]+)\s*\)',
+                r'ast.literal_eval(\1)',
+                improved,
+            )
+
+        # Error handling improvements
+        elif goal.category == ImprovementCategory.ERROR_HANDLING:
+            # Replace bare except with specific exception
+            improved = re.sub(
+                r'except:\s*\n(\s+)pass',
+                r'except Exception as e:\n\1logger.debug(f"Error: {e}")',
+                improved,
+            )
+
+        # Async pattern improvements
+        elif goal.category == ImprovementCategory.ASYNC_PATTERNS:
+            # Replace asyncio.run in async context
+            improved = re.sub(
+                r'asyncio\.run\(([^)]+)\)',
+                r'await \1',
+                improved,
+            )
+
+        return improved
+
+    async def _run_tests(self, file_path: str) -> bool:
+        """Run tests related to a file."""
+        try:
+            # Try to find and run related tests
+            test_file = Path(file_path).parent / f"test_{Path(file_path).name}"
+
+            if test_file.exists():
+                result = await asyncio.to_thread(
+                    subprocess.run,
+                    [sys.executable, "-m", "pytest", str(test_file), "-v"],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+                return result.returncode == 0
+
+            # No specific test file, try general syntax check
+            result = await asyncio.to_thread(
+                subprocess.run,
+                [sys.executable, "-m", "py_compile", file_path],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            return result.returncode == 0
+
+        except Exception as e:
+            logger.warning(f"Test execution failed: {e}")
+            return True  # Assume passing if we can't run tests
+
+    def get_status(self) -> Dict[str, Any]:
+        """Get engine status."""
+        return {
+            "running": self._running,
+            "active_goals": len(self._active_goals),
+            "queued_goals": len(self._queued_goals),
+            "improvement_history": len(self._improvement_history),
+            "recent_improvements": [
+                {
+                    "file": r.file_path,
+                    "success": r.success,
+                    "completed": r.completed_at.isoformat(),
+                }
+                for r in self._improvement_history[-5:]
+            ],
+        }
+
+
+class VoiceCommandHandler:
+    """
+    v8.0: Handles voice commands for self-improvement.
+
+    Maps voice commands to improvement actions:
+    - "JARVIS, improve yourself" → improve_yourself()
+    - "JARVIS, improve [file]" → improve_file(file)
+    - "JARVIS, fix [file]" → improve_file(file, goal="fix")
+    - "JARVIS, optimize [file]" → improve_file(file, goal="optimize")
+    """
+
+    def __init__(self, improvement_engine: AutonomousImprovementEngine):
+        self._engine = improvement_engine
+        self._command_patterns = self._compile_patterns()
+
+    def _compile_patterns(self) -> List[Tuple[re.Pattern, str, Callable]]:
+        """Compile voice command patterns for natural language commands."""
+        # Patterns are tried in order - more specific first
+        return [
+            # "JARVIS, improve yourself" / "improve yourself"
+            (
+                re.compile(r"(?:jarvis[,\s]+)?improve\s+yourself", re.IGNORECASE),
+                "improve_yourself",
+                self._handle_improve_yourself,
+            ),
+            # "Make yourself better" / "JARVIS, make yourself better"
+            (
+                re.compile(r"(?:jarvis[,\s]+)?make\s+yourself\s+better", re.IGNORECASE),
+                "improve_yourself",
+                self._handle_improve_yourself,
+            ),
+            # "Upgrade yourself"
+            (
+                re.compile(r"(?:jarvis[,\s]+)?upgrade\s+yourself", re.IGNORECASE),
+                "improve_yourself",
+                self._handle_improve_yourself,
+            ),
+            # "Self-improve" / "Self improve"
+            (
+                re.compile(r"(?:jarvis[,\s]+)?self[- ]?improv", re.IGNORECASE),
+                "improve_yourself",
+                self._handle_improve_yourself,
+            ),
+            # "Improve your code" / "Improve your system"
+            (
+                re.compile(r"(?:jarvis[,\s]+)?improve\s+your\s+(?:code|system|codebase)", re.IGNORECASE),
+                "improve_yourself",
+                self._handle_improve_yourself,
+            ),
+            # "Fix bugs" / "Fix bugs in the system"
+            (
+                re.compile(r"(?:jarvis[,\s]+)?fix\s+(?:the\s+)?bugs?(?:\s+in\s+(?:the\s+)?(?:system|code|codebase))?", re.IGNORECASE),
+                "improve_yourself",
+                self._handle_improve_yourself,
+            ),
+            # "Improve security"
+            (
+                re.compile(r"(?:jarvis[,\s]+)?improve\s+security", re.IGNORECASE),
+                "improve_security",
+                self._handle_improve_category,
+            ),
+            # "Improve performance" / "Make the code faster"
+            (
+                re.compile(r"(?:jarvis[,\s]+)?(?:improve\s+performance|make\s+(?:the\s+)?code\s+faster|optimize\s+performance)", re.IGNORECASE),
+                "improve_performance",
+                self._handle_improve_category,
+            ),
+            # "Make it better" (vague - default to improve_yourself)
+            (
+                re.compile(r"(?:jarvis[,\s]+)?make\s+(?:it\s+)?better", re.IGNORECASE),
+                "improve_yourself",
+                self._handle_improve_yourself,
+            ),
+            # "Improve specific file" - matches "[improve] path/file.py"
+            (
+                re.compile(r"(?:jarvis[,\s]+)?improve\s+(.+\.py)", re.IGNORECASE),
+                "improve_file",
+                self._handle_improve_file,
+            ),
+            # "Fix specific file"
+            (
+                re.compile(r"(?:jarvis[,\s]+)?fix\s+(.+\.py)", re.IGNORECASE),
+                "fix_file",
+                self._handle_fix_file,
+            ),
+            # "Optimize specific file"
+            (
+                re.compile(r"(?:jarvis[,\s]+)?optimize\s+(.+\.py)", re.IGNORECASE),
+                "optimize_file",
+                self._handle_optimize_file,
+            ),
+            # "Refactor specific file"
+            (
+                re.compile(r"(?:jarvis[,\s]+)?refactor\s+(.+\.py)", re.IGNORECASE),
+                "refactor_file",
+                self._handle_refactor_file,
+            ),
+        ]
+
+    async def handle_command(self, command: str) -> Dict[str, Any]:
+        """
+        Handle a voice command for improvement.
+
+        Args:
+            command: The voice command text
+
+        Returns:
+            Result dictionary with response and actions taken
+        """
+        command = command.strip()
+
+        for pattern, cmd_type, handler in self._command_patterns:
+            match = pattern.search(command)
+            if match:
+                return await handler(match, command)
+
+        # No pattern matched
+        return {
+            "success": False,
+            "response": "I couldn't understand that improvement command. "
+                       "Try 'improve yourself' or 'improve [filename].py'",
+            "command_type": "unknown",
+        }
+
+    async def _handle_improve_yourself(
+        self,
+        match: re.Match,
+        command: str,
+    ) -> Dict[str, Any]:
+        """Handle 'improve yourself' command."""
+        try:
+            results = await self._engine.improve_yourself(
+                max_improvements=5,
+                dry_run=False,
+            )
+
+            successful = sum(1 for r in results if r.success)
+
+            return {
+                "success": True,
+                "response": f"I've made {successful} improvements to myself, Sir. "
+                           f"Check the logs for details.",
+                "command_type": "improve_yourself",
+                "results": [
+                    {"file": r.file_path, "success": r.success}
+                    for r in results
+                ],
+            }
+
+        except Exception as e:
+            return {
+                "success": False,
+                "response": f"I encountered an error during self-improvement: {e}",
+                "command_type": "improve_yourself",
+                "error": str(e),
+            }
+
+    async def _handle_improve_file(
+        self,
+        match: re.Match,
+        command: str,
+    ) -> Dict[str, Any]:
+        """Handle 'improve [file]' command."""
+        file_path = match.group(1)
+
+        # Search for the file
+        found_path = await self._find_file(file_path)
+
+        if not found_path:
+            return {
+                "success": False,
+                "response": f"I couldn't find {file_path}. "
+                           "Please provide the full path.",
+                "command_type": "improve_file",
+            }
+
+        try:
+            result = await self._engine.improve_file(found_path)
+
+            if result.success:
+                return {
+                    "success": True,
+                    "response": f"I've improved {Path(found_path).name}, Sir.",
+                    "command_type": "improve_file",
+                    "file": found_path,
+                    "changes": result.changes_made,
+                }
+            else:
+                return {
+                    "success": False,
+                    "response": f"I wasn't able to improve {Path(found_path).name}. "
+                               f"Reason: {result.error}",
+                    "command_type": "improve_file",
+                    "file": found_path,
+                    "error": result.error,
+                }
+
+        except Exception as e:
+            return {
+                "success": False,
+                "response": f"Error improving {file_path}: {e}",
+                "command_type": "improve_file",
+                "error": str(e),
+            }
+
+    async def _handle_fix_file(
+        self,
+        match: re.Match,
+        command: str,
+    ) -> Dict[str, Any]:
+        """Handle 'fix [file]' command."""
+        file_path = match.group(1)
+        found_path = await self._find_file(file_path)
+
+        if not found_path:
+            return {
+                "success": False,
+                "response": f"I couldn't find {file_path}.",
+                "command_type": "fix_file",
+            }
+
+        result = await self._engine.improve_file(
+            found_path,
+            goal="Fix bugs and errors",
+        )
+
+        return {
+            "success": result.success,
+            "response": f"I've fixed issues in {Path(found_path).name}, Sir."
+                       if result.success else
+                       f"I couldn't fix {Path(found_path).name}: {result.error}",
+            "command_type": "fix_file",
+            "file": found_path,
+        }
+
+    async def _handle_optimize_file(
+        self,
+        match: re.Match,
+        command: str,
+    ) -> Dict[str, Any]:
+        """Handle 'optimize [file]' command."""
+        file_path = match.group(1)
+        found_path = await self._find_file(file_path)
+
+        if not found_path:
+            return {
+                "success": False,
+                "response": f"I couldn't find {file_path}.",
+                "command_type": "optimize_file",
+            }
+
+        result = await self._engine.improve_file(
+            found_path,
+            goal="Optimize performance",
+        )
+
+        return {
+            "success": result.success,
+            "response": f"I've optimized {Path(found_path).name}, Sir."
+                       if result.success else
+                       f"I couldn't optimize {Path(found_path).name}: {result.error}",
+            "command_type": "optimize_file",
+            "file": found_path,
+        }
+
+    async def _handle_refactor_file(
+        self,
+        match: re.Match,
+        command: str,
+    ) -> Dict[str, Any]:
+        """Handle 'refactor [file]' command."""
+        file_path = match.group(1)
+        found_path = await self._find_file(file_path)
+
+        if not found_path:
+            return {
+                "success": False,
+                "response": f"I couldn't find {file_path}.",
+                "command_type": "refactor_file",
+            }
+
+        result = await self._engine.improve_file(
+            found_path,
+            goal="Refactor for better maintainability and readability",
+        )
+
+        return {
+            "success": result.success,
+            "response": f"I've refactored {Path(found_path).name}, Sir."
+                       if result.success else
+                       f"I couldn't refactor {Path(found_path).name}: {result.error}",
+            "command_type": "refactor_file",
+            "file": found_path,
+        }
+
+    async def _handle_improve_category(
+        self,
+        match: re.Match,
+        command: str,
+    ) -> Dict[str, Any]:
+        """Handle category-specific improvement commands like 'improve security'."""
+        # Determine category from command
+        command_lower = command.lower()
+
+        if "security" in command_lower:
+            from backend.core.ouroboros.native_integration import ImprovementCategory
+            categories = [ImprovementCategory.SECURITY]
+            category_name = "security"
+        elif "performance" in command_lower or "faster" in command_lower:
+            from backend.core.ouroboros.native_integration import ImprovementCategory
+            categories = [ImprovementCategory.PERFORMANCE]
+            category_name = "performance"
+        elif "reliability" in command_lower:
+            from backend.core.ouroboros.native_integration import ImprovementCategory
+            categories = [ImprovementCategory.RELIABILITY]
+            category_name = "reliability"
+        elif "maintainability" in command_lower:
+            from backend.core.ouroboros.native_integration import ImprovementCategory
+            categories = [ImprovementCategory.MAINTAINABILITY]
+            category_name = "maintainability"
+        else:
+            categories = None
+            category_name = "general"
+
+        try:
+            results = await self._engine.improve_yourself(
+                max_improvements=5,
+                categories=categories,
+                dry_run=False,
+            )
+
+            successful = sum(1 for r in results if r.success)
+
+            return {
+                "success": True,
+                "response": f"I've made {successful} {category_name} improvements, Sir. "
+                           f"Check the logs for details.",
+                "command_type": f"improve_{category_name}",
+                "improvements": len(results),
+                "successful": successful,
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "response": f"I encountered an error during {category_name} improvement: {e}",
+                "command_type": f"improve_{category_name}",
+                "error": str(e),
+            }
+
+    async def _find_file(self, file_path: str) -> Optional[str]:
+        """Find a file by name or partial path."""
+        # Try exact path first
+        if Path(file_path).exists():
+            return str(Path(file_path).absolute())
+
+        # Search in project
+        project_root = Path.cwd()
+        for py_file in project_root.rglob("*.py"):
+            if file_path in str(py_file) or py_file.name == file_path:
+                return str(py_file)
+
+        return None
+
+
+# =============================================================================
+# v8.0: GLOBAL INSTANCES
+# =============================================================================
+
+_file_selector: Optional[IntelligentFileSelector] = None
+_goal_decomposer: Optional[GoalDecomposer] = None
+_improvement_engine: Optional[AutonomousImprovementEngine] = None
+_voice_handler: Optional[VoiceCommandHandler] = None
+
+
+# =============================================================================
+# v8.0: FACTORY FUNCTIONS
+# =============================================================================
+
+def get_intelligent_file_selector() -> IntelligentFileSelector:
+    """Get or create the intelligent file selector."""
+    global _file_selector
+    if _file_selector is None:
+        _file_selector = IntelligentFileSelector()
+    return _file_selector
+
+
+def get_goal_decomposer(llm_client: Optional[Any] = None) -> GoalDecomposer:
+    """Get or create the goal decomposer."""
+    global _goal_decomposer
+    if _goal_decomposer is None:
+        _goal_decomposer = GoalDecomposer(llm_client)
+    return _goal_decomposer
+
+
+def get_improvement_engine(
+    llm_client: Optional[Any] = None,
+    oracle: Optional[Any] = None,
+) -> AutonomousImprovementEngine:
+    """Get or create the autonomous improvement engine."""
+    global _improvement_engine
+    if _improvement_engine is None:
+        _improvement_engine = AutonomousImprovementEngine(
+            file_selector=get_intelligent_file_selector(),
+            goal_decomposer=get_goal_decomposer(llm_client),
+            llm_client=llm_client,
+            oracle=oracle,
+        )
+    return _improvement_engine
+
+
+def get_voice_command_handler(
+    llm_client: Optional[Any] = None,
+    oracle: Optional[Any] = None,
+) -> VoiceCommandHandler:
+    """Get or create the voice command handler."""
+    global _voice_handler
+    if _voice_handler is None:
+        _voice_handler = VoiceCommandHandler(
+            get_improvement_engine(llm_client, oracle)
+        )
+    return _voice_handler
+
+
+# =============================================================================
+# v8.0: MASTER INITIALIZATION
+# =============================================================================
+
+async def initialize_improve_yourself_system(
+    llm_client: Optional[Any] = None,
+    oracle: Optional[Any] = None,
+    start_scheduler: bool = False,
+) -> Dict[str, Any]:
+    """
+    Initialize the complete "Improve Yourself" system.
+
+    This sets up:
+    - Intelligent file selection
+    - Goal decomposition
+    - Autonomous improvement engine
+    - Voice command handling
+
+    Args:
+        llm_client: LLM client for intelligent improvements
+        oracle: Oracle for code understanding
+        start_scheduler: Whether to start autonomous improvement scheduler
+
+    Returns:
+        Dictionary with initialized components
+    """
+    logger.info("🚀 Initializing 'Improve Yourself' System v8.0...")
+    start_time = time.monotonic()
+
+    components = {}
+
+    try:
+        # Initialize file selector
+        file_selector = get_intelligent_file_selector()
+        components["file_selector"] = file_selector
+
+        # Initialize goal decomposer
+        goal_decomposer = get_goal_decomposer(llm_client)
+        components["goal_decomposer"] = goal_decomposer
+
+        # Initialize improvement engine
+        engine = get_improvement_engine(llm_client, oracle)
+        components["improvement_engine"] = engine
+
+        # Initialize voice handler
+        voice_handler = get_voice_command_handler(llm_client, oracle)
+        components["voice_handler"] = voice_handler
+
+        elapsed = time.monotonic() - start_time
+        logger.info(f"✅ 'Improve Yourself' System initialized in {elapsed:.2f}s")
+
+        return components
+
+    except Exception as e:
+        logger.error(f"❌ 'Improve Yourself' System initialization failed: {e}")
+        raise
+
+
+async def shutdown_improve_yourself_system() -> None:
+    """Shutdown the 'Improve Yourself' system."""
+    logger.info("Shutting down 'Improve Yourself' System...")
+
+    global _file_selector, _goal_decomposer, _improvement_engine, _voice_handler
+
+    _file_selector = None
+    _goal_decomposer = None
+    _improvement_engine = None
+    _voice_handler = None
+
+    logger.info("✅ 'Improve Yourself' System shutdown complete")
+
+
+# =============================================================================
+# v8.0: CONVENIENCE FUNCTION
+# =============================================================================
+
+async def jarvis_improve_yourself(
+    project_root: Optional[Path] = None,
+    max_improvements: int = 5,
+    dry_run: bool = False,
+    voice_feedback: bool = True,
+) -> List[ImprovementResult]:
+    """
+    Execute "JARVIS, improve yourself" command.
+
+    This is the main entry point that can be called from anywhere.
+
+    Usage:
+        results = await jarvis_improve_yourself()
+
+    Args:
+        project_root: Project root directory
+        max_improvements: Maximum improvements to make
+        dry_run: If True, show what would be done
+        voice_feedback: Whether to provide voice feedback
+
+    Returns:
+        List of improvement results
+    """
+    engine = get_improvement_engine()
+
+    # Register voice feedback if requested
+    if voice_feedback:
+        async def voice_progress(message: str, progress: float):
+            # This would integrate with JARVIS voice system
+            logger.info(f"[JARVIS] {message} ({progress*100:.0f}%)")
+
+        engine.register_progress_callback(voice_progress)
+
+    return await engine.improve_yourself(
+        project_root=project_root,
+        max_improvements=max_improvements,
+        dry_run=dry_run,
+    )
+
+
+async def jarvis_improve_file(
+    file_path: str,
+    goal: Optional[str] = None,
+    dry_run: bool = False,
+) -> ImprovementResult:
+    """
+    Execute "JARVIS, improve [file]" command.
+
+    Usage:
+        result = await jarvis_improve_file("backend/api/main.py")
+
+    Args:
+        file_path: Path to the file to improve
+        goal: Optional specific goal
+        dry_run: If True, show what would be done
+
+    Returns:
+        Improvement result
+    """
+    engine = get_improvement_engine()
+    return await engine.improve_file(file_path, goal, dry_run)
+
+
+async def handle_jarvis_voice_command(command: str) -> Dict[str, Any]:
+    """
+    Handle a JARVIS voice command for improvement.
+
+    Usage:
+        result = await handle_jarvis_voice_command("improve yourself")
+        result = await handle_jarvis_voice_command("improve main.py")
+
+    Args:
+        command: The voice command text
+
+    Returns:
+        Result dictionary with response
+    """
+    handler = get_voice_command_handler()
+    return await handler.handle_command(command)

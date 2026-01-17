@@ -14019,6 +14019,21 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
                         total_active = v6_active + v7_active
                         self.logger.info(f"[v7.0] ✅ Enterprise Autonomous System: {total_active}/18 components active")
 
+                        # v8.0: "Improve Yourself" System
+                        v8_components = ["file_selector", "improvement_engine", "voice_handler"]
+                        v8_active = sum(1 for c in v8_components if components.get(c) is not None)
+
+                        if v8_active > 0:
+                            print(f"  {TerminalUI.GREEN}    ├─ v8.0 'Improve Yourself' System: {v8_active}/3 components{TerminalUI.RESET}")
+                            print(f"  {TerminalUI.MAGENTA}        ├─ IntelligentFileSelector: Auto file selection{TerminalUI.RESET}")
+                            print(f"  {TerminalUI.MAGENTA}        ├─ AutonomousImprovementEngine: Self-improvement{TerminalUI.RESET}")
+                            print(f"  {TerminalUI.MAGENTA}        └─ VoiceCommandHandler: Voice-activated improvement{TerminalUI.RESET}")
+                            self.logger.info(f"[v8.0] ✅ 'Improve Yourself' System: {v8_active}/3 components active")
+                            print(f"  {TerminalUI.CYAN}        📢 Say 'JARVIS, improve yourself' to trigger{TerminalUI.RESET}")
+
+                        total_all_versions = total_active + v8_active
+                        self.logger.info(f"[v8.0] ✅ Total Autonomous System: {total_all_versions}/21 components active")
+
                         # Get cross-repo integration status
                         cross_repo = get_cross_repo_autonomous_integration()
                         cross_status = cross_repo.get_status()

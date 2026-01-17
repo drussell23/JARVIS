@@ -4067,6 +4067,15 @@ class CrossRepoAutonomousIntegration:
                     get_import_updater,
                     get_file_chunker,
                     get_dashboard,
+                    # v8.0: "Improve Yourself" autonomous system
+                    initialize_improve_yourself_system,
+                    shutdown_improve_yourself_system,
+                    get_intelligent_file_selector,
+                    get_improvement_engine,
+                    get_voice_command_handler,
+                    jarvis_improve_yourself,
+                    jarvis_improve_file,
+                    handle_jarvis_voice_command,
                 )
 
                 # Phase 1: Initialize independent components in parallel
@@ -4231,6 +4240,37 @@ class CrossRepoAutonomousIntegration:
                     logger.warning(f"  ⚠️ v7.0 autonomous system initialization failed: {e}")
                     logger.debug(f"  v7.0 error details: {e}", exc_info=True)
 
+                # Phase 7: Initialize v8.0 "Improve Yourself" system
+                logger.info("Phase 7: Initializing v8.0 'Improve Yourself' system...")
+                try:
+                    v8_components = await initialize_improve_yourself_system(
+                        llm_client=llm_client,
+                        oracle=oracle,
+                        start_scheduler=start_loops,
+                    )
+
+                    # Wire v8.0 components into our component registry
+                    v8_component_names = [
+                        "file_selector",
+                        "goal_decomposer",  # v8.0 enhanced version
+                        "improvement_engine",
+                        "voice_handler",
+                    ]
+
+                    for name in v8_component_names:
+                        comp = v8_components.get(name)
+                        if comp:
+                            # Prefix to avoid collision with v4.0 goal_decomposer
+                            registry_name = f"v8_{name}" if name == "goal_decomposer" else name
+                            self._components[registry_name] = comp
+                            logger.info(f"  ✅ {registry_name} initialized (v8.0)")
+
+                    logger.info(f"  ✅ v8.0 'Improve Yourself' system initialized with {len(v8_components)} components")
+
+                except Exception as e:
+                    logger.warning(f"  ⚠️ v8.0 'Improve Yourself' system initialization failed: {e}")
+                    logger.debug(f"  v8.0 error details: {e}", exc_info=True)
+
                 # Update global state
                 global _autonomous_state
                 _autonomous_state.goal_decomposer = self._components.get("goal_decomposer")
@@ -4241,6 +4281,10 @@ class CrossRepoAutonomousIntegration:
                 _autonomous_state.system_feedback_loop = self._components.get("system_feedback_loop")
                 _autonomous_state.auto_test_generator = self._components.get("auto_test_generator")
                 _autonomous_state.web_integration = self._components.get("web_integration")  # v5.0
+                # v8.0: "Improve Yourself" components
+                _autonomous_state.file_selector = self._components.get("file_selector")
+                _autonomous_state.improvement_engine = self._components.get("improvement_engine")
+                _autonomous_state.voice_handler = self._components.get("voice_handler")
                 _autonomous_state.orchestrator = orchestrator
                 _autonomous_state.oracle = oracle
                 _autonomous_state.llm_client = llm_client
@@ -4658,7 +4702,15 @@ class CrossRepoAutonomousIntegration:
 
         await self.stop_background_loops()
 
-        # v7.0: Shutdown advanced autonomous system first (includes v6.0)
+        # v8.0: Shutdown "Improve Yourself" system first
+        try:
+            from backend.core.ouroboros.native_integration import shutdown_improve_yourself_system
+            await shutdown_improve_yourself_system()
+            logger.info("  ✅ v8.0 'Improve Yourself' system shutdown")
+        except Exception as e:
+            logger.warning(f"  ⚠️ v8.0 'Improve Yourself' system shutdown error: {e}")
+
+        # v7.0: Shutdown advanced autonomous system (includes v6.0)
         try:
             from backend.core.ouroboros.native_integration import shutdown_autonomous_system_v7
             await shutdown_autonomous_system_v7()
@@ -4666,9 +4718,13 @@ class CrossRepoAutonomousIntegration:
         except Exception as e:
             logger.warning(f"  ⚠️ v7.0 autonomous system shutdown error: {e}")
 
-        # v6.0 + v7.0: Shutdown individual components
+        # v6.0 + v7.0 + v8.0: Shutdown individual components
         all_components = [
-            # v7.0 components (shutdown first)
+            # v8.0 components (shutdown first)
+            "voice_handler",
+            "improvement_engine",
+            "file_selector",
+            # v7.0 components
             "dashboard",
             "file_chunker",
             "import_updater",
