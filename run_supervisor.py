@@ -19393,12 +19393,27 @@ class UnifiedTrinityConnector:
             "reactor": False,
         }
 
-    async def initialize(self) -> bool:
+        # Real-time communication
+        self._realtime_broadcaster = None
+
+    async def initialize(
+        self,
+        websocket_manager=None,
+        voice_system=None,
+        menu_bar=None,
+        event_bus=None,
+    ) -> bool:
         """
         Initialize the Trinity connector.
 
         This sets up all enhanced components and establishes
         connections to JARVIS Prime and Reactor Core.
+
+        Args:
+            websocket_manager: WebSocket manager for real-time UI updates
+            voice_system: Voice system for real-time narration
+            menu_bar: Menu bar for status indicators
+            event_bus: Event bus for system events
         """
         if self._initialized:
             return True
@@ -19447,6 +19462,28 @@ class UnifiedTrinityConnector:
             health = self._enhanced_cross_repo._health_consensus.get_cluster_health()
             self.logger.info(f"  - Alive nodes: {health['alive_nodes']}/{health['total_nodes']}")
             self.logger.info(f"  - Quorum: {'yes' if health['quorum'] else 'NO'}")
+
+            # Phase 5: Connect real-time broadcaster (if communication channels provided)
+            if websocket_manager or voice_system or menu_bar or event_bus:
+                self.logger.info("[Trinity] Phase 5: Real-Time Communication...")
+                try:
+                    from core.ouroboros.ui_integration import connect_realtime_broadcaster
+                    self._realtime_broadcaster = await connect_realtime_broadcaster(
+                        websocket_manager=websocket_manager,
+                        voice_system=voice_system,
+                        menu_bar=menu_bar,
+                        event_bus=event_bus,
+                    )
+                    self.logger.info("[Trinity] ✓ Real-time communication enabled")
+                    self.logger.info(f"  - Voice narration: {'yes' if voice_system else 'no'}")
+                    self.logger.info(f"  - WebSocket streaming: {'yes' if websocket_manager else 'no'}")
+                    self.logger.info(f"  - Menu bar updates: {'yes' if menu_bar else 'no'}")
+                except Exception as e:
+                    self.logger.warning(f"[Trinity] Real-time broadcaster not available: {e}")
+                    self._realtime_broadcaster = None
+            else:
+                self.logger.info("[Trinity] Phase 5: Skipped (no communication channels provided)")
+                self._realtime_broadcaster = None
 
             self._initialized = True
             self._running = True
@@ -19499,6 +19536,15 @@ class UnifiedTrinityConnector:
         self.logger.info("[Trinity] Shutting down...")
 
         try:
+            # Disconnect real-time broadcaster first
+            if self._realtime_broadcaster:
+                try:
+                    from core.ouroboros.ui_integration import disconnect_realtime_broadcaster
+                    await disconnect_realtime_broadcaster()
+                except Exception as e:
+                    self.logger.warning(f"[Trinity] Realtime broadcaster disconnect error: {e}")
+                self._realtime_broadcaster = None
+
             if self._enhanced_cross_repo:
                 from core.ouroboros.cross_repo import shutdown_enhanced_cross_repo
                 await shutdown_enhanced_cross_repo()
