@@ -81,6 +81,7 @@ import tempfile
 import time
 import uuid
 import weakref
+from datetime import datetime
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from enum import Enum, auto
@@ -8924,3 +8925,2118 @@ async def shutdown_autonomous_self_programming() -> None:
         await _system_feedback_loop.stop()
 
     logger.info("Autonomous self-programming shutdown complete")
+
+
+# =============================================================================
+# v5.0: Web Search Integration for Autonomous Self-Programming
+# =============================================================================
+# This module provides web search capabilities for the self-programming system:
+# - WebSearchExtractor: Multi-provider web search with fallback
+# - DocumentationLookup: Official library documentation retrieval
+# - StackOverflowSearcher: Error solutions from Stack Overflow
+# - CodeExampleScraper: Code examples from GitHub
+# - OuroborosWebIntegration: Integration with the improvement loop
+# =============================================================================
+
+
+class SearchProvider(Enum):
+    """Supported web search providers."""
+    DUCKDUCKGO = "duckduckgo"
+    BRAVE = "brave"
+    BING = "bing"
+    GOOGLE = "google"
+    SEARXNG = "searxng"
+
+
+class SearchResultType(Enum):
+    """Types of search results."""
+    WEB_PAGE = "web_page"
+    DOCUMENTATION = "documentation"
+    STACK_OVERFLOW = "stack_overflow"
+    GITHUB_CODE = "github_code"
+    GITHUB_REPO = "github_repo"
+    API_REFERENCE = "api_reference"
+    TUTORIAL = "tutorial"
+    BLOG_POST = "blog_post"
+
+
+class DocumentationType(Enum):
+    """Types of documentation sources."""
+    OFFICIAL = "official"
+    COMMUNITY = "community"
+    API_REFERENCE = "api_reference"
+    TUTORIAL = "tutorial"
+    CHANGELOG = "changelog"
+    README = "readme"
+
+
+@dataclass
+class SearchResult:
+    """A single search result."""
+    title: str
+    url: str
+    snippet: str
+    provider: SearchProvider
+    result_type: SearchResultType
+    relevance_score: float  # 0.0 to 1.0
+    timestamp: datetime = field(default_factory=datetime.now)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    cached: bool = False
+    cache_expires: Optional[datetime] = None
+
+
+@dataclass
+class DocumentationResult:
+    """Documentation lookup result."""
+    library_name: str
+    version: Optional[str]
+    doc_type: DocumentationType
+    title: str
+    url: str
+    content: str
+    code_examples: List[str] = field(default_factory=list)
+    related_topics: List[str] = field(default_factory=list)
+    last_updated: Optional[datetime] = None
+    relevance_score: float = 0.0
+
+
+@dataclass
+class StackOverflowResult:
+    """Stack Overflow search result."""
+    question_id: int
+    question_title: str
+    question_url: str
+    question_score: int
+    answer_count: int
+    is_answered: bool
+    accepted_answer_id: Optional[int]
+    tags: List[str]
+    question_body: str
+    answers: List[Dict[str, Any]] = field(default_factory=list)
+    relevance_score: float = 0.0
+
+
+@dataclass
+class CodeExample:
+    """Code example from GitHub or other sources."""
+    source: str  # 'github', 'gist', 'docs', etc.
+    repo_name: Optional[str]
+    file_path: Optional[str]
+    code: str
+    language: str
+    context: str  # Surrounding description
+    stars: int = 0
+    url: str = ""
+    relevance_score: float = 0.0
+
+
+@dataclass
+class WebSearchConfig:
+    """Configuration for web search components."""
+    # Provider configuration
+    primary_provider: SearchProvider = SearchProvider.DUCKDUCKGO
+    fallback_providers: List[SearchProvider] = field(
+        default_factory=lambda: [SearchProvider.BRAVE, SearchProvider.BING]
+    )
+
+    # Rate limiting (requests per minute per provider)
+    rate_limits: Dict[SearchProvider, int] = field(default_factory=lambda: {
+        SearchProvider.DUCKDUCKGO: 30,
+        SearchProvider.BRAVE: 60,
+        SearchProvider.BING: 100,
+        SearchProvider.GOOGLE: 100,
+        SearchProvider.SEARXNG: 120,
+    })
+
+    # Caching
+    cache_ttl_seconds: int = 3600  # 1 hour
+    max_cache_size: int = 10000
+
+    # Retry configuration
+    max_retries: int = 3
+    retry_base_delay: float = 1.0
+    retry_max_delay: float = 30.0
+    retry_exponential_base: float = 2.0
+
+    # Circuit breaker
+    circuit_breaker_threshold: int = 5  # failures before opening
+    circuit_breaker_timeout: float = 60.0  # seconds to wait before retry
+
+    # Timeouts
+    request_timeout: float = 30.0
+    connection_timeout: float = 10.0
+
+    # Result limits
+    max_results_per_query: int = 20
+    max_parallel_requests: int = 5
+
+    # API Keys (loaded from environment)
+    brave_api_key: Optional[str] = None
+    bing_api_key: Optional[str] = None
+    google_api_key: Optional[str] = None
+    google_cx_id: Optional[str] = None
+    github_token: Optional[str] = None
+    stackoverflow_key: Optional[str] = None
+
+    def __post_init__(self):
+        """Load API keys from environment."""
+        self.brave_api_key = os.getenv("BRAVE_SEARCH_API_KEY", self.brave_api_key)
+        self.bing_api_key = os.getenv("BING_SEARCH_API_KEY", self.bing_api_key)
+        self.google_api_key = os.getenv("GOOGLE_SEARCH_API_KEY", self.google_api_key)
+        self.google_cx_id = os.getenv("GOOGLE_SEARCH_CX_ID", self.google_cx_id)
+        self.github_token = os.getenv("GITHUB_TOKEN", self.github_token)
+        self.stackoverflow_key = os.getenv("STACKOVERFLOW_API_KEY", self.stackoverflow_key)
+
+
+class RateLimiter:
+    """Token bucket rate limiter for API calls."""
+
+    def __init__(self, rate_per_minute: int):
+        self.rate = rate_per_minute
+        self.tokens = float(rate_per_minute)
+        self.max_tokens = float(rate_per_minute)
+        self.last_update = time.monotonic()
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> bool:
+        """Acquire a token, waiting if necessary."""
+        async with self._lock:
+            now = time.monotonic()
+            elapsed = now - self.last_update
+            self.last_update = now
+
+            # Replenish tokens
+            self.tokens = min(
+                self.max_tokens,
+                self.tokens + elapsed * (self.rate / 60.0)
+            )
+
+            if self.tokens >= 1.0:
+                self.tokens -= 1.0
+                return True
+
+            # Calculate wait time
+            wait_time = (1.0 - self.tokens) * (60.0 / self.rate)
+            await asyncio.sleep(wait_time)
+            self.tokens = 0.0
+            return True
+
+    def available(self) -> float:
+        """Get available tokens without consuming."""
+        now = time.monotonic()
+        elapsed = now - self.last_update
+        return min(
+            self.max_tokens,
+            self.tokens + elapsed * (self.rate / 60.0)
+        )
+
+
+class CircuitBreaker:
+    """Circuit breaker for handling provider failures."""
+
+    def __init__(
+        self,
+        failure_threshold: int = 5,
+        recovery_timeout: float = 60.0,
+    ):
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self.failures = 0
+        self.last_failure_time: Optional[float] = None
+        self.state = "closed"  # closed, open, half-open
+        self._lock = asyncio.Lock()
+
+    async def call(self, func: Callable, *args, **kwargs) -> Any:
+        """Execute function with circuit breaker protection."""
+        async with self._lock:
+            if self.state == "open":
+                if self.last_failure_time:
+                    elapsed = time.monotonic() - self.last_failure_time
+                    if elapsed >= self.recovery_timeout:
+                        self.state = "half-open"
+                    else:
+                        raise Exception(
+                            f"Circuit breaker open, retry in {self.recovery_timeout - elapsed:.1f}s"
+                        )
+
+        try:
+            if asyncio.iscoroutinefunction(func):
+                result = await func(*args, **kwargs)
+            else:
+                result = func(*args, **kwargs)
+
+            async with self._lock:
+                self.failures = 0
+                self.state = "closed"
+
+            return result
+
+        except Exception as e:
+            async with self._lock:
+                self.failures += 1
+                self.last_failure_time = time.monotonic()
+
+                if self.failures >= self.failure_threshold:
+                    self.state = "open"
+                    logger.warning(
+                        f"Circuit breaker opened after {self.failures} failures"
+                    )
+            raise
+
+    @property
+    def is_open(self) -> bool:
+        """Check if circuit is open."""
+        return self.state == "open"
+
+
+class SearchCache:
+    """LRU cache with TTL for search results."""
+
+    def __init__(self, max_size: int = 10000, ttl_seconds: int = 3600):
+        self.max_size = max_size
+        self.ttl_seconds = ttl_seconds
+        self._cache: Dict[str, Tuple[Any, datetime]] = {}
+        self._access_order: List[str] = []
+        self._lock = asyncio.Lock()
+
+    def _make_key(self, query: str, provider: Optional[str] = None) -> str:
+        """Generate cache key."""
+        key_data = f"{query}:{provider or 'default'}"
+        return hashlib.sha256(key_data.encode()).hexdigest()[:32]
+
+    async def get(self, query: str, provider: Optional[str] = None) -> Optional[Any]:
+        """Get cached result if not expired."""
+        async with self._lock:
+            key = self._make_key(query, provider)
+            if key in self._cache:
+                value, timestamp = self._cache[key]
+                if (datetime.now() - timestamp).total_seconds() < self.ttl_seconds:
+                    # Move to end of access order
+                    if key in self._access_order:
+                        self._access_order.remove(key)
+                    self._access_order.append(key)
+                    return value
+                else:
+                    # Expired, remove
+                    del self._cache[key]
+                    if key in self._access_order:
+                        self._access_order.remove(key)
+            return None
+
+    async def set(self, query: str, value: Any, provider: Optional[str] = None) -> None:
+        """Cache a result."""
+        async with self._lock:
+            key = self._make_key(query, provider)
+
+            # Evict if at capacity
+            while len(self._cache) >= self.max_size and self._access_order:
+                oldest_key = self._access_order.pop(0)
+                if oldest_key in self._cache:
+                    del self._cache[oldest_key]
+
+            self._cache[key] = (value, datetime.now())
+            self._access_order.append(key)
+
+    async def invalidate(self, query: str, provider: Optional[str] = None) -> None:
+        """Invalidate a cached entry."""
+        async with self._lock:
+            key = self._make_key(query, provider)
+            if key in self._cache:
+                del self._cache[key]
+            if key in self._access_order:
+                self._access_order.remove(key)
+
+    async def clear(self) -> None:
+        """Clear all cached entries."""
+        async with self._lock:
+            self._cache.clear()
+            self._access_order.clear()
+
+    def stats(self) -> Dict[str, Any]:
+        """Get cache statistics."""
+        return {
+            "size": len(self._cache),
+            "max_size": self.max_size,
+            "ttl_seconds": self.ttl_seconds,
+        }
+
+
+class WebSearchExtractor:
+    """
+    Multi-provider web search extractor with fallback, rate limiting, and caching.
+
+    Supports:
+    - DuckDuckGo (free, no API key required)
+    - Brave Search (API key optional for limited use)
+    - Bing Search (API key required)
+    - Google Custom Search (API key required)
+    - SearXNG (self-hosted, configurable)
+    """
+
+    def __init__(self, config: Optional[WebSearchConfig] = None):
+        self.config = config or WebSearchConfig()
+        self._cache = SearchCache(
+            max_size=self.config.max_cache_size,
+            ttl_seconds=self.config.cache_ttl_seconds,
+        )
+        self._rate_limiters: Dict[SearchProvider, RateLimiter] = {}
+        self._circuit_breakers: Dict[SearchProvider, CircuitBreaker] = {}
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._initialized = False
+
+        # Initialize rate limiters and circuit breakers for each provider
+        for provider, rate in self.config.rate_limits.items():
+            self._rate_limiters[provider] = RateLimiter(rate)
+            self._circuit_breakers[provider] = CircuitBreaker(
+                failure_threshold=self.config.circuit_breaker_threshold,
+                recovery_timeout=self.config.circuit_breaker_timeout,
+            )
+
+    async def initialize(self) -> None:
+        """Initialize HTTP session and validate configuration."""
+        if self._initialized:
+            return
+
+        connector = aiohttp.TCPConnector(
+            limit=self.config.max_parallel_requests,
+            limit_per_host=10,
+        )
+
+        timeout = aiohttp.ClientTimeout(
+            total=self.config.request_timeout,
+            connect=self.config.connection_timeout,
+        )
+
+        self._session = aiohttp.ClientSession(
+            connector=connector,
+            timeout=timeout,
+            headers={"User-Agent": "JARVIS-AI-Agent/1.0 (Self-Programming System)"},
+        )
+
+        self._initialized = True
+        logger.info("WebSearchExtractor initialized")
+
+    async def shutdown(self) -> None:
+        """Cleanup resources."""
+        if self._session:
+            await self._session.close()
+            self._session = None
+        self._initialized = False
+        logger.info("WebSearchExtractor shutdown complete")
+
+    async def search(
+        self,
+        query: str,
+        max_results: int = 10,
+        result_types: Optional[List[SearchResultType]] = None,
+        use_cache: bool = True,
+    ) -> List[SearchResult]:
+        """
+        Perform web search across providers with fallback.
+
+        Args:
+            query: Search query string
+            max_results: Maximum results to return
+            result_types: Filter by result types (None = all)
+            use_cache: Whether to use cached results
+
+        Returns:
+            List of search results sorted by relevance
+        """
+        if not self._initialized:
+            await self.initialize()
+
+        # Check cache first
+        if use_cache:
+            cached = await self._cache.get(query)
+            if cached:
+                logger.debug(f"Cache hit for query: {query[:50]}...")
+                results = cached
+                for r in results:
+                    r.cached = True
+                return results[:max_results]
+
+        # Try providers in order
+        providers = [self.config.primary_provider] + self.config.fallback_providers
+        last_error = None
+
+        for provider in providers:
+            if self._circuit_breakers[provider].is_open:
+                logger.debug(f"Skipping {provider.value} - circuit breaker open")
+                continue
+
+            try:
+                # Rate limit
+                await self._rate_limiters[provider].acquire()
+
+                # Execute search with circuit breaker
+                results = await self._circuit_breakers[provider].call(
+                    self._search_provider,
+                    provider,
+                    query,
+                    max_results * 2,  # Get extra for filtering
+                )
+
+                # Cache results
+                await self._cache.set(query, results)
+
+                # Filter and sort
+                if result_types:
+                    results = [r for r in results if r.result_type in result_types]
+
+                results.sort(key=lambda r: r.relevance_score, reverse=True)
+
+                logger.info(
+                    f"Search '{query[:30]}...' returned {len(results)} results from {provider.value}"
+                )
+                return results[:max_results]
+
+            except Exception as e:
+                logger.warning(f"Search failed with {provider.value}: {e}")
+                last_error = e
+                continue
+
+        # All providers failed
+        if last_error:
+            logger.error(f"All search providers failed for query: {query}")
+            raise last_error
+
+        return []
+
+    async def _search_provider(
+        self,
+        provider: SearchProvider,
+        query: str,
+        max_results: int,
+    ) -> List[SearchResult]:
+        """Execute search on specific provider."""
+        if provider == SearchProvider.DUCKDUCKGO:
+            return await self._search_duckduckgo(query, max_results)
+        elif provider == SearchProvider.BRAVE:
+            return await self._search_brave(query, max_results)
+        elif provider == SearchProvider.BING:
+            return await self._search_bing(query, max_results)
+        elif provider == SearchProvider.GOOGLE:
+            return await self._search_google(query, max_results)
+        elif provider == SearchProvider.SEARXNG:
+            return await self._search_searxng(query, max_results)
+        else:
+            raise ValueError(f"Unsupported provider: {provider}")
+
+    async def _search_duckduckgo(
+        self,
+        query: str,
+        max_results: int,
+    ) -> List[SearchResult]:
+        """Search using DuckDuckGo HTML (no API key required)."""
+        results = []
+
+        # Use DuckDuckGo Lite (HTML) for reliability
+        url = "https://lite.duckduckgo.com/lite/"
+        params = {"q": query, "kl": "us-en"}
+
+        async with self._session.post(url, data=params) as response:
+            response.raise_for_status()
+            html = await response.text()
+
+        # Parse HTML results
+        # DuckDuckGo Lite uses simple HTML structure
+        soup = None
+        try:
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(html, "html.parser")
+        except ImportError:
+            # Fallback to regex parsing
+            import re
+
+            # Extract links from HTML
+            link_pattern = r'<a[^>]+href="([^"]+)"[^>]*class="result-link"[^>]*>([^<]+)</a>'
+            snippet_pattern = r'<td[^>]+class="result-snippet"[^>]*>([^<]+)</td>'
+
+            links = re.findall(link_pattern, html)
+            snippets = re.findall(snippet_pattern, html)
+
+            for i, (link_url, title) in enumerate(links[:max_results]):
+                snippet = snippets[i] if i < len(snippets) else ""
+                results.append(SearchResult(
+                    title=title.strip(),
+                    url=link_url,
+                    snippet=snippet.strip(),
+                    provider=SearchProvider.DUCKDUCKGO,
+                    result_type=self._classify_result_type(link_url, title),
+                    relevance_score=1.0 - (i * 0.05),
+                ))
+
+        if soup:
+            # Parse with BeautifulSoup
+            for i, link in enumerate(soup.select("a.result-link")[:max_results]):
+                link_url = link.get("href", "")
+                title = link.get_text(strip=True)
+
+                # Get snippet from sibling
+                snippet_td = link.find_parent("tr")
+                snippet = ""
+                if snippet_td:
+                    snippet_elem = snippet_td.find_next_sibling("tr")
+                    if snippet_elem:
+                        snippet = snippet_elem.get_text(strip=True)
+
+                results.append(SearchResult(
+                    title=title,
+                    url=link_url,
+                    snippet=snippet,
+                    provider=SearchProvider.DUCKDUCKGO,
+                    result_type=self._classify_result_type(link_url, title),
+                    relevance_score=1.0 - (i * 0.05),
+                ))
+
+        return results
+
+    async def _search_brave(
+        self,
+        query: str,
+        max_results: int,
+    ) -> List[SearchResult]:
+        """Search using Brave Search API."""
+        if not self.config.brave_api_key:
+            raise ValueError("Brave API key not configured")
+
+        results = []
+        url = "https://api.search.brave.com/res/v1/web/search"
+        headers = {
+            "X-Subscription-Token": self.config.brave_api_key,
+            "Accept": "application/json",
+        }
+        params = {
+            "q": query,
+            "count": min(max_results, 20),
+            "freshness": "py",  # Past year
+        }
+
+        async with self._session.get(url, headers=headers, params=params) as response:
+            response.raise_for_status()
+            data = await response.json()
+
+        web_results = data.get("web", {}).get("results", [])
+
+        for i, item in enumerate(web_results):
+            results.append(SearchResult(
+                title=item.get("title", ""),
+                url=item.get("url", ""),
+                snippet=item.get("description", ""),
+                provider=SearchProvider.BRAVE,
+                result_type=self._classify_result_type(
+                    item.get("url", ""),
+                    item.get("title", ""),
+                ),
+                relevance_score=1.0 - (i * 0.04),
+                metadata={
+                    "published": item.get("age"),
+                    "family_friendly": item.get("family_friendly"),
+                },
+            ))
+
+        return results
+
+    async def _search_bing(
+        self,
+        query: str,
+        max_results: int,
+    ) -> List[SearchResult]:
+        """Search using Bing Web Search API."""
+        if not self.config.bing_api_key:
+            raise ValueError("Bing API key not configured")
+
+        results = []
+        url = "https://api.bing.microsoft.com/v7.0/search"
+        headers = {"Ocp-Apim-Subscription-Key": self.config.bing_api_key}
+        params = {
+            "q": query,
+            "count": min(max_results, 50),
+            "mkt": "en-US",
+        }
+
+        async with self._session.get(url, headers=headers, params=params) as response:
+            response.raise_for_status()
+            data = await response.json()
+
+        web_pages = data.get("webPages", {}).get("value", [])
+
+        for i, item in enumerate(web_pages):
+            results.append(SearchResult(
+                title=item.get("name", ""),
+                url=item.get("url", ""),
+                snippet=item.get("snippet", ""),
+                provider=SearchProvider.BING,
+                result_type=self._classify_result_type(
+                    item.get("url", ""),
+                    item.get("name", ""),
+                ),
+                relevance_score=1.0 - (i * 0.03),
+                metadata={
+                    "date_last_crawled": item.get("dateLastCrawled"),
+                    "language": item.get("language"),
+                },
+            ))
+
+        return results
+
+    async def _search_google(
+        self,
+        query: str,
+        max_results: int,
+    ) -> List[SearchResult]:
+        """Search using Google Custom Search API."""
+        if not self.config.google_api_key or not self.config.google_cx_id:
+            raise ValueError("Google API key or CX ID not configured")
+
+        results = []
+        url = "https://www.googleapis.com/customsearch/v1"
+        params = {
+            "key": self.config.google_api_key,
+            "cx": self.config.google_cx_id,
+            "q": query,
+            "num": min(max_results, 10),
+        }
+
+        async with self._session.get(url, params=params) as response:
+            response.raise_for_status()
+            data = await response.json()
+
+        items = data.get("items", [])
+
+        for i, item in enumerate(items):
+            results.append(SearchResult(
+                title=item.get("title", ""),
+                url=item.get("link", ""),
+                snippet=item.get("snippet", ""),
+                provider=SearchProvider.GOOGLE,
+                result_type=self._classify_result_type(
+                    item.get("link", ""),
+                    item.get("title", ""),
+                ),
+                relevance_score=1.0 - (i * 0.05),
+                metadata={
+                    "display_link": item.get("displayLink"),
+                    "cache_id": item.get("cacheId"),
+                },
+            ))
+
+        return results
+
+    async def _search_searxng(
+        self,
+        query: str,
+        max_results: int,
+    ) -> List[SearchResult]:
+        """Search using self-hosted SearXNG instance."""
+        searxng_url = os.getenv("SEARXNG_URL", "http://localhost:8888")
+
+        results = []
+        url = f"{searxng_url}/search"
+        params = {
+            "q": query,
+            "format": "json",
+            "engines": "google,bing,duckduckgo",
+        }
+
+        async with self._session.get(url, params=params) as response:
+            response.raise_for_status()
+            data = await response.json()
+
+        for i, item in enumerate(data.get("results", [])[:max_results]):
+            results.append(SearchResult(
+                title=item.get("title", ""),
+                url=item.get("url", ""),
+                snippet=item.get("content", ""),
+                provider=SearchProvider.SEARXNG,
+                result_type=self._classify_result_type(
+                    item.get("url", ""),
+                    item.get("title", ""),
+                ),
+                relevance_score=item.get("score", 1.0 - (i * 0.05)),
+                metadata={
+                    "engine": item.get("engine"),
+                    "parsed_url": item.get("parsed_url"),
+                },
+            ))
+
+        return results
+
+    def _classify_result_type(self, url: str, title: str) -> SearchResultType:
+        """Classify search result type based on URL and title."""
+        url_lower = url.lower()
+        title_lower = title.lower()
+
+        # Documentation sites
+        doc_patterns = [
+            "docs.", "documentation", ".readthedocs.", "/docs/",
+            "developer.", "reference/", "api-reference",
+        ]
+        if any(p in url_lower for p in doc_patterns):
+            return SearchResultType.DOCUMENTATION
+
+        # Stack Overflow
+        if "stackoverflow.com" in url_lower or "stackexchange.com" in url_lower:
+            return SearchResultType.STACK_OVERFLOW
+
+        # GitHub
+        if "github.com" in url_lower:
+            if "/blob/" in url_lower or "/tree/" in url_lower:
+                return SearchResultType.GITHUB_CODE
+            return SearchResultType.GITHUB_REPO
+
+        # API references
+        if "api" in url_lower and ("reference" in url_lower or "docs" in url_lower):
+            return SearchResultType.API_REFERENCE
+
+        # Tutorials
+        tutorial_patterns = ["tutorial", "guide", "how-to", "getting-started"]
+        if any(p in url_lower or p in title_lower for p in tutorial_patterns):
+            return SearchResultType.TUTORIAL
+
+        # Blog posts
+        blog_patterns = ["blog", "medium.com", "dev.to", "hashnode"]
+        if any(p in url_lower for p in blog_patterns):
+            return SearchResultType.BLOG_POST
+
+        return SearchResultType.WEB_PAGE
+
+    async def search_for_error(
+        self,
+        error_message: str,
+        language: str = "python",
+        max_results: int = 10,
+    ) -> List[SearchResult]:
+        """Search specifically for error solutions."""
+        # Construct targeted query
+        query = f"{language} {error_message} solution"
+
+        results = await self.search(
+            query,
+            max_results=max_results * 2,
+            result_types=[
+                SearchResultType.STACK_OVERFLOW,
+                SearchResultType.DOCUMENTATION,
+                SearchResultType.BLOG_POST,
+            ],
+        )
+
+        # Boost Stack Overflow results
+        for r in results:
+            if r.result_type == SearchResultType.STACK_OVERFLOW:
+                r.relevance_score *= 1.5
+
+        results.sort(key=lambda r: r.relevance_score, reverse=True)
+        return results[:max_results]
+
+    async def search_for_library(
+        self,
+        library_name: str,
+        topic: str = "usage",
+        max_results: int = 10,
+    ) -> List[SearchResult]:
+        """Search for library documentation and usage."""
+        query = f"{library_name} {topic} documentation"
+
+        results = await self.search(
+            query,
+            max_results=max_results * 2,
+            result_types=[
+                SearchResultType.DOCUMENTATION,
+                SearchResultType.API_REFERENCE,
+                SearchResultType.TUTORIAL,
+            ],
+        )
+
+        # Boost official docs
+        for r in results:
+            if "official" in r.title.lower() or library_name.lower() in r.url.lower():
+                r.relevance_score *= 1.3
+
+        results.sort(key=lambda r: r.relevance_score, reverse=True)
+        return results[:max_results]
+
+
+class DocumentationLookup:
+    """
+    Library documentation lookup with official docs priority.
+
+    Maintains mapping of popular libraries to their official documentation URLs
+    and provides structured documentation retrieval.
+    """
+
+    # Dynamic documentation source registry
+    DOCUMENTATION_SOURCES: Dict[str, Dict[str, str]] = {
+        # Python standard library and popular packages
+        "python": {"base": "https://docs.python.org/3/", "search": "search.html?q="},
+        "asyncio": {"base": "https://docs.python.org/3/library/asyncio.html"},
+        "typing": {"base": "https://docs.python.org/3/library/typing.html"},
+
+        # Web frameworks
+        "fastapi": {"base": "https://fastapi.tiangolo.com/", "search": "?q="},
+        "flask": {"base": "https://flask.palletsprojects.com/", "search": "search/?q="},
+        "django": {"base": "https://docs.djangoproject.com/", "search": "search/?q="},
+        "starlette": {"base": "https://www.starlette.io/"},
+
+        # Async/networking
+        "aiohttp": {"base": "https://docs.aiohttp.org/en/stable/"},
+        "httpx": {"base": "https://www.python-httpx.org/"},
+        "requests": {"base": "https://requests.readthedocs.io/en/latest/"},
+
+        # Data science
+        "numpy": {"base": "https://numpy.org/doc/stable/", "search": "search.html?q="},
+        "pandas": {"base": "https://pandas.pydata.org/docs/", "search": "search.html?q="},
+        "scipy": {"base": "https://docs.scipy.org/doc/scipy/", "search": "search.html?q="},
+        "matplotlib": {"base": "https://matplotlib.org/stable/", "search": "search.html?q="},
+
+        # ML/AI
+        "torch": {"base": "https://pytorch.org/docs/stable/", "search": "search.html?q="},
+        "pytorch": {"base": "https://pytorch.org/docs/stable/", "search": "search.html?q="},
+        "tensorflow": {"base": "https://www.tensorflow.org/api_docs/python/"},
+        "transformers": {"base": "https://huggingface.co/docs/transformers/"},
+        "langchain": {"base": "https://python.langchain.com/docs/"},
+        "openai": {"base": "https://platform.openai.com/docs/"},
+        "anthropic": {"base": "https://docs.anthropic.com/"},
+
+        # Database
+        "sqlalchemy": {"base": "https://docs.sqlalchemy.org/en/20/"},
+        "psycopg2": {"base": "https://www.psycopg.org/docs/"},
+        "redis": {"base": "https://redis.io/docs/"},
+        "chromadb": {"base": "https://docs.trychroma.com/"},
+
+        # Testing
+        "pytest": {"base": "https://docs.pytest.org/en/stable/", "search": "search.html?q="},
+        "unittest": {"base": "https://docs.python.org/3/library/unittest.html"},
+
+        # DevOps/Cloud
+        "docker": {"base": "https://docs.docker.com/"},
+        "kubernetes": {"base": "https://kubernetes.io/docs/"},
+        "gcp": {"base": "https://cloud.google.com/docs/"},
+        "aws": {"base": "https://docs.aws.amazon.com/"},
+
+        # Misc
+        "pydantic": {"base": "https://docs.pydantic.dev/latest/"},
+        "click": {"base": "https://click.palletsprojects.com/"},
+        "rich": {"base": "https://rich.readthedocs.io/en/stable/"},
+    }
+
+    def __init__(
+        self,
+        search_extractor: Optional[WebSearchExtractor] = None,
+        config: Optional[WebSearchConfig] = None,
+    ):
+        self.search_extractor = search_extractor
+        self.config = config or WebSearchConfig()
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._cache = SearchCache(
+            max_size=self.config.max_cache_size,
+            ttl_seconds=self.config.cache_ttl_seconds * 2,  # Docs change less often
+        )
+
+    async def initialize(self) -> None:
+        """Initialize HTTP session."""
+        if self._session is None:
+            self._session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=30),
+                headers={"User-Agent": "JARVIS-AI-Agent/1.0 (Documentation Lookup)"},
+            )
+
+    async def shutdown(self) -> None:
+        """Cleanup resources."""
+        if self._session:
+            await self._session.close()
+            self._session = None
+
+    def register_documentation_source(
+        self,
+        library: str,
+        base_url: str,
+        search_path: Optional[str] = None,
+    ) -> None:
+        """Dynamically register a new documentation source."""
+        self.DOCUMENTATION_SOURCES[library.lower()] = {
+            "base": base_url,
+            **({"search": search_path} if search_path else {}),
+        }
+
+    async def lookup(
+        self,
+        library: str,
+        topic: Optional[str] = None,
+        version: Optional[str] = None,
+    ) -> List[DocumentationResult]:
+        """
+        Look up documentation for a library.
+
+        Args:
+            library: Library name (e.g., 'fastapi', 'numpy')
+            topic: Specific topic to search for
+            version: Specific version (if applicable)
+
+        Returns:
+            List of documentation results
+        """
+        await self.initialize()
+
+        library_lower = library.lower()
+        results = []
+
+        # Check if we have a known documentation source
+        if library_lower in self.DOCUMENTATION_SOURCES:
+            source = self.DOCUMENTATION_SOURCES[library_lower]
+            base_url = source["base"]
+
+            # Direct documentation URL
+            results.append(DocumentationResult(
+                library_name=library,
+                version=version,
+                doc_type=DocumentationType.OFFICIAL,
+                title=f"{library} Official Documentation",
+                url=base_url,
+                content="",  # Will be fetched on demand
+                relevance_score=1.0,
+            ))
+
+            # If topic specified and search path exists
+            if topic and "search" in source:
+                search_url = f"{base_url}{source['search']}{topic}"
+                results.append(DocumentationResult(
+                    library_name=library,
+                    version=version,
+                    doc_type=DocumentationType.OFFICIAL,
+                    title=f"{library} - {topic}",
+                    url=search_url,
+                    content="",
+                    relevance_score=0.95,
+                ))
+
+        # Fall back to web search if needed
+        if self.search_extractor and (not results or topic):
+            query = f"{library} {topic or 'documentation'} official docs"
+            search_results = await self.search_extractor.search_for_library(
+                library,
+                topic=topic or "documentation",
+                max_results=5,
+            )
+
+            for sr in search_results:
+                if sr.result_type in [
+                    SearchResultType.DOCUMENTATION,
+                    SearchResultType.API_REFERENCE,
+                ]:
+                    results.append(DocumentationResult(
+                        library_name=library,
+                        version=version,
+                        doc_type=self._classify_doc_type(sr),
+                        title=sr.title,
+                        url=sr.url,
+                        content=sr.snippet,
+                        relevance_score=sr.relevance_score * 0.9,
+                    ))
+
+        return results
+
+    async def fetch_content(
+        self,
+        doc_result: DocumentationResult,
+        extract_examples: bool = True,
+    ) -> DocumentationResult:
+        """
+        Fetch and parse documentation content.
+
+        Args:
+            doc_result: Documentation result to fetch
+            extract_examples: Whether to extract code examples
+
+        Returns:
+            Updated documentation result with content
+        """
+        await self.initialize()
+
+        try:
+            async with self._session.get(doc_result.url) as response:
+                response.raise_for_status()
+                html = await response.text()
+
+            # Parse HTML
+            try:
+                from bs4 import BeautifulSoup
+                soup = BeautifulSoup(html, "html.parser")
+
+                # Extract main content
+                main_content = soup.find("main") or soup.find("article") or soup.find("body")
+                if main_content:
+                    doc_result.content = main_content.get_text(separator="\n", strip=True)
+
+                # Extract code examples
+                if extract_examples:
+                    code_blocks = soup.find_all(["code", "pre"])
+                    for block in code_blocks:
+                        code = block.get_text(strip=True)
+                        if len(code) > 20:  # Skip tiny snippets
+                            doc_result.code_examples.append(code)
+
+                # Extract related topics
+                links = soup.find_all("a", href=True)
+                for link in links[:20]:
+                    href = link.get("href", "")
+                    text = link.get_text(strip=True)
+                    if href.startswith(doc_result.url) and text:
+                        doc_result.related_topics.append(text)
+
+            except ImportError:
+                # Fallback: Basic content extraction
+                import re
+                # Remove HTML tags
+                doc_result.content = re.sub(r"<[^>]+>", " ", html)
+                doc_result.content = re.sub(r"\s+", " ", doc_result.content).strip()
+
+                # Extract code blocks with regex
+                code_pattern = r"<(?:code|pre)[^>]*>(.*?)</(?:code|pre)>"
+                matches = re.findall(code_pattern, html, re.DOTALL | re.IGNORECASE)
+                doc_result.code_examples = [
+                    re.sub(r"<[^>]+>", "", m).strip()
+                    for m in matches if len(m) > 20
+                ]
+
+        except Exception as e:
+            logger.warning(f"Failed to fetch documentation: {e}")
+
+        return doc_result
+
+    def _classify_doc_type(self, search_result: SearchResult) -> DocumentationType:
+        """Classify documentation type from search result."""
+        url_lower = search_result.url.lower()
+        title_lower = search_result.title.lower()
+
+        if "api" in url_lower or "api" in title_lower:
+            return DocumentationType.API_REFERENCE
+        elif "tutorial" in url_lower or "tutorial" in title_lower:
+            return DocumentationType.TUTORIAL
+        elif "changelog" in url_lower or "release" in url_lower:
+            return DocumentationType.CHANGELOG
+        elif "readme" in url_lower:
+            return DocumentationType.README
+        elif any(x in url_lower for x in ["docs.", "documentation", ".readthedocs."]):
+            return DocumentationType.OFFICIAL
+        else:
+            return DocumentationType.COMMUNITY
+
+
+class StackOverflowSearcher:
+    """
+    Stack Overflow integration for finding solutions to errors and coding questions.
+
+    Supports both API and web scraping fallback.
+    """
+
+    API_BASE = "https://api.stackexchange.com/2.3"
+    SITE = "stackoverflow"
+
+    def __init__(self, config: Optional[WebSearchConfig] = None):
+        self.config = config or WebSearchConfig()
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._rate_limiter = RateLimiter(30)  # SO API limit
+        self._cache = SearchCache(
+            max_size=self.config.max_cache_size,
+            ttl_seconds=self.config.cache_ttl_seconds,
+        )
+
+    async def initialize(self) -> None:
+        """Initialize HTTP session."""
+        if self._session is None:
+            self._session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=30),
+            )
+
+    async def shutdown(self) -> None:
+        """Cleanup resources."""
+        if self._session:
+            await self._session.close()
+            self._session = None
+
+    async def search(
+        self,
+        query: str,
+        tags: Optional[List[str]] = None,
+        max_results: int = 10,
+        sort: str = "relevance",
+    ) -> List[StackOverflowResult]:
+        """
+        Search Stack Overflow for questions matching query.
+
+        Args:
+            query: Search query
+            tags: Filter by tags (e.g., ['python', 'asyncio'])
+            max_results: Maximum results to return
+            sort: Sort order ('relevance', 'votes', 'creation', 'activity')
+
+        Returns:
+            List of Stack Overflow results
+        """
+        await self.initialize()
+
+        # Check cache
+        cache_key = f"{query}:{','.join(tags or [])}:{sort}"
+        cached = await self._cache.get(cache_key)
+        if cached:
+            return cached[:max_results]
+
+        await self._rate_limiter.acquire()
+
+        results = []
+
+        # Build API request
+        params = {
+            "order": "desc",
+            "sort": sort,
+            "intitle": query,
+            "site": self.SITE,
+            "pagesize": min(max_results, 30),
+            "filter": "withbody",  # Include question body
+        }
+
+        if tags:
+            params["tagged"] = ";".join(tags)
+
+        if self.config.stackoverflow_key:
+            params["key"] = self.config.stackoverflow_key
+
+        try:
+            async with self._session.get(
+                f"{self.API_BASE}/search/advanced",
+                params=params,
+            ) as response:
+                response.raise_for_status()
+                data = await response.json()
+
+            for item in data.get("items", []):
+                result = StackOverflowResult(
+                    question_id=item["question_id"],
+                    question_title=item["title"],
+                    question_url=item["link"],
+                    question_score=item["score"],
+                    answer_count=item["answer_count"],
+                    is_answered=item["is_answered"],
+                    accepted_answer_id=item.get("accepted_answer_id"),
+                    tags=item.get("tags", []),
+                    question_body=item.get("body", ""),
+                    relevance_score=self._calculate_relevance(item, query),
+                )
+                results.append(result)
+
+            # Cache results
+            await self._cache.set(cache_key, results)
+
+        except Exception as e:
+            logger.warning(f"Stack Overflow API search failed: {e}")
+            # Fallback could be implemented here
+
+        return results[:max_results]
+
+    async def get_answers(
+        self,
+        question_id: int,
+        max_answers: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """
+        Get answers for a specific question.
+
+        Args:
+            question_id: Stack Overflow question ID
+            max_answers: Maximum answers to fetch
+
+        Returns:
+            List of answer dictionaries
+        """
+        await self.initialize()
+        await self._rate_limiter.acquire()
+
+        params = {
+            "order": "desc",
+            "sort": "votes",
+            "site": self.SITE,
+            "pagesize": max_answers,
+            "filter": "withbody",
+        }
+
+        if self.config.stackoverflow_key:
+            params["key"] = self.config.stackoverflow_key
+
+        try:
+            async with self._session.get(
+                f"{self.API_BASE}/questions/{question_id}/answers",
+                params=params,
+            ) as response:
+                response.raise_for_status()
+                data = await response.json()
+
+            return [
+                {
+                    "answer_id": a["answer_id"],
+                    "score": a["score"],
+                    "is_accepted": a.get("is_accepted", False),
+                    "body": a.get("body", ""),
+                    "creation_date": a.get("creation_date"),
+                }
+                for a in data.get("items", [])
+            ]
+
+        except Exception as e:
+            logger.warning(f"Failed to fetch answers: {e}")
+            return []
+
+    async def search_for_error(
+        self,
+        error_message: str,
+        language: str = "python",
+        max_results: int = 5,
+    ) -> List[StackOverflowResult]:
+        """
+        Search for solutions to a specific error.
+
+        Args:
+            error_message: The error message to search for
+            language: Programming language tag
+            max_results: Maximum results
+
+        Returns:
+            List of relevant Stack Overflow results
+        """
+        # Clean up error message for search
+        import re
+
+        # Remove file paths and line numbers
+        clean_error = re.sub(r'File "[^"]+", line \d+', '', error_message)
+        # Remove memory addresses
+        clean_error = re.sub(r'0x[a-fA-F0-9]+', '', clean_error)
+        # Get core error type and message
+        clean_error = clean_error.strip()[:200]
+
+        results = await self.search(
+            query=clean_error,
+            tags=[language],
+            max_results=max_results,
+            sort="relevance",
+        )
+
+        # Fetch answers for top results
+        for result in results[:3]:
+            result.answers = await self.get_answers(
+                result.question_id,
+                max_answers=3,
+            )
+
+        return results
+
+    def _calculate_relevance(
+        self,
+        item: Dict[str, Any],
+        query: str,
+    ) -> float:
+        """Calculate relevance score for a result."""
+        score = 0.5  # Base score
+
+        # Boost for answered questions
+        if item.get("is_answered"):
+            score += 0.2
+
+        # Boost for accepted answers
+        if item.get("accepted_answer_id"):
+            score += 0.1
+
+        # Boost for high vote count
+        votes = item.get("score", 0)
+        if votes > 100:
+            score += 0.15
+        elif votes > 50:
+            score += 0.1
+        elif votes > 10:
+            score += 0.05
+
+        # Title match bonus
+        title_lower = item.get("title", "").lower()
+        query_words = query.lower().split()
+        matching_words = sum(1 for w in query_words if w in title_lower)
+        score += min(0.15, matching_words * 0.03)
+
+        return min(1.0, score)
+
+
+class CodeExampleScraper:
+    """
+    Code example scraper for GitHub repositories and gists.
+
+    Finds relevant code examples for implementation patterns.
+    """
+
+    GITHUB_API = "https://api.github.com"
+
+    def __init__(self, config: Optional[WebSearchConfig] = None):
+        self.config = config or WebSearchConfig()
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._rate_limiter = RateLimiter(30)  # GitHub API limit
+        self._cache = SearchCache(
+            max_size=self.config.max_cache_size,
+            ttl_seconds=self.config.cache_ttl_seconds * 2,
+        )
+
+    async def initialize(self) -> None:
+        """Initialize HTTP session."""
+        if self._session is None:
+            headers = {
+                "Accept": "application/vnd.github.v3+json",
+                "User-Agent": "JARVIS-AI-Agent/1.0",
+            }
+            if self.config.github_token:
+                headers["Authorization"] = f"token {self.config.github_token}"
+
+            self._session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=30),
+                headers=headers,
+            )
+
+    async def shutdown(self) -> None:
+        """Cleanup resources."""
+        if self._session:
+            await self._session.close()
+            self._session = None
+
+    async def search_code(
+        self,
+        query: str,
+        language: str = "python",
+        max_results: int = 10,
+    ) -> List[CodeExample]:
+        """
+        Search GitHub for code examples.
+
+        Args:
+            query: Code search query
+            language: Programming language filter
+            max_results: Maximum results
+
+        Returns:
+            List of code examples
+        """
+        await self.initialize()
+
+        # Check cache
+        cache_key = f"{query}:{language}"
+        cached = await self._cache.get(cache_key)
+        if cached:
+            return cached[:max_results]
+
+        await self._rate_limiter.acquire()
+
+        results = []
+
+        # Build search query
+        search_query = f"{query} language:{language}"
+
+        params = {
+            "q": search_query,
+            "per_page": min(max_results, 30),
+            "sort": "indexed",
+        }
+
+        try:
+            async with self._session.get(
+                f"{self.GITHUB_API}/search/code",
+                params=params,
+            ) as response:
+                if response.status == 403:
+                    # Rate limited
+                    logger.warning("GitHub API rate limited")
+                    return []
+
+                response.raise_for_status()
+                data = await response.json()
+
+            for item in data.get("items", []):
+                # Fetch file content
+                content = await self._fetch_file_content(item["url"])
+
+                if content:
+                    results.append(CodeExample(
+                        source="github",
+                        repo_name=item["repository"]["full_name"],
+                        file_path=item["path"],
+                        code=content,
+                        language=language,
+                        context=item.get("name", ""),
+                        stars=0,  # Would need additional API call
+                        url=item["html_url"],
+                        relevance_score=item.get("score", 0.5),
+                    ))
+
+            # Cache results
+            await self._cache.set(cache_key, results)
+
+        except Exception as e:
+            logger.warning(f"GitHub code search failed: {e}")
+
+        return results[:max_results]
+
+    async def search_repos(
+        self,
+        query: str,
+        language: str = "python",
+        max_results: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """
+        Search for GitHub repositories.
+
+        Args:
+            query: Repository search query
+            language: Language filter
+            max_results: Maximum results
+
+        Returns:
+            List of repository info dictionaries
+        """
+        await self.initialize()
+        await self._rate_limiter.acquire()
+
+        params = {
+            "q": f"{query} language:{language}",
+            "sort": "stars",
+            "per_page": max_results,
+        }
+
+        try:
+            async with self._session.get(
+                f"{self.GITHUB_API}/search/repositories",
+                params=params,
+            ) as response:
+                response.raise_for_status()
+                data = await response.json()
+
+            return [
+                {
+                    "name": r["full_name"],
+                    "description": r.get("description", ""),
+                    "url": r["html_url"],
+                    "stars": r["stargazers_count"],
+                    "forks": r["forks_count"],
+                    "language": r.get("language"),
+                    "topics": r.get("topics", []),
+                }
+                for r in data.get("items", [])
+            ]
+
+        except Exception as e:
+            logger.warning(f"GitHub repo search failed: {e}")
+            return []
+
+    async def get_readme(self, repo_name: str) -> Optional[str]:
+        """
+        Get README content for a repository.
+
+        Args:
+            repo_name: Repository full name (owner/repo)
+
+        Returns:
+            README content or None
+        """
+        await self.initialize()
+        await self._rate_limiter.acquire()
+
+        try:
+            async with self._session.get(
+                f"{self.GITHUB_API}/repos/{repo_name}/readme",
+                headers={"Accept": "application/vnd.github.v3.raw"},
+            ) as response:
+                if response.status == 200:
+                    return await response.text()
+        except Exception as e:
+            logger.debug(f"Failed to fetch README: {e}")
+
+        return None
+
+    async def _fetch_file_content(self, content_url: str) -> Optional[str]:
+        """Fetch raw file content from GitHub API."""
+        try:
+            async with self._session.get(
+                content_url,
+                headers={"Accept": "application/vnd.github.v3.raw"},
+            ) as response:
+                if response.status == 200:
+                    return await response.text()
+        except Exception as e:
+            logger.debug(f"Failed to fetch file content: {e}")
+
+        return None
+
+
+class OuroborosWebIntegration:
+    """
+    Integrates web search capabilities into the Ouroboros improvement loop.
+
+    This class bridges the gap between autonomous self-programming and
+    external knowledge sources, enabling:
+    - Error resolution via Stack Overflow
+    - Library documentation lookup during implementation
+    - Code example discovery for implementation patterns
+    - Best practices research before refactoring
+    """
+
+    def __init__(
+        self,
+        search_extractor: Optional[WebSearchExtractor] = None,
+        doc_lookup: Optional[DocumentationLookup] = None,
+        stackoverflow: Optional[StackOverflowSearcher] = None,
+        code_scraper: Optional[CodeExampleScraper] = None,
+        oracle: Optional[Any] = None,
+        orchestrator: Optional[Any] = None,
+        config: Optional[WebSearchConfig] = None,
+    ):
+        self.config = config or WebSearchConfig()
+
+        # Initialize components
+        self.search_extractor = search_extractor or WebSearchExtractor(self.config)
+        self.doc_lookup = doc_lookup or DocumentationLookup(
+            search_extractor=self.search_extractor,
+            config=self.config,
+        )
+        self.stackoverflow = stackoverflow or StackOverflowSearcher(self.config)
+        self.code_scraper = code_scraper or CodeExampleScraper(self.config)
+
+        # Ouroboros integration
+        self.oracle = oracle
+        self.orchestrator = orchestrator
+
+        # Event handlers
+        self._error_handlers: List[Callable] = []
+        self._improvement_handlers: List[Callable] = []
+
+        # Metrics
+        self._searches_performed = 0
+        self._errors_resolved = 0
+        self._docs_fetched = 0
+        self._examples_found = 0
+
+    async def initialize(self) -> None:
+        """Initialize all web integration components."""
+        await asyncio.gather(
+            self.search_extractor.initialize(),
+            self.doc_lookup.initialize(),
+            self.stackoverflow.initialize(),
+            self.code_scraper.initialize(),
+        )
+        logger.info("OuroborosWebIntegration initialized")
+
+    async def shutdown(self) -> None:
+        """Shutdown all components."""
+        await asyncio.gather(
+            self.search_extractor.shutdown(),
+            self.doc_lookup.shutdown(),
+            self.stackoverflow.shutdown(),
+            self.code_scraper.shutdown(),
+        )
+        logger.info("OuroborosWebIntegration shutdown complete")
+
+    def register_error_handler(self, handler: Callable) -> None:
+        """Register handler for error resolution events."""
+        self._error_handlers.append(handler)
+
+    def register_improvement_handler(self, handler: Callable) -> None:
+        """Register handler for improvement research events."""
+        self._improvement_handlers.append(handler)
+
+    async def resolve_error(
+        self,
+        error_message: str,
+        error_type: str = "",
+        file_path: Optional[str] = None,
+        code_context: Optional[str] = None,
+        language: str = "python",
+    ) -> Dict[str, Any]:
+        """
+        Attempt to resolve an error using web resources.
+
+        Args:
+            error_message: The error message
+            error_type: Error type (e.g., 'TypeError', 'ImportError')
+            file_path: File where error occurred
+            code_context: Surrounding code context
+            language: Programming language
+
+        Returns:
+            Resolution result with solutions and confidence
+        """
+        self._searches_performed += 1
+
+        result = {
+            "error_message": error_message,
+            "error_type": error_type,
+            "solutions": [],
+            "documentation": [],
+            "code_examples": [],
+            "confidence": 0.0,
+            "resolution_status": "pending",
+        }
+
+        # Parallel search across sources
+        tasks = [
+            self.stackoverflow.search_for_error(error_message, language),
+            self.search_extractor.search_for_error(error_message, language),
+        ]
+
+        # If we know the library involved, get docs
+        detected_library = self._detect_library_from_error(error_message)
+        if detected_library:
+            tasks.append(self.doc_lookup.lookup(detected_library, error_type))
+
+        search_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Process Stack Overflow results
+        if not isinstance(search_results[0], Exception):
+            so_results = search_results[0]
+            for so in so_results:
+                if so.is_answered and so.answers:
+                    result["solutions"].append({
+                        "source": "stackoverflow",
+                        "question": so.question_title,
+                        "url": so.question_url,
+                        "score": so.question_score,
+                        "answer": so.answers[0].get("body", "") if so.answers else "",
+                        "relevance": so.relevance_score,
+                    })
+
+        # Process web search results
+        if not isinstance(search_results[1], Exception):
+            web_results = search_results[1]
+            for wr in web_results:
+                if wr.result_type == SearchResultType.DOCUMENTATION:
+                    result["documentation"].append({
+                        "title": wr.title,
+                        "url": wr.url,
+                        "snippet": wr.snippet,
+                        "relevance": wr.relevance_score,
+                    })
+
+        # Process documentation results
+        if len(search_results) > 2 and not isinstance(search_results[2], Exception):
+            doc_results = search_results[2]
+            for doc in doc_results:
+                result["documentation"].append({
+                    "library": doc.library_name,
+                    "title": doc.title,
+                    "url": doc.url,
+                    "type": doc.doc_type.value,
+                    "relevance": doc.relevance_score,
+                })
+
+        # Calculate confidence
+        if result["solutions"]:
+            best_solution = max(result["solutions"], key=lambda s: s["relevance"])
+            result["confidence"] = best_solution["relevance"]
+            result["best_solution"] = best_solution
+
+            if result["confidence"] > 0.7:
+                result["resolution_status"] = "likely_resolved"
+                self._errors_resolved += 1
+            else:
+                result["resolution_status"] = "needs_review"
+        else:
+            result["resolution_status"] = "no_solution_found"
+
+        # Notify handlers
+        for handler in self._error_handlers:
+            try:
+                if asyncio.iscoroutinefunction(handler):
+                    await handler(result)
+                else:
+                    handler(result)
+            except Exception as e:
+                logger.warning(f"Error handler failed: {e}")
+
+        return result
+
+    async def research_improvement(
+        self,
+        topic: str,
+        improvement_type: str = "refactoring",
+        current_implementation: Optional[str] = None,
+        target_libraries: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Research best practices and patterns for an improvement task.
+
+        Args:
+            topic: The improvement topic (e.g., 'async error handling')
+            improvement_type: Type of improvement (refactoring, optimization, etc.)
+            current_implementation: Current code for context
+            target_libraries: Specific libraries to research
+
+        Returns:
+            Research results with patterns, examples, and recommendations
+        """
+        self._searches_performed += 1
+
+        result = {
+            "topic": topic,
+            "improvement_type": improvement_type,
+            "best_practices": [],
+            "patterns": [],
+            "code_examples": [],
+            "documentation": [],
+            "recommendations": [],
+        }
+
+        # Build search queries
+        queries = [
+            f"python {topic} best practices",
+            f"python {improvement_type} {topic} pattern",
+        ]
+
+        if target_libraries:
+            for lib in target_libraries:
+                queries.append(f"{lib} {topic} example")
+
+        # Execute parallel searches
+        search_tasks = [
+            self.search_extractor.search(q, max_results=5)
+            for q in queries[:3]  # Limit parallel queries
+        ]
+
+        # Also search for code examples
+        code_task = self.code_scraper.search_code(
+            topic,
+            language="python",
+            max_results=5,
+        )
+        search_tasks.append(code_task)
+
+        # Get documentation if libraries specified
+        doc_tasks = []
+        if target_libraries:
+            for lib in target_libraries[:3]:
+                doc_tasks.append(self.doc_lookup.lookup(lib, topic))
+
+        all_results = await asyncio.gather(
+            *search_tasks,
+            *doc_tasks,
+            return_exceptions=True,
+        )
+
+        # Process search results
+        for i, res in enumerate(all_results[:len(search_tasks)]):
+            if isinstance(res, Exception):
+                continue
+
+            if isinstance(res, list):
+                if res and isinstance(res[0], CodeExample):
+                    # Code examples
+                    for ex in res:
+                        result["code_examples"].append({
+                            "source": ex.source,
+                            "repo": ex.repo_name,
+                            "path": ex.file_path,
+                            "code": ex.code[:2000],  # Limit size
+                            "url": ex.url,
+                            "relevance": ex.relevance_score,
+                        })
+                        self._examples_found += 1
+                else:
+                    # Search results
+                    for sr in res:
+                        if sr.result_type == SearchResultType.TUTORIAL:
+                            result["best_practices"].append({
+                                "title": sr.title,
+                                "url": sr.url,
+                                "snippet": sr.snippet,
+                            })
+                        elif sr.result_type in [
+                            SearchResultType.DOCUMENTATION,
+                            SearchResultType.API_REFERENCE,
+                        ]:
+                            result["documentation"].append({
+                                "title": sr.title,
+                                "url": sr.url,
+                                "snippet": sr.snippet,
+                            })
+
+        # Process documentation results
+        for res in all_results[len(search_tasks):]:
+            if isinstance(res, Exception):
+                continue
+            if isinstance(res, list):
+                for doc in res:
+                    result["documentation"].append({
+                        "library": doc.library_name,
+                        "title": doc.title,
+                        "url": doc.url,
+                        "type": doc.doc_type.value,
+                    })
+                    self._docs_fetched += 1
+
+        # Generate recommendations based on findings
+        result["recommendations"] = self._generate_recommendations(result)
+
+        # Notify handlers
+        for handler in self._improvement_handlers:
+            try:
+                if asyncio.iscoroutinefunction(handler):
+                    await handler(result)
+                else:
+                    handler(result)
+            except Exception as e:
+                logger.warning(f"Improvement handler failed: {e}")
+
+        return result
+
+    async def get_library_usage(
+        self,
+        library: str,
+        feature: str,
+    ) -> Dict[str, Any]:
+        """
+        Get usage examples and documentation for a specific library feature.
+
+        Args:
+            library: Library name
+            feature: Feature or function name
+
+        Returns:
+            Usage information with examples and documentation
+        """
+        result = {
+            "library": library,
+            "feature": feature,
+            "documentation": [],
+            "examples": [],
+            "related_functions": [],
+        }
+
+        # Get documentation
+        docs = await self.doc_lookup.lookup(library, feature)
+        for doc in docs:
+            fetched = await self.doc_lookup.fetch_content(doc)
+            result["documentation"].append({
+                "title": fetched.title,
+                "url": fetched.url,
+                "content": fetched.content[:3000],
+                "examples": fetched.code_examples[:5],
+            })
+
+        # Get code examples
+        examples = await self.code_scraper.search_code(
+            f"{library} {feature}",
+            max_results=5,
+        )
+        for ex in examples:
+            result["examples"].append({
+                "source": ex.source,
+                "repo": ex.repo_name,
+                "code": ex.code[:1500],
+                "url": ex.url,
+            })
+
+        return result
+
+    def _detect_library_from_error(self, error_message: str) -> Optional[str]:
+        """Detect which library an error originated from."""
+        # Common library error patterns
+        patterns = {
+            "aiohttp": ["aiohttp", "ClientSession", "ClientError"],
+            "fastapi": ["fastapi", "HTTPException", "RequestValidation"],
+            "pydantic": ["pydantic", "ValidationError", "validator"],
+            "sqlalchemy": ["sqlalchemy", "IntegrityError", "OperationalError"],
+            "requests": ["requests.exceptions", "ConnectionError", "HTTPError"],
+            "numpy": ["numpy", "ndarray", "AxisError"],
+            "pandas": ["pandas", "DataFrame", "KeyError"],
+            "torch": ["torch", "cuda", "RuntimeError: CUDA"],
+        }
+
+        error_lower = error_message.lower()
+        for lib, keywords in patterns.items():
+            if any(kw.lower() in error_lower for kw in keywords):
+                return lib
+
+        return None
+
+    def _generate_recommendations(
+        self,
+        research_result: Dict[str, Any],
+    ) -> List[str]:
+        """Generate recommendations based on research findings."""
+        recommendations = []
+
+        if research_result["code_examples"]:
+            recommendations.append(
+                f"Found {len(research_result['code_examples'])} relevant code examples. "
+                "Review top-rated implementations for proven patterns."
+            )
+
+        if research_result["documentation"]:
+            recommendations.append(
+                f"Official documentation available for {len(research_result['documentation'])} topics. "
+                "Consult docs before implementation."
+            )
+
+        if research_result["best_practices"]:
+            recommendations.append(
+                f"Found {len(research_result['best_practices'])} best practice guides. "
+                "Consider established patterns."
+            )
+
+        if not any([
+            research_result["code_examples"],
+            research_result["documentation"],
+            research_result["best_practices"],
+        ]):
+            recommendations.append(
+                "Limited external resources found. Consider searching with different terms "
+                "or consulting internal documentation."
+            )
+
+        return recommendations
+
+    def get_metrics(self) -> Dict[str, Any]:
+        """Get web integration metrics."""
+        return {
+            "searches_performed": self._searches_performed,
+            "errors_resolved": self._errors_resolved,
+            "docs_fetched": self._docs_fetched,
+            "examples_found": self._examples_found,
+            "resolution_rate": (
+                self._errors_resolved / max(1, self._searches_performed)
+            ),
+        }
+
+
+# =============================================================================
+# Web Integration Factory Functions and Initialization
+# =============================================================================
+
+# Global instances
+_web_search_extractor: Optional[WebSearchExtractor] = None
+_doc_lookup: Optional[DocumentationLookup] = None
+_stackoverflow_searcher: Optional[StackOverflowSearcher] = None
+_code_example_scraper: Optional[CodeExampleScraper] = None
+_ouroboros_web_integration: Optional[OuroborosWebIntegration] = None
+
+
+def get_web_search_extractor(
+    config: Optional[WebSearchConfig] = None,
+) -> WebSearchExtractor:
+    """Get or create the web search extractor."""
+    global _web_search_extractor
+    if _web_search_extractor is None:
+        _web_search_extractor = WebSearchExtractor(config)
+    return _web_search_extractor
+
+
+def get_doc_lookup(
+    search_extractor: Optional[WebSearchExtractor] = None,
+    config: Optional[WebSearchConfig] = None,
+) -> DocumentationLookup:
+    """Get or create the documentation lookup."""
+    global _doc_lookup
+    if _doc_lookup is None:
+        _doc_lookup = DocumentationLookup(
+            search_extractor=search_extractor or get_web_search_extractor(config),
+            config=config,
+        )
+    return _doc_lookup
+
+
+def get_stackoverflow_searcher(
+    config: Optional[WebSearchConfig] = None,
+) -> StackOverflowSearcher:
+    """Get or create the Stack Overflow searcher."""
+    global _stackoverflow_searcher
+    if _stackoverflow_searcher is None:
+        _stackoverflow_searcher = StackOverflowSearcher(config)
+    return _stackoverflow_searcher
+
+
+def get_code_example_scraper(
+    config: Optional[WebSearchConfig] = None,
+) -> CodeExampleScraper:
+    """Get or create the code example scraper."""
+    global _code_example_scraper
+    if _code_example_scraper is None:
+        _code_example_scraper = CodeExampleScraper(config)
+    return _code_example_scraper
+
+
+def get_ouroboros_web_integration(
+    oracle: Optional[Any] = None,
+    orchestrator: Optional[Any] = None,
+    config: Optional[WebSearchConfig] = None,
+) -> OuroborosWebIntegration:
+    """Get or create the Ouroboros web integration."""
+    global _ouroboros_web_integration
+    if _ouroboros_web_integration is None:
+        _ouroboros_web_integration = OuroborosWebIntegration(
+            search_extractor=get_web_search_extractor(config),
+            doc_lookup=get_doc_lookup(config=config),
+            stackoverflow=get_stackoverflow_searcher(config),
+            code_scraper=get_code_example_scraper(config),
+            oracle=oracle,
+            orchestrator=orchestrator,
+            config=config,
+        )
+    return _ouroboros_web_integration
+
+
+async def initialize_web_integration(
+    oracle: Optional[Any] = None,
+    orchestrator: Optional[Any] = None,
+    config: Optional[WebSearchConfig] = None,
+) -> Dict[str, Any]:
+    """
+    Initialize all web integration components.
+
+    Args:
+        oracle: Oracle codebase knowledge graph
+        orchestrator: AgenticLoopOrchestrator for task execution
+        config: Web search configuration
+
+    Returns:
+        Dictionary with all initialized components
+    """
+    logger.info("Initializing web integration components...")
+
+    web_integration = get_ouroboros_web_integration(
+        oracle=oracle,
+        orchestrator=orchestrator,
+        config=config,
+    )
+
+    await web_integration.initialize()
+
+    components = {
+        "web_search_extractor": web_integration.search_extractor,
+        "doc_lookup": web_integration.doc_lookup,
+        "stackoverflow_searcher": web_integration.stackoverflow,
+        "code_example_scraper": web_integration.code_scraper,
+        "ouroboros_web_integration": web_integration,
+    }
+
+    logger.info(f"Web integration initialized with {len(components)} components")
+    return components
+
+
+async def shutdown_web_integration() -> None:
+    """Shutdown all web integration components."""
+    logger.info("Shutting down web integration components...")
+
+    global _ouroboros_web_integration
+
+    if _ouroboros_web_integration:
+        await _ouroboros_web_integration.shutdown()
+
+    # Reset global instances
+    global _web_search_extractor, _doc_lookup, _stackoverflow_searcher, _code_example_scraper
+    _web_search_extractor = None
+    _doc_lookup = None
+    _stackoverflow_searcher = None
+    _code_example_scraper = None
+    _ouroboros_web_integration = None
+
+    logger.info("Web integration shutdown complete")

@@ -3917,6 +3917,7 @@ class AutonomousSystemState:
     code_memory_rag: Optional[Any] = None
     system_feedback_loop: Optional[Any] = None
     auto_test_generator: Optional[Any] = None
+    web_integration: Optional[Any] = None  # v5.0: Web search integration
     orchestrator: Optional[Any] = None
     oracle: Optional[Any] = None
     llm_client: Optional[Any] = None
@@ -3935,12 +3936,17 @@ class AutonomousSystemState:
         for name in [
             "goal_decomposer", "debt_detector", "refinement_loop",
             "dual_agent_system", "code_memory_rag", "system_feedback_loop",
-            "auto_test_generator", "orchestrator"
+            "auto_test_generator", "web_integration", "orchestrator"
         ]:
             component = getattr(self, name, None)
             if component and hasattr(component, 'get_status'):
                 try:
                     status["components"][name] = component.get_status()
+                except Exception as e:
+                    status["components"][name] = {"error": str(e)}
+            elif component and hasattr(component, 'get_metrics'):
+                try:
+                    status["components"][name] = component.get_metrics()
                 except Exception as e:
                     status["components"][name] = {"error": str(e)}
             else:
@@ -4034,6 +4040,9 @@ class CrossRepoAutonomousIntegration:
                     get_code_memory_rag,
                     get_system_feedback_loop,
                     get_auto_test_generator,
+                    # v5.0: Web integration
+                    get_ouroboros_web_integration,
+                    initialize_web_integration,
                 )
 
                 # Phase 1: Initialize independent components in parallel
@@ -4074,6 +4083,15 @@ class CrossRepoAutonomousIntegration:
                     )
                     return ("auto_test_generator", test_gen)
 
+                async def init_web_integration():
+                    """v5.0: Initialize web search integration."""
+                    web_components = await initialize_web_integration(
+                        oracle=oracle,
+                        orchestrator=orchestrator,
+                    )
+                    web_integration = web_components.get("ouroboros_web_integration")
+                    return ("web_integration", web_integration)
+
                 # Run parallel initialization
                 phase1_results = await asyncio.gather(
                     init_goal_decomposer(),
@@ -4081,6 +4099,7 @@ class CrossRepoAutonomousIntegration:
                     init_dual_agent(),
                     init_code_memory(),
                     init_test_generator(),
+                    init_web_integration(),  # v5.0: Web integration
                     return_exceptions=True,
                 )
 
@@ -4135,6 +4154,7 @@ class CrossRepoAutonomousIntegration:
                 _autonomous_state.code_memory_rag = self._components.get("code_memory_rag")
                 _autonomous_state.system_feedback_loop = self._components.get("system_feedback_loop")
                 _autonomous_state.auto_test_generator = self._components.get("auto_test_generator")
+                _autonomous_state.web_integration = self._components.get("web_integration")  # v5.0
                 _autonomous_state.orchestrator = orchestrator
                 _autonomous_state.oracle = oracle
                 _autonomous_state.llm_client = llm_client
@@ -4213,6 +4233,57 @@ class CrossRepoAutonomousIntegration:
 
                 orchestrator._on_task_complete.append(generate_tests_after_improvement)
             logger.debug("  Wired auto_test_generator → orchestrator")
+
+        # v5.0: Wire web integration for error resolution and best practices research
+        web_integration = self._components.get("web_integration")
+        if web_integration:
+            # Wire into refinement loop for error resolution
+            if refinement_loop and hasattr(refinement_loop, 'register_error_resolver'):
+                async def resolve_error_with_web(error_info):
+                    """Resolve errors using web search."""
+                    try:
+                        result = await web_integration.resolve_error(
+                            error_message=error_info.get("message", ""),
+                            error_type=error_info.get("type", ""),
+                            file_path=error_info.get("file_path"),
+                            code_context=error_info.get("context"),
+                        )
+                        if result.get("confidence", 0) > 0.7:
+                            logger.info(f"Web search found likely solution: {result.get('best_solution', {}).get('url', '')}")
+                        return result
+                    except Exception as e:
+                        logger.debug(f"Web error resolution failed: {e}")
+                        return None
+
+                refinement_loop.register_error_resolver(resolve_error_with_web)
+                logger.debug("  Wired web_integration → refinement_loop (error resolution)")
+
+            # Wire into orchestrator for improvement research
+            if orchestrator and hasattr(orchestrator, '_on_task_start'):
+                async def research_before_improvement(task):
+                    """Research best practices before starting improvement."""
+                    try:
+                        if hasattr(task, 'goal') and task.goal:
+                            # Get improvement research
+                            research = await web_integration.research_improvement(
+                                topic=task.goal,
+                                improvement_type="refactoring",
+                            )
+                            if research.get("recommendations"):
+                                logger.info(f"Web research for '{task.goal[:30]}...' found {len(research.get('code_examples', []))} examples")
+                            return research
+                    except Exception as e:
+                        logger.debug(f"Web research failed: {e}")
+                    return None
+
+                orchestrator._on_task_start.append(research_before_improvement)
+                logger.debug("  Wired web_integration → orchestrator (improvement research)")
+
+            # Register improvement handler for metrics
+            web_integration.register_improvement_handler(
+                lambda result: logger.debug(f"Web research completed: {len(result.get('recommendations', []))} recommendations")
+            )
+            logger.debug("  Web integration wired for autonomous improvement")
 
     async def _connect_cross_repo_services(self) -> None:
         """Connect to cross-repo services (JARVIS Prime, Reactor Core)."""
@@ -4334,6 +4405,15 @@ class CrossRepoAutonomousIntegration:
         logger.info("Shutting down CrossRepoAutonomousIntegration...")
 
         await self.stop_background_loops()
+
+        # v5.0: Shutdown web integration
+        web_integration = self._components.get("web_integration")
+        if web_integration:
+            try:
+                await web_integration.shutdown()
+                logger.info("  ✅ WebIntegration shutdown")
+            except Exception as e:
+                logger.warning(f"  ⚠️ WebIntegration shutdown error: {e}")
 
         self._components.clear()
         self._initialized = False
@@ -4465,11 +4545,13 @@ async def shutdown_autonomous_self_programming_full() -> None:
             await _cross_repo_integration.shutdown()
             _cross_repo_integration = None
 
-        # Also call native shutdown
+        # Also call native shutdown (includes web integration)
         from backend.core.ouroboros.native_integration import (
             shutdown_autonomous_self_programming,
+            shutdown_web_integration,
         )
         await shutdown_autonomous_self_programming()
+        await shutdown_web_integration()  # v5.0: Web integration shutdown
 
         _autonomous_initialized = False
         _autonomous_components = {}
