@@ -15024,8 +15024,8 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
 
             self._experience_forwarder = await get_experience_forwarder()
 
-            # Get metrics
-            metrics = self._experience_forwarder.get_metrics()
+            # Get metrics (async method requires await)
+            metrics = await self._experience_forwarder.get_metrics()
             reactor_available = metrics.get("reactor_core_available", False)
             event_bus_connected = metrics.get("event_bus_connected", False)
 

@@ -545,6 +545,17 @@ class CrossRepoStateInitializer:
 
             # v6.4: Acquire distributed lock for atomic read-modify-write
             # This lock works across processes (not just coroutines)
+            # v6.5: Guard against None lock manager (graceful degradation)
+            if self._lock_manager is None:
+                logger.warning("[CrossRepoState] Lock manager not initialized, emitting without lock")
+                events = await self._read_json_file(events_file, default=[])
+                events.append(asdict(event))
+                if self.config.event_rotation_enabled and len(events) > self.config.max_events_per_file:
+                    events = events[-self.config.max_events_per_file:]
+                await self._write_json_file(events_file, events)
+                logger.debug(f"[CrossRepoState] Event emitted (unlocked): {event.event_type.value}")
+                return
+
             async with self._lock_manager.acquire("vbia_events", timeout=5.0, ttl=10.0) as acquired:
                 if not acquired:
                     logger.warning("Could not acquire vbia_events lock, skipping emit")
@@ -615,6 +626,12 @@ class CrossRepoStateInitializer:
     async def _write_jarvis_state(self) -> None:
         """Write JARVIS state to vbia_state.json (thread-safe)."""
         state_file = self._state_files["vbia_state"]
+        # v6.5: Guard against None lock manager
+        if self._lock_manager is None:
+            logger.debug("[CrossRepoState] Writing state without lock (manager not initialized)")
+            self._jarvis_state.last_update = datetime.now().isoformat()
+            await self._write_json_file(state_file, asdict(self._jarvis_state))
+            return
         # v6.4: Use distributed lock
         async with self._lock_manager.acquire("vbia_state", timeout=5.0, ttl=10.0) as acquired:
             if not acquired:
@@ -677,6 +694,21 @@ class CrossRepoStateInitializer:
             try:
                 # v6.4: Update heartbeat file with distributed lock for atomic read-modify-write
                 heartbeat_file = self._state_files["heartbeat"]
+
+                # v6.5: Guard against None lock manager
+                if self._lock_manager is None:
+                    logger.debug("[CrossRepoState] Heartbeat without lock (manager not initialized)")
+                    heartbeats = await self._read_json_file(heartbeat_file, default={})
+                    heartbeats["jarvis"] = asdict(Heartbeat(
+                        repo_type=RepoType.JARVIS,
+                        status=self._jarvis_state.status,
+                        uptime_seconds=time.time() - self._start_time,
+                        active_sessions=self._jarvis_state.metrics.get("active_sessions", 0),
+                    ))
+                    await self._write_json_file(heartbeat_file, heartbeats)
+                    self._jarvis_state.last_heartbeat = datetime.now().isoformat()
+                    await asyncio.sleep(self.config.heartbeat_interval_seconds)
+                    continue
 
                 async with self._lock_manager.acquire("heartbeat", timeout=5.0, ttl=10.0) as acquired:
                     if not acquired:
@@ -1000,6 +1032,14 @@ class CrossRepoStateInitializer:
     async def _update_prime_state(self, status: StateStatus) -> None:
         """Update JARVIS Prime state file."""
         prime_file = self._state_files["prime_state"]
+        # v6.5: Guard against None lock manager
+        if self._lock_manager is None:
+            logger.debug("[CrossRepoState] Updating prime state without lock")
+            prime_state = await self._read_json_file(prime_file, default={})
+            prime_state["status"] = status.value
+            prime_state["last_update"] = datetime.now().isoformat()
+            await self._write_json_file(prime_file, prime_state)
+            return
         # v6.4: Use distributed lock
         async with self._lock_manager.acquire("prime_state", timeout=5.0, ttl=10.0) as acquired:
             if not acquired:
@@ -1013,6 +1053,14 @@ class CrossRepoStateInitializer:
     async def _update_reactor_state(self, status: StateStatus) -> None:
         """Update Reactor Core state file."""
         reactor_file = self._state_files["reactor_state"]
+        # v6.5: Guard against None lock manager
+        if self._lock_manager is None:
+            logger.debug("[CrossRepoState] Updating reactor state without lock")
+            reactor_state = await self._read_json_file(reactor_file, default={})
+            reactor_state["status"] = status.value
+            reactor_state["last_update"] = datetime.now().isoformat()
+            await self._write_json_file(reactor_file, reactor_state)
+            return
         # v6.4: Use distributed lock
         async with self._lock_manager.acquire("reactor_state", timeout=5.0, ttl=10.0) as acquired:
             if not acquired:

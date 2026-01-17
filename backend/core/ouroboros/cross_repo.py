@@ -127,6 +127,29 @@ class EventType(Enum):
     OWNERSHIP_CHANGE_DETECTED = "ownership_change_detected"
     CROSS_REPO_CORRELATION = "cross_repo_correlation"
 
+    # Code Understanding events (v12.0 Advanced Code Understanding)
+    # Type Analysis events
+    TYPE_ERROR_DETECTED = "type_error_detected"
+    TYPE_INFERENCE_REQUEST = "type_inference_request"
+    TYPE_INFERENCE_RESULT = "type_inference_result"
+    TYPE_COMPATIBILITY_CHECK = "type_compatibility_check"
+    TYPE_ANNOTATION_SUGGESTED = "type_annotation_suggested"
+
+    # Design Pattern events
+    PATTERN_DETECTED = "pattern_detected"
+    PATTERN_VIOLATION = "pattern_violation"
+    PATTERN_INTEGRITY_CHECK = "pattern_integrity_check"
+    PATTERN_REFACTORING_SUGGESTED = "pattern_refactoring_suggested"
+    ANTI_PATTERN_DETECTED = "anti_pattern_detected"
+
+    # API Contract events
+    API_CONTRACT_CHANGED = "api_contract_changed"
+    API_BREAKING_CHANGE = "api_breaking_change"
+    API_MIGRATION_PLANNED = "api_migration_planned"
+    API_ENDPOINT_ADDED = "api_endpoint_added"
+    API_ENDPOINT_REMOVED = "api_endpoint_removed"
+    API_SCHEMA_VALIDATION = "api_schema_validation"
+
 
 # =============================================================================
 # DATA STRUCTURES

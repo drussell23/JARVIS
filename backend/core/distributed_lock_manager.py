@@ -341,8 +341,19 @@ class DistributedLockManager:
             return None
 
     async def _write_lock_metadata(self, lock_file: Path, metadata: LockMetadata) -> None:
-        """Write lock metadata to file atomically."""
+        """
+        Write lock metadata to file atomically.
+
+        v1.1: Ensures parent directory exists before writing.
+        """
         try:
+            # Ensure directory exists (resilient to race conditions)
+            lock_dir = lock_file.parent
+            try:
+                await aiofiles.os.makedirs(lock_dir, exist_ok=True)
+            except FileExistsError:
+                pass  # Another process created it - that's fine
+
             # Write to temp file first
             temp_file = lock_file.with_suffix('.lock.tmp')
             async with aiofiles.open(temp_file, 'w') as f:
@@ -356,12 +367,24 @@ class DistributedLockManager:
             raise
 
     async def _remove_lock_file(self, lock_file: Path) -> None:
-        """Remove lock file safely."""
+        """
+        Remove lock file safely with race condition handling.
+
+        v1.1: Made robust against TOCTOU race conditions - if file disappears
+        between exists check and remove, we treat it as successful removal.
+        """
         try:
-            if await aiofiles.os.path.exists(lock_file):
-                await aiofiles.os.remove(lock_file)
-        except Exception as e:
-            logger.error(f"Error removing lock file {lock_file}: {e}")
+            await aiofiles.os.remove(lock_file)
+        except FileNotFoundError:
+            # File already gone - treat as successful removal (race condition handled)
+            logger.debug(f"Lock file already removed (race condition OK): {lock_file}")
+        except OSError as e:
+            # Check if it's "No such file or directory" error
+            import errno
+            if e.errno == errno.ENOENT:
+                logger.debug(f"Lock file already removed: {lock_file}")
+            else:
+                logger.error(f"Error removing lock file {lock_file}: {e}")
 
     # =========================================================================
     # Cleanup Tasks
