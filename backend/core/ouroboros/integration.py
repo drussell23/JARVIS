@@ -4133,6 +4133,26 @@ class CrossRepoAutonomousIntegration:
                     ExperienceType,
                     ForwardingStatus,
                     ResilientExperienceMesh,
+                    # v13.0: Bulletproof orchestration layer
+                    initialize_bulletproof_mesh,
+                    shutdown_bulletproof_mesh,
+                    get_bulletproof_mesh,
+                    get_bulletproof_mesh_status,
+                    supervise_task,
+                    write_file_atomic,
+                    check_repo_health,
+                    save_to_dlq,
+                    ValidatedTimeouts,
+                    AsyncLockGuard,
+                    TaskSupervisor,
+                    AtomicFileManager,
+                    GracefulShutdownOrchestrator,
+                    CrossRepoHealthCoordinator,
+                    EventLossPreventor,
+                    BulletproofOrchestrationMesh,
+                    ShutdownPhase,
+                    TaskHealth,
+                    LockPriority,
                 )
 
                 # Phase 1: Initialize independent components in parallel
@@ -4496,6 +4516,41 @@ class CrossRepoAutonomousIntegration:
                     logger.warning(f"  ⚠️ v12.0 Resilient Experience Mesh initialization failed: {e}")
                     logger.debug(f"  v12.0 error details: {e}", exc_info=True)
 
+                # Phase 12: Initialize v13.0 Bulletproof Orchestration Mesh
+                logger.info("Phase 12: Initializing v13.0 Bulletproof Orchestration Mesh...")
+                try:
+                    # Validate timeout configuration upfront
+                    timeout_issues = ValidatedTimeouts.validate_relationships()
+                    if timeout_issues:
+                        for issue in timeout_issues:
+                            logger.warning(f"  ⚠️ Timeout config: {issue}")
+
+                    v13_components = await initialize_bulletproof_mesh()
+
+                    # Wire v13.0 components into our component registry
+                    v13_component_names = [
+                        "bulletproof_mesh",
+                        "lock_guard",
+                        "task_supervisor",
+                        "atomic_file_manager",
+                        "shutdown_orchestrator",
+                        "health_coordinator",
+                        "event_loss_preventor",
+                        "startup_sequencer",
+                    ]
+
+                    for name in v13_component_names:
+                        comp = v13_components.get(name)
+                        if comp:
+                            self._components[name] = comp
+                            logger.info(f"  ✅ {name} initialized (v13.0)")
+
+                    logger.info(f"  ✅ v13.0 Bulletproof Orchestration Mesh initialized with {len(v13_components)} components")
+
+                except Exception as e:
+                    logger.warning(f"  ⚠️ v13.0 Bulletproof Orchestration Mesh initialization failed: {e}")
+                    logger.debug(f"  v13.0 error details: {e}", exc_info=True)
+
                 # Update global state
                 global _autonomous_state
                 _autonomous_state.goal_decomposer = self._components.get("goal_decomposer")
@@ -4536,6 +4591,15 @@ class CrossRepoAutonomousIntegration:
                 _autonomous_state.backend_selector = self._components.get("backend_selector")
                 _autonomous_state.event_bus_monitor = self._components.get("event_bus_monitor")
                 _autonomous_state.degraded_manager = self._components.get("degraded_manager")
+                # v13.0: Bulletproof orchestration mesh components
+                _autonomous_state.bulletproof_mesh = self._components.get("bulletproof_mesh")
+                _autonomous_state.lock_guard = self._components.get("lock_guard")
+                _autonomous_state.task_supervisor = self._components.get("task_supervisor")
+                _autonomous_state.atomic_file_manager = self._components.get("atomic_file_manager")
+                _autonomous_state.shutdown_orchestrator = self._components.get("shutdown_orchestrator")
+                _autonomous_state.health_coordinator = self._components.get("health_coordinator")
+                _autonomous_state.event_loss_preventor = self._components.get("event_loss_preventor")
+                _autonomous_state.startup_sequencer = self._components.get("startup_sequencer")
                 _autonomous_state.orchestrator = orchestrator
                 _autonomous_state.oracle = oracle
                 _autonomous_state.llm_client = llm_client
@@ -4953,7 +5017,15 @@ class CrossRepoAutonomousIntegration:
 
         await self.stop_background_loops()
 
-        # v12.0: Shutdown Resilient Experience Mesh first (newest)
+        # v13.0: Shutdown Bulletproof Orchestration Mesh first (newest)
+        try:
+            from backend.core.ouroboros.native_integration import shutdown_bulletproof_mesh
+            await shutdown_bulletproof_mesh()
+            logger.info("  ✅ v13.0 Bulletproof Orchestration Mesh shutdown")
+        except Exception as e:
+            logger.warning(f"  ⚠️ v13.0 Bulletproof Orchestration Mesh shutdown error: {e}")
+
+        # v12.0: Shutdown Resilient Experience Mesh
         try:
             from backend.core.ouroboros.native_integration import shutdown_experience_mesh
             await shutdown_experience_mesh()
@@ -5001,9 +5073,18 @@ class CrossRepoAutonomousIntegration:
         except Exception as e:
             logger.warning(f"  ⚠️ v7.0 autonomous system shutdown error: {e}")
 
-        # v6.0 + v7.0 + v8.0 + v9.0 + v10.0 + v11.0 + v12.0: Shutdown individual components
+        # v6.0 + v7.0 + v8.0 + v9.0 + v10.0 + v11.0 + v12.0 + v13.0: Shutdown individual components
         all_components = [
-            # v12.0 components (shutdown first - newest)
+            # v13.0 components (shutdown first - newest)
+            "startup_sequencer",
+            "event_loss_preventor",
+            "health_coordinator",
+            "shutdown_orchestrator",
+            "atomic_file_manager",
+            "task_supervisor",
+            "lock_guard",
+            "bulletproof_mesh",
+            # v12.0 components
             "degraded_manager",
             "event_bus_monitor",
             "backend_selector",

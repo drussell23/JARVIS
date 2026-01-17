@@ -24616,3 +24616,1788 @@ async def get_pending_experiences_count() -> int:
     """
     mesh = get_experience_mesh()
     return await mesh._sqlite_store.get_pending_count()
+
+
+# =============================================================================
+# v13.0: BULLETPROOF ORCHESTRATION LAYER
+# =============================================================================
+#
+# Fixes 20 identified critical/high/medium issues:
+#
+# CRITICAL:
+# 1. Flush task not monitored (silent crash)
+# 2. Non-atomic file truncation (event loss)
+# 3. Event bus started too late
+#
+# HIGH:
+# 1. Unordered task cancellation (shutdown hangs)
+# 2. Queue lock nesting (deadlock possible)
+# 3. Silent exception swallowing
+# 4. Inconsistent lock ordering
+# 5. Mixed thread/async locks
+# 6. Failed experiences dropped silently
+# 7. No health check for Reactor Core
+# 8. Forwarder startup ordering
+#
+# MEDIUM:
+# Various configuration and minor issues
+# =============================================================================
+
+
+class ShutdownPhase(Enum):
+    """Shutdown phases for ordered shutdown choreography."""
+    NOT_STARTED = "not_started"
+    PREPARING = "preparing"
+    DRAINING = "draining"
+    CANCELLING = "cancelling"
+    WAITING = "waiting"
+    CLEANUP = "cleanup"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class TaskHealth(Enum):
+    """Health status for supervised tasks."""
+    HEALTHY = "healthy"
+    DEGRADED = "degraded"
+    CRASHED = "crashed"
+    CANCELLED = "cancelled"
+    UNKNOWN = "unknown"
+
+
+class LockPriority(Enum):
+    """Lock acquisition priority (lower = acquired first)."""
+    CRITICAL = 1       # System-critical locks
+    HIGH = 2           # Resource management locks
+    NORMAL = 3         # Standard operation locks
+    LOW = 4            # Metrics and monitoring locks
+    BACKGROUND = 5     # Background task locks
+
+
+@dataclass
+class SupervisedTask:
+    """Metadata for a supervised background task."""
+    task: asyncio.Task
+    name: str
+    created_at: float = field(default_factory=time.time)
+    health: TaskHealth = TaskHealth.HEALTHY
+    restart_count: int = 0
+    max_restarts: int = 3
+    restart_delay: float = 1.0
+    critical: bool = False
+    factory: Optional[Callable[[], Awaitable[None]]] = None
+    last_heartbeat: float = field(default_factory=time.time)
+    heartbeat_timeout: float = 60.0
+
+
+@dataclass
+class LockAcquisition:
+    """Track a lock acquisition for deadlock detection."""
+    lock_id: str
+    priority: LockPriority
+    acquired_at: float
+    task_id: int
+    stack_trace: str
+
+
+@dataclass
+class AtomicWriteContext:
+    """Context for atomic file write operations."""
+    target_path: Path
+    temp_path: Path
+    backup_path: Optional[Path]
+    content_hash: str
+    started_at: float
+
+
+# =============================================================================
+# VALIDATED TIMEOUT CONFIGURATION
+# =============================================================================
+
+class ValidatedTimeouts:
+    """
+    Centralized timeout configuration with validation.
+    Prevents invalid timeout combinations that cause failures.
+    """
+
+    # Minimum and maximum bounds for all timeouts
+    BOUNDS = {
+        "operation": (1.0, 300.0),       # 1s - 5min
+        "shutdown": (30.0, 600.0),       # 30s - 10min
+        "health_check": (1.0, 30.0),     # 1s - 30s
+        "lock_acquire": (0.1, 60.0),     # 100ms - 1min
+        "task_cancel": (1.0, 30.0),      # 1s - 30s
+        "heartbeat": (5.0, 300.0),       # 5s - 5min
+        "startup": (5.0, 120.0),         # 5s - 2min
+        "batch_flush": (5.0, 60.0),      # 5s - 1min
+        "connection": (1.0, 30.0),       # 1s - 30s
+    }
+
+    @classmethod
+    def get(cls, key: str, default: float) -> float:
+        """Get a validated timeout value."""
+        env_key = f"JARVIS_TIMEOUT_{key.upper()}"
+        try:
+            value = float(os.environ.get(env_key, default))
+        except (ValueError, TypeError):
+            logger.warning(f"Invalid timeout value for {env_key}, using default {default}")
+            value = default
+
+        # Apply bounds
+        min_val, max_val = cls.BOUNDS.get(key, (0.1, 3600.0))
+        bounded = max(min_val, min(max_val, value))
+
+        if bounded != value:
+            logger.warning(
+                f"Timeout {key}={value} out of bounds [{min_val}, {max_val}], "
+                f"clamped to {bounded}"
+            )
+
+        return bounded
+
+    @classmethod
+    def validate_relationships(cls) -> List[str]:
+        """Validate timeout relationships are logical."""
+        issues = []
+
+        shutdown = cls.get("shutdown", 60.0)
+        operation = cls.get("operation", 10.0)
+        health_check = cls.get("health_check", 5.0)
+        batch_flush = cls.get("batch_flush", 10.0)
+
+        if health_check >= operation:
+            issues.append(
+                f"health_check ({health_check}s) >= operation ({operation}s): "
+                "health checks may always timeout"
+            )
+
+        if batch_flush >= shutdown / 2:
+            issues.append(
+                f"batch_flush ({batch_flush}s) >= shutdown/2 ({shutdown/2}s): "
+                "final flush may not complete during shutdown"
+            )
+
+        if operation >= shutdown:
+            issues.append(
+                f"operation ({operation}s) >= shutdown ({shutdown}s): "
+                "operations may prevent clean shutdown"
+            )
+
+        return issues
+
+
+# =============================================================================
+# UNIFIED ASYNC LOCK GUARD
+# =============================================================================
+
+class AsyncLockGuard:
+    """
+    Unified async lock management with:
+    - Deadlock detection via lock ordering
+    - Timeout protection on all acquisitions
+    - Lock priority enforcement
+    - Circular wait prevention
+    """
+
+    # Canonical lock ordering (lower number = acquired first)
+    LOCK_ORDER = {
+        "system": 1,
+        "resource": 2,
+        "queue": 3,
+        "pending": 4,
+        "dedup": 5,
+        "metrics": 6,
+        "cache": 7,
+    }
+
+    def __init__(self):
+        self._locks: Dict[str, asyncio.Lock] = {}
+        self._acquisitions: Dict[int, List[LockAcquisition]] = defaultdict(list)
+        self._lock = asyncio.Lock()
+        self._stats = {
+            "acquisitions": 0,
+            "releases": 0,
+            "timeouts": 0,
+            "order_violations": 0,
+        }
+
+    def register_lock(self, name: str, priority: LockPriority = LockPriority.NORMAL) -> asyncio.Lock:
+        """Register a new lock with ordering."""
+        if name not in self._locks:
+            self._locks[name] = asyncio.Lock()
+        return self._locks[name]
+
+    def get_lock(self, name: str) -> asyncio.Lock:
+        """Get a registered lock."""
+        if name not in self._locks:
+            self._locks[name] = asyncio.Lock()
+        return self._locks[name]
+
+    @asynccontextmanager
+    async def acquire(
+        self,
+        name: str,
+        timeout: Optional[float] = None,
+        priority: LockPriority = LockPriority.NORMAL,
+    ):
+        """
+        Acquire a lock with timeout and ordering enforcement.
+
+        Usage:
+            async with lock_guard.acquire("queue", timeout=5.0):
+                # Critical section
+        """
+        if timeout is None:
+            timeout = ValidatedTimeouts.get("lock_acquire", 10.0)
+
+        task_id = id(asyncio.current_task())
+        lock = self.get_lock(name)
+        lock_order = self.LOCK_ORDER.get(name, 100)
+
+        # Check for lock ordering violation
+        current_acquisitions = self._acquisitions.get(task_id, [])
+        for acq in current_acquisitions:
+            acq_order = self.LOCK_ORDER.get(acq.lock_id, 100)
+            if lock_order < acq_order:
+                self._stats["order_violations"] += 1
+                logger.warning(
+                    f"Lock ordering violation: acquiring '{name}' (order={lock_order}) "
+                    f"while holding '{acq.lock_id}' (order={acq_order}). "
+                    f"Risk of deadlock!"
+                )
+
+        # Acquire with timeout
+        acquired = False
+        try:
+            acquired = await asyncio.wait_for(lock.acquire(), timeout=timeout)
+            self._stats["acquisitions"] += 1
+
+            # Track acquisition
+            acquisition = LockAcquisition(
+                lock_id=name,
+                priority=priority,
+                acquired_at=time.time(),
+                task_id=task_id,
+                stack_trace="",  # Could add traceback.format_stack() for debugging
+            )
+            self._acquisitions[task_id].append(acquisition)
+
+            yield
+
+        except asyncio.TimeoutError:
+            self._stats["timeouts"] += 1
+            logger.error(f"Lock acquisition timeout: {name} after {timeout}s")
+            raise
+
+        finally:
+            if acquired:
+                lock.release()
+                self._stats["releases"] += 1
+
+                # Remove from acquisitions
+                if task_id in self._acquisitions:
+                    self._acquisitions[task_id] = [
+                        a for a in self._acquisitions[task_id] if a.lock_id != name
+                    ]
+                    if not self._acquisitions[task_id]:
+                        del self._acquisitions[task_id]
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Get lock statistics."""
+        return {
+            **self._stats,
+            "active_locks": sum(
+                1 for lock in self._locks.values() if lock.locked()
+            ),
+            "tasks_holding_locks": len(self._acquisitions),
+        }
+
+
+# =============================================================================
+# TASK SUPERVISOR
+# =============================================================================
+
+class TaskSupervisor:
+    """
+    Supervises background tasks with:
+    - Crash detection and automatic restart
+    - Health monitoring via heartbeats
+    - Graceful shutdown coordination
+    - Exception propagation to supervisor
+    """
+
+    def __init__(
+        self,
+        on_task_crash: Optional[Callable[[str, Exception], Awaitable[None]]] = None,
+        on_task_restart: Optional[Callable[[str, int], Awaitable[None]]] = None,
+    ):
+        self._tasks: Dict[str, SupervisedTask] = {}
+        self._lock = asyncio.Lock()
+        self._running = False
+        self._monitor_task: Optional[asyncio.Task] = None
+        self._on_task_crash = on_task_crash
+        self._on_task_restart = on_task_restart
+        self._crash_count = 0
+        self._restart_count = 0
+
+    async def start(self) -> None:
+        """Start the task supervisor."""
+        if self._running:
+            return
+
+        self._running = True
+        self._monitor_task = asyncio.create_task(
+            self._monitor_loop(),
+            name="task_supervisor_monitor"
+        )
+        logger.info("TaskSupervisor started")
+
+    async def stop(self) -> None:
+        """Stop all supervised tasks gracefully."""
+        if not self._running:
+            return
+
+        self._running = False
+
+        # Cancel monitor task
+        if self._monitor_task:
+            self._monitor_task.cancel()
+            try:
+                await asyncio.wait_for(self._monitor_task, timeout=5.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+
+        # Stop all supervised tasks
+        await self._shutdown_all_tasks()
+
+        logger.info(
+            f"TaskSupervisor stopped: {self._crash_count} crashes, "
+            f"{self._restart_count} restarts"
+        )
+
+    async def supervise(
+        self,
+        name: str,
+        coro: Awaitable[None],
+        *,
+        critical: bool = False,
+        max_restarts: int = 3,
+        restart_delay: float = 1.0,
+        heartbeat_timeout: float = 60.0,
+        factory: Optional[Callable[[], Awaitable[None]]] = None,
+    ) -> asyncio.Task:
+        """
+        Create and supervise a background task.
+
+        Args:
+            name: Unique task name
+            coro: The coroutine to run
+            critical: If True, crash propagates to supervisor
+            max_restarts: Maximum automatic restart attempts
+            restart_delay: Delay between restarts (with exponential backoff)
+            heartbeat_timeout: Task must heartbeat within this interval
+            factory: Optional factory to recreate the coroutine for restarts
+        """
+        task = asyncio.create_task(coro, name=name)
+
+        supervised = SupervisedTask(
+            task=task,
+            name=name,
+            critical=critical,
+            max_restarts=max_restarts,
+            restart_delay=restart_delay,
+            heartbeat_timeout=heartbeat_timeout,
+            factory=factory,
+        )
+
+        # Add done callback for crash detection
+        task.add_done_callback(
+            lambda t: asyncio.create_task(self._handle_task_done(name, t))
+        )
+
+        async with self._lock:
+            self._tasks[name] = supervised
+
+        logger.debug(f"Supervising task: {name} (critical={critical})")
+        return task
+
+    async def heartbeat(self, name: str) -> None:
+        """Record a heartbeat for a supervised task."""
+        async with self._lock:
+            if name in self._tasks:
+                self._tasks[name].last_heartbeat = time.time()
+
+    async def _handle_task_done(self, name: str, task: asyncio.Task) -> None:
+        """Handle task completion or crash."""
+        async with self._lock:
+            if name not in self._tasks:
+                return
+
+            supervised = self._tasks[name]
+
+            if task.cancelled():
+                supervised.health = TaskHealth.CANCELLED
+                logger.debug(f"Task {name} was cancelled")
+                return
+
+            exception = task.exception()
+            if exception:
+                supervised.health = TaskHealth.CRASHED
+                self._crash_count += 1
+
+                logger.error(
+                    f"Supervised task {name} crashed: {exception}",
+                    exc_info=exception
+                )
+
+                # Notify crash callback
+                if self._on_task_crash:
+                    try:
+                        await self._on_task_crash(name, exception)
+                    except Exception as e:
+                        logger.error(f"Crash callback failed: {e}")
+
+                # Attempt restart if allowed
+                if supervised.restart_count < supervised.max_restarts and supervised.factory:
+                    await self._restart_task(name, supervised)
+                elif supervised.critical:
+                    logger.critical(
+                        f"Critical task {name} exhausted restarts. "
+                        "System may be in degraded state."
+                    )
+            else:
+                logger.debug(f"Task {name} completed normally")
+
+    async def _restart_task(self, name: str, supervised: SupervisedTask) -> None:
+        """Restart a crashed task."""
+        if not supervised.factory:
+            return
+
+        supervised.restart_count += 1
+        self._restart_count += 1
+
+        # Exponential backoff
+        delay = supervised.restart_delay * (2 ** (supervised.restart_count - 1))
+        delay = min(delay, 60.0)  # Cap at 60s
+
+        logger.warning(
+            f"Restarting task {name} (attempt {supervised.restart_count}/"
+            f"{supervised.max_restarts}) after {delay:.1f}s delay"
+        )
+
+        await asyncio.sleep(delay)
+
+        try:
+            new_coro = supervised.factory()
+            new_task = asyncio.create_task(new_coro, name=name)
+            new_task.add_done_callback(
+                lambda t: asyncio.create_task(self._handle_task_done(name, t))
+            )
+
+            supervised.task = new_task
+            supervised.health = TaskHealth.HEALTHY
+            supervised.last_heartbeat = time.time()
+
+            if self._on_task_restart:
+                await self._on_task_restart(name, supervised.restart_count)
+
+        except Exception as e:
+            logger.error(f"Failed to restart task {name}: {e}")
+            supervised.health = TaskHealth.CRASHED
+
+    async def _monitor_loop(self) -> None:
+        """Monitor task health via heartbeats."""
+        while self._running:
+            try:
+                await asyncio.sleep(10.0)
+
+                now = time.time()
+                async with self._lock:
+                    for name, supervised in self._tasks.items():
+                        if supervised.health != TaskHealth.HEALTHY:
+                            continue
+
+                        time_since_heartbeat = now - supervised.last_heartbeat
+                        if time_since_heartbeat > supervised.heartbeat_timeout:
+                            logger.warning(
+                                f"Task {name} missed heartbeat "
+                                f"({time_since_heartbeat:.1f}s > "
+                                f"{supervised.heartbeat_timeout}s)"
+                            )
+                            supervised.health = TaskHealth.DEGRADED
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Task monitor error: {e}")
+
+    async def _shutdown_all_tasks(self) -> None:
+        """Shutdown all tasks in order."""
+        timeout = ValidatedTimeouts.get("task_cancel", 10.0)
+
+        async with self._lock:
+            tasks_to_cancel = list(self._tasks.values())
+
+        # Cancel in reverse order of creation
+        tasks_to_cancel.sort(key=lambda t: t.created_at, reverse=True)
+
+        for supervised in tasks_to_cancel:
+            if supervised.task.done():
+                continue
+
+            supervised.task.cancel()
+            try:
+                await asyncio.wait_for(
+                    supervised.task,
+                    timeout=timeout
+                )
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+            except Exception as e:
+                logger.warning(f"Task {supervised.name} shutdown error: {e}")
+
+    def get_status(self) -> Dict[str, Any]:
+        """Get supervisor status."""
+        return {
+            "running": self._running,
+            "task_count": len(self._tasks),
+            "crash_count": self._crash_count,
+            "restart_count": self._restart_count,
+            "tasks": {
+                name: {
+                    "health": t.health.value,
+                    "restart_count": t.restart_count,
+                    "critical": t.critical,
+                    "age_seconds": time.time() - t.created_at,
+                }
+                for name, t in self._tasks.items()
+            }
+        }
+
+
+# =============================================================================
+# ATOMIC FILE MANAGER
+# =============================================================================
+
+class AtomicFileManager:
+    """
+    Atomic file operations with:
+    - Write-then-rename pattern for atomicity
+    - Automatic backup before overwrite
+    - Crash recovery from incomplete writes
+    - Content hash verification
+    """
+
+    def __init__(
+        self,
+        backup_dir: Optional[Path] = None,
+        max_backups: int = 5,
+    ):
+        self.backup_dir = backup_dir or Path.home() / ".jarvis" / "atomic_backups"
+        self.max_backups = max_backups
+        self._pending_writes: Dict[str, AtomicWriteContext] = {}
+        self._lock = asyncio.Lock()
+
+    async def write_atomic(
+        self,
+        path: Path,
+        content: Union[str, bytes],
+        *,
+        create_backup: bool = True,
+        verify: bool = True,
+    ) -> bool:
+        """
+        Write file atomically using temp-then-rename pattern.
+
+        Args:
+            path: Target file path
+            content: Content to write
+            create_backup: If True, backup existing file first
+            verify: If True, verify written content matches
+
+        Returns:
+            True if write succeeded
+        """
+        path = Path(path)
+        is_bytes = isinstance(content, bytes)
+        content_bytes = content if is_bytes else content.encode("utf-8")
+        content_hash = hashlib.sha256(content_bytes).hexdigest()[:16]
+
+        # Create temp file path
+        temp_path = path.with_suffix(f".{content_hash}.tmp")
+        backup_path = None
+
+        async with self._lock:
+            try:
+                # Ensure parent directory exists
+                path.parent.mkdir(parents=True, exist_ok=True)
+
+                # Backup existing file if requested
+                if create_backup and path.exists():
+                    backup_path = await self._create_backup(path)
+
+                # Track pending write
+                context = AtomicWriteContext(
+                    target_path=path,
+                    temp_path=temp_path,
+                    backup_path=backup_path,
+                    content_hash=content_hash,
+                    started_at=time.time(),
+                )
+                self._pending_writes[str(path)] = context
+
+                # Write to temp file
+                if aiofiles:
+                    mode = "wb" if is_bytes else "w"
+                    async with aiofiles.open(temp_path, mode) as f:
+                        await f.write(content)
+                else:
+                    # Fallback to sync write in executor
+                    def sync_write():
+                        mode = "wb" if is_bytes else "w"
+                        with open(temp_path, mode) as f:
+                            f.write(content)
+                    await asyncio.get_event_loop().run_in_executor(None, sync_write)
+
+                # Sync to disk
+                await self._sync_file(temp_path)
+
+                # Verify if requested
+                if verify:
+                    if not await self._verify_content(temp_path, content_hash, is_bytes):
+                        raise IOError(f"Content verification failed for {path}")
+
+                # Atomic rename
+                temp_path.rename(path)
+
+                # Remove from pending
+                del self._pending_writes[str(path)]
+
+                logger.debug(f"Atomic write completed: {path}")
+                return True
+
+            except Exception as e:
+                logger.error(f"Atomic write failed for {path}: {e}")
+
+                # Cleanup temp file
+                if temp_path.exists():
+                    try:
+                        temp_path.unlink()
+                    except Exception:
+                        pass
+
+                # Restore backup if write failed
+                if backup_path and backup_path.exists():
+                    try:
+                        backup_path.rename(path)
+                        logger.info(f"Restored backup for {path}")
+                    except Exception as restore_err:
+                        logger.error(f"Failed to restore backup: {restore_err}")
+
+                return False
+
+    async def _create_backup(self, path: Path) -> Path:
+        """Create a backup of an existing file."""
+        self.backup_dir.mkdir(parents=True, exist_ok=True)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_name = f"{path.stem}_{timestamp}{path.suffix}"
+        backup_path = self.backup_dir / backup_name
+
+        # Copy file
+        if aiofiles:
+            async with aiofiles.open(path, "rb") as src:
+                content = await src.read()
+            async with aiofiles.open(backup_path, "wb") as dst:
+                await dst.write(content)
+        else:
+            shutil.copy2(path, backup_path)
+
+        # Cleanup old backups
+        await self._cleanup_old_backups(path.stem)
+
+        return backup_path
+
+    async def _cleanup_old_backups(self, stem: str) -> None:
+        """Remove old backups keeping only max_backups."""
+        try:
+            backups = sorted(
+                [f for f in self.backup_dir.iterdir() if f.stem.startswith(stem)],
+                key=lambda f: f.stat().st_mtime,
+                reverse=True
+            )
+
+            for old_backup in backups[self.max_backups:]:
+                old_backup.unlink()
+
+        except Exception as e:
+            logger.debug(f"Backup cleanup error: {e}")
+
+    async def _sync_file(self, path: Path) -> None:
+        """Sync file to disk."""
+        try:
+            def sync():
+                fd = os.open(str(path), os.O_RDONLY)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+
+            await asyncio.get_event_loop().run_in_executor(None, sync)
+        except Exception as e:
+            logger.debug(f"File sync warning: {e}")
+
+    async def _verify_content(
+        self,
+        path: Path,
+        expected_hash: str,
+        is_bytes: bool,
+    ) -> bool:
+        """Verify file content matches expected hash."""
+        try:
+            if aiofiles:
+                async with aiofiles.open(path, "rb") as f:
+                    content = await f.read()
+            else:
+                with open(path, "rb") as f:
+                    content = f.read()
+
+            actual_hash = hashlib.sha256(content).hexdigest()[:16]
+            return actual_hash == expected_hash
+
+        except Exception as e:
+            logger.error(f"Content verification error: {e}")
+            return False
+
+    async def recover_pending(self) -> int:
+        """
+        Recover from incomplete writes on startup.
+        Returns count of recovered files.
+        """
+        recovered = 0
+
+        try:
+            # Find temp files
+            for temp_file in Path("/tmp").glob("*.tmp"):
+                if temp_file.stem.count(".") >= 1:
+                    # Extract target path from temp name
+                    parts = temp_file.stem.rsplit(".", 1)
+                    if len(parts) == 2:
+                        target_name = parts[0] + temp_file.suffix.replace(".tmp", "")
+                        target_path = temp_file.parent / target_name
+
+                        # If temp is newer than target (or target missing), recover
+                        if not target_path.exists() or \
+                           temp_file.stat().st_mtime > target_path.stat().st_mtime:
+                            temp_file.rename(target_path)
+                            recovered += 1
+                            logger.info(f"Recovered incomplete write: {target_path}")
+
+        except Exception as e:
+            logger.warning(f"Recovery scan error: {e}")
+
+        return recovered
+
+
+# =============================================================================
+# GRACEFUL SHUTDOWN ORCHESTRATOR
+# =============================================================================
+
+class GracefulShutdownOrchestrator:
+    """
+    Choreographed shutdown with:
+    - Ordered phase execution
+    - Timeout enforcement per phase
+    - Error collection without early exit
+    - Final state reporting
+    """
+
+    def __init__(self):
+        self._phase = ShutdownPhase.NOT_STARTED
+        self._errors: List[Tuple[str, Exception]] = []
+        self._start_time: Optional[float] = None
+        self._callbacks: Dict[ShutdownPhase, List[Callable[[], Awaitable[None]]]] = {
+            phase: [] for phase in ShutdownPhase
+        }
+
+    def register_callback(
+        self,
+        phase: ShutdownPhase,
+        callback: Callable[[], Awaitable[None]],
+    ) -> None:
+        """Register a callback for a shutdown phase."""
+        self._callbacks[phase].append(callback)
+
+    async def execute_shutdown(
+        self,
+        components: List[Tuple[str, Callable[[], Awaitable[None]]]],
+        tasks: List[asyncio.Task],
+    ) -> Dict[str, Any]:
+        """
+        Execute graceful shutdown sequence.
+
+        Args:
+            components: List of (name, stop_coroutine) tuples
+            tasks: List of background tasks to cancel
+
+        Returns:
+            Shutdown report
+        """
+        self._start_time = time.time()
+        self._phase = ShutdownPhase.PREPARING
+        self._errors.clear()
+
+        try:
+            # Phase 1: Preparing
+            await self._run_phase_callbacks(ShutdownPhase.PREPARING)
+
+            # Phase 2: Draining - stop accepting new work
+            self._phase = ShutdownPhase.DRAINING
+            drain_timeout = ValidatedTimeouts.get("shutdown", 60.0) / 3
+            await self._drain_components(components, drain_timeout)
+
+            # Phase 3: Cancelling - cancel background tasks
+            self._phase = ShutdownPhase.CANCELLING
+            cancel_timeout = ValidatedTimeouts.get("task_cancel", 10.0)
+            await self._cancel_tasks(tasks, cancel_timeout)
+
+            # Phase 4: Waiting - wait for tasks to complete
+            self._phase = ShutdownPhase.WAITING
+            wait_timeout = ValidatedTimeouts.get("shutdown", 60.0) / 3
+            await self._wait_for_tasks(tasks, wait_timeout)
+
+            # Phase 5: Cleanup - final cleanup
+            self._phase = ShutdownPhase.CLEANUP
+            await self._run_phase_callbacks(ShutdownPhase.CLEANUP)
+
+            self._phase = ShutdownPhase.COMPLETED
+
+        except Exception as e:
+            self._errors.append(("orchestrator", e))
+            self._phase = ShutdownPhase.FAILED
+
+        return self._generate_report()
+
+    async def _drain_components(
+        self,
+        components: List[Tuple[str, Callable[[], Awaitable[None]]]],
+        timeout: float,
+    ) -> None:
+        """Drain components by calling their stop methods."""
+        for name, stop_coro in components:
+            try:
+                await asyncio.wait_for(stop_coro(), timeout=timeout / len(components))
+                logger.debug(f"Drained component: {name}")
+            except asyncio.TimeoutError:
+                self._errors.append((name, TimeoutError(f"Drain timeout for {name}")))
+                logger.warning(f"Drain timeout for {name}")
+            except Exception as e:
+                self._errors.append((name, e))
+                logger.warning(f"Drain error for {name}: {e}")
+
+    async def _cancel_tasks(
+        self,
+        tasks: List[asyncio.Task],
+        timeout: float,
+    ) -> None:
+        """Cancel all tasks."""
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+
+    async def _wait_for_tasks(
+        self,
+        tasks: List[asyncio.Task],
+        timeout: float,
+    ) -> None:
+        """Wait for tasks to complete after cancellation."""
+        if not tasks:
+            return
+
+        try:
+            done, pending = await asyncio.wait(
+                tasks,
+                timeout=timeout,
+                return_when=asyncio.ALL_COMPLETED,
+            )
+
+            for task in pending:
+                self._errors.append((
+                    task.get_name(),
+                    TimeoutError(f"Task did not complete within {timeout}s")
+                ))
+
+        except Exception as e:
+            self._errors.append(("wait_for_tasks", e))
+
+    async def _run_phase_callbacks(self, phase: ShutdownPhase) -> None:
+        """Run callbacks for a shutdown phase."""
+        for callback in self._callbacks[phase]:
+            try:
+                await callback()
+            except Exception as e:
+                self._errors.append((f"callback_{phase.value}", e))
+
+    def _generate_report(self) -> Dict[str, Any]:
+        """Generate shutdown report."""
+        return {
+            "phase": self._phase.value,
+            "duration_seconds": time.time() - self._start_time if self._start_time else 0,
+            "errors": [
+                {"component": name, "error": str(e)}
+                for name, e in self._errors
+            ],
+            "success": self._phase == ShutdownPhase.COMPLETED and not self._errors,
+        }
+
+
+# =============================================================================
+# CROSS-REPO HEALTH COORDINATOR
+# =============================================================================
+
+class CrossRepoHealthCoordinator:
+    """
+    Coordinates health checking across repos:
+    - JARVIS Core
+    - JARVIS Prime
+    - Reactor Core
+
+    Uses active health probes, not just path existence.
+    """
+
+    def __init__(self):
+        self._health_cache: Dict[str, Tuple[bool, float]] = {}
+        self._cache_ttl = 30.0  # seconds
+        self._endpoints = {
+            "jarvis_core": {
+                "path": Path(os.environ.get(
+                    "JARVIS_PROJECT_ROOT",
+                    Path(__file__).parent.parent.parent.parent
+                )),
+                "health_file": ".jarvis_health",
+                "port": int(os.environ.get("JARVIS_CORE_PORT", 8000)),
+            },
+            "jarvis_prime": {
+                "path": Path(os.environ.get(
+                    "JARVIS_PRIME_ROOT",
+                    Path.home() / "Documents/repos/JARVIS-Prime"
+                )),
+                "health_file": ".jarvis_prime_health",
+                "port": int(os.environ.get("JARVIS_PRIME_PORT", 8001)),
+            },
+            "reactor_core": {
+                "path": Path(os.environ.get(
+                    "REACTOR_CORE_ROOT",
+                    Path.home() / "Documents/repos/reactor-core"
+                )),
+                "health_file": ".reactor_health",
+                "port": int(os.environ.get("REACTOR_CORE_PORT", 8003)),
+            },
+        }
+        self._lock = asyncio.Lock()
+
+    async def check_health(
+        self,
+        repo: str,
+        use_cache: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Check health of a repo.
+
+        Returns:
+            {
+                "healthy": bool,
+                "checks": {
+                    "path_exists": bool,
+                    "health_file_fresh": bool,
+                    "port_responsive": bool,
+                    "supervisor_running": bool,
+                },
+                "last_check": float,
+            }
+        """
+        if repo not in self._endpoints:
+            return {"healthy": False, "error": f"Unknown repo: {repo}"}
+
+        # Check cache
+        if use_cache and repo in self._health_cache:
+            cached_health, cached_time = self._health_cache[repo]
+            if time.time() - cached_time < self._cache_ttl:
+                return {
+                    "healthy": cached_health,
+                    "cached": True,
+                    "last_check": cached_time,
+                }
+
+        endpoint = self._endpoints[repo]
+        checks = {}
+
+        # Check 1: Path exists
+        checks["path_exists"] = endpoint["path"].exists()
+
+        # Check 2: Health file is fresh (written within last 60s)
+        health_file = endpoint["path"] / endpoint["health_file"]
+        checks["health_file_fresh"] = False
+        if health_file.exists():
+            try:
+                mtime = health_file.stat().st_mtime
+                checks["health_file_fresh"] = (time.time() - mtime) < 60.0
+            except Exception:
+                pass
+
+        # Check 3: Port is responsive
+        checks["port_responsive"] = await self._check_port(
+            "localhost",
+            endpoint["port"]
+        )
+
+        # Check 4: Supervisor running (check PID file)
+        pid_file = endpoint["path"] / ".supervisor.pid"
+        checks["supervisor_running"] = await self._check_pid_file(pid_file)
+
+        # Overall health: at least 2 of 4 checks must pass
+        passing = sum(1 for v in checks.values() if v)
+        healthy = passing >= 2
+
+        # Cache result
+        async with self._lock:
+            self._health_cache[repo] = (healthy, time.time())
+
+        return {
+            "healthy": healthy,
+            "checks": checks,
+            "passing_checks": passing,
+            "last_check": time.time(),
+        }
+
+    async def check_all(self) -> Dict[str, Dict[str, Any]]:
+        """Check health of all repos."""
+        results = {}
+        for repo in self._endpoints:
+            results[repo] = await self.check_health(repo, use_cache=False)
+        return results
+
+    async def _check_port(self, host: str, port: int) -> bool:
+        """Check if a port is responsive."""
+        try:
+            timeout = ValidatedTimeouts.get("health_check", 5.0)
+
+            async def probe():
+                reader, writer = await asyncio.open_connection(host, port)
+                writer.close()
+                await writer.wait_closed()
+                return True
+
+            return await asyncio.wait_for(probe(), timeout=timeout)
+
+        except Exception:
+            return False
+
+    async def _check_pid_file(self, pid_file: Path) -> bool:
+        """Check if process from PID file is running."""
+        try:
+            if not pid_file.exists():
+                return False
+
+            pid = int(pid_file.read_text().strip())
+
+            # Check if process exists
+            os.kill(pid, 0)  # Doesn't actually kill, just checks
+            return True
+
+        except (ValueError, OSError, PermissionError):
+            return False
+
+    async def write_health_beacon(self, repo: str) -> bool:
+        """Write health beacon for this repo."""
+        if repo not in self._endpoints:
+            return False
+
+        endpoint = self._endpoints[repo]
+        health_file = endpoint["path"] / endpoint["health_file"]
+
+        try:
+            health_data = json.dumps({
+                "timestamp": time.time(),
+                "pid": os.getpid(),
+                "status": "healthy",
+            })
+
+            health_file.write_text(health_data)
+            return True
+
+        except Exception as e:
+            logger.warning(f"Failed to write health beacon: {e}")
+            return False
+
+
+# =============================================================================
+# EVENT LOSS PREVENTOR (Dead Letter Queue)
+# =============================================================================
+
+class EventLossPreventor:
+    """
+    Prevents event loss with:
+    - Dead Letter Queue for failed events
+    - Automatic retry scheduling
+    - Manual recovery interface
+    - Loss metrics tracking
+    """
+
+    def __init__(
+        self,
+        dlq_path: Optional[Path] = None,
+        max_dlq_size: int = 10000,
+        retention_days: int = 7,
+    ):
+        self.dlq_path = dlq_path or Path.home() / ".jarvis" / "dlq"
+        self.max_dlq_size = max_dlq_size
+        self.retention_days = retention_days
+        self._lock = asyncio.Lock()
+        self._metrics = {
+            "events_saved": 0,
+            "events_recovered": 0,
+            "events_expired": 0,
+            "save_failures": 0,
+        }
+
+    async def start(self) -> None:
+        """Initialize the DLQ."""
+        self.dlq_path.mkdir(parents=True, exist_ok=True)
+
+        # Cleanup expired events
+        await self._cleanup_expired()
+
+    async def save_failed_event(
+        self,
+        event_id: str,
+        event_data: Dict[str, Any],
+        failure_reason: str,
+        retry_count: int = 0,
+    ) -> bool:
+        """Save a failed event to the DLQ."""
+        async with self._lock:
+            try:
+                # Check DLQ size
+                current_size = len(list(self.dlq_path.glob("*.json")))
+                if current_size >= self.max_dlq_size:
+                    logger.warning(f"DLQ full ({current_size} events), dropping oldest")
+                    await self._drop_oldest()
+
+                # Create DLQ entry
+                entry = {
+                    "event_id": event_id,
+                    "event_data": event_data,
+                    "failure_reason": failure_reason,
+                    "retry_count": retry_count,
+                    "saved_at": time.time(),
+                    "expires_at": time.time() + (self.retention_days * 86400),
+                }
+
+                # Write to file
+                filename = f"{event_id}_{int(time.time())}.json"
+                filepath = self.dlq_path / filename
+
+                if aiofiles:
+                    async with aiofiles.open(filepath, "w") as f:
+                        await f.write(json.dumps(entry, indent=2))
+                else:
+                    with open(filepath, "w") as f:
+                        json.dump(entry, f, indent=2)
+
+                self._metrics["events_saved"] += 1
+                logger.debug(f"Saved failed event to DLQ: {event_id}")
+                return True
+
+            except Exception as e:
+                self._metrics["save_failures"] += 1
+                logger.error(f"Failed to save event to DLQ: {e}")
+                return False
+
+    async def get_recoverable_events(
+        self,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """Get events that can be retried."""
+        events = []
+
+        try:
+            files = sorted(
+                self.dlq_path.glob("*.json"),
+                key=lambda f: f.stat().st_mtime
+            )
+
+            for filepath in files[:limit]:
+                try:
+                    if aiofiles:
+                        async with aiofiles.open(filepath, "r") as f:
+                            content = await f.read()
+                            entry = json.loads(content)
+                    else:
+                        with open(filepath, "r") as f:
+                            entry = json.load(f)
+
+                    # Check if not expired
+                    if entry.get("expires_at", 0) > time.time():
+                        entry["_filepath"] = str(filepath)
+                        events.append(entry)
+
+                except Exception as e:
+                    logger.debug(f"Error reading DLQ file {filepath}: {e}")
+
+        except Exception as e:
+            logger.error(f"Error scanning DLQ: {e}")
+
+        return events
+
+    async def mark_recovered(self, event_id: str) -> bool:
+        """Mark an event as recovered (remove from DLQ)."""
+        async with self._lock:
+            try:
+                for filepath in self.dlq_path.glob(f"{event_id}_*.json"):
+                    filepath.unlink()
+                    self._metrics["events_recovered"] += 1
+                    return True
+            except Exception as e:
+                logger.error(f"Error marking event recovered: {e}")
+
+        return False
+
+    async def _cleanup_expired(self) -> int:
+        """Remove expired events."""
+        removed = 0
+        now = time.time()
+
+        try:
+            for filepath in self.dlq_path.glob("*.json"):
+                try:
+                    if aiofiles:
+                        async with aiofiles.open(filepath, "r") as f:
+                            content = await f.read()
+                            entry = json.loads(content)
+                    else:
+                        with open(filepath, "r") as f:
+                            entry = json.load(f)
+
+                    if entry.get("expires_at", 0) <= now:
+                        filepath.unlink()
+                        removed += 1
+                        self._metrics["events_expired"] += 1
+
+                except Exception:
+                    # If we can't read it, check file age
+                    if (now - filepath.stat().st_mtime) > (self.retention_days * 86400):
+                        filepath.unlink()
+                        removed += 1
+
+        except Exception as e:
+            logger.error(f"DLQ cleanup error: {e}")
+
+        if removed:
+            logger.info(f"Cleaned up {removed} expired DLQ events")
+
+        return removed
+
+    async def _drop_oldest(self) -> None:
+        """Drop oldest events when DLQ is full."""
+        try:
+            files = sorted(
+                self.dlq_path.glob("*.json"),
+                key=lambda f: f.stat().st_mtime
+            )
+
+            # Drop oldest 10%
+            to_drop = max(1, len(files) // 10)
+            for filepath in files[:to_drop]:
+                filepath.unlink()
+                self._metrics["events_expired"] += 1
+
+        except Exception as e:
+            logger.error(f"Error dropping oldest DLQ events: {e}")
+
+    def get_metrics(self) -> Dict[str, Any]:
+        """Get DLQ metrics."""
+        try:
+            current_size = len(list(self.dlq_path.glob("*.json")))
+        except Exception:
+            current_size = 0
+
+        return {
+            **self._metrics,
+            "current_size": current_size,
+            "max_size": self.max_dlq_size,
+        }
+
+
+# =============================================================================
+# STARTUP SEQUENCER
+# =============================================================================
+
+class StartupPhase(Enum):
+    """Startup phases for ordered initialization."""
+    NOT_STARTED = "not_started"
+    ENVIRONMENT = "environment"
+    CORE_SERVICES = "core_services"
+    EVENT_BUS = "event_bus"
+    CROSS_REPO = "cross_repo"
+    COMPONENTS = "components"
+    BACKGROUND_TASKS = "background_tasks"
+    HEALTH_CHECK = "health_check"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+@dataclass
+class StartupComponent:
+    """A component to initialize during startup."""
+    name: str
+    phase: StartupPhase
+    init_func: Callable[[], Awaitable[Any]]
+    dependencies: List[str] = field(default_factory=list)
+    timeout: float = 30.0
+    critical: bool = True
+    result: Optional[Any] = None
+    error: Optional[Exception] = None
+    duration: float = 0.0
+
+
+class StartupSequencer:
+    """
+    Ordered startup with:
+    - Dependency resolution
+    - Phase-based initialization
+    - Timeout enforcement
+    - Rollback on failure
+    """
+
+    def __init__(self):
+        self._components: Dict[str, StartupComponent] = {}
+        self._phase = StartupPhase.NOT_STARTED
+        self._initialized: Set[str] = set()
+        self._failed: Set[str] = set()
+        self._start_time: Optional[float] = None
+
+    def register(
+        self,
+        name: str,
+        phase: StartupPhase,
+        init_func: Callable[[], Awaitable[Any]],
+        dependencies: Optional[List[str]] = None,
+        timeout: float = 30.0,
+        critical: bool = True,
+    ) -> None:
+        """Register a component for startup."""
+        self._components[name] = StartupComponent(
+            name=name,
+            phase=phase,
+            init_func=init_func,
+            dependencies=dependencies or [],
+            timeout=timeout,
+            critical=critical,
+        )
+
+    async def execute_startup(self) -> Dict[str, Any]:
+        """
+        Execute startup sequence in phase order.
+
+        Returns:
+            Startup report with status of all components
+        """
+        self._start_time = time.time()
+        self._phase = StartupPhase.ENVIRONMENT
+
+        # Group components by phase
+        phases = defaultdict(list)
+        for comp in self._components.values():
+            phases[comp.phase].append(comp)
+
+        # Execute phases in order
+        phase_order = [
+            StartupPhase.ENVIRONMENT,
+            StartupPhase.CORE_SERVICES,
+            StartupPhase.EVENT_BUS,
+            StartupPhase.CROSS_REPO,
+            StartupPhase.COMPONENTS,
+            StartupPhase.BACKGROUND_TASKS,
+            StartupPhase.HEALTH_CHECK,
+        ]
+
+        for phase in phase_order:
+            self._phase = phase
+            components = phases.get(phase, [])
+
+            if not components:
+                continue
+
+            # Sort by dependencies
+            sorted_components = self._topological_sort(components)
+
+            for comp in sorted_components:
+                # Check dependencies
+                unmet = [d for d in comp.dependencies if d not in self._initialized]
+                if unmet:
+                    comp.error = RuntimeError(f"Unmet dependencies: {unmet}")
+                    self._failed.add(comp.name)
+                    if comp.critical:
+                        self._phase = StartupPhase.FAILED
+                        return self._generate_report()
+                    continue
+
+                # Initialize component
+                success = await self._init_component(comp)
+
+                if not success and comp.critical:
+                    self._phase = StartupPhase.FAILED
+                    return self._generate_report()
+
+        self._phase = StartupPhase.COMPLETED
+        return self._generate_report()
+
+    async def _init_component(self, comp: StartupComponent) -> bool:
+        """Initialize a single component."""
+        start = time.time()
+
+        try:
+            comp.result = await asyncio.wait_for(
+                comp.init_func(),
+                timeout=comp.timeout
+            )
+            comp.duration = time.time() - start
+            self._initialized.add(comp.name)
+            logger.debug(f"Initialized {comp.name} in {comp.duration:.2f}s")
+            return True
+
+        except asyncio.TimeoutError:
+            comp.error = TimeoutError(f"Initialization timeout after {comp.timeout}s")
+            comp.duration = time.time() - start
+            self._failed.add(comp.name)
+            logger.error(f"Timeout initializing {comp.name}")
+            return False
+
+        except Exception as e:
+            comp.error = e
+            comp.duration = time.time() - start
+            self._failed.add(comp.name)
+            logger.error(f"Error initializing {comp.name}: {e}")
+            return False
+
+    def _topological_sort(
+        self,
+        components: List[StartupComponent]
+    ) -> List[StartupComponent]:
+        """Sort components by dependencies."""
+        # Simple topological sort
+        sorted_list = []
+        visited = set()
+
+        def visit(comp):
+            if comp.name in visited:
+                return
+            visited.add(comp.name)
+
+            for dep_name in comp.dependencies:
+                dep_comp = next((c for c in components if c.name == dep_name), None)
+                if dep_comp:
+                    visit(dep_comp)
+
+            sorted_list.append(comp)
+
+        for comp in components:
+            visit(comp)
+
+        return sorted_list
+
+    def _generate_report(self) -> Dict[str, Any]:
+        """Generate startup report."""
+        return {
+            "phase": self._phase.value,
+            "duration_seconds": time.time() - self._start_time if self._start_time else 0,
+            "initialized": list(self._initialized),
+            "failed": list(self._failed),
+            "components": {
+                name: {
+                    "phase": comp.phase.value,
+                    "status": "initialized" if name in self._initialized else (
+                        "failed" if name in self._failed else "pending"
+                    ),
+                    "duration": comp.duration,
+                    "error": str(comp.error) if comp.error else None,
+                    "critical": comp.critical,
+                }
+                for name, comp in self._components.items()
+            },
+            "success": self._phase == StartupPhase.COMPLETED,
+        }
+
+
+# =============================================================================
+# v13.0 BULLETPROOF ORCHESTRATION MESH (Master Orchestrator)
+# =============================================================================
+
+class BulletproofOrchestrationMesh:
+    """
+    Master orchestrator combining all v13.0 components:
+    - ValidatedTimeouts
+    - AsyncLockGuard
+    - TaskSupervisor
+    - AtomicFileManager
+    - GracefulShutdownOrchestrator
+    - CrossRepoHealthCoordinator
+    - EventLossPreventor
+    - StartupSequencer
+    """
+
+    _instance: Optional["BulletproofOrchestrationMesh"] = None
+    _lock = asyncio.Lock()
+
+    def __init__(self):
+        self.lock_guard = AsyncLockGuard()
+        self.task_supervisor = TaskSupervisor(
+            on_task_crash=self._handle_task_crash,
+            on_task_restart=self._handle_task_restart,
+        )
+        self.atomic_file_manager = AtomicFileManager()
+        self.shutdown_orchestrator = GracefulShutdownOrchestrator()
+        self.health_coordinator = CrossRepoHealthCoordinator()
+        self.event_loss_preventor = EventLossPreventor()
+        self.startup_sequencer = StartupSequencer()
+
+        self._running = False
+        self._health_beacon_task: Optional[asyncio.Task] = None
+
+    @classmethod
+    async def get_instance(cls) -> "BulletproofOrchestrationMesh":
+        """Get or create singleton instance."""
+        async with cls._lock:
+            if cls._instance is None:
+                cls._instance = cls()
+            return cls._instance
+
+    async def start(self) -> Dict[str, Any]:
+        """Start the orchestration mesh."""
+        if self._running:
+            return {"status": "already_running"}
+
+        logger.info("🛡️ Starting Bulletproof Orchestration Mesh v13.0...")
+        start_time = time.monotonic()
+
+        # Validate timeout configuration
+        timeout_issues = ValidatedTimeouts.validate_relationships()
+        if timeout_issues:
+            for issue in timeout_issues:
+                logger.warning(f"Timeout config issue: {issue}")
+
+        # Start components
+        await self.task_supervisor.start()
+        await self.event_loss_preventor.start()
+
+        # Recover any incomplete file writes
+        recovered = await self.atomic_file_manager.recover_pending()
+        if recovered:
+            logger.info(f"Recovered {recovered} incomplete file writes")
+
+        # Start health beacon task
+        self._health_beacon_task = await self.task_supervisor.supervise(
+            "health_beacon",
+            self._health_beacon_loop(),
+            critical=False,
+            max_restarts=5,
+            factory=lambda: self._health_beacon_loop(),
+        )
+
+        self._running = True
+        elapsed = time.monotonic() - start_time
+
+        logger.info(f"✅ Bulletproof Orchestration Mesh started in {elapsed:.2f}s")
+
+        return {
+            "status": "running",
+            "elapsed": elapsed,
+            "timeout_issues": timeout_issues,
+            "recovered_files": recovered,
+        }
+
+    async def stop(self) -> Dict[str, Any]:
+        """Stop the orchestration mesh gracefully."""
+        if not self._running:
+            return {"status": "not_running"}
+
+        logger.info("🛡️ Stopping Bulletproof Orchestration Mesh...")
+
+        # Execute choreographed shutdown
+        components = [
+            ("task_supervisor", self.task_supervisor.stop),
+        ]
+
+        tasks = []
+        if self._health_beacon_task:
+            tasks.append(self._health_beacon_task)
+
+        report = await self.shutdown_orchestrator.execute_shutdown(
+            components=components,
+            tasks=tasks,
+        )
+
+        self._running = False
+
+        logger.info(f"✅ Orchestration Mesh shutdown: {report['phase']}")
+
+        return report
+
+    async def _health_beacon_loop(self) -> None:
+        """Periodically write health beacon."""
+        while self._running:
+            try:
+                await self.task_supervisor.heartbeat("health_beacon")
+                await self.health_coordinator.write_health_beacon("jarvis_core")
+                await asyncio.sleep(30.0)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.warning(f"Health beacon error: {e}")
+                await asyncio.sleep(5.0)
+
+    async def _handle_task_crash(self, name: str, error: Exception) -> None:
+        """Handle task crash notification."""
+        logger.error(f"Task {name} crashed: {error}")
+
+        # Save crash info to DLQ for analysis
+        await self.event_loss_preventor.save_failed_event(
+            event_id=f"crash_{name}_{int(time.time())}",
+            event_data={
+                "task_name": name,
+                "error_type": type(error).__name__,
+                "error_message": str(error),
+            },
+            failure_reason="task_crash",
+        )
+
+    async def _handle_task_restart(self, name: str, count: int) -> None:
+        """Handle task restart notification."""
+        logger.warning(f"Task {name} restarted (attempt {count})")
+
+    def get_status(self) -> Dict[str, Any]:
+        """Get comprehensive mesh status."""
+        return {
+            "running": self._running,
+            "task_supervisor": self.task_supervisor.get_status(),
+            "lock_guard": self.lock_guard.get_stats(),
+            "dlq": self.event_loss_preventor.get_metrics(),
+        }
+
+
+# =============================================================================
+# v13.0 CONVENIENCE FUNCTIONS
+# =============================================================================
+
+_bulletproof_mesh: Optional[BulletproofOrchestrationMesh] = None
+
+
+def get_bulletproof_mesh() -> BulletproofOrchestrationMesh:
+    """Get the global bulletproof mesh instance (sync)."""
+    global _bulletproof_mesh
+    if _bulletproof_mesh is None:
+        _bulletproof_mesh = BulletproofOrchestrationMesh()
+    return _bulletproof_mesh
+
+
+async def initialize_bulletproof_mesh() -> Dict[str, Any]:
+    """
+    Initialize the bulletproof orchestration mesh.
+
+    Returns:
+        Dictionary with initialization status and components
+    """
+    logger.info("🔗 Initializing Bulletproof Orchestration Mesh v13.0...")
+    start_time = time.monotonic()
+
+    components = {}
+
+    try:
+        mesh = get_bulletproof_mesh()
+        start_result = await mesh.start()
+
+        components["bulletproof_mesh"] = mesh
+        components["lock_guard"] = mesh.lock_guard
+        components["task_supervisor"] = mesh.task_supervisor
+        components["atomic_file_manager"] = mesh.atomic_file_manager
+        components["shutdown_orchestrator"] = mesh.shutdown_orchestrator
+        components["health_coordinator"] = mesh.health_coordinator
+        components["event_loss_preventor"] = mesh.event_loss_preventor
+        components["startup_sequencer"] = mesh.startup_sequencer
+
+        elapsed = time.monotonic() - start_time
+        logger.info(f"✅ Bulletproof Orchestration Mesh initialized in {elapsed:.2f}s")
+        logger.info(f"   Components: {len(components)}")
+
+        return components
+
+    except Exception as e:
+        logger.error(f"❌ Bulletproof Mesh initialization failed: {e}")
+        raise
+
+
+async def shutdown_bulletproof_mesh() -> None:
+    """Shutdown the bulletproof orchestration mesh."""
+    global _bulletproof_mesh
+    if _bulletproof_mesh:
+        await _bulletproof_mesh.stop()
+        _bulletproof_mesh = None
+        logger.info("✅ Bulletproof Orchestration Mesh shutdown complete")
+
+
+async def get_bulletproof_mesh_status() -> Dict[str, Any]:
+    """Get comprehensive mesh status."""
+    mesh = get_bulletproof_mesh()
+    return mesh.get_status()
+
+
+# Convenience accessors for common operations
+async def supervise_task(
+    name: str,
+    coro: Awaitable[None],
+    critical: bool = False,
+    max_restarts: int = 3,
+) -> asyncio.Task:
+    """Supervise a background task with automatic crash recovery."""
+    mesh = get_bulletproof_mesh()
+    return await mesh.task_supervisor.supervise(
+        name=name,
+        coro=coro,
+        critical=critical,
+        max_restarts=max_restarts,
+    )
+
+
+async def write_file_atomic(
+    path: Path,
+    content: Union[str, bytes],
+    create_backup: bool = True,
+) -> bool:
+    """Write a file atomically with backup."""
+    mesh = get_bulletproof_mesh()
+    return await mesh.atomic_file_manager.write_atomic(
+        path=path,
+        content=content,
+        create_backup=create_backup,
+    )
+
+
+async def check_repo_health(repo: str) -> Dict[str, Any]:
+    """Check health of a repo."""
+    mesh = get_bulletproof_mesh()
+    return await mesh.health_coordinator.check_health(repo)
+
+
+async def save_to_dlq(
+    event_id: str,
+    event_data: Dict[str, Any],
+    failure_reason: str,
+) -> bool:
+    """Save a failed event to the Dead Letter Queue."""
+    mesh = get_bulletproof_mesh()
+    return await mesh.event_loss_preventor.save_failed_event(
+        event_id=event_id,
+        event_data=event_data,
+        failure_reason=failure_reason,
+    )

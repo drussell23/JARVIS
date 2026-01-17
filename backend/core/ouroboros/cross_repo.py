@@ -107,6 +107,26 @@ class EventType(Enum):
     REFACTORING_LOCK_ACQUIRED = "refactoring_lock_acquired"
     REFACTORING_LOCK_RELEASED = "refactoring_lock_released"
 
+    # Context Awareness events (v11.0 Context Intelligence System)
+    CONTEXT_REQUEST = "context_request"
+    CONTEXT_RESPONSE = "context_response"
+    CONTEXT_INVALIDATED = "context_invalidated"
+
+    # Dependency Analysis events
+    DEPENDENCY_ANALYSIS_REQUEST = "dependency_analysis_request"
+    DEPENDENCY_ANALYSIS_RESULT = "dependency_analysis_result"
+    BREAKING_CHANGE_DETECTED = "breaking_change_detected"
+    CIRCULAR_DEPENDENCY_DETECTED = "circular_dependency_detected"
+    DEAD_CODE_DETECTED = "dead_code_detected"
+
+    # Git Intelligence events
+    GIT_INSIGHT_REQUEST = "git_insight_request"
+    GIT_INSIGHT_RESULT = "git_insight_result"
+    HOTSPOT_DETECTED = "hotspot_detected"
+    REFACTORING_PATTERN_DETECTED = "refactoring_pattern_detected"
+    OWNERSHIP_CHANGE_DETECTED = "ownership_change_detected"
+    CROSS_REPO_CORRELATION = "cross_repo_correlation"
+
 
 # =============================================================================
 # DATA STRUCTURES
