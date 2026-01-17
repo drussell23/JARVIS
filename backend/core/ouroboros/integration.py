@@ -3890,3 +3890,209 @@ async def shutdown_ouroboros_integration() -> None:
     if _integration:
         await _integration.shutdown()
         _integration = None
+
+
+# =============================================================================
+# v4.0: AUTONOMOUS SELF-PROGRAMMING INTEGRATION
+# =============================================================================
+# These functions integrate the autonomous components from native_integration.py
+# with the AgenticLoopOrchestrator for true autonomous self-programming.
+# =============================================================================
+
+_autonomous_initialized = False
+
+
+async def initialize_autonomous_self_programming_full(
+    start_loops: bool = True,
+) -> Dict[str, Any]:
+    """
+    Initialize the complete autonomous self-programming system.
+
+    This connects:
+    - GoalDecompositionEngine (breaks down goals)
+    - TechnicalDebtDetector (finds issues)
+    - AutonomousSelfRefinementLoop (continuous improvement)
+    - DualAgentSystem (architect/reviewer)
+    - CodeMemoryRAG (Oracle + ChromaDB)
+    - SystemFeedbackLoop (metrics-driven optimization)
+    - AutoTestGenerator (test generation)
+
+    With:
+    - AgenticLoopOrchestrator (task execution)
+    - Oracle (code knowledge graph)
+    - LLM clients (for intelligent decisions)
+
+    Args:
+        start_loops: Whether to start background improvement loops
+
+    Returns:
+        Dictionary with all initialized components
+    """
+    global _autonomous_initialized
+
+    if _autonomous_initialized:
+        logger.info("Autonomous self-programming already initialized")
+        return {}
+
+    logger.info("Initializing autonomous self-programming integration...")
+
+    # Get or create the orchestrator
+    orchestrator = get_agentic_orchestrator()
+
+    # Try to import and get the Oracle
+    oracle = None
+    try:
+        from backend.core.ouroboros.oracle import get_oracle
+        oracle = get_oracle()
+    except ImportError:
+        logger.warning("Oracle not available - some features will be limited")
+    except Exception as e:
+        logger.warning(f"Failed to get Oracle: {e}")
+
+    # Try to get LLM client from integration
+    llm_client = None
+    integration = get_ouroboros_integration()
+    if hasattr(integration, '_llm_client'):
+        llm_client = integration._llm_client
+
+    # Try to get ChromaDB client
+    chromadb_client = None
+    try:
+        from backend.autonomy.trinity_knowledge_indexer import get_knowledge_indexer
+        indexer = await get_knowledge_indexer()
+        if hasattr(indexer, '_chroma_client'):
+            chromadb_client = indexer._chroma_client
+    except Exception:
+        logger.debug("ChromaDB not available")
+
+    # Import autonomous components from native_integration
+    try:
+        from backend.core.ouroboros.native_integration import (
+            initialize_autonomous_self_programming,
+            get_goal_decomposer,
+            get_debt_detector,
+            get_refinement_loop,
+            get_dual_agent_system,
+            get_code_memory_rag,
+            get_system_feedback_loop,
+            get_auto_test_generator,
+        )
+
+        # Initialize all components
+        components = await initialize_autonomous_self_programming(
+            oracle=oracle,
+            orchestrator=orchestrator,
+            llm_client=llm_client,
+            chromadb_client=chromadb_client,
+            start_loops=start_loops,
+        )
+
+        _autonomous_initialized = True
+        logger.info(f"✅ Autonomous self-programming initialized with {len(components)} components")
+
+        # Log status
+        for name, component in components.items():
+            if hasattr(component, 'get_status'):
+                status = component.get_status()
+                logger.debug(f"  {name}: {status}")
+
+        return components
+
+    except ImportError as e:
+        logger.error(f"Failed to import autonomous components: {e}")
+        return {}
+    except Exception as e:
+        logger.error(f"Failed to initialize autonomous self-programming: {e}")
+        return {}
+
+
+async def shutdown_autonomous_self_programming_full() -> None:
+    """Shutdown all autonomous self-programming components."""
+    global _autonomous_initialized
+
+    if not _autonomous_initialized:
+        return
+
+    try:
+        from backend.core.ouroboros.native_integration import (
+            shutdown_autonomous_self_programming,
+        )
+        await shutdown_autonomous_self_programming()
+        _autonomous_initialized = False
+        logger.info("Autonomous self-programming shutdown complete")
+    except Exception as e:
+        logger.error(f"Error during autonomous shutdown: {e}")
+
+
+async def start_full_jarvis_system(
+    enable_autonomous: bool = True,
+    start_autonomous_loops: bool = False,  # Default to False for safety
+) -> Dict[str, Any]:
+    """
+    Start the complete JARVIS self-programming system.
+
+    This is the master initialization that starts:
+    1. OuroborosIntegration (LLM providers, model selection)
+    2. AgenticLoopOrchestrator (task queue, workers)
+    3. Autonomous Self-Programming (if enabled)
+
+    Args:
+        enable_autonomous: Enable autonomous self-programming components
+        start_autonomous_loops: Start background improvement loops
+
+    Returns:
+        Dictionary with system status and components
+    """
+    result = {
+        "integration": None,
+        "orchestrator": None,
+        "autonomous": None,
+        "status": "starting",
+    }
+
+    try:
+        # 1. Initialize integration
+        integration = get_ouroboros_integration()
+        if not await integration.initialize():
+            logger.error("Failed to initialize OuroborosIntegration")
+            result["status"] = "integration_failed"
+            return result
+        result["integration"] = integration
+
+        # 2. Start orchestrator
+        orchestrator = get_agentic_orchestrator()
+        await orchestrator.start()
+        result["orchestrator"] = orchestrator
+
+        # 3. Initialize autonomous self-programming
+        if enable_autonomous:
+            autonomous = await initialize_autonomous_self_programming_full(
+                start_loops=start_autonomous_loops,
+            )
+            result["autonomous"] = autonomous
+
+        result["status"] = "running"
+        logger.info("✅ Full JARVIS system started successfully")
+
+        return result
+
+    except Exception as e:
+        logger.error(f"Failed to start full JARVIS system: {e}")
+        result["status"] = f"error: {e}"
+        return result
+
+
+async def stop_full_jarvis_system() -> None:
+    """Stop the complete JARVIS self-programming system."""
+    logger.info("Stopping full JARVIS system...")
+
+    try:
+        # 1. Stop autonomous self-programming
+        await shutdown_autonomous_self_programming_full()
+
+        # 2. Stop orchestrator and integration
+        await shutdown_ouroboros_integration()
+
+        logger.info("✅ Full JARVIS system stopped")
+    except Exception as e:
+        logger.error(f"Error stopping JARVIS system: {e}")

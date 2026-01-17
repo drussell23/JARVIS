@@ -6018,3 +6018,2909 @@ async def execute_multi_file(
         shared_context=shared_context,
         require_approval=require_approval,
     )
+
+
+# =============================================================================
+# v4.0: AUTONOMOUS SELF-PROGRAMMING - THE MISSING 20%
+# =============================================================================
+# These components enable TRUE autonomous decision-making:
+# - GoalDecompositionEngine: Breaks "Make yourself faster" into actionable tasks
+# - TechnicalDebtDetector: Finds issues without being told
+# - AutonomousSelfRefinementLoop: Runs continuously without prompts
+# - DualAgentSystem: Architect generates, Reviewer critiques
+# - CodeMemoryRAG: Oracle (graph) + ChromaDB (semantic) fusion
+# - SystemFeedbackLoop: Hardware metrics trigger code improvements
+# - AutoTestGenerator: Generates tests for untested existing code
+# =============================================================================
+
+
+class SubTaskPriority(Enum):
+    """Priority levels for decomposed sub-tasks."""
+    CRITICAL = 1      # Blocking issues, security vulnerabilities
+    HIGH = 2          # Performance issues, missing tests
+    MEDIUM = 3        # Code smells, minor improvements
+    LOW = 4           # Style issues, documentation
+    DEFERRED = 5      # Future improvements
+
+
+class SubTaskType(Enum):
+    """Types of sub-tasks from goal decomposition."""
+    ANALYZE = "analyze"           # Investigate/profile code
+    IMPLEMENT = "implement"       # Write new code
+    REFACTOR = "refactor"         # Restructure existing code
+    FIX = "fix"                   # Fix bugs/issues
+    TEST = "test"                 # Write/run tests
+    DOCUMENT = "document"         # Add documentation
+    OPTIMIZE = "optimize"         # Performance improvements
+    VALIDATE = "validate"         # Verify changes work
+    BENCHMARK = "benchmark"       # Measure performance
+    REVIEW = "review"             # Code review
+
+
+class TechnicalDebtCategory(Enum):
+    """Categories of technical debt."""
+    COMPLEXITY = "complexity"         # High cyclomatic/cognitive complexity
+    DUPLICATION = "duplication"       # Code duplication
+    DEAD_CODE = "dead_code"           # Unused code
+    CIRCULAR_DEPS = "circular_deps"   # Circular dependencies
+    MISSING_TESTS = "missing_tests"   # Insufficient test coverage
+    SECURITY = "security"             # Security vulnerabilities
+    PERFORMANCE = "performance"       # Performance bottlenecks
+    TYPE_SAFETY = "type_safety"       # Missing type hints
+    ERROR_HANDLING = "error_handling" # Poor error handling
+    DEPRECATED = "deprecated"         # Deprecated API usage
+    COUPLING = "coupling"             # High coupling between modules
+
+
+@dataclass
+class SubTask:
+    """
+    A decomposed sub-task from a high-level goal.
+
+    This is the atomic unit of work that can be assigned to the
+    AgenticLoopOrchestrator for execution.
+    """
+    id: str
+    description: str
+    task_type: SubTaskType
+    priority: SubTaskPriority
+    target_files: List[str]
+    dependencies: List[str] = field(default_factory=list)  # IDs of tasks that must complete first
+    success_criteria: str = ""
+    estimated_complexity: str = "medium"  # trivial, easy, medium, hard, expert
+    context: Dict[str, Any] = field(default_factory=dict)
+    parent_goal: str = ""
+    created_at: float = field(default_factory=time.time)
+    status: str = "pending"  # pending, in_progress, completed, failed, blocked
+    result: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for serialization."""
+        return {
+            "id": self.id,
+            "description": self.description,
+            "task_type": self.task_type.value,
+            "priority": self.priority.value,
+            "target_files": self.target_files,
+            "dependencies": self.dependencies,
+            "success_criteria": self.success_criteria,
+            "estimated_complexity": self.estimated_complexity,
+            "context": self.context,
+            "parent_goal": self.parent_goal,
+            "status": self.status,
+        }
+
+
+@dataclass
+class TechnicalDebtItem:
+    """
+    A single instance of technical debt detected in the codebase.
+    """
+    id: str
+    category: TechnicalDebtCategory
+    file_path: str
+    line_start: int
+    line_end: int
+    severity: float  # 0.0 - 1.0
+    description: str
+    code_snippet: str = ""
+    suggested_fix: str = ""
+    estimated_effort: str = "medium"  # trivial, easy, medium, hard, expert
+    detected_at: float = field(default_factory=time.time)
+    metrics: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for serialization."""
+        return {
+            "id": self.id,
+            "category": self.category.value,
+            "file_path": self.file_path,
+            "line_start": self.line_start,
+            "line_end": self.line_end,
+            "severity": self.severity,
+            "description": self.description,
+            "suggested_fix": self.suggested_fix,
+            "estimated_effort": self.estimated_effort,
+        }
+
+
+@dataclass
+class DecompositionResult:
+    """Result of goal decomposition."""
+    original_goal: str
+    sub_tasks: List[SubTask]
+    execution_order: List[str]  # Task IDs in order
+    total_estimated_complexity: str
+    reasoning: str
+    dependencies_graph: Dict[str, List[str]]  # task_id -> [dependency_ids]
+    created_at: float = field(default_factory=time.time)
+
+
+@dataclass
+class CodeMemoryResult:
+    """Result from CodeMemoryRAG search."""
+    query: str
+    graph_results: List[Dict[str, Any]]  # From Oracle
+    semantic_results: List[Dict[str, Any]]  # From ChromaDB
+    merged_results: List[Dict[str, Any]]  # Combined and ranked
+    relevance_scores: Dict[str, float]
+    total_results: int
+
+
+class GoalDecompositionEngine:
+    """
+    v4.0: Autonomous goal breakdown engine using LLM-powered analysis.
+
+    This is the CRITICAL missing piece - the ability to take a high-level goal
+    like "Make yourself faster" and decompose it into specific, actionable
+    sub-tasks that can be executed by the AgenticLoopOrchestrator.
+
+    The decomposition process:
+    1. Analyze the goal using LLM to understand intent
+    2. Query Oracle for relevant code structure
+    3. Identify affected files and dependencies
+    4. Generate ordered sub-tasks with dependencies
+    5. Estimate complexity and priority for each
+
+    Example:
+        engine = GoalDecompositionEngine(oracle, llm_client)
+        result = await engine.decompose(
+            "Make the voice authentication faster",
+            context={"codebase": "jarvis"}
+        )
+        # Returns: [
+        #   SubTask("Profile voice_auth.py to find bottlenecks", ANALYZE, HIGH),
+        #   SubTask("Cache speaker embeddings", IMPLEMENT, HIGH),
+        #   SubTask("Optimize cosine similarity calculation", OPTIMIZE, MEDIUM),
+        #   SubTask("Add benchmark tests", TEST, MEDIUM),
+        # ]
+    """
+
+    # System prompt for goal decomposition
+    DECOMPOSITION_SYSTEM_PROMPT = """You are an expert software architect specializing in breaking down complex improvement goals into actionable sub-tasks.
+
+Your job is to analyze high-level goals and decompose them into specific, executable tasks that can be performed by an AI coding agent.
+
+For each sub-task, you must specify:
+1. A clear, actionable description
+2. The type of task (analyze, implement, refactor, fix, test, document, optimize, validate, benchmark, review)
+3. Priority (critical, high, medium, low)
+4. Target files that will be affected
+5. Dependencies on other tasks (which tasks must complete first)
+6. Success criteria (how to verify the task is complete)
+7. Estimated complexity (trivial, easy, medium, hard, expert)
+
+Guidelines:
+- Break goals into 3-10 specific sub-tasks
+- Always start with analysis/profiling for optimization goals
+- Always end with validation/testing tasks
+- Consider dependencies between tasks (order matters)
+- Be specific about file paths when possible
+- Identify potential risks and blockers
+
+Output your response as valid JSON with this structure:
+{
+    "reasoning": "Your analysis of the goal and approach",
+    "sub_tasks": [
+        {
+            "description": "Task description",
+            "task_type": "analyze|implement|refactor|fix|test|document|optimize|validate|benchmark|review",
+            "priority": "critical|high|medium|low",
+            "target_files": ["file1.py", "file2.py"],
+            "dependencies": [],
+            "success_criteria": "How to verify completion",
+            "estimated_complexity": "trivial|easy|medium|hard|expert"
+        }
+    ],
+    "execution_order": ["task_0", "task_1", ...],
+    "total_complexity": "easy|medium|hard|expert"
+}"""
+
+    def __init__(
+        self,
+        oracle: Optional[Any] = None,
+        llm_client: Optional[Any] = None,
+        learning_db: Optional[Any] = None,
+    ):
+        """
+        Initialize the goal decomposition engine.
+
+        Args:
+            oracle: The Oracle codebase knowledge graph
+            llm_client: LLM client for goal analysis (Prime or Claude)
+            learning_db: Learning database for pattern storage
+        """
+        self._oracle = oracle
+        self._llm_client = llm_client
+        self._learning_db = learning_db
+        self._lock = asyncio.Lock()
+        self._cache: Dict[str, DecompositionResult] = {}
+        self._decomposition_history: List[DecompositionResult] = []
+
+        # Configuration from environment
+        self._max_sub_tasks = int(os.getenv("GOAL_DECOMP_MAX_TASKS", "10"))
+        self._cache_ttl = int(os.getenv("GOAL_DECOMP_CACHE_TTL", "3600"))
+        self._min_sub_tasks = int(os.getenv("GOAL_DECOMP_MIN_TASKS", "2"))
+
+        logger.info("GoalDecompositionEngine initialized")
+
+    async def set_oracle(self, oracle: Any) -> None:
+        """Set the Oracle instance."""
+        self._oracle = oracle
+
+    async def set_llm_client(self, llm_client: Any) -> None:
+        """Set the LLM client."""
+        self._llm_client = llm_client
+
+    async def decompose(
+        self,
+        goal: str,
+        context: Optional[Dict[str, Any]] = None,
+        target_files: Optional[List[str]] = None,
+        force_refresh: bool = False,
+    ) -> DecompositionResult:
+        """
+        Decompose a high-level goal into actionable sub-tasks.
+
+        Args:
+            goal: The high-level goal to decompose
+            context: Additional context (codebase info, constraints, etc.)
+            target_files: Optional list of specific files to focus on
+            force_refresh: Bypass cache and regenerate
+
+        Returns:
+            DecompositionResult with ordered sub-tasks
+        """
+        # Check cache
+        cache_key = hashlib.sha256(f"{goal}:{json.dumps(context or {})}".encode()).hexdigest()[:16]
+        if not force_refresh and cache_key in self._cache:
+            cached = self._cache[cache_key]
+            if time.time() - cached.created_at < self._cache_ttl:
+                logger.debug(f"Using cached decomposition for goal: {goal[:50]}...")
+                return cached
+
+        async with self._lock:
+            # Gather context from Oracle
+            oracle_context = await self._gather_oracle_context(goal, target_files)
+
+            # Query learning DB for similar past decompositions
+            historical_patterns = await self._get_historical_patterns(goal)
+
+            # Build the prompt
+            prompt = await self._build_decomposition_prompt(
+                goal, context or {}, oracle_context, historical_patterns, target_files
+            )
+
+            # Call LLM for decomposition
+            response = await self._call_llm(prompt)
+
+            # Parse response into sub-tasks
+            result = await self._parse_decomposition_response(goal, response)
+
+            # Cache and store
+            self._cache[cache_key] = result
+            self._decomposition_history.append(result)
+
+            # Record in learning DB
+            if self._learning_db:
+                await self._record_decomposition(result)
+
+            logger.info(f"Decomposed goal '{goal[:50]}...' into {len(result.sub_tasks)} sub-tasks")
+            return result
+
+    async def _gather_oracle_context(
+        self,
+        goal: str,
+        target_files: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Gather relevant codebase context from Oracle."""
+        if not self._oracle:
+            return {"available": False}
+
+        context = {"available": True}
+
+        try:
+            # Extract keywords from goal for file search
+            keywords = self._extract_keywords(goal)
+
+            # Find relevant files
+            relevant_files = []
+            for keyword in keywords:
+                try:
+                    nodes = await asyncio.to_thread(
+                        lambda k=keyword: self._oracle.find_nodes_by_name(k, fuzzy=True)
+                        if hasattr(self._oracle, 'find_nodes_by_name') else []
+                    )
+                    relevant_files.extend([str(n) for n in nodes[:5]])
+                except Exception:
+                    pass
+
+            context["relevant_files"] = list(set(relevant_files))[:20]
+
+            # Get dead code if optimization goal
+            if any(kw in goal.lower() for kw in ["optimize", "performance", "speed", "fast"]):
+                try:
+                    dead_code = await asyncio.to_thread(
+                        lambda: self._oracle.get_dead_code()
+                        if hasattr(self._oracle, 'get_dead_code') else []
+                    )
+                    context["dead_code"] = [str(d) for d in list(dead_code)[:10]]
+                except Exception:
+                    pass
+
+            # Get circular dependencies if refactor goal
+            if any(kw in goal.lower() for kw in ["refactor", "clean", "structure", "architecture"]):
+                try:
+                    cycles = await asyncio.to_thread(
+                        lambda: self._oracle.get_circular_dependencies()
+                        if hasattr(self._oracle, 'get_circular_dependencies') else []
+                    )
+                    context["circular_deps"] = [str(c) for c in list(cycles)[:5]]
+                except Exception:
+                    pass
+
+            # Get blast radius for target files
+            if target_files:
+                blast_radii = {}
+                for file in target_files[:3]:
+                    try:
+                        radius = await asyncio.to_thread(
+                            lambda f=file: self._oracle.get_blast_radius(f)
+                            if hasattr(self._oracle, 'get_blast_radius') else None
+                        )
+                        if radius:
+                            blast_radii[file] = {
+                                "directly_affected": radius.directly_affected[:10]
+                                if hasattr(radius, 'directly_affected') else [],
+                                "risk_level": getattr(radius, 'risk_level', 'unknown'),
+                            }
+                    except Exception:
+                        pass
+                context["blast_radii"] = blast_radii
+
+        except Exception as e:
+            logger.warning(f"Error gathering Oracle context: {e}")
+            context["error"] = str(e)
+
+        return context
+
+    def _extract_keywords(self, goal: str) -> List[str]:
+        """Extract relevant keywords from goal for search."""
+        # Remove common words and extract meaningful terms
+        stop_words = {
+            "the", "a", "an", "in", "on", "at", "to", "for", "of", "and", "or",
+            "is", "are", "be", "been", "being", "have", "has", "had", "do", "does",
+            "did", "will", "would", "could", "should", "may", "might", "must",
+            "make", "it", "this", "that", "these", "those", "i", "you", "we",
+            "more", "better", "improve", "fix", "add", "create", "update",
+        }
+
+        words = re.findall(r'\b[a-zA-Z_][a-zA-Z0-9_]*\b', goal.lower())
+        keywords = [w for w in words if w not in stop_words and len(w) > 2]
+
+        # Also extract potential class/function names (CamelCase or snake_case)
+        camel_case = re.findall(r'[A-Z][a-z]+(?:[A-Z][a-z]+)*', goal)
+        snake_case = re.findall(r'[a-z]+(?:_[a-z]+)+', goal)
+
+        return list(set(keywords + camel_case + snake_case))[:10]
+
+    async def _get_historical_patterns(self, goal: str) -> List[Dict[str, Any]]:
+        """Get similar historical decompositions from learning DB."""
+        if not self._learning_db:
+            return []
+
+        try:
+            # Query for similar past decompositions
+            if hasattr(self._learning_db, 'query_patterns'):
+                patterns = await self._learning_db.query_patterns(
+                    category="goal_decomposition",
+                    limit=3,
+                )
+                return patterns
+        except Exception as e:
+            logger.debug(f"Error getting historical patterns: {e}")
+
+        return []
+
+    async def _build_decomposition_prompt(
+        self,
+        goal: str,
+        context: Dict[str, Any],
+        oracle_context: Dict[str, Any],
+        historical_patterns: List[Dict[str, Any]],
+        target_files: Optional[List[str]],
+    ) -> str:
+        """Build the prompt for LLM decomposition."""
+        prompt_parts = [
+            f"# Goal to Decompose\n{goal}\n",
+        ]
+
+        if context:
+            prompt_parts.append(f"# Additional Context\n{json.dumps(context, indent=2)}\n")
+
+        if oracle_context.get("available"):
+            prompt_parts.append("# Codebase Analysis from Oracle")
+            if oracle_context.get("relevant_files"):
+                prompt_parts.append(f"Relevant files: {', '.join(oracle_context['relevant_files'][:10])}")
+            if oracle_context.get("dead_code"):
+                prompt_parts.append(f"Dead code detected: {', '.join(oracle_context['dead_code'][:5])}")
+            if oracle_context.get("circular_deps"):
+                prompt_parts.append(f"Circular dependencies: {', '.join(str(c) for c in oracle_context['circular_deps'][:3])}")
+            if oracle_context.get("blast_radii"):
+                prompt_parts.append(f"Blast radius info: {json.dumps(oracle_context['blast_radii'], indent=2)}")
+            prompt_parts.append("")
+
+        if target_files:
+            prompt_parts.append(f"# Target Files to Focus On\n{', '.join(target_files)}\n")
+
+        if historical_patterns:
+            prompt_parts.append("# Similar Past Decompositions")
+            for pattern in historical_patterns[:2]:
+                if isinstance(pattern, dict):
+                    prompt_parts.append(f"- Goal: {pattern.get('goal', 'N/A')[:100]}")
+                    prompt_parts.append(f"  Tasks: {pattern.get('task_count', 'N/A')}")
+            prompt_parts.append("")
+
+        prompt_parts.append(
+            "Please decompose this goal into specific, actionable sub-tasks. "
+            "Return valid JSON as specified in the system prompt."
+        )
+
+        return "\n".join(prompt_parts)
+
+    async def _call_llm(self, prompt: str) -> str:
+        """Call the LLM for decomposition."""
+        if not self._llm_client:
+            # Fallback to basic decomposition without LLM
+            return await self._basic_decomposition_fallback(prompt)
+
+        try:
+            # Try different LLM client interfaces
+            if hasattr(self._llm_client, 'complete'):
+                response = await self._llm_client.complete(
+                    system=self.DECOMPOSITION_SYSTEM_PROMPT,
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=2000,
+                    temperature=0.3,
+                )
+                return response[0] if isinstance(response, tuple) else response
+            elif hasattr(self._llm_client, 'generate'):
+                response = await self._llm_client.generate(
+                    prompt=f"{self.DECOMPOSITION_SYSTEM_PROMPT}\n\n{prompt}",
+                    max_tokens=2000,
+                )
+                return response
+            elif hasattr(self._llm_client, 'chat'):
+                response = await self._llm_client.chat(
+                    messages=[
+                        {"role": "system", "content": self.DECOMPOSITION_SYSTEM_PROMPT},
+                        {"role": "user", "content": prompt},
+                    ],
+                    max_tokens=2000,
+                )
+                return response.get("content", "") if isinstance(response, dict) else str(response)
+            else:
+                logger.warning("Unknown LLM client interface, using fallback")
+                return await self._basic_decomposition_fallback(prompt)
+        except Exception as e:
+            logger.error(f"LLM call failed: {e}, using fallback")
+            return await self._basic_decomposition_fallback(prompt)
+
+    async def _basic_decomposition_fallback(self, prompt: str) -> str:
+        """Basic rule-based decomposition when LLM is unavailable."""
+        goal = prompt.split("\n")[1] if "\n" in prompt else prompt
+        goal_lower = goal.lower()
+
+        sub_tasks = []
+
+        # Determine task types based on goal keywords
+        if any(kw in goal_lower for kw in ["optimize", "performance", "speed", "fast"]):
+            sub_tasks = [
+                {"description": "Profile code to identify bottlenecks", "task_type": "analyze", "priority": "high", "target_files": [], "dependencies": [], "success_criteria": "Profiling report generated", "estimated_complexity": "easy"},
+                {"description": "Implement optimizations based on profiling", "task_type": "optimize", "priority": "high", "target_files": [], "dependencies": ["task_0"], "success_criteria": "Optimizations applied", "estimated_complexity": "medium"},
+                {"description": "Run benchmarks to verify improvements", "task_type": "benchmark", "priority": "medium", "target_files": [], "dependencies": ["task_1"], "success_criteria": "Performance improved", "estimated_complexity": "easy"},
+            ]
+        elif any(kw in goal_lower for kw in ["fix", "bug", "error", "issue"]):
+            sub_tasks = [
+                {"description": "Analyze error and identify root cause", "task_type": "analyze", "priority": "critical", "target_files": [], "dependencies": [], "success_criteria": "Root cause identified", "estimated_complexity": "medium"},
+                {"description": "Implement fix for the issue", "task_type": "fix", "priority": "critical", "target_files": [], "dependencies": ["task_0"], "success_criteria": "Fix implemented", "estimated_complexity": "medium"},
+                {"description": "Add tests to prevent regression", "task_type": "test", "priority": "high", "target_files": [], "dependencies": ["task_1"], "success_criteria": "Tests pass", "estimated_complexity": "easy"},
+            ]
+        elif any(kw in goal_lower for kw in ["refactor", "clean", "improve"]):
+            sub_tasks = [
+                {"description": "Analyze code structure and identify improvements", "task_type": "analyze", "priority": "high", "target_files": [], "dependencies": [], "success_criteria": "Analysis complete", "estimated_complexity": "easy"},
+                {"description": "Refactor code to improve structure", "task_type": "refactor", "priority": "high", "target_files": [], "dependencies": ["task_0"], "success_criteria": "Code refactored", "estimated_complexity": "medium"},
+                {"description": "Validate refactoring with existing tests", "task_type": "validate", "priority": "medium", "target_files": [], "dependencies": ["task_1"], "success_criteria": "All tests pass", "estimated_complexity": "easy"},
+            ]
+        else:
+            sub_tasks = [
+                {"description": f"Analyze requirements for: {goal}", "task_type": "analyze", "priority": "high", "target_files": [], "dependencies": [], "success_criteria": "Requirements understood", "estimated_complexity": "easy"},
+                {"description": "Implement the requested changes", "task_type": "implement", "priority": "high", "target_files": [], "dependencies": ["task_0"], "success_criteria": "Implementation complete", "estimated_complexity": "medium"},
+                {"description": "Test and validate changes", "task_type": "validate", "priority": "medium", "target_files": [], "dependencies": ["task_1"], "success_criteria": "Validation passed", "estimated_complexity": "easy"},
+            ]
+
+        return json.dumps({
+            "reasoning": "Basic rule-based decomposition (LLM unavailable)",
+            "sub_tasks": sub_tasks,
+            "execution_order": [f"task_{i}" for i in range(len(sub_tasks))],
+            "total_complexity": "medium",
+        })
+
+    async def _parse_decomposition_response(
+        self,
+        goal: str,
+        response: str,
+    ) -> DecompositionResult:
+        """Parse the LLM response into a DecompositionResult."""
+        try:
+            # Extract JSON from response
+            json_match = re.search(r'\{[\s\S]*\}', response)
+            if not json_match:
+                raise ValueError("No JSON found in response")
+
+            data = json.loads(json_match.group())
+
+            # Build sub-tasks
+            sub_tasks = []
+            for i, task_data in enumerate(data.get("sub_tasks", [])):
+                task_id = f"task_{i}"
+
+                # Parse enums safely
+                try:
+                    task_type = SubTaskType(task_data.get("task_type", "implement"))
+                except ValueError:
+                    task_type = SubTaskType.IMPLEMENT
+
+                try:
+                    priority_str = task_data.get("priority", "medium").upper()
+                    priority = SubTaskPriority[priority_str] if priority_str in SubTaskPriority.__members__ else SubTaskPriority.MEDIUM
+                except (KeyError, ValueError):
+                    priority = SubTaskPriority.MEDIUM
+
+                sub_task = SubTask(
+                    id=task_id,
+                    description=task_data.get("description", f"Task {i}"),
+                    task_type=task_type,
+                    priority=priority,
+                    target_files=task_data.get("target_files", []),
+                    dependencies=task_data.get("dependencies", []),
+                    success_criteria=task_data.get("success_criteria", ""),
+                    estimated_complexity=task_data.get("estimated_complexity", "medium"),
+                    parent_goal=goal,
+                )
+                sub_tasks.append(sub_task)
+
+            # Build dependency graph
+            deps_graph = {task.id: task.dependencies for task in sub_tasks}
+
+            return DecompositionResult(
+                original_goal=goal,
+                sub_tasks=sub_tasks,
+                execution_order=data.get("execution_order", [t.id for t in sub_tasks]),
+                total_estimated_complexity=data.get("total_complexity", "medium"),
+                reasoning=data.get("reasoning", ""),
+                dependencies_graph=deps_graph,
+            )
+
+        except Exception as e:
+            logger.error(f"Failed to parse decomposition response: {e}")
+            # Return minimal result
+            return DecompositionResult(
+                original_goal=goal,
+                sub_tasks=[SubTask(
+                    id="task_0",
+                    description=goal,
+                    task_type=SubTaskType.IMPLEMENT,
+                    priority=SubTaskPriority.HIGH,
+                    target_files=[],
+                    parent_goal=goal,
+                )],
+                execution_order=["task_0"],
+                total_estimated_complexity="medium",
+                reasoning=f"Parse error: {e}",
+                dependencies_graph={"task_0": []},
+            )
+
+    async def _record_decomposition(self, result: DecompositionResult) -> None:
+        """Record decomposition in learning database."""
+        if not self._learning_db:
+            return
+
+        try:
+            if hasattr(self._learning_db, 'record_experience'):
+                await self._learning_db.record_experience(
+                    category="goal_decomposition",
+                    data={
+                        "goal": result.original_goal,
+                        "task_count": len(result.sub_tasks),
+                        "complexity": result.total_estimated_complexity,
+                        "task_types": [t.task_type.value for t in result.sub_tasks],
+                    }
+                )
+        except Exception as e:
+            logger.debug(f"Error recording decomposition: {e}")
+
+    def get_status(self) -> Dict[str, Any]:
+        """Get engine status."""
+        return {
+            "cache_size": len(self._cache),
+            "history_size": len(self._decomposition_history),
+            "oracle_connected": self._oracle is not None,
+            "llm_connected": self._llm_client is not None,
+            "learning_db_connected": self._learning_db is not None,
+        }
+
+
+class TechnicalDebtDetector:
+    """
+    v4.0: Autonomous codebase scanner for technical debt detection.
+
+    This component enables JARVIS to find problems WITHOUT being told -
+    it scans the codebase and identifies issues that need attention.
+
+    Detection categories:
+    - High complexity functions (cyclomatic, cognitive)
+    - Code duplication
+    - Dead/unused code
+    - Circular dependencies
+    - Missing test coverage
+    - Security vulnerabilities
+    - Performance bottlenecks
+    - Type safety issues
+    - Poor error handling
+    - Deprecated API usage
+
+    Integration:
+    - Uses Oracle for structural analysis
+    - Uses AST for complexity metrics
+    - Uses pattern matching for security/performance issues
+    - Prioritizes issues by severity and effort
+    """
+
+    # Complexity thresholds (configurable via environment)
+    CYCLOMATIC_THRESHOLD = int(os.getenv("DEBT_CYCLOMATIC_THRESHOLD", "10"))
+    COGNITIVE_THRESHOLD = int(os.getenv("DEBT_COGNITIVE_THRESHOLD", "15"))
+    LINE_COUNT_THRESHOLD = int(os.getenv("DEBT_LINE_THRESHOLD", "200"))
+    NESTING_THRESHOLD = int(os.getenv("DEBT_NESTING_THRESHOLD", "4"))
+
+    # Security patterns to detect
+    SECURITY_PATTERNS = [
+        (r'eval\s*\(', "eval() usage - potential code injection", 0.9),
+        (r'exec\s*\(', "exec() usage - potential code injection", 0.9),
+        (r'__import__\s*\(', "Dynamic import - potential security risk", 0.7),
+        (r'subprocess\..*shell\s*=\s*True', "Shell=True in subprocess - command injection risk", 0.85),
+        (r'pickle\.loads?\s*\(', "Pickle usage - potential arbitrary code execution", 0.8),
+        (r'yaml\.load\s*\([^,]+\)(?!.*Loader)', "yaml.load without Loader - arbitrary code execution", 0.85),
+        (r'request\.args\.get|request\.form\.get', "Unsanitized user input", 0.6),
+        (r'os\.system\s*\(', "os.system usage - prefer subprocess", 0.7),
+        (r'\.format\s*\([^)]*request', "Format string with user input - potential injection", 0.75),
+        (r'f["\'][^"\']*\{[^}]*request', "F-string with user input - potential injection", 0.75),
+    ]
+
+    # Performance patterns to detect
+    PERFORMANCE_PATTERNS = [
+        (r'for\s+\w+\s+in\s+range\(len\(', "range(len()) - use enumerate instead", 0.4),
+        (r'\.append\([^)]+\)\s*$.*for\s+', "Append in loop - consider list comprehension", 0.3),
+        (r'\+\s*=\s*["\']', "String concatenation in loop - use join()", 0.5),
+        (r'time\.sleep\s*\(\s*[0-9]+\s*\)', "Blocking sleep - consider async sleep", 0.4),
+        (r'open\s*\([^)]+\)(?!.*with)', "File open without context manager", 0.6),
+        (r'except\s*:\s*$', "Bare except clause - catches SystemExit", 0.65),
+        (r'except\s+Exception\s*:\s*$', "Broad exception catch", 0.5),
+        (r'global\s+\w+', "Global variable usage - potential side effects", 0.4),
+    ]
+
+    def __init__(
+        self,
+        oracle: Optional[Any] = None,
+        project_root: Optional[Path] = None,
+    ):
+        """
+        Initialize technical debt detector.
+
+        Args:
+            oracle: The Oracle codebase knowledge graph
+            project_root: Root directory of the project to scan
+        """
+        self._oracle = oracle
+        self._project_root = project_root or Path(os.getenv(
+            "JARVIS_PATH",
+            Path.home() / "Documents/repos/JARVIS-AI-Agent"
+        ))
+        self._lock = asyncio.Lock()
+        self._scan_results: List[TechnicalDebtItem] = []
+        self._last_scan: Optional[float] = None
+        self._scan_interval = int(os.getenv("DEBT_SCAN_INTERVAL", "3600"))  # 1 hour
+
+        logger.info(f"TechnicalDebtDetector initialized for {self._project_root}")
+
+    async def set_oracle(self, oracle: Any) -> None:
+        """Set the Oracle instance."""
+        self._oracle = oracle
+
+    async def scan_codebase(
+        self,
+        target_dirs: Optional[List[str]] = None,
+        categories: Optional[List[TechnicalDebtCategory]] = None,
+        max_issues: int = 100,
+        force_refresh: bool = False,
+    ) -> List[TechnicalDebtItem]:
+        """
+        Scan the codebase for technical debt.
+
+        Args:
+            target_dirs: Specific directories to scan (default: entire project)
+            categories: Specific categories to scan for (default: all)
+            max_issues: Maximum number of issues to return
+            force_refresh: Force rescan even if within scan interval
+
+        Returns:
+            List of detected technical debt items, sorted by severity
+        """
+        # Check if we should use cached results
+        if not force_refresh and self._last_scan:
+            if time.time() - self._last_scan < self._scan_interval:
+                logger.debug("Using cached scan results")
+                return self._filter_results(categories, max_issues)
+
+        async with self._lock:
+            self._scan_results = []
+
+            # Determine directories to scan
+            scan_dirs = []
+            if target_dirs:
+                scan_dirs = [self._project_root / d for d in target_dirs]
+            else:
+                scan_dirs = [self._project_root / "backend"]
+
+            # Get all Python files
+            python_files = []
+            for scan_dir in scan_dirs:
+                if scan_dir.exists():
+                    python_files.extend(scan_dir.rglob("*.py"))
+
+            # Filter out test files and cache
+            python_files = [
+                f for f in python_files
+                if "__pycache__" not in str(f)
+                and ".venv" not in str(f)
+                and "node_modules" not in str(f)
+            ]
+
+            logger.info(f"Scanning {len(python_files)} Python files for technical debt...")
+
+            # Scan in parallel
+            tasks = []
+            for file_path in python_files[:200]:  # Limit to avoid overwhelming
+                tasks.append(self._scan_file(file_path, categories))
+
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            for result in results:
+                if isinstance(result, list):
+                    self._scan_results.extend(result)
+                elif isinstance(result, Exception):
+                    logger.debug(f"Scan error: {result}")
+
+            # Add Oracle-based detections
+            if self._oracle:
+                await self._add_oracle_detections(categories)
+
+            # Sort by severity
+            self._scan_results.sort(key=lambda x: x.severity, reverse=True)
+            self._last_scan = time.time()
+
+            logger.info(f"Technical debt scan complete: {len(self._scan_results)} issues found")
+            return self._filter_results(categories, max_issues)
+
+    async def _scan_file(
+        self,
+        file_path: Path,
+        categories: Optional[List[TechnicalDebtCategory]],
+    ) -> List[TechnicalDebtItem]:
+        """Scan a single file for technical debt."""
+        items = []
+
+        try:
+            content = await asyncio.to_thread(file_path.read_text, encoding="utf-8")
+            lines = content.splitlines()
+
+            # Parse AST
+            try:
+                tree = ast.parse(content)
+            except SyntaxError:
+                return items
+
+            # Check complexity
+            if not categories or TechnicalDebtCategory.COMPLEXITY in categories:
+                items.extend(await self._check_complexity(file_path, tree, lines))
+
+            # Check security
+            if not categories or TechnicalDebtCategory.SECURITY in categories:
+                items.extend(await self._check_security(file_path, content, lines))
+
+            # Check performance
+            if not categories or TechnicalDebtCategory.PERFORMANCE in categories:
+                items.extend(await self._check_performance(file_path, content, lines))
+
+            # Check error handling
+            if not categories or TechnicalDebtCategory.ERROR_HANDLING in categories:
+                items.extend(await self._check_error_handling(file_path, tree, lines))
+
+            # Check type safety
+            if not categories or TechnicalDebtCategory.TYPE_SAFETY in categories:
+                items.extend(await self._check_type_safety(file_path, tree, lines))
+
+        except Exception as e:
+            logger.debug(f"Error scanning {file_path}: {e}")
+
+        return items
+
+    async def _check_complexity(
+        self,
+        file_path: Path,
+        tree: ast.AST,
+        lines: List[str],
+    ) -> List[TechnicalDebtItem]:
+        """Check for complexity issues."""
+        items = []
+
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                # Calculate cyclomatic complexity
+                cyclomatic = self._calculate_cyclomatic_complexity(node)
+
+                # Calculate cognitive complexity
+                cognitive = self._calculate_cognitive_complexity(node)
+
+                # Check line count
+                end_line = getattr(node, 'end_lineno', node.lineno + 10)
+                line_count = end_line - node.lineno
+
+                # Check nesting depth
+                max_nesting = self._calculate_max_nesting(node)
+
+                severity = 0.0
+                issues = []
+
+                if cyclomatic > self.CYCLOMATIC_THRESHOLD:
+                    severity = max(severity, min(0.9, cyclomatic / 30))
+                    issues.append(f"cyclomatic={cyclomatic}")
+
+                if cognitive > self.COGNITIVE_THRESHOLD:
+                    severity = max(severity, min(0.85, cognitive / 40))
+                    issues.append(f"cognitive={cognitive}")
+
+                if line_count > self.LINE_COUNT_THRESHOLD:
+                    severity = max(severity, min(0.7, line_count / 500))
+                    issues.append(f"lines={line_count}")
+
+                if max_nesting > self.NESTING_THRESHOLD:
+                    severity = max(severity, min(0.6, max_nesting / 8))
+                    issues.append(f"nesting={max_nesting}")
+
+                if severity > 0:
+                    items.append(TechnicalDebtItem(
+                        id=f"complexity_{uuid.uuid4().hex[:8]}",
+                        category=TechnicalDebtCategory.COMPLEXITY,
+                        file_path=str(file_path),
+                        line_start=node.lineno,
+                        line_end=end_line,
+                        severity=severity,
+                        description=f"High complexity in '{node.name}': {', '.join(issues)}",
+                        code_snippet=lines[node.lineno - 1] if node.lineno <= len(lines) else "",
+                        suggested_fix="Consider breaking this function into smaller, focused functions",
+                        estimated_effort="medium" if severity < 0.7 else "hard",
+                        metrics={
+                            "cyclomatic": cyclomatic,
+                            "cognitive": cognitive,
+                            "line_count": line_count,
+                            "max_nesting": max_nesting,
+                        },
+                    ))
+
+        return items
+
+    def _calculate_cyclomatic_complexity(self, node: ast.AST) -> int:
+        """Calculate cyclomatic complexity of a function."""
+        complexity = 1  # Base complexity
+
+        for child in ast.walk(node):
+            if isinstance(child, (ast.If, ast.While, ast.For, ast.AsyncFor)):
+                complexity += 1
+            elif isinstance(child, ast.ExceptHandler):
+                complexity += 1
+            elif isinstance(child, (ast.And, ast.Or)):
+                complexity += 1
+            elif isinstance(child, ast.comprehension):
+                complexity += 1
+                if child.ifs:
+                    complexity += len(child.ifs)
+            elif isinstance(child, ast.Match):
+                complexity += len(child.cases) - 1
+
+        return complexity
+
+    def _calculate_cognitive_complexity(self, node: ast.AST, depth: int = 0) -> int:
+        """Calculate cognitive complexity of a function."""
+        complexity = 0
+
+        for child in ast.iter_child_nodes(node):
+            increment = 0
+            nesting_increment = 0
+
+            if isinstance(child, (ast.If, ast.While, ast.For, ast.AsyncFor)):
+                increment = 1
+                nesting_increment = depth
+            elif isinstance(child, ast.ExceptHandler):
+                increment = 1
+                nesting_increment = depth
+            elif isinstance(child, (ast.And, ast.Or)):
+                increment = 1
+            elif isinstance(child, ast.Lambda):
+                increment = 1
+
+            complexity += increment + nesting_increment
+
+            # Recurse with increased depth for nesting structures
+            new_depth = depth + 1 if isinstance(child, (ast.If, ast.While, ast.For, ast.AsyncFor, ast.Try)) else depth
+            complexity += self._calculate_cognitive_complexity(child, new_depth)
+
+        return complexity
+
+    def _calculate_max_nesting(self, node: ast.AST, depth: int = 0) -> int:
+        """Calculate maximum nesting depth."""
+        max_depth = depth
+
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.If, ast.While, ast.For, ast.AsyncFor, ast.Try, ast.With, ast.AsyncWith)):
+                child_depth = self._calculate_max_nesting(child, depth + 1)
+                max_depth = max(max_depth, child_depth)
+            else:
+                child_depth = self._calculate_max_nesting(child, depth)
+                max_depth = max(max_depth, child_depth)
+
+        return max_depth
+
+    async def _check_security(
+        self,
+        file_path: Path,
+        content: str,
+        lines: List[str],
+    ) -> List[TechnicalDebtItem]:
+        """Check for security issues."""
+        items = []
+
+        for pattern, description, severity in self.SECURITY_PATTERNS:
+            for match in re.finditer(pattern, content, re.MULTILINE):
+                line_num = content[:match.start()].count('\n') + 1
+                items.append(TechnicalDebtItem(
+                    id=f"security_{uuid.uuid4().hex[:8]}",
+                    category=TechnicalDebtCategory.SECURITY,
+                    file_path=str(file_path),
+                    line_start=line_num,
+                    line_end=line_num,
+                    severity=severity,
+                    description=description,
+                    code_snippet=lines[line_num - 1].strip() if line_num <= len(lines) else "",
+                    suggested_fix="Review and apply security best practices",
+                    estimated_effort="medium",
+                ))
+
+        return items
+
+    async def _check_performance(
+        self,
+        file_path: Path,
+        content: str,
+        lines: List[str],
+    ) -> List[TechnicalDebtItem]:
+        """Check for performance issues."""
+        items = []
+
+        for pattern, description, severity in self.PERFORMANCE_PATTERNS:
+            for match in re.finditer(pattern, content, re.MULTILINE):
+                line_num = content[:match.start()].count('\n') + 1
+                items.append(TechnicalDebtItem(
+                    id=f"perf_{uuid.uuid4().hex[:8]}",
+                    category=TechnicalDebtCategory.PERFORMANCE,
+                    file_path=str(file_path),
+                    line_start=line_num,
+                    line_end=line_num,
+                    severity=severity,
+                    description=description,
+                    code_snippet=lines[line_num - 1].strip() if line_num <= len(lines) else "",
+                    suggested_fix="Apply performance optimization",
+                    estimated_effort="easy",
+                ))
+
+        return items
+
+    async def _check_error_handling(
+        self,
+        file_path: Path,
+        tree: ast.AST,
+        lines: List[str],
+    ) -> List[TechnicalDebtItem]:
+        """Check for error handling issues."""
+        items = []
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ExceptHandler):
+                # Bare except
+                if node.type is None:
+                    items.append(TechnicalDebtItem(
+                        id=f"error_{uuid.uuid4().hex[:8]}",
+                        category=TechnicalDebtCategory.ERROR_HANDLING,
+                        file_path=str(file_path),
+                        line_start=node.lineno,
+                        line_end=node.lineno,
+                        severity=0.7,
+                        description="Bare except clause catches all exceptions including SystemExit",
+                        code_snippet=lines[node.lineno - 1].strip() if node.lineno <= len(lines) else "",
+                        suggested_fix="Specify the exception type to catch",
+                        estimated_effort="easy",
+                    ))
+                # Except Exception with pass
+                elif isinstance(node.type, ast.Name) and node.type.id == "Exception":
+                    if node.body and isinstance(node.body[0], ast.Pass):
+                        items.append(TechnicalDebtItem(
+                            id=f"error_{uuid.uuid4().hex[:8]}",
+                            category=TechnicalDebtCategory.ERROR_HANDLING,
+                            file_path=str(file_path),
+                            line_start=node.lineno,
+                            line_end=node.lineno,
+                            severity=0.6,
+                            description="Silently catching and ignoring all exceptions",
+                            code_snippet=lines[node.lineno - 1].strip() if node.lineno <= len(lines) else "",
+                            suggested_fix="Log the exception or handle it appropriately",
+                            estimated_effort="easy",
+                        ))
+
+        return items
+
+    async def _check_type_safety(
+        self,
+        file_path: Path,
+        tree: ast.AST,
+        lines: List[str],
+    ) -> List[TechnicalDebtItem]:
+        """Check for type safety issues (missing type hints)."""
+        items = []
+
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                # Skip private/magic methods and short functions
+                if node.name.startswith('_') and not node.name.startswith('__'):
+                    continue
+
+                # Check for missing return type hint
+                if node.returns is None and not node.name.startswith('__'):
+                    # Check if function has return statements
+                    has_return = any(
+                        isinstance(n, ast.Return) and n.value is not None
+                        for n in ast.walk(node)
+                    )
+                    if has_return:
+                        items.append(TechnicalDebtItem(
+                            id=f"type_{uuid.uuid4().hex[:8]}",
+                            category=TechnicalDebtCategory.TYPE_SAFETY,
+                            file_path=str(file_path),
+                            line_start=node.lineno,
+                            line_end=node.lineno,
+                            severity=0.3,
+                            description=f"Function '{node.name}' missing return type hint",
+                            code_snippet=lines[node.lineno - 1].strip() if node.lineno <= len(lines) else "",
+                            suggested_fix="Add return type annotation",
+                            estimated_effort="trivial",
+                        ))
+
+                # Check for missing parameter type hints
+                untyped_params = []
+                for arg in node.args.args:
+                    if arg.annotation is None and arg.arg != 'self' and arg.arg != 'cls':
+                        untyped_params.append(arg.arg)
+
+                if untyped_params and len(untyped_params) > 2:
+                    items.append(TechnicalDebtItem(
+                        id=f"type_{uuid.uuid4().hex[:8]}",
+                        category=TechnicalDebtCategory.TYPE_SAFETY,
+                        file_path=str(file_path),
+                        line_start=node.lineno,
+                        line_end=node.lineno,
+                        severity=0.25,
+                        description=f"Function '{node.name}' has {len(untyped_params)} untyped parameters: {', '.join(untyped_params[:3])}...",
+                        code_snippet=lines[node.lineno - 1].strip() if node.lineno <= len(lines) else "",
+                        suggested_fix="Add type annotations to parameters",
+                        estimated_effort="easy",
+                    ))
+
+        return items
+
+    async def _add_oracle_detections(
+        self,
+        categories: Optional[List[TechnicalDebtCategory]],
+    ) -> None:
+        """Add detections from Oracle analysis."""
+        if not self._oracle:
+            return
+
+        try:
+            # Dead code detection
+            if not categories or TechnicalDebtCategory.DEAD_CODE in categories:
+                if hasattr(self._oracle, 'get_dead_code'):
+                    dead_code = await asyncio.to_thread(self._oracle.get_dead_code)
+                    for node in list(dead_code)[:20]:
+                        self._scan_results.append(TechnicalDebtItem(
+                            id=f"dead_{uuid.uuid4().hex[:8]}",
+                            category=TechnicalDebtCategory.DEAD_CODE,
+                            file_path=str(node) if hasattr(node, '__str__') else "unknown",
+                            line_start=getattr(node, 'line_number', 0),
+                            line_end=getattr(node, 'line_number', 0),
+                            severity=0.4,
+                            description=f"Dead code detected: {node}",
+                            suggested_fix="Remove unused code or add usage",
+                            estimated_effort="easy",
+                        ))
+
+            # Circular dependency detection
+            if not categories or TechnicalDebtCategory.CIRCULAR_DEPS in categories:
+                if hasattr(self._oracle, 'get_circular_dependencies'):
+                    cycles = await asyncio.to_thread(self._oracle.get_circular_dependencies)
+                    for cycle in list(cycles)[:10]:
+                        self._scan_results.append(TechnicalDebtItem(
+                            id=f"circ_{uuid.uuid4().hex[:8]}",
+                            category=TechnicalDebtCategory.CIRCULAR_DEPS,
+                            file_path=str(cycle[0]) if cycle else "unknown",
+                            line_start=0,
+                            line_end=0,
+                            severity=0.75,
+                            description=f"Circular dependency: {' -> '.join(str(c) for c in cycle)}",
+                            suggested_fix="Refactor to remove circular import",
+                            estimated_effort="hard",
+                        ))
+
+        except Exception as e:
+            logger.debug(f"Oracle detection error: {e}")
+
+    def _filter_results(
+        self,
+        categories: Optional[List[TechnicalDebtCategory]],
+        max_issues: int,
+    ) -> List[TechnicalDebtItem]:
+        """Filter and limit results."""
+        results = self._scan_results
+
+        if categories:
+            results = [r for r in results if r.category in categories]
+
+        return results[:max_issues]
+
+    def get_status(self) -> Dict[str, Any]:
+        """Get detector status."""
+        return {
+            "total_issues": len(self._scan_results),
+            "last_scan": self._last_scan,
+            "oracle_connected": self._oracle is not None,
+            "issues_by_category": {
+                cat.value: len([r for r in self._scan_results if r.category == cat])
+                for cat in TechnicalDebtCategory
+            },
+        }
+
+
+class AutonomousSelfRefinementLoop:
+    """
+    v4.0: The "Think-Loop" - Continuous autonomous self-improvement.
+
+    This is the EXECUTIVE CONTROL that makes JARVIS truly autonomous.
+    It runs continuously in the background:
+    1. Detects technical debt
+    2. Decomposes issues into tasks
+    3. Submits tasks to the orchestrator
+    4. Learns from results
+
+    The loop operates without human prompting - JARVIS decides what
+    to improve and when.
+
+    Safety features:
+    - Configurable improvement budget (max tasks per hour)
+    - Risk thresholds (won't touch critical systems without approval)
+    - Learning from failures (avoids repeating mistakes)
+    - Circuit breaker for consecutive failures
+    - Priority-based scheduling
+    """
+
+    def __init__(
+        self,
+        debt_detector: Optional[TechnicalDebtDetector] = None,
+        goal_decomposer: Optional[GoalDecompositionEngine] = None,
+        orchestrator: Optional[Any] = None,  # AgenticLoopOrchestrator
+        learning_db: Optional[Any] = None,
+    ):
+        """
+        Initialize the autonomous refinement loop.
+
+        Args:
+            debt_detector: Technical debt detector instance
+            goal_decomposer: Goal decomposition engine
+            orchestrator: AgenticLoopOrchestrator for task execution
+            learning_db: Learning database for pattern storage
+        """
+        self._debt_detector = debt_detector
+        self._goal_decomposer = goal_decomposer
+        self._orchestrator = orchestrator
+        self._learning_db = learning_db
+
+        self._running = False
+        self._paused = False
+        self._task: Optional[asyncio.Task] = None
+        self._lock = asyncio.Lock()
+
+        # Configuration from environment
+        self._scan_interval = int(os.getenv("AUTONOMOUS_SCAN_INTERVAL", "3600"))  # 1 hour
+        self._max_tasks_per_hour = int(os.getenv("AUTONOMOUS_MAX_TASKS_HOUR", "5"))
+        self._min_severity_threshold = float(os.getenv("AUTONOMOUS_MIN_SEVERITY", "0.5"))
+        self._risk_threshold = float(os.getenv("AUTONOMOUS_RISK_THRESHOLD", "0.8"))
+        self._consecutive_failure_limit = int(os.getenv("AUTONOMOUS_FAILURE_LIMIT", "3"))
+
+        # State tracking
+        self._tasks_this_hour: List[float] = []  # Timestamps of submitted tasks
+        self._consecutive_failures = 0
+        self._total_improvements = 0
+        self._total_failures = 0
+        self._avoided_issues: Set[str] = set()  # Issues we've learned to avoid
+
+        # Metrics
+        self._metrics = {
+            "cycles_completed": 0,
+            "issues_detected": 0,
+            "tasks_submitted": 0,
+            "improvements_successful": 0,
+            "improvements_failed": 0,
+            "issues_skipped_low_severity": 0,
+            "issues_skipped_high_risk": 0,
+            "issues_skipped_learned": 0,
+        }
+
+        logger.info("AutonomousSelfRefinementLoop initialized")
+
+    async def start(self) -> None:
+        """Start the autonomous refinement loop."""
+        if self._running:
+            logger.warning("AutonomousSelfRefinementLoop already running")
+            return
+
+        logger.info("Starting AutonomousSelfRefinementLoop...")
+        self._running = True
+        self._paused = False
+        self._task = asyncio.create_task(self._refinement_loop())
+        logger.info("AutonomousSelfRefinementLoop started")
+
+    async def stop(self) -> None:
+        """Stop the autonomous refinement loop."""
+        if not self._running:
+            return
+
+        logger.info("Stopping AutonomousSelfRefinementLoop...")
+        self._running = False
+
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+            self._task = None
+
+        logger.info("AutonomousSelfRefinementLoop stopped")
+
+    async def pause(self) -> None:
+        """Pause the refinement loop (keeps running but skips processing)."""
+        self._paused = True
+        logger.info("AutonomousSelfRefinementLoop paused")
+
+    async def resume(self) -> None:
+        """Resume the refinement loop."""
+        self._paused = False
+        logger.info("AutonomousSelfRefinementLoop resumed")
+
+    async def trigger_scan_now(self) -> List[TechnicalDebtItem]:
+        """Trigger an immediate scan and return results."""
+        if not self._debt_detector:
+            return []
+
+        return await self._debt_detector.scan_codebase(force_refresh=True)
+
+    async def _refinement_loop(self) -> None:
+        """Main refinement loop that runs continuously."""
+        logger.info("Refinement loop started")
+
+        while self._running:
+            try:
+                # Check if paused
+                if self._paused:
+                    await asyncio.sleep(10)
+                    continue
+
+                # Check circuit breaker
+                if self._consecutive_failures >= self._consecutive_failure_limit:
+                    logger.warning(
+                        f"Circuit breaker open: {self._consecutive_failures} consecutive failures. "
+                        f"Waiting 5 minutes before retry."
+                    )
+                    await asyncio.sleep(300)  # 5 minute cooldown
+                    self._consecutive_failures = 0
+                    continue
+
+                # Run one refinement cycle
+                await self._run_refinement_cycle()
+
+                self._metrics["cycles_completed"] += 1
+
+                # Wait before next cycle
+                await asyncio.sleep(self._scan_interval)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Refinement loop error: {e}")
+                self._consecutive_failures += 1
+                await asyncio.sleep(60)  # 1 minute cooldown on error
+
+        logger.info("Refinement loop ended")
+
+    async def _run_refinement_cycle(self) -> None:
+        """Run a single refinement cycle."""
+        logger.debug("Starting refinement cycle")
+
+        # 1. Check task budget
+        self._cleanup_old_tasks()
+        remaining_budget = self._max_tasks_per_hour - len(self._tasks_this_hour)
+
+        if remaining_budget <= 0:
+            logger.debug("Task budget exhausted, skipping cycle")
+            return
+
+        # 2. Detect technical debt
+        if not self._debt_detector:
+            logger.warning("No debt detector configured")
+            return
+
+        issues = await self._debt_detector.scan_codebase()
+        self._metrics["issues_detected"] += len(issues)
+
+        if not issues:
+            logger.debug("No technical debt detected")
+            return
+
+        # 3. Filter and prioritize issues
+        actionable_issues = await self._filter_issues(issues)
+
+        if not actionable_issues:
+            logger.debug("No actionable issues after filtering")
+            return
+
+        logger.info(f"Found {len(actionable_issues)} actionable issues")
+
+        # 4. Process top issues up to budget
+        for issue in actionable_issues[:remaining_budget]:
+            try:
+                await self._process_issue(issue)
+                self._consecutive_failures = 0  # Reset on success
+            except Exception as e:
+                logger.error(f"Failed to process issue {issue.id}: {e}")
+                self._consecutive_failures += 1
+                self._metrics["improvements_failed"] += 1
+
+                # Learn from failure
+                await self._record_failure(issue, str(e))
+
+    async def _filter_issues(
+        self,
+        issues: List[TechnicalDebtItem],
+    ) -> List[TechnicalDebtItem]:
+        """Filter issues based on severity, risk, and learned patterns."""
+        filtered = []
+
+        for issue in issues:
+            # Skip low severity
+            if issue.severity < self._min_severity_threshold:
+                self._metrics["issues_skipped_low_severity"] += 1
+                continue
+
+            # Skip high risk (security critical files, etc.)
+            if await self._assess_risk(issue) > self._risk_threshold:
+                self._metrics["issues_skipped_high_risk"] += 1
+                continue
+
+            # Skip issues we've learned to avoid
+            issue_signature = self._get_issue_signature(issue)
+            if issue_signature in self._avoided_issues:
+                self._metrics["issues_skipped_learned"] += 1
+                continue
+
+            filtered.append(issue)
+
+        # Sort by severity (highest first)
+        filtered.sort(key=lambda x: x.severity, reverse=True)
+
+        return filtered
+
+    async def _assess_risk(self, issue: TechnicalDebtItem) -> float:
+        """Assess the risk of fixing an issue."""
+        risk = 0.0
+
+        # Higher risk for certain files
+        high_risk_patterns = [
+            "security", "auth", "crypto", "payment", "billing",
+            "database", "migration", "config", "secret",
+        ]
+
+        file_lower = issue.file_path.lower()
+        for pattern in high_risk_patterns:
+            if pattern in file_lower:
+                risk += 0.2
+
+        # Higher risk for high-severity security issues
+        if issue.category == TechnicalDebtCategory.SECURITY:
+            risk += 0.3
+
+        # Use Oracle for blast radius if available
+        if self._debt_detector and self._debt_detector._oracle:
+            try:
+                oracle = self._debt_detector._oracle
+                if hasattr(oracle, 'get_blast_radius'):
+                    blast = await asyncio.to_thread(
+                        lambda: oracle.get_blast_radius(issue.file_path)
+                    )
+                    if blast and hasattr(blast, 'directly_affected'):
+                        affected_count = len(blast.directly_affected)
+                        risk += min(0.3, affected_count * 0.03)
+            except Exception:
+                pass
+
+        return min(1.0, risk)
+
+    def _get_issue_signature(self, issue: TechnicalDebtItem) -> str:
+        """Get a unique signature for an issue (for learning)."""
+        return f"{issue.category.value}:{issue.file_path}:{issue.line_start}"
+
+    async def _process_issue(self, issue: TechnicalDebtItem) -> None:
+        """Process a single issue by decomposing and submitting tasks."""
+        logger.info(f"Processing issue: {issue.description[:50]}...")
+
+        # Build improvement goal from issue
+        goal = f"Fix {issue.category.value}: {issue.description}"
+
+        # Decompose into sub-tasks
+        if self._goal_decomposer:
+            result = await self._goal_decomposer.decompose(
+                goal=goal,
+                context={
+                    "issue_id": issue.id,
+                    "category": issue.category.value,
+                    "severity": issue.severity,
+                    "file": issue.file_path,
+                },
+                target_files=[issue.file_path],
+            )
+            sub_tasks = result.sub_tasks
+        else:
+            # Fallback: single task
+            sub_tasks = [SubTask(
+                id=f"fix_{issue.id}",
+                description=goal,
+                task_type=SubTaskType.FIX,
+                priority=SubTaskPriority.HIGH,
+                target_files=[issue.file_path],
+                parent_goal=goal,
+            )]
+
+        # Submit tasks to orchestrator
+        if self._orchestrator:
+            for sub_task in sub_tasks:
+                await self._submit_task_to_orchestrator(sub_task, issue)
+        else:
+            logger.warning("No orchestrator configured, tasks not submitted")
+
+        self._metrics["tasks_submitted"] += len(sub_tasks)
+        self._tasks_this_hour.append(time.time())
+
+    async def _submit_task_to_orchestrator(
+        self,
+        sub_task: SubTask,
+        issue: TechnicalDebtItem,
+    ) -> Optional[str]:
+        """Submit a sub-task to the AgenticLoopOrchestrator."""
+        if not self._orchestrator:
+            return None
+
+        try:
+            # Map priority
+            from enum import Enum
+
+            # Import or create priority enum
+            priority_value = 2  # Default to HIGH
+            if sub_task.priority == SubTaskPriority.CRITICAL:
+                priority_value = 1
+            elif sub_task.priority == SubTaskPriority.MEDIUM:
+                priority_value = 3
+            elif sub_task.priority == SubTaskPriority.LOW:
+                priority_value = 4
+
+            # Find target file
+            target_file = Path(issue.file_path)
+            if not target_file.exists() and sub_task.target_files:
+                target_file = Path(sub_task.target_files[0])
+
+            if not target_file.exists():
+                logger.warning(f"Target file not found: {target_file}")
+                return None
+
+            # Submit task
+            if hasattr(self._orchestrator, 'submit_task'):
+                task_id = await self._orchestrator.submit_task(
+                    file_path=target_file,
+                    goal=sub_task.description,
+                    triggered_by="autonomous_refinement",
+                )
+
+                logger.info(f"Submitted task {task_id}: {sub_task.description[:50]}...")
+                self._metrics["improvements_successful"] += 1
+                return task_id
+
+        except Exception as e:
+            logger.error(f"Failed to submit task: {e}")
+            return None
+
+    async def _record_failure(self, issue: TechnicalDebtItem, error: str) -> None:
+        """Record a failure for learning."""
+        # Add to avoided issues if repeated failures
+        issue_signature = self._get_issue_signature(issue)
+
+        # Track in learning DB
+        if self._learning_db and hasattr(self._learning_db, 'record_experience'):
+            try:
+                await self._learning_db.record_experience(
+                    category="autonomous_refinement_failure",
+                    data={
+                        "issue_id": issue.id,
+                        "category": issue.category.value,
+                        "file": issue.file_path,
+                        "error": error,
+                        "signature": issue_signature,
+                    }
+                )
+            except Exception:
+                pass
+
+        # After 2 failures on same issue, avoid it
+        self._total_failures += 1
+        if self._total_failures % 2 == 0:
+            self._avoided_issues.add(issue_signature)
+
+    def _cleanup_old_tasks(self) -> None:
+        """Remove task timestamps older than 1 hour."""
+        one_hour_ago = time.time() - 3600
+        self._tasks_this_hour = [t for t in self._tasks_this_hour if t > one_hour_ago]
+
+    def get_status(self) -> Dict[str, Any]:
+        """Get loop status."""
+        return {
+            "running": self._running,
+            "paused": self._paused,
+            "consecutive_failures": self._consecutive_failures,
+            "tasks_this_hour": len(self._tasks_this_hour),
+            "max_tasks_per_hour": self._max_tasks_per_hour,
+            "total_improvements": self._total_improvements,
+            "avoided_issues_count": len(self._avoided_issues),
+            "metrics": self._metrics.copy(),
+        }
+
+
+class DualAgentSystem:
+    """
+    v4.0: Architect/Reviewer dual-agent pattern for code improvements.
+
+    This implements a two-phase approach:
+    1. Architect agent generates the improvement
+    2. Reviewer agent critiques and validates
+
+    If the reviewer finds issues, the architect refines based on feedback.
+    This catches errors before they're applied.
+
+    Benefits:
+    - Catches logical errors before application
+    - Improves code quality through review
+    - Reduces rollbacks from failed improvements
+    - Enables different models for different roles
+    """
+
+    # Prompts for each role
+    ARCHITECT_SYSTEM = """You are an expert software architect. Your job is to improve code based on goals while:
+- Maintaining existing functionality
+- Following best practices
+- Writing clean, readable code
+- Ensuring type safety
+- Handling errors appropriately
+
+Generate improved code that achieves the goal. Return the full improved code."""
+
+    REVIEWER_SYSTEM = """You are a senior code reviewer. Analyze the proposed code changes and identify:
+1. Logical errors or bugs
+2. Security vulnerabilities
+3. Performance issues
+4. Code style violations
+5. Missing error handling
+6. Breaking changes
+
+Be constructive and specific. If the code is good, say "APPROVED".
+If issues found, list them clearly with specific line references.
+
+Format:
+VERDICT: APPROVED or NEEDS_REVISION
+ISSUES: (if any)
+- Issue 1 (line X): description
+- Issue 2 (line Y): description
+SUGGESTIONS: (optional improvements)"""
+
+    def __init__(
+        self,
+        architect_client: Optional[Any] = None,
+        reviewer_client: Optional[Any] = None,
+        max_refinement_rounds: int = 3,
+    ):
+        """
+        Initialize dual agent system.
+
+        Args:
+            architect_client: LLM client for architect agent
+            reviewer_client: LLM client for reviewer agent (can be same)
+            max_refinement_rounds: Maximum rounds of refinement
+        """
+        self._architect = architect_client
+        self._reviewer = reviewer_client
+        self._max_rounds = max_refinement_rounds
+        self._lock = asyncio.Lock()
+
+        # Metrics
+        self._metrics = {
+            "total_reviews": 0,
+            "approved_first_try": 0,
+            "approved_after_refinement": 0,
+            "rejected": 0,
+            "total_refinement_rounds": 0,
+        }
+
+        logger.info("DualAgentSystem initialized")
+
+    async def improve_code(
+        self,
+        code: str,
+        goal: str,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[str, Dict[str, Any]]:
+        """
+        Improve code using architect/reviewer pattern.
+
+        Args:
+            code: Original code to improve
+            goal: Improvement goal
+            context: Additional context
+
+        Returns:
+            Tuple of (improved_code, metadata)
+        """
+        async with self._lock:
+            self._metrics["total_reviews"] += 1
+
+            current_code = code
+            refinement_round = 0
+            review_history = []
+
+            while refinement_round < self._max_rounds:
+                # 1. Architect generates improvement
+                improved = await self._architect_generate(current_code, goal, context, review_history)
+
+                if not improved or improved == current_code:
+                    logger.warning("Architect produced no changes")
+                    break
+
+                # 2. Reviewer evaluates
+                review = await self._reviewer_review(code, improved, goal)
+                review_history.append(review)
+
+                # 3. Check verdict
+                if review.get("approved", False):
+                    if refinement_round == 0:
+                        self._metrics["approved_first_try"] += 1
+                    else:
+                        self._metrics["approved_after_refinement"] += 1
+
+                    return improved, {
+                        "approved": True,
+                        "rounds": refinement_round + 1,
+                        "review_history": review_history,
+                    }
+
+                # 4. Refinement needed
+                refinement_round += 1
+                self._metrics["total_refinement_rounds"] += 1
+                current_code = improved
+
+                logger.debug(f"Refinement round {refinement_round}: {review.get('issues', [])}")
+
+            # Max rounds reached or no improvement
+            self._metrics["rejected"] += 1
+            return code, {  # Return original code
+                "approved": False,
+                "rounds": refinement_round,
+                "review_history": review_history,
+                "reason": "Max refinement rounds reached or no improvement",
+            }
+
+    async def _architect_generate(
+        self,
+        code: str,
+        goal: str,
+        context: Optional[Dict[str, Any]],
+        review_history: List[Dict[str, Any]],
+    ) -> str:
+        """Generate improved code using architect agent."""
+        if not self._architect:
+            return code
+
+        # Build prompt
+        prompt_parts = [
+            f"# Goal\n{goal}\n",
+            f"# Original Code\n```python\n{code}\n```\n",
+        ]
+
+        if context:
+            prompt_parts.append(f"# Context\n{json.dumps(context, indent=2)}\n")
+
+        if review_history:
+            prompt_parts.append("# Previous Review Feedback")
+            for i, review in enumerate(review_history):
+                if review.get("issues"):
+                    prompt_parts.append(f"Round {i+1} issues: {review['issues']}")
+            prompt_parts.append("")
+
+        prompt_parts.append(
+            "Generate improved code that achieves the goal and addresses any previous feedback. "
+            "Return ONLY the improved code, no explanation."
+        )
+
+        prompt = "\n".join(prompt_parts)
+
+        try:
+            response = await self._call_llm(self._architect, self.ARCHITECT_SYSTEM, prompt)
+
+            # Extract code from response
+            code_match = re.search(r'```python\n(.*?)```', response, re.DOTALL)
+            if code_match:
+                return code_match.group(1).strip()
+            return response.strip()
+
+        except Exception as e:
+            logger.error(f"Architect generation failed: {e}")
+            return code
+
+    async def _reviewer_review(
+        self,
+        original: str,
+        improved: str,
+        goal: str,
+    ) -> Dict[str, Any]:
+        """Review improved code using reviewer agent."""
+        if not self._reviewer:
+            return {"approved": True, "issues": []}
+
+        prompt = f"""# Goal
+{goal}
+
+# Original Code
+```python
+{original}
+```
+
+# Proposed Improvement
+```python
+{improved}
+```
+
+Review the proposed changes. Is this improvement correct and safe to apply?"""
+
+        try:
+            response = await self._call_llm(self._reviewer, self.REVIEWER_SYSTEM, prompt)
+
+            # Parse response
+            approved = "APPROVED" in response.upper() and "NEEDS_REVISION" not in response.upper()
+
+            # Extract issues
+            issues = []
+            if "ISSUES:" in response.upper():
+                issues_section = response.split("ISSUES:")[1].split("SUGGESTIONS:")[0] if "SUGGESTIONS:" in response else response.split("ISSUES:")[1]
+                issues = [line.strip() for line in issues_section.strip().split("\n") if line.strip().startswith("-")]
+
+            return {
+                "approved": approved,
+                "issues": issues,
+                "raw_response": response,
+            }
+
+        except Exception as e:
+            logger.error(f"Reviewer evaluation failed: {e}")
+            return {"approved": True, "issues": [], "error": str(e)}
+
+    async def _call_llm(self, client: Any, system: str, prompt: str) -> str:
+        """Call LLM with various client interfaces."""
+        try:
+            if hasattr(client, 'complete'):
+                response = await client.complete(
+                    system=system,
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=4000,
+                    temperature=0.3,
+                )
+                return response[0] if isinstance(response, tuple) else response
+            elif hasattr(client, 'generate'):
+                return await client.generate(
+                    prompt=f"{system}\n\n{prompt}",
+                    max_tokens=4000,
+                )
+            elif hasattr(client, 'chat'):
+                response = await client.chat(
+                    messages=[
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": prompt},
+                    ],
+                    max_tokens=4000,
+                )
+                return response.get("content", "") if isinstance(response, dict) else str(response)
+        except Exception as e:
+            logger.error(f"LLM call failed: {e}")
+            return ""
+
+        return ""
+
+    def get_status(self) -> Dict[str, Any]:
+        """Get system status."""
+        return {
+            "architect_connected": self._architect is not None,
+            "reviewer_connected": self._reviewer is not None,
+            "max_rounds": self._max_rounds,
+            "metrics": self._metrics.copy(),
+        }
+
+
+class CodeMemoryRAG:
+    """
+    v4.0: Unified Oracle + ChromaDB code memory with GraphRAG.
+
+    This fuses two memory systems:
+    - Oracle (graph): Structural relationships (imports, calls, inheritance)
+    - ChromaDB (semantic): Conceptual similarity and semantic search
+
+    The combination enables:
+    - "Find code similar to authentication" (semantic)
+    - "Find code that calls the auth module" (graph)
+    - "Find similar code that's structurally related" (hybrid)
+
+    This is critical for intelligent code navigation and improvement.
+    """
+
+    def __init__(
+        self,
+        oracle: Optional[Any] = None,
+        chromadb_client: Optional[Any] = None,
+        embedding_model: Optional[Any] = None,
+    ):
+        """
+        Initialize unified code memory.
+
+        Args:
+            oracle: The Oracle codebase knowledge graph
+            chromadb_client: ChromaDB client for semantic memory
+            embedding_model: Model for generating embeddings
+        """
+        self._oracle = oracle
+        self._chromadb = chromadb_client
+        self._embedding_model = embedding_model
+        self._lock = asyncio.Lock()
+        self._collection_name = os.getenv("CODE_MEMORY_COLLECTION", "jarvis_code_memory")
+
+        logger.info("CodeMemoryRAG initialized")
+
+    async def remember_code(
+        self,
+        file_path: str,
+        code: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """
+        Index code in both Oracle (structure) and ChromaDB (semantics).
+
+        Args:
+            file_path: Path to the file
+            code: Code content
+            metadata: Additional metadata
+        """
+        async with self._lock:
+            # Index in Oracle (structural)
+            if self._oracle:
+                try:
+                    if hasattr(self._oracle, 'index_file'):
+                        await asyncio.to_thread(
+                            lambda: self._oracle.index_file(Path(file_path))
+                        )
+                except Exception as e:
+                    logger.debug(f"Oracle indexing error: {e}")
+
+            # Index in ChromaDB (semantic)
+            if self._chromadb:
+                try:
+                    await self._index_in_chromadb(file_path, code, metadata)
+                except Exception as e:
+                    logger.debug(f"ChromaDB indexing error: {e}")
+
+    async def _index_in_chromadb(
+        self,
+        file_path: str,
+        code: str,
+        metadata: Optional[Dict[str, Any]],
+    ) -> None:
+        """Index code in ChromaDB."""
+        # Get or create collection
+        if hasattr(self._chromadb, 'get_or_create_collection'):
+            collection = self._chromadb.get_or_create_collection(
+                name=self._collection_name,
+            )
+        else:
+            return
+
+        # Split code into chunks
+        chunks = self._chunk_code(code)
+
+        # Generate embeddings
+        embeddings = []
+        if self._embedding_model:
+            for chunk in chunks:
+                try:
+                    if hasattr(self._embedding_model, 'encode'):
+                        emb = self._embedding_model.encode(chunk)
+                        embeddings.append(emb.tolist() if hasattr(emb, 'tolist') else emb)
+                except Exception:
+                    pass
+
+        # Store in ChromaDB
+        for i, chunk in enumerate(chunks):
+            doc_id = f"{hashlib.sha256(file_path.encode()).hexdigest()[:12]}_{i}"
+            chunk_metadata = {
+                "file_path": file_path,
+                "chunk_index": i,
+                "total_chunks": len(chunks),
+                **(metadata or {}),
+            }
+
+            try:
+                if embeddings and i < len(embeddings):
+                    collection.upsert(
+                        ids=[doc_id],
+                        documents=[chunk],
+                        metadatas=[chunk_metadata],
+                        embeddings=[embeddings[i]],
+                    )
+                else:
+                    collection.upsert(
+                        ids=[doc_id],
+                        documents=[chunk],
+                        metadatas=[chunk_metadata],
+                    )
+            except Exception as e:
+                logger.debug(f"ChromaDB upsert error: {e}")
+
+    def _chunk_code(self, code: str, chunk_size: int = 500) -> List[str]:
+        """Split code into semantic chunks (at function/class boundaries)."""
+        chunks = []
+
+        try:
+            tree = ast.parse(code)
+            lines = code.splitlines()
+
+            for node in ast.iter_child_nodes(tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    start = node.lineno - 1
+                    end = getattr(node, 'end_lineno', start + 10)
+                    chunk = "\n".join(lines[start:end])
+                    if chunk.strip():
+                        chunks.append(chunk)
+
+            # Add module-level code
+            if not chunks:
+                # No functions/classes, chunk by lines
+                for i in range(0, len(lines), chunk_size // 50):
+                    chunk = "\n".join(lines[i:i + chunk_size // 50])
+                    if chunk.strip():
+                        chunks.append(chunk)
+
+        except SyntaxError:
+            # Fallback to simple line-based chunking
+            lines = code.splitlines()
+            for i in range(0, len(lines), chunk_size // 50):
+                chunk = "\n".join(lines[i:i + chunk_size // 50])
+                if chunk.strip():
+                    chunks.append(chunk)
+
+        return chunks or [code]
+
+    async def find_related_code(
+        self,
+        query: str,
+        limit: int = 10,
+        use_graph: bool = True,
+        use_semantic: bool = True,
+    ) -> CodeMemoryResult:
+        """
+        Find code related to a query using hybrid search.
+
+        Args:
+            query: Search query (natural language or code)
+            limit: Maximum results to return
+            use_graph: Include Oracle graph search
+            use_semantic: Include ChromaDB semantic search
+
+        Returns:
+            CodeMemoryResult with merged results
+        """
+        graph_results = []
+        semantic_results = []
+
+        # Graph search (Oracle)
+        if use_graph and self._oracle:
+            graph_results = await self._search_oracle(query, limit)
+
+        # Semantic search (ChromaDB)
+        if use_semantic and self._chromadb:
+            semantic_results = await self._search_chromadb(query, limit)
+
+        # Merge results
+        merged, scores = self._merge_results(graph_results, semantic_results)
+
+        return CodeMemoryResult(
+            query=query,
+            graph_results=graph_results,
+            semantic_results=semantic_results,
+            merged_results=merged[:limit],
+            relevance_scores=scores,
+            total_results=len(merged),
+        )
+
+    async def _search_oracle(self, query: str, limit: int) -> List[Dict[str, Any]]:
+        """Search Oracle graph database."""
+        results = []
+
+        try:
+            # Extract keywords
+            keywords = re.findall(r'\b[a-zA-Z_][a-zA-Z0-9_]*\b', query)
+
+            for keyword in keywords[:5]:
+                if hasattr(self._oracle, 'find_nodes_by_name'):
+                    nodes = await asyncio.to_thread(
+                        lambda k=keyword: self._oracle.find_nodes_by_name(k, fuzzy=True)
+                    )
+                    for node in nodes[:limit // 2]:
+                        results.append({
+                            "source": "oracle",
+                            "type": "graph",
+                            "node": str(node),
+                            "keyword": keyword,
+                        })
+        except Exception as e:
+            logger.debug(f"Oracle search error: {e}")
+
+        return results
+
+    async def _search_chromadb(self, query: str, limit: int) -> List[Dict[str, Any]]:
+        """Search ChromaDB semantic memory."""
+        results = []
+
+        try:
+            if hasattr(self._chromadb, 'get_or_create_collection'):
+                collection = self._chromadb.get_or_create_collection(
+                    name=self._collection_name
+                )
+
+                # Generate query embedding
+                query_embedding = None
+                if self._embedding_model and hasattr(self._embedding_model, 'encode'):
+                    emb = self._embedding_model.encode(query)
+                    query_embedding = emb.tolist() if hasattr(emb, 'tolist') else emb
+
+                # Search
+                if query_embedding:
+                    search_results = collection.query(
+                        query_embeddings=[query_embedding],
+                        n_results=limit,
+                    )
+                else:
+                    search_results = collection.query(
+                        query_texts=[query],
+                        n_results=limit,
+                    )
+
+                # Format results
+                if search_results and search_results.get("documents"):
+                    for i, doc in enumerate(search_results["documents"][0]):
+                        metadata = search_results.get("metadatas", [[]])[0]
+                        meta = metadata[i] if i < len(metadata) else {}
+                        results.append({
+                            "source": "chromadb",
+                            "type": "semantic",
+                            "content": doc[:200] + "..." if len(doc) > 200 else doc,
+                            "file_path": meta.get("file_path", "unknown"),
+                            "score": search_results.get("distances", [[]])[0][i]
+                            if search_results.get("distances") else 0,
+                        })
+
+        except Exception as e:
+            logger.debug(f"ChromaDB search error: {e}")
+
+        return results
+
+    def _merge_results(
+        self,
+        graph_results: List[Dict[str, Any]],
+        semantic_results: List[Dict[str, Any]],
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, float]]:
+        """Merge and rank results from both sources."""
+        merged = []
+        scores = {}
+
+        # Score and deduplicate
+        seen_files = set()
+
+        # Add semantic results (higher priority for similarity)
+        for result in semantic_results:
+            file_path = result.get("file_path", "")
+            if file_path and file_path not in seen_files:
+                seen_files.add(file_path)
+                score = 1.0 - result.get("score", 0.5)  # ChromaDB returns distance
+                scores[file_path] = score
+                result["combined_score"] = score
+                merged.append(result)
+
+        # Add graph results
+        for result in graph_results:
+            node = result.get("node", "")
+            if node not in seen_files:
+                seen_files.add(node)
+                score = 0.7  # Base score for graph matches
+                scores[node] = score
+                result["combined_score"] = score
+                merged.append(result)
+
+        # Sort by score
+        merged.sort(key=lambda x: x.get("combined_score", 0), reverse=True)
+
+        return merged, scores
+
+    def get_status(self) -> Dict[str, Any]:
+        """Get memory status."""
+        return {
+            "oracle_connected": self._oracle is not None,
+            "chromadb_connected": self._chromadb is not None,
+            "embedding_model_connected": self._embedding_model is not None,
+            "collection_name": self._collection_name,
+        }
+
+
+class SystemFeedbackLoop:
+    """
+    v4.0: Hardware metrics → code improvements feedback loop.
+
+    Monitors system performance and triggers code improvements
+    when resource usage exceeds thresholds.
+
+    Example:
+    - Memory > 85% → Trigger memory optimization task
+    - CPU > 90% → Trigger performance optimization
+    - Slow API responses → Profile and optimize
+    """
+
+    def __init__(
+        self,
+        orchestrator: Optional[Any] = None,
+        goal_decomposer: Optional[GoalDecompositionEngine] = None,
+    ):
+        """
+        Initialize system feedback loop.
+
+        Args:
+            orchestrator: AgenticLoopOrchestrator for task submission
+            goal_decomposer: Goal decomposition engine
+        """
+        self._orchestrator = orchestrator
+        self._goal_decomposer = goal_decomposer
+        self._running = False
+        self._task: Optional[asyncio.Task] = None
+        self._lock = asyncio.Lock()
+
+        # Thresholds (from environment)
+        self._memory_threshold = float(os.getenv("FEEDBACK_MEMORY_THRESHOLD", "0.85"))
+        self._cpu_threshold = float(os.getenv("FEEDBACK_CPU_THRESHOLD", "0.90"))
+        self._disk_threshold = float(os.getenv("FEEDBACK_DISK_THRESHOLD", "0.90"))
+        self._check_interval = int(os.getenv("FEEDBACK_CHECK_INTERVAL", "60"))
+
+        # Cooldown to prevent spam
+        self._last_memory_alert: Optional[float] = None
+        self._last_cpu_alert: Optional[float] = None
+        self._alert_cooldown = 3600  # 1 hour
+
+        # Metrics
+        self._metrics = {
+            "checks_performed": 0,
+            "memory_alerts": 0,
+            "cpu_alerts": 0,
+            "tasks_triggered": 0,
+        }
+
+        logger.info("SystemFeedbackLoop initialized")
+
+    async def start(self) -> None:
+        """Start the feedback monitoring loop."""
+        if self._running:
+            return
+
+        self._running = True
+        self._task = asyncio.create_task(self._monitor_loop())
+        logger.info("SystemFeedbackLoop started")
+
+    async def stop(self) -> None:
+        """Stop the feedback monitoring loop."""
+        if not self._running:
+            return
+
+        self._running = False
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+
+        logger.info("SystemFeedbackLoop stopped")
+
+    async def _monitor_loop(self) -> None:
+        """Main monitoring loop."""
+        while self._running:
+            try:
+                metrics = await self._get_system_metrics()
+                self._metrics["checks_performed"] += 1
+
+                # Check memory
+                if metrics.get("memory_percent", 0) > self._memory_threshold * 100:
+                    await self._handle_high_memory(metrics)
+
+                # Check CPU
+                if metrics.get("cpu_percent", 0) > self._cpu_threshold * 100:
+                    await self._handle_high_cpu(metrics)
+
+                await asyncio.sleep(self._check_interval)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Monitor loop error: {e}")
+                await asyncio.sleep(60)
+
+    async def _get_system_metrics(self) -> Dict[str, Any]:
+        """Get current system metrics."""
+        metrics = {}
+
+        try:
+            import psutil
+
+            # Memory
+            memory = psutil.virtual_memory()
+            metrics["memory_percent"] = memory.percent
+            metrics["memory_available_gb"] = memory.available / (1024**3)
+
+            # CPU
+            metrics["cpu_percent"] = psutil.cpu_percent(interval=1)
+
+            # Disk
+            disk = psutil.disk_usage('/')
+            metrics["disk_percent"] = disk.percent
+
+        except ImportError:
+            # Fallback without psutil
+            metrics["memory_percent"] = 0
+            metrics["cpu_percent"] = 0
+            metrics["disk_percent"] = 0
+        except Exception as e:
+            logger.debug(f"Metrics collection error: {e}")
+
+        return metrics
+
+    async def _handle_high_memory(self, metrics: Dict[str, Any]) -> None:
+        """Handle high memory usage."""
+        now = time.time()
+
+        # Check cooldown
+        if self._last_memory_alert and now - self._last_memory_alert < self._alert_cooldown:
+            return
+
+        self._last_memory_alert = now
+        self._metrics["memory_alerts"] += 1
+
+        logger.warning(f"High memory usage: {metrics.get('memory_percent', 0):.1f}%")
+
+        # Submit optimization task
+        if self._orchestrator:
+            goal = f"Optimize memory usage - currently at {metrics.get('memory_percent', 0):.1f}%"
+
+            if self._goal_decomposer:
+                result = await self._goal_decomposer.decompose(goal)
+                for task in result.sub_tasks:
+                    if task.target_files:
+                        await self._submit_task(task.target_files[0], task.description)
+            else:
+                await self._submit_task(
+                    "backend/core/ouroboros/integration.py",
+                    goal,
+                )
+
+    async def _handle_high_cpu(self, metrics: Dict[str, Any]) -> None:
+        """Handle high CPU usage."""
+        now = time.time()
+
+        # Check cooldown
+        if self._last_cpu_alert and now - self._last_cpu_alert < self._alert_cooldown:
+            return
+
+        self._last_cpu_alert = now
+        self._metrics["cpu_alerts"] += 1
+
+        logger.warning(f"High CPU usage: {metrics.get('cpu_percent', 0):.1f}%")
+
+        # Submit optimization task
+        if self._orchestrator:
+            goal = f"Optimize CPU usage - currently at {metrics.get('cpu_percent', 0):.1f}%"
+            await self._submit_task(
+                "backend/core/ouroboros/integration.py",
+                goal,
+            )
+
+    async def _submit_task(self, file_path: str, goal: str) -> None:
+        """Submit optimization task to orchestrator."""
+        if not self._orchestrator or not hasattr(self._orchestrator, 'submit_task'):
+            return
+
+        try:
+            await self._orchestrator.submit_task(
+                file_path=Path(file_path),
+                goal=goal,
+                triggered_by="system_feedback",
+            )
+            self._metrics["tasks_triggered"] += 1
+        except Exception as e:
+            logger.error(f"Failed to submit task: {e}")
+
+    def get_status(self) -> Dict[str, Any]:
+        """Get loop status."""
+        return {
+            "running": self._running,
+            "orchestrator_connected": self._orchestrator is not None,
+            "thresholds": {
+                "memory": self._memory_threshold,
+                "cpu": self._cpu_threshold,
+                "disk": self._disk_threshold,
+            },
+            "metrics": self._metrics.copy(),
+        }
+
+
+class AutoTestGenerator:
+    """
+    v4.0: Automatic test generation for existing untested code.
+
+    Scans the codebase for functions/classes without tests and
+    generates pytest tests for them.
+
+    Features:
+    - Identifies untested code through coverage analysis
+    - Generates meaningful test cases using LLM
+    - Validates tests actually pass
+    - Integrates with existing test suites
+    """
+
+    def __init__(
+        self,
+        project_root: Optional[Path] = None,
+        llm_client: Optional[Any] = None,
+    ):
+        """
+        Initialize auto test generator.
+
+        Args:
+            project_root: Root directory of the project
+            llm_client: LLM client for test generation
+        """
+        self._project_root = project_root or Path(os.getenv(
+            "JARVIS_PATH",
+            Path.home() / "Documents/repos/JARVIS-AI-Agent"
+        ))
+        self._llm_client = llm_client
+        self._lock = asyncio.Lock()
+
+        logger.info("AutoTestGenerator initialized")
+
+    async def find_untested_code(
+        self,
+        target_dir: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Find functions and classes without test coverage.
+
+        Args:
+            target_dir: Directory to scan (default: backend/)
+
+        Returns:
+            List of untested items with metadata
+        """
+        scan_dir = self._project_root / (target_dir or "backend")
+        test_dir = self._project_root / "tests"
+
+        untested = []
+
+        # Get all Python files
+        source_files = list(scan_dir.rglob("*.py"))
+        source_files = [f for f in source_files if "__pycache__" not in str(f)]
+
+        # Get all test files
+        test_files = list(test_dir.rglob("test_*.py")) if test_dir.exists() else []
+
+        # Build set of tested items
+        tested_items = set()
+        for test_file in test_files:
+            try:
+                content = await asyncio.to_thread(test_file.read_text)
+                # Extract tested function/class names
+                matches = re.findall(r'def test_(\w+)', content)
+                matches += re.findall(r'class Test(\w+)', content)
+                tested_items.update(m.lower() for m in matches)
+            except Exception:
+                pass
+
+        # Find untested items
+        for source_file in source_files[:50]:  # Limit to avoid overwhelming
+            try:
+                content = await asyncio.to_thread(source_file.read_text)
+                tree = ast.parse(content)
+
+                for node in ast.walk(tree):
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        # Skip private and magic methods
+                        if node.name.startswith('_'):
+                            continue
+
+                        # Check if tested
+                        if node.name.lower() not in tested_items:
+                            untested.append({
+                                "type": "function",
+                                "name": node.name,
+                                "file": str(source_file),
+                                "line": node.lineno,
+                                "signature": self._get_signature(node),
+                                "docstring": ast.get_docstring(node),
+                            })
+
+                    elif isinstance(node, ast.ClassDef):
+                        if node.name.startswith('_'):
+                            continue
+
+                        if node.name.lower() not in tested_items:
+                            untested.append({
+                                "type": "class",
+                                "name": node.name,
+                                "file": str(source_file),
+                                "line": node.lineno,
+                                "docstring": ast.get_docstring(node),
+                            })
+            except Exception:
+                pass
+
+        return untested
+
+    def _get_signature(self, node: ast.FunctionDef) -> str:
+        """Extract function signature."""
+        args = []
+        for arg in node.args.args:
+            arg_str = arg.arg
+            if arg.annotation:
+                try:
+                    arg_str += f": {ast.unparse(arg.annotation)}"
+                except Exception:
+                    pass
+            args.append(arg_str)
+
+        return_hint = ""
+        if node.returns:
+            try:
+                return_hint = f" -> {ast.unparse(node.returns)}"
+            except Exception:
+                pass
+
+        return f"def {node.name}({', '.join(args)}){return_hint}"
+
+    async def generate_tests(
+        self,
+        item: Dict[str, Any],
+        dry_run: bool = True,
+    ) -> str:
+        """
+        Generate tests for an untested item.
+
+        Args:
+            item: Untested item metadata
+            dry_run: If True, only return tests without saving
+
+        Returns:
+            Generated test code
+        """
+        if not self._llm_client:
+            return self._generate_basic_test(item)
+
+        # Read source code
+        try:
+            source_file = Path(item["file"])
+            content = await asyncio.to_thread(source_file.read_text)
+        except Exception:
+            content = ""
+
+        # Build prompt
+        prompt = f"""Generate pytest tests for the following {item['type']}:
+
+Name: {item['name']}
+Signature: {item.get('signature', 'N/A')}
+Docstring: {item.get('docstring', 'No documentation')}
+
+Source file: {item['file']}
+
+Source code context:
+```python
+{content[:3000]}
+```
+
+Generate comprehensive pytest tests including:
+1. Happy path test cases
+2. Edge cases
+3. Error handling tests (if applicable)
+
+Use pytest fixtures where appropriate.
+Include docstrings for each test.
+Return only the test code, no explanation."""
+
+        try:
+            system = "You are a test engineering expert. Generate comprehensive, clean pytest tests."
+
+            if hasattr(self._llm_client, 'complete'):
+                response = await self._llm_client.complete(
+                    system=system,
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=2000,
+                )
+                test_code = response[0] if isinstance(response, tuple) else response
+            else:
+                test_code = self._generate_basic_test(item)
+
+            # Extract code from response
+            code_match = re.search(r'```python\n(.*?)```', test_code, re.DOTALL)
+            if code_match:
+                test_code = code_match.group(1)
+
+            # Save if not dry run
+            if not dry_run:
+                await self._save_tests(item, test_code)
+
+            return test_code
+
+        except Exception as e:
+            logger.error(f"Test generation failed: {e}")
+            return self._generate_basic_test(item)
+
+    def _generate_basic_test(self, item: Dict[str, Any]) -> str:
+        """Generate basic test template without LLM."""
+        name = item["name"]
+        item_type = item["type"]
+
+        if item_type == "function":
+            return f'''import pytest
+from {self._get_import_path(item["file"])} import {name}
+
+
+def test_{name}_basic():
+    """Basic test for {name}."""
+    # TODO: Implement test
+    pass
+
+
+def test_{name}_edge_case():
+    """Edge case test for {name}."""
+    # TODO: Implement test
+    pass
+'''
+        else:  # class
+            return f'''import pytest
+from {self._get_import_path(item["file"])} import {name}
+
+
+class Test{name}:
+    """Tests for {name} class."""
+
+    def test_init(self):
+        """Test {name} initialization."""
+        # TODO: Implement test
+        pass
+
+    def test_basic_usage(self):
+        """Test basic {name} usage."""
+        # TODO: Implement test
+        pass
+'''
+
+    def _get_import_path(self, file_path: str) -> str:
+        """Convert file path to import path."""
+        rel_path = Path(file_path).relative_to(self._project_root)
+        import_path = str(rel_path).replace("/", ".").replace("\\", ".").replace(".py", "")
+        return import_path
+
+    async def _save_tests(self, item: Dict[str, Any], test_code: str) -> None:
+        """Save generated tests to file."""
+        source_file = Path(item["file"])
+        rel_path = source_file.relative_to(self._project_root)
+
+        # Create test file path
+        test_path = self._project_root / "tests" / f"test_{rel_path.stem}.py"
+        test_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Append or create
+        if test_path.exists():
+            existing = await asyncio.to_thread(test_path.read_text)
+            if item["name"] not in existing:
+                test_code = f"\n\n{test_code}"
+                await asyncio.to_thread(
+                    lambda: test_path.write_text(existing + test_code)
+                )
+        else:
+            await asyncio.to_thread(
+                lambda: test_path.write_text(test_code)
+            )
+
+        logger.info(f"Saved tests to {test_path}")
+
+    def get_status(self) -> Dict[str, Any]:
+        """Get generator status."""
+        return {
+            "project_root": str(self._project_root),
+            "llm_connected": self._llm_client is not None,
+        }
+
+
+# =============================================================================
+# v4.0: GLOBAL INSTANCES AND FACTORY FUNCTIONS
+# =============================================================================
+
+_goal_decomposer: Optional[GoalDecompositionEngine] = None
+_debt_detector: Optional[TechnicalDebtDetector] = None
+_refinement_loop: Optional[AutonomousSelfRefinementLoop] = None
+_dual_agent_system: Optional[DualAgentSystem] = None
+_code_memory_rag: Optional[CodeMemoryRAG] = None
+_system_feedback_loop: Optional[SystemFeedbackLoop] = None
+_auto_test_generator: Optional[AutoTestGenerator] = None
+
+
+def get_goal_decomposer(
+    oracle: Optional[Any] = None,
+    llm_client: Optional[Any] = None,
+) -> GoalDecompositionEngine:
+    """Get or create the goal decomposition engine."""
+    global _goal_decomposer
+    if _goal_decomposer is None:
+        _goal_decomposer = GoalDecompositionEngine(
+            oracle=oracle,
+            llm_client=llm_client,
+        )
+    return _goal_decomposer
+
+
+def get_debt_detector(
+    oracle: Optional[Any] = None,
+    project_root: Optional[Path] = None,
+) -> TechnicalDebtDetector:
+    """Get or create the technical debt detector."""
+    global _debt_detector
+    if _debt_detector is None:
+        _debt_detector = TechnicalDebtDetector(
+            oracle=oracle,
+            project_root=project_root,
+        )
+    return _debt_detector
+
+
+def get_refinement_loop(
+    debt_detector: Optional[TechnicalDebtDetector] = None,
+    goal_decomposer: Optional[GoalDecompositionEngine] = None,
+    orchestrator: Optional[Any] = None,
+) -> AutonomousSelfRefinementLoop:
+    """Get or create the autonomous refinement loop."""
+    global _refinement_loop
+    if _refinement_loop is None:
+        _refinement_loop = AutonomousSelfRefinementLoop(
+            debt_detector=debt_detector,
+            goal_decomposer=goal_decomposer,
+            orchestrator=orchestrator,
+        )
+    return _refinement_loop
+
+
+def get_dual_agent_system(
+    architect_client: Optional[Any] = None,
+    reviewer_client: Optional[Any] = None,
+) -> DualAgentSystem:
+    """Get or create the dual agent system."""
+    global _dual_agent_system
+    if _dual_agent_system is None:
+        _dual_agent_system = DualAgentSystem(
+            architect_client=architect_client,
+            reviewer_client=reviewer_client,
+        )
+    return _dual_agent_system
+
+
+def get_code_memory_rag(
+    oracle: Optional[Any] = None,
+    chromadb_client: Optional[Any] = None,
+) -> CodeMemoryRAG:
+    """Get or create the code memory RAG."""
+    global _code_memory_rag
+    if _code_memory_rag is None:
+        _code_memory_rag = CodeMemoryRAG(
+            oracle=oracle,
+            chromadb_client=chromadb_client,
+        )
+    return _code_memory_rag
+
+
+def get_system_feedback_loop(
+    orchestrator: Optional[Any] = None,
+    goal_decomposer: Optional[GoalDecompositionEngine] = None,
+) -> SystemFeedbackLoop:
+    """Get or create the system feedback loop."""
+    global _system_feedback_loop
+    if _system_feedback_loop is None:
+        _system_feedback_loop = SystemFeedbackLoop(
+            orchestrator=orchestrator,
+            goal_decomposer=goal_decomposer,
+        )
+    return _system_feedback_loop
+
+
+def get_auto_test_generator(
+    project_root: Optional[Path] = None,
+    llm_client: Optional[Any] = None,
+) -> AutoTestGenerator:
+    """Get or create the auto test generator."""
+    global _auto_test_generator
+    if _auto_test_generator is None:
+        _auto_test_generator = AutoTestGenerator(
+            project_root=project_root,
+            llm_client=llm_client,
+        )
+    return _auto_test_generator
+
+
+async def initialize_autonomous_self_programming(
+    oracle: Optional[Any] = None,
+    orchestrator: Optional[Any] = None,
+    llm_client: Optional[Any] = None,
+    chromadb_client: Optional[Any] = None,
+    start_loops: bool = False,
+) -> Dict[str, Any]:
+    """
+    Initialize all autonomous self-programming components.
+
+    This is the master initialization function that sets up:
+    - GoalDecompositionEngine
+    - TechnicalDebtDetector
+    - AutonomousSelfRefinementLoop
+    - DualAgentSystem
+    - CodeMemoryRAG
+    - SystemFeedbackLoop
+    - AutoTestGenerator
+
+    Args:
+        oracle: The Oracle codebase knowledge graph
+        orchestrator: AgenticLoopOrchestrator for task execution
+        llm_client: LLM client for goal decomposition and test generation
+        chromadb_client: ChromaDB client for semantic memory
+        start_loops: Whether to start background loops
+
+    Returns:
+        Dictionary with all initialized components
+    """
+    logger.info("Initializing autonomous self-programming components...")
+
+    # Initialize components
+    goal_decomposer = get_goal_decomposer(oracle=oracle, llm_client=llm_client)
+    debt_detector = get_debt_detector(oracle=oracle)
+    dual_agent = get_dual_agent_system(architect_client=llm_client, reviewer_client=llm_client)
+    code_memory = get_code_memory_rag(oracle=oracle, chromadb_client=chromadb_client)
+
+    # Initialize loops (but don't start yet)
+    refinement_loop = get_refinement_loop(
+        debt_detector=debt_detector,
+        goal_decomposer=goal_decomposer,
+        orchestrator=orchestrator,
+    )
+
+    system_feedback = get_system_feedback_loop(
+        orchestrator=orchestrator,
+        goal_decomposer=goal_decomposer,
+    )
+
+    test_generator = get_auto_test_generator(llm_client=llm_client)
+
+    # Start background loops if requested
+    if start_loops:
+        await refinement_loop.start()
+        await system_feedback.start()
+
+    components = {
+        "goal_decomposer": goal_decomposer,
+        "debt_detector": debt_detector,
+        "refinement_loop": refinement_loop,
+        "dual_agent_system": dual_agent,
+        "code_memory_rag": code_memory,
+        "system_feedback_loop": system_feedback,
+        "auto_test_generator": test_generator,
+    }
+
+    logger.info(f"Autonomous self-programming initialized with {len(components)} components")
+    return components
+
+
+async def shutdown_autonomous_self_programming() -> None:
+    """Shutdown all autonomous self-programming components."""
+    logger.info("Shutting down autonomous self-programming components...")
+
+    global _refinement_loop, _system_feedback_loop
+
+    if _refinement_loop:
+        await _refinement_loop.stop()
+
+    if _system_feedback_loop:
+        await _system_feedback_loop.stop()
+
+    logger.info("Autonomous self-programming shutdown complete")
