@@ -229,6 +229,7 @@ class GCPHybridPrimeRouter:
 
         if self._use_resilience and CrossRepoCircuitBreaker:
             self._circuit_breaker = CrossRepoCircuitBreaker(
+                name="gcp_hybrid_prime_router",
                 config=CircuitBreakerConfig(
                     failure_threshold=3,
                     timeout_seconds=60.0,  # v2.1: Fixed - was 'recovery_timeout' which doesn't exist

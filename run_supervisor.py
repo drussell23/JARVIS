@@ -559,6 +559,37 @@ except ImportError as e:
     ResourceUsage = None
 
 
+# =============================================================================
+# v16.0: OPTIONAL DEPENDENCY MANAGER - Centralized ML Dependency Checking
+# =============================================================================
+# Provides thread-safe, cached checking of optional dependencies (PyTorch,
+# CoreML, etc.) with consolidated logging to avoid warning spam.
+# =============================================================================
+_OPTIONAL_DEPS_AVAILABLE = False
+try:
+    from backend.core.optional_dependencies import (
+        get_dependency_manager,
+        log_dependency_status,
+        is_torch_available,
+        is_coreml_available,
+        get_ml_capabilities,
+    )
+    _OPTIONAL_DEPS_AVAILABLE = True
+except ImportError as e:
+    print(f"[INFO] Optional dependency manager not available: {e}")
+    # Provide stubs
+    def get_dependency_manager():
+        return None
+    def log_dependency_status():
+        pass
+    def is_torch_available():
+        return False
+    def is_coreml_available():
+        return False
+    def get_ml_capabilities():
+        return {"ml_available": False, "gpu_available": False}
+
+
 # v91.0: Lazy psutil import for process health monitoring
 _psutil_cache = None
 
@@ -3668,6 +3699,26 @@ class SupervisorBootstrapper:
                 self.logger.warning(f"[v91] Could not initialize advanced primitives: {e}")
                 import traceback
                 self.logger.debug(f"[v91] Traceback: {traceback.format_exc()}")
+
+        # v16.0: Log optional dependency status (consolidated, cached)
+        # This provides a single summary log instead of scattered warnings
+        if _OPTIONAL_DEPS_AVAILABLE:
+            try:
+                log_dependency_status()
+                # Also store capabilities for later reference
+                self._ml_capabilities = get_ml_capabilities()
+                if self._ml_capabilities.get("ml_available"):
+                    gpu_type = (
+                        "MPS" if self._ml_capabilities.get("mps_available") else
+                        "CUDA" if self._ml_capabilities.get("cuda_available") else
+                        "CPU"
+                    )
+                    self.logger.info(f"[v16.0] ML Runtime: {gpu_type}")
+            except Exception as e:
+                self.logger.debug(f"[v16.0] Dependency status logging skipped: {e}")
+                self._ml_capabilities = {"ml_available": False, "gpu_available": False}
+        else:
+            self._ml_capabilities = {"ml_available": False, "gpu_available": False}
 
         self._model_download_in_progress = False
 

@@ -1005,6 +1005,7 @@ from backend.core.resilience.cross_repo_circuit_breaker import (
 )
 
 breaker = CrossRepoCircuitBreaker(
+    name="my_circuit_breaker",
     config=CircuitBreakerConfig(
         failure_threshold=3,        # Open after 3 failures
         success_threshold=2,        # Close after 2 successes in half-open

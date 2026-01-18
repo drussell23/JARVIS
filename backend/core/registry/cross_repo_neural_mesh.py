@@ -296,6 +296,7 @@ class CrossRepoNeuralMeshBridge:
 
         # Circuit breaker for external operations
         self._circuit_breaker = CrossRepoCircuitBreaker(
+            name="cross_repo_neural_mesh",
             config=CircuitBreakerConfig(
                 failure_threshold=5,
                 timeout_seconds=30.0,  # v2.1: Fixed - was 'recovery_timeout' which doesn't exist

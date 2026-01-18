@@ -16,7 +16,17 @@ __all__ = [
     "TaskType",
     "TaskAnalysis",
     "JARVISCore",
-    "JARVISAssistant"
+    "JARVISAssistant",
+    # v16.0: Optional Dependency Manager
+    "OptionalDependencyManager",
+    "get_dependency_manager",
+    "is_torch_available",
+    "is_coreml_available",
+    "is_mlx_available",
+    "is_transformers_available",
+    "is_gpu_available",
+    "get_ml_capabilities",
+    "log_dependency_status",
 ]
 
 __version__ = "2.0.0"
@@ -40,6 +50,16 @@ _lazy_modules = {
     "TaskAnalysis": (".task_router", "TaskAnalysis"),
     "JARVISCore": (".jarvis_core", "JARVISCore"),
     "JARVISAssistant": (".jarvis_core", "JARVISAssistant"),
+    # v16.0: Optional Dependency Manager
+    "OptionalDependencyManager": (".optional_dependencies", "OptionalDependencyManager"),
+    "get_dependency_manager": (".optional_dependencies", "get_dependency_manager"),
+    "is_torch_available": (".optional_dependencies", "is_torch_available"),
+    "is_coreml_available": (".optional_dependencies", "is_coreml_available"),
+    "is_mlx_available": (".optional_dependencies", "is_mlx_available"),
+    "is_transformers_available": (".optional_dependencies", "is_transformers_available"),
+    "is_gpu_available": (".optional_dependencies", "is_gpu_available"),
+    "get_ml_capabilities": (".optional_dependencies", "get_ml_capabilities"),
+    "log_dependency_status": (".optional_dependencies", "log_dependency_status"),
 }
 
 _loaded_modules = {}
