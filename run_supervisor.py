@@ -11849,7 +11849,10 @@ class SupervisorBootstrapper:
 
                 # Create ownership engine with environment-driven config
                 config = OwnershipConfig()
-                self._code_ownership_engine = await get_ownership_engine(config)
+                self._code_ownership_engine = get_ownership_engine(config)  # Sync call - no await
+
+                # Initialize the engine (async)
+                await self._code_ownership_engine.initialize()
 
                 # Initialize cross-repo ownership coordination
                 if os.getenv("JARVIS_CROSS_REPO_OWNERSHIP", "true").lower() == "true":
@@ -11888,7 +11891,10 @@ class SupervisorBootstrapper:
 
                 # Create review workflow engine with environment-driven config
                 config = ReviewWorkflowConfig()
-                self._review_workflow_engine = await get_review_workflow_engine(config)
+                self._review_workflow_engine = get_review_workflow_engine(config)  # Sync call - no await
+
+                # Initialize the engine (async)
+                await self._review_workflow_engine.initialize()
 
                 # Initialize cross-repo review coordination
                 if os.getenv("JARVIS_CROSS_REPO_REVIEW", "true").lower() == "true":
@@ -11927,11 +11933,11 @@ class SupervisorBootstrapper:
 
                 # Create LSP server with environment-driven config
                 config = LSPServerConfig()
-                self._lsp_server = await get_lsp_server(config)
+                self._lsp_server = get_lsp_server(config)  # Sync call - no await
 
                 # Start LSP server if auto-start is enabled
                 if os.getenv("JARVIS_LSP_AUTO_START", "false").lower() == "true":
-                    await start_lsp_server(self._lsp_server)
+                    await start_lsp_server()  # No args - uses global server
                     self.logger.info("   • LSP server auto-started")
                 else:
                     self.logger.info("   • LSP server ready (waiting for connection)")
@@ -11964,7 +11970,10 @@ class SupervisorBootstrapper:
 
                 # Create IDE integration engine with environment-driven config
                 config = IDEIntegrationConfig()
-                self._ide_integration_engine = await get_ide_integration_engine(config)
+                self._ide_integration_engine = get_ide_integration_engine(config)  # Sync call - no await
+
+                # Initialize the engine (async)
+                await self._ide_integration_engine.initialize()
 
                 # Initialize cross-repo IDE coordination
                 if os.getenv("JARVIS_CROSS_REPO_IDE", "true").lower() == "true":

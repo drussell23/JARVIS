@@ -1196,11 +1196,22 @@ _ide_engine: Optional[IDEIntegrationEngine] = None
 _cross_repo_coordinator: Optional[CrossRepoIDECoordinator] = None
 
 
-def get_ide_integration_engine() -> IDEIntegrationEngine:
-    """Get the global IDE integration engine."""
+def get_ide_integration_engine(
+    config: Optional[IDEIntegrationConfig] = None
+) -> IDEIntegrationEngine:
+    """
+    Get or create the global IDE integration engine.
+
+    Args:
+        config: Optional configuration. If provided and engine doesn't exist,
+               uses this config. If engine exists, config is ignored.
+
+    Returns:
+        The global IDEIntegrationEngine instance.
+    """
     global _ide_engine
     if _ide_engine is None:
-        _ide_engine = IDEIntegrationEngine()
+        _ide_engine = IDEIntegrationEngine(config=config)
     return _ide_engine
 
 

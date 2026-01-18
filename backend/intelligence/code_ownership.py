@@ -1131,11 +1131,22 @@ _ownership_engine: Optional[CodeOwnershipEngine] = None
 _cross_repo_coordinator: Optional[CrossRepoOwnershipCoordinator] = None
 
 
-def get_ownership_engine() -> CodeOwnershipEngine:
-    """Get the global ownership engine."""
+def get_ownership_engine(
+    config: Optional[OwnershipConfig] = None
+) -> CodeOwnershipEngine:
+    """
+    Get or create the global ownership engine.
+
+    Args:
+        config: Optional configuration. If provided and engine doesn't exist,
+               uses this config. If engine exists, config is ignored.
+
+    Returns:
+        The global CodeOwnershipEngine instance.
+    """
     global _ownership_engine
     if _ownership_engine is None:
-        _ownership_engine = CodeOwnershipEngine()
+        _ownership_engine = CodeOwnershipEngine(config=config)
     return _ownership_engine
 
 

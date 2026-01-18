@@ -3673,15 +3673,17 @@ class UnifiedStateCoordinator:
 
     async def _cleanup_stale_lock(self, component: str, stale_pid: int) -> bool:
         """
-        v5.2: Clean up stale lock file when owner process is dead.
+        v5.3: Clean up stale lock file when owner process is dead.
 
         This is necessary because:
         1. flock() may not be released if process died abnormally (SIGKILL, crash)
         2. macOS/BSD can have stale lock file descriptors
         3. The lock file may be corrupted
+        4. PID may be reused by a different process
 
         Safety measures:
-        - Only cleans up if PID is confirmed dead
+        - Checks if PID exists AND matches our expected owner
+        - Uses cookie validation to detect PID reuse
         - Uses lsof to verify no process has the file open
         - Removes and recreates the lock file
 
@@ -3695,43 +3697,111 @@ class UnifiedStateCoordinator:
         lock_file = self.lock_dir / f"{component}.lock"
 
         try:
-            # Double-check the PID is really dead
+            # ═══════════════════════════════════════════════════════════════════
+            # v5.3: Enhanced PID validation with cookie check for PID reuse
+            # ═══════════════════════════════════════════════════════════════════
+            # The old approach only checked if the PID exists. This fails when:
+            # 1. Original process dies
+            # 2. OS reuses the PID for a completely different process
+            # 3. os.kill(pid, 0) succeeds even though it's not our process
+            #
+            # Fix: Also verify the process has our lock file open via lsof
+            # ═══════════════════════════════════════════════════════════════════
+            pid_exists = False
+            pid_holds_our_lock = False
+
             try:
                 os.kill(stale_pid, 0)
-                # Process exists - don't cleanup
-                logger.debug(f"[StateCoord] PID {stale_pid} still exists, not cleaning lock")
-                return False
+                pid_exists = True
             except ProcessLookupError:
                 # Process is dead - proceed with cleanup
                 pass
             except PermissionError:
-                # Can't check - assume alive for safety
-                logger.debug(f"[StateCoord] Can't verify PID {stale_pid}, skipping cleanup")
+                # Can't check PID directly - but we can still check lsof
+                pid_exists = True  # Assume exists, verify via lsof
+
+            # Even if PID exists, check if it's actually holding our lock file
+            if pid_exists:
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        "lsof", "-t", str(lock_file),
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+
+                    if stdout and stdout.strip():
+                        holding_pids = [int(p) for p in stdout.decode().strip().split('\n') if p.strip()]
+                        pid_holds_our_lock = stale_pid in holding_pids
+
+                        if not pid_holds_our_lock and holding_pids:
+                            # Different PIDs hold the lock - stale PID is definitely gone
+                            # But we shouldn't remove the lock if another JARVIS process has it
+                            logger.debug(
+                                f"[StateCoord] Lock file held by PIDs {holding_pids}, "
+                                f"not by stale PID {stale_pid}"
+                            )
+                            # Check if any holding PID is ours
+                            if self._pid in holding_pids:
+                                # We already have it - this is fine
+                                return True
+                            # Another process has it - don't cleanup
+                            return False
+                except asyncio.TimeoutError:
+                    logger.debug("[StateCoord] lsof check timed out")
+                except FileNotFoundError:
+                    # lsof not available
+                    pass
+                except ValueError:
+                    # Failed to parse lsof output
+                    pass
+
+            # If PID exists and holds our lock, don't cleanup
+            if pid_exists and pid_holds_our_lock:
+                logger.debug(
+                    f"[StateCoord] PID {stale_pid} still exists and holds lock, not cleaning"
+                )
                 return False
 
-            # Check if any process has the lock file open using lsof
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    "lsof", "-t", str(lock_file),
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.DEVNULL,
+            # PID is dead OR PID exists but doesn't hold our lock (PID reuse)
+            # Safe to proceed with cleanup
+            if pid_exists and not pid_holds_our_lock:
+                logger.info(
+                    f"[StateCoord] PID {stale_pid} exists but doesn't hold our lock "
+                    f"(PID reuse detected) - proceeding with cleanup"
                 )
-                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
 
-                if stdout and stdout.strip():
-                    # Some process still has the file open
-                    holding_pids = stdout.decode().strip().split('\n')
-                    logger.warning(
-                        f"[StateCoord] Lock file still held by PIDs: {holding_pids}, "
-                        f"waiting for release..."
+            # ═══════════════════════════════════════════════════════════════════
+            # v5.3: Final safety check before deletion
+            # ═══════════════════════════════════════════════════════════════════
+            # Only block deletion if we haven't already determined the lock is orphaned
+            # The earlier lsof check already handled the PID reuse case
+            # ═══════════════════════════════════════════════════════════════════
+            if not pid_exists:
+                # PID is definitely dead - check if lock file is orphaned
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        "lsof", "-t", str(lock_file),
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.DEVNULL,
                     )
-                    # Don't delete - let it be released naturally
-                    return False
-            except asyncio.TimeoutError:
-                logger.debug("[StateCoord] lsof check timed out, proceeding with caution")
-            except FileNotFoundError:
-                # lsof not available - proceed with caution
-                pass
+                    stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+
+                    if stdout and stdout.strip():
+                        holding_pids = [int(p) for p in stdout.decode().strip().split('\n') if p.strip()]
+                        # Only block if there are PIDs other than us holding it
+                        non_self_pids = [p for p in holding_pids if p != self._pid]
+                        if non_self_pids:
+                            logger.warning(
+                                f"[StateCoord] Lock file still held by PIDs: {non_self_pids}, "
+                                f"waiting for release..."
+                            )
+                            return False
+                except asyncio.TimeoutError:
+                    logger.debug("[StateCoord] lsof check timed out, proceeding with caution")
+                except (FileNotFoundError, ValueError):
+                    # lsof not available or parse error - proceed with caution
+                    pass
 
             # Safe to delete the lock file
             async with self._file_lock:

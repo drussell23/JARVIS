@@ -1325,11 +1325,22 @@ _review_workflow_engine: Optional[ReviewWorkflowEngine] = None
 _cross_repo_coordinator: Optional[CrossRepoReviewCoordinator] = None
 
 
-def get_review_workflow_engine() -> ReviewWorkflowEngine:
-    """Get the global review workflow engine."""
+def get_review_workflow_engine(
+    config: Optional[ReviewWorkflowConfig] = None
+) -> ReviewWorkflowEngine:
+    """
+    Get or create the global review workflow engine.
+
+    Args:
+        config: Optional configuration. If provided and engine doesn't exist,
+               uses this config. If engine exists, config is ignored.
+
+    Returns:
+        The global ReviewWorkflowEngine instance.
+    """
     global _review_workflow_engine
     if _review_workflow_engine is None:
-        _review_workflow_engine = ReviewWorkflowEngine()
+        _review_workflow_engine = ReviewWorkflowEngine(config=config)
     return _review_workflow_engine
 
 

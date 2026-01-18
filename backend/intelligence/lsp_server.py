@@ -1352,11 +1352,22 @@ class JARVISLSPServer:
 _lsp_server: Optional[JARVISLSPServer] = None
 
 
-def get_lsp_server() -> JARVISLSPServer:
-    """Get the global LSP server."""
+def get_lsp_server(
+    config: Optional[LSPServerConfig] = None
+) -> JARVISLSPServer:
+    """
+    Get or create the global LSP server.
+
+    Args:
+        config: Optional configuration. If provided and server doesn't exist,
+               uses this config. If server exists, config is ignored.
+
+    Returns:
+        The global JARVISLSPServer instance.
+    """
     global _lsp_server
     if _lsp_server is None:
-        _lsp_server = JARVISLSPServer()
+        _lsp_server = JARVISLSPServer(config=config)
     return _lsp_server
 
 
