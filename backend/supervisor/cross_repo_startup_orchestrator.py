@@ -682,16 +682,25 @@ class ProcessOrchestrator:
 
                 if healthy:
                     managed.consecutive_failures = 0
+
+                    # Log status transition only once
                     if managed.status != ServiceStatus.HEALTHY:
                         managed.status = ServiceStatus.HEALTHY
                         logger.info(f"✅ {managed.definition.name} is healthy")
 
-                        # Update registry
-                        if self.registry:
-                            await self.registry.heartbeat(
-                                managed.definition.name,
-                                status="healthy"
-                            )
+                    # ═══════════════════════════════════════════════════════════════════
+                    # CRITICAL FIX: Send heartbeat on EVERY successful health check
+                    # ═══════════════════════════════════════════════════════════════════
+                    # Previously: Heartbeat was only sent on status transition to HEALTHY
+                    # This caused services to become "stale" after 60 seconds because
+                    # subsequent heartbeats were never sent once the service was healthy.
+                    # Now: We send heartbeat on every successful check to keep alive.
+                    # ═══════════════════════════════════════════════════════════════════
+                    if self.registry:
+                        await self.registry.heartbeat(
+                            managed.definition.name,
+                            status="healthy"
+                        )
                 else:
                     managed.consecutive_failures += 1
                     logger.warning(

@@ -405,24 +405,68 @@ class VMManagerConfig:
 
     def __post_init__(self):
         """Validate configuration after initialization"""
-        # Only warn about missing project_id if GCP is explicitly enabled
-        if self.enabled and not self.project_id:
-            logger.warning(
-                "⚠️  GCP_ENABLED=true but GCP_PROJECT_ID not set. "
-                "Set via environment variable or provide in config."
-            )
-        elif not self.enabled:
+        # Track validation status for pre-flight checks
+        self._validation_errors: List[str] = []
+
+        if not self.enabled:
             logger.debug("GCP VM Manager disabled (GCP_ENABLED=false or not set)")
             return  # Skip rest of validation if disabled
 
-        # Log configuration summary (only if enabled)
-        if self.enabled:
+        # ═══════════════════════════════════════════════════════════════════════════
+        # CRITICAL: Validate required fields for API calls
+        # ═══════════════════════════════════════════════════════════════════════════
+        if not self.project_id or self.project_id.strip() == "":
+            self._validation_errors.append(
+                "GCP_PROJECT_ID not set - required for VM operations. "
+                "Set via environment variable or GOOGLE_CLOUD_PROJECT."
+            )
+            logger.error(
+                "❌ GCP_ENABLED=true but GCP_PROJECT_ID not set. "
+                "VM creation will be blocked until this is configured."
+            )
+
+        if not self.zone or self.zone.strip() == "":
+            self._validation_errors.append(
+                "GCP_ZONE not set - required for VM operations. "
+                "Set via environment variable (default: us-central1-a)."
+            )
+            logger.error(
+                "❌ GCP_ENABLED=true but GCP_ZONE not set. "
+                "VM creation will be blocked until this is configured."
+            )
+
+        # Log configuration summary (only if enabled and valid)
+        if self.enabled and not self._validation_errors:
             logger.info(f"GCP VM Manager enabled:")
             logger.info(f"  Project: {self.project_id}")
             logger.info(f"  Zone: {self.zone}")
             logger.info(f"  Machine Type: {self.machine_type}")
             logger.info(f"  Use Spot: {self.use_spot}")
             logger.info(f"  Daily Budget: ${self.daily_budget_usd}")
+        elif self._validation_errors:
+            logger.warning(f"GCP VM Manager has {len(self._validation_errors)} configuration error(s)")
+
+    def is_valid_for_vm_operations(self) -> Tuple[bool, str]:
+        """
+        Check if configuration is valid for VM operations.
+
+        Returns:
+            Tuple of (is_valid, error_message)
+        """
+        if not self.enabled:
+            return False, "GCP VM Manager is disabled (GCP_ENABLED=false)"
+
+        if hasattr(self, '_validation_errors') and self._validation_errors:
+            return False, "; ".join(self._validation_errors)
+
+        # Double-check critical fields (defensive)
+        if not self.project_id or self.project_id.strip() == "":
+            return False, "GCP_PROJECT_ID is empty or not set"
+
+        if not self.zone or self.zone.strip() == "":
+            return False, "GCP_ZONE is empty or not set"
+
+        return True, "Configuration valid"
 
     def to_dict(self) -> Dict[str, Any]:
         """Export configuration as dictionary"""
@@ -1050,10 +1094,25 @@ class GCPVMManager:
         if not self.initialized:
             await self.initialize()
 
+        # ═══════════════════════════════════════════════════════════════════════════
+        # PRE-FLIGHT CONFIGURATION VALIDATION
+        # ═══════════════════════════════════════════════════════════════════════════
+        # Ensure project_id and zone are properly configured before making API calls
+        # This prevents cryptic API errors about "missing project/zone fields"
+        # ═══════════════════════════════════════════════════════════════════════════
+        is_valid, validation_error = self.config.is_valid_for_vm_operations()
+        if not is_valid:
+            logger.error(f"❌ VM creation blocked - configuration invalid: {validation_error}")
+            logger.error("   Ensure GCP_PROJECT_ID and GCP_ZONE environment variables are set")
+            self.stats["total_failed"] += 1
+            self.stats["last_error"] = f"Configuration invalid: {validation_error}"
+            self.stats["last_error_time"] = time.time()
+            return None
+
         # Check circuit breaker before attempting
         circuit = self._circuit_breakers["vm_create"]
         can_execute, circuit_reason = circuit.can_execute()
-        
+
         if not can_execute:
             logger.warning(f"🔌 VM creation blocked by circuit breaker: {circuit_reason}")
             self.stats["circuit_breaks"] += 1

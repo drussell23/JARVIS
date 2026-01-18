@@ -11807,7 +11807,10 @@ class SupervisorBootstrapper:
 
                 # Create collaboration engine with environment-driven config
                 config = CollaborationConfig()
-                self._collaboration_engine = await get_collaboration_engine(config)
+                self._collaboration_engine = get_collaboration_engine(config)  # Sync call - no await
+
+                # Initialize the engine (async)
+                await self._collaboration_engine.initialize()
 
                 # Initialize cross-repo collaboration if enabled
                 if os.getenv("JARVIS_CROSS_REPO_COLLAB", "true").lower() == "true":

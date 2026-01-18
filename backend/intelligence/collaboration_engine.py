@@ -1335,11 +1335,24 @@ _collaboration_engine: Optional[CollaborationEngine] = None
 _cross_repo_coordinator: Optional[CrossRepoCollaborationCoordinator] = None
 
 
-def get_collaboration_engine() -> CollaborationEngine:
-    """Get the global collaboration engine."""
+def get_collaboration_engine(
+    config: Optional[CollaborationConfig] = None
+) -> CollaborationEngine:
+    """
+    Get or create the global collaboration engine.
+
+    Args:
+        config: Optional configuration. If provided and engine doesn't exist,
+               uses this config. If engine exists, config is ignored
+               (singleton already created).
+
+    Returns:
+        The global CollaborationEngine instance.
+    """
     global _collaboration_engine
     if _collaboration_engine is None:
-        _collaboration_engine = CollaborationEngine()
+        # Use provided config or let CollaborationEngine use defaults
+        _collaboration_engine = CollaborationEngine(config=config)
     return _collaboration_engine
 
 
