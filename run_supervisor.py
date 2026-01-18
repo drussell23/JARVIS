@@ -13834,6 +13834,7 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
 
             # Count healthy tiers
             healthy_tiers = sum(1 for cb in circuit_breakers.values() if isinstance(cb, dict) and cb.get("state") == "closed")
+            total_tiers = len(circuit_breakers) if circuit_breakers else 0
             if healthy_tiers > 0:
                 status_parts.append(f"{healthy_tiers} tiers")
 
@@ -13842,8 +13843,23 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
                 print(f"  {TerminalUI.GREEN}✅ Hybrid Router: Active ({features}){TerminalUI.RESET}")
                 self.logger.info(f"[v101.0] ✅ Hybrid Router initialized: {features}")
             else:
-                print(f"  {TerminalUI.YELLOW}⚠️ Hybrid Router: Basic mode{TerminalUI.RESET}")
-                self.logger.warning("[v101.0] ⚠️ Hybrid Router: Running in basic mode")
+                # v16.0: Provide more informative status about basic mode
+                if total_tiers == 0:
+                    # No tiers configured - this is expected on startup
+                    print(f"  {TerminalUI.GREEN}✓ Hybrid Router: Ready (tiers will activate on first request){TerminalUI.RESET}")
+                    self.logger.info("[v101.0] ✓ Hybrid Router: Ready - tiers lazily initialized")
+                elif not resilience_enabled:
+                    # Tiers exist but resilience not enabled
+                    print(f"  {TerminalUI.YELLOW}⚠️ Hybrid Router: Basic mode ({total_tiers} tiers, resilience disabled){TerminalUI.RESET}")
+                    self.logger.warning(f"[v101.0] ⚠️ Hybrid Router: Basic mode - {total_tiers} tiers without resilience")
+                else:
+                    # All tiers are unhealthy
+                    unhealthy_tiers = [
+                        name for name, cb in circuit_breakers.items()
+                        if isinstance(cb, dict) and cb.get("state") != "closed"
+                    ]
+                    print(f"  {TerminalUI.YELLOW}⚠️ Hybrid Router: Degraded (unhealthy: {', '.join(unhealthy_tiers) or 'all tiers'}){TerminalUI.RESET}")
+                    self.logger.warning(f"[v101.0] ⚠️ Hybrid Router: Degraded - unhealthy tiers: {unhealthy_tiers}")
 
         except ImportError as e:
             self.logger.warning(f"[v101.0] ⚠️ Hybrid Router import failed: {e}")
@@ -14679,11 +14695,30 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
 
             # Get metrics
             metrics = self._trinity_integration_coordinator.get_metrics()
-            health_status = metrics.get("health", {}).get("overall_status", "unknown")
+            health_data = metrics.get("health", {})
+            health_status = health_data.get("overall_status", "unknown")
+            components = health_data.get("components", {})
 
+            # v16.0: Provide more informative status messages
             if health_status == "healthy":
                 print(f"  {TerminalUI.GREEN}✅ Integration Coordinator: Fully operational{TerminalUI.RESET}")
                 self.logger.info("[v102.0] ✅ Integration Coordinator: All components healthy")
+            elif health_status == "unknown":
+                # "unknown" typically means no components have registered yet - this is expected at startup
+                component_count = len(components)
+                if component_count == 0:
+                    print(f"  {TerminalUI.GREEN}✓ Integration Coordinator: Ready (awaiting component registration){TerminalUI.RESET}")
+                    self.logger.info("[v102.0] ✓ Integration Coordinator: Ready - components will register during startup")
+                else:
+                    print(f"  {TerminalUI.YELLOW}⚠️ Integration Coordinator: {component_count} components, status pending{TerminalUI.RESET}")
+                    self.logger.warning(f"[v102.0] ⚠️ Integration Coordinator: {component_count} components registered, status unknown")
+            elif health_status == "degraded":
+                degraded_components = [
+                    name for name, data in components.items()
+                    if data.get("status") in ("degraded", "unhealthy")
+                ]
+                print(f"  {TerminalUI.YELLOW}⚠️ Integration Coordinator: Degraded ({', '.join(degraded_components) or 'some components'}){TerminalUI.RESET}")
+                self.logger.warning(f"[v102.0] ⚠️ Integration Coordinator: Degraded - {degraded_components}")
             else:
                 print(f"  {TerminalUI.YELLOW}⚠️ Integration Coordinator: Status - {health_status}{TerminalUI.RESET}")
                 self.logger.warning(f"[v102.0] ⚠️ Integration Coordinator: {health_status}")
@@ -15890,9 +15925,52 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
                 elif result is not None:
                     self.logger.info(f"   ✅ {component_name}: Launched successfully")
 
-            # v100.0: Wait for registration with config-driven timeout
-            self.logger.info(f"   ⏳ Waiting for component registration ({trinity_config.registration_timeout_sec}s)...")
-            await asyncio.sleep(min(trinity_config.registration_timeout_sec, 10.0))
+            # v16.0: Wait for J-Prime to be ready using ServiceReadinessChecker
+            # This replaces the static sleep with a dynamic readiness check
+            if self._jprime_orchestrator_process is not None:
+                jprime_url = os.getenv("JARVIS_PRIME_URL", "http://localhost:8000")
+                self.logger.info(f"   ⏳ Waiting for J-Prime to be ready at {jprime_url}...")
+                print(f"  {TerminalUI.CYAN}⏳ Waiting for J-Prime to be ready...{TerminalUI.RESET}")
+
+                try:
+                    from backend.core.ouroboros.integration import (
+                        ServiceReadinessChecker,
+                        ServiceReadinessLevel,
+                    )
+
+                    jprime_checker = ServiceReadinessChecker(
+                        service_name="jarvis_prime",
+                        base_url=jprime_url,
+                        health_check_timeout=3.0,
+                    )
+
+                    jprime_ready = await jprime_checker.wait_for_ready(
+                        timeout=float(trinity_config.registration_timeout_sec),
+                        min_level=ServiceReadinessLevel.DEGRADED,
+                    )
+
+                    if jprime_ready:
+                        snapshot = jprime_checker.last_health_snapshot
+                        if snapshot and snapshot.available_models:
+                            self.logger.info(f"   ✅ J-Prime ready with {len(snapshot.available_models)} models")
+                            print(f"  {TerminalUI.GREEN}✅ J-Prime ready ({len(snapshot.available_models)} models available){TerminalUI.RESET}")
+                        else:
+                            self.logger.info("   ✅ J-Prime ready")
+                            print(f"  {TerminalUI.GREEN}✅ J-Prime ready{TerminalUI.RESET}")
+                    else:
+                        self.logger.warning("   ⚠️ J-Prime not ready - continuing with degraded mode")
+                        print(f"  {TerminalUI.YELLOW}⚠️ J-Prime not ready - other components will use fallbacks{TerminalUI.RESET}")
+
+                except ImportError:
+                    # Fallback to static sleep if ServiceReadinessChecker not available
+                    self.logger.debug("   ServiceReadinessChecker not available, using static wait")
+                    await asyncio.sleep(min(trinity_config.registration_timeout_sec, 10.0))
+                except Exception as e:
+                    self.logger.warning(f"   J-Prime readiness check error: {e}, using static wait")
+                    await asyncio.sleep(min(trinity_config.registration_timeout_sec, 10.0))
+            else:
+                # No J-Prime process - just wait briefly for other components
+                await asyncio.sleep(min(trinity_config.registration_timeout_sec, 5.0))
 
             # v100.0: Verify health before declaring success
             if trinity_config.health_monitor_enabled:

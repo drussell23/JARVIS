@@ -1269,6 +1269,20 @@ class AdvancedModelCapabilityRegistry:
         },
     }
 
+    # v16.0: Default offline models for graceful degradation
+    OFFLINE_FALLBACK_MODELS = [
+        {
+            "id": "offline-default",
+            "name": "Offline Fallback Model",
+            "context_window": 4096,
+            "capabilities": {"general": 0.5},
+            "load_status": "not_available",
+            "specializations": ["general"],
+            "version": "1.0",
+            "offline": True,
+        }
+    ]
+
     def __init__(self, api_base: str = None, enable_persistence: bool = True):
         self.api_base = api_base or os.getenv("JARVIS_PRIME_API_BASE", "http://localhost:8000/v1")
         self._models: Dict[str, ModelMetadata] = {}
@@ -1285,6 +1299,13 @@ class AdvancedModelCapabilityRegistry:
         self._enable_persistence = enable_persistence
         self._persistence: Optional[PerformanceRecordPersistence] = None
         self._persistence_initialized = False
+
+        # v16.0: Service readiness integration
+        self._service_checker: Optional['ServiceReadinessChecker'] = None
+        self._circuit_breaker = CircuitBreaker(name="model_registry_discovery")
+        self._discovery_wait_timeout = float(os.getenv("JARVIS_PRIME_DISCOVERY_TIMEOUT", "15.0"))
+        self._offline_mode = False
+        self._last_discovery_error: Optional[str] = None
 
     async def initialize_persistence(self) -> None:
         """
@@ -1319,26 +1340,89 @@ class AdvancedModelCapabilityRegistry:
             logger.warning(f"Failed to initialize persistence (non-fatal): {e}")
             self._persistence = None
 
-    async def discover_models(self, force_refresh: bool = False) -> List[Dict[str, Any]]:
+    async def discover_models(
+        self,
+        force_refresh: bool = False,
+        wait_for_service: bool = True,
+        timeout: Optional[float] = None,
+    ) -> List[Dict[str, Any]]:
         """
-        Discover available JARVIS Prime models with enhanced metadata.
+        v16.0: Discover available JARVIS Prime models with enhanced resilience.
 
-        Returns list of model info dicts with:
-        - id: Model identifier
-        - context_window: Context window size
-        - capabilities: Dict of capability -> strength
-        - load_status: Current load status
-        - specializations: Set of specializations
-        - version: Model version
+        Features:
+        - Wait-for-service pattern with configurable timeout
+        - Circuit breaker protection against cascading failures
+        - Graceful degradation with offline fallback models
+        - Exponential backoff with jitter on retries
+
+        Args:
+            force_refresh: Bypass cache and fetch fresh data
+            wait_for_service: Wait for J-Prime to become ready (default True)
+            timeout: Override default wait timeout
+
+        Returns:
+            List of model info dicts with:
+            - id: Model identifier
+            - context_window: Context window size
+            - capabilities: Dict of capability -> strength
+            - load_status: Current load status
+            - specializations: Set of specializations
+            - version: Model version
+            - offline: True if using fallback (when J-Prime unavailable)
         """
         async with self._lock:
+            # Return cached models if valid
             if not force_refresh and self._cached_models and (time.time() - self._cache_time) < self._cache_ttl:
                 return self._cached_models
 
+            # v16.0: Check circuit breaker
+            if not self._circuit_breaker.can_execute():
+                logger.debug("[v16.0] Circuit breaker OPEN - returning cached/offline models")
+                return self._cached_models or self.OFFLINE_FALLBACK_MODELS
+
+            # v16.0: Initialize service checker if needed
+            if self._service_checker is None:
+                # Extract base URL (strip /v1 suffix if present)
+                base_url = self.api_base.rstrip("/")
+                if base_url.endswith("/v1"):
+                    base_url = base_url[:-3]
+                self._service_checker = ServiceReadinessChecker(
+                    service_name="jarvis_prime",
+                    base_url=base_url,
+                    circuit_breaker=self._circuit_breaker,
+                )
+
+            # v16.0: Wait for service readiness if requested
+            discovery_timeout = timeout or self._discovery_wait_timeout
+            if wait_for_service:
+                is_ready = await self._service_checker.wait_for_ready(
+                    timeout=discovery_timeout,
+                    min_level=ServiceReadinessLevel.DEGRADED,
+                )
+                if not is_ready:
+                    self._offline_mode = True
+                    self._last_discovery_error = (
+                        f"JARVIS Prime not ready after {discovery_timeout}s - "
+                        f"using offline mode"
+                    )
+                    logger.warning(f"[v16.0] {self._last_discovery_error}")
+
+                    # Return cached models if available, otherwise fallback
+                    if self._cached_models:
+                        logger.info(f"[v16.0] Returning {len(self._cached_models)} cached models")
+                        return self._cached_models
+                    else:
+                        logger.info("[v16.0] No cached models - returning offline fallback")
+                        return self.OFFLINE_FALLBACK_MODELS
+
+            # v16.0: Attempt model discovery with better error handling
             try:
                 async with aiohttp.ClientSession() as session:
                     url = f"{self.api_base.rstrip('/')}/models"
-                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    async with session.get(
+                        url,
+                        timeout=aiohttp.ClientTimeout(total=10)
+                    ) as resp:
                         if resp.status == 200:
                             data = await resp.json()
                             models = data.get("data", [])
@@ -1354,13 +1438,55 @@ class AdvancedModelCapabilityRegistry:
                             self._cached_models = enriched
                             self._cache_time = time.time()
                             self._initialization_complete = True
-                            logger.info(f"✅ Discovered {len(enriched)} models from JARVIS Prime")
+                            self._offline_mode = False
+                            self._last_discovery_error = None
+                            self._circuit_breaker.record_success()
+                            logger.info(f"✅ [v16.0] Discovered {len(enriched)} models from JARVIS Prime")
                             return enriched
 
-            except Exception as e:
-                logger.warning(f"Failed to discover JARVIS Prime models: {e}")
+                        else:
+                            # Non-200 response
+                            self._last_discovery_error = f"HTTP {resp.status}"
+                            logger.warning(f"[v16.0] Model discovery failed: {self._last_discovery_error}")
+                            self._circuit_breaker.record_failure()
 
-            return self._cached_models or []
+            except aiohttp.ClientConnectorError as e:
+                # Connection refused - J-Prime not running
+                self._last_discovery_error = f"Connection refused: {e}"
+                self._offline_mode = True
+                self._circuit_breaker.record_failure()
+                logger.warning(f"[v16.0] JARVIS Prime unavailable: {self._last_discovery_error}")
+
+            except asyncio.TimeoutError:
+                # Timeout
+                self._last_discovery_error = "Request timeout"
+                self._circuit_breaker.record_failure()
+                logger.warning(f"[v16.0] Model discovery timeout")
+
+            except Exception as e:
+                self._last_discovery_error = f"{type(e).__name__}: {e}"
+                self._circuit_breaker.record_failure()
+                logger.warning(f"[v16.0] Model discovery error: {self._last_discovery_error}")
+
+            # v16.0: Graceful degradation
+            if self._cached_models:
+                logger.info(f"[v16.0] Using {len(self._cached_models)} cached models (stale)")
+                return self._cached_models
+            else:
+                logger.info("[v16.0] No cached models available - using offline fallback")
+                return self.OFFLINE_FALLBACK_MODELS
+
+    def get_discovery_status(self) -> Dict[str, Any]:
+        """v16.0: Get current discovery status for diagnostics."""
+        return {
+            "initialized": self._initialization_complete,
+            "offline_mode": self._offline_mode,
+            "last_error": self._last_discovery_error,
+            "cached_models_count": len(self._cached_models) if self._cached_models else 0,
+            "cache_age_seconds": time.time() - self._cache_time if self._cache_time else None,
+            "circuit_breaker": self._circuit_breaker.get_status(),
+            "service_checker": self._service_checker.get_stats() if self._service_checker else None,
+        }
 
     async def _build_model_metadata(
         self, session: aiohttp.ClientSession, model_id: str, basic_info: Dict
@@ -2727,6 +2853,311 @@ class CircuitBreaker:
             "successes": self.successes,
             "can_execute": self.can_execute(),
         }
+
+
+# =============================================================================
+# v16.0: SERVICE READINESS CHECKER - Robust Service Discovery
+# =============================================================================
+
+class ServiceReadinessLevel(Enum):
+    """Service readiness levels for graduated availability."""
+    UNKNOWN = "unknown"           # Never checked
+    UNREACHABLE = "unreachable"   # Cannot connect at all
+    STARTING = "starting"         # Service is starting up
+    DEGRADED = "degraded"         # Partially available
+    HEALTHY = "healthy"           # Fully operational
+
+
+@dataclass
+class ServiceHealthSnapshot:
+    """Point-in-time health snapshot of a service."""
+    service_name: str
+    level: ServiceReadinessLevel
+    latency_ms: float
+    timestamp: float
+    endpoint_url: str
+    error_message: Optional[str] = None
+    available_models: List[str] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+class ServiceReadinessChecker:
+    """
+    v16.0: Advanced service readiness checker with exponential backoff.
+
+    Features:
+    - Wait-for-ready pattern with configurable timeout
+    - Exponential backoff with jitter to prevent thundering herd
+    - Circuit breaker integration for cascading failure protection
+    - Health snapshot caching with TTL
+    - Graduated readiness levels (UNKNOWN -> UNREACHABLE -> STARTING -> DEGRADED -> HEALTHY)
+    - Async event notification when service becomes ready
+
+    Usage:
+        checker = ServiceReadinessChecker("jarvis_prime", "http://localhost:8000")
+        ready = await checker.wait_for_ready(timeout=30.0)
+        if ready:
+            # Service is available
+            models = await discover_models()
+    """
+
+    # Backoff configuration
+    INITIAL_BACKOFF_MS = 100
+    MAX_BACKOFF_MS = 5000
+    BACKOFF_MULTIPLIER = 2.0
+    JITTER_FACTOR = 0.3
+
+    # Health check endpoints to try in order
+    HEALTH_ENDPOINTS = [
+        "/health",
+        "/v1/models",
+        "/api/health",
+        "/",
+    ]
+
+    def __init__(
+        self,
+        service_name: str,
+        base_url: str,
+        circuit_breaker: Optional[CircuitBreaker] = None,
+        health_check_timeout: float = 3.0,
+        snapshot_ttl: float = 5.0,
+    ):
+        """
+        Initialize service readiness checker.
+
+        Args:
+            service_name: Identifier for logging and metrics
+            base_url: Base URL of the service (e.g., http://localhost:8000)
+            circuit_breaker: Optional circuit breaker for failure tracking
+            health_check_timeout: Timeout for individual health checks
+            snapshot_ttl: How long to cache health snapshots
+        """
+        self._service_name = service_name
+        self._base_url = base_url.rstrip("/")
+        self._circuit_breaker = circuit_breaker or CircuitBreaker(name=f"{service_name}_readiness")
+        self._health_check_timeout = health_check_timeout
+        self._snapshot_ttl = snapshot_ttl
+
+        self._last_snapshot: Optional[ServiceHealthSnapshot] = None
+        self._ready_event: asyncio.Event = asyncio.Event()
+        self._lock = asyncio.Lock()
+        self._consecutive_failures = 0
+        self._total_checks = 0
+
+        logger.debug(f"[v16.0] ServiceReadinessChecker initialized for {service_name} at {base_url}")
+
+    @property
+    def is_ready(self) -> bool:
+        """Check if service is currently marked as ready."""
+        if self._last_snapshot is None:
+            return False
+        if time.time() - self._last_snapshot.timestamp > self._snapshot_ttl:
+            return False  # Snapshot expired
+        return self._last_snapshot.level in (ServiceReadinessLevel.HEALTHY, ServiceReadinessLevel.DEGRADED)
+
+    @property
+    def last_health_snapshot(self) -> Optional[ServiceHealthSnapshot]:
+        """Get the most recent health snapshot."""
+        return self._last_snapshot
+
+    async def check_health(self) -> ServiceHealthSnapshot:
+        """
+        Perform a single health check and return snapshot.
+
+        Returns:
+            ServiceHealthSnapshot with current health status
+        """
+        self._total_checks += 1
+        start_time = time.time()
+        snapshot = ServiceHealthSnapshot(
+            service_name=self._service_name,
+            level=ServiceReadinessLevel.UNKNOWN,
+            latency_ms=0,
+            timestamp=start_time,
+            endpoint_url=self._base_url,
+        )
+
+        # Try health endpoints in order
+        async with aiohttp.ClientSession() as session:
+            for endpoint in self.HEALTH_ENDPOINTS:
+                url = f"{self._base_url}{endpoint}"
+                try:
+                    async with session.get(
+                        url,
+                        timeout=aiohttp.ClientTimeout(total=self._health_check_timeout)
+                    ) as resp:
+                        latency_ms = (time.time() - start_time) * 1000
+                        snapshot.latency_ms = latency_ms
+                        snapshot.endpoint_url = url
+
+                        if resp.status == 200:
+                            # Try to parse response for model info
+                            try:
+                                data = await resp.json()
+                                if "data" in data:  # /v1/models response
+                                    snapshot.available_models = [
+                                        m.get("id", "unknown") for m in data.get("data", [])
+                                    ]
+                                snapshot.metadata = data if isinstance(data, dict) else {}
+                            except Exception:
+                                pass
+
+                            snapshot.level = ServiceReadinessLevel.HEALTHY
+                            self._consecutive_failures = 0
+                            self._circuit_breaker.record_success()
+                            self._ready_event.set()
+                            logger.debug(f"[v16.0] {self._service_name} HEALTHY ({latency_ms:.1f}ms)")
+                            break
+
+                        elif resp.status in (503, 502, 504):
+                            # Service starting or temporarily unavailable
+                            snapshot.level = ServiceReadinessLevel.STARTING
+                            snapshot.error_message = f"HTTP {resp.status}"
+                            break
+
+                        elif resp.status < 500:
+                            # Degraded but responding
+                            snapshot.level = ServiceReadinessLevel.DEGRADED
+                            snapshot.error_message = f"HTTP {resp.status}"
+                            self._circuit_breaker.record_success()  # Still counts as reachable
+                            break
+
+                except aiohttp.ClientConnectorError as e:
+                    # Connection refused - service not running
+                    snapshot.level = ServiceReadinessLevel.UNREACHABLE
+                    snapshot.error_message = f"Connection refused: {e}"
+                    self._consecutive_failures += 1
+                    self._circuit_breaker.record_failure()
+
+                except asyncio.TimeoutError:
+                    # Timeout - service may be overloaded or starting
+                    snapshot.level = ServiceReadinessLevel.STARTING
+                    snapshot.error_message = "Health check timeout"
+                    self._consecutive_failures += 1
+
+                except Exception as e:
+                    snapshot.level = ServiceReadinessLevel.UNKNOWN
+                    snapshot.error_message = f"Unexpected error: {type(e).__name__}: {e}"
+                    self._consecutive_failures += 1
+                    self._circuit_breaker.record_failure()
+
+        self._last_snapshot = snapshot
+        return snapshot
+
+    async def wait_for_ready(
+        self,
+        timeout: float = 30.0,
+        min_level: ServiceReadinessLevel = ServiceReadinessLevel.DEGRADED,
+    ) -> bool:
+        """
+        Wait for service to become ready with exponential backoff.
+
+        Args:
+            timeout: Maximum time to wait in seconds
+            min_level: Minimum readiness level to accept as "ready"
+
+        Returns:
+            True if service became ready within timeout, False otherwise
+        """
+        start_time = time.time()
+        backoff_ms = self.INITIAL_BACKOFF_MS
+        attempt = 0
+
+        logger.info(f"[v16.0] Waiting for {self._service_name} to become ready (timeout: {timeout}s)...")
+
+        while (time.time() - start_time) < timeout:
+            attempt += 1
+
+            # Check if circuit breaker allows request
+            if not self._circuit_breaker.can_execute():
+                logger.debug(f"[v16.0] Circuit breaker OPEN for {self._service_name}, waiting...")
+                await asyncio.sleep(self._circuit_breaker.timeout / 2)
+                continue
+
+            # Perform health check
+            snapshot = await self.check_health()
+
+            # Check if ready
+            acceptable_levels = {ServiceReadinessLevel.HEALTHY}
+            if min_level == ServiceReadinessLevel.DEGRADED:
+                acceptable_levels.add(ServiceReadinessLevel.DEGRADED)
+
+            if snapshot.level in acceptable_levels:
+                elapsed = time.time() - start_time
+                logger.info(
+                    f"[v16.0] {self._service_name} ready after {attempt} attempts, "
+                    f"{elapsed:.2f}s ({snapshot.level.value}, {snapshot.latency_ms:.1f}ms)"
+                )
+                return True
+
+            # Log progress
+            if attempt % 5 == 0:
+                elapsed = time.time() - start_time
+                logger.debug(
+                    f"[v16.0] {self._service_name} not ready yet "
+                    f"(attempt {attempt}, {elapsed:.1f}s/{timeout}s, {snapshot.level.value})"
+                )
+
+            # Calculate backoff with jitter
+            jitter = random.uniform(-self.JITTER_FACTOR, self.JITTER_FACTOR)
+            sleep_ms = backoff_ms * (1 + jitter)
+            await asyncio.sleep(sleep_ms / 1000.0)
+
+            # Increase backoff (exponential)
+            backoff_ms = min(backoff_ms * self.BACKOFF_MULTIPLIER, self.MAX_BACKOFF_MS)
+
+        # Timeout reached
+        logger.warning(
+            f"[v16.0] {self._service_name} not ready after {timeout}s "
+            f"({attempt} attempts, last: {self._last_snapshot.level.value if self._last_snapshot else 'unknown'})"
+        )
+        return False
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Get readiness checker statistics."""
+        return {
+            "service_name": self._service_name,
+            "base_url": self._base_url,
+            "is_ready": self.is_ready,
+            "total_checks": self._total_checks,
+            "consecutive_failures": self._consecutive_failures,
+            "circuit_breaker": self._circuit_breaker.get_status(),
+            "last_snapshot": {
+                "level": self._last_snapshot.level.value if self._last_snapshot else None,
+                "latency_ms": self._last_snapshot.latency_ms if self._last_snapshot else None,
+                "error": self._last_snapshot.error_message if self._last_snapshot else None,
+                "models_count": len(self._last_snapshot.available_models) if self._last_snapshot else 0,
+            } if self._last_snapshot else None,
+        }
+
+
+# Global service readiness checkers (singleton pattern)
+_service_checkers: Dict[str, ServiceReadinessChecker] = {}
+_service_checker_lock = asyncio.Lock()
+
+
+async def get_service_checker(
+    service_name: str,
+    base_url: str,
+) -> ServiceReadinessChecker:
+    """
+    Get or create a service readiness checker (singleton per service).
+
+    Args:
+        service_name: Unique identifier for the service
+        base_url: Base URL of the service
+
+    Returns:
+        ServiceReadinessChecker instance
+    """
+    async with _service_checker_lock:
+        if service_name not in _service_checkers:
+            _service_checkers[service_name] = ServiceReadinessChecker(
+                service_name=service_name,
+                base_url=base_url,
+            )
+        return _service_checkers[service_name]
 
 
 # =============================================================================
