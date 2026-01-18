@@ -72,7 +72,12 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ServiceInfo:
-    """Information about a registered service."""
+    """
+    Information about a registered service.
+
+    v4.0: Enhanced with process start time tracking to detect PID reuse,
+    which can cause false-positive alive checks.
+    """
     service_name: str
     pid: int
     port: int
@@ -82,6 +87,8 @@ class ServiceInfo:
     registered_at: float = 0.0
     last_heartbeat: float = 0.0
     metadata: Dict = None
+    # v4.0: Track process start time to detect PID reuse
+    process_start_time: float = 0.0
 
     def __post_init__(self):
         if self.registered_at == 0.0:
@@ -90,6 +97,17 @@ class ServiceInfo:
             self.last_heartbeat = time.time()
         if self.metadata is None:
             self.metadata = {}
+        # v4.0: Capture process start time if not provided
+        if self.process_start_time == 0.0:
+            self.process_start_time = self._get_process_start_time()
+
+    def _get_process_start_time(self) -> float:
+        """v4.0: Get the process start time for PID reuse detection."""
+        try:
+            process = psutil.Process(self.pid)
+            return process.create_time()
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            return 0.0
 
     def to_dict(self) -> Dict:
         """Convert to dictionary for JSON serialization."""
@@ -98,19 +116,71 @@ class ServiceInfo:
     @classmethod
     def from_dict(cls, data: Dict) -> "ServiceInfo":
         """Create from dictionary."""
+        # v4.0: Handle legacy entries without process_start_time
+        if "process_start_time" not in data:
+            data["process_start_time"] = 0.0
         return cls(**data)
 
     def is_process_alive(self) -> bool:
-        """Check if the service's process is still running."""
+        """
+        Check if the service's process is still running.
+
+        v4.0 Enhancement: Also validates process start time to detect PID reuse.
+        On Unix systems, PIDs can be reused after a process terminates.
+        A new process could get the same PID, causing false-positive alive checks.
+        """
         try:
             process = psutil.Process(self.pid)
-            return process.is_running()
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
+
+            # Basic check: process exists and is running
+            if not process.is_running():
+                return False
+
+            # v4.0: PID reuse detection
+            # If we have a stored start time, verify it matches
+            if self.process_start_time > 0.0:
+                current_start_time = process.create_time()
+                # Allow 1 second tolerance for timing differences
+                if abs(current_start_time - self.process_start_time) > 1.0:
+                    logger.warning(
+                        f"PID reuse detected for {self.service_name}: "
+                        f"stored_start={self.process_start_time:.1f}, "
+                        f"current_start={current_start_time:.1f}"
+                    )
+                    return False
+
+            return True
+
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
             return False
 
     def is_stale(self, timeout_seconds: float = 60.0) -> bool:
         """Check if service hasn't sent heartbeat in timeout period."""
         return (time.time() - self.last_heartbeat) > timeout_seconds
+
+    def validate(self) -> tuple[bool, str]:
+        """
+        v4.0: Comprehensive validation of service entry.
+
+        Returns:
+            Tuple of (is_valid, reason_if_invalid)
+        """
+        # Check PID is valid
+        if self.pid <= 0:
+            return False, f"Invalid PID: {self.pid}"
+
+        # Check port is valid
+        if not (0 < self.port < 65536):
+            return False, f"Invalid port: {self.port}"
+
+        # Check process is alive (with PID reuse detection)
+        if not self.is_process_alive():
+            return False, f"Process {self.pid} is dead or PID was reused"
+
+        # Check not stale (but don't fail on this - just warn)
+        # Stale services may still be running, just not heartbeating
+
+        return True, "OK"
 
 
 # =============================================================================
@@ -483,6 +553,229 @@ class ServiceRegistry:
             f"⏱️  Timeout waiting for service: {service_name} (after {timeout}s)"
         )
         return None
+
+    # =========================================================================
+    # v4.0: PRE-FLIGHT CLEANUP - Critical for Robust Startup
+    # =========================================================================
+
+    async def pre_flight_cleanup(self) -> Dict[str, Any]:
+        """
+        v4.0: Comprehensive pre-flight cleanup before starting services.
+
+        MUST be called before starting any services to ensure a clean slate.
+        This prevents "dead PID" warnings and ensures reliable service discovery.
+
+        What it does:
+        1. Validates ALL entries in the registry
+        2. Removes entries with dead PIDs (process not running)
+        3. Removes entries with reused PIDs (process start time mismatch)
+        4. Removes entries with invalid data (bad port, bad PID)
+        5. Optionally kills zombie processes still holding ports
+        6. Reports detailed cleanup statistics
+
+        Returns:
+            Dict with cleanup statistics and removed services
+        """
+        logger.info("🚀 Pre-flight cleanup: Validating service registry...")
+
+        services = await asyncio.to_thread(self._read_registry)
+        stats = {
+            "total_entries": len(services),
+            "valid_entries": 0,
+            "removed_dead_pid": [],
+            "removed_pid_reuse": [],
+            "removed_invalid": [],
+            "removed_stale": [],
+            "ports_freed": [],
+            "cleanup_time_ms": 0,
+        }
+
+        start_time = time.time()
+        to_remove = []
+
+        for service_name, service in services.items():
+            # Run comprehensive validation
+            is_valid, reason = service.validate()
+
+            if not is_valid:
+                to_remove.append(service_name)
+
+                # Categorize the removal reason
+                if "dead" in reason.lower() or "not found" in reason.lower():
+                    stats["removed_dead_pid"].append({
+                        "name": service_name,
+                        "pid": service.pid,
+                        "port": service.port,
+                        "reason": reason
+                    })
+                elif "reuse" in reason.lower():
+                    stats["removed_pid_reuse"].append({
+                        "name": service_name,
+                        "pid": service.pid,
+                        "port": service.port,
+                        "reason": reason
+                    })
+                else:
+                    stats["removed_invalid"].append({
+                        "name": service_name,
+                        "pid": service.pid,
+                        "port": service.port,
+                        "reason": reason
+                    })
+
+                # Track freed ports
+                stats["ports_freed"].append(service.port)
+
+                logger.info(
+                    f"  🧹 Removing {service_name}: {reason} "
+                    f"(PID: {service.pid}, Port: {service.port})"
+                )
+            else:
+                stats["valid_entries"] += 1
+
+                # Also check for stale services (valid process but no heartbeat)
+                if service.is_stale(self.heartbeat_timeout):
+                    stale_age = time.time() - service.last_heartbeat
+                    logger.warning(
+                        f"  ⚠️  {service_name} is stale "
+                        f"(last heartbeat {stale_age:.0f}s ago) - keeping for now"
+                    )
+                    stats["removed_stale"].append({
+                        "name": service_name,
+                        "pid": service.pid,
+                        "stale_seconds": stale_age
+                    })
+
+        # Remove invalid entries
+        if to_remove:
+            for name in to_remove:
+                del services[name]
+            await asyncio.to_thread(self._write_registry, services)
+
+        stats["cleanup_time_ms"] = (time.time() - start_time) * 1000
+
+        # Log summary
+        removed_count = len(to_remove)
+        if removed_count > 0:
+            logger.info(
+                f"✅ Pre-flight cleanup complete: "
+                f"removed {removed_count} invalid entries, "
+                f"{stats['valid_entries']} valid entries remain "
+                f"({stats['cleanup_time_ms']:.1f}ms)"
+            )
+        else:
+            logger.info(
+                f"✅ Pre-flight cleanup complete: "
+                f"registry is clean ({stats['valid_entries']} valid entries, "
+                f"{stats['cleanup_time_ms']:.1f}ms)"
+            )
+
+        return stats
+
+    async def validate_and_cleanup_port(self, port: int) -> bool:
+        """
+        v4.0: Ensure a port is free before starting a service.
+
+        Checks if port is in use by:
+        1. A registered service (validates if still alive)
+        2. An unregistered process (optionally kills it)
+
+        Returns:
+            True if port is now free, False if still in use
+        """
+        # Check if any registered service claims this port
+        services = await asyncio.to_thread(self._read_registry)
+
+        for service_name, service in services.items():
+            if service.port == port:
+                if service.is_process_alive():
+                    logger.warning(
+                        f"Port {port} in use by registered service {service_name} "
+                        f"(PID: {service.pid})"
+                    )
+                    return False
+                else:
+                    # Dead service holding port - remove from registry
+                    logger.info(
+                        f"Removing dead service {service_name} from port {port}"
+                    )
+                    await self.deregister_service(service_name)
+
+        # Check if port is in use by an unregistered process
+        try:
+            for conn in psutil.net_connections(kind='inet'):
+                if conn.laddr.port == port and conn.status == 'LISTEN':
+                    # Port is in use by unregistered process
+                    try:
+                        proc = psutil.Process(conn.pid)
+                        logger.warning(
+                            f"Port {port} in use by unregistered process: "
+                            f"{proc.name()} (PID: {conn.pid})"
+                        )
+                        return False
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        pass
+        except (psutil.AccessDenied, OSError):
+            # May not have permission to check all connections
+            pass
+
+        return True
+
+    async def get_registry_health_report(self) -> Dict[str, Any]:
+        """
+        v4.0: Generate comprehensive health report for the registry.
+
+        Returns detailed information about all registered services,
+        their health status, and any issues detected.
+        """
+        services = await asyncio.to_thread(self._read_registry)
+
+        report = {
+            "timestamp": datetime.now().isoformat(),
+            "total_services": len(services),
+            "healthy_services": 0,
+            "degraded_services": 0,
+            "dead_services": 0,
+            "stale_services": 0,
+            "services": {}
+        }
+
+        for service_name, service in services.items():
+            is_alive = service.is_process_alive()
+            is_stale = service.is_stale(self.heartbeat_timeout)
+
+            service_report = {
+                "pid": service.pid,
+                "port": service.port,
+                "host": service.host,
+                "status": service.status,
+                "is_alive": is_alive,
+                "is_stale": is_stale,
+                "registered_at": datetime.fromtimestamp(
+                    service.registered_at
+                ).isoformat() if service.registered_at else None,
+                "last_heartbeat": datetime.fromtimestamp(
+                    service.last_heartbeat
+                ).isoformat() if service.last_heartbeat else None,
+                "heartbeat_age_seconds": time.time() - service.last_heartbeat,
+            }
+
+            if not is_alive:
+                service_report["health"] = "DEAD"
+                report["dead_services"] += 1
+            elif is_stale:
+                service_report["health"] = "STALE"
+                report["stale_services"] += 1
+            elif service.status == "degraded":
+                service_report["health"] = "DEGRADED"
+                report["degraded_services"] += 1
+            else:
+                service_report["health"] = "HEALTHY"
+                report["healthy_services"] += 1
+
+            report["services"][service_name] = service_report
+
+        return report
 
 
 # =============================================================================

@@ -1165,9 +1165,33 @@ class ProcessOrchestrator:
         logger.info(f"  Ports: jarvis-prime={self.config.jarvis_prime_default_port}, "
                     f"reactor-core={self.config.reactor_core_default_port}")
 
-        # Phase 0: Pre-flight cleanup (v5.0)
+        # Phase 0: Pre-flight cleanup (v5.0 + v4.0 Service Registry)
         logger.info("\n📍 PHASE 0: Pre-flight cleanup")
+
+        # v5.0: Clean up legacy ports (processes on old hardcoded ports)
         await self._cleanup_legacy_ports()
+
+        # v4.0: Clean up stale service registry entries (dead PIDs, PID reuse)
+        if self.registry:
+            logger.info("  🧹 Service registry pre-flight cleanup...")
+            try:
+                cleanup_stats = await self.registry.pre_flight_cleanup()
+                removed_count = (
+                    len(cleanup_stats.get("removed_dead_pid", [])) +
+                    len(cleanup_stats.get("removed_pid_reuse", [])) +
+                    len(cleanup_stats.get("removed_invalid", []))
+                )
+                if removed_count > 0:
+                    logger.info(
+                        f"  ✅ Cleaned {removed_count} stale registry entries "
+                        f"({cleanup_stats['valid_entries']} valid remain)"
+                    )
+                else:
+                    logger.info(
+                        f"  ✅ Registry clean ({cleanup_stats['valid_entries']} valid services)"
+                    )
+            except Exception as e:
+                logger.warning(f"  ⚠️ Registry cleanup failed (continuing): {e}")
 
         # Phase 1: JARVIS Core (already starting)
         logger.info("\n📍 PHASE 1: JARVIS Core (starting via supervisor)")

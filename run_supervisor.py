@@ -4691,6 +4691,66 @@ class SupervisorBootstrapper:
                 return 1
 
             # ═══════════════════════════════════════════════════════════════════
+            # v4.0: SERVICE REGISTRY PRE-FLIGHT CLEANUP
+            # ═══════════════════════════════════════════════════════════════════
+            # CRITICAL: Clean up stale/dead service entries BEFORE starting
+            # any services. This prevents "dead PID" warnings and ensures
+            # reliable service discovery across JARVIS, J-Prime, and Reactor-Core.
+            #
+            # This cleanup:
+            # 1. Removes services with dead PIDs (process no longer running)
+            # 2. Detects PID reuse (same PID but different process)
+            # 3. Removes invalid entries (bad port, bad PID)
+            # 4. Reports detailed cleanup statistics
+            # ═══════════════════════════════════════════════════════════════════
+            try:
+                from backend.core.service_registry import ServiceRegistry
+
+                self.logger.info("[v4.0] 🧹 Running service registry pre-flight cleanup...")
+                TerminalUI.print_step("[v4.0] Service registry pre-flight cleanup")
+
+                registry = ServiceRegistry()
+                cleanup_stats = await registry.pre_flight_cleanup()
+
+                # Log cleanup statistics
+                removed_total = (
+                    len(cleanup_stats.get("removed_dead_pid", [])) +
+                    len(cleanup_stats.get("removed_pid_reuse", [])) +
+                    len(cleanup_stats.get("removed_invalid", []))
+                )
+
+                if removed_total > 0:
+                    self.logger.info(
+                        f"[v4.0] ✅ Cleaned {removed_total} stale entries "
+                        f"(dead_pid: {len(cleanup_stats.get('removed_dead_pid', []))}, "
+                        f"pid_reuse: {len(cleanup_stats.get('removed_pid_reuse', []))}, "
+                        f"invalid: {len(cleanup_stats.get('removed_invalid', []))})"
+                    )
+                    TerminalUI.print_success(
+                        f"[v4.0] Cleaned {removed_total} stale services "
+                        f"({cleanup_stats['valid_entries']} valid remain)"
+                    )
+                else:
+                    self.logger.info(
+                        f"[v4.0] ✅ Registry clean "
+                        f"({cleanup_stats['valid_entries']} valid services)"
+                    )
+                    TerminalUI.print_success(
+                        f"[v4.0] Registry clean ({cleanup_stats['valid_entries']} valid services)"
+                    )
+
+                # Store registry reference for later use
+                self._service_registry = registry
+
+            except ImportError as e:
+                self.logger.warning(f"[v4.0] ServiceRegistry not available: {e}")
+            except Exception as e:
+                self.logger.warning(
+                    f"[v4.0] Service registry cleanup failed (continuing): {e}",
+                    exc_info=True
+                )
+
+            # ═══════════════════════════════════════════════════════════════════
             # v88.0: Ultra-Advanced Coordinator Initialization
             # ═══════════════════════════════════════════════════════════════════
             # Initialize the ultra coordinator with adaptive circuit breakers,
