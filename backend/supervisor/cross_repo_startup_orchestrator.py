@@ -1,42 +1,47 @@
 """
-Cross-Repo Startup Orchestrator v4.0 - Enterprise-Grade Process Lifecycle Manager
+Cross-Repo Startup Orchestrator v5.0 - Enterprise-Grade Process Lifecycle Manager
 ===================================================================================
 
 Dynamic service discovery and self-healing process orchestration for JARVIS ecosystem.
 Enables single-command startup of all Trinity components (JARVIS Body, J-Prime Mind, Reactor-Core Nerves).
 
-Features (v4.0):
-- 🔍 Dynamic Service Discovery via Service Registry (zero hardcoded ports)
+Features (v5.0):
+- 🔧 SINGLE SOURCE OF TRUTH: Ports from trinity_config.py (no hardcoding!)
+- 🧹 Pre-flight Cleanup: Kills stale processes on legacy ports (8002, 8003)
+- 🔍 Wrong-Binding Detection: Detects 127.0.0.1 vs 0.0.0.0 misconfigurations
 - 🔄 Auto-Healing with exponential backoff (dead process detection & restart)
 - 📡 Real-Time Output Streaming (stdout/stderr prefixed per service)
 - 🎯 Process Lifecycle Management (spawn, monitor, graceful shutdown)
 - 🛡️ Graceful Shutdown Handlers (SIGINT/SIGTERM cleanup)
-- 🧹 Automatic Zombie Process Cleanup
-- 📊 Service Health Monitoring with heartbeats
 - 🐍 Auto-detect venv Python for each repo
-- 🦄 Uvicorn support for FastAPI applications
 - 📁 Correct entry points: run_server.py, run_reactor.py
 - ⚡ Pre-spawn validation (port check, dependency check)
+- 📊 Service Health Monitoring with progressive backoff
 
-Service Ports (v4.0 - MUST match actual service defaults):
-- jarvis-prime: port 8000 (run_server.py)
-- reactor-core: port 8090 (run_reactor.py)
-- jarvis-body: port 8080 (main JARVIS)
+Service Ports (v5.0 - from trinity_config.py):
+- jarvis-prime: port 8000 (run_server.py --port 8000 --host 0.0.0.0)
+- reactor-core: port 8090 (run_reactor.py --port 8090)
+- jarvis-body: port 8010 (main JARVIS)
+
+Legacy ports cleaned up automatically:
+- jarvis-prime: 8001, 8002 (killed if found)
+- reactor-core: 8003, 8004, 8005 (killed if found)
 
 Architecture:
     ┌──────────────────────────────────────────────────────────────────┐
-    │         Cross-Repo Orchestrator v4.0 - Process Manager           │
+    │         Cross-Repo Orchestrator v5.0 - Process Manager           │
     ├──────────────────────────────────────────────────────────────────┤
     │                                                                   │
     │  Service Registry: ~/.jarvis/registry/services.json              │
     │  ┌────────────────┬──────────────┬─────────────────────┐        │
     │  │   JARVIS       │   J-PRIME    │   REACTOR-CORE      │        │
     │  │  PID: auto     │  PID: auto   │   PID: auto         │        │
-    │  │  Port: 8080    │  Port: 8000  │   Port: 8090        │        │
+    │  │  Port: 8010    │  Port: 8000  │   Port: 8090        │        │
     │  │  Status: ✅    │  Status: ✅  │   Status: ✅        │        │
     │  └────────────────┴──────────────┴─────────────────────┘        │
     │                                                                   │
     │  Process Lifecycle:                                               │
+    │  0. Pre-flight Cleanup (kill stale legacy processes)             │
     │  1. Pre-Spawn Validation (venv detect, port check)               │
     │  2. Spawn (asyncio.create_subprocess_exec with venv Python)      │
     │  3. Monitor (PID tracking + progressive health checks)           │
@@ -47,7 +52,7 @@ Architecture:
     └──────────────────────────────────────────────────────────────────┘
 
 Author: JARVIS AI System
-Version: 4.0.0
+Version: 5.0.0
 """
 
 from __future__ import annotations
@@ -72,9 +77,45 @@ logger = logging.getLogger(__name__)
 # Configuration (Zero Hardcoding - All Environment Driven)
 # =============================================================================
 
+# v5.0: Import from trinity_config as SINGLE SOURCE OF TRUTH
+try:
+    from backend.core.trinity_config import get_config as get_trinity_config
+    _TRINITY_CONFIG_AVAILABLE = True
+except ImportError:
+    _TRINITY_CONFIG_AVAILABLE = False
+    get_trinity_config = None
+
+
+def _get_port_from_trinity(service: str, fallback: int) -> int:
+    """
+    Get port from trinity_config (single source of truth) with fallback.
+
+    v5.0: This ensures all services use consistent ports from trinity_config.
+    """
+    if not _TRINITY_CONFIG_AVAILABLE:
+        return int(os.getenv(f"{service.upper()}_PORT", str(fallback)))
+
+    try:
+        config = get_trinity_config()
+        if service == "jarvis_prime":
+            return config.jarvis_prime_endpoint.port
+        elif service == "reactor_core":
+            return config.reactor_core_endpoint.port
+        elif service == "jarvis":
+            return config.jarvis_endpoint.port
+    except Exception:
+        pass
+
+    return int(os.getenv(f"{service.upper()}_PORT", str(fallback)))
+
+
 @dataclass
 class OrchestratorConfig:
-    """Enterprise configuration with zero hardcoding."""
+    """
+    Enterprise configuration with zero hardcoding.
+
+    v5.0: Ports sourced from trinity_config as SINGLE SOURCE OF TRUTH.
+    """
 
     # Repository paths
     jarvis_prime_path: Path = field(default_factory=lambda: Path(
@@ -84,15 +125,18 @@ class OrchestratorConfig:
         os.getenv("REACTOR_CORE_PATH", str(Path.home() / "Documents" / "repos" / "reactor-core"))
     ))
 
-    # Default ports (MUST match actual service defaults!)
-    # jarvis-prime/run_server.py defaults to 8000
-    # reactor-core/run_reactor.py defaults to 8090
+    # Default ports - sourced from trinity_config (SINGLE SOURCE OF TRUTH)
+    # Fallbacks: jarvis-prime=8000, reactor-core=8090
     jarvis_prime_default_port: int = field(
-        default_factory=lambda: int(os.getenv("JARVIS_PRIME_PORT", "8000"))
+        default_factory=lambda: _get_port_from_trinity("jarvis_prime", 8000)
     )
     reactor_core_default_port: int = field(
-        default_factory=lambda: int(os.getenv("REACTOR_CORE_PORT", "8090"))
+        default_factory=lambda: _get_port_from_trinity("reactor_core", 8090)
     )
+
+    # Legacy ports to clean up (processes on these should be killed)
+    legacy_jarvis_prime_ports: List[int] = field(default_factory=lambda: [8001, 8002])
+    legacy_reactor_core_ports: List[int] = field(default_factory=lambda: [8003, 8004, 8005])
 
     # Feature flags
     jarvis_prime_enabled: bool = field(
@@ -244,6 +288,123 @@ class ProcessOrchestrator:
 
         # Signal handlers registered flag
         self._signals_registered = False
+
+    # =========================================================================
+    # Pre-Flight Cleanup (v5.0)
+    # =========================================================================
+
+    async def _kill_process_on_port(self, port: int) -> bool:
+        """
+        Kill any process listening on the specified port.
+
+        v5.0: Uses lsof to find and kill stale processes.
+        Returns True if a process was killed.
+        """
+        try:
+            # Find process on port using lsof
+            proc = await asyncio.create_subprocess_exec(
+                "lsof", "-ti", f":{port}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await proc.communicate()
+
+            if not stdout:
+                return False
+
+            pids = stdout.decode().strip().split('\n')
+            killed = False
+
+            for pid_str in pids:
+                if not pid_str:
+                    continue
+                try:
+                    pid = int(pid_str)
+                    os.kill(pid, signal.SIGTERM)
+                    logger.info(f"    🔪 Killed stale process on port {port} (PID: {pid})")
+                    killed = True
+                except (ValueError, ProcessLookupError, PermissionError) as e:
+                    logger.debug(f"    Could not kill PID {pid_str}: {e}")
+
+            if killed:
+                # Give process time to terminate
+                await asyncio.sleep(0.5)
+
+            return killed
+
+        except Exception as e:
+            logger.debug(f"    Port cleanup failed for {port}: {e}")
+            return False
+
+    async def _cleanup_legacy_ports(self) -> Dict[str, List[int]]:
+        """
+        Clean up any processes on legacy ports before startup.
+
+        v5.0: Ensures no stale processes from old configurations are blocking
+        the correct ports. Returns dict of service -> [killed_ports].
+        """
+        logger.info("  🧹 Pre-flight: Cleaning up legacy ports...")
+
+        cleaned = {"jarvis-prime": [], "reactor-core": []}
+
+        # Clean up legacy jarvis-prime ports
+        for port in self.config.legacy_jarvis_prime_ports:
+            if await self._kill_process_on_port(port):
+                cleaned["jarvis-prime"].append(port)
+
+        # Clean up legacy reactor-core ports
+        for port in self.config.legacy_reactor_core_ports:
+            if await self._kill_process_on_port(port):
+                cleaned["reactor-core"].append(port)
+
+        # Also check if something is running on CORRECT ports but with wrong host
+        # (e.g., bound to 127.0.0.1 instead of 0.0.0.0)
+        for service, port in [
+            ("jarvis-prime", self.config.jarvis_prime_default_port),
+            ("reactor-core", self.config.reactor_core_default_port),
+        ]:
+            if await self._check_wrong_binding(port):
+                logger.warning(f"    ⚠️ {service} on port {port} bound to 127.0.0.1, restarting...")
+                if await self._kill_process_on_port(port):
+                    cleaned[service].append(port)
+
+        # Summary
+        total_cleaned = sum(len(ports) for ports in cleaned.values())
+        if total_cleaned > 0:
+            logger.info(f"  ✅ Cleaned {total_cleaned} stale processes")
+        else:
+            logger.info(f"  ✅ No legacy processes found")
+
+        return cleaned
+
+    async def _check_wrong_binding(self, port: int) -> bool:
+        """
+        Check if a service on port is bound to 127.0.0.1 (should be 0.0.0.0).
+
+        v5.0: Detects misconfigured services that won't accept external connections.
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "lsof", "-i", f":{port}", "-P", "-n",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await proc.communicate()
+
+            if not stdout:
+                return False
+
+            output = stdout.decode()
+            # Check if bound to 127.0.0.1 (localhost only)
+            if "127.0.0.1:" in output or "localhost:" in output:
+                # Also check it's not bound to 0.0.0.0 (which would be correct)
+                if "*:" not in output and "0.0.0.0:" not in output:
+                    return True
+
+        except Exception:
+            pass
+
+        return False
 
     @property
     def registry(self):
@@ -923,6 +1084,11 @@ class ProcessOrchestrator:
         """
         Start all configured services with coordinated orchestration.
 
+        v5.0: Enhanced with:
+        - Pre-flight cleanup of legacy ports
+        - Wrong-binding detection (127.0.0.1 vs 0.0.0.0)
+        - Trinity config integration for port consistency
+
         Returns dict mapping service names to success status.
         """
         self._running = True
@@ -940,8 +1106,14 @@ class ProcessOrchestrator:
         results = {"jarvis": True}  # JARVIS is already running
 
         logger.info("=" * 70)
-        logger.info("Cross-Repo Startup Orchestrator v3.0 - Enterprise Grade")
+        logger.info("Cross-Repo Startup Orchestrator v5.0 - Enterprise Grade")
         logger.info("=" * 70)
+        logger.info(f"  Ports: jarvis-prime={self.config.jarvis_prime_default_port}, "
+                    f"reactor-core={self.config.reactor_core_default_port}")
+
+        # Phase 0: Pre-flight cleanup (v5.0)
+        logger.info("\n📍 PHASE 0: Pre-flight cleanup")
+        await self._cleanup_legacy_ports()
 
         # Phase 1: JARVIS Core (already starting)
         logger.info("\n📍 PHASE 1: JARVIS Core (starting via supervisor)")

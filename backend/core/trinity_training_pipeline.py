@@ -111,11 +111,11 @@ class PipelineConfig:
     MODEL_ROLLBACK_THRESHOLD = _env_float("MODEL_ROLLBACK_THRESHOLD", 0.9)
 
     # Reactor Core settings
-    REACTOR_CORE_URL = _env_str("REACTOR_CORE_API_URL", "http://localhost:8003")
+    REACTOR_CORE_URL = _env_str("REACTOR_CORE_API_URL", "http://localhost:8090")
     REACTOR_CORE_TIMEOUT = _env_float("REACTOR_CORE_TIMEOUT", 30.0)
 
     # Prime settings
-    PRIME_URL = _env_str("JARVIS_PRIME_URL", "http://localhost:8002")
+    PRIME_URL = _env_str("JARVIS_PRIME_URL", "http://localhost:8000")
     PRIME_TIMEOUT = _env_float("JARVIS_PRIME_TIMEOUT", 30.0)
 
     # Storage

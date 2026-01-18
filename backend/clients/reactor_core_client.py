@@ -68,7 +68,7 @@ class ReactorCoreConfig:
 
     # API Configuration
     api_url: str = field(
-        default_factory=lambda: os.getenv("REACTOR_CORE_API_URL", "http://localhost:8003")
+        default_factory=lambda: os.getenv("REACTOR_CORE_API_URL", "http://localhost:8090")
     )
     api_timeout: float = field(
         default_factory=lambda: float(os.getenv("REACTOR_CORE_TIMEOUT", "30.0"))

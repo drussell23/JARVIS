@@ -143,7 +143,7 @@ class ValidatorConfig:
 
     # Required ports (comma-separated)
     REQUIRED_PORTS: Final[List[int]] = [
-        int(p) for p in _env_list("TRINITY_REQUIRED_PORTS", ["8010", "8002", "8003"])
+        int(p) for p in _env_list("TRINITY_REQUIRED_PORTS", ["8010", "8000", "8090"])
     ]
 
     # Required packages

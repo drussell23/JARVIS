@@ -9900,7 +9900,7 @@ class TrinityUnifiedOrchestrator:
             # Create launch configuration
             # v87.0: Launch Reactor-Core API server (not orchestrator script)
             # The API server provides HTTP health checks and is the proper component
-            reactor_port = int(os.getenv("REACTOR_CORE_PORT", "8003"))
+            reactor_port = int(os.getenv("REACTOR_CORE_PORT", "8090"))
 
             config = LaunchConfig(
                 repo_id="reactor_core",

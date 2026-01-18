@@ -22,7 +22,7 @@ Architecture:
     │   JARVIS    │       J-Prime           │   Reactor-Core     │
     │   (Body)    │       (Mind)            │    (Nerves)        │
     ├─────────────┼─────────────────────────┼────────────────────┤
-    │ HTTP:8010   │ Heartbeat + HTTP:8002   │ Heartbeat + HTTP   │
+    │ HTTP:8010   │ Heartbeat + HTTP:8000   │ Heartbeat + HTTP   │
     │ Internal    │ jarvis_prime.json       │ reactor_core.json  │
     └─────────────┴─────────────────────────┴────────────────────┘
 
@@ -187,7 +187,7 @@ class TrinityHealthConfig:
     # Component endpoints (dynamically discovered if possible)
     jarvis_backend_port: int = 8010
     jarvis_prime_port: int = 8000  # v89.0: Fixed to 8000 (was incorrectly 8002)
-    reactor_core_port: int = 8003
+    reactor_core_port: int = 8090
 
     # Component weights for health score calculation
     component_weights: Dict[TrinityComponent, float] = field(default_factory=lambda: {
@@ -208,7 +208,7 @@ class TrinityHealthConfig:
             check_interval_seconds=float(os.getenv("TRINITY_CHECK_INTERVAL", "10.0")),
             jarvis_backend_port=int(os.getenv("JARVIS_BACKEND_PORT", "8010")),
             jarvis_prime_port=int(os.getenv("JARVIS_PRIME_PORT", "8000")),  # v89.0: Fixed to 8000
-            reactor_core_port=int(os.getenv("REACTOR_CORE_PORT", "8003")),
+            reactor_core_port=int(os.getenv("REACTOR_CORE_PORT", "8090")),
         )
 
 

@@ -221,7 +221,7 @@ async def register_service():
     """Register Reactor Core in service registry on startup."""
     await register_current_service(
         service_name="reactor-core",
-        port=8003,
+        port=8090,
         health_endpoint="/api/health"
     )
 

@@ -165,7 +165,7 @@ class AdvancedTrainingConfig:
     reactor_api_url: str = field(
         default_factory=lambda: os.getenv(
             "REACTOR_CORE_API_URL",
-            f"http://localhost:{os.getenv('REACTOR_CORE_PORT', '8003')}"
+            f"http://localhost:{os.getenv('REACTOR_CORE_PORT', '8090')}"
         )
     )
     reactor_api_timeout: float = field(

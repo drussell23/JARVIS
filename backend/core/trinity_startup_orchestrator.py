@@ -27,8 +27,8 @@ ARCHITECTURE:
     │  └── Export environment variables                                │
     │                                                                  │
     │  Phase 2: Parallel Component Launch                              │
-    │  ├── Start JARVIS-Prime (Mind) → Port 8002                      │
-    │  ├── Start Reactor-Core (Nerves) → Port 8003                    │
+    │  ├── Start JARVIS-Prime (Mind) → Port 8000                      │
+    │  ├── Start Reactor-Core (Nerves) → Port 8090                    │
     │  └── Wait for health checks to pass                              │
     │                                                                  │
     │  Phase 3: Integration Verification                               │
@@ -199,7 +199,7 @@ class TrinityStartupOrchestrator:
 
         # Get ports from config or defaults
         prime_port = int(os.getenv("JARVIS_PRIME_PORT", "8000"))  # v89.0: Fixed to 8000
-        reactor_port = int(os.getenv("REACTOR_CORE_PORT", "8003"))
+        reactor_port = int(os.getenv("REACTOR_CORE_PORT", "8090"))
 
         self.state.components = {
             ComponentType.JARVIS_PRIME: ComponentInfo(

@@ -44,7 +44,7 @@ Architecture:
     │   ┌──────────────┐     ┌──────────────┐     ┌──────────────┐             │
     │   │   JARVIS     │     │   J-PRIME    │     │   REACTOR    │             │
     │   │   (Body)     │     │   (Brain)    │     │   (Training) │             │
-    │   │   Port: 5001 │     │   Port: 8002 │     │   Port: 8003 │             │
+    │   │   Port: 5001 │     │   Port: 8000 │     │   Port: 8090 │             │
     │   └──────────────┘     └──────────────┘     └──────────────┘             │
     │                                                                           │
     └───────────────────────────────────────────────────────────────────────────┘
@@ -115,10 +115,10 @@ class TrinityBridgeConfig:
         default_factory=lambda: int(os.getenv("JARVIS_PORT", "5001"))
     )
     jprime_port: int = field(
-        default_factory=lambda: int(os.getenv("JARVIS_PRIME_PORT", "8002"))
+        default_factory=lambda: int(os.getenv("JARVIS_PRIME_PORT", "8000"))
     )
     reactor_port: int = field(
-        default_factory=lambda: int(os.getenv("REACTOR_CORE_PORT", "8003"))
+        default_factory=lambda: int(os.getenv("REACTOR_CORE_PORT", "8090"))
     )
 
     # Feature flags

@@ -74,8 +74,8 @@ class DiscoveredConfig:
     trinity_dir: Path = field(default_factory=lambda: Path.home() / ".jarvis" / "trinity")
     ports: Dict[str, int] = field(default_factory=lambda: {
         "jarvis_backend": 8010,
-        "jarvis_prime": 8002,
-        "reactor_core": 8003,
+        "jarvis_prime": 8000,
+        "reactor_core": 8090,
     })
     heartbeat_files: Dict[str, Path] = field(default_factory=dict)
     component_states: Dict[str, ComponentState] = field(default_factory=dict)
@@ -507,8 +507,8 @@ class DynamicConfigDiscovery:
         """Discover ports from environment."""
         return {
             "jarvis_backend": int(os.getenv("JARVIS_BACKEND_PORT", "8010")),
-            "jarvis_prime": int(os.getenv("JARVIS_PRIME_PORT", "8002")),
-            "reactor_core": int(os.getenv("REACTOR_CORE_PORT", "8003")),
+            "jarvis_prime": int(os.getenv("JARVIS_PRIME_PORT", "8000")),
+            "reactor_core": int(os.getenv("REACTOR_CORE_PORT", "8090")),
         }
 
     def _discover_heartbeat_files(self, trinity_dir: Path) -> Dict[str, Path]:

@@ -146,16 +146,16 @@ class TrinityPortConfig:
                 ComponentType.JARVIS_PRIME: PortAllocation.from_env(
                     name="JARVIS Prime",
                     env_primary="JARVIS_PRIME_PORT",
-                    default_primary=8002,
+                    default_primary=8000,
                     env_fallbacks="JARVIS_PRIME_PORT_FALLBACK",
                     default_fallbacks=(8004, 8005, 8006),
                 ),
                 ComponentType.REACTOR_CORE: PortAllocation.from_env(
                     name="Reactor Core",
                     env_primary="REACTOR_CORE_PORT",
-                    default_primary=8003,
+                    default_primary=8090,
                     env_fallbacks="REACTOR_CORE_PORT_FALLBACK",
-                    default_fallbacks=(8007, 8008, 8009),
+                    default_fallbacks=(8091, 8092, 8093),
                 ),
             }
 

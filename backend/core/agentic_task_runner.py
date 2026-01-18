@@ -196,7 +196,7 @@ class AgenticRunnerConfig:
         default_factory=lambda: os.getenv("JARVIS_REACTOR_CORE_ENABLED", "true").lower() == "true"
     )
     reactor_core_url: str = field(
-        default_factory=lambda: os.getenv("REACTOR_CORE_API_URL", "http://localhost:8003")
+        default_factory=lambda: os.getenv("REACTOR_CORE_API_URL", "http://localhost:8090")
     )
     reactor_core_auto_trigger: bool = field(
         default_factory=lambda: os.getenv("REACTOR_CORE_AUTO_TRIGGER", "true").lower() == "true"

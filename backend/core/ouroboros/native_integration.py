@@ -25591,7 +25591,7 @@ class CrossRepoHealthCoordinator:
                     Path.home() / "Documents/repos/reactor-core"
                 )),
                 "health_file": ".reactor_health",
-                "port": int(os.environ.get("REACTOR_CORE_PORT", 8003)),
+                "port": int(os.environ.get("REACTOR_CORE_PORT", 8090)),
             },
         }
         self._lock = asyncio.Lock()

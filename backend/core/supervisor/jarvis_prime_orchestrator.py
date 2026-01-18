@@ -1978,7 +1978,9 @@ class JarvisPrimeOrchestrator:
                     info["is_jarvis_prime"] = True
                 elif "jarvis-prime" in cmdline_lower:
                     info["is_jarvis_prime"] = True
-                elif "8002" in cmdline_lower:  # Default JARVIS Prime port
+                elif "8000" in cmdline_lower:  # Current JARVIS Prime port
+                    info["is_jarvis_prime"] = True
+                elif "8002" in cmdline_lower:  # Legacy JARVIS Prime port
                     info["is_jarvis_prime"] = True
 
             except (psutil.NoSuchProcess, psutil.AccessDenied):

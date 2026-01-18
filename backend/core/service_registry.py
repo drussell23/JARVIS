@@ -13,7 +13,7 @@ Architecture:
     │  │  ┌──────────────┬──────────────┬─────────────────────┐     │  │
     │  │  │   JARVIS     │   J-PRIME    │   REACTOR-CORE      │     │  │
     │  │  │  PID: 12345  │  PID: 12346  │   PID: 12347        │     │  │
-    │  │  │  Port: 5001  │  Port: 8002  │   Port: 8003        │     │  │
+    │  │  │  Port: 5001  │  Port: 8000  │   Port: 8090        │     │  │
     │  │  │  Status: ✅  │  Status: ✅  │   Status: ✅         │     │  │
     │  │  └──────────────┴──────────────┴─────────────────────┘     │  │
     │  └────────────────────────────────────────────────────────────┘  │
@@ -32,7 +32,7 @@ Usage:
     await registry.register_service(
         service_name="jarvis-prime",
         pid=os.getpid(),
-        port=8002,
+        port=8000,
         health_endpoint="/health"
     )
 

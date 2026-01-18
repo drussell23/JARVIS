@@ -1153,7 +1153,7 @@ class TrinityLaunchConfig:
         [int(p) for p in os.getenv("TRINITY_JPRIME_PORTS", "8000,8002").split(",")]
     )
     reactor_core_ports: List[int] = field(default_factory=lambda:
-        [int(p) for p in os.getenv("TRINITY_REACTOR_PORTS", "8003").split(",")]
+        [int(p) for p in os.getenv("TRINITY_REACTOR_PORTS", "8090").split(",")]
     )
 
     # Dynamic port allocation (fallback if primary ports busy)
@@ -3698,7 +3698,7 @@ class SupervisorBootstrapper:
         # v101.0: UnifiedTrinityConnector (Claude Code-like behaviors)
         self._unified_trinity_connector = None
         self._reactor_core_enabled = os.getenv("JARVIS_REACTOR_CORE_ENABLED", "true").lower() == "true"
-        self._reactor_core_port = int(os.getenv("REACTOR_CORE_PORT", "8003"))
+        self._reactor_core_port = int(os.getenv("REACTOR_CORE_PORT", "8090"))
 
         # v72.0: Trinity Component Auto-Launch (One-Command Startup)
         # These track subprocesses for J-Prime and Reactor-Core launched by this supervisor
@@ -16067,7 +16067,7 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
         Protected Ports:
             - 8000: J-Prime default server port
             - 8002: J-Prime alternate port
-            - 8003: Reactor-Core API port
+            - 8090: Reactor-Core API port
         """
         import psutil
 
@@ -16075,7 +16075,7 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
         zombie_ports = {
             8000: "J-Prime",
             8002: "J-Prime",
-            8003: "Reactor-Core",
+            8090: "Reactor-Core",
         }
 
         current_pid = os.getpid()

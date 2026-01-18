@@ -28380,7 +28380,7 @@ async def _initialize_reactor_core_client(self):
         
         reactor_core_url = os.getenv(
             "REACTOR_CORE_API_URL",
-            "http://localhost:8003"  # Reactor-Core API port
+            "http://localhost:8090"  # Reactor-Core API port
         )
         
         self._reactor_core_client = {
@@ -28708,7 +28708,7 @@ class ReactorCoreClient:
     def __init__(self, base_url: Optional[str] = None):
         self.base_url = base_url or os.getenv(
             "REACTOR_CORE_API_URL",
-            "http://localhost:8003"  # Reactor-Core API port
+            "http://localhost:8090"  # Reactor-Core API port
         )
         self.session: Optional[aiohttp.ClientSession] = None
         self.connected = False

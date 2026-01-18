@@ -266,7 +266,7 @@ Phase 2: External Repos (Parallel)
 │   ├─ If not running → Launch ~/Documents/repos/jarvis-prime/main.py
 │   └─ Wait for health check (30s timeout)
 └─ Reactor-Core
-    ├─ Probe http://localhost:8003/api/health
+    ├─ Probe http://localhost:8090/api/health
     ├─ If not running → Launch ~/Documents/repos/reactor-core/main.py
     └─ Wait for health check (60s timeout)
 
@@ -318,7 +318,7 @@ REACTOR_CORE_PATH=~/Documents/repos/reactor-core
 
 # Ports
 JARVIS_PRIME_PORT=8002
-REACTOR_CORE_PORT=8003
+REACTOR_CORE_PORT=8090
 
 # Enable/disable repos
 JARVIS_PRIME_ENABLED=true
@@ -660,10 +660,10 @@ job = await orchestrator.trigger_training(
 tail -f logs/jarvis*.log | grep -E "Training|Coordinator|Reactor"
 
 # Check Reactor Core status
-curl http://localhost:8003/api/health
+curl http://localhost:8090/api/health
 
 # Stream training status
-curl -N http://localhost:8003/api/training/stream/{job_id}
+curl -N http://localhost:8090/api/training/stream/{job_id}
 ```
 
 ---

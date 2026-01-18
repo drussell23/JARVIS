@@ -3148,7 +3148,7 @@ class AutoAcousticFeatureEnhancer:
             # Method 3: Direct API call to Reactor-Core (if available)
             try:
                 import aiohttp
-                reactor_port = int(os.environ.get("REACTOR_CORE_PORT", "8003"))
+                reactor_port = int(os.environ.get("REACTOR_CORE_PORT", "8090"))
 
                 async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
                     async with session.post(

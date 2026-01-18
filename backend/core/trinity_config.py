@@ -289,7 +289,7 @@ class TrinityConfig:
 
     reactor_core_endpoint: ServiceEndpoint = field(default_factory=lambda: ServiceEndpoint(
         host=_env_str("REACTOR_CORE_HOST", "localhost"),
-        port=_env_int("REACTOR_CORE_PORT", 8003),
+        port=_env_int("REACTOR_CORE_PORT", 8090),
         health_path=_env_str("REACTOR_CORE_HEALTH_PATH", "/health"),
     ))
 

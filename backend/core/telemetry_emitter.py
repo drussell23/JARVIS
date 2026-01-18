@@ -112,7 +112,7 @@ class TelemetryConfig:
     """Configuration for telemetry emission."""
     # Reactor-Core connection
     reactor_host: str = field(default_factory=lambda: os.getenv("REACTOR_CORE_HOST", "localhost"))
-    reactor_port: int = field(default_factory=lambda: _get_env_int("REACTOR_CORE_PORT", 8003))
+    reactor_port: int = field(default_factory=lambda: _get_env_int("REACTOR_CORE_PORT", 8090))
     reactor_api_version: str = field(default_factory=lambda: os.getenv("REACTOR_CORE_API_VERSION", "v1"))
 
     # Batching configuration

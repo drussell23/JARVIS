@@ -226,10 +226,10 @@ class TrinityIPCConfig:
         default_factory=lambda: int(os.getenv("JARVIS_BODY_PORT", "5001"))
     )
     jarvis_prime_port: int = field(
-        default_factory=lambda: int(os.getenv("JARVIS_PRIME_PORT", "8002"))
+        default_factory=lambda: int(os.getenv("JARVIS_PRIME_PORT", "8000"))
     )
     reactor_core_port: int = field(
-        default_factory=lambda: int(os.getenv("REACTOR_CORE_PORT", "8003"))
+        default_factory=lambda: int(os.getenv("REACTOR_CORE_PORT", "8090"))
     )
 
     # Message queue settings

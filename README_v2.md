@@ -871,7 +871,7 @@ JARVIS_REPO_HEALTH_RETRY_DELAY=2.0         # Delay between retries (seconds)
 
 # Health endpoints (optional)
 JARVIS_PRIME_HEALTH_URL=http://localhost:8002/health
-REACTOR_CORE_HEALTH_URL=http://localhost:8003/health
+REACTOR_CORE_HEALTH_URL=http://localhost:8090/health
 ```
 
 **Example Output:**
@@ -944,10 +944,10 @@ Experience Types:
 **WebSocket Communication:**
 ```python
 # Primary: WebSocket (low latency)
-ws://localhost:8003/training/experience
+ws://localhost:8090/training/experience
 
 # Fallback: REST API
-POST http://localhost:8003/api/training/experience
+POST http://localhost:8090/api/training/experience
 ```
 
 **Continuous Learning:**
@@ -1244,7 +1244,7 @@ REACTOR_CORE_REPO_PATH=~/Documents/repos/reactor-core
 
 # Health endpoints
 JARVIS_PRIME_HEALTH_URL=http://localhost:8002/health
-REACTOR_CORE_HEALTH_URL=http://localhost:8003/health
+REACTOR_CORE_HEALTH_URL=http://localhost:8090/health
 
 # Startup timeouts
 JARVIS_REPO_STARTUP_TIMEOUT=30.0

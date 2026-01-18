@@ -95,7 +95,7 @@ tail -f logs/jarvis*.log | grep -E "Training|Coordinator"
 # Check all repos health
 curl http://localhost:5001/health      # JARVIS
 curl http://localhost:8002/health      # J-Prime  
-curl http://localhost:8003/api/health  # Reactor Core
+curl http://localhost:8090/api/health  # Reactor Core
 ```
 
 ---

@@ -212,7 +212,7 @@ Cross-Repo Startup Orchestration v1.0
 # Check all repos are running
 curl http://localhost:5001/health      # JARVIS Core
 curl http://localhost:8002/health      # J-Prime
-curl http://localhost:8003/api/health  # Reactor Core
+curl http://localhost:8090/api/health  # Reactor Core
 
 # All should return HTTP 200 with {"status": "healthy"}
 ```
@@ -386,7 +386,7 @@ REACTOR_CORE_PATH=~/Documents/repos/reactor-core
 
 # Ports
 JARVIS_PRIME_PORT=8002
-REACTOR_CORE_PORT=8003
+REACTOR_CORE_PORT=8090
 
 # Enable/disable repos
 JARVIS_PRIME_ENABLED=true

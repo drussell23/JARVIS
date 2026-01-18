@@ -51,7 +51,7 @@ Usage in Reactor Core:
     router = create_training_router(
         training_engine=your_training_engine,
         service_name="reactor-core",
-        port=8003
+        port=8090
     )
 
     app.include_router(router)
@@ -93,7 +93,7 @@ class ReactorAPIConfig:
         default_factory=lambda: os.getenv("REACTOR_SERVICE_NAME", "reactor-core")
     )
     port: int = field(
-        default_factory=lambda: int(os.getenv("REACTOR_CORE_PORT", "8003"))
+        default_factory=lambda: int(os.getenv("REACTOR_CORE_PORT", "8090"))
     )
     health_endpoint: str = "/api/health"
 
@@ -507,7 +507,7 @@ def create_training_router(
     training_engine: Optional[TrainingEngineProtocol] = None,
     config: Optional[ReactorAPIConfig] = None,
     service_name: str = "reactor-core",
-    port: int = 8003
+    port: int = 8090
 ) -> APIRouter:
     """
     Create FastAPI router for training API.
@@ -713,7 +713,7 @@ def create_standalone_app():
     Create standalone FastAPI app for testing or standalone deployment.
 
     Usage:
-        uvicorn backend.reactor.reactor_api_interface:app --port 8003
+        uvicorn backend.reactor.reactor_api_interface:app --port 8090
     """
     from fastapi import FastAPI
 

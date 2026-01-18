@@ -408,7 +408,7 @@ class TestFullPipeline:
 
         # Step 3: Register mock services
         await registry.register_service("jarvis-core", os.getpid(), 5001)
-        await registry.register_service("reactor-core", os.getpid(), 8003)
+        await registry.register_service("reactor-core", os.getpid(), 8090)
 
         # Step 4: Verify discovery
         jarvis = await registry.discover_service("jarvis-core")
@@ -417,7 +417,7 @@ class TestFullPipeline:
         assert jarvis is not None
         assert reactor is not None
         assert jarvis.port == 5001
-        assert reactor.port == 8003
+        assert reactor.port == 8090
 
         # Step 5: Send heartbeats
         await registry.heartbeat("jarvis-core", status="healthy")

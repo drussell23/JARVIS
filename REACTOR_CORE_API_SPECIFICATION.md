@@ -22,7 +22,7 @@ Reactor Core is a separate repository that handles:
 
 ### Base URL
 ```
-http://localhost:8003  (configurable via REACTOR_CORE_PORT)
+http://localhost:8090  (configurable via REACTOR_CORE_PORT)
 ```
 
 ###
@@ -30,7 +30,7 @@ http://localhost:8003  (configurable via REACTOR_CORE_PORT)
  Required Environment Variables
 ```bash
 # In Reactor Core
-REACTOR_CORE_PORT=8003
+REACTOR_CORE_PORT=8090
 REACTOR_CORE_HOST=0.0.0.0
 EXPERIENCE_DIR=~/.jarvis/trinity/events
 CHECKPOINT_DIR=~/.jarvis/training_checkpoints
@@ -478,7 +478,7 @@ cd ~/Documents/repos/JARVIS-AI-Agent
 python3 run_supervisor.py
 
 # Terminal 3: Trigger training
-curl -X POST http://localhost:8003/api/training/start \
+curl -X POST http://localhost:8090/api/training/start \
   -H "Content-Type: application/json" \
   -d '{
     "job_id": "test-123",
@@ -488,7 +488,7 @@ curl -X POST http://localhost:8003/api/training/start \
   }'
 
 # Terminal 4: Stream status
-curl -N http://localhost:8003/api/training/stream/test-123
+curl -N http://localhost:8090/api/training/stream/test-123
 ```
 
 ---
@@ -496,8 +496,8 @@ curl -N http://localhost:8003/api/training/stream/test-123
 ## 🐛 Troubleshooting
 
 ### Training doesn't start
-- **Check:** Reactor Core health: `curl http://localhost:8003/api/health`
-- **Check:** JARVIS can reach Reactor Core: `curl http://localhost:8003/api/health`
+- **Check:** Reactor Core health: `curl http://localhost:8090/api/health`
+- **Check:** JARVIS can reach Reactor Core: `curl http://localhost:8090/api/health`
 - **Check:** Experience files in `~/.jarvis/trinity/events/`
 - **Check:** Reactor Core logs for errors
 

@@ -111,7 +111,7 @@ class TrinityConfig:
     # Ports (dynamic allocation if not specified)
     JARVIS_PORT = int(os.getenv("JARVIS_PORT", "8765"))
     PRIME_PORT = int(os.getenv("PRIME_PORT", "8000"))
-    REACTOR_PORT = int(os.getenv("REACTOR_PORT", "8003"))
+    REACTOR_PORT = int(os.getenv("REACTOR_PORT", "8090"))
 
     # Timing
     HEARTBEAT_INTERVAL = float(os.getenv("TRINITY_HEARTBEAT_INTERVAL", "5.0"))

@@ -2876,7 +2876,7 @@ class ServiceRegistry:
             ),
             ServiceEndpoint(
                 name="reactor_core",
-                url=os.getenv("REACTOR_CORE_URL", "http://localhost:8003"),
+                url=os.getenv("REACTOR_CORE_URL", "http://localhost:8090"),
                 health_path="/health",
                 tags={"type": "training"},
             ),

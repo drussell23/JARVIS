@@ -20,7 +20,7 @@ Architecture:
     │                            │                                  │
     │  ┌─────────────┐   ┌──────┴─────┐   ┌──────────────────┐    │
     │  │   Local     │   │  Cloud Run │   │   Gemini API     │    │
-    │  │ (Port 8002) │→→→│  (GCR URL) │→→→│  (Fallback)      │    │
+    │  │ (Port 8000) │→→→│  (GCR URL) │→→→│  (Fallback)      │    │
     │  └─────────────┘   └────────────┘   └──────────────────┘    │
     │         ↓                ↓                   ↓               │
     │  ┌──────────────────────────────────────────────────────────┐│
@@ -429,7 +429,7 @@ class JarvisPrimeConfig:
         default_factory=lambda: os.getenv("JARVIS_PRIME_HOST", "127.0.0.1")
     )
     local_port: int = field(
-        default_factory=lambda: int(os.getenv("JARVIS_PRIME_PORT", "8002"))
+        default_factory=lambda: int(os.getenv("JARVIS_PRIME_PORT", "8000"))
     )
 
     # Cloud Run settings

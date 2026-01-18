@@ -2511,7 +2511,7 @@ class TrinityCoordinator:
             "default_path": "~/Documents/repos/jarvis-prime",
             "health_endpoint": "/v1/models",
             "port_env": "JARVIS_PRIME_PORT",
-            "default_port": 8002,
+            "default_port": 8000,
         },
         "reactor": {
             "name": "Reactor-Core",
@@ -2519,7 +2519,7 @@ class TrinityCoordinator:
             "default_path": "~/Documents/repos/reactor-core",
             "health_endpoint": "/health",
             "port_env": "REACTOR_CORE_PORT",
-            "default_port": 8003,
+            "default_port": 8090,
         },
     }
 
@@ -4865,7 +4865,7 @@ class CrossRepoAutonomousIntegration:
                     mesh_services = [
                         {"name": "jarvis-core", "port": 8000, "health_path": "/health"},
                         {"name": "jarvis-prime", "port": 8001, "health_path": "/health", "dependencies": ["jarvis-core"]},
-                        {"name": "reactor-core", "port": 8003, "health_path": "/health", "dependencies": ["jarvis-core"]},
+                        {"name": "reactor-core", "port": 8090, "health_path": "/health", "dependencies": ["jarvis-core"]},
                     ]
 
                     v11_components = await initialize_resilient_mesh(services=mesh_services)

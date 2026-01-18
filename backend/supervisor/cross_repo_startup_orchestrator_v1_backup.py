@@ -23,7 +23,7 @@ Architecture:
     │  ┌────────────────┬──────────────┬─────────────────────┐         │
     │  │   JARVIS       │   J-PRIME    │   REACTOR-CORE      │         │
     │  │  PID: auto     │  PID: auto   │   PID: auto         │         │
-    │  │  Port: dynamic │  Port: 8002  │   Port: 8003        │         │
+    │  │  Port: dynamic │  Port: 8002  │   Port: 8090        │         │
     │  │  Status: ✅     │  Status: ✅  │   Status: ✅        │         │
     │  └────────────────┴──────────────┴─────────────────────┘         │
     │                                                                  │
@@ -83,7 +83,7 @@ REACTOR_CORE_PATH = Path(os.getenv(
 ))
 
 JARVIS_PRIME_PORT = int(os.getenv("JARVIS_PRIME_PORT", "8002"))
-REACTOR_CORE_PORT = int(os.getenv("REACTOR_CORE_PORT", "8003"))
+REACTOR_CORE_PORT = int(os.getenv("REACTOR_CORE_PORT", "8090"))
 
 JARVIS_PRIME_ENABLED = os.getenv("JARVIS_PRIME_ENABLED", "true").lower() == "true"
 REACTOR_CORE_ENABLED = os.getenv("REACTOR_CORE_ENABLED", "true").lower() == "true"

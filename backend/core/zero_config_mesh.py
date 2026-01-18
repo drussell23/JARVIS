@@ -115,7 +115,7 @@ class ZeroConfigMesh:
             >>> await mesh.join({
             ...     "name": "voice_service",
             ...     "type": "voice",
-            ...     "port": 8002,
+            ...     "port": 8000,
             ...     "protocol": "websocket"
             ... })
         """

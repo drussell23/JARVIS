@@ -75,7 +75,7 @@ logger = logging.getLogger("TrinityProbe")
 # Default ports for Trinity components
 JARVIS_API_PORT = int(os.getenv("JARVIS_API_PORT", "8001"))
 JARVIS_PRIME_PORT = int(os.getenv("JARVIS_PRIME_PORT", "8000"))
-REACTOR_CORE_PORT = int(os.getenv("REACTOR_CORE_PORT", "8003"))
+REACTOR_CORE_PORT = int(os.getenv("REACTOR_CORE_PORT", "8090"))
 
 
 @dataclass

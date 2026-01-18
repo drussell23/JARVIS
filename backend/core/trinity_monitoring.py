@@ -898,8 +898,8 @@ class TrinityMonitoring:
 
         checks = [
             (RepoType.JARVIS, "main", "http://localhost:8000/health"),
-            (RepoType.PRIME, "inference", "http://localhost:8002/health"),
-            (RepoType.REACTOR, "training", "http://localhost:8003/health"),
+            (RepoType.PRIME, "inference", "http://localhost:8000/health"),
+            (RepoType.REACTOR, "training", "http://localhost:8090/health"),
         ]
 
         async with aiohttp.ClientSession() as session:

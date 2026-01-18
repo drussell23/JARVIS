@@ -256,8 +256,8 @@ class OrchestratorHooks:
         if not self._discovered_config:
             return {
                 "jarvis_backend": 8010,
-                "jarvis_prime": 8002,
-                "reactor_core": 8003,
+                "jarvis_prime": 8000,
+                "reactor_core": 8090,
             }
 
         return self._discovered_config.ports
