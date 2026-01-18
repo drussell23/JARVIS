@@ -298,7 +298,7 @@ class CrossRepoNeuralMeshBridge:
         self._circuit_breaker = CrossRepoCircuitBreaker(
             config=CircuitBreakerConfig(
                 failure_threshold=5,
-                recovery_timeout=30.0,
+                timeout_seconds=30.0,  # v2.1: Fixed - was 'recovery_timeout' which doesn't exist
                 half_open_max_calls=2,
             )
         )

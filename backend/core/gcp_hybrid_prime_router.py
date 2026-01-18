@@ -231,7 +231,7 @@ class GCPHybridPrimeRouter:
             self._circuit_breaker = CrossRepoCircuitBreaker(
                 config=CircuitBreakerConfig(
                     failure_threshold=3,
-                    recovery_timeout=60.0,
+                    timeout_seconds=60.0,  # v2.1: Fixed - was 'recovery_timeout' which doesn't exist
                     half_open_max_calls=2,
                 )
             )
