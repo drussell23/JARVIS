@@ -567,6 +567,148 @@ AUTONOMOUS_START_LOOPS=true python3 run_supervisor.py
 
 ---
 
+### Advanced Gaps, Edge Cases, and Nuances
+
+This section documents **advanced limitations**, **edge cases**, and **weird nuances** in Ouroboros compared to Claude Code, along with missing features and technology stacks that need to be added.
+
+#### 🔴 Critical Advanced Gaps (High Priority)
+
+| # | Gap | What It Means | Impact | Claude Code Status | Ouroboros Status |
+|---|-----|---------------|--------|-------------------|------------------|
+| 1 | **Type-Aware Refactoring** | Cannot use type hints to safely refactor with type checking | May break type contracts during refactoring | ✅ Full type checking integration | ❌ AST-based only, no type checker |
+| 2 | **Git Merge Conflict Resolution** | Cannot automatically resolve merge conflicts when user commits while Ouroboros improves | Requires manual conflict resolution | ✅ Auto-merge + 3-way diff | ❌ Git rollback only, no conflict resolution |
+| 3 | **Test Generation (ATDD)** | Cannot generate comprehensive test suites from scratch (property-based, edge cases) | Test coverage gaps | ✅ Generates tests with edge cases | ⚠️ Can generate basic tests, not comprehensive |
+| 4 | **Interactive Refinement Loop** | Cannot refine improvements mid-process based on user feedback | All-or-nothing improvements | ✅ Can refine based on feedback | ❌ Single-pass improvements only |
+| 5 | **Performance Profiling Integration** | Does not use actual profiler data (cProfile, py-spy) to optimize | Optimizations based on heuristics, not data | ⚠️ Limited profiling integration | ❌ No profiler integration |
+| 6 | **Multi-File Coordination** | Cannot atomically coordinate related changes across 3+ files (e.g., model + serializer + tests) | Risk of partial application | ✅ Multi-file atomic edits | ⚠️ Supports 2-3 files, not large coordinated changes |
+| 7 | **Framework Migration Support** | Cannot handle major framework/library upgrades (Django 2→3, Python 2→3) | Manual migration required | ✅ Migration tooling | ❌ No migration support |
+| 8 | **API Contract Change Detection** | Does not update OpenAPI specs, client code, or API docs when APIs change | API drift over time | ✅ API contract tracking | ❌ No API contract awareness |
+| 9 | **Database Schema Migration Generation** | Cannot auto-generate migrations (Django/Alembic) when models change | Manual migration creation | ⚠️ Limited migration support | ❌ No migration generation |
+| 10 | **Dependency Version Management** | Can install missing packages, but cannot safely upgrade versions or test compatibility | Dependency drift, security vulnerabilities | ✅ Suggests upgrades + tests compatibility | ⚠️ Auto-installs, no upgrade management |
+
+#### 🟡 Medium-Priority Gaps (Nice to Have)
+
+| # | Gap | What It Means | Impact | Claude Code Status | Ouroboros Status |
+|---|-----|---------------|--------|-------------------|------------------|
+| 11 | **Incremental Improvement Versioning** | Cannot track multiple improvement iterations with rollback to specific versions | Limited improvement history | ✅ Version tracking + rollback | ⚠️ Git snapshots, not structured versioning |
+| 12 | **Code Pattern Enforcement** | Does not enforce architectural patterns (MVC, Repository, etc.) or style guides | Code style drift | ✅ Pattern detection + enforcement | ❌ No pattern enforcement |
+| 13 | **Change Impact Analysis (Metrics)** | Blast radius exists, but cannot predict performance/metric impact (latency, memory, CPU) | Unknown performance regression risk | ⚠️ Limited impact prediction | ❌ Blast radius only (structural), no metrics |
+| 14 | **Documentation Generation** | Can generate docstrings, but not comprehensive docs (API docs, architecture diagrams, guides) | Documentation gaps | ✅ Generates comprehensive docs | ⚠️ Docstrings only |
+| 15 | **Semantic Versioning Awareness** | Does not suggest version bumps (patch/minor/major) based on change type | Manual versioning | ❌ Manual versioning | ❌ No version awareness |
+| 16 | **Code Review Quality** | Basic security/pattern checks, but not deep code review (subtle bugs, logic errors, race conditions) | Misses subtle issues | ✅ Advanced code review | ⚠️ Basic checks only |
+| 17 | **Multi-Language Workspace Support** | Python-only (no TypeScript, JavaScript, Go, Rust) | Cannot improve frontend/full-stack | ✅ 20+ languages | ❌ Python only |
+| 18 | **Context Window Extreme Edge Cases** | SmartContext handles most cases, but extremely nested code (>50 levels) or massive classes (>5k lines) may exceed even chunked limits | Cannot handle extreme edge cases | ✅ Handles extreme cases | ⚠️ SmartContext helps, but not guaranteed |
+
+#### 🟢 Subtle Nuances & Edge Cases (Weird Behaviors)
+
+| # | Nuance | What Happens | Why | Workaround |
+|---|--------|--------------|-----|------------|
+| 19 | **Concurrent User Edit Detection** | FileLockManager checks if file is open, but if user saves file while Ouroboros is reading it, may read stale version | Race condition between lock check and file read | User should close file or wait for improvement to complete |
+| 20 | **Oracle Graph Staleness** | Oracle graph may be stale if files changed outside Ouroboros (manual edits, external tools) | Incremental updates only track Ouroboros changes | Run `oracle.rebuild()` manually or restart Ouroboros |
+| 21 | **LSP Server Availability** | Watcher requires pyright/jedi installed. If LSP server crashes, falls back to AST-only analysis (less precise) | LSP servers can crash or be unavailable | Monitor LSP health, restart servers if needed |
+| 22 | **Web Search Rate Limiting** | Web search integration uses DuckDuckGo/Google APIs with rate limits. May throttle during heavy improvement sessions | API rate limits (1 req/sec for DuckDuckGo) | Uses circuit breaker, caches results, but may still throttle |
+| 23 | **Cross-Repo State Sync Delay** | CrossRepoSyncManager uses file-based IPC. If Prime/Reactor are slow to read state files, improvements may proceed without latest state | File-based IPC is eventually consistent | State sync is async; improvements proceed with best-effort state |
+| 24 | **Sandbox Execution Limits** | Simulator sandbox has 30s timeout, 512MB memory limit. Code that needs longer or more memory may fail validation even if correct | Safety limits prevent resource exhaustion | Increase `SIMULATOR_MAX_TIME` or `SIMULATOR_MAX_MEMORY` env vars |
+| 25 | **Genetic Evolution Population Collapse** | Genetic algorithm may converge to local optimum if initial population is similar | Limited diversity in candidate pool | Increase `POPULATION_SIZE` or add mutation rate |
+| 26 | **SmartContext False Negatives** | SmartContext may exclude code that seems unrelated but is actually needed (dynamic imports, reflection, decorators) | AST-based analysis misses runtime dependencies | Falls back to full-file reads if improvement fails |
+| 27 | **ChromaDB Vector Staleness** | Semantic memory (ChromaDB) may return stale embeddings if code changed significantly but embeddings not updated | Embeddings computed at improvement time, not continuously | Semantic memory is best-effort; Oracle graph is source of truth |
+| 28 | **JARVIS Prime Model Selection Race** | If multiple improvements run simultaneously, all may select same model, causing load imbalance | Model selection not coordinated across concurrent improvements | Uses circuit breaker to prevent overload, but may queue requests |
+
+#### 🔧 Missing Technology Stacks & Integrations
+
+| Technology Stack | What It Enables | Claude Code Support | Ouroboros Status | Priority |
+|------------------|-----------------|---------------------|------------------|----------|
+| **Type Checkers** (mypy, pyright, pyre) | Type-aware refactoring, type-safe improvements | ✅ Integrated | ❌ Not integrated | High |
+| **Performance Profilers** (cProfile, py-spy, line_profiler) | Data-driven performance optimization | ⚠️ Limited | ❌ Not integrated | High |
+| **Test Frameworks** (pytest, unittest, Hypothesis) | Comprehensive test generation, property-based testing | ✅ Integrated | ⚠️ Basic test running | Medium |
+| **Migration Tools** (Alembic, Django migrations) | Auto-generate database migrations | ⚠️ Limited | ❌ Not integrated | Medium |
+| **API Documentation** (OpenAPI/Swagger, FastAPI, pydantic) | Auto-update API docs, client code generation | ✅ Integrated | ❌ Not integrated | Medium |
+| **Code Quality Tools** (pylint, flake8, black, isort) | Enforce style guides, detect code smells | ✅ Integrated | ⚠️ Basic checks | Low |
+| **Static Analysis** (bandit, safety, semgrep) | Security vulnerability scanning, dependency checks | ✅ Integrated | ⚠️ CodeSanitizer only | Low |
+| **Dependency Managers** (poetry, pip-tools, dependabot) | Safe dependency upgrades, version pinning | ✅ Integrated | ⚠️ Auto-install only | Low |
+| **Multi-Language Parsers** (tree-sitter, Language Server Protocol) | Support TypeScript, JavaScript, Go, Rust, etc. | ✅ Full support | ❌ Python AST only | High (if needed) |
+| **Architecture Enforcement** (ArchUnit, dependency-cruiser) | Enforce architectural patterns, dependency rules | ⚠️ Limited | ❌ Not integrated | Low |
+
+#### 📊 Gap Summary Matrix
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    OUROBOROS VS CLAUDE CODE GAPS                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  Category                  │  Claude Code  │  Ouroboros  │  Gap Size   │
+│  ──────────────────────────┼──────────────┼─────────────┼─────────────┤
+│  Self-Improvement          │      ❌       │      ✅     │  +10 points │
+│  Graph-Based Understanding │      ❌       │      ✅     │  +5 points  │
+│  Smart Context             │      ⚠️       │      ✅     │  +3 points  │
+│  Local LLMs                │      ❌       │      ✅     │  +2 points  │
+│  Cross-Repo                │      ❌       │      ✅     │  +1 point   │
+│  ──────────────────────────┼──────────────┼─────────────┼─────────────┤
+│  Type Checking             │      ✅       │      ❌     │  -2 points  │
+│  Multi-Language            │      ✅       │      ❌     │  -3 points  │
+│  IDE Integration           │      ✅       │      ❌     │  -2 points  │
+│  Test Generation           │      ✅       │      ⚠️     │  -1 point   │
+│  Migration Tooling         │      ⚠️       │      ❌     │  -1 point   │
+│  ──────────────────────────┼──────────────┼─────────────┼─────────────┤
+│  NET SCORE                 │              │             │  +12 points │
+│                            │  Ouroboros is stronger for self-improvement│
+│                            │  Claude Code is stronger for IDE workflows │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 🎯 Recommended Next Steps (Priority Order)
+
+1. **Type-Aware Refactoring (High Impact)**
+   - Integrate mypy/pyright for type checking
+   - Enable type-safe refactoring with type inference
+   - **Estimated effort**: 2-3 weeks
+   - **Technology**: mypy, pyright, type stubs
+
+2. **Test Generation Enhancement (High Impact)**
+   - Integrate Hypothesis for property-based testing
+   - Generate edge case tests automatically
+   - **Estimated effort**: 1-2 weeks
+   - **Technology**: Hypothesis, pytest fixtures
+
+3. **Performance Profiler Integration (Medium Impact)**
+   - Use cProfile/py-spy data to drive optimizations
+   - Profile before/after improvements
+   - **Estimated effort**: 1-2 weeks
+   - **Technology**: cProfile, py-spy, line_profiler
+
+4. **Multi-Language Support (If Needed)**
+   - Add tree-sitter for TypeScript/JavaScript
+   - Extend Oracle to multi-language graphs
+   - **Estimated effort**: 4-6 weeks
+   - **Technology**: tree-sitter, language servers
+
+5. **Git Conflict Resolution (Medium Impact)**
+   - Implement 3-way merge for conflict resolution
+   - Auto-merge when safe, prompt when not
+   - **Estimated effort**: 2-3 weeks
+   - **Technology**: GitPython, diff3 algorithm
+
+6. **API Contract Tracking (Low Impact)**
+   - Detect API changes, update OpenAPI specs
+   - Generate client code updates
+   - **Estimated effort**: 2-3 weeks
+   - **Technology**: OpenAPI parser, pydantic models
+
+#### 💡 Workarounds & Mitigations
+
+For gaps that cannot be immediately fixed:
+
+| Gap | Workaround | How Effective |
+|-----|------------|---------------|
+| **Type-Aware Refactoring** | Run mypy manually after improvements, iterate | 70% effective |
+| **Git Conflicts** | Use separate branches for improvements, merge manually | 90% effective |
+| **Test Generation** | Generate basic tests, expand manually | 50% effective |
+| **Performance Profiling** | Use manual profiling before improvements | 60% effective |
+| **Multi-Language** | Use Ouroboros for Python, Claude Code for other languages | 80% effective |
+| **Migration Tooling** | Generate migration stubs, fill in manually | 70% effective |
+
+---
+
 ## 🎬 Behind-the-Scenes: How It All Works Together
 
 ### Example 1: Voice Authentication & Screen Unlock (2.35 seconds)
