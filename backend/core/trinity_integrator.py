@@ -9108,6 +9108,9 @@ class TrinityUnifiedOrchestrator:
                                 f"Failed: {', '.join(failed_components)}"
                             )
 
+                            # v100.5: Provide detailed diagnostics for failed components
+                            await self._log_component_diagnostics()
+
                         # Step 3.2: Record initial health baselines
                         logger.info("   📝 [v86.0] Recording health baselines...")
                         async with self._tracer.span("record_baselines"):
@@ -9620,6 +9623,184 @@ class TrinityUnifiedOrchestrator:
         except Exception as e:
             logger.debug(f"[Discovery] Error checking {component}: {e}")
             return False
+
+    async def _diagnose_component_status(self, component: str) -> Dict[str, Any]:
+        """
+        v100.5: Comprehensive diagnosis of why a component isn't available.
+
+        Provides detailed status for better user messaging:
+        - repo_installed: Is the repo directory present?
+        - venv_exists: Does the virtual environment exist?
+        - venv_valid: Is the venv properly set up with Python?
+        - launch_script_exists: Is the launch script present?
+        - currently_running: Is the service currently running?
+        - last_heartbeat: When was the last heartbeat?
+        - recommended_action: What should the user do?
+
+        Args:
+            component: Component name (jarvis_prime, reactor_core)
+
+        Returns:
+            Dict with diagnostic information
+        """
+        diagnosis = {
+            "component": component,
+            "repo_installed": False,
+            "repo_path": None,
+            "venv_exists": False,
+            "venv_valid": False,
+            "launch_script_exists": False,
+            "launch_script_path": None,
+            "currently_running": False,
+            "last_heartbeat": None,
+            "heartbeat_age_seconds": None,
+            "pid": None,
+            "port": None,
+            "recommended_action": "unknown",
+            "status_emoji": "❓",
+            "status_message": "Unknown status",
+        }
+
+        # Determine repo path based on component
+        if component == "jarvis_prime":
+            repo_path = Path(os.getenv(
+                "JARVIS_PRIME_PATH",
+                str(Path.home() / "Documents" / "repos" / "jarvis-prime")
+            ))
+            launch_scripts = [
+                "jarvis_prime/server.py",
+                "run_server.py",
+                "jarvis_prime/core/trinity_bridge.py",
+            ]
+            default_port = int(os.getenv("JARVIS_PRIME_PORT", "8000"))
+        elif component == "reactor_core":
+            repo_path = Path(os.getenv(
+                "REACTOR_CORE_PATH",
+                str(Path.home() / "Documents" / "repos" / "reactor-core")
+            ))
+            launch_scripts = [
+                "reactor_core/orchestration/trinity_orchestrator.py",
+                "run_orchestrator.py",
+            ]
+            default_port = int(os.getenv("REACTOR_CORE_PORT", "8001"))
+        else:
+            diagnosis["recommended_action"] = f"Unknown component: {component}"
+            return diagnosis
+
+        diagnosis["repo_path"] = str(repo_path)
+
+        # Check 1: Repo installed
+        if repo_path.exists():
+            diagnosis["repo_installed"] = True
+        else:
+            diagnosis["status_emoji"] = "📁"
+            diagnosis["status_message"] = f"Repo not found at {repo_path}"
+            diagnosis["recommended_action"] = f"Clone the {component} repository to {repo_path}"
+            return diagnosis
+
+        # Check 2: Virtual environment
+        venv_path = repo_path / "venv"
+        if venv_path.exists():
+            diagnosis["venv_exists"] = True
+            # Check if Python is valid in venv
+            venv_python = venv_path / "bin" / "python3"
+            if not venv_python.exists():
+                venv_python = venv_path / "bin" / "python"
+            if venv_python.exists():
+                diagnosis["venv_valid"] = True
+        else:
+            diagnosis["status_emoji"] = "🐍"
+            diagnosis["status_message"] = f"Virtual environment not found"
+            diagnosis["recommended_action"] = f"cd {repo_path} && python3 -m venv venv && source venv/bin/activate && pip install -r requirements.txt"
+            return diagnosis
+
+        if not diagnosis["venv_valid"]:
+            diagnosis["status_emoji"] = "⚠️"
+            diagnosis["status_message"] = f"Virtual environment invalid (no Python found)"
+            diagnosis["recommended_action"] = f"Recreate venv: rm -rf {venv_path} && python3 -m venv {venv_path}"
+            return diagnosis
+
+        # Check 3: Launch script exists
+        for script in launch_scripts:
+            script_path = repo_path / script
+            if script_path.exists():
+                diagnosis["launch_script_exists"] = True
+                diagnosis["launch_script_path"] = str(script_path)
+                break
+
+        if not diagnosis["launch_script_exists"]:
+            diagnosis["status_emoji"] = "📜"
+            diagnosis["status_message"] = f"No launch script found"
+            diagnosis["recommended_action"] = f"Check {component} repository structure"
+            return diagnosis
+
+        # Check 4: Currently running (heartbeat + process check)
+        trinity_dir = Path(os.getenv(
+            "TRINITY_DIR",
+            str(Path.home() / ".jarvis" / "trinity")
+        ))
+        heartbeat_file = trinity_dir / "components" / f"{component}.json"
+
+        if heartbeat_file.exists():
+            try:
+                with open(heartbeat_file, 'r') as f:
+                    hb_data = json.load(f)
+                diagnosis["last_heartbeat"] = hb_data.get("timestamp")
+                diagnosis["pid"] = hb_data.get("pid")
+                diagnosis["port"] = hb_data.get("port", default_port)
+
+                if diagnosis["last_heartbeat"]:
+                    age = time.time() - diagnosis["last_heartbeat"]
+                    diagnosis["heartbeat_age_seconds"] = age
+
+                    # Check if process is alive
+                    if diagnosis["pid"]:
+                        try:
+                            import psutil
+                            proc = psutil.Process(diagnosis["pid"])
+                            if proc.is_running() and age < 30.0:
+                                diagnosis["currently_running"] = True
+                                diagnosis["status_emoji"] = "✅"
+                                diagnosis["status_message"] = f"Running (PID {diagnosis['pid']}, port {diagnosis['port']})"
+                                diagnosis["recommended_action"] = "Component is healthy"
+                                return diagnosis
+                        except (psutil.NoSuchProcess, psutil.AccessDenied):
+                            pass
+            except Exception as e:
+                logger.debug(f"[Diagnosis] Heartbeat read error for {component}: {e}")
+
+        # If we get here, component is installed but not running
+        diagnosis["status_emoji"] = "💤"
+        diagnosis["status_message"] = f"Installed but not running"
+        diagnosis["recommended_action"] = f"Start {component}: the supervisor will auto-launch it, or manually run the launch script"
+
+        return diagnosis
+
+    async def _log_component_diagnostics(self) -> None:
+        """
+        v100.5: Log detailed diagnostics for external components.
+
+        Called during startup to provide clear visibility into why
+        components might be unavailable.
+        """
+        logger.info("   🔍 [v100.5] Diagnosing external component status...")
+
+        components_to_diagnose = []
+        if self.enable_jprime:
+            components_to_diagnose.append("jarvis_prime")
+        if self.enable_reactor:
+            components_to_diagnose.append("reactor_core")
+
+        for component in components_to_diagnose:
+            diag = await self._diagnose_component_status(component)
+            display_name = "J-Prime" if component == "jarvis_prime" else "Reactor-Core"
+
+            logger.info(
+                f"      {diag['status_emoji']} {display_name}: {diag['status_message']}"
+            )
+
+            if diag["recommended_action"] != "Component is healthy":
+                logger.info(f"         → {diag['recommended_action']}")
 
     async def _launch_jprime_process(self) -> bool:
         """

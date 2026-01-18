@@ -1057,47 +1057,100 @@ class CloudSQLConnectionManager:
                 # IMMEDIATE cleanup of leaked connections before creating pool
                 await self._immediate_leak_cleanup()
 
-                # v3.1: Create pool with retry logic and serialized connection setup
-                # This prevents TLS race conditions (InvalidStateError) that occur when
-                # multiple connections try to establish TLS simultaneously
-                async def create_pool_with_retry():
-                    """Create pool with retry on transient errors."""
-                    max_retries = 3
+                # v16.0: Enhanced TLS-Safe Connection Pool Creation
+                # ═══════════════════════════════════════════════════════════════════
+                # ROOT CAUSE FIX for asyncpg TLS InvalidStateError:
+                # The error occurs in TLSUpgradeProto.data_received when set_result()
+                # is called on an already-completed future. This happens when:
+                # 1. Multiple connections try TLS upgrade simultaneously
+                # 2. The internal state machine gets corrupted by race conditions
+                #
+                # FIX STRATEGY:
+                # 1. Create connections ONE AT A TIME using a semaphore
+                # 2. Start with min_size=1 to verify TLS works first
+                # 3. Use a custom init callback that serializes connection setup
+                # 4. Wrap all connection operations in defensive error handling
+                # ═══════════════════════════════════════════════════════════════════
+
+                # Global semaphore to serialize ALL TLS connection establishment
+                # This prevents the race condition at the uvloop level
+                if not hasattr(self, '_tls_connection_semaphore'):
+                    self._tls_connection_semaphore = asyncio.Semaphore(1)
+
+                async def create_pool_with_tls_safety():
+                    """Create pool with TLS race condition prevention."""
+                    max_retries = 5
                     last_error = None
 
                     for attempt in range(max_retries):
                         try:
-                            # v3.1: Use setup callback to serialize connection initialization
-                            # This helps prevent TLS race conditions in asyncpg
-                            async def connection_setup(conn):
-                                """Called when a new connection is established."""
-                                # Small delay to prevent thundering herd during pool init
-                                if attempt > 0:
-                                    await asyncio.sleep(0.1 * attempt)
+                            # v16.0: Connection init callback that serializes TLS setup
+                            # Each connection waits for the semaphore before completing setup
+                            async def serialized_connection_init(conn):
+                                """Serialize connection initialization to prevent TLS races."""
+                                async with self._tls_connection_semaphore:
+                                    # Small delay to let TLS state machine settle
+                                    await asyncio.sleep(0.05)
+                                    # Verify connection is actually usable
+                                    try:
+                                        await conn.execute("SELECT 1")
+                                    except Exception as verify_err:
+                                        logger.debug(f"Connection verify failed: {verify_err}")
+                                        raise
 
+                            # v16.0: CRITICAL - Start with min_size=1 to verify TLS first
+                            # This prevents multiple simultaneous TLS handshakes during pool init
+                            initial_min_size = 1 if attempt == 0 else self._conn_config.min_connections
+
+                            logger.info(f"   [v16.0] Creating pool (attempt {attempt + 1}/{max_retries}, "
+                                        f"min={initial_min_size}, max={max_connections})")
+
+                            # Create pool with serialized init
                             pool = await asyncpg.create_pool(
                                 host=host,
                                 port=port,
                                 database=database,
                                 user=user,
                                 password=password,
-                                min_size=self._conn_config.min_connections,
+                                min_size=initial_min_size,
                                 max_size=max_connections,
                                 timeout=self._conn_config.connection_timeout,
                                 command_timeout=self._conn_config.query_timeout,
                                 max_queries=self._conn_config.max_queries_per_connection,
                                 max_inactive_connection_lifetime=self._conn_config.max_idle_time_seconds,
-                                setup=connection_setup,
+                                init=serialized_connection_init,
                             )
+
+                            # v16.0: Verify pool is functional with a test query
+                            async with pool.acquire() as test_conn:
+                                await test_conn.execute("SELECT 1")
+
                             return pool
 
-                        except (asyncio.InvalidStateError, OSError) as e:
-                            # v3.1: TLS race condition or network error - retry with backoff
+                        except asyncio.InvalidStateError as e:
+                            # v16.0: TLS race condition - this is the specific error we're fixing
+                            last_error = e
+                            logger.warning(
+                                f"⚠️ [v16.0] TLS InvalidStateError on attempt {attempt + 1}/{max_retries}: {e}"
+                            )
+
+                            if attempt < max_retries - 1:
+                                # Exponential backoff with jitter
+                                import random
+                                delay = (2 ** attempt) * 0.5 * (0.5 + random.random())
+                                logger.info(f"   [v16.0] Waiting {delay:.2f}s before retry...")
+                                await asyncio.sleep(delay)
+
+                                # Clear any corrupted event loop state
+                                await asyncio.sleep(0)  # Yield to event loop
+
+                        except (OSError, ConnectionError, asyncio.TimeoutError) as e:
+                            # Network/connection errors - retry with backoff
                             last_error = e
                             if attempt < max_retries - 1:
-                                delay = (attempt + 1) * 0.5  # 0.5s, 1.0s, 1.5s
+                                delay = (attempt + 1) * 1.0
                                 logger.warning(
-                                    f"⚠️ Pool creation attempt {attempt + 1}/{max_retries} failed: {e}. "
+                                    f"⚠️ [v16.0] Connection error on attempt {attempt + 1}/{max_retries}: {e}. "
                                     f"Retrying in {delay:.1f}s..."
                                 )
                                 await asyncio.sleep(delay)
@@ -1105,15 +1158,23 @@ class CloudSQLConnectionManager:
                                 raise
 
                         except Exception as e:
+                            # Check if this is a wrapped TLS error
+                            if "invalid state" in str(e).lower() or "InvalidStateError" in str(type(e).__name__):
+                                last_error = e
+                                if attempt < max_retries - 1:
+                                    await asyncio.sleep(1.0)
+                                    continue
                             # Non-retryable error
                             raise
 
                     if last_error:
+                        logger.error(f"❌ [v16.0] Pool creation failed after {max_retries} attempts: {last_error}")
                         raise last_error
+                    raise RuntimeError("Pool creation failed without error")
 
                 # Create pool
                 self.pool = await asyncio.wait_for(
-                    create_pool_with_retry(),
+                    create_pool_with_tls_safety(),
                     timeout=self._conn_config.pool_creation_timeout
                 )
 

@@ -1113,7 +1113,12 @@ class UnifiedModelServing:
                 self._clients[ModelProvider.PRIME_LOCAL] = client
                 self.logger.info("  ✓ Prime Local client ready")
             else:
+                # v100.5: Provide helpful guidance instead of just warning
                 self.logger.info("  ⚠️ Prime Local client not available")
+                self.logger.info(
+                    "     → Prime Local requires a GGUF model. "
+                    "Set JARVIS_PRIME_AUTO_DOWNLOAD=true or place a model in ~/models/"
+                )
 
         if PRIME_CLOUD_RUN_ENABLED and PRIME_CLOUD_RUN_URL:
             client = PrimeCloudRunClient()

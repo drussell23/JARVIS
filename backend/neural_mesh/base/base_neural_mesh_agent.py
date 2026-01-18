@@ -603,52 +603,100 @@ class BaseNeuralMeshAgent(ABC):
         """
         Send periodic heartbeats with resilient error recovery.
 
-        Features:
+        v16.0 Enhanced Features:
         - Continues sending heartbeats even if registry temporarily unavailable
         - Exponential backoff on errors to avoid overwhelming system
         - Auto-recovery when registry becomes available again
         - Logs warning only after consecutive failures (not every time)
+        - IMMEDIATE first heartbeat to ensure agent is marked online
+        - Self-healing re-registration on persistent failures
+        - Defensive error handling for registry unavailability
         """
         consecutive_failures = 0
         max_backoff = 30.0  # Maximum backoff in seconds
-        base_interval = self.config.heartbeat_interval_seconds
+        base_interval = getattr(self.config, 'heartbeat_interval_seconds', 10.0)
+        total_heartbeats_sent = 0
+
+        # v16.0: Send IMMEDIATE first heartbeat to ensure we're marked online ASAP
+        # This fixes the issue where agents register but don't send their first heartbeat
+        # until after the regular interval, causing them to appear offline initially
+        try:
+            if self.registry:
+                logger.debug("Agent %s sending initial heartbeat", self.agent_name)
+                await self.registry.heartbeat(
+                    self.agent_name,
+                    load=self._current_load,
+                    task_queue_size=self._task_queue_size,
+                )
+                total_heartbeats_sent += 1
+                logger.debug("Agent %s initial heartbeat sent successfully", self.agent_name)
+        except Exception as first_hb_err:
+            logger.warning("Agent %s initial heartbeat failed: %s", self.agent_name, first_hb_err)
 
         while self._running:
             try:
-                if self.registry:
-                    # Send heartbeat
-                    success = await self.registry.heartbeat(
-                        self.agent_name,
-                        load=self._current_load,
-                        task_queue_size=self._task_queue_size,
-                    )
+                # v16.0: Defensive check - ensure registry reference is still valid
+                if not self.registry:
+                    logger.debug("Agent %s has no registry reference, skipping heartbeat", self.agent_name)
+                    await asyncio.sleep(base_interval)
+                    continue
 
-                    if success:
-                        consecutive_failures = 0
-                    else:
-                        # Agent might not be registered yet - try re-registering
-                        consecutive_failures += 1
-                        if consecutive_failures >= 3:
-                            logger.warning(
-                                "Agent %s heartbeat failed %d times - attempting re-registration",
-                                self.agent_name,
-                                consecutive_failures,
-                            )
-                            # Try to re-register
-                            try:
-                                await self.registry.register(
+                # Send heartbeat with timeout to prevent blocking
+                try:
+                    success = await asyncio.wait_for(
+                        self.registry.heartbeat(
+                            self.agent_name,
+                            load=self._current_load,
+                            task_queue_size=self._task_queue_size,
+                        ),
+                        timeout=5.0  # Don't wait forever for heartbeat
+                    )
+                except asyncio.TimeoutError:
+                    success = False
+                    logger.debug("Agent %s heartbeat timed out", self.agent_name)
+
+                if success:
+                    consecutive_failures = 0
+                    total_heartbeats_sent += 1
+
+                    # Log successful heartbeats periodically at debug level
+                    if total_heartbeats_sent % 100 == 0:
+                        logger.debug(
+                            "Agent %s heartbeat #%d (load=%.2f, queue=%d)",
+                            self.agent_name,
+                            total_heartbeats_sent,
+                            self._current_load,
+                            self._task_queue_size,
+                        )
+                else:
+                    # Agent might not be registered yet - try re-registering
+                    consecutive_failures += 1
+                    if consecutive_failures >= 3:
+                        logger.warning(
+                            "Agent %s heartbeat failed %d times - attempting re-registration",
+                            self.agent_name,
+                            consecutive_failures,
+                        )
+                        # Try to re-register with timeout
+                        try:
+                            await asyncio.wait_for(
+                                self.registry.register(
                                     agent_name=self.agent_name,
                                     agent_type=self.agent_type,
                                     capabilities=self.capabilities,
                                     backend=self.backend,
                                     version=self.version,
                                     dependencies=self.dependencies,
-                                    metadata={"config": self.config.__dict__},
-                                )
-                                logger.info("Agent %s re-registered successfully", self.agent_name)
-                                consecutive_failures = 0
-                            except Exception as re_reg_err:
-                                logger.debug("Re-registration failed: %s", re_reg_err)
+                                    metadata={"config": getattr(self.config, '__dict__', {})},
+                                ),
+                                timeout=10.0
+                            )
+                            logger.info("Agent %s re-registered successfully", self.agent_name)
+                            consecutive_failures = 0
+                        except asyncio.TimeoutError:
+                            logger.debug("Agent %s re-registration timed out", self.agent_name)
+                        except Exception as re_reg_err:
+                            logger.debug("Re-registration failed: %s", re_reg_err)
 
                 # Calculate next sleep interval with backoff on failures
                 if consecutive_failures > 0:
@@ -659,6 +707,7 @@ class BaseNeuralMeshAgent(ABC):
                     await asyncio.sleep(base_interval)
 
             except asyncio.CancelledError:
+                logger.debug("Agent %s heartbeat loop cancelled", self.agent_name)
                 break
             except Exception as e:
                 consecutive_failures += 1
@@ -673,6 +722,13 @@ class BaseNeuralMeshAgent(ABC):
                 # Backoff on errors
                 backoff = min(max_backoff, base_interval * (2 ** min(consecutive_failures, 5)))
                 await asyncio.sleep(backoff)
+
+        # v16.0: Log when heartbeat loop exits
+        logger.debug(
+            "Agent %s heartbeat loop exited (sent %d total heartbeats)",
+            self.agent_name,
+            total_heartbeats_sent,
+        )
 
     async def _message_handler_loop(self) -> None:
         """
