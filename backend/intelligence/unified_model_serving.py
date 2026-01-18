@@ -707,7 +707,7 @@ class PrimeAPIClient(ModelClient):
 
             # Use first available model or request override
             model_name = (
-                request.model_override
+                getattr(request, 'model_override', None)
                 or (self._available_models[0] if self._available_models else "default")
             )
 
@@ -741,7 +741,7 @@ class PrimeAPIClient(ModelClient):
                     data = await resp.json()
                     choices = data.get("choices", [])
                     if choices:
-                        response.text = choices[0].get("message", {}).get("content", "")
+                        response.content = choices[0].get("message", {}).get("content", "")
                         response.success = True
                         response.model_name = data.get("model", model_name)
                         usage = data.get("usage", {})
@@ -765,6 +765,101 @@ class PrimeAPIClient(ModelClient):
             response.error = f"J-Prime API error: {type(e).__name__}: {e}"
 
         return response
+
+    async def generate_stream(self, request: ModelRequest) -> AsyncIterator[str]:
+        """
+        v17.0: Generate a streaming response using J-Prime API.
+
+        Uses Server-Sent Events (SSE) in OpenAI-compatible format.
+        The J-Prime server streams responses as "data: {...}" lines.
+        """
+        if not self._ready:
+            if not await self.wait_for_ready():
+                yield "[Error: J-Prime API not available]"
+                return
+
+        try:
+            import aiohttp
+            session = await self._get_session()
+
+            # Use first available model or request override
+            model_name = (
+                getattr(request, 'model_override', None)
+                or (self._available_models[0] if self._available_models else "default")
+            )
+
+            # Build OpenAI-compatible request
+            messages = []
+            if request.system_prompt:
+                messages.append({"role": "system", "content": request.system_prompt})
+
+            for msg in request.messages:
+                messages.append({
+                    "role": msg.get("role", "user"),
+                    "content": msg.get("content", ""),
+                })
+
+            payload = {
+                "model": model_name,
+                "messages": messages,
+                "max_tokens": request.max_tokens,
+                "temperature": request.temperature,
+                "stream": True,  # Enable streaming
+            }
+
+            # Use longer timeout for streaming
+            stream_timeout = aiohttp.ClientTimeout(
+                total=self.timeout * 3,  # 3x normal timeout for streaming
+                sock_read=30.0,  # 30s read timeout between chunks
+            )
+
+            async with session.post(
+                f"{self.base_url}/v1/chat/completions",
+                json=payload,
+                timeout=stream_timeout,
+            ) as resp:
+                if resp.status != 200:
+                    error_text = await resp.text()
+                    yield f"[Error: J-Prime API {resp.status}: {error_text[:100]}]"
+                    return
+
+                # Parse SSE stream
+                async for line in resp.content:
+                    line = line.decode("utf-8").strip()
+
+                    if not line:
+                        continue
+
+                    if line.startswith("data: "):
+                        data_str = line[6:]  # Remove "data: " prefix
+
+                        # Handle stream end marker
+                        if data_str == "[DONE]":
+                            break
+
+                        try:
+                            data = json.loads(data_str)
+                            choices = data.get("choices", [])
+                            if choices:
+                                delta = choices[0].get("delta", {})
+                                content = delta.get("content", "")
+                                if content:
+                                    yield content
+                        except json.JSONDecodeError:
+                            # Skip malformed JSON chunks
+                            self.logger.debug(f"[v17.0] Skipping malformed SSE: {data_str[:50]}")
+                            continue
+
+        except aiohttp.ClientConnectorError as e:
+            self._ready = False
+            yield f"[Error: J-Prime API connection refused: {e}]"
+
+        except asyncio.TimeoutError:
+            yield "[Error: J-Prime API stream timeout]"
+
+        except Exception as e:
+            self.logger.error(f"[v17.0] J-Prime streaming error: {e}")
+            yield f"[Error: {type(e).__name__}: {e}]"
 
     async def health_check(self) -> bool:
         """Check if J-Prime server is healthy."""
