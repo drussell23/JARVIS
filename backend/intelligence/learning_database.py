@@ -439,26 +439,60 @@ class AsyncContextCursor:
         """
         Initialize with coroutine that returns DetachedCursor.
 
+        v19.0: Enhanced with proper CancelledError handling.
+
         Args:
             coro: Coroutine from execute() method
         """
         self._coro = coro
         self._cursor = None
+        self._entered = False
 
     def __await__(self):
         """Make awaitable - returns DetachedCursor."""
         return self._coro.__await__()
 
     async def __aenter__(self):
-        """Async context manager entry - await and return cursor."""
-        self._cursor = await self._coro
-        return self._cursor
+        """
+        Async context manager entry - await and return cursor.
+
+        v19.0: Properly handles CancelledError by re-raising after
+        marking state (cursor cleanup will happen in __aexit__).
+        """
+        try:
+            self._cursor = await self._coro
+            self._entered = True
+            return self._cursor
+        except asyncio.CancelledError:
+            # Re-raise CancelledError - don't suppress it
+            # Set _entered to False so __aexit__ knows not to close cursor
+            self._entered = False
+            raise
+        except Exception:
+            # On any error, mark as not entered
+            self._entered = False
+            raise
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """Async context manager exit."""
-        if self._cursor:
-            await self._cursor.close()
-        return False
+        """
+        Async context manager exit.
+
+        v19.0: Enhanced to handle cleanup even on CancelledError,
+        but never suppresses the exception.
+        """
+        if self._cursor and self._entered:
+            try:
+                await self._cursor.close()
+            except asyncio.CancelledError:
+                # Re-raise CancelledError after attempting cleanup
+                raise
+            except Exception as e:
+                # Log but don't suppress other cleanup errors
+                import logging
+                logging.getLogger(__name__).debug(
+                    f"[v19.0] Cursor close error (non-fatal): {e}"
+                )
+        return False  # Never suppress the exception
 
 
 class UniversalRow:

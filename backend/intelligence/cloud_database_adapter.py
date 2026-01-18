@@ -607,76 +607,266 @@ class SQLiteConnection:
         await self.execute(query, *values)
 
 
+class CloudSQLCircuitBreaker:
+    """
+    v19.0: Circuit breaker pattern for database connections.
+
+    Prevents cascading failures by temporarily disabling operations
+    when too many failures occur in a short time window.
+
+    States:
+    - CLOSED: Normal operation, all requests pass through
+    - OPEN: Failure threshold exceeded, requests fail fast
+    - HALF_OPEN: Testing if service recovered, limited requests allowed
+    """
+
+    def __init__(
+        self,
+        failure_threshold: int = 5,
+        recovery_timeout: float = 30.0,
+        half_open_max_calls: int = 3,
+    ):
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self.half_open_max_calls = half_open_max_calls
+
+        self._failure_count = 0
+        self._last_failure_time = 0.0
+        self._state = "CLOSED"
+        self._half_open_calls = 0
+        self._lock = asyncio.Lock()
+
+    @property
+    def state(self) -> str:
+        return self._state
+
+    async def can_execute(self) -> bool:
+        """Check if execution is allowed based on circuit state."""
+        async with self._lock:
+            if self._state == "CLOSED":
+                return True
+
+            if self._state == "OPEN":
+                # Check if recovery timeout has passed
+                import time
+                if time.time() - self._last_failure_time >= self.recovery_timeout:
+                    self._state = "HALF_OPEN"
+                    self._half_open_calls = 0
+                    logger.info("[v19.0] Circuit breaker transitioning to HALF_OPEN")
+                    return True
+                return False
+
+            if self._state == "HALF_OPEN":
+                if self._half_open_calls < self.half_open_max_calls:
+                    self._half_open_calls += 1
+                    return True
+                return False
+
+            return False
+
+    async def record_success(self):
+        """Record a successful operation."""
+        async with self._lock:
+            if self._state == "HALF_OPEN":
+                self._state = "CLOSED"
+                self._failure_count = 0
+                logger.info("[v19.0] Circuit breaker CLOSED (service recovered)")
+            elif self._state == "CLOSED":
+                self._failure_count = max(0, self._failure_count - 1)
+
+    async def record_failure(self):
+        """Record a failed operation."""
+        import time
+        async with self._lock:
+            self._failure_count += 1
+            self._last_failure_time = time.time()
+
+            if self._state == "HALF_OPEN":
+                self._state = "OPEN"
+                logger.warning("[v19.0] Circuit breaker OPEN (failure during half-open)")
+            elif self._state == "CLOSED" and self._failure_count >= self.failure_threshold:
+                self._state = "OPEN"
+                logger.warning(f"[v19.0] Circuit breaker OPEN ({self._failure_count} failures)")
+
+
 class CloudSQLConnection:
     """
-    v18.0: Wrapper for Cloud SQL (PostgreSQL) connection with unified interface.
+    v19.0: Wrapper for Cloud SQL (PostgreSQL) connection with unified interface.
 
     Features:
     - Query-level timeout protection to prevent hanging queries
     - Automatic placeholder conversion (? -> $1, $2, etc)
-    - Graceful timeout handling with clear error messages
+    - Exponential backoff retry for transient failures
+    - Circuit breaker to prevent cascading failures
+    - Proper CancelledError handling (never swallowed)
     """
 
-    # v18.0: Default query timeout (configurable via env)
+    # v19.0: Configuration from environment
     DEFAULT_QUERY_TIMEOUT = float(os.getenv("CLOUDSQL_QUERY_TIMEOUT_SECONDS", "30.0"))
+    DEFAULT_MAX_RETRIES = int(os.getenv("CLOUDSQL_MAX_RETRIES", "3"))
+    DEFAULT_BASE_DELAY = float(os.getenv("CLOUDSQL_RETRY_BASE_DELAY", "0.5"))
+    DEFAULT_MAX_DELAY = float(os.getenv("CLOUDSQL_RETRY_MAX_DELAY", "10.0"))
+
+    # Class-level circuit breaker (shared across instances for same connection)
+    _circuit_breaker = None
 
     def __init__(self, conn, query_timeout: float = None):
         self.conn = conn
         self.query_timeout = query_timeout or self.DEFAULT_QUERY_TIMEOUT
 
+        # Initialize circuit breaker (singleton per class)
+        if CloudSQLConnection._circuit_breaker is None:
+            CloudSQLConnection._circuit_breaker = CloudSQLCircuitBreaker()
+
+    async def _execute_with_retry(
+        self,
+        operation: str,
+        coro_factory,
+        timeout: float,
+        max_retries: int = None,
+    ):
+        """
+        v19.0: Execute an async operation with retry and circuit breaker.
+
+        Args:
+            operation: Description for logging
+            coro_factory: Callable that returns a new coroutine for each attempt
+            timeout: Timeout per attempt
+            max_retries: Maximum retry attempts
+
+        Returns:
+            Result of the operation
+
+        Raises:
+            asyncio.CancelledError: Always re-raised (never retried)
+            asyncio.TimeoutError: After all retries exhausted
+            Exception: Other exceptions after all retries exhausted
+        """
+        import random
+
+        max_retries = max_retries or self.DEFAULT_MAX_RETRIES
+        circuit = CloudSQLConnection._circuit_breaker
+
+        last_exception = None
+
+        for attempt in range(max_retries + 1):
+            # Check circuit breaker
+            if not await circuit.can_execute():
+                logger.warning(f"[v19.0] Circuit breaker OPEN, failing fast: {operation}")
+                raise asyncio.TimeoutError(f"Circuit breaker open for: {operation}")
+
+            try:
+                # Create fresh coroutine for this attempt
+                result = await asyncio.wait_for(coro_factory(), timeout=timeout)
+                await circuit.record_success()
+                return result
+
+            except asyncio.CancelledError:
+                # NEVER retry cancelled operations - always re-raise immediately
+                logger.debug(f"[v19.0] Operation cancelled (not retrying): {operation}")
+                raise
+
+            except asyncio.TimeoutError as e:
+                last_exception = e
+                await circuit.record_failure()
+
+                if attempt < max_retries:
+                    # Exponential backoff with jitter
+                    delay = min(
+                        self.DEFAULT_BASE_DELAY * (2 ** attempt),
+                        self.DEFAULT_MAX_DELAY
+                    )
+                    jitter = delay * random.uniform(0.1, 0.3)
+                    actual_delay = delay + jitter
+
+                    logger.warning(
+                        f"[v19.0] Timeout on {operation} (attempt {attempt + 1}/{max_retries + 1}), "
+                        f"retrying in {actual_delay:.2f}s..."
+                    )
+                    await asyncio.sleep(actual_delay)
+                else:
+                    logger.error(f"[v19.0] {operation} failed after {max_retries + 1} attempts (timeout)")
+
+            except (ConnectionError, OSError) as e:
+                # Network errors - retry with backoff
+                last_exception = e
+                await circuit.record_failure()
+
+                if attempt < max_retries:
+                    delay = min(
+                        self.DEFAULT_BASE_DELAY * (2 ** attempt),
+                        self.DEFAULT_MAX_DELAY
+                    )
+                    logger.warning(
+                        f"[v19.0] Connection error on {operation} (attempt {attempt + 1}): {e}, "
+                        f"retrying in {delay:.2f}s..."
+                    )
+                    await asyncio.sleep(delay)
+                else:
+                    logger.error(f"[v19.0] {operation} failed after {max_retries + 1} attempts: {e}")
+
+            except Exception as e:
+                # Unexpected errors - log but don't retry (likely query error)
+                last_exception = e
+                logger.error(f"[v19.0] Unexpected error on {operation}: {type(e).__name__}: {e}")
+                raise
+
+        # All retries exhausted
+        if last_exception:
+            raise last_exception
+        raise asyncio.TimeoutError(f"Operation failed: {operation}")
+
     async def execute(self, query: str, *args, timeout: float = None):
-        """Execute query with timeout protection (convert ? to $1, $2, etc for PostgreSQL)"""
+        """Execute query with timeout protection and retry."""
         pg_query = self._convert_placeholders(query)
         effective_timeout = timeout or self.query_timeout
-        try:
-            return await asyncio.wait_for(
-                self.conn.execute(pg_query, *args),
-                timeout=effective_timeout
-            )
-        except asyncio.TimeoutError:
-            logger.warning(f"[v18.0] Query timeout ({effective_timeout}s): {pg_query[:100]}...")
-            raise
+
+        return await self._execute_with_retry(
+            operation=f"execute({pg_query[:60]}...)",
+            coro_factory=lambda: self.conn.execute(pg_query, *args),
+            timeout=effective_timeout,
+        )
 
     async def fetch(self, query: str, *args, timeout: float = None):
-        """Fetch all results with timeout protection"""
+        """Fetch all results with timeout protection and retry."""
         pg_query = self._convert_placeholders(query)
         effective_timeout = timeout or self.query_timeout
-        try:
-            rows = await asyncio.wait_for(
-                self.conn.fetch(pg_query, *args),
-                timeout=effective_timeout
-            )
+
+        async def _fetch():
+            rows = await self.conn.fetch(pg_query, *args)
             return [dict(row) for row in rows]
-        except asyncio.TimeoutError:
-            logger.warning(f"[v18.0] Query timeout ({effective_timeout}s): {pg_query[:100]}...")
-            raise
+
+        return await self._execute_with_retry(
+            operation=f"fetch({pg_query[:60]}...)",
+            coro_factory=_fetch,
+            timeout=effective_timeout,
+        )
 
     async def fetchone(self, query: str, *args, timeout: float = None):
-        """Fetch one result with timeout protection"""
+        """Fetch one result with timeout protection and retry."""
         pg_query = self._convert_placeholders(query)
         effective_timeout = timeout or self.query_timeout
-        try:
-            row = await asyncio.wait_for(
-                self.conn.fetchrow(pg_query, *args),
-                timeout=effective_timeout
-            )
+
+        async def _fetchone():
+            row = await self.conn.fetchrow(pg_query, *args)
             return dict(row) if row else None
-        except asyncio.TimeoutError:
-            logger.warning(f"[v18.0] Query timeout ({effective_timeout}s): {pg_query[:100]}...")
-            raise
+
+        return await self._execute_with_retry(
+            operation=f"fetchone({pg_query[:60]}...)",
+            coro_factory=_fetchone,
+            timeout=effective_timeout,
+        )
 
     async def fetchval(self, query: str, *args, timeout: float = None):
-        """Fetch single value with timeout protection"""
+        """Fetch single value with timeout protection and retry."""
         pg_query = self._convert_placeholders(query)
         effective_timeout = timeout or self.query_timeout
-        try:
-            return await asyncio.wait_for(
-                self.conn.fetchval(pg_query, *args),
-                timeout=effective_timeout
-            )
-        except asyncio.TimeoutError:
-            logger.warning(f"[v18.0] Query timeout ({effective_timeout}s): {pg_query[:100]}...")
-            raise
+
+        return await self._execute_with_retry(
+            operation=f"fetchval({pg_query[:60]}...)",
+            coro_factory=lambda: self.conn.fetchval(pg_query, *args),
+            timeout=effective_timeout,
+        )
 
     async def commit(self):
         """No-op for PostgreSQL (auto-commit)"""
