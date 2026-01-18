@@ -556,6 +556,16 @@ class TrinityBridge:
 
                 if healthy:
                     healthy_count += 1
+                    # ═══════════════════════════════════════════════════════════════════
+                    # CRITICAL FIX: Send heartbeat on EVERY successful health check
+                    # ═══════════════════════════════════════════════════════════════════
+                    # Without this, services become "stale" after 60 seconds because
+                    # their heartbeat timestamps never get updated after registration.
+                    # ═══════════════════════════════════════════════════════════════════
+                    await self._service_registry.heartbeat(
+                        service.service_name,
+                        status="healthy"
+                    )
 
             except Exception as e:
                 self._service_health[service.service_name] = ServiceHealth(

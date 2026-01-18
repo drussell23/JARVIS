@@ -2861,15 +2861,28 @@ SystemResourceValidator = IntelligentResourceOrchestrator
 
 class TerminalUI:
     """Enhanced terminal UI with colors and formatting."""
-    
-    # ANSI color codes
+
+    # ANSI color codes - Complete palette
     CYAN = "\033[36m"
     GREEN = "\033[32m"
     YELLOW = "\033[33m"
     RED = "\033[31m"
     GRAY = "\033[90m"
+    MAGENTA = "\033[35m"
+    BLUE = "\033[34m"
+    WHITE = "\033[37m"
     BOLD = "\033[1m"
+    DIM = "\033[2m"
+    UNDERLINE = "\033[4m"
     RESET = "\033[0m"
+
+    # Background colors
+    BG_RED = "\033[41m"
+    BG_GREEN = "\033[42m"
+    BG_YELLOW = "\033[43m"
+    BG_BLUE = "\033[44m"
+    BG_MAGENTA = "\033[45m"
+    BG_CYAN = "\033[46m"
     
     @classmethod
     def print_banner(cls) -> None:
