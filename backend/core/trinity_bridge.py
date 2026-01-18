@@ -136,8 +136,10 @@ class TrinityBridgeConfig:
     )
 
     # Health monitoring
+    # v92.0: Reduced from 30s to 20s to ensure heartbeats are sent
+    # well before the 60s service registry timeout
     health_check_interval: float = field(
-        default_factory=lambda: float(os.getenv("TRINITY_HEALTH_INTERVAL", "30.0"))
+        default_factory=lambda: float(os.getenv("TRINITY_HEALTH_INTERVAL", "20.0"))
     )
     startup_timeout: float = field(
         default_factory=lambda: float(os.getenv("TRINITY_STARTUP_TIMEOUT", "120.0"))
@@ -556,16 +558,20 @@ class TrinityBridge:
 
                 if healthy:
                     healthy_count += 1
-                    # ═══════════════════════════════════════════════════════════════════
-                    # CRITICAL FIX: Send heartbeat on EVERY successful health check
-                    # ═══════════════════════════════════════════════════════════════════
-                    # Without this, services become "stale" after 60 seconds because
-                    # their heartbeat timestamps never get updated after registration.
-                    # ═══════════════════════════════════════════════════════════════════
-                    await self._service_registry.heartbeat(
-                        service.service_name,
-                        status="healthy"
-                    )
+
+                # ═══════════════════════════════════════════════════════════════════
+                # v92.0 FIX: ALWAYS send heartbeat regardless of health status
+                # ═══════════════════════════════════════════════════════════════════
+                # Previously: Heartbeat only sent when healthy=True
+                # Problem: If discover_service returns None (service marked stale),
+                # healthy=False, so no heartbeat sent, service stays stale forever.
+                # Now: Always send heartbeat to keep service alive in registry,
+                # with appropriate status to indicate health state.
+                # ═══════════════════════════════════════════════════════════════════
+                await self._service_registry.heartbeat(
+                    service.service_name,
+                    status="healthy" if healthy else "degraded"
+                )
 
             except Exception as e:
                 self._service_health[service.service_name] = ServiceHealth(
@@ -573,6 +579,14 @@ class TrinityBridge:
                     healthy=False,
                     error=str(e)
                 )
+                # v92.0: Still try to send heartbeat even on exception
+                try:
+                    await self._service_registry.heartbeat(
+                        service.service_name,
+                        status="unhealthy"
+                    )
+                except Exception:
+                    pass  # Don't let heartbeat failure mask original error
 
         # Update state based on health
         total = len(services)

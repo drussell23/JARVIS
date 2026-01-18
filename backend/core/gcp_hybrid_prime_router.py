@@ -296,6 +296,13 @@ class GCPHybridPrimeRouter:
         self._active_request_validation_interval = float(os.getenv("ACTIVE_REQUEST_VALIDATION_INTERVAL", "60.0"))
         self._last_active_request_validation = 0.0
 
+        # v92.0: Memory pressure cooldown and backoff
+        self._last_pressure_event: float = 0.0
+        self._pressure_cooldown_base: float = float(os.getenv("MEMORY_PRESSURE_COOLDOWN", "60.0"))  # 60s base cooldown
+        self._pressure_consecutive_failures: int = 0
+        self._pressure_max_backoff: float = float(os.getenv("MEMORY_PRESSURE_MAX_BACKOFF", "600.0"))  # 10 min max
+        self._gcp_permanently_unavailable: bool = False  # True if GCP is disabled/unconfigured
+
         # Initialize VM provisioning lock if available
         if self._vm_provisioning_enabled and _VM_LOCK_AVAILABLE and DistributedLock:
             try:
@@ -346,14 +353,30 @@ class GCPHybridPrimeRouter:
 
     async def _memory_pressure_monitor(self) -> None:
         """
-        v2.0: Monitor memory pressure and trigger VM provisioning.
+        v92.0: Monitor memory pressure and trigger VM provisioning with intelligent cooldown.
 
         When RAM usage exceeds VM_PROVISIONING_THRESHOLD, attempts to provision
         a GCP VM using distributed locking to prevent race conditions.
+
+        Features:
+        - Cooldown period after failed attempts (prevents spam)
+        - Exponential backoff on consecutive failures
+        - Early exit if GCP is permanently unavailable
+        - Graceful degradation when GCP not configured
         """
         while self._running:
             try:
                 await asyncio.sleep(5.0)  # Check every 5 seconds
+
+                # v92.0: Early exit if GCP is permanently unavailable
+                if self._gcp_permanently_unavailable:
+                    # Only log periodically (every 10 minutes) to avoid spam
+                    if time.time() - self._last_pressure_event > 600:
+                        self.logger.debug(
+                            "Memory pressure monitor: GCP unavailable, skipping checks"
+                        )
+                        self._last_pressure_event = time.time()
+                    continue
 
                 ram_info = await self._get_ram_info()
                 if not ram_info:
@@ -364,11 +387,34 @@ class GCPHybridPrimeRouter:
                 # Check if we should trigger VM provisioning
                 if used_percent >= VM_PROVISIONING_THRESHOLD:
                     if not self._vm_provisioning_in_progress:
+                        # v92.0: Check cooldown with exponential backoff
+                        current_cooldown = min(
+                            self._pressure_cooldown_base * (2 ** self._pressure_consecutive_failures),
+                            self._pressure_max_backoff
+                        )
+                        time_since_last = time.time() - self._last_pressure_event
+
+                        if time_since_last < current_cooldown:
+                            # Still in cooldown - don't spam logs, just skip
+                            continue
+
                         self.logger.warning(
                             f"Memory pressure detected: {used_percent:.1f}% "
                             f"(threshold: {VM_PROVISIONING_THRESHOLD}%)"
                         )
-                        await self._trigger_vm_provisioning(reason="memory_pressure")
+                        self._last_pressure_event = time.time()
+
+                        success = await self._trigger_vm_provisioning(reason="memory_pressure")
+
+                        if success:
+                            self._pressure_consecutive_failures = 0
+                        else:
+                            self._pressure_consecutive_failures += 1
+                            if self._pressure_consecutive_failures >= 3:
+                                self.logger.info(
+                                    f"VM provisioning failed {self._pressure_consecutive_failures} times, "
+                                    f"backing off for {current_cooldown:.0f}s"
+                                )
 
                 # Check if we should terminate VM (low usage)
                 elif used_percent < GCP_TRIGGER_RAM_PERCENT - 20:
@@ -419,7 +465,23 @@ class GCPHybridPrimeRouter:
             # Check if GCP controller is available
             if not self._gcp_controller:
                 self.logger.warning("GCP controller not available for VM provisioning")
+                self._gcp_permanently_unavailable = True
                 return False
+
+            # v92.0: Check if GCP is configured and enabled BEFORE attempting
+            if hasattr(self._gcp_controller, 'config'):
+                config = self._gcp_controller.config
+                if hasattr(config, 'is_valid_for_vm_operations'):
+                    is_valid, error_msg = config.is_valid_for_vm_operations()
+                    if not is_valid:
+                        # GCP is permanently unavailable (disabled or misconfigured)
+                        if not self._gcp_permanently_unavailable:
+                            self.logger.info(
+                                f"GCP VM provisioning disabled: {error_msg}. "
+                                f"Memory pressure monitoring will continue but VM provisioning skipped."
+                            )
+                        self._gcp_permanently_unavailable = True
+                        return False
 
             # Check if VM already exists
             if hasattr(self._gcp_controller, 'is_vm_available'):
@@ -437,6 +499,13 @@ class GCPHybridPrimeRouter:
                     self._metrics.gcp_requests += 1
                     return True
                 else:
+                    # Check if this is a permanent failure (disabled/misconfigured)
+                    if hasattr(self._gcp_controller, 'config'):
+                        config = self._gcp_controller.config
+                        if hasattr(config, 'is_valid_for_vm_operations'):
+                            is_valid, _ = config.is_valid_for_vm_operations()
+                            if not is_valid:
+                                self._gcp_permanently_unavailable = True
                     self.logger.error("GCP VM provisioning failed")
                     return False
             else:

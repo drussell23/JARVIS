@@ -269,7 +269,12 @@ class ResilientRedisClient:
         logger.info("[ResilientRedis] Disconnected")
 
     def _is_permanent_error(self, error: Exception) -> bool:
-        """Check if error is permanent (shouldn't retry)."""
+        """
+        Check if error is permanent (shouldn't retry).
+
+        v92.0: Added detection for missing redis module to prevent
+        infinite reconnection spam when redis isn't installed.
+        """
         error_str = str(error).lower()
 
         permanent_patterns = [
@@ -278,7 +283,15 @@ class ResilientRedisClient:
             "noauth",
             "wrongpass",
             "invalid database",
+            # v92.0: Module not installed - permanent failure
+            "no module named",
+            "modulenotfounderror",
+            "cannot import",
         ]
+
+        # Also check exception type for ImportError/ModuleNotFoundError
+        if isinstance(error, (ImportError, ModuleNotFoundError)):
+            return True
 
         return any(p in error_str for p in permanent_patterns)
 
