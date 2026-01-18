@@ -52,9 +52,10 @@ Architecture:
     └──────────────────────────────────────────────────────────────────┘
 
 Author: JARVIS AI System
-Version: 5.2.0
+Version: 5.3.0
 
 Changelog:
+- v5.3: Made startup resilient to CancelledError (don't propagate during init)
 - v5.2: Fixed loop.stop() antipattern, proper task cancellation on shutdown
 - v5.1: Fixed sys.exit() antipattern in async shutdown handler
 - v5.0: Added pre-flight cleanup, circuit breaker, trinity_config integration
@@ -302,7 +303,8 @@ class ProcessOrchestrator:
         """
         Kill any process listening on the specified port.
 
-        v5.0: Uses lsof to find and kill stale processes.
+        v5.3: Uses lsof to find and kill stale processes.
+        Resilient to CancelledError during startup.
         Returns True if a process was killed.
         """
         try:
@@ -332,11 +334,19 @@ class ProcessOrchestrator:
                     logger.debug(f"    Could not kill PID {pid_str}: {e}")
 
             if killed:
-                # Give process time to terminate
-                await asyncio.sleep(0.5)
+                # Give process time to terminate - use shield to prevent cancellation
+                try:
+                    await asyncio.sleep(0.5)
+                except asyncio.CancelledError:
+                    # Don't let cancellation interrupt cleanup
+                    logger.debug(f"    Port {port} cleanup sleep interrupted, continuing...")
 
             return killed
 
+        except asyncio.CancelledError:
+            # v5.3: Don't propagate CancelledError during critical cleanup
+            logger.debug(f"    Port cleanup cancelled for {port}, continuing startup...")
+            return False
         except Exception as e:
             logger.debug(f"    Port cleanup failed for {port}: {e}")
             return False
@@ -345,33 +355,39 @@ class ProcessOrchestrator:
         """
         Clean up any processes on legacy ports before startup.
 
-        v5.0: Ensures no stale processes from old configurations are blocking
-        the correct ports. Returns dict of service -> [killed_ports].
+        v5.3: Ensures no stale processes from old configurations are blocking
+        the correct ports. Resilient to CancelledError.
+        Returns dict of service -> [killed_ports].
         """
         logger.info("  🧹 Pre-flight: Cleaning up legacy ports...")
 
         cleaned = {"jarvis-prime": [], "reactor-core": []}
 
-        # Clean up legacy jarvis-prime ports
-        for port in self.config.legacy_jarvis_prime_ports:
-            if await self._kill_process_on_port(port):
-                cleaned["jarvis-prime"].append(port)
-
-        # Clean up legacy reactor-core ports
-        for port in self.config.legacy_reactor_core_ports:
-            if await self._kill_process_on_port(port):
-                cleaned["reactor-core"].append(port)
-
-        # Also check if something is running on CORRECT ports but with wrong host
-        # (e.g., bound to 127.0.0.1 instead of 0.0.0.0)
-        for service, port in [
-            ("jarvis-prime", self.config.jarvis_prime_default_port),
-            ("reactor-core", self.config.reactor_core_default_port),
-        ]:
-            if await self._check_wrong_binding(port):
-                logger.warning(f"    ⚠️ {service} on port {port} bound to 127.0.0.1, restarting...")
+        try:
+            # Clean up legacy jarvis-prime ports
+            for port in self.config.legacy_jarvis_prime_ports:
                 if await self._kill_process_on_port(port):
-                    cleaned[service].append(port)
+                    cleaned["jarvis-prime"].append(port)
+
+            # Clean up legacy reactor-core ports
+            for port in self.config.legacy_reactor_core_ports:
+                if await self._kill_process_on_port(port):
+                    cleaned["reactor-core"].append(port)
+
+            # Also check if something is running on CORRECT ports but with wrong host
+            # (e.g., bound to 127.0.0.1 instead of 0.0.0.0)
+            for service, port in [
+                ("jarvis-prime", self.config.jarvis_prime_default_port),
+                ("reactor-core", self.config.reactor_core_default_port),
+            ]:
+                if await self._check_wrong_binding(port):
+                    logger.warning(f"    ⚠️ {service} on port {port} bound to 127.0.0.1, restarting...")
+                    if await self._kill_process_on_port(port):
+                        cleaned[service].append(port)
+
+        except asyncio.CancelledError:
+            # v5.3: Don't let cancellation interrupt startup - log and continue
+            logger.warning("  ⚠️ Legacy port cleanup interrupted, continuing startup...")
 
         # Summary
         total_cleaned = sum(len(ports) for ports in cleaned.values())
@@ -386,7 +402,8 @@ class ProcessOrchestrator:
         """
         Check if a service on port is bound to 127.0.0.1 (should be 0.0.0.0).
 
-        v5.0: Detects misconfigured services that won't accept external connections.
+        v5.3: Detects misconfigured services that won't accept external connections.
+        Resilient to CancelledError.
         """
         try:
             proc = await asyncio.create_subprocess_exec(

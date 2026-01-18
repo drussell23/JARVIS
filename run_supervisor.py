@@ -4130,6 +4130,7 @@ class SupervisorBootstrapper:
             return await self._run_fast_startup()
 
         # v80.0: Wrap entire startup in global timeout
+        # v5.3: Properly handle CancelledError (not subclass of Exception in Python 3.8+)
         try:
             return await asyncio.wait_for(
                 self._run_with_deep_health(),
@@ -4142,6 +4143,14 @@ class SupervisorBootstrapper:
             )
             await self._emergency_shutdown()
             return 1
+        except asyncio.CancelledError:
+            # v5.3: CancelledError is BaseException, not Exception - handle explicitly
+            self.logger.warning("🛑 Startup cancelled (SIGINT/SIGTERM received)")
+            try:
+                await self._emergency_shutdown()
+            except asyncio.CancelledError:
+                pass  # Already shutting down
+            return 130  # Standard exit code for SIGINT
         except Exception as e:
             self.logger.error(f"🚨 Startup failed with exception: {e}")
             await self._emergency_shutdown()
