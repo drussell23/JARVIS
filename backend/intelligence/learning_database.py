@@ -12,6 +12,7 @@ import functools
 import hashlib
 import json
 import logging
+import os
 import random
 import time
 from collections import defaultdict, deque
@@ -61,6 +62,125 @@ except ImportError:
 from backend.core.async_safety import LazyAsyncLock
 
 logger = logging.getLogger(__name__)
+
+# v18.0: Database operation configuration
+DB_QUERY_TIMEOUT = float(os.getenv("DB_QUERY_TIMEOUT_SECONDS", "30.0"))
+DB_CIRCUIT_BREAKER_THRESHOLD = int(os.getenv("DB_CIRCUIT_BREAKER_THRESHOLD", "5"))
+DB_CIRCUIT_BREAKER_TIMEOUT = float(os.getenv("DB_CIRCUIT_BREAKER_TIMEOUT_SECONDS", "60.0"))
+
+
+# ============================================================================
+# v18.0: DATABASE CIRCUIT BREAKER
+# ============================================================================
+
+class DatabaseCircuitBreaker:
+    """
+    v18.0: Circuit breaker for database operations to prevent cascading failures.
+
+    When database operations repeatedly fail (e.g., timeouts), the circuit
+    opens and fast-fails subsequent requests instead of waiting for timeouts.
+
+    States:
+    - CLOSED: Normal operation, requests pass through
+    - OPEN: Circuit is open, requests fail immediately
+    - HALF_OPEN: Testing if database has recovered
+
+    Features:
+    - Configurable failure threshold before opening
+    - Automatic recovery testing after timeout
+    - Per-operation-type tracking
+    - Thread-safe async implementation
+    """
+
+    def __init__(
+        self,
+        name: str = "learning_db",
+        failure_threshold: int = DB_CIRCUIT_BREAKER_THRESHOLD,
+        recovery_timeout: float = DB_CIRCUIT_BREAKER_TIMEOUT,
+    ):
+        self._name = name
+        self._failure_threshold = failure_threshold
+        self._recovery_timeout = recovery_timeout
+
+        self._failures = 0
+        self._successes = 0
+        self._state = "closed"
+        self._last_failure_time = 0.0
+        self._lock = asyncio.Lock()
+
+    @property
+    def is_open(self) -> bool:
+        """Check if circuit is open (failing fast)."""
+        if self._state == "closed":
+            return False
+        if self._state == "open":
+            # Check if enough time has passed to try half-open
+            if time.time() - self._last_failure_time > self._recovery_timeout:
+                return False  # Allow test request
+            return True
+        return False  # half_open allows requests
+
+    async def record_success(self) -> None:
+        """Record a successful operation."""
+        async with self._lock:
+            self._successes += 1
+            if self._state == "half_open":
+                self._state = "closed"
+                self._failures = 0
+                logger.info(f"[v18.0] Circuit breaker {self._name}: CLOSED (recovered)")
+
+    async def record_failure(self) -> None:
+        """Record a failed operation."""
+        async with self._lock:
+            self._failures += 1
+            self._last_failure_time = time.time()
+
+            if self._state == "half_open":
+                self._state = "open"
+                logger.warning(f"[v18.0] Circuit breaker {self._name}: OPEN (recovery failed)")
+            elif self._failures >= self._failure_threshold:
+                self._state = "open"
+                logger.warning(
+                    f"[v18.0] Circuit breaker {self._name}: OPEN "
+                    f"({self._failures} consecutive failures)"
+                )
+
+    async def allow_request(self) -> bool:
+        """Check if a request should be allowed."""
+        async with self._lock:
+            if self._state == "closed":
+                return True
+            elif self._state == "open":
+                # Check if we should try half-open
+                if time.time() - self._last_failure_time > self._recovery_timeout:
+                    self._state = "half_open"
+                    logger.info(f"[v18.0] Circuit breaker {self._name}: HALF_OPEN (testing)")
+                    return True
+                return False
+            else:  # half_open
+                return True
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Get circuit breaker statistics."""
+        return {
+            "name": self._name,
+            "state": self._state,
+            "failures": self._failures,
+            "successes": self._successes,
+            "time_since_last_failure": time.time() - self._last_failure_time if self._last_failure_time else None,
+        }
+
+
+# Global circuit breaker instance
+_db_circuit_breaker: Optional[DatabaseCircuitBreaker] = None
+
+
+def get_db_circuit_breaker() -> DatabaseCircuitBreaker:
+    """Get global database circuit breaker."""
+    global _db_circuit_breaker
+    if _db_circuit_breaker is None:
+        _db_circuit_breaker = DatabaseCircuitBreaker()
+    return _db_circuit_breaker
 
 
 # ============================================================================

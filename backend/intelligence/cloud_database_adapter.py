@@ -608,32 +608,75 @@ class SQLiteConnection:
 
 
 class CloudSQLConnection:
-    """Wrapper for Cloud SQL (PostgreSQL) connection with unified interface"""
+    """
+    v18.0: Wrapper for Cloud SQL (PostgreSQL) connection with unified interface.
 
-    def __init__(self, conn):
+    Features:
+    - Query-level timeout protection to prevent hanging queries
+    - Automatic placeholder conversion (? -> $1, $2, etc)
+    - Graceful timeout handling with clear error messages
+    """
+
+    # v18.0: Default query timeout (configurable via env)
+    DEFAULT_QUERY_TIMEOUT = float(os.getenv("CLOUDSQL_QUERY_TIMEOUT_SECONDS", "30.0"))
+
+    def __init__(self, conn, query_timeout: float = None):
         self.conn = conn
+        self.query_timeout = query_timeout or self.DEFAULT_QUERY_TIMEOUT
 
-    async def execute(self, query: str, *args):
-        """Execute query (convert ? to $1, $2, etc for PostgreSQL)"""
+    async def execute(self, query: str, *args, timeout: float = None):
+        """Execute query with timeout protection (convert ? to $1, $2, etc for PostgreSQL)"""
         pg_query = self._convert_placeholders(query)
-        return await self.conn.execute(pg_query, *args)
+        effective_timeout = timeout or self.query_timeout
+        try:
+            return await asyncio.wait_for(
+                self.conn.execute(pg_query, *args),
+                timeout=effective_timeout
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f"[v18.0] Query timeout ({effective_timeout}s): {pg_query[:100]}...")
+            raise
 
-    async def fetch(self, query: str, *args):
-        """Fetch all results"""
+    async def fetch(self, query: str, *args, timeout: float = None):
+        """Fetch all results with timeout protection"""
         pg_query = self._convert_placeholders(query)
-        rows = await self.conn.fetch(pg_query, *args)
-        return [dict(row) for row in rows]
+        effective_timeout = timeout or self.query_timeout
+        try:
+            rows = await asyncio.wait_for(
+                self.conn.fetch(pg_query, *args),
+                timeout=effective_timeout
+            )
+            return [dict(row) for row in rows]
+        except asyncio.TimeoutError:
+            logger.warning(f"[v18.0] Query timeout ({effective_timeout}s): {pg_query[:100]}...")
+            raise
 
-    async def fetchone(self, query: str, *args):
-        """Fetch one result"""
+    async def fetchone(self, query: str, *args, timeout: float = None):
+        """Fetch one result with timeout protection"""
         pg_query = self._convert_placeholders(query)
-        row = await self.conn.fetchrow(pg_query, *args)
-        return dict(row) if row else None
+        effective_timeout = timeout or self.query_timeout
+        try:
+            row = await asyncio.wait_for(
+                self.conn.fetchrow(pg_query, *args),
+                timeout=effective_timeout
+            )
+            return dict(row) if row else None
+        except asyncio.TimeoutError:
+            logger.warning(f"[v18.0] Query timeout ({effective_timeout}s): {pg_query[:100]}...")
+            raise
 
-    async def fetchval(self, query: str, *args):
-        """Fetch single value"""
+    async def fetchval(self, query: str, *args, timeout: float = None):
+        """Fetch single value with timeout protection"""
         pg_query = self._convert_placeholders(query)
-        return await self.conn.fetchval(pg_query, *args)
+        effective_timeout = timeout or self.query_timeout
+        try:
+            return await asyncio.wait_for(
+                self.conn.fetchval(pg_query, *args),
+                timeout=effective_timeout
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f"[v18.0] Query timeout ({effective_timeout}s): {pg_query[:100]}...")
+            raise
 
     async def commit(self):
         """No-op for PostgreSQL (auto-commit)"""

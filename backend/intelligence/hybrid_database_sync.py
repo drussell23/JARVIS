@@ -1460,7 +1460,7 @@ class HybridDatabaseSync:
 
     async def _warm_cache_on_reconnection(self):
         """
-        Automatically warm voice profile cache when CloudSQL reconnects.
+        v18.0: Automatically warm voice profile cache when CloudSQL reconnects.
         Called by health check loop when connection is restored.
 
         Features:
@@ -1468,19 +1468,38 @@ class HybridDatabaseSync:
         - Only syncs if profiles are outdated or missing
         - Updates both SQLite and FAISS cache
         - Non-blocking background operation
+        - v18.0: Overall timeout protection to prevent long connection holds
         """
+        # v18.0: Overall timeout to prevent holding connections too long
+        CACHE_WARM_TIMEOUT = float(os.getenv("CACHE_WARM_TIMEOUT_SECONDS", "30.0"))
+
         try:
             logger.info("🔥 Warming voice profile cache after reconnection...")
 
-            # Check if cache needs refresh
-            needs_refresh = await self._check_cache_staleness()
+            # v18.0: Wrap entire operation in timeout
+            try:
+                # Check if cache needs refresh (with timeout)
+                needs_refresh = await asyncio.wait_for(
+                    self._check_cache_staleness(),
+                    timeout=min(10.0, CACHE_WARM_TIMEOUT / 3)
+                )
+            except asyncio.TimeoutError:
+                logger.warning("[v18.0] Cache staleness check timed out - assuming refresh needed")
+                needs_refresh = True
 
             if not needs_refresh:
                 logger.info("✅ Voice profile cache is fresh - no refresh needed")
                 return
 
-            # Bootstrap/refresh voice profiles
-            success = await self.bootstrap_voice_profiles_from_cloudsql()
+            # v18.0: Bootstrap/refresh voice profiles with timeout
+            try:
+                success = await asyncio.wait_for(
+                    self.bootstrap_voice_profiles_from_cloudsql(),
+                    timeout=CACHE_WARM_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                logger.warning(f"[v18.0] Cache warming timed out after {CACHE_WARM_TIMEOUT}s")
+                success = False
 
             if success:
                 logger.info("✅ Voice profile cache warmed and ready for offline auth")
@@ -1488,6 +1507,9 @@ class HybridDatabaseSync:
             else:
                 logger.warning("⚠️  Cache warming failed - will retry on next health check")
 
+        except asyncio.CancelledError:
+            logger.debug("[v18.0] Cache warming cancelled")
+            raise
         except Exception as e:
             logger.error(f"❌ Cache warming failed: {e}")
 
