@@ -450,9 +450,19 @@ class ReactorCoreReceiver:
         v2.1: Added guard against duplicate fsevents watches and graceful error handling.
         Multiple components may try to watch the same directory, which causes
         "Cannot add watch - it is already scheduled" errors on macOS fsevents.
+
+        v2.2: Properly captures event loop for cross-thread communication and uses
+        centralized watch prevention to avoid fsevents conflicts.
         """
         if self._running:
             logger.debug("ReactorCoreReceiver already running, skipping start")
+            return
+
+        # v2.2: Capture the main event loop for cross-thread callback scheduling
+        try:
+            main_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            logger.error("ReactorCoreReceiver.start() must be called from async context")
             return
 
         self._running = True
@@ -469,12 +479,31 @@ class ReactorCoreReceiver:
                 pass
             self._observer = None
 
+        # v2.2: Check if this directory is already being watched globally
+        # This prevents the "Cannot add watch - it is already scheduled" error
+        watch_key = str(self._watch_dir)
+        if hasattr(_FileWatchHandler, "_global_watches"):
+            if watch_key in _FileWatchHandler._global_watches:
+                logger.info(
+                    f"ReactorCoreReceiver: Directory {self._watch_dir} already watched. "
+                    "Using fallback polling mode."
+                )
+                asyncio.create_task(self._fallback_poll_loop())
+                return
+        else:
+            _FileWatchHandler._global_watches = set()
+
         # Start file watcher with graceful error handling
         try:
-            event_handler = _FileWatchHandler(self._on_file_created)
+            # v2.2: Pass the event loop to the handler
+            event_handler = _FileWatchHandler(self._on_file_created, loop=main_loop)
             self._observer = Observer()
             self._observer.schedule(event_handler, str(self._watch_dir), recursive=False)
             self._observer.start()
+
+            # v2.2: Register this watch globally
+            _FileWatchHandler._global_watches.add(watch_key)
+
             logger.info(f"ReactorCoreReceiver started watching {self._watch_dir}")
         except RuntimeError as e:
             if "already scheduled" in str(e):
@@ -505,12 +534,22 @@ class ReactorCoreReceiver:
                 await asyncio.sleep(poll_interval)
 
     async def stop(self) -> None:
-        """Stop watching for events."""
+        """
+        Stop watching for events.
+
+        v2.2: Properly unregisters from global watch registry.
+        """
         self._running = False
+
+        # v2.2: Unregister from global watches
+        watch_key = str(self._watch_dir)
+        if hasattr(_FileWatchHandler, "_global_watches"):
+            _FileWatchHandler._global_watches.discard(watch_key)
 
         if self._observer:
             self._observer.stop()
             self._observer.join(timeout=5)
+            self._observer = None
 
         logger.info("ReactorCoreReceiver stopped")
 
@@ -621,28 +660,57 @@ class ReactorCoreReceiver:
 
 
 class _FileWatchHandler(FileSystemEventHandler):
-    """Watchdog event handler for file creation."""
+    """
+    Watchdog event handler for file creation.
 
-    def __init__(self, callback: Callable[[Path], Coroutine]):
+    v2.1: Fixed event loop handling for background threads.
+          The loop must be passed in during construction, not discovered
+          at runtime from the watchdog thread.
+    """
+
+    def __init__(
+        self,
+        callback: Callable[[Path], Coroutine],
+        loop: Optional[asyncio.AbstractEventLoop] = None,
+    ):
         super().__init__()
         self._callback = callback
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        # v2.1: Loop must be passed in from the async context that creates us
+        self._loop = loop
+
+    def set_event_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        """
+        v2.1: Set the event loop after construction.
+        Must be called from the main async context before watchdog starts.
+        """
+        self._loop = loop
 
     def on_created(self, event):
         if isinstance(event, FileCreatedEvent):
             file_path = Path(event.src_path)
             if file_path.suffix == ".json":
-                # Schedule async callback
+                # v2.1: Use the pre-captured loop, don't try to get it here
                 if self._loop is None:
-                    try:
-                        self._loop = asyncio.get_running_loop()
-                    except RuntimeError:
-                        self._loop = asyncio.get_event_loop()
+                    logger.warning(
+                        "[ReactorCoreReceiver] Event loop not set, callback skipped. "
+                        "Call set_event_loop() before starting watchdog."
+                    )
+                    return
 
-                asyncio.run_coroutine_threadsafe(
-                    self._callback(file_path),
-                    self._loop,
-                )
+                if not self._loop.is_running():
+                    logger.debug("[ReactorCoreReceiver] Event loop not running, skipping event")
+                    return
+
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        self._callback(file_path),
+                        self._loop,
+                    )
+                except RuntimeError as e:
+                    if "closed" in str(e).lower():
+                        logger.debug("[ReactorCoreReceiver] Event loop closed, ignoring event")
+                    else:
+                        logger.error(f"[ReactorCoreReceiver] Failed to schedule callback: {e}")
 
 
 # =============================================================================

@@ -21,7 +21,9 @@ import asyncio
 import hashlib
 import logging
 import os
+import threading
 import time
+import queue as thread_queue
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from enum import Enum
@@ -108,6 +110,9 @@ class FileWatchGuard:
 
     Wraps watchdog with additional safety measures for production use.
 
+    v2.0: Enhanced cross-thread async communication with proper event loop handling.
+          Fixes "There is no current event loop in thread" errors.
+
     Usage:
         config = FileWatchConfig(patterns=["*.json"])
         guard = FileWatchGuard(
@@ -120,6 +125,10 @@ class FileWatchGuard:
         # ... events flow to handler ...
         await guard.stop()
     """
+
+    # v2.0: Centralized watch registry to prevent duplicate watches
+    _global_watched_paths: Dict[str, "FileWatchGuard"] = {}
+    _global_lock = threading.Lock()
 
     def __init__(
         self,
@@ -139,6 +148,9 @@ class FileWatchGuard:
         self._processor_task: Optional[asyncio.Task] = None
         self._health_task: Optional[asyncio.Task] = None
 
+        # v2.0: Store the main event loop for cross-thread communication
+        self._main_loop: Optional[asyncio.AbstractEventLoop] = None
+
         # Deduplication
         self._seen_events: OrderedDict[str, float] = OrderedDict()  # LRU cache
         self._pending_events: Dict[str, FileEvent] = {}  # Debounce buffer
@@ -156,14 +168,41 @@ class FileWatchGuard:
         """
         Start file watching.
 
+        v2.0: Captures the main event loop for cross-thread communication
+              and prevents duplicate watches on the same directory.
+
         Returns:
             True if started successfully
         """
         if self._running:
             return True
 
+        # v2.0: Capture the main event loop for cross-thread communication
+        try:
+            self._main_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            logger.error("[FileWatchGuard] Must be called from async context")
+            return False
+
         # Ensure directory exists
         self.watch_dir.mkdir(parents=True, exist_ok=True)
+
+        # v2.0: Check for duplicate watches
+        path_key = str(self.watch_dir)
+        with FileWatchGuard._global_lock:
+            if path_key in FileWatchGuard._global_watched_paths:
+                existing = FileWatchGuard._global_watched_paths[path_key]
+                if existing._running and existing is not self:
+                    logger.warning(
+                        f"[FileWatchGuard] Path already watched: {self.watch_dir}. "
+                        "Sharing events from existing watcher."
+                    )
+                    # Register as a secondary handler on the existing watcher
+                    existing._register_secondary_handler(self._on_event)
+                    self._running = True
+                    return True
+            # Register this watcher
+            FileWatchGuard._global_watched_paths[path_key] = self
 
         try:
             await self._start_watchdog()
@@ -182,11 +221,37 @@ class FileWatchGuard:
             logger.error(f"[FileWatchGuard] Failed to start: {e}")
             self._last_error = e
             self.metrics.errors += 1
+            # Unregister on failure
+            with FileWatchGuard._global_lock:
+                if FileWatchGuard._global_watched_paths.get(path_key) is self:
+                    del FileWatchGuard._global_watched_paths[path_key]
             return False
 
+    def _register_secondary_handler(self, handler: Callable[[FileEvent], Any]) -> None:
+        """
+        v2.0: Register a secondary event handler for shared watching.
+
+        When multiple components want to watch the same directory, secondary
+        handlers receive events from the primary watcher.
+        """
+        if not hasattr(self, "_secondary_handlers"):
+            self._secondary_handlers: List[Callable[[FileEvent], Any]] = []
+        self._secondary_handlers.append(handler)
+        logger.debug(f"[FileWatchGuard] Registered secondary handler ({len(self._secondary_handlers)} total)")
+
     async def stop(self) -> None:
-        """Stop file watching."""
+        """
+        Stop file watching.
+
+        v2.0: Properly unregisters from global watch registry.
+        """
         self._running = False
+
+        # v2.0: Unregister from global watched paths
+        path_key = str(self.watch_dir)
+        with FileWatchGuard._global_lock:
+            if FileWatchGuard._global_watched_paths.get(path_key) is self:
+                del FileWatchGuard._global_watched_paths[path_key]
 
         # Stop tasks
         if self._processor_task:
@@ -205,6 +270,13 @@ class FileWatchGuard:
 
         # Stop watchdog
         await self._stop_watchdog()
+
+        # v2.0: Clear secondary handlers
+        if hasattr(self, "_secondary_handlers"):
+            self._secondary_handlers.clear()
+
+        # Clear main loop reference
+        self._main_loop = None
 
         logger.info("[FileWatchGuard] Stopped")
 
@@ -267,16 +339,32 @@ class FileWatchGuard:
             self._observer = None
 
     def _queue_event(self, event: FileEvent) -> None:
-        """Queue an event for processing (called from watchdog thread)."""
+        """
+        Queue an event for processing (called from watchdog thread).
+
+        v2.0: Uses the stored main event loop for thread-safe queue access.
+              Handles the case where no event loop exists in the current thread.
+        """
         try:
-            # Use asyncio-safe method to put in queue
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                loop.call_soon_threadsafe(
-                    lambda: self._event_queue.put_nowait(event)
+            # v2.0: Use the stored main loop (captured in start())
+            # This is the ONLY safe way to communicate from watchdog thread to async
+            if self._main_loop is not None and self._main_loop.is_running():
+                # Thread-safe call into the main event loop
+                self._main_loop.call_soon_threadsafe(
+                    self._event_queue.put_nowait, event
                 )
             else:
-                self._event_queue.put_nowait(event)
+                # Fallback: If main loop not running, log warning
+                # This shouldn't happen in normal operation
+                logger.warning(
+                    "[FileWatchGuard] Main event loop not running, event may be lost"
+                )
+        except RuntimeError as e:
+            # Handle case where loop is closed
+            if "closed" in str(e).lower():
+                logger.debug("[FileWatchGuard] Event loop closed, ignoring event")
+            else:
+                logger.error(f"[FileWatchGuard] Queue error: {e}")
         except Exception as e:
             logger.error(f"[FileWatchGuard] Queue error: {e}")
 
@@ -417,7 +505,11 @@ class FileWatchGuard:
             await self._process_single_event(event)
 
     async def _process_single_event(self, event: FileEvent) -> None:
-        """Process a single event."""
+        """
+        Process a single event.
+
+        v2.0: Also notifies secondary handlers for shared watching.
+        """
         start_time = time.time()
 
         try:
@@ -436,10 +528,20 @@ class FileWatchGuard:
             if event.path.exists() and not event.is_directory:
                 event.size = event.path.stat().st_size
 
-            # Call handler
+            # Call primary handler
             result = self._on_event(event)
             if asyncio.iscoroutine(result):
                 await result
+
+            # v2.0: Call secondary handlers (for shared watching)
+            if hasattr(self, "_secondary_handlers"):
+                for handler in self._secondary_handlers:
+                    try:
+                        handler_result = handler(event)
+                        if asyncio.iscoroutine(handler_result):
+                            await handler_result
+                    except Exception as handler_err:
+                        logger.warning(f"[FileWatchGuard] Secondary handler error: {handler_err}")
 
             self.metrics.events_processed += 1
             self.metrics.last_event_time = time.time()
