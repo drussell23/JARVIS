@@ -382,9 +382,10 @@ class GCPHybridPrimeRouter:
                 self._vm_provisioning_lock = DistributedLock(
                     lock_name="gcp_vm_provisioning",
                     config=DistributedLockConfig(
-                        ttl_seconds=VM_PROVISIONING_LOCK_TTL,
-                        retry_count=3,
-                        retry_delay=1.0,
+                        # v93.0: Fixed parameter names to match DistributedLockConfig API
+                        lock_ttl=VM_PROVISIONING_LOCK_TTL,  # Was ttl_seconds
+                        default_timeout=30.0,  # Max wait time to acquire
+                        retry_interval=1.0,  # Was retry_delay
                     ),
                 )
             except Exception as e:

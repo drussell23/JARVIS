@@ -466,22 +466,25 @@ class CrossRepoNeuralMeshBridge:
             return
 
         try:
-            # Create registration data
+            # v93.0: Fixed registration to match AgentRegistry.register() API
+            # status, load, health go in metadata, not as top-level params
             agent_data = {
                 "agent_name": agent.agent_id,
                 "agent_type": "external",
                 "capabilities": set(agent.capabilities),
                 "backend": "cross_repo",
                 "version": agent.version,
-                "status": "online" if agent.is_healthy() else "offline",
-                "load": agent.load,
-                "health": "healthy" if agent.health_score >= 0.8 else "degraded",
                 "metadata": {
                     **agent.metadata,
                     "repo_name": agent.repo_name,
                     "endpoint": agent.endpoint,
                     "is_external": True,
                     "cross_repo_bridge": True,
+                    # v93.0: Moved these to metadata (not register() params)
+                    "initial_status": "online" if agent.is_healthy() else "offline",
+                    "load": agent.load,
+                    "health_score": agent.health_score,
+                    "health_status": "healthy" if agent.health_score >= 0.8 else "degraded",
                 },
             }
 
