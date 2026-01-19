@@ -42,6 +42,7 @@ Version: 1.0.0
 """
 
 import asyncio
+import atexit
 import logging
 import multiprocessing
 import os
@@ -51,6 +52,7 @@ import sys
 import tempfile
 import time
 import traceback
+import weakref
 from concurrent.futures import ProcessPoolExecutor, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -1284,17 +1286,57 @@ class ProcessIsolatedMLLoader:
 
 
 # =============================================================================
-# Singleton Instance
+# Singleton Instance with Proper Cleanup
 # =============================================================================
 
 _loader_instance: Optional[ProcessIsolatedMLLoader] = None
+_atexit_registered: bool = False
+
+
+def _sync_cleanup_processes() -> None:
+    """
+    v93.0: Synchronous cleanup for atexit handler.
+
+    This ensures child processes are killed when the parent exits,
+    preventing leaked semaphores and zombie processes.
+    """
+    global _loader_instance
+    if _loader_instance is None:
+        return
+
+    try:
+        for pid, process in list(_loader_instance._active_processes.items()):
+            try:
+                if process.is_alive():
+                    logger.debug(f"[atexit] Terminating ML process {pid}")
+                    process.terminate()
+                    process.join(timeout=2.0)
+
+                    if process.is_alive():
+                        logger.warning(f"[atexit] Force killing ML process {pid}")
+                        process.kill()
+                        process.join(timeout=1.0)
+            except Exception as e:
+                logger.debug(f"[atexit] Error cleaning process {pid}: {e}")
+
+        _loader_instance._active_processes.clear()
+        logger.debug("[atexit] ML loader processes cleaned up")
+    except Exception as e:
+        logger.debug(f"[atexit] Cleanup error: {e}")
 
 
 def get_ml_loader() -> ProcessIsolatedMLLoader:
     """Get the global ML loader instance."""
-    global _loader_instance
+    global _loader_instance, _atexit_registered
     if _loader_instance is None:
         _loader_instance = ProcessIsolatedMLLoader()
+
+        # v93.0: Register atexit handler for proper cleanup
+        if not _atexit_registered:
+            atexit.register(_sync_cleanup_processes)
+            _atexit_registered = True
+            logger.debug("ML loader atexit cleanup handler registered")
+
     return _loader_instance
 
 
@@ -1625,6 +1667,60 @@ async def discover_and_start_backend(
         'blacklisted_ports': result.get('blacklisted_ports', []),
         'healer': healer,
     }
+
+
+# =============================================================================
+# Shutdown Manager Integration
+# =============================================================================
+
+def register_shutdown_hooks() -> bool:
+    """
+    v93.0: Register ML loader cleanup with coordinated shutdown manager.
+
+    This ensures proper cleanup during graceful shutdown, complementing
+    the atexit handler which handles abrupt termination.
+
+    Returns:
+        True if hooks were registered, False if shutdown manager unavailable
+    """
+    try:
+        from backend.core.coordinated_shutdown import (
+            get_shutdown_manager,
+            ShutdownPhase,
+            ShutdownHook,
+        )
+
+        manager = get_shutdown_manager()
+        if manager is None:
+            logger.debug("Shutdown manager not available - using atexit only")
+            return False
+
+        async def ml_cleanup_hook():
+            """Cleanup ML processes during coordinated shutdown."""
+            global _loader_instance
+            if _loader_instance is not None:
+                logger.info("[Shutdown] Cleaning up ML loader processes...")
+                await _loader_instance.shutdown()
+
+        manager.register_hook(
+            ShutdownHook(
+                name="ml_loader_cleanup",
+                callback=ml_cleanup_hook,
+                phase=ShutdownPhase.CLEANUP,
+                priority=90,  # High priority - clean processes early
+                timeout=10.0,
+                critical=False,  # Don't block shutdown if this fails
+            )
+        )
+        logger.debug("ML loader shutdown hook registered")
+        return True
+
+    except ImportError:
+        logger.debug("Shutdown manager not available - using atexit only")
+        return False
+    except Exception as e:
+        logger.debug(f"Failed to register shutdown hook: {e}")
+        return False
 
 
 # =============================================================================
