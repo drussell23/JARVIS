@@ -3028,11 +3028,27 @@ class UnifiedStateCoordinator:
             "JARVIS_ENABLE_ULTRA_COORD", "true"
         ).lower() == "true"
 
+        # ═══════════════════════════════════════════════════════════════════════
+        # v93.0: Stale PID tracking to prevent warning spam
+        # ═══════════════════════════════════════════════════════════════════════
+        self._reported_stale_pids: Set[int] = set()
+        self._stale_pid_cleanup_attempts: Dict[int, int] = {}
+        self._pre_startup_cleanup_done: bool = False
+        self._max_cleanup_attempts_per_pid: int = int(
+            os.getenv("JARVIS_MAX_CLEANUP_ATTEMPTS", "3")
+        )
+
+        # v93.0: Startup grace period for state reconciliation
+        self._startup_time = time.time()
+        self._startup_grace_period = float(
+            os.getenv("JARVIS_STARTUP_GRACE_PERIOD", "10.0")
+        )
+
         # v92.0: Mark as initialized (singleton pattern)
         self._initialized = True
 
         logger.debug(
-            f"[StateCoord] v92.0 Initialized (PID={self._pid}, "
+            f"[StateCoord] v93.0 Initialized (PID={self._pid}, "
             f"PGID={self._pgid}, Cookie={self._process_cookie[:8]}...)"
         )
 
@@ -3043,6 +3059,158 @@ class UnifiedStateCoordinator:
             return proc.create_time()
         except Exception:
             return time.time()
+
+    async def _perform_pre_startup_cleanup(self) -> int:
+        """
+        v93.0: Pre-startup cleanup of ALL stale state.
+
+        This runs ONCE at the start of coordination to clean up any stale
+        ownership entries from crashed processes. This prevents the retry
+        loop from repeatedly detecting and warning about the same stale PIDs.
+
+        Returns:
+            Number of stale entries cleaned up
+        """
+        if self._pre_startup_cleanup_done:
+            return 0
+
+        self._pre_startup_cleanup_done = True
+        cleaned_count = 0
+
+        try:
+            logger.info("[StateCoord] v93.0 Running pre-startup cleanup...")
+
+            # Read current state
+            state = await self._read_state()
+            if not state:
+                logger.debug("[StateCoord] No existing state to clean")
+                return 0
+
+            owners = state.get("owners", {})
+            if not owners:
+                logger.debug("[StateCoord] No existing owners to validate")
+                return 0
+
+            # Check each owner for staleness
+            stale_components = []
+            for component, owner_data in list(owners.items()):
+                owner_pid = owner_data.get("pid", 0)
+                owner_cookie = owner_data.get("cookie", "")
+                owner_heartbeat = owner_data.get("last_heartbeat", 0)
+
+                # Skip if this is our own PID (shouldn't happen on fresh start)
+                if owner_pid == self._pid:
+                    continue
+
+                # Check if process exists
+                is_alive = False
+                try:
+                    proc = psutil.Process(owner_pid)
+                    if proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE:
+                        # Process exists - check heartbeat freshness
+                        age = time.time() - owner_heartbeat
+                        is_alive = age < self._stale_threshold
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    is_alive = False
+
+                if not is_alive:
+                    stale_components.append((component, owner_pid, owner_data))
+                    self._reported_stale_pids.add(owner_pid)
+
+            # Clean up all stale entries atomically
+            if stale_components:
+                logger.info(
+                    f"[StateCoord] v93.0 Found {len(stale_components)} stale ownership entries"
+                )
+
+                async with self._file_lock:
+                    # Re-read state to avoid race conditions
+                    state = await self._read_state()
+                    if not state:
+                        state = {"owners": {}, "version": 0}
+
+                    owners = state.get("owners", {})
+                    for component, stale_pid, _ in stale_components:
+                        if component in owners:
+                            current_pid = owners[component].get("pid", 0)
+                            # Only remove if still stale (not taken over)
+                            if current_pid == stale_pid:
+                                del owners[component]
+                                cleaned_count += 1
+                                logger.info(
+                                    f"[StateCoord] v93.0 Cleaned stale entry: "
+                                    f"{component} (dead PID {stale_pid})"
+                                )
+
+                                # Also clean up lock file
+                                lock_file = self.lock_dir / f"{component}.lock"
+                                if lock_file.exists():
+                                    try:
+                                        lock_file.unlink()
+                                        logger.debug(
+                                            f"[StateCoord] v93.0 Removed stale lock file: {lock_file}"
+                                        )
+                                    except Exception as e:
+                                        logger.debug(f"[StateCoord] Lock file removal error: {e}")
+
+                    # Write cleaned state atomically
+                    if cleaned_count > 0:
+                        state["last_update"] = time.time()
+                        state["version"] = state.get("version", 0) + 1
+                        state["cleanup_by_pid"] = self._pid
+                        state["cleanup_timestamp"] = time.time()
+                        state = self._add_state_checksum(state)
+
+                        temp_file = self.state_file.with_suffix(".tmp")
+                        temp_file.write_text(json.dumps(state, indent=2))
+                        temp_file.replace(self.state_file)
+
+                        self._state_cache = state
+                        self._last_cache_time = time.time()
+
+                logger.info(
+                    f"[StateCoord] v93.0 Pre-startup cleanup complete: "
+                    f"{cleaned_count} stale entries removed"
+                )
+            else:
+                logger.debug("[StateCoord] v93.0 No stale entries found")
+
+            return cleaned_count
+
+        except Exception as e:
+            logger.warning(f"[StateCoord] v93.0 Pre-startup cleanup error: {e}")
+            return 0
+
+    def _is_stale_pid_already_reported(self, pid: int) -> bool:
+        """
+        v93.0: Check if a stale PID has already been reported.
+
+        This prevents repeated warnings for the same stale PID.
+        """
+        return pid in self._reported_stale_pids
+
+    def _mark_stale_pid_reported(self, pid: int) -> None:
+        """
+        v93.0: Mark a stale PID as reported.
+        """
+        self._reported_stale_pids.add(pid)
+
+    def _should_attempt_cleanup(self, pid: int) -> bool:
+        """
+        v93.0: Check if we should attempt cleanup for this stale PID.
+
+        Limits cleanup attempts to prevent infinite loops.
+        """
+        attempts = self._stale_pid_cleanup_attempts.get(pid, 0)
+        return attempts < self._max_cleanup_attempts_per_pid
+
+    def _record_cleanup_attempt(self, pid: int) -> None:
+        """
+        v93.0: Record a cleanup attempt for a stale PID.
+        """
+        self._stale_pid_cleanup_attempts[pid] = (
+            self._stale_pid_cleanup_attempts.get(pid, 0) + 1
+        )
 
     async def _ensure_advanced_coord(self) -> Optional["TrinityAdvancedCoordinator"]:
         """
@@ -3466,6 +3634,17 @@ class UnifiedStateCoordinator:
         await self._validate_and_recover_lock_file(lock_file)
         await self._validate_and_recover_state_file()
 
+        # ═══════════════════════════════════════════════════════════════════════
+        # v93.0: Pre-startup cleanup - runs ONCE to clean all stale state
+        # This prevents the retry loop from repeatedly detecting the same stale PIDs
+        # ═══════════════════════════════════════════════════════════════════════
+        try:
+            cleanup_count = await self._perform_pre_startup_cleanup()
+            if cleanup_count > 0:
+                logger.info(f"[StateCoord] v93.0 Pre-startup: {cleanup_count} stale entries cleaned")
+        except Exception as e:
+            logger.debug(f"[StateCoord] v93.0 Pre-startup cleanup error: {e}")
+
         # v86.0: Cleanup stale owners before attempting acquisition
         try:
             cleaned = await self._cleanup_stale_owners()
@@ -3506,30 +3685,63 @@ class UnifiedStateCoordinator:
                     is_alive = await self._validate_owner_alive(previous_owner)
 
                     if not is_alive:
-                        # Owner is dead/stale - take over
-                        logger.warning(
-                            f"[StateCoord] Owner PID {previous_owner.pid} is dead/stale, "
-                            f"force acquiring..."
-                        )
+                        stale_pid = previous_owner.pid
 
-                        # v5.2: Delete stale lock file to force cleanup
-                        # This is necessary because the OS may not have released
-                        # the flock if the process died abnormally
-                        await self._cleanup_stale_lock(component, previous_owner.pid)
-
-                        acquired, _ = await self._try_acquire_lock(
-                            entry_point, component, force=True
-                        )
-                        if acquired:
-                            await self.publish_component_event(
-                                component,
-                                self.ComponentEventType.OWNERSHIP_TRANSFERRED,
-                                metadata={
-                                    "reason": "stale_owner",
-                                    "previous_owner_pid": previous_owner.pid,
-                                }
+                        # ═══════════════════════════════════════════════════════════════
+                        # v93.0: Deduplicate warnings - only log once per stale PID
+                        # ═══════════════════════════════════════════════════════════════
+                        if not self._is_stale_pid_already_reported(stale_pid):
+                            logger.warning(
+                                f"[StateCoord] Owner PID {stale_pid} is dead/stale, "
+                                f"force acquiring..."
                             )
-                            return True, previous_owner
+                            self._mark_stale_pid_reported(stale_pid)
+
+                        # v93.0: Limit cleanup attempts to prevent infinite loops
+                        if self._should_attempt_cleanup(stale_pid):
+                            self._record_cleanup_attempt(stale_pid)
+
+                            # v5.2: Delete stale lock file to force cleanup
+                            # This is necessary because the OS may not have released
+                            # the flock if the process died abnormally
+                            cleanup_success = await self._cleanup_stale_lock(component, stale_pid)
+
+                            if cleanup_success:
+                                acquired, _ = await self._try_acquire_lock(
+                                    entry_point, component, force=True
+                                )
+                                if acquired:
+                                    # v93.0: Clear reported status on successful acquisition
+                                    self._reported_stale_pids.discard(stale_pid)
+                                    await self.publish_component_event(
+                                        component,
+                                        self.ComponentEventType.OWNERSHIP_TRANSFERRED,
+                                        metadata={
+                                            "reason": "stale_owner",
+                                            "previous_owner_pid": stale_pid,
+                                        }
+                                    )
+                                    return True, previous_owner
+                        else:
+                            # v93.0: Max cleanup attempts reached - force acquire without cleanup
+                            logger.debug(
+                                f"[StateCoord] v93.0 Max cleanup attempts for PID {stale_pid}, "
+                                f"attempting direct force acquire"
+                            )
+                            acquired, _ = await self._try_acquire_lock(
+                                entry_point, component, force=True
+                            )
+                            if acquired:
+                                self._reported_stale_pids.discard(stale_pid)
+                                await self.publish_component_event(
+                                    component,
+                                    self.ComponentEventType.OWNERSHIP_TRANSFERRED,
+                                    metadata={
+                                        "reason": "stale_owner_force",
+                                        "previous_owner_pid": stale_pid,
+                                    }
+                                )
+                                return True, previous_owner
                     else:
                         # Owner is alive - check if we have higher priority
                         should_takeover, reason = await self._resolve_ownership_conflict(
