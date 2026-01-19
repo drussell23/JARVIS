@@ -48,6 +48,7 @@ from backend.core.resilience.redis_reconnector import (
     ResilientRedisClient,
     RedisConnectionConfig,
     RedisNotAvailableError,
+    REDIS_AVAILABLE,  # v93.0: Check if Redis is installed before using
 )
 from backend.core.resilience.correlation_context import (
     CorrelationContext,
@@ -262,6 +263,7 @@ __all__ = [
     "ResilientRedisClient",
     "RedisConnectionConfig",
     "RedisNotAvailableError",
+    "REDIS_AVAILABLE",  # v93.0: Check if Redis is installed
     # Correlation Context
     "CorrelationContext",
     "get_current_correlation_id",

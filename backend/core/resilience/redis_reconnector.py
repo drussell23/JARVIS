@@ -11,6 +11,7 @@ Features:
     - Connection pooling with proper cleanup
     - Pub/Sub reconnection with subscription restore
     - Comprehensive metrics and health status
+    - v93.0: Redis is optional - graceful no-op when not installed
 
 Author: JARVIS Cross-Repo Resilience
 """
@@ -25,6 +26,17 @@ from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
+
+# v93.0: Check if Redis is available at module load time
+REDIS_AVAILABLE = False
+_redis_import_error: Optional[str] = None
+
+try:
+    import redis.asyncio as aioredis
+    REDIS_AVAILABLE = True
+except ImportError as e:
+    _redis_import_error = str(e)
+    aioredis = None  # type: ignore
 
 
 class RedisNotAvailableError(Exception):
@@ -162,9 +174,26 @@ class ResilientRedisClient:
         """
         Establish Redis connection.
 
+        v93.0: Gracefully handles missing Redis module - returns False without error spam.
+
         Returns:
             True if connected successfully
         """
+        # v93.0: Early exit if Redis module not installed
+        if not REDIS_AVAILABLE:
+            async with self._state_lock:
+                self._state = ConnectionState.FAILED
+                self._last_error = ModuleNotFoundError(_redis_import_error or "redis module not installed")
+
+            # Only log once at INFO level (not ERROR)
+            if not hasattr(self, '_redis_unavailable_logged'):
+                self._redis_unavailable_logged = True
+                logger.info(
+                    "[ResilientRedis] Redis module not installed - running without Redis. "
+                    "Install with: pip install redis"
+                )
+            return False
+
         async with self._state_lock:
             if self._state == ConnectionState.CONNECTED:
                 return True
@@ -172,9 +201,6 @@ class ResilientRedisClient:
             self._state = ConnectionState.CONNECTING
 
         try:
-            # Import Redis here to avoid import errors if not installed
-            import redis.asyncio as aioredis
-
             self._redis = await aioredis.from_url(
                 self.config.url,
                 db=self.config.db,
