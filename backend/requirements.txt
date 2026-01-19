@@ -57,7 +57,7 @@ aiofiles==23.2.1
 # Model training dependencies
 wandb==0.16.2
 tensorboard==2.20.0
-datasets==2.16.1
+datasets==4.5.0
 evaluate==0.4.1
 rouge-score==0.1.2
 
