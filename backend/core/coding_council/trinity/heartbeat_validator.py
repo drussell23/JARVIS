@@ -102,6 +102,14 @@ class Heartbeat:
         )
 
 
+def _env_float(key: str, default: float) -> float:
+    """Get float from environment variable with default."""
+    try:
+        return float(os.environ.get(key, str(default)))
+    except ValueError:
+        return default
+
+
 class HeartbeatValidator:
     """
     Validates heartbeats with PID verification and staleness detection.
@@ -112,12 +120,20 @@ class HeartbeatValidator:
     - Health score calculation
     - Automatic cleanup of dead components
     - Event callbacks for status changes
+
+    v93.0 Enhancements:
+    - All thresholds configurable via environment variables
+    - Cross-repo heartbeat synchronization
+    - HTTP health check integration
     """
 
-    # Thresholds
-    STALE_THRESHOLD_SECONDS = 30.0  # Mark as stale after 30s
-    DEAD_THRESHOLD_SECONDS = 120.0  # Mark as dead after 2 minutes
-    HEALTH_DECAY_RATE = 0.1  # Health score decay per missed heartbeat
+    # v93.0: Thresholds now configurable via environment variables
+    # Environment variables: HEARTBEAT_STALE_THRESHOLD, HEARTBEAT_DEAD_THRESHOLD, etc.
+    STALE_THRESHOLD_SECONDS = _env_float("HEARTBEAT_STALE_THRESHOLD", 30.0)
+    DEAD_THRESHOLD_SECONDS = _env_float("HEARTBEAT_DEAD_THRESHOLD", 120.0)
+    HEALTH_DECAY_RATE = _env_float("HEARTBEAT_HEALTH_DECAY_RATE", 0.1)
+    MONITOR_INTERVAL_SECONDS = _env_float("HEARTBEAT_MONITOR_INTERVAL", 5.0)
+    CLEANUP_MULTIPLIER = _env_float("HEARTBEAT_CLEANUP_MULTIPLIER", 5.0)  # Dead threshold * this = cleanup
 
     def __init__(self, heartbeat_dir: Optional[Path] = None):
         self.heartbeat_dir = heartbeat_dir or Path.home() / ".jarvis" / "trinity" / "heartbeats"
@@ -498,11 +514,14 @@ class HeartbeatValidator:
                     # Clean up dead components after extended period
                     if health.status == HeartbeatStatus.DEAD:
                         age = time.time() - health.last_heartbeat
-                        if age > self.DEAD_THRESHOLD_SECONDS * 5:  # 10 minutes
+                        # v93.0: Use configurable cleanup multiplier
+                        cleanup_threshold = self.DEAD_THRESHOLD_SECONDS * self.CLEANUP_MULTIPLIER
+                        if age > cleanup_threshold:
                             del self._components[component_id]
                             logger.info(f"[HeartbeatValidator] Removed dead component: {component_id}")
 
-                await asyncio.sleep(5)  # Check every 5 seconds
+                # v93.0: Use configurable monitor interval
+                await asyncio.sleep(self.MONITOR_INTERVAL_SECONDS)
 
             except asyncio.CancelledError:
                 break

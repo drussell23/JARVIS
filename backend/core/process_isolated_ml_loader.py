@@ -905,8 +905,12 @@ def _worker_load_speechbrain_model(
         import torch
         torch.set_num_threads(2)
 
-        # Import SpeechBrain
-        from speechbrain.pretrained import EncoderClassifier
+        # Import SpeechBrain (v93.0: Updated for SpeechBrain 1.0+ compatibility)
+        try:
+            from speechbrain.inference import EncoderClassifier
+        except ImportError:
+            # Fallback for older SpeechBrain versions
+            from speechbrain.pretrained import EncoderClassifier
 
         # Load the model
         logger.info(f"[Worker] Loading SpeechBrain model: {model_name}")

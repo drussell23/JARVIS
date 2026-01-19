@@ -1038,16 +1038,18 @@ def setup_signal_handlers(
         return
 
     # Track if shutdown was already triggered to prevent duplicate calls
-    _shutdown_triggered = {"value": False}
-    _shutdown_lock = asyncio.Lock()
+    # v93.0: Use threading.Event for sync-safe flag and LazyAsyncLock for async-safe locking
+    import threading
+    _shutdown_triggered = threading.Event()
+    _shutdown_lock = LazyAsyncLock()  # v93.0: Lazy lock avoids "no running event loop" issues
 
     async def _safe_shutdown(reason: ShutdownReason, sig_name: str) -> None:
         """Execute shutdown with lock to prevent duplicates."""
         async with _shutdown_lock:
-            if _shutdown_triggered["value"]:
+            if _shutdown_triggered.is_set():
                 logger.debug(f"[ShutdownManager] Ignoring duplicate signal {sig_name}")
                 return
-            _shutdown_triggered["value"] = True
+            _shutdown_triggered.set()
 
         logger.info(f"[ShutdownManager] Initiating shutdown due to {sig_name}")
         try:
@@ -1558,11 +1560,29 @@ class OrphanProcessDetector:
         return False
 
     # v93.0: HTTP port configuration for each component
-    COMPONENT_HTTP_PORTS = {
-        "jarvis_body": [8080, 8000, 5000],
-        "jarvis_prime": [8091, 8001, 5001],
-        "reactor_core": [8090, 8002, 5002],
-    }
+    # Configurable via environment variables: JARVIS_BODY_PORTS, JARVIS_PRIME_PORTS, etc.
+    @staticmethod
+    def _get_component_ports() -> Dict[str, List[int]]:
+        """Get component HTTP ports from environment or defaults."""
+        def parse_ports(env_key: str, defaults: List[int]) -> List[int]:
+            env_val = os.environ.get(env_key)
+            if env_val:
+                try:
+                    return [int(p.strip()) for p in env_val.split(",")]
+                except ValueError:
+                    pass
+            return defaults
+
+        return {
+            "jarvis_body": parse_ports("JARVIS_BODY_PORTS", [8080, 8000, 5000]),
+            "jarvis_prime": parse_ports("JARVIS_PRIME_PORTS", [8091, 8001, 5001]),
+            "reactor_core": parse_ports("REACTOR_CORE_PORTS", [8090, 8002, 5002]),
+        }
+
+    @property
+    def COMPONENT_HTTP_PORTS(self) -> Dict[str, List[int]]:
+        """Dynamic port configuration."""
+        return self._get_component_ports()
 
     async def _http_health_check(self, component_type: str, pid: int) -> bool:
         """

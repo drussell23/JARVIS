@@ -801,9 +801,12 @@ class ParallelInitializer:
                     logger.info("   [BACKGROUND] ECAPA model loaded")
                     return manager
                 except ImportError:
-                    # Try alternative import path
+                    # Try alternative import path (v93.0: Updated for SpeechBrain 1.0+ compatibility)
                     try:
-                        from speechbrain.pretrained import EncoderClassifier
+                        try:
+                            from speechbrain.inference import EncoderClassifier
+                        except ImportError:
+                            from speechbrain.pretrained import EncoderClassifier
                         model = EncoderClassifier.from_hparams(
                             source="speechbrain/spkrec-ecapa-voxceleb",
                             savedir="/tmp/ecapa_model",

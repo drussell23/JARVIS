@@ -321,18 +321,31 @@ class DistributedLockManager:
                 lock_name=lock_name
             )
 
-            # Write lock file atomically
+            # Write lock file atomically (with fsync for durability)
             await self._write_lock_metadata(lock_file, metadata)
 
-            # Verify we actually got the lock (another process might have written simultaneously)
-            await asyncio.sleep(0.01)  # Small delay for filesystem consistency
-            verify_lock = await self._read_lock_metadata(lock_file)
+            # v93.0: Verify we actually got the lock with exponential backoff
+            # This handles slow filesystems (NFS, cloud storage) that may have delays
+            verification_delays = [0.005, 0.01, 0.02, 0.05]  # Exponential backoff
+            for delay in verification_delays:
+                await asyncio.sleep(delay)
+                verify_lock = await self._read_lock_metadata(lock_file)
 
-            if verify_lock and verify_lock.token == token:
-                return True
-            else:
-                logger.debug(f"Lock race condition detected: {lock_name} (lost to another process)")
-                return False
+                if verify_lock is None:
+                    # Lock file disappeared - race condition, we lost
+                    logger.debug(f"Lock file disappeared during verification: {lock_name}")
+                    return False
+
+                if verify_lock.token == token:
+                    # We successfully own the lock
+                    return True
+
+                # Someone else's token - continue checking in case of read timing issue
+                continue
+
+            # After all retries, still not our token - we lost the race
+            logger.debug(f"Lock race condition detected: {lock_name} (lost to another process)")
+            return False
 
         except Exception as e:
             logger.error(f"Error acquiring lock {lock_name}: {e}")
@@ -383,9 +396,11 @@ class DistributedLockManager:
 
     async def _write_lock_metadata(self, lock_file: Path, metadata: LockMetadata) -> None:
         """
-        Write lock metadata to file atomically.
+        Write lock metadata to file atomically with fsync guarantee.
 
         v1.1: Ensures parent directory exists before writing.
+        v93.0: Added fsync to ensure filesystem consistency before verification.
+               This prevents race conditions on slow filesystems (NFS, cloud storage).
         """
         try:
             # Ensure directory exists (resilient to race conditions)
@@ -395,13 +410,27 @@ class DistributedLockManager:
             except FileExistsError:
                 pass  # Another process created it - that's fine
 
-            # Write to temp file first
+            # Write to temp file first with explicit flush
             temp_file = lock_file.with_suffix('.lock.tmp')
             async with aiofiles.open(temp_file, 'w') as f:
                 await f.write(json.dumps(asdict(metadata), indent=2))
+                await f.flush()
+                # v93.0: Force write to disk before rename
+                os.fsync(f.fileno())
 
             # Atomic rename
             await aiofiles.os.rename(temp_file, lock_file)
+
+            # v93.0: Sync directory to ensure rename is durable
+            try:
+                dir_fd = os.open(str(lock_dir), os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except (OSError, AttributeError):
+                # O_DIRECTORY not supported on some platforms - fall back to brief sleep
+                await asyncio.sleep(0.001)
 
         except Exception as e:
             logger.error(f"Error writing lock metadata {lock_file}: {e}")
@@ -442,23 +471,54 @@ class DistributedLockManager:
 
         Returns:
             True if process is alive, False if dead or unable to determine
+
+        v93.0 FIX: Previously returned True on any unexpected exception,
+        which caused stale locks to persist forever. Now uses more
+        conservative logic that assumes dead unless proven alive.
         """
         try:
             # Extract PID from owner_id (format: "jarvis-{pid}")
             if "-" not in owner_id:
+                logger.debug(f"Cannot extract PID from owner_id: {owner_id}")
                 return True  # Can't validate, assume alive
 
             pid_str = owner_id.split("-")[-1]
-            pid = int(pid_str)
+            try:
+                pid = int(pid_str)
+            except ValueError:
+                logger.debug(f"Invalid PID in owner_id: {owner_id}")
+                return False  # Invalid PID format = dead process
 
-            # Check if process exists
+            if pid <= 0:
+                logger.debug(f"Invalid PID value: {pid}")
+                return False  # Invalid PID = dead process
+
+            # Check if process exists using signal 0
             os.kill(pid, 0)
-            return True
+            return True  # Process exists
 
-        except (ValueError, ProcessLookupError, PermissionError):
+        except ProcessLookupError:
+            # Process doesn't exist - ESRCH
             return False
-        except Exception:
-            return True  # On error, assume alive to be safe
+        except PermissionError:
+            # Process exists but we can't signal it (different user)
+            # This is actually a valid live process
+            return True
+        except OSError as e:
+            import errno
+            if e.errno == errno.ESRCH:  # No such process
+                return False
+            elif e.errno == errno.EPERM:  # Permission denied (process exists)
+                return True
+            else:
+                # Other OSError - log and assume dead (conservative approach)
+                logger.debug(f"OSError checking PID from {owner_id}: {e}")
+                return False
+        except Exception as e:
+            # v93.0: Log unexpected errors instead of silently assuming alive
+            logger.warning(f"Unexpected error checking process {owner_id}: {e}")
+            # Conservative approach: assume dead to prevent stale lock accumulation
+            return False
 
     async def _aggressive_stale_cleanup(self) -> int:
         """

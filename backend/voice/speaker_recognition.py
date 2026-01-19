@@ -129,7 +129,12 @@ class SpeakerRecognitionEngine:
 
         def _load_speechbrain_model():
             """Synchronous SpeechBrain model loader (runs in thread)."""
-            from speechbrain.pretrained import EncoderClassifier
+            # v93.0: Updated to use speechbrain.inference (pretrained deprecated in SpeechBrain 1.0)
+            try:
+                from speechbrain.inference import EncoderClassifier
+            except ImportError:
+                # Fallback for older SpeechBrain versions
+                from speechbrain.pretrained import EncoderClassifier
             import torch
 
             # Limit torch threads to prevent CPU overload
