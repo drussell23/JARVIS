@@ -341,13 +341,35 @@ class GCPHybridPrimeRouter:
             f"resilience: {self._use_resilience})"
         )
 
-        # v2.0: Start memory pressure monitoring
+        # v92.0: Pre-flight check for GCP configuration BEFORE starting monitor
+        # This prevents the first memory pressure event from triggering if GCP is disabled
         if self._vm_provisioning_enabled:
-            self._memory_pressure_task = asyncio.create_task(
-                self._memory_pressure_monitor(),
-                name="gcp_memory_pressure_monitor",
-            )
-            self.logger.info("GCPHybridPrimeRouter: Memory pressure monitoring active")
+            # Check if GCP is actually configured and enabled
+            gcp_enabled = os.getenv("GCP_ENABLED", "false").lower() == "true"
+            gcp_project = os.getenv("GCP_PROJECT_ID", os.getenv("GOOGLE_CLOUD_PROJECT", ""))
+
+            if not gcp_enabled:
+                self.logger.info(
+                    "GCPHybridPrimeRouter: GCP_ENABLED=false, memory pressure monitoring disabled. "
+                    "Set GCP_ENABLED=true to enable VM provisioning."
+                )
+                self._gcp_permanently_unavailable = True
+            elif not gcp_project:
+                self.logger.info(
+                    "GCPHybridPrimeRouter: GCP_PROJECT_ID not set, memory pressure monitoring disabled. "
+                    "Set GCP_PROJECT_ID to enable VM provisioning."
+                )
+                self._gcp_permanently_unavailable = True
+            else:
+                # GCP is properly configured - start monitoring
+                self._memory_pressure_task = asyncio.create_task(
+                    self._memory_pressure_monitor(),
+                    name="gcp_memory_pressure_monitor",
+                )
+                self.logger.info(
+                    f"GCPHybridPrimeRouter: Memory pressure monitoring active "
+                    f"(project: {gcp_project[:10]}..., threshold: {VM_PROVISIONING_THRESHOLD}%)"
+                )
 
         return True
 

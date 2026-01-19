@@ -16398,8 +16398,17 @@ def get_intelligent_file_selector() -> IntelligentFileSelector:
     return _file_selector
 
 
-def get_goal_decomposer(llm_client: Optional[Any] = None) -> GoalDecomposer:
-    """Get or create the goal decomposer."""
+def get_goal_decomposer(
+    llm_client: Optional[Any] = None,
+    oracle: Optional[Any] = None,  # v92.0: Accept oracle for backwards compatibility
+) -> GoalDecomposer:
+    """
+    Get or create the goal decomposer.
+
+    v92.0: Added oracle parameter for backwards compatibility with callers
+    that pass oracle=... kwarg. The oracle is not used by GoalDecomposer
+    but accepting it prevents TypeError when called with that argument.
+    """
     global _goal_decomposer
     if _goal_decomposer is None:
         _goal_decomposer = GoalDecomposer(llm_client)
