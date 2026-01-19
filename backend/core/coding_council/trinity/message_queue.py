@@ -244,12 +244,54 @@ class PersistentMessageQueue:
                 logger.error(f"[MessageQueue] Enqueue failed: {e}")
                 return False
 
-    async def dequeue(self, channel: Optional[str] = None) -> Optional[QueueMessage]:
+    async def dequeue(
+        self,
+        channel: Optional[str] = None,
+        timeout: Optional[float] = None,
+    ) -> Optional[QueueMessage]:
         """
-        Get next message from queue.
+        v93.0: Get next message from queue with optional timeout.
 
-        Returns highest priority pending message.
+        Returns highest priority pending message. If timeout is specified,
+        will poll for a message until timeout expires.
+
+        Args:
+            channel: Optional channel to filter messages
+            timeout: Optional timeout in seconds to wait for a message.
+                    If None, returns immediately (non-blocking).
+                    If specified, polls with exponential backoff until timeout.
+
+        Returns:
+            QueueMessage if found, None if no message available
         """
+        start_time = time.time()
+        poll_interval = 0.1  # Start with 100ms
+        max_poll_interval = 1.0  # Cap at 1 second
+
+        while True:
+            message = await self._dequeue_once(channel)
+            if message is not None:
+                return message
+
+            # If no timeout specified, return immediately
+            if timeout is None:
+                return None
+
+            # Check if timeout expired
+            elapsed = time.time() - start_time
+            if elapsed >= timeout:
+                return None
+
+            # Wait before polling again (with exponential backoff)
+            remaining = timeout - elapsed
+            wait_time = min(poll_interval, remaining, max_poll_interval)
+            await asyncio.sleep(wait_time)
+
+            # Exponential backoff (capped)
+            poll_interval = min(poll_interval * 1.5, max_poll_interval)
+
+    async def _dequeue_once(self, channel: Optional[str] = None) -> Optional[QueueMessage]:
+        """v93.0: Internal single dequeue attempt."""
         async with self._lock:
             try:
                 with self._get_conn() as conn:
