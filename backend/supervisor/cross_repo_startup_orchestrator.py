@@ -173,8 +173,18 @@ class OrchestratorConfig:
     health_check_timeout: float = field(
         default_factory=lambda: float(os.getenv("HEALTH_CHECK_TIMEOUT", "5.0"))
     )
+    # v93.0: Default startup timeout (applies to lightweight services)
     startup_timeout: float = field(
         default_factory=lambda: float(os.getenv("SERVICE_STARTUP_TIMEOUT", "60.0"))
+    )
+
+    # v93.0: Per-service startup timeouts for services with different initialization times
+    # JARVIS Prime loads heavy ML models (ECAPA-TDNN, etc.) and needs longer timeout
+    jarvis_prime_startup_timeout: float = field(
+        default_factory=lambda: float(os.getenv("JARVIS_PRIME_STARTUP_TIMEOUT", "180.0"))  # 3 minutes for ML models
+    )
+    reactor_core_startup_timeout: float = field(
+        default_factory=lambda: float(os.getenv("REACTOR_CORE_STARTUP_TIMEOUT", "90.0"))  # 1.5 minutes
     )
 
     # Graceful shutdown
@@ -495,6 +505,7 @@ class ProcessOrchestrator:
         if self.config.jarvis_prime_enabled:
             # jarvis-prime uses run_server.py as main entry point
             # Port is passed via --port CLI arg (not env var)
+            # v93.0: Uses extended timeout for ML model loading
             definitions.append(ServiceDefinition(
                 name="jarvis-prime",
                 repo_path=self.config.jarvis_prime_path,
@@ -502,7 +513,8 @@ class ProcessOrchestrator:
                 fallback_scripts=["main.py", "server.py", "app.py"],
                 default_port=self.config.jarvis_prime_default_port,
                 health_endpoint="/health",
-                startup_timeout=self.config.startup_timeout,
+                # v93.0: Use jarvis_prime_startup_timeout (180s) for ML model loading
+                startup_timeout=self.config.jarvis_prime_startup_timeout,
                 # Pass port via command-line (run_server.py uses argparse)
                 script_args=[
                     "--port", str(self.config.jarvis_prime_default_port),
@@ -516,6 +528,7 @@ class ProcessOrchestrator:
         if self.config.reactor_core_enabled:
             # reactor-core uses run_reactor.py as main entry point
             # Port is passed via --port CLI arg
+            # v93.0: Uses reactor_core_startup_timeout (90s)
             definitions.append(ServiceDefinition(
                 name="reactor-core",
                 repo_path=self.config.reactor_core_path,
@@ -523,7 +536,8 @@ class ProcessOrchestrator:
                 fallback_scripts=["run_supervisor.py", "main.py", "server.py"],
                 default_port=self.config.reactor_core_default_port,
                 health_endpoint="/health",
-                startup_timeout=self.config.startup_timeout,
+                # v93.0: Use reactor_core_startup_timeout
+                startup_timeout=self.config.reactor_core_startup_timeout,
                 # Don't use uvicorn - run_reactor.py handles its own server
                 use_uvicorn=False,
                 uvicorn_app=None,
@@ -1117,16 +1131,29 @@ class ProcessOrchestrator:
         - Progressive backoff (1s → 2s → 3s)
         - Detailed progress logging
         - Process exit code capture on failure
+
+        v93.0: Enhanced for long-running ML model loading:
+        - Better progress indicators for long timeouts
+        - Periodic milestone logging (every 30s)
+        - Adaptive check intervals for long waits
         """
         start_time = time.time()
         check_interval = 1.0
         check_count = 0
         max_quiet_checks = 5  # Only log periodically after first few
+        last_milestone_log = start_time
+
+        # v93.0: Detect if this is a long-timeout service (likely loading ML models)
+        is_ml_heavy = timeout > 90.0
+        milestone_interval = 30.0 if is_ml_heavy else 15.0
 
         logger.info(f"    ⏳ Waiting for {managed.definition.name} to become healthy (timeout: {timeout}s)...")
+        if is_ml_heavy:
+            logger.info(f"    ℹ️  {managed.definition.name} has extended timeout for ML model loading")
 
         while (time.time() - start_time) < timeout:
             check_count += 1
+            elapsed = time.time() - start_time
 
             # Check if process died
             if not managed.is_running:
@@ -1139,24 +1166,40 @@ class ProcessOrchestrator:
 
             # Check health endpoint
             if await self._check_health(managed):
-                elapsed = time.time() - start_time
                 logger.info(
                     f"    ✅ {managed.definition.name} healthy after {elapsed:.1f}s "
                     f"({check_count} health checks)"
                 )
                 return True
 
+            # v93.0: Milestone logging for long waits (every 30s)
+            if (time.time() - last_milestone_log) >= milestone_interval:
+                remaining = timeout - elapsed
+                logger.info(
+                    f"    ⏳ {managed.definition.name}: still starting... "
+                    f"({elapsed:.0f}s elapsed, {remaining:.0f}s remaining, {check_count} checks)"
+                )
+                last_milestone_log = time.time()
+
             # Progressive logging: frequent at start, sparse later
-            if check_count <= max_quiet_checks or check_count % 10 == 0:
-                elapsed = time.time() - start_time
+            elif check_count <= max_quiet_checks or check_count % 10 == 0:
                 logger.debug(
                     f"    ⏳ {managed.definition.name}: health check {check_count} "
                     f"(elapsed: {elapsed:.1f}s)"
                 )
 
-            # Progressive backoff: 1s, 1.5s, 2s, 2.5s, 3s (max)
-            await asyncio.sleep(min(check_interval, 3.0))
-            check_interval = min(check_interval + 0.5, 3.0)
+            # v93.0: Adaptive check intervals - slower for long waits
+            if elapsed > 60:
+                # After 1 minute, slow down checks to every 5s
+                check_interval = 5.0
+            elif elapsed > 30:
+                # After 30s, check every 3s
+                check_interval = 3.0
+            else:
+                # Progressive backoff: 1s, 1.5s, 2s, 2.5s, 3s (max)
+                check_interval = min(check_interval + 0.5, 3.0)
+
+            await asyncio.sleep(check_interval)
 
         elapsed = time.time() - start_time
         logger.warning(

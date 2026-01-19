@@ -1008,18 +1008,51 @@ async def create_voice_unlock_adapter(
         Configured VoiceSystemAdapter
     """
     if integration is None:
+        # v93.0: Try multiple import paths with better error handling
+        VoiceUnlockIntegration = None
+        import_errors = []
+
+        # Try absolute import first (most reliable)
         try:
-            # Try the correct path first (backend/voice/voice_unlock_integration.py)
-            from ...voice.voice_unlock_integration import VoiceUnlockIntegration
-            integration = VoiceUnlockIntegration()
-        except ImportError:
+            from backend.voice.voice_unlock_integration import VoiceUnlockIntegration as VUI
+            VoiceUnlockIntegration = VUI
+        except ImportError as e:
+            import_errors.append(f"backend.voice.voice_unlock_integration: {e}")
+
+        # Try relative import from voice directory
+        if VoiceUnlockIntegration is None:
             try:
-                # Fallback to alternative path
-                from ...voice_unlock.voice_unlock_integration import VoiceUnlockIntegration
-                integration = VoiceUnlockIntegration()
-            except ImportError:
-                logger.warning("Could not import VoiceUnlockIntegration from any path")
-                raise
+                from ...voice.voice_unlock_integration import VoiceUnlockIntegration as VUI
+                VoiceUnlockIntegration = VUI
+            except ImportError as e:
+                import_errors.append(f"...voice.voice_unlock_integration: {e}")
+
+        # Try relative import from voice_unlock directory
+        if VoiceUnlockIntegration is None:
+            try:
+                from ...voice_unlock.voice_unlock_integration import VoiceUnlockIntegration as VUI
+                VoiceUnlockIntegration = VUI
+            except ImportError as e:
+                import_errors.append(f"...voice_unlock.voice_unlock_integration: {e}")
+
+        # Try direct module import as last resort
+        if VoiceUnlockIntegration is None:
+            try:
+                import importlib
+                mod = importlib.import_module("voice.voice_unlock_integration")
+                VoiceUnlockIntegration = mod.VoiceUnlockIntegration
+            except (ImportError, AttributeError) as e:
+                import_errors.append(f"voice.voice_unlock_integration (direct): {e}")
+
+        if VoiceUnlockIntegration is None:
+            logger.warning(
+                f"Could not import VoiceUnlockIntegration from any path. "
+                f"Errors: {'; '.join(import_errors)}. "
+                f"Voice unlock adapter will not be available."
+            )
+            raise ImportError("VoiceUnlockIntegration not found in any import path")
+
+        integration = VoiceUnlockIntegration()
 
     return VoiceSystemAdapter(
         voice_component=integration,
