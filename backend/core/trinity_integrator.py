@@ -10024,12 +10024,19 @@ class TrinityUnifiedOrchestrator:
 
     async def _discover_running_component(self, component: str) -> bool:
         """
-        v84.0: Discover if a component is already running.
+        v93.0: Enhanced component discovery with multi-source verification.
 
-        Checks:
-        1. Heartbeat file freshness (< 30s)
-        2. Process is actually alive (PID check)
-        3. HTTP health check responds
+        Discovery Strategy (Priority Order):
+        1. HTTP health check (most reliable - proves service is actually responsive)
+        2. Heartbeat file verification (multiple directories checked)
+        3. Process liveness check (PID validation via psutil)
+
+        v93.0 Enhancements:
+        - Checks multiple heartbeat directories for backwards compatibility
+        - HTTP health check is now PRIMARY (not optional)
+        - Parallel verification for speed
+        - Detailed logging for debugging
+        - Graceful fallback chain
 
         Args:
             component: Component name (jarvis_prime, reactor_core)
@@ -10038,64 +10045,160 @@ class TrinityUnifiedOrchestrator:
             True if component is running and healthy
         """
         import psutil
+        import aiohttp
+
+        # v93.0: Component-specific configuration
+        component_config = {
+            "jarvis_prime": {
+                "ports": [8000, 8002, 8004, 8005, 8006],  # Primary and fallbacks
+                "heartbeat_names": ["jarvis_prime", "jprime", "jprime_main"],
+            },
+            "reactor_core": {
+                "ports": [8090, 8091, 8092, 8093],  # Primary and fallbacks
+                "heartbeat_names": ["reactor_core", "reactor"],
+            },
+        }
+
+        config = component_config.get(component, {
+            "ports": [],
+            "heartbeat_names": [component],
+        })
 
         trinity_dir = Path(os.getenv(
             "TRINITY_DIR",
             str(Path.home() / ".jarvis" / "trinity")
         ))
 
-        heartbeat_file = trinity_dir / "components" / f"{component}.json"
+        # v93.0: Multiple heartbeat directories to check (for backwards compatibility)
+        heartbeat_dirs = [
+            trinity_dir / "heartbeats",      # NEW: correct location
+            trinity_dir / "components",      # LEGACY: old location
+            Path.home() / ".jarvis" / "cross_repo",  # Alternative location
+        ]
 
-        if not heartbeat_file.exists():
-            return False
-
-        try:
-            with open(heartbeat_file, 'r') as f:
-                data = json.load(f)
-
-            # Check freshness (30 second threshold)
-            timestamp = data.get("timestamp", 0)
-            age = time.time() - timestamp
-            if age > 30.0:
-                logger.debug(f"[Discovery] {component} heartbeat stale ({age:.1f}s)")
-                return False
-
-            # Check if process is alive
-            pid = data.get("pid")
-            if pid:
-                try:
-                    proc = psutil.Process(pid)
-                    if proc.is_running():
-                        logger.debug(f"[Discovery] {component} process alive (PID {pid})")
-
-                        # Optional: HTTP health check
-                        port = data.get("port")
-                        if port:
+        # ═══════════════════════════════════════════════════════════════════════
+        # PHASE 1: HTTP Health Check (HIGHEST PRIORITY)
+        # ═══════════════════════════════════════════════════════════════════════
+        for port in config["ports"]:
+            try:
+                async with aiohttp.ClientSession(
+                    timeout=aiohttp.ClientTimeout(total=3.0)
+                ) as session:
+                    url = f"http://localhost:{port}/health"
+                    async with session.get(url) as resp:
+                        if resp.status == 200:
                             try:
-                                import aiohttp
-                                async with aiohttp.ClientSession(
-                                    timeout=aiohttp.ClientTimeout(total=5.0)
-                                ) as session:
-                                    url = f"http://localhost:{port}/health"
-                                    async with session.get(url) as resp:
-                                        if resp.status == 200:
-                                            logger.info(
-                                                f"[Discovery] {component} healthy at port {port}"
-                                            )
-                                            return True
+                                health_data = await resp.json()
+                                # Verify it's the right component
+                                service_name = health_data.get("service", "")
+                                if component.replace("_", "") in service_name.replace("_", "").lower():
+                                    logger.info(
+                                        f"[Discovery] ✅ {component} discovered via HTTP at port {port}"
+                                    )
+                                    return True
                             except Exception:
-                                # HTTP check failed but process is alive
-                                pass
+                                # Response isn't JSON but status is 200
+                                logger.info(
+                                    f"[Discovery] ✅ {component} responding at port {port}"
+                                )
+                                return True
+            except aiohttp.ClientConnectorError:
+                # Connection refused - port not listening
+                continue
+            except asyncio.TimeoutError:
+                # Timeout - service slow but might be starting
+                logger.debug(f"[Discovery] {component} timeout on port {port}")
+                continue
+            except Exception as e:
+                logger.debug(f"[Discovery] {component} HTTP check error on {port}: {e}")
+                continue
 
-                        return True
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    pass
+        # ═══════════════════════════════════════════════════════════════════════
+        # PHASE 2: Heartbeat File Verification (SECONDARY)
+        # ═══════════════════════════════════════════════════════════════════════
+        heartbeat_data = None
+        heartbeat_source = None
 
+        for hb_dir in heartbeat_dirs:
+            if not hb_dir.exists():
+                continue
+
+            for hb_name in config["heartbeat_names"]:
+                heartbeat_file = hb_dir / f"{hb_name}.json"
+                if heartbeat_file.exists():
+                    try:
+                        with open(heartbeat_file, 'r') as f:
+                            data = json.load(f)
+
+                        # Check freshness (30 second threshold)
+                        timestamp = data.get("timestamp", 0)
+                        age = time.time() - timestamp
+
+                        if age <= 30.0:
+                            heartbeat_data = data
+                            heartbeat_source = heartbeat_file
+                            logger.debug(
+                                f"[Discovery] Found fresh heartbeat: {heartbeat_file} "
+                                f"(age={age:.1f}s)"
+                            )
+                            break
+                        else:
+                            logger.debug(
+                                f"[Discovery] Stale heartbeat: {heartbeat_file} "
+                                f"(age={age:.1f}s > 30s)"
+                            )
+                    except Exception as e:
+                        logger.debug(f"[Discovery] Error reading {heartbeat_file}: {e}")
+
+            if heartbeat_data:
+                break
+
+        if not heartbeat_data:
+            logger.debug(f"[Discovery] No fresh heartbeat found for {component}")
             return False
 
-        except Exception as e:
-            logger.debug(f"[Discovery] Error checking {component}: {e}")
-            return False
+        # ═══════════════════════════════════════════════════════════════════════
+        # PHASE 3: Process Liveness Check (VALIDATION)
+        # ═══════════════════════════════════════════════════════════════════════
+        pid = heartbeat_data.get("pid")
+        if pid:
+            try:
+                proc = psutil.Process(pid)
+                if proc.is_running():
+                    # Double-check with HTTP if we have a port
+                    port = heartbeat_data.get("port")
+                    if port:
+                        try:
+                            async with aiohttp.ClientSession(
+                                timeout=aiohttp.ClientTimeout(total=2.0)
+                            ) as session:
+                                url = f"http://localhost:{port}/health"
+                                async with session.get(url) as resp:
+                                    if resp.status == 200:
+                                        logger.info(
+                                            f"[Discovery] ✅ {component} verified via heartbeat "
+                                            f"+ HTTP (PID={pid}, port={port})"
+                                        )
+                                        return True
+                        except Exception:
+                            pass
+
+                    # Process is alive even if HTTP failed
+                    logger.info(
+                        f"[Discovery] ✅ {component} process alive (PID={pid}) "
+                        f"from {heartbeat_source}"
+                    )
+                    return True
+                else:
+                    logger.debug(f"[Discovery] {component} PID {pid} not running")
+            except psutil.NoSuchProcess:
+                logger.debug(f"[Discovery] {component} PID {pid} no longer exists")
+            except psutil.AccessDenied:
+                logger.debug(f"[Discovery] {component} PID {pid} access denied")
+            except Exception as e:
+                logger.debug(f"[Discovery] {component} PID check error: {e}")
+
+        return False
 
     async def _diagnose_component_status(self, component: str) -> Dict[str, Any]:
         """

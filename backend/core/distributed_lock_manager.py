@@ -127,7 +127,7 @@ class LockMetadata:
 
 class DistributedLockManager:
     """
-    Production-grade distributed lock manager for cross-repo coordination.
+    v93.0: Production-grade distributed lock manager for cross-repo coordination.
 
     Features:
     - Automatic lock expiration (TTL-based)
@@ -135,6 +135,9 @@ class DistributedLockManager:
     - Deadlock prevention
     - Lock renewal support
     - Process-safe across multiple repos
+    - v93.0: Aggressive pre-cleanup on initialization
+    - v93.0: PID validation for stale lock detection
+    - v93.0: Faster acquisition with optimistic locking
     """
 
     def __init__(self, config: Optional[LockConfig] = None):
@@ -142,23 +145,46 @@ class DistributedLockManager:
         self.config = config or LockConfig()
         self._cleanup_task: Optional[asyncio.Task] = None
         self._owner_id = f"jarvis-{os.getpid()}"
+        self._initialized = False
+        self._init_lock = asyncio.Lock()
 
-        logger.info(f"Distributed Lock Manager v1.0 initialized (owner: {self._owner_id})")
+        logger.info(f"Distributed Lock Manager v93.0 initialized (owner: {self._owner_id})")
 
     async def initialize(self) -> None:
-        """Initialize lock manager and start background tasks."""
-        # Create lock directory
-        try:
-            await aiofiles.os.makedirs(self.config.lock_dir, exist_ok=True)
-            logger.info(f"Lock directory initialized: {self.config.lock_dir}")
-        except Exception as e:
-            logger.error(f"Failed to create lock directory: {e}")
-            raise
+        """
+        v93.0: Initialize lock manager with aggressive pre-cleanup.
 
-        # Start cleanup task
-        if self.config.cleanup_enabled:
-            self._cleanup_task = asyncio.create_task(self._cleanup_loop())
-            logger.info("Stale lock cleanup task started")
+        This method ensures any stale locks from crashed processes are
+        cleaned up BEFORE we start operations, preventing the common
+        "Lock acquisition timeout" issue.
+        """
+        async with self._init_lock:
+            if self._initialized:
+                return
+
+            # Create lock directory
+            try:
+                await aiofiles.os.makedirs(self.config.lock_dir, exist_ok=True)
+                logger.info(f"Lock directory initialized: {self.config.lock_dir}")
+            except Exception as e:
+                logger.error(f"Failed to create lock directory: {e}")
+                raise
+
+            # v93.0: CRITICAL - Aggressive pre-cleanup of stale locks
+            # This runs SYNCHRONOUSLY before anything else to ensure clean state
+            cleaned = await self._aggressive_stale_cleanup()
+            if cleaned > 0:
+                logger.info(f"[v93.0] Pre-cleaned {cleaned} stale lock(s) at startup")
+
+            # Start cleanup task
+            if self.config.cleanup_enabled:
+                self._cleanup_task = asyncio.create_task(
+                    self._cleanup_loop(),
+                    name="lock_cleanup_loop"
+                )
+                logger.info("Stale lock cleanup task started")
+
+            self._initialized = True
 
     async def shutdown(self) -> None:
         """Shutdown lock manager and cleanup resources."""
@@ -242,7 +268,12 @@ class DistributedLockManager:
         ttl: float
     ) -> bool:
         """
-        Try to acquire lock atomically.
+        v93.0: Try to acquire lock atomically with dead process detection.
+
+        Enhancements:
+        - Immediately removes locks from expired TTL
+        - Immediately removes locks from dead processes (no waiting!)
+        - Optimistic locking with verification
 
         Returns:
             True if lock acquired, False otherwise
@@ -254,16 +285,26 @@ class DistributedLockManager:
                 existing_lock = await self._read_lock_metadata(lock_file)
 
                 if existing_lock:
-                    # Check if lock is expired
+                    should_remove = False
+                    remove_reason = ""
+
+                    # Check 1: Lock is expired
                     if existing_lock.is_expired():
+                        should_remove = True
+                        remove_reason = f"expired {-existing_lock.time_remaining():.1f}s ago"
+
+                    # v93.0: Check 2: Owner process is dead - DON'T WAIT!
+                    elif not self._is_process_alive(existing_lock.owner):
+                        should_remove = True
+                        remove_reason = f"owner process {existing_lock.owner} is dead"
+
+                    if should_remove:
                         logger.info(
-                            f"Found expired lock: {lock_name} "
-                            f"(owner: {existing_lock.owner}, expired {-existing_lock.time_remaining():.1f}s ago)"
+                            f"[v93.0] Removing lock: {lock_name} ({remove_reason})"
                         )
-                        # Remove expired lock
                         await self._remove_lock_file(lock_file)
                     else:
-                        # Lock is still valid
+                        # Lock is still valid AND owner is alive
                         logger.debug(
                             f"Lock held by another process: {lock_name} "
                             f"(owner: {existing_lock.owner}, expires in {existing_lock.time_remaining():.1f}s)"
@@ -387,8 +428,106 @@ class DistributedLockManager:
                 logger.error(f"Error removing lock file {lock_file}: {e}")
 
     # =========================================================================
-    # Cleanup Tasks
+    # v93.0: Advanced Cleanup with PID Validation
     # =========================================================================
+
+    def _is_process_alive(self, owner_id: str) -> bool:
+        """
+        v93.0: Check if the process that owns a lock is still alive.
+
+        Extracts PID from owner ID (format: "jarvis-{pid}") and validates.
+
+        Args:
+            owner_id: Lock owner identifier
+
+        Returns:
+            True if process is alive, False if dead or unable to determine
+        """
+        try:
+            # Extract PID from owner_id (format: "jarvis-{pid}")
+            if "-" not in owner_id:
+                return True  # Can't validate, assume alive
+
+            pid_str = owner_id.split("-")[-1]
+            pid = int(pid_str)
+
+            # Check if process exists
+            os.kill(pid, 0)
+            return True
+
+        except (ValueError, ProcessLookupError, PermissionError):
+            return False
+        except Exception:
+            return True  # On error, assume alive to be safe
+
+    async def _aggressive_stale_cleanup(self) -> int:
+        """
+        v93.0: Aggressive cleanup of stale locks at startup.
+
+        This is more aggressive than the normal cleanup:
+        1. Cleans ALL expired locks (not just stale ones)
+        2. Validates PIDs for locks that aren't expired yet
+        3. Removes locks from dead processes immediately
+
+        This prevents the "Lock acquisition timeout" issue when starting
+        after a crash.
+
+        Returns:
+            Number of locks cleaned
+        """
+        cleaned_count = 0
+
+        try:
+            if not await aiofiles.os.path.exists(self.config.lock_dir):
+                return 0
+
+            lock_files = [
+                f for f in await aiofiles.os.listdir(self.config.lock_dir)
+                if f.endswith('.lock')
+            ]
+
+            for lock_file_name in lock_files:
+                lock_file = self.config.lock_dir / lock_file_name
+                metadata = await self._read_lock_metadata(lock_file)
+
+                if not metadata:
+                    # Corrupted lock file - remove it
+                    await self._remove_lock_file(lock_file)
+                    cleaned_count += 1
+                    continue
+
+                should_clean = False
+                reason = ""
+
+                # Check 1: Lock is expired
+                if metadata.is_expired():
+                    should_clean = True
+                    reason = f"expired {-metadata.time_remaining():.1f}s ago"
+
+                # Check 2: Owner process is dead (even if not expired yet)
+                elif not self._is_process_alive(metadata.owner):
+                    should_clean = True
+                    reason = f"owner process dead (was {metadata.owner})"
+
+                # Check 3: Lock is our own from a previous run (same PID reused)
+                elif metadata.owner == self._owner_id:
+                    # Same PID as us - this is a stale lock from a previous run
+                    # that got the same PID (process recycling)
+                    if metadata.acquired_at < time.time() - 60:  # More than 1 min old
+                        should_clean = True
+                        reason = "own stale lock from previous run"
+
+                if should_clean:
+                    logger.info(
+                        f"[v93.0] Cleaning lock: {metadata.lock_name} ({reason})"
+                    )
+                    await self._remove_lock_file(lock_file)
+                    cleaned_count += 1
+
+        except Exception as e:
+            logger.error(f"[v93.0] Error in aggressive cleanup: {e}")
+
+        return cleaned_count
 
     async def _cleanup_loop(self) -> None:
         """Background task to clean up stale locks."""
@@ -405,7 +544,13 @@ class DistributedLockManager:
                 logger.error(f"Error in cleanup loop: {e}", exc_info=True)
 
     async def _cleanup_stale_locks(self) -> None:
-        """Clean up expired and stale locks."""
+        """
+        v93.0: Enhanced cleanup with PID validation.
+
+        Cleans locks that are:
+        1. Past their TTL (expired/stale)
+        2. Owned by dead processes (PID validation)
+        """
         try:
             if not await aiofiles.os.path.exists(self.config.lock_dir):
                 return
@@ -421,16 +566,33 @@ class DistributedLockManager:
                 lock_file = self.config.lock_dir / lock_file_name
                 metadata = await self._read_lock_metadata(lock_file)
 
-                if metadata and metadata.is_stale():
+                if not metadata:
+                    continue
+
+                should_clean = False
+
+                # Check TTL expiration
+                if metadata.is_stale():
                     logger.warning(
                         f"Cleaning stale lock: {metadata.lock_name} "
                         f"(owner: {metadata.owner}, expired {-metadata.time_remaining():.1f}s ago)"
                     )
+                    should_clean = True
+
+                # v93.0: Also check if owner process is dead
+                elif not self._is_process_alive(metadata.owner):
+                    logger.warning(
+                        f"Cleaning orphaned lock: {metadata.lock_name} "
+                        f"(owner process {metadata.owner} is dead)"
+                    )
+                    should_clean = True
+
+                if should_clean:
                     await self._remove_lock_file(lock_file)
                     cleaned_count += 1
 
             if cleaned_count > 0:
-                logger.info(f"Cleaned up {cleaned_count} stale lock(s)")
+                logger.info(f"Cleaned up {cleaned_count} stale/orphaned lock(s)")
 
         except Exception as e:
             logger.error(f"Error during stale lock cleanup: {e}", exc_info=True)
