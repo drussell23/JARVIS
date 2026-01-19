@@ -46,7 +46,7 @@ objgraph==3.6.1
 pympler==1.0.1
 
 # LangChain and Tools
-langchain==0.0.350
+langchain==1.2.6
 langchain-community==0.0.10
 langchain-experimental==0.0.47
 duckduckgo-search==4.1.1
