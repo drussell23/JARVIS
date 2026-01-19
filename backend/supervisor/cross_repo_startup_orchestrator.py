@@ -181,7 +181,7 @@ class OrchestratorConfig:
     # v93.0: Per-service startup timeouts for services with different initialization times
     # JARVIS Prime loads heavy ML models (ECAPA-TDNN, etc.) and needs longer timeout
     jarvis_prime_startup_timeout: float = field(
-        default_factory=lambda: float(os.getenv("JARVIS_PRIME_STARTUP_TIMEOUT", "180.0"))  # 3 minutes for ML models
+        default_factory=lambda: float(os.getenv("JARVIS_PRIME_STARTUP_TIMEOUT", "300.0"))  # 5 minutes for ML models (70B models can take 200+ seconds)
     )
     reactor_core_startup_timeout: float = field(
         default_factory=lambda: float(os.getenv("REACTOR_CORE_STARTUP_TIMEOUT", "90.0"))  # 1.5 minutes
@@ -717,8 +717,23 @@ class ProcessOrchestrator:
     # Health Monitoring
     # =========================================================================
 
-    async def _check_health(self, managed: ManagedProcess) -> bool:
-        """Check health of a service via HTTP endpoint."""
+    async def _check_health(
+        self,
+        managed: ManagedProcess,
+        require_ready: bool = True,
+    ) -> bool:
+        """
+        Check health of a service via HTTP endpoint.
+
+        v93.0: Enhanced to support startup-aware health checking.
+
+        Args:
+            managed: The managed process to check
+            require_ready: If True, require "healthy" status. If False, accept "starting" too.
+
+        Returns:
+            True if service is responding appropriately
+        """
         if managed.port is None:
             return False
 
@@ -730,9 +745,51 @@ class ProcessOrchestrator:
                     url,
                     timeout=aiohttp.ClientTimeout(total=self.config.health_check_timeout)
                 ) as response:
-                    return response.status == 200
+                    if response.status != 200:
+                        return False
+
+                    # v93.0: Parse response to check status field
+                    try:
+                        data = await response.json()
+                        status = data.get("status", "unknown")
+
+                        if status == "healthy":
+                            return True
+                        elif status == "starting":
+                            # Server is up but model still loading
+                            if not require_ready:
+                                return True
+                            # Log progress if available
+                            elapsed = data.get("model_load_elapsed_seconds")
+                            if elapsed:
+                                logger.debug(
+                                    f"    ℹ️  {managed.definition.name}: status=starting, "
+                                    f"model loading for {elapsed:.0f}s"
+                                )
+                            return False
+                        elif status == "error":
+                            error = data.get("model_load_error", "unknown error")
+                            logger.warning(
+                                f"    ⚠️ {managed.definition.name}: status=error - {error}"
+                            )
+                            return False
+                        else:
+                            # Unknown status, be conservative
+                            return False
+                    except Exception:
+                        # Couldn't parse JSON, fall back to HTTP status
+                        return True
+
         except Exception:
             return False
+
+    async def _check_service_responding(self, managed: ManagedProcess) -> bool:
+        """
+        v93.0: Check if service is responding at all (including "starting" status).
+
+        This is for the initial health check - we just want to know the port is open.
+        """
+        return await self._check_health(managed, require_ready=False)
 
     async def _health_monitor_loop(self, managed: ManagedProcess) -> None:
         """
@@ -1125,35 +1182,46 @@ class ProcessOrchestrator:
         timeout: float = 60.0
     ) -> bool:
         """
-        Wait for service to become healthy with progressive logging.
+        Wait for service to become healthy with two-phase startup detection.
 
-        v4.0: Enhanced with:
-        - Progressive backoff (1s → 2s → 3s)
-        - Detailed progress logging
-        - Process exit code capture on failure
+        v93.0: Completely redesigned for ML model loading scenarios:
 
-        v93.0: Enhanced for long-running ML model loading:
-        - Better progress indicators for long timeouts
-        - Periodic milestone logging (every 30s)
-        - Adaptive check intervals for long waits
+        PHASE 1 (Quick): Wait for server to start responding (max 60s)
+        - Server starts listening on port
+        - Health endpoint returns any status (including "starting")
+        - If this times out, the service failed to start
+
+        PHASE 2 (Patient): Wait for model to load (remaining timeout)
+        - Health endpoint returns "healthy" status
+        - Server is up, just loading models in background
+        - Unlimited effective timeout as long as server responds
+
+        This prevents the scenario where:
+        - Server takes 5s to start listening
+        - Model takes 200s to load
+        - Old approach: times out at 180s even though server was healthy
+        - New approach: detects server at 5s, waits patiently for model
         """
         start_time = time.time()
         check_interval = 1.0
         check_count = 0
-        max_quiet_checks = 5  # Only log periodically after first few
         last_milestone_log = start_time
 
         # v93.0: Detect if this is a long-timeout service (likely loading ML models)
         is_ml_heavy = timeout > 90.0
         milestone_interval = 30.0 if is_ml_heavy else 15.0
 
-        logger.info(f"    ⏳ Waiting for {managed.definition.name} to become healthy (timeout: {timeout}s)...")
-        if is_ml_heavy:
-            logger.info(f"    ℹ️  {managed.definition.name} has extended timeout for ML model loading")
+        # Phase 1: Wait for server to respond (quick timeout)
+        phase1_timeout = min(60.0, timeout / 3)  # Max 60s or 1/3 of total timeout
+        server_responding = False
 
-        while (time.time() - start_time) < timeout:
+        logger.info(
+            f"    ⏳ Phase 1: Waiting for {managed.definition.name} server to start "
+            f"(timeout: {phase1_timeout:.0f}s)..."
+        )
+
+        while (time.time() - start_time) < phase1_timeout:
             check_count += 1
-            elapsed = time.time() - start_time
 
             # Check if process died
             if not managed.is_running:
@@ -1164,47 +1232,112 @@ class ProcessOrchestrator:
                 )
                 return False
 
-            # Check health endpoint
-            if await self._check_health(managed):
+            # Check if server is responding (any status including "starting")
+            if await self._check_service_responding(managed):
+                elapsed = time.time() - start_time
                 logger.info(
-                    f"    ✅ {managed.definition.name} healthy after {elapsed:.1f}s "
-                    f"({check_count} health checks)"
+                    f"    ✅ Phase 1 complete: {managed.definition.name} server responding "
+                    f"after {elapsed:.1f}s"
+                )
+                server_responding = True
+                break
+
+            # Quick checks during phase 1
+            await asyncio.sleep(check_interval)
+            check_interval = min(check_interval + 0.3, 2.0)
+
+        if not server_responding:
+            elapsed = time.time() - start_time
+            logger.warning(
+                f"    ⚠️ {managed.definition.name} server failed to start within {elapsed:.1f}s"
+            )
+            return False
+
+        # Phase 2: Wait for "healthy" status (model loading)
+        # Reset for phase 2
+        phase2_start = time.time()
+        phase2_timeout = timeout  # Full timeout for model loading
+        check_interval = 2.0  # Slower checks now that server is up
+        check_count = 0
+        last_status = "unknown"
+
+        if is_ml_heavy:
+            logger.info(
+                f"    ⏳ Phase 2: Waiting for {managed.definition.name} model to load "
+                f"(timeout: {phase2_timeout:.0f}s)..."
+            )
+            logger.info(
+                f"    ℹ️  {managed.definition.name}: Server is up, model loading in background"
+            )
+
+        while (time.time() - phase2_start) < phase2_timeout:
+            check_count += 1
+            elapsed = time.time() - start_time
+            phase2_elapsed = time.time() - phase2_start
+
+            # Check if process died
+            if not managed.is_running:
+                exit_code = managed.process.returncode if managed.process else "unknown"
+                logger.error(
+                    f"    ❌ {managed.definition.name} process died during model loading "
+                    f"(exit code: {exit_code})"
+                )
+                return False
+
+            # Check for full "healthy" status
+            if await self._check_health(managed, require_ready=True):
+                logger.info(
+                    f"    ✅ {managed.definition.name} fully healthy after {elapsed:.1f}s "
+                    f"(server: {phase2_start - start_time:.1f}s, model: {phase2_elapsed:.1f}s)"
                 )
                 return True
 
-            # v93.0: Milestone logging for long waits (every 30s)
-            if (time.time() - last_milestone_log) >= milestone_interval:
-                remaining = timeout - elapsed
-                logger.info(
-                    f"    ⏳ {managed.definition.name}: still starting... "
-                    f"({elapsed:.0f}s elapsed, {remaining:.0f}s remaining, {check_count} checks)"
-                )
-                last_milestone_log = time.time()
+            # v93.0: Get current status for progress logging
+            try:
+                url = f"http://localhost:{managed.port}{managed.definition.health_endpoint}"
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        url,
+                        timeout=aiohttp.ClientTimeout(total=self.config.health_check_timeout)
+                    ) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            current_status = data.get("status", "unknown")
+                            model_elapsed = data.get("model_load_elapsed_seconds")
 
-            # Progressive logging: frequent at start, sparse later
-            elif check_count <= max_quiet_checks or check_count % 10 == 0:
-                logger.debug(
-                    f"    ⏳ {managed.definition.name}: health check {check_count} "
-                    f"(elapsed: {elapsed:.1f}s)"
-                )
+                            if current_status != last_status:
+                                logger.info(
+                                    f"    ℹ️  {managed.definition.name}: status={current_status}"
+                                )
+                                last_status = current_status
 
-            # v93.0: Adaptive check intervals - slower for long waits
-            if elapsed > 60:
-                # After 1 minute, slow down checks to every 5s
-                check_interval = 5.0
-            elif elapsed > 30:
-                # After 30s, check every 3s
-                check_interval = 3.0
+                            # v93.0: Milestone logging for long waits
+                            if (time.time() - last_milestone_log) >= milestone_interval:
+                                remaining = phase2_timeout - phase2_elapsed
+                                model_info = f", model loading: {model_elapsed:.0f}s" if model_elapsed else ""
+                                logger.info(
+                                    f"    ⏳ {managed.definition.name}: {current_status} "
+                                    f"({phase2_elapsed:.0f}s elapsed, {remaining:.0f}s remaining{model_info})"
+                                )
+                                last_milestone_log = time.time()
+            except Exception:
+                pass  # Non-critical, just for logging
+
+            # v93.0: Adaptive check intervals for phase 2
+            if phase2_elapsed > 120:
+                check_interval = 10.0  # After 2 min, check every 10s
+            elif phase2_elapsed > 60:
+                check_interval = 5.0   # After 1 min, check every 5s
             else:
-                # Progressive backoff: 1s, 1.5s, 2s, 2.5s, 3s (max)
-                check_interval = min(check_interval + 0.5, 3.0)
+                check_interval = 3.0   # First minute, check every 3s
 
             await asyncio.sleep(check_interval)
 
+        # Timeout
         elapsed = time.time() - start_time
         logger.warning(
-            f"    ⚠️ {managed.definition.name} health check timed out after {elapsed:.1f}s "
-            f"({check_count} checks)"
+            f"    ⚠️ {managed.definition.name} model loading timed out after {elapsed:.1f}s "
+            f"({check_count} phase 2 checks)"
         )
         return False
 
