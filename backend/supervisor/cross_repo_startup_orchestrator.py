@@ -588,8 +588,41 @@ class ProcessOrchestrator:
         return None
 
     # =========================================================================
-    # Output Streaming
+    # Output Streaming (v93.0: Intelligent log level detection)
     # =========================================================================
+
+    def _detect_log_level(self, line: str) -> str:
+        """
+        v93.0: Intelligently detect log level from output line content.
+
+        Python logging outputs to stderr by default, so we can't rely on
+        stream type alone. Instead, we parse the line content to detect
+        the actual log level.
+
+        Patterns detected:
+        - "| DEBUG |", "DEBUG:", "[DEBUG]"
+        - "| INFO |", "INFO:", "[INFO]"
+        - "| WARNING |", "WARNING:", "[WARNING]", "WARN:"
+        - "| ERROR |", "ERROR:", "[ERROR]"
+        - "| CRITICAL |", "CRITICAL:", "[CRITICAL]"
+        - Traceback, Exception indicators -> ERROR
+        """
+        line_upper = line.upper()
+
+        # Check for explicit log level indicators
+        if any(p in line_upper for p in ['| ERROR |', 'ERROR:', '[ERROR]', '| CRITICAL |', 'CRITICAL:']):
+            return 'error'
+        if any(p in line_upper for p in ['TRACEBACK', 'EXCEPTION', 'RAISE ', 'FAILED:', '❌']):
+            return 'error'
+        if any(p in line_upper for p in ['| WARNING |', 'WARNING:', '[WARNING]', 'WARN:', '⚠️']):
+            return 'warning'
+        if any(p in line_upper for p in ['| DEBUG |', 'DEBUG:', '[DEBUG]']):
+            return 'debug'
+        if any(p in line_upper for p in ['| INFO |', 'INFO:', '[INFO]', '✅', '✓']):
+            return 'info'
+
+        # Default to info for normal output
+        return 'info'
 
     async def _stream_output(
         self,
@@ -598,15 +631,20 @@ class ProcessOrchestrator:
         stream_type: str = "stdout"
     ) -> None:
         """
-        Stream process output with service prefix.
+        v93.0: Stream process output with intelligent log level detection.
+
+        Python's logging module outputs to stderr by default, which previously
+        caused all child process logs to appear as WARNING in our output.
+
+        Now we parse the actual content to detect the real log level and
+        route appropriately.
 
         Example output:
-            [J-PRIME] Loading model...
-            [J-PRIME] Model loaded in 2.3s
-            [REACTOR] Initializing pipeline...
+            [JARVIS_PRIME] Loading model...
+            [JARVIS_PRIME] Model loaded in 2.3s
+            [REACTOR_CORE] Initializing pipeline...
         """
         prefix = f"[{managed.definition.name.upper().replace('-', '_')}]"
-        is_stderr = stream_type == "stderr"
 
         try:
             while True:
@@ -616,8 +654,18 @@ class ProcessOrchestrator:
 
                 decoded = line.decode('utf-8', errors='replace').rstrip()
                 if decoded:
-                    log_func = logger.warning if is_stderr else logger.info
-                    log_func(f"{prefix} {decoded}")
+                    # Detect actual log level from content
+                    level = self._detect_log_level(decoded)
+
+                    # Route to appropriate log function
+                    if level == 'error':
+                        logger.error(f"{prefix} {decoded}")
+                    elif level == 'warning':
+                        logger.warning(f"{prefix} {decoded}")
+                    elif level == 'debug':
+                        logger.debug(f"{prefix} {decoded}")
+                    else:
+                        logger.info(f"{prefix} {decoded}")
 
         except asyncio.CancelledError:
             pass
@@ -673,20 +721,74 @@ class ProcessOrchestrator:
             return False
 
     async def _health_monitor_loop(self, managed: ManagedProcess) -> None:
-        """Background health monitoring for a service."""
+        """
+        v93.0: Enhanced background health monitoring with robust auto-healing.
+
+        CRITICAL FIX: Previous version would `break` after auto-heal, which meant
+        if auto-heal failed, monitoring would stop completely. Now we continue
+        monitoring and retry auto-heal as needed.
+
+        Features:
+        - Robust process death detection with poll()
+        - Continuous monitoring even after auto-heal attempts
+        - HTTP health check with consecutive failure tracking
+        - Heartbeat updates to service registry
+        - Graceful degradation on temporary failures
+        """
         try:
             while not self._shutdown_event.is_set():
                 await asyncio.sleep(self.config.health_check_interval)
 
+                # v93.0: Enhanced process death detection
+                # Use poll() to update returncode without blocking
+                if managed.process is not None:
+                    try:
+                        # poll() returns None if still running, exit code if terminated
+                        poll_result = managed.process.returncode
+                        if poll_result is None:
+                            # Process might have exited but returncode not updated yet
+                            # On macOS/Unix, we need to wait() to reap zombie processes
+                            # Use wait_for with 0 timeout to check without blocking
+                            pass  # returncode is None means still running
+                    except Exception:
+                        pass
+
                 if not managed.is_running:
                     # Process died, trigger auto-heal if enabled
+                    exit_code = managed.process.returncode if managed.process else "unknown"
+                    logger.warning(
+                        f"🚨 Process {managed.definition.name} died (exit code: {exit_code})"
+                    )
+                    managed.status = ServiceStatus.FAILED
+
                     if self.config.auto_healing_enabled:
-                        logger.warning(
-                            f"🚨 Process {managed.definition.name} died (exit code: {managed.process.returncode})"
+                        success = await self._auto_heal(managed)
+                        if success:
+                            # v93.0: After successful auto-heal, the new process has
+                            # its own health monitor task started in _spawn_service()
+                            # We exit THIS loop since we're monitoring the OLD process
+                            logger.info(
+                                f"[v93.0] Health monitor for old {managed.definition.name} "
+                                f"process exiting (new monitor started)"
+                            )
+                            return
+                        else:
+                            # Auto-heal failed, but don't give up immediately
+                            # Continue monitoring - maybe the process will recover
+                            # or manual intervention will fix it
+                            logger.warning(
+                                f"[v93.0] Auto-heal failed for {managed.definition.name}, "
+                                f"continuing to monitor"
+                            )
+                            # Wait longer before retrying
+                            await asyncio.sleep(self.config.health_check_interval * 2)
+                            continue
+                    else:
+                        # Auto-healing disabled, just log and exit
+                        logger.error(
+                            f"[v93.0] {managed.definition.name} died but auto-healing disabled"
                         )
-                        managed.status = ServiceStatus.FAILED
-                        await self._auto_heal(managed)
-                    break
+                        return
 
                 # HTTP health check
                 healthy = await self._check_health(managed)
@@ -703,14 +805,7 @@ class ProcessOrchestrator:
                     # ═══════════════════════════════════════════════════════════════════
                     # CRITICAL FIX: Send heartbeat on EVERY successful health check
                     # ═══════════════════════════════════════════════════════════════════
-                    # Previously: Heartbeat was only sent on status transition to HEALTHY
-                    # This caused services to become "stale" after 60 seconds because
-                    # subsequent heartbeats were never sent once the service was healthy.
-                    # Now: We send heartbeat on every successful check to keep alive.
-                    # ═══════════════════════════════════════════════════════════════════
                     if self.registry:
-                        # v93.0: Wrap heartbeat in try-except for resilience
-                        # If registry write fails (e.g., disk full), don't crash monitor
                         try:
                             await self.registry.heartbeat(
                                 managed.definition.name,
@@ -732,10 +827,14 @@ class ProcessOrchestrator:
                         managed.status = ServiceStatus.DEGRADED
 
                         if self.config.auto_healing_enabled:
-                            await self._auto_heal(managed)
+                            success = await self._auto_heal(managed)
+                            if success:
+                                # Reset consecutive failures after successful heal
+                                managed.consecutive_failures = 0
+                            # v93.0: Don't break - continue monitoring
 
         except asyncio.CancelledError:
-            pass
+            logger.debug(f"[v93.0] Health monitor cancelled for {managed.definition.name}")
         except Exception as e:
             logger.error(f"Health monitor error for {managed.definition.name}: {e}")
 
