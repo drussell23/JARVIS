@@ -177,7 +177,113 @@ async def cleanup_remote_resources(
     # v2.0: Notify cost tracker of cleanup for accurate cost tracking
     await _notify_cost_tracker(results, reason)
 
+    # v93.6: Close all client sessions to prevent "Unclosed client session" warnings
+    await _close_client_sessions()
+
     return results
+
+
+async def _close_client_sessions() -> None:
+    """
+    v93.6: Close all aiohttp client sessions to prevent "Unclosed client session" errors.
+
+    This is called during shutdown to ensure all HTTP clients are properly closed
+    before the event loop terminates.
+    """
+    sessions_closed = 0
+
+    # Close prime client session
+    try:
+        for module_path in ["core.prime_client", "backend.core.prime_client"]:
+            try:
+                import importlib
+                module = importlib.import_module(module_path)
+                close_func = getattr(module, "close_prime_client", None)
+                if close_func:
+                    await close_func()
+                    sessions_closed += 1
+                    logger.debug("   Closed prime client session")
+                    break
+            except ImportError:
+                continue
+    except Exception as e:
+        logger.debug(f"   Prime client close error (non-critical): {e}")
+
+    # Close cost tracker
+    try:
+        for module_path in ["core.cost_tracker", "backend.core.cost_tracker"]:
+            try:
+                import importlib
+                module = importlib.import_module(module_path)
+                get_tracker = getattr(module, "get_cost_tracker", None)
+                if get_tracker:
+                    tracker = get_tracker()
+                    if tracker:
+                        await tracker.shutdown()
+                        sessions_closed += 1
+                        logger.debug("   Closed cost tracker")
+                        break
+            except ImportError:
+                continue
+    except Exception as e:
+        logger.debug(f"   Cost tracker close error (non-critical): {e}")
+
+    # Close GCP VM manager
+    try:
+        for module_path in ["core.gcp_vm_manager", "backend.core.gcp_vm_manager"]:
+            try:
+                import importlib
+                module = importlib.import_module(module_path)
+                cleanup_func = getattr(module, "cleanup_vm_manager", None)
+                if cleanup_func:
+                    await cleanup_func()
+                    sessions_closed += 1
+                    logger.debug("   Closed GCP VM manager")
+                    break
+            except ImportError:
+                continue
+    except Exception as e:
+        logger.debug(f"   GCP VM manager close error (non-critical): {e}")
+
+    # Close reactor core client
+    try:
+        for module_path in ["clients.reactor_core_client", "backend.clients.reactor_core_client"]:
+            try:
+                import importlib
+                module = importlib.import_module(module_path)
+                # Try shutdown_reactor_client first (the correct function name)
+                close_func = getattr(module, "shutdown_reactor_client", None)
+                if close_func:
+                    await close_func()
+                    sessions_closed += 1
+                    logger.debug("   Closed reactor core client")
+                    break
+            except ImportError:
+                continue
+    except Exception as e:
+        logger.debug(f"   Reactor core client close error (non-critical): {e}")
+
+    # Close jarvis prime client
+    try:
+        for module_path in ["clients.jarvis_prime_client", "backend.clients.jarvis_prime_client"]:
+            try:
+                import importlib
+                module = importlib.import_module(module_path)
+                close_func = getattr(module, "close_jarvis_prime_client", None)
+                if not close_func:
+                    close_func = getattr(module, "shutdown_jarvis_prime_client", None)
+                if close_func:
+                    await close_func()
+                    sessions_closed += 1
+                    logger.debug("   Closed jarvis prime client")
+                    break
+            except ImportError:
+                continue
+    except Exception as e:
+        logger.debug(f"   Jarvis prime client close error (non-critical): {e}")
+
+    if sessions_closed > 0:
+        logger.debug(f"   Closed {sessions_closed} client session(s)")
 
 
 async def _cleanup_via_infrastructure_orchestrator(timeout: float) -> int:

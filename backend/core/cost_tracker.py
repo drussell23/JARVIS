@@ -385,18 +385,43 @@ class CostTracker:
             )
 
     async def shutdown(self):
-        """Gracefully shutdown cost tracker with Redis cleanup"""
-        # Cancel cleanup task
-        if self._cleanup_task:
+        """
+        Gracefully shutdown cost tracker with Redis cleanup.
+
+        v93.6: Enhanced with proper task termination and timeout handling.
+        """
+        logger.info("💰 CostTracker shutdown starting...")
+
+        # v93.6: Signal cleanup loop to stop
+        if hasattr(self, '_cleanup_running'):
+            self._cleanup_running = False
+
+        # v93.6: Set global shutdown event if available
+        try:
+            from backend.core.async_safety import set_shutdown_event
+            set_shutdown_event()
+        except ImportError:
+            pass
+
+        # Cancel cleanup task with timeout
+        if self._cleanup_task and not self._cleanup_task.done():
             self._cleanup_task.cancel()
             try:
-                await self._cleanup_task
+                # Give task 5 seconds to shutdown gracefully
+                await asyncio.wait_for(
+                    asyncio.shield(self._cleanup_task),
+                    timeout=5.0
+                )
+            except asyncio.TimeoutError:
+                logger.warning("⚠️ Cleanup task didn't stop in time, forcing...")
             except asyncio.CancelledError:
                 pass
-        
+            except Exception as e:
+                logger.debug(f"Cleanup task termination error (non-critical): {e}")
+
         # Shutdown Redis (v3.0)
         await self._shutdown_redis()
-        
+
         logger.info("💰 CostTracker shutdown complete")
 
     # =========================================================================
@@ -1242,12 +1267,18 @@ class CostTracker:
             return results
 
     async def _auto_cleanup_loop(self):
-        """Background task for automatic cleanup with timeout protection."""
+        """
+        Background task for automatic cleanup with timeout protection.
+
+        v93.6: Enhanced with short sleep intervals (1s) to check shutdown state
+        frequently, preventing "Task was destroyed but it is pending" errors.
+        """
         shutdown_event = get_shutdown_event()
         max_iterations = int(os.getenv("COST_CLEANUP_MAX_ITERATIONS", "0")) or None
         iteration = 0
+        self._cleanup_running = True  # v93.6: Track running state
 
-        while True:
+        while self._cleanup_running:
             # Check for shutdown
             if shutdown_event.is_set():
                 logger.info("Auto-cleanup loop stopped via shutdown event")
@@ -1261,7 +1292,26 @@ class CostTracker:
             iteration += 1
 
             try:
-                await asyncio.sleep(self.config.cleanup_check_interval_hours * 3600)
+                # v93.6: Use short sleep intervals (1s) to check shutdown state frequently
+                # This prevents the "Task was destroyed but it is pending" error
+                total_sleep_seconds = self.config.cleanup_check_interval_hours * 3600
+                sleep_remaining = total_sleep_seconds
+
+                while sleep_remaining > 0 and self._cleanup_running:
+                    # Check shutdown event frequently
+                    if shutdown_event.is_set():
+                        logger.info("Auto-cleanup loop: shutdown event detected during sleep")
+                        self._cleanup_running = False
+                        return
+
+                    # Sleep in 1-second intervals
+                    await asyncio.sleep(min(1.0, sleep_remaining))
+                    sleep_remaining -= 1.0
+
+                # Exit if we were signaled to stop
+                if not self._cleanup_running:
+                    break
+
                 logger.info("🔄 Running scheduled orphaned VM cleanup...")
                 # Add timeout protection for cleanup operation
                 results = await asyncio.wait_for(
@@ -1280,10 +1330,16 @@ class CostTracker:
             except asyncio.TimeoutError:
                 logger.warning(f"Auto-cleanup timed out after {TimeoutConfig.VM_OPERATION}s")
             except asyncio.CancelledError:
-                logger.info("Auto-cleanup loop cancelled")
-                break
+                logger.info("Auto-cleanup loop cancelled (graceful shutdown)")
+                self._cleanup_running = False
+                return
             except Exception as e:
+                if not self._cleanup_running:
+                    break
                 logger.error(f"Auto-cleanup loop error: {e}")
+
+        # v93.6: Clean exit logging
+        logger.info("Auto-cleanup loop stopped")
 
     async def record_routing_decision(
         self,

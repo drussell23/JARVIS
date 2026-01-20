@@ -1648,13 +1648,38 @@ class GCPVMManager:
         - Idle VM detection and auto-termination
         - Memory pressure monitoring (terminate when local RAM normalizes)
         - Detailed metrics collection (CPU, memory, network, disk)
+
+        v93.6: Enhanced with graceful shutdown handling - uses short sleep intervals
+        to check shutdown state frequently, preventing "Task was destroyed" errors.
         """
         logger.info("🔍 VM monitoring loop started (intelligent cost-cutting enabled)")
         self.is_monitoring = True
 
+        # v93.6: Import shutdown event for graceful termination
+        try:
+            from backend.core.async_safety import get_shutdown_event
+            shutdown_event = get_shutdown_event()
+        except ImportError:
+            shutdown_event = None
+
         while self.is_monitoring:
             try:
-                await asyncio.sleep(self.config.health_check_interval)
+                # v93.6: Use short sleep intervals (1s) to check shutdown state frequently
+                # This prevents the "Task was destroyed but it is pending" error
+                sleep_remaining = self.config.health_check_interval
+                while sleep_remaining > 0 and self.is_monitoring:
+                    # Check shutdown event if available
+                    if shutdown_event and shutdown_event.is_set():
+                        logger.info("🔍 VM monitoring loop: shutdown event detected")
+                        self.is_monitoring = False
+                        return
+
+                    await asyncio.sleep(min(1.0, sleep_remaining))
+                    sleep_remaining -= 1.0
+
+                # Check if we should exit after sleep
+                if not self.is_monitoring:
+                    break
 
                 for vm_name, vm in list(self.managed_vms.items()):
                     # Update cost and efficiency
@@ -1762,8 +1787,19 @@ class GCPVMManager:
                     except Exception as metrics_error:
                         logger.debug(f"Could not collect metrics for {vm_name}: {metrics_error}")
 
+            except asyncio.CancelledError:
+                # v93.6: Graceful shutdown - don't log as error
+                logger.info("🔍 VM monitoring loop cancelled (graceful shutdown)")
+                self.is_monitoring = False
+                return
             except Exception as e:
+                if not self.is_monitoring:
+                    # Shutdown in progress, don't log error
+                    break
                 logger.error(f"Error in monitoring loop: {e}", exc_info=True)
+
+        # v93.6: Clean exit logging
+        logger.info("🔍 VM monitoring loop stopped")
 
     async def _health_check_vm(self, vm_name: str) -> bool:
         """Perform health check on a VM"""
@@ -1835,17 +1871,49 @@ class GCPVMManager:
         logger.info("=" * 60)
 
     async def cleanup(self):
-        """Cleanup and shutdown"""
+        """
+        Cleanup and shutdown with graceful task termination.
+
+        v93.6: Enhanced with proper timeout handling to prevent hanging during shutdown.
+        """
+        logger.info("🧹 GCP VM Manager cleanup starting...")
+
+        # Signal monitoring loop to stop
         self.is_monitoring = False
 
-        if self.monitoring_task:
+        # v93.6: Set global shutdown event if available
+        try:
+            from backend.core.async_safety import set_shutdown_event
+            set_shutdown_event()
+        except ImportError:
+            pass
+
+        # v93.6: Cancel monitoring task with timeout
+        if self.monitoring_task and not self.monitoring_task.done():
             self.monitoring_task.cancel()
             try:
-                await self.monitoring_task
+                # Give task 5 seconds to shutdown gracefully
+                await asyncio.wait_for(
+                    asyncio.shield(self.monitoring_task),
+                    timeout=5.0
+                )
+            except asyncio.TimeoutError:
+                logger.warning("⚠️ Monitoring task didn't stop in time, forcing...")
             except asyncio.CancelledError:
                 pass
+            except Exception as e:
+                logger.debug(f"Monitoring task cleanup error (non-critical): {e}")
 
-        await self.cleanup_all_vms(reason="Manager shutdown")
+        # Cleanup VMs with timeout protection
+        try:
+            await asyncio.wait_for(
+                self.cleanup_all_vms(reason="Manager shutdown"),
+                timeout=30.0
+            )
+        except asyncio.TimeoutError:
+            logger.warning("⚠️ VM cleanup timed out after 30s")
+        except Exception as e:
+            logger.warning(f"⚠️ VM cleanup error: {e}")
 
         self.initialized = False
         logger.info("🧹 GCP VM Manager cleaned up")
