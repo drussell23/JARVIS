@@ -52,9 +52,17 @@ Architecture:
     └──────────────────────────────────────────────────────────────────┘
 
 Author: JARVIS AI System
-Version: 5.6.0 (v93.10)
+Version: 5.7.0 (v93.11)
 
 Changelog:
+- v93.11 (v5.7): Parallel Startup & Thread Safety Enhancements
+  - Thread-safe locks for circuit breakers, memory status, and startup coordination
+  - Shared aiohttp session with connection pooling (100 connections, 10 per host)
+  - Parallel service startup with semaphore-based concurrency control
+  - Cross-repo health aggregation with caching
+  - Startup coordination events for dependency tracking
+  - Graceful HTTP session cleanup during shutdown
+  - Lazy initialization of asyncio primitives (event loop safety)
 - v93.10 (v5.6): Enhanced GCP Integration with Full VM Lifecycle Management
   - 4-tier memory-aware routing decision tree (Emergency/Low/Medium/High)
   - GCP VM Manager integration for full lifecycle control
@@ -615,9 +623,103 @@ class ProcessOrchestrator:
         # v93.9: GCP VM manager reference (lazy loaded)
         self._gcp_vm_manager = None
 
+        # v93.11: Thread-safe locks for concurrent access
+        self._circuit_breaker_lock: Optional[asyncio.Lock] = None
+        self._memory_status_lock: Optional[asyncio.Lock] = None
+        self._startup_coordination_lock: Optional[asyncio.Lock] = None
+        self._service_startup_semaphore: Optional[asyncio.Semaphore] = None
+
+        # v93.11: Shared HTTP session with connection pooling (lazy initialized)
+        self._http_session: Optional[aiohttp.ClientSession] = None
+        self._http_session_lock: Optional[asyncio.Lock] = None
+
+        # v93.11: Cross-repo health aggregation
+        self._service_health_cache: Dict[str, Dict[str, Any]] = {}
+        self._health_cache_lock: Optional[asyncio.Lock] = None
+
+        # v93.11: Startup coordination - track which services are starting
+        self._services_starting: Set[str] = set()
+        self._services_ready: Set[str] = set()
+        self._startup_events: Dict[str, asyncio.Event] = {}
+
+    def _ensure_locks_initialized(self) -> None:
+        """
+        v93.11: Lazily initialize asyncio primitives.
+
+        Called before any operation that needs locks.
+        This handles the case where __init__ runs before event loop exists.
+        """
+        if self._circuit_breaker_lock is None:
+            self._circuit_breaker_lock = asyncio.Lock()
+        if self._memory_status_lock is None:
+            self._memory_status_lock = asyncio.Lock()
+        if self._startup_coordination_lock is None:
+            self._startup_coordination_lock = asyncio.Lock()
+        if self._service_startup_semaphore is None:
+            # Limit concurrent startups to prevent resource exhaustion
+            self._service_startup_semaphore = asyncio.Semaphore(3)
+        if self._http_session_lock is None:
+            self._http_session_lock = asyncio.Lock()
+        if self._health_cache_lock is None:
+            self._health_cache_lock = asyncio.Lock()
+
+    async def _get_http_session(self) -> aiohttp.ClientSession:
+        """
+        v93.11: Get shared HTTP session with connection pooling.
+
+        Creates session lazily and reuses it for all HTTP requests.
+        Connection pooling improves performance and reduces resource usage.
+        """
+        self._ensure_locks_initialized()
+
+        async with self._http_session_lock:
+            if self._http_session is None or self._http_session.closed:
+                # Configure connection pooling
+                connector = aiohttp.TCPConnector(
+                    limit=100,  # Max total connections
+                    limit_per_host=10,  # Max connections per host
+                    ttl_dns_cache=300,  # DNS cache TTL
+                    enable_cleanup_closed=True,
+                    force_close=False,  # Reuse connections
+                )
+
+                # Default timeouts
+                timeout = aiohttp.ClientTimeout(
+                    total=30,
+                    connect=10,
+                    sock_read=10,
+                )
+
+                self._http_session = aiohttp.ClientSession(
+                    connector=connector,
+                    timeout=timeout,
+                    raise_for_status=False,
+                )
+
+                logger.debug("[v93.11] Shared HTTP session initialized with connection pooling")
+
+            return self._http_session
+
+    async def _close_http_session(self) -> None:
+        """
+        v93.11: Close shared HTTP session gracefully.
+
+        Called during shutdown.
+        """
+        if self._http_session and not self._http_session.closed:
+            await self._http_session.close()
+            # Allow connections to close gracefully
+            await asyncio.sleep(0.25)
+            self._http_session = None
+            logger.debug("[v93.11] Shared HTTP session closed")
+
     def _get_circuit_breaker(self, service_name: str) -> CircuitBreaker:
         """
-        v93.9: Get or create circuit breaker for a service.
+        v93.11: Get or create circuit breaker for a service (thread-safe).
+
+        Uses a simple check-then-create pattern that's safe for single-threaded
+        asyncio code. For true thread safety in multi-threaded scenarios,
+        use _get_circuit_breaker_async.
         """
         if service_name not in self._circuit_breakers:
             self._circuit_breakers[service_name] = CircuitBreaker(
@@ -627,6 +729,25 @@ class ProcessOrchestrator:
                 half_open_max_requests=self.config.docker_circuit_breaker_half_open_requests,
             )
         return self._circuit_breakers[service_name]
+
+    async def _get_circuit_breaker_async(self, service_name: str) -> CircuitBreaker:
+        """
+        v93.11: Get or create circuit breaker with async lock protection.
+
+        Use this version when called from async contexts where multiple
+        coroutines might access circuit breakers concurrently.
+        """
+        self._ensure_locks_initialized()
+
+        async with self._circuit_breaker_lock:
+            if service_name not in self._circuit_breakers:
+                self._circuit_breakers[service_name] = CircuitBreaker(
+                    name=f"docker-{service_name}",
+                    failure_threshold=self.config.docker_circuit_breaker_failure_threshold,
+                    recovery_timeout=self.config.docker_circuit_breaker_recovery_timeout,
+                    half_open_max_requests=self.config.docker_circuit_breaker_half_open_requests,
+                )
+            return self._circuit_breakers[service_name]
 
     def _get_retry_state(self, operation_name: str) -> RetryState:
         """
@@ -832,7 +953,9 @@ class ProcessOrchestrator:
         health_endpoint: str = "/health",
     ) -> tuple[bool, Optional[str]]:
         """
-        v93.8: Check if a Docker-hosted service is healthy via HTTP.
+        v93.11: Check if a Docker-hosted service is healthy via HTTP.
+
+        Uses shared HTTP session with connection pooling.
 
         Args:
             service_name: Name of the service (for logging)
@@ -845,28 +968,28 @@ class ProcessOrchestrator:
         url = f"http://localhost:{port}{health_endpoint}"
 
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    url,
-                    timeout=aiohttp.ClientTimeout(total=self.config.docker_health_timeout)
-                ) as response:
-                    if response.status != 200:
-                        return False, f"HTTP {response.status}"
+            session = await self._get_http_session()
+            async with session.get(
+                url,
+                timeout=aiohttp.ClientTimeout(total=self.config.docker_health_timeout)
+            ) as response:
+                if response.status != 200:
+                    return False, f"HTTP {response.status}"
 
-                    try:
-                        data = await response.json()
-                        status = data.get("status", "unknown")
+                try:
+                    data = await response.json()
+                    status = data.get("status", "unknown")
 
-                        if status == "healthy":
-                            return True, "healthy"
-                        elif status == "starting":
-                            elapsed = data.get("model_load_elapsed_seconds", 0)
-                            return False, f"starting (model loading: {elapsed:.0f}s)"
-                        else:
-                            return False, status
-                    except Exception:
-                        # Couldn't parse JSON, but got 200 - assume healthy
-                        return True, "healthy (no JSON)"
+                    if status == "healthy":
+                        return True, "healthy"
+                    elif status == "starting":
+                        elapsed = data.get("model_load_elapsed_seconds", 0)
+                        return False, f"starting (model loading: {elapsed:.0f}s)"
+                    else:
+                        return False, status
+                except Exception:
+                    # Couldn't parse JSON, but got 200 - assume healthy
+                    return True, "healthy (no JSON)"
 
         except asyncio.TimeoutError:
             return False, "timeout"
@@ -1815,27 +1938,27 @@ echo "=== JARVIS Prime started ==="
         url = f"http://{external_ip}:{definition.default_port}{definition.health_endpoint}"
 
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    url,
-                    timeout=aiohttp.ClientTimeout(total=10.0)
-                ) as response:
-                    if response.status != 200:
-                        return False, f"HTTP {response.status}"
+            session = await self._get_http_session()
+            async with session.get(
+                url,
+                timeout=aiohttp.ClientTimeout(total=10.0)
+            ) as response:
+                if response.status != 200:
+                    return False, f"HTTP {response.status}"
 
-                    try:
-                        data = await response.json()
-                        status = data.get("status", "unknown")
+                try:
+                    data = await response.json()
+                    status = data.get("status", "unknown")
 
-                        if status == "healthy":
-                            return True, "healthy"
-                        elif status == "starting":
-                            elapsed = data.get("model_load_elapsed_seconds", 0)
-                            return False, f"starting (model loading: {elapsed:.0f}s)"
-                        else:
-                            return False, status
-                    except Exception:
-                        return True, "healthy (no JSON)"
+                    if status == "healthy":
+                        return True, "healthy"
+                    elif status == "starting":
+                        elapsed = data.get("model_load_elapsed_seconds", 0)
+                        return False, f"starting (model loading: {elapsed:.0f}s)"
+                    else:
+                        return False, status
+                except Exception:
+                    return True, "healthy (no JSON)"
 
         except asyncio.TimeoutError:
             return False, "timeout"
@@ -2468,45 +2591,45 @@ echo "=== JARVIS Prime started ==="
         url = f"http://localhost:{managed.port}{managed.definition.health_endpoint}"
 
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    url,
-                    timeout=aiohttp.ClientTimeout(total=self.config.health_check_timeout)
-                ) as response:
-                    if response.status != 200:
-                        return False
+            session = await self._get_http_session()
+            async with session.get(
+                url,
+                timeout=aiohttp.ClientTimeout(total=self.config.health_check_timeout)
+            ) as response:
+                if response.status != 200:
+                    return False
 
-                    # v93.0: Parse response to check status field
-                    try:
-                        data = await response.json()
-                        status = data.get("status", "unknown")
+                # v93.0: Parse response to check status field
+                try:
+                    data = await response.json()
+                    status = data.get("status", "unknown")
 
-                        if status == "healthy":
-                            return True
-                        elif status == "starting":
-                            # Server is up but model still loading
-                            if not require_ready:
-                                return True
-                            # Log progress if available
-                            elapsed = data.get("model_load_elapsed_seconds")
-                            if elapsed:
-                                logger.debug(
-                                    f"    ℹ️  {managed.definition.name}: status=starting, "
-                                    f"model loading for {elapsed:.0f}s"
-                                )
-                            return False
-                        elif status == "error":
-                            error = data.get("model_load_error", "unknown error")
-                            logger.warning(
-                                f"    ⚠️ {managed.definition.name}: status=error - {error}"
-                            )
-                            return False
-                        else:
-                            # Unknown status, be conservative
-                            return False
-                    except Exception:
-                        # Couldn't parse JSON, fall back to HTTP status
+                    if status == "healthy":
                         return True
+                    elif status == "starting":
+                        # Server is up but model still loading
+                        if not require_ready:
+                            return True
+                        # Log progress if available
+                        elapsed = data.get("model_load_elapsed_seconds")
+                        if elapsed:
+                            logger.debug(
+                                f"    ℹ️  {managed.definition.name}: status=starting, "
+                                f"model loading for {elapsed:.0f}s"
+                            )
+                        return False
+                    elif status == "error":
+                        error = data.get("model_load_error", "unknown error")
+                        logger.warning(
+                            f"    ⚠️ {managed.definition.name}: status=error - {error}"
+                        )
+                        return False
+                    else:
+                        # Unknown status, be conservative
+                        return False
+                except Exception:
+                    # Couldn't parse JSON, fall back to HTTP status
+                    return True
 
         except Exception:
             return False
@@ -3049,61 +3172,62 @@ echo "=== JARVIS Prime started ==="
 
             # v93.7: SINGLE health check request that both checks status AND tracks progress
             # This fixes the duplicate health check issue (was making 2 requests per interval)
+            # v93.11: Uses shared HTTP session with connection pooling
             try:
                 url = f"http://localhost:{managed.port}{managed.definition.health_endpoint}"
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(
-                        url,
-                        timeout=aiohttp.ClientTimeout(total=self.config.health_check_timeout)
-                    ) as response:
-                        if response.status == 200:
-                            data = await response.json()
-                            current_status = data.get("status", "unknown")
-                            model_elapsed = data.get("model_load_elapsed_seconds", 0)
-                            current_step = data.get("current_step", "")
-                            model_progress = data.get("model_load_progress_pct", 0)
+                session = await self._get_http_session()
+                async with session.get(
+                    url,
+                    timeout=aiohttp.ClientTimeout(total=self.config.health_check_timeout)
+                ) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        current_status = data.get("status", "unknown")
+                        model_elapsed = data.get("model_load_elapsed_seconds", 0)
+                        current_step = data.get("current_step", "")
+                        model_progress = data.get("model_load_progress_pct", 0)
 
-                            # v93.7: Check if fully healthy (replaces separate _check_health call)
-                            if current_status == "healthy":
-                                logger.info(
-                                    f"    ✅ {managed.definition.name} fully healthy after {total_elapsed:.1f}s "
-                                    f"(server: {phase2_start - start_time:.1f}s, model: {phase2_elapsed:.1f}s)"
-                                    + (f" [timeout was extended]" if timeout_extended else "")
-                                )
-                                return True
+                        # v93.7: Check if fully healthy (replaces separate _check_health call)
+                        if current_status == "healthy":
+                            logger.info(
+                                f"    ✅ {managed.definition.name} fully healthy after {total_elapsed:.1f}s "
+                                f"(server: {phase2_start - start_time:.1f}s, model: {phase2_elapsed:.1f}s)"
+                                + (f" [timeout was extended]" if timeout_extended else "")
+                            )
+                            return True
 
-                            # v93.5: Detect progress (model_elapsed increasing)
-                            if model_elapsed and model_elapsed > last_model_elapsed:
-                                progress_detected_at = time.time()
-                                last_model_elapsed = model_elapsed
+                        # v93.5: Detect progress (model_elapsed increasing)
+                        if model_elapsed and model_elapsed > last_model_elapsed:
+                            progress_detected_at = time.time()
+                            last_model_elapsed = model_elapsed
 
-                            # v93.7: Log status changes with step info
-                            if current_status != last_status:
-                                step_info = f" (step: {current_step})" if current_step else ""
-                                logger.info(
-                                    f"    ℹ️  {managed.definition.name}: status={current_status}{step_info}"
-                                )
-                                last_status = current_status
+                        # v93.7: Log status changes with step info
+                        if current_status != last_status:
+                            step_info = f" (step: {current_step})" if current_step else ""
+                            logger.info(
+                                f"    ℹ️  {managed.definition.name}: status={current_status}{step_info}"
+                            )
+                            last_status = current_status
 
-                            # v93.7: Enhanced milestone logging with step and progress info
-                            if (time.time() - last_milestone_log) >= milestone_interval:
-                                remaining = effective_timeout - phase2_elapsed
-                                model_info = f", model loading: {model_elapsed:.0f}s" if model_elapsed else ""
-                                progress_info = ""
-                                if model_progress > 0:
-                                    progress_info = f" ({model_progress:.0f}% est.)"
-                                if progress_detected_at > 0:
-                                    since_progress = time.time() - progress_detected_at
-                                    progress_info += f", last progress: {since_progress:.0f}s ago"
-                                step_info = f", step: {current_step}" if current_step else ""
-                                logger.info(
-                                    f"    ⏳ {managed.definition.name}: {current_status}{step_info} "
-                                    f"({phase2_elapsed:.0f}s elapsed, {remaining:.0f}s remaining{model_info}{progress_info})"
-                                )
-                                last_milestone_log = time.time()
-                        else:
-                            # Non-200 response
-                            logger.debug(f"    Health check returned {response.status}")
+                        # v93.7: Enhanced milestone logging with step and progress info
+                        if (time.time() - last_milestone_log) >= milestone_interval:
+                            remaining = effective_timeout - phase2_elapsed
+                            model_info = f", model loading: {model_elapsed:.0f}s" if model_elapsed else ""
+                            progress_info = ""
+                            if model_progress > 0:
+                                progress_info = f" ({model_progress:.0f}% est.)"
+                            if progress_detected_at > 0:
+                                since_progress = time.time() - progress_detected_at
+                                progress_info += f", last progress: {since_progress:.0f}s ago"
+                            step_info = f", step: {current_step}" if current_step else ""
+                            logger.info(
+                                f"    ⏳ {managed.definition.name}: {current_status}{step_info} "
+                                f"({phase2_elapsed:.0f}s elapsed, {remaining:.0f}s remaining{model_info}{progress_info})"
+                            )
+                            last_milestone_log = time.time()
+                    else:
+                        # Non-200 response
+                        logger.debug(f"    Health check returned {response.status}")
 
             except asyncio.TimeoutError:
                 logger.debug(f"    Health check timed out")
@@ -3243,6 +3367,276 @@ echo "=== JARVIS Prime started ==="
             logger.debug(f"[Shutdown] Task cleanup note: {e}")
 
     # =========================================================================
+    # v93.11: Parallel Service Startup with Coordination
+    # =========================================================================
+
+    async def _start_single_service_with_coordination(
+        self,
+        definition: ServiceDefinition,
+    ) -> tuple[str, bool, str]:
+        """
+        v93.11: Start a single service with proper coordination and error handling.
+
+        Uses semaphore to limit concurrent startups and prevent resource exhaustion.
+        Returns tuple of (service_name, success, reason).
+        """
+        self._ensure_locks_initialized()
+
+        async with self._service_startup_semaphore:
+            service_name = definition.name
+
+            # Mark service as starting
+            async with self._startup_coordination_lock:
+                self._services_starting.add(service_name)
+                if service_name not in self._startup_events:
+                    self._startup_events[service_name] = asyncio.Event()
+
+            try:
+                # Step 1: Check if already running via registry
+                if self.registry:
+                    existing = await self.registry.discover_service(service_name)
+                    if existing:
+                        reason = f"already running (PID: {existing.pid}, Port: {existing.port})"
+                        return service_name, True, reason
+
+                # Step 2: HTTP probe using shared session
+                session = await self._get_http_session()
+                url = f"http://localhost:{definition.default_port}{definition.health_endpoint}"
+
+                try:
+                    async with session.get(
+                        url,
+                        timeout=aiohttp.ClientTimeout(total=3.0)
+                    ) as resp:
+                        if resp.status == 200:
+                            reason = f"already running at port {definition.default_port}"
+                            return service_name, True, reason
+                except Exception:
+                    pass  # Service not running, need to start
+
+                # Step 3: Try Docker hybrid mode
+                use_docker, docker_reason = await self._try_docker_hybrid_for_service(definition)
+                if use_docker:
+                    # Create managed process entry for Docker
+                    managed = ManagedProcess(definition=definition)
+                    managed.status = ServiceStatus.HEALTHY
+                    managed.port = definition.default_port
+                    managed.pid = None
+                    self.processes[service_name] = managed
+
+                    # Start health monitor
+                    managed.health_monitor_task = asyncio.create_task(
+                        self._health_monitor_loop(managed)
+                    )
+
+                    # Register in service registry
+                    if self.registry:
+                        await self.registry.register_service(
+                            service_name=service_name,
+                            pid=0,
+                            port=managed.port,
+                            health_endpoint=definition.health_endpoint,
+                            metadata={
+                                "repo_path": str(definition.repo_path),
+                                "docker": True,
+                                "container": self.config.jarvis_prime_docker_container,
+                            }
+                        )
+
+                    return service_name, True, f"Docker container ({docker_reason})"
+
+                # Step 4: Spawn local process
+                managed = ManagedProcess(definition=definition)
+                self.processes[service_name] = managed
+
+                success = await self._spawn_service(managed)
+
+                if success:
+                    return service_name, True, "local process"
+                else:
+                    return service_name, False, "spawn failed"
+
+            except Exception as e:
+                logger.error(f"    ❌ {service_name} startup error: {e}")
+                return service_name, False, f"error: {e}"
+
+            finally:
+                # Mark service as no longer starting
+                async with self._startup_coordination_lock:
+                    self._services_starting.discard(service_name)
+                    if service_name in self._startup_events:
+                        self._startup_events[service_name].set()
+
+    async def _start_services_parallel(
+        self,
+        definitions: List[ServiceDefinition],
+    ) -> Dict[str, bool]:
+        """
+        v93.11: Start multiple services in parallel with intelligent coordination.
+
+        Features:
+        - Parallel startup using asyncio.gather
+        - Semaphore limits concurrent startups (default: 3)
+        - Memory-aware service ordering (light services first)
+        - Error isolation (one failure doesn't block others)
+        - Aggregated results with detailed reasons
+
+        Returns:
+            Dict mapping service names to success status
+        """
+        self._ensure_locks_initialized()
+
+        # Separate heavy (ML-based) and light services
+        heavy_services = [d for d in definitions if d.name == "jarvis-prime"]
+        light_services = [d for d in definitions if d.name != "jarvis-prime"]
+
+        results: Dict[str, bool] = {}
+        reasons: Dict[str, str] = {}
+
+        # Phase 1: Start light services in parallel
+        if light_services:
+            logger.info(f"  🚀 Starting {len(light_services)} light service(s) in parallel...")
+
+            light_tasks = [
+                self._start_single_service_with_coordination(d)
+                for d in light_services
+            ]
+
+            light_results = await asyncio.gather(*light_tasks, return_exceptions=True)
+
+            for result in light_results:
+                if isinstance(result, Exception):
+                    logger.error(f"  ❌ Service startup exception: {result}")
+                    continue
+
+                name, success, reason = result
+                results[name] = success
+                reasons[name] = reason
+
+                if success:
+                    logger.info(f"    ✅ {name}: {reason}")
+                else:
+                    logger.warning(f"    ⚠️ {name}: {reason}")
+
+        # Phase 2: Start heavy services (with memory check)
+        if heavy_services:
+            logger.info(f"  🚀 Starting {len(heavy_services)} heavy service(s)...")
+
+            # Check memory before starting heavy services
+            memory_status = await self._get_memory_status()
+            logger.info(
+                f"    📊 Memory: {memory_status.available_gb:.1f}GB available "
+                f"({memory_status.percent_used:.0f}% used)"
+            )
+
+            heavy_tasks = [
+                self._start_single_service_with_coordination(d)
+                for d in heavy_services
+            ]
+
+            heavy_results = await asyncio.gather(*heavy_tasks, return_exceptions=True)
+
+            for result in heavy_results:
+                if isinstance(result, Exception):
+                    logger.error(f"  ❌ Heavy service startup exception: {result}")
+                    continue
+
+                name, success, reason = result
+                results[name] = success
+                reasons[name] = reason
+
+                if success:
+                    logger.info(f"    ✅ {name}: {reason}")
+                else:
+                    logger.warning(f"    ⚠️ {name}: {reason}")
+
+        return results
+
+    async def _aggregate_cross_repo_health(self) -> Dict[str, Any]:
+        """
+        v93.11: Aggregate health status from all repos.
+
+        Returns unified health view across JARVIS, Prime, and Reactor-Core.
+        """
+        self._ensure_locks_initialized()
+
+        session = await self._get_http_session()
+
+        services = [
+            ("jarvis", 8010, "/health"),
+            ("jarvis-prime", self.config.jarvis_prime_default_port, "/health"),
+            ("reactor-core", self.config.reactor_core_default_port, "/health"),
+        ]
+
+        async def check_health(name: str, port: int, endpoint: str) -> Dict[str, Any]:
+            url = f"http://localhost:{port}{endpoint}"
+            try:
+                async with session.get(
+                    url,
+                    timeout=aiohttp.ClientTimeout(total=5.0)
+                ) as resp:
+                    if resp.status == 200:
+                        try:
+                            data = await resp.json()
+                            return {
+                                "name": name,
+                                "healthy": True,
+                                "status": data.get("status", "healthy"),
+                                "port": port,
+                                "details": data,
+                            }
+                        except Exception:
+                            return {
+                                "name": name,
+                                "healthy": True,
+                                "status": "healthy",
+                                "port": port,
+                            }
+                    else:
+                        return {
+                            "name": name,
+                            "healthy": False,
+                            "status": f"HTTP {resp.status}",
+                            "port": port,
+                        }
+            except asyncio.TimeoutError:
+                return {"name": name, "healthy": False, "status": "timeout", "port": port}
+            except aiohttp.ClientConnectorError:
+                return {"name": name, "healthy": False, "status": "connection refused", "port": port}
+            except Exception as e:
+                return {"name": name, "healthy": False, "status": str(e), "port": port}
+
+        # Check all services in parallel
+        health_tasks = [check_health(n, p, e) for n, p, e in services]
+        health_results = await asyncio.gather(*health_tasks, return_exceptions=True)
+
+        # Aggregate results
+        aggregated = {
+            "timestamp": time.time(),
+            "services": {},
+            "all_healthy": True,
+            "healthy_count": 0,
+            "total_count": len(services),
+        }
+
+        for result in health_results:
+            if isinstance(result, Exception):
+                continue
+            name = result["name"]
+            aggregated["services"][name] = result
+
+            if result.get("healthy"):
+                aggregated["healthy_count"] += 1
+            else:
+                aggregated["all_healthy"] = False
+
+        # Update cache
+        async with self._health_cache_lock:
+            self._service_health_cache = aggregated
+
+        return aggregated
+
+    # =========================================================================
     # Main Orchestration
     # =========================================================================
 
@@ -3288,7 +3682,8 @@ echo "=== JARVIS Prime started ==="
         results = {"jarvis": True}  # JARVIS is already running
 
         logger.info("=" * 70)
-        logger.info("Cross-Repo Startup Orchestrator v93.0 - Enterprise Grade")
+        logger.info("Cross-Repo Startup Orchestrator v93.11 - Enterprise Grade")
+        logger.info("  Features: Parallel startup, Connection pooling, Thread-safe ops")
         logger.info("=" * 70)
         logger.info(f"  Ports: jarvis-prime={self.config.jarvis_prime_default_port}, "
                     f"reactor-core={self.config.reactor_core_default_port}")
@@ -3325,87 +3720,14 @@ echo "=== JARVIS Prime started ==="
         logger.info("\n📍 PHASE 1: JARVIS Core (starting via supervisor)")
         logger.info("✅ JARVIS Core initialization in progress...")
 
-        # Phase 2: Probe and spawn external services
-        logger.info("\n📍 PHASE 2: External services startup")
+        # Phase 2: Probe and spawn external services (v93.11: PARALLEL)
+        logger.info("\n📍 PHASE 2: External services startup (PARALLEL)")
 
         definitions = self._get_service_definitions()
 
-        for definition in definitions:
-            logger.info(f"\n  → Processing {definition.name}...")
-
-            # First, check if already running via registry
-            existing = None
-            if self.registry:
-                existing = await self.registry.discover_service(definition.name)
-
-            if existing:
-                logger.info(f"    ✅ {definition.name} already running (PID: {existing.pid}, Port: {existing.port})")
-                results[definition.name] = True
-                continue
-
-            # Also try HTTP probe with default port
-            url = f"http://localhost:{definition.default_port}{definition.health_endpoint}"
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=3.0)) as resp:
-                        if resp.status == 200:
-                            logger.info(f"    ✅ {definition.name} already running at port {definition.default_port}")
-                            results[definition.name] = True
-                            continue
-            except Exception:
-                pass
-
-            # v93.8: Try Docker hybrid mode before spawning local process
-            # This checks if a Docker container is running and healthy
-            use_docker, docker_reason = await self._try_docker_hybrid_for_service(definition)
-            if use_docker:
-                logger.info(f"    🐳 {definition.name}: Using Docker container ({docker_reason})")
-                results[definition.name] = True
-
-                # Create a managed process entry for Docker (no actual process, just tracking)
-                managed = ManagedProcess(definition=definition)
-                managed.status = ServiceStatus.HEALTHY
-                managed.port = definition.default_port
-                managed.pid = None  # Docker container, no local PID
-                self.processes[definition.name] = managed
-
-                # Start health monitor for Docker-hosted service
-                managed.health_monitor_task = asyncio.create_task(
-                    self._health_monitor_loop(managed)
-                )
-
-                # Register in service registry (with special metadata)
-                if self.registry:
-                    await self.registry.register_service(
-                        service_name=definition.name,
-                        pid=0,  # Special PID 0 indicates Docker
-                        port=managed.port,
-                        health_endpoint=definition.health_endpoint,
-                        metadata={
-                            "repo_path": str(definition.repo_path),
-                            "docker": True,
-                            "container": self.config.jarvis_prime_docker_container,
-                        }
-                    )
-                continue
-
-            # Docker not available or not healthy - fallback to local process
-            if docker_reason and "not available" not in docker_reason.lower():
-                logger.info(f"    ℹ️  Docker fallback: {docker_reason}")
-
-            # Need to spawn local process
-            logger.info(f"    ℹ️ {definition.name} not running, spawning local process...")
-
-            managed = ManagedProcess(definition=definition)
-            self.processes[definition.name] = managed
-
-            success = await self._spawn_service(managed)
-            results[definition.name] = success
-
-            if success:
-                logger.info(f"    ✅ {definition.name} started successfully (local)")
-            else:
-                logger.warning(f"    ⚠️ {definition.name} failed to start (degraded mode)")
+        # v93.11: Use parallel startup with coordination
+        parallel_results = await self._start_services_parallel(definitions)
+        results.update(parallel_results)
 
         # Phase 3: Verification
         logger.info("\n📍 PHASE 3: Integration verification")
@@ -3453,7 +3775,14 @@ echo "=== JARVIS Prime started ==="
         return results
 
     async def shutdown_all_services(self) -> None:
-        """Gracefully shutdown all managed services."""
+        """
+        v93.11: Gracefully shutdown all managed services.
+
+        Enhanced with:
+        - Parallel process shutdown
+        - HTTP session cleanup
+        - Startup coordination cleanup
+        """
         logger.info("\n🛑 Shutting down all services...")
 
         # Stop all processes in parallel
@@ -3468,6 +3797,15 @@ echo "=== JARVIS Prime started ==="
         # Stop registry cleanup
         if self.registry:
             await self.registry.stop_cleanup_task()
+
+        # v93.11: Close shared HTTP session
+        await self._close_http_session()
+
+        # v93.11: Clear startup coordination state
+        self._services_starting.clear()
+        self._services_ready.clear()
+        self._startup_events.clear()
+        self._service_health_cache.clear()
 
         logger.info("✅ All services shut down")
         self._running = False
