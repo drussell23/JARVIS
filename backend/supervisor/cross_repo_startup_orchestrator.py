@@ -1320,16 +1320,8 @@ class ProcessOrchestrator:
                 )
                 return False
 
-            # Check for full "healthy" status
-            if await self._check_health(managed, require_ready=True):
-                logger.info(
-                    f"    ✅ {managed.definition.name} fully healthy after {total_elapsed:.1f}s "
-                    f"(server: {phase2_start - start_time:.1f}s, model: {phase2_elapsed:.1f}s)"
-                    + (f" [timeout was extended]" if timeout_extended else "")
-                )
-                return True
-
-            # v93.5: Get current status and track progress for intelligent timeout extension
+            # v93.7: SINGLE health check request that both checks status AND tracks progress
+            # This fixes the duplicate health check issue (was making 2 requests per interval)
             try:
                 url = f"http://localhost:{managed.port}{managed.definition.health_endpoint}"
                 async with aiohttp.ClientSession() as session:
@@ -1341,33 +1333,55 @@ class ProcessOrchestrator:
                             data = await response.json()
                             current_status = data.get("status", "unknown")
                             model_elapsed = data.get("model_load_elapsed_seconds", 0)
+                            current_step = data.get("current_step", "")
+                            model_progress = data.get("model_load_progress_pct", 0)
+
+                            # v93.7: Check if fully healthy (replaces separate _check_health call)
+                            if current_status == "healthy":
+                                logger.info(
+                                    f"    ✅ {managed.definition.name} fully healthy after {total_elapsed:.1f}s "
+                                    f"(server: {phase2_start - start_time:.1f}s, model: {phase2_elapsed:.1f}s)"
+                                    + (f" [timeout was extended]" if timeout_extended else "")
+                                )
+                                return True
 
                             # v93.5: Detect progress (model_elapsed increasing)
                             if model_elapsed and model_elapsed > last_model_elapsed:
                                 progress_detected_at = time.time()
                                 last_model_elapsed = model_elapsed
 
+                            # v93.7: Log status changes with step info
                             if current_status != last_status:
+                                step_info = f" (step: {current_step})" if current_step else ""
                                 logger.info(
-                                    f"    ℹ️  {managed.definition.name}: status={current_status}"
+                                    f"    ℹ️  {managed.definition.name}: status={current_status}{step_info}"
                                 )
                                 last_status = current_status
 
-                            # v93.5: Enhanced milestone logging with progress info
+                            # v93.7: Enhanced milestone logging with step and progress info
                             if (time.time() - last_milestone_log) >= milestone_interval:
                                 remaining = effective_timeout - phase2_elapsed
                                 model_info = f", model loading: {model_elapsed:.0f}s" if model_elapsed else ""
                                 progress_info = ""
+                                if model_progress > 0:
+                                    progress_info = f" ({model_progress:.0f}% est.)"
                                 if progress_detected_at > 0:
                                     since_progress = time.time() - progress_detected_at
-                                    progress_info = f", last progress: {since_progress:.0f}s ago"
+                                    progress_info += f", last progress: {since_progress:.0f}s ago"
+                                step_info = f", step: {current_step}" if current_step else ""
                                 logger.info(
-                                    f"    ⏳ {managed.definition.name}: {current_status} "
+                                    f"    ⏳ {managed.definition.name}: {current_status}{step_info} "
                                     f"({phase2_elapsed:.0f}s elapsed, {remaining:.0f}s remaining{model_info}{progress_info})"
                                 )
                                 last_milestone_log = time.time()
-            except Exception:
-                pass  # Non-critical, just for logging
+                        else:
+                            # Non-200 response
+                            logger.debug(f"    Health check returned {response.status}")
+
+            except asyncio.TimeoutError:
+                logger.debug(f"    Health check timed out")
+            except Exception as e:
+                logger.debug(f"    Health check error: {e}")
 
             # v93.5: Adaptive check intervals for phase 2
             if phase2_elapsed > 180:
