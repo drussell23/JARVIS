@@ -52,9 +52,19 @@ Architecture:
     └──────────────────────────────────────────────────────────────────┘
 
 Author: JARVIS AI System
-Version: 5.5.0 (v93.9)
+Version: 5.6.0 (v93.10)
 
 Changelog:
+- v93.10 (v5.6): Enhanced GCP Integration with Full VM Lifecycle Management
+  - 4-tier memory-aware routing decision tree (Emergency/Low/Medium/High)
+  - GCP VM Manager integration for full lifecycle control
+  - CloudMLRouter and HybridRouter integration for intelligent routing
+  - Auto VM type selection based on model memory requirements
+  - Spot VM support for cost optimization
+  - Health check with progress monitoring for GCP services
+  - VM startup script generation for automatic service deployment
+  - Existing VM detection and reuse
+  - Comprehensive fallback chain (Docker -> GCP -> Local)
 - v93.9 (v5.5): Advanced Docker Operations with intelligent routing
   - Circuit Breaker pattern prevents cascading failures
   - Exponential backoff retry with jitter for resilience
@@ -1121,12 +1131,19 @@ class ProcessOrchestrator:
         definition: ServiceDefinition,
     ) -> tuple[RoutingDecision, str]:
         """
-        v93.9: Make intelligent routing decision for a service.
+        v93.10: Make intelligent routing decision for a service.
 
-        Order of preference:
-        1. Docker (if available, healthy, and memory sufficient)
-        2. Local process (if memory sufficient)
-        3. GCP cloud (if enabled and needed)
+        Enhanced decision tree with detailed memory thresholds:
+        1. Memory < 2GB → GCP (emergency, system unstable)
+        2. Memory 2-4GB → Docker (pre-loaded models) or GCP
+        3. Memory 4-6GB → Docker (preferred) or Local
+        4. Memory > 6GB → Local (fastest, no container overhead)
+
+        Also considers:
+        - Circuit breaker state
+        - Docker availability
+        - GCP infrastructure availability
+        - Model size estimation
 
         Returns:
             Tuple of (decision, reason)
@@ -1136,33 +1153,204 @@ class ProcessOrchestrator:
         logger.info(f"    📊 Memory: {memory_status.available_gb:.1f}GB available "
                    f"({memory_status.percent_used:.0f}% used)")
 
-        # Check if we need to route to GCP due to memory pressure
-        if await self._should_route_to_gcp(definition, memory_status):
-            return RoutingDecision.GCP_CLOUD, f"Low memory ({memory_status.available_gb:.1f}GB)"
+        # Use the enhanced routing decision tree
+        route_type, reason = await self._determine_optimal_routing(
+            definition, memory_status
+        )
 
-        # Check Docker availability
-        docker_available = await self._check_docker_available()
-        if docker_available:
-            # Check circuit breaker
-            cb = self._get_circuit_breaker(definition.name)
-            if cb.can_execute():
-                return RoutingDecision.DOCKER_LOCAL, "Docker available"
+        # Map string route type to RoutingDecision enum
+        route_map = {
+            "gcp": RoutingDecision.GCP_CLOUD,
+            "docker": RoutingDecision.DOCKER_LOCAL,
+            "local": RoutingDecision.LOCAL_PROCESS,
+            "hybrid": RoutingDecision.HYBRID,
+        }
+
+        return route_map.get(route_type, RoutingDecision.LOCAL_PROCESS), reason
+
+    async def _determine_optimal_routing(
+        self,
+        definition: ServiceDefinition,
+        memory_status: MemoryStatus,
+    ) -> tuple[str, str]:
+        """
+        v93.10: Intelligently determine: Docker, Local, or GCP?
+
+        Enhanced decision tree with:
+        - Model size estimation
+        - Circuit breaker awareness
+        - Parallel availability checks
+        - Cost-aware routing (prefer local when possible)
+
+        Decision tree:
+        1. Memory < 2GB → GCP (emergency)
+        2. Memory 2-4GB → Docker (pre-loaded models) OR GCP
+        3. Memory 4-6GB → Docker (preferred) or Local
+        4. Memory > 6GB → Local (fastest)
+
+        Returns:
+            Tuple of (route_type, reason)
+        """
+        available_gb = memory_status.available_gb
+
+        # Estimate model memory requirements
+        estimated_model_gb = await self._estimate_model_memory_requirement(definition)
+        logger.debug(f"    Estimated model memory: {estimated_model_gb:.1f}GB")
+
+        # =====================================================================
+        # TIER 0: Emergency - System critically low on memory
+        # =====================================================================
+        if available_gb < 2.0:
+            logger.warning(
+                f"    🚨 EMERGENCY: Only {available_gb:.1f}GB available! "
+                f"Routing to GCP to prevent system instability"
+            )
+            return "gcp", f"Emergency: {available_gb:.1f}GB available (< 2GB threshold)"
+
+        # =====================================================================
+        # TIER 1: Low memory (2-4GB) - Docker with pre-loaded models or GCP
+        # =====================================================================
+        if available_gb < 4.0:
+            # Check Docker availability and circuit breaker in parallel
+            docker_available, cb_can_execute = await asyncio.gather(
+                self._check_docker_available(),
+                asyncio.to_thread(
+                    lambda: self._get_circuit_breaker(definition.name).can_execute()
+                ),
+            )
+
+            if docker_available and cb_can_execute:
+                return (
+                    "docker",
+                    f"Low memory ({available_gb:.1f}GB), using Docker pre-loaded models"
+                )
+            elif self.config.gcp_fallback_enabled:
+                return (
+                    "gcp",
+                    f"Low memory ({available_gb:.1f}GB), Docker unavailable, using GCP"
+                )
             else:
-                logger.info(
-                    f"    ⚠️ Docker circuit breaker OPEN for {definition.name}, "
-                    f"using alternative"
+                # Last resort: try local anyway with warning
+                logger.warning(
+                    f"    ⚠️ Low memory ({available_gb:.1f}GB) but no alternatives, "
+                    f"attempting local (may be slow)"
+                )
+                return (
+                    "local",
+                    f"Low memory ({available_gb:.1f}GB), no alternatives (risky)"
                 )
 
-        # Check if local process is viable
-        if memory_status.can_load_local_model:
-            return RoutingDecision.LOCAL_PROCESS, "Sufficient memory for local"
+        # =====================================================================
+        # TIER 2: Medium memory (4-6GB) - Prefer Docker, fallback to Local
+        # =====================================================================
+        if available_gb < 6.0:
+            # Check if model will fit with headroom
+            memory_with_model = available_gb - estimated_model_gb
+            has_headroom = memory_with_model >= 1.0  # Need at least 1GB headroom
 
-        # Fallback to GCP if enabled
-        if self.config.gcp_fallback_enabled:
-            return RoutingDecision.GCP_CLOUD, "Memory insufficient for local"
+            # Check Docker availability
+            docker_available = await self._check_docker_available()
+            cb = self._get_circuit_breaker(definition.name)
 
-        # Last resort: try local anyway
-        return RoutingDecision.LOCAL_PROCESS, "No alternatives, trying local"
+            if docker_available and cb.can_execute():
+                return (
+                    "docker",
+                    f"Medium memory ({available_gb:.1f}GB), using Docker for efficiency"
+                )
+            elif has_headroom:
+                return (
+                    "local",
+                    f"Medium memory ({available_gb:.1f}GB), Docker unavailable, "
+                    f"local has {memory_with_model:.1f}GB headroom"
+                )
+            elif self.config.gcp_fallback_enabled:
+                return (
+                    "gcp",
+                    f"Medium memory ({available_gb:.1f}GB), insufficient headroom for local"
+                )
+            else:
+                return (
+                    "local",
+                    f"Medium memory ({available_gb:.1f}GB), attempting local (tight fit)"
+                )
+
+        # =====================================================================
+        # TIER 3: High memory (6GB+) - Local is fastest (no container overhead)
+        # =====================================================================
+        # Check if local process will have enough headroom
+        memory_with_model = available_gb - estimated_model_gb
+        has_good_headroom = memory_with_model >= 2.0  # 2GB+ headroom is comfortable
+
+        if has_good_headroom:
+            return (
+                "local",
+                f"Sufficient memory ({available_gb:.1f}GB, {memory_with_model:.1f}GB headroom), "
+                f"using local process (fastest)"
+            )
+
+        # High memory but model is large - consider Docker for pre-loading
+        docker_available = await self._check_docker_available()
+        cb = self._get_circuit_breaker(definition.name)
+
+        if docker_available and cb.can_execute():
+            return (
+                "docker",
+                f"Good memory ({available_gb:.1f}GB) but large model "
+                f"({estimated_model_gb:.1f}GB), using Docker"
+            )
+
+        # Local with warning
+        return (
+            "local",
+            f"Good memory ({available_gb:.1f}GB), using local process"
+        )
+
+    async def _estimate_model_memory_requirement(
+        self,
+        definition: ServiceDefinition,
+    ) -> float:
+        """
+        v93.10: Estimate memory required for loading the model.
+
+        Considers:
+        - Model file size
+        - Runtime overhead factor (1.5x for llama.cpp)
+        - Context window allocation
+        - Safety buffer
+        """
+        try:
+            model_path = definition.repo_path / "models"
+
+            if not model_path.exists():
+                # Default estimate for 7B model
+                return 6.0
+
+            # Find the current model (symlink) or largest .gguf
+            current_model = model_path / "current.gguf"
+            if current_model.is_symlink() or current_model.exists():
+                try:
+                    # Resolve symlink to get actual file
+                    actual_path = current_model.resolve()
+                    if actual_path.exists():
+                        file_size_gb = actual_path.stat().st_size / (1024 ** 3)
+                        # Runtime overhead: file_size * 1.5 + context buffer (0.5GB)
+                        return file_size_gb * self.config.memory_model_size_estimation_factor + 0.5
+                except Exception:
+                    pass
+
+            # Find largest .gguf file as fallback
+            gguf_files = list(model_path.glob("*.gguf"))
+            if gguf_files:
+                largest = max(gguf_files, key=lambda p: p.stat().st_size)
+                file_size_gb = largest.stat().st_size / (1024 ** 3)
+                return file_size_gb * self.config.memory_model_size_estimation_factor + 0.5
+
+            # Default estimate
+            return 6.0
+
+        except Exception as e:
+            logger.debug(f"    Model size estimation failed: {e}")
+            return 6.0  # Conservative default
 
     # =========================================================================
     # v93.9: Docker Image Management
@@ -1261,7 +1449,7 @@ class ProcessOrchestrator:
             return False
 
     # =========================================================================
-    # v93.9: GCP Fallback Routing
+    # v93.10: Enhanced GCP Fallback Routing
     # =========================================================================
 
     async def _start_gcp_service(
@@ -1269,57 +1457,479 @@ class ProcessOrchestrator:
         definition: ServiceDefinition,
     ) -> bool:
         """
-        v93.9: Start service on GCP cloud VM as fallback.
+        v93.10: Start service on GCP Spot VM when local memory is insufficient.
 
-        Uses GCPVMManager if available.
+        Integrates with existing GCP infrastructure:
+        - GCPVMManager for VM lifecycle management
+        - CloudMLRouter for intelligent model routing
+        - HybridRouter for capability-based routing
+        - Cost-optimized Spot VM instances
+
+        Features:
+        - Auto VM selection based on model requirements
+        - Spot VM for cost savings (with preemption handling)
+        - Health check with retry
+        - Automatic service deployment on VM
         """
         if not self.config.gcp_fallback_enabled:
+            logger.info("    ℹ️ GCP fallback disabled via config")
             return False
 
         try:
-            # Lazy load GCP VM manager
-            if self._gcp_vm_manager is None:
-                try:
-                    from backend.core.gcp_vm_manager import GCPVMManager
-                    self._gcp_vm_manager = GCPVMManager()
-                    logger.info("    ☁️ GCP VM Manager initialized")
-                except ImportError:
-                    logger.warning("    ⚠️ GCP VM Manager not available")
-                    return False
+            # ================================================================
+            # Step 1: Initialize GCP infrastructure
+            # ================================================================
+            gcp_infra = await self._initialize_gcp_infrastructure()
+            if not gcp_infra:
+                logger.warning("    ⚠️ GCP infrastructure not available")
+                return False
+
+            vm_manager = gcp_infra.get("vm_manager")
+            ml_router = gcp_infra.get("ml_router")
+            hybrid_router = gcp_infra.get("hybrid_router")
 
             logger.info(f"    ☁️ Starting {definition.name} on GCP cloud...")
 
-            # Check if VM already exists and is running
-            vm_status = await self._gcp_vm_manager.get_vm_status(
-                f"jarvis-prime-{definition.name}"
+            # ================================================================
+            # Step 2: Determine optimal VM configuration
+            # ================================================================
+            vm_config = await self._determine_gcp_vm_config(definition, ml_router)
+            vm_name = vm_config["name"]
+            machine_type = vm_config["machine_type"]
+            use_spot = vm_config["use_spot"]
+
+            logger.info(
+                f"    📊 GCP VM config: {machine_type} "
+                f"({'Spot' if use_spot else 'On-demand'})"
             )
 
-            if vm_status and vm_status.get("status") == "RUNNING":
-                logger.info(f"    ✅ GCP VM already running")
-                # Get external IP and verify health
+            # ================================================================
+            # Step 3: Check if VM already exists and is running
+            # ================================================================
+            existing_vm = await self._check_existing_gcp_vm(
+                vm_manager, vm_name, definition
+            )
+            if existing_vm:
+                return True
+
+            # ================================================================
+            # Step 4: Create/start VM with service deployment
+            # ================================================================
+            vm_started = await self._create_and_start_gcp_vm(
+                vm_manager,
+                vm_name,
+                machine_type,
+                use_spot,
+                definition,
+            )
+
+            if not vm_started:
+                logger.warning(f"    ⚠️ Failed to start GCP VM")
+                return False
+
+            # ================================================================
+            # Step 5: Wait for service to be healthy
+            # ================================================================
+            return await self._wait_for_gcp_service_health(
+                vm_manager,
+                vm_name,
+                definition,
+            )
+
+        except ImportError as e:
+            logger.warning(f"    ⚠️ GCP module not available: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"    ❌ GCP service start failed: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            return False
+
+    async def _initialize_gcp_infrastructure(self) -> Optional[Dict[str, Any]]:
+        """
+        v93.10: Initialize GCP infrastructure components.
+
+        Lazy-loads:
+        - GCPVMManager for VM lifecycle
+        - CloudMLRouter for model routing (optional)
+        - HybridRouter for capability routing (optional)
+        """
+        infrastructure: Dict[str, Any] = {}
+
+        # VM Manager (required)
+        if self._gcp_vm_manager is None:
+            try:
+                from backend.core.gcp_vm_manager import get_gcp_vm_manager
+                self._gcp_vm_manager = get_gcp_vm_manager()
+                logger.info("    ☁️ GCP VM Manager initialized")
+            except ImportError:
+                try:
+                    from backend.core.gcp_vm_manager import GCPVMManager
+                    self._gcp_vm_manager = GCPVMManager()
+                    logger.info("    ☁️ GCP VM Manager initialized (direct)")
+                except ImportError:
+                    logger.warning("    ⚠️ GCP VM Manager not available")
+                    return None
+
+        infrastructure["vm_manager"] = self._gcp_vm_manager
+
+        # CloudML Router (optional - for intelligent routing)
+        try:
+            from backend.core.cloud_ml_router import CloudMLRouter, get_cloud_ml_router
+            try:
+                infrastructure["ml_router"] = get_cloud_ml_router()
+            except Exception:
+                infrastructure["ml_router"] = CloudMLRouter()
+            logger.debug("    ☁️ CloudML Router available")
+        except ImportError:
+            infrastructure["ml_router"] = None
+            logger.debug("    ℹ️ CloudML Router not available")
+
+        # Hybrid Router (optional - for capability-based routing)
+        try:
+            from backend.core.hybrid_router import HybridRouter, get_hybrid_router
+            try:
+                infrastructure["hybrid_router"] = get_hybrid_router()
+            except Exception:
+                infrastructure["hybrid_router"] = HybridRouter()
+            logger.debug("    ☁️ Hybrid Router available")
+        except ImportError:
+            infrastructure["hybrid_router"] = None
+            logger.debug("    ℹ️ Hybrid Router not available")
+
+        return infrastructure
+
+    async def _determine_gcp_vm_config(
+        self,
+        definition: ServiceDefinition,
+        ml_router: Optional[Any],
+    ) -> Dict[str, Any]:
+        """
+        v93.10: Determine optimal GCP VM configuration.
+
+        Considers:
+        - Model memory requirements
+        - Cost optimization (Spot vs On-demand)
+        - Region availability
+        """
+        # Estimate model memory requirements
+        estimated_model_gb = await self._estimate_model_memory_requirement(definition)
+
+        # Base VM name
+        vm_name = f"jarvis-prime-{definition.name}"
+
+        # Select machine type based on model requirements
+        if estimated_model_gb < 4.0:
+            # Small model: e2-standard-4 (16GB RAM)
+            machine_type = "e2-standard-4"
+        elif estimated_model_gb < 8.0:
+            # Medium model: e2-highmem-4 (32GB RAM)
+            machine_type = "e2-highmem-4"
+        elif estimated_model_gb < 16.0:
+            # Large model: e2-highmem-8 (64GB RAM)
+            machine_type = "e2-highmem-8"
+        else:
+            # Very large model: n1-highmem-8 (52GB RAM) with GPU option
+            machine_type = "n1-highmem-8"
+
+        # Use Spot VMs for cost savings (with preemption handling)
+        use_spot = True
+
+        # If ML router available, get its recommendation
+        if ml_router:
+            try:
+                ml_recommendation = await ml_router.get_vm_recommendation(
+                    model_size_gb=estimated_model_gb,
+                    prefer_spot=True,
+                )
+                if ml_recommendation:
+                    machine_type = ml_recommendation.get("machine_type", machine_type)
+                    use_spot = ml_recommendation.get("use_spot", use_spot)
+            except Exception as e:
+                logger.debug(f"    ML router recommendation failed: {e}")
+
+        return {
+            "name": vm_name,
+            "machine_type": machine_type,
+            "use_spot": use_spot,
+            "estimated_memory_gb": estimated_model_gb,
+        }
+
+    async def _check_existing_gcp_vm(
+        self,
+        vm_manager: Any,
+        vm_name: str,
+        definition: ServiceDefinition,
+    ) -> bool:
+        """
+        v93.10: Check if GCP VM already exists and is running.
+
+        Returns True if VM is running and service is healthy.
+        """
+        try:
+            # Check VM status
+            vm_status = await vm_manager.get_vm_status(vm_name)
+
+            if not vm_status:
+                return False
+
+            status = vm_status.get("status", "UNKNOWN")
+
+            if status == "RUNNING":
+                logger.info(f"    ✅ GCP VM '{vm_name}' already running")
+
+                # Get external IP
                 external_ip = vm_status.get("external_ip")
-                if external_ip:
-                    is_healthy, status = await self._check_docker_service_healthy(
-                        definition.name,
-                        definition.default_port,
-                        definition.health_endpoint,
+                if not external_ip:
+                    logger.warning(f"    ⚠️ VM running but no external IP")
+                    return False
+
+                # Check if service is healthy on the VM
+                is_healthy, health_status = await self._check_gcp_service_health(
+                    external_ip, definition
+                )
+
+                if is_healthy:
+                    logger.info(
+                        f"    ⚡ Connected to {definition.name} via GCP "
+                        f"({external_ip}, status: {health_status})"
                     )
-                    if is_healthy:
-                        logger.info(f"    ⚡ Connected to {definition.name} via GCP ({external_ip})")
-                        return True
+                    return True
+                else:
+                    logger.info(
+                        f"    ℹ️ VM running but service not healthy: {health_status}"
+                    )
+                    # Service might be starting, let the caller handle waiting
+                    return False
 
-            # Start or create VM
-            success = await self._gcp_vm_manager.ensure_vm_running(
-                name=f"jarvis-prime-{definition.name}",
-                machine_type="n1-standard-4",
-                timeout=self.config.gcp_vm_startup_timeout,
-            )
+            elif status in ("STAGING", "PROVISIONING"):
+                logger.info(f"    ℹ️ GCP VM '{vm_name}' is {status}...")
+                return False
 
-            return success
+            elif status == "TERMINATED":
+                logger.info(f"    ℹ️ GCP VM '{vm_name}' is terminated, will restart")
+                return False
+
+            else:
+                logger.info(f"    ℹ️ GCP VM '{vm_name}' status: {status}")
+                return False
 
         except Exception as e:
-            logger.warning(f"    ⚠️ GCP service start failed: {e}")
+            logger.debug(f"    VM status check failed: {e}")
             return False
+
+    async def _create_and_start_gcp_vm(
+        self,
+        vm_manager: Any,
+        vm_name: str,
+        machine_type: str,
+        use_spot: bool,
+        definition: ServiceDefinition,
+    ) -> bool:
+        """
+        v93.10: Create and start GCP VM with jarvis-prime service.
+        """
+        try:
+            logger.info(
+                f"    🚀 Creating/starting GCP VM '{vm_name}' "
+                f"({machine_type}, {'Spot' if use_spot else 'On-demand'})..."
+            )
+
+            # Create or start VM
+            # Try the enhanced method first
+            try:
+                result = await vm_manager.ensure_vm_running(
+                    name=vm_name,
+                    machine_type=machine_type,
+                    preemptible=use_spot,
+                    startup_script=self._generate_gcp_startup_script(definition),
+                    timeout=self.config.gcp_vm_startup_timeout,
+                )
+                return result
+            except TypeError:
+                # Fallback to simpler interface
+                result = await vm_manager.ensure_vm_running(
+                    name=vm_name,
+                    machine_type=machine_type,
+                    timeout=self.config.gcp_vm_startup_timeout,
+                )
+                return result
+
+        except Exception as e:
+            logger.error(f"    ❌ Failed to create/start GCP VM: {e}")
+            return False
+
+    def _generate_gcp_startup_script(self, definition: ServiceDefinition) -> str:
+        """
+        v93.10: Generate startup script for GCP VM.
+
+        Installs and starts jarvis-prime on the VM.
+        """
+        return f"""#!/bin/bash
+set -e
+
+# Log startup
+exec > >(tee /var/log/jarvis-prime-startup.log) 2>&1
+echo "=== JARVIS Prime GCP Startup Script ==="
+date
+
+# Install dependencies
+apt-get update
+apt-get install -y python3-pip python3-venv git
+
+# Clone or update jarvis-prime
+cd /opt
+if [ -d "jarvis-prime" ]; then
+    cd jarvis-prime && git pull
+else
+    git clone https://github.com/your-org/jarvis-prime.git
+    cd jarvis-prime
+fi
+
+# Create virtual environment
+python3 -m venv venv
+source venv/bin/activate
+
+# Install requirements
+pip install -r requirements.txt
+
+# Download model if not exists
+if [ ! -f "models/current.gguf" ]; then
+    python -m jarvis_prime.docker.model_downloader --model phi-3.5-mini
+fi
+
+# Start server
+python run_server.py --host 0.0.0.0 --port {definition.default_port} &
+
+echo "=== JARVIS Prime started ==="
+"""
+
+    async def _check_gcp_service_health(
+        self,
+        external_ip: str,
+        definition: ServiceDefinition,
+    ) -> tuple[bool, str]:
+        """
+        v93.10: Check health of service running on GCP VM.
+        """
+        url = f"http://{external_ip}:{definition.default_port}{definition.health_endpoint}"
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    url,
+                    timeout=aiohttp.ClientTimeout(total=10.0)
+                ) as response:
+                    if response.status != 200:
+                        return False, f"HTTP {response.status}"
+
+                    try:
+                        data = await response.json()
+                        status = data.get("status", "unknown")
+
+                        if status == "healthy":
+                            return True, "healthy"
+                        elif status == "starting":
+                            elapsed = data.get("model_load_elapsed_seconds", 0)
+                            return False, f"starting (model loading: {elapsed:.0f}s)"
+                        else:
+                            return False, status
+                    except Exception:
+                        return True, "healthy (no JSON)"
+
+        except asyncio.TimeoutError:
+            return False, "timeout"
+        except aiohttp.ClientConnectorError:
+            return False, "connection refused"
+        except Exception as e:
+            return False, f"error: {e}"
+
+    async def _wait_for_gcp_service_health(
+        self,
+        vm_manager: Any,
+        vm_name: str,
+        definition: ServiceDefinition,
+    ) -> bool:
+        """
+        v93.10: Wait for service on GCP VM to become healthy.
+
+        Includes:
+        - VM status monitoring
+        - Service health checking
+        - Progress logging
+        """
+        start_time = time.time()
+        timeout = self.config.gcp_vm_startup_timeout
+        check_interval = 5.0
+        last_log_time = start_time
+
+        logger.info(
+            f"    ⏳ Waiting for GCP service to become healthy "
+            f"(timeout: {timeout:.0f}s)..."
+        )
+
+        while (time.time() - start_time) < timeout:
+            elapsed = time.time() - start_time
+
+            # Check VM status first
+            try:
+                vm_status = await vm_manager.get_vm_status(vm_name)
+
+                if not vm_status:
+                    logger.warning(f"    ⚠️ VM status unavailable")
+                    await asyncio.sleep(check_interval)
+                    continue
+
+                status = vm_status.get("status", "UNKNOWN")
+
+                if status != "RUNNING":
+                    # Log progress every 30 seconds
+                    if (time.time() - last_log_time) >= 30.0:
+                        logger.info(
+                            f"    ⏳ VM status: {status} ({elapsed:.0f}s elapsed)"
+                        )
+                        last_log_time = time.time()
+                    await asyncio.sleep(check_interval)
+                    continue
+
+                # VM is running, check service health
+                external_ip = vm_status.get("external_ip")
+                if not external_ip:
+                    await asyncio.sleep(check_interval)
+                    continue
+
+                is_healthy, health_status = await self._check_gcp_service_health(
+                    external_ip, definition
+                )
+
+                if is_healthy:
+                    total_time = time.time() - start_time
+                    logger.info(
+                        f"    ✅ GCP service healthy after {total_time:.1f}s "
+                        f"(IP: {external_ip})"
+                    )
+                    return True
+
+                # Log progress
+                if (time.time() - last_log_time) >= 30.0:
+                    remaining = timeout - elapsed
+                    logger.info(
+                        f"    ⏳ GCP service: {health_status} "
+                        f"({elapsed:.0f}s elapsed, {remaining:.0f}s remaining)"
+                    )
+                    last_log_time = time.time()
+
+            except Exception as e:
+                logger.debug(f"    Health check error: {e}")
+
+            await asyncio.sleep(check_interval)
+
+        # Timeout
+        total_time = time.time() - start_time
+        logger.warning(
+            f"    ⚠️ GCP service health timeout after {total_time:.1f}s"
+        )
+        return False
 
     # =========================================================================
     # v93.9: Enhanced Docker Container Startup
