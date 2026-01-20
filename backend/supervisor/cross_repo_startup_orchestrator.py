@@ -52,9 +52,16 @@ Architecture:
     └──────────────────────────────────────────────────────────────────┘
 
 Author: JARVIS AI System
-Version: 5.3.0
+Version: 5.4.0 (v93.8)
 
 Changelog:
+- v93.8 (v5.4): Docker Hybrid Mode - checks Docker before spawning local process
+  - Automatic detection of jarvis-prime Docker container
+  - Docker-first, local-fallback approach for seamless deployment
+  - Optional auto-start of Docker containers
+  - Pre-loaded models in Docker eliminate startup delays
+- v93.7: Fixed duplicate health check requests, enhanced step logging
+- v93.5: Intelligent progress-based timeout extension for model loading
 - v5.3: Made startup resilient to CancelledError (don't propagate during init)
 - v5.2: Fixed loop.stop() antipattern, proper task cancellation on shutdown
 - v5.1: Fixed sys.exit() antipattern in async shutdown handler
@@ -204,6 +211,39 @@ class OrchestratorConfig:
     # Output streaming
     stream_output: bool = field(
         default_factory=lambda: os.getenv("STREAM_CHILD_OUTPUT", "true").lower() == "true"
+    )
+
+    # =========================================================================
+    # v93.8: Docker Hybrid Mode Configuration
+    # =========================================================================
+    # Enable Docker-first startup for jarvis-prime (checks Docker before local)
+    docker_hybrid_enabled: bool = field(
+        default_factory=lambda: os.getenv("DOCKER_HYBRID_ENABLED", "true").lower() == "true"
+    )
+
+    # Docker container name for jarvis-prime
+    jarvis_prime_docker_container: str = field(
+        default_factory=lambda: os.getenv("JARVIS_PRIME_DOCKER_CONTAINER", "jarvis-prime-service")
+    )
+
+    # Docker compose file path (relative to jarvis-prime repo)
+    jarvis_prime_docker_compose: str = field(
+        default_factory=lambda: os.getenv("JARVIS_PRIME_DOCKER_COMPOSE", "docker/docker-compose.yml")
+    )
+
+    # Timeout for Docker health check
+    docker_health_timeout: float = field(
+        default_factory=lambda: float(os.getenv("DOCKER_HEALTH_TIMEOUT", "5.0"))
+    )
+
+    # Whether to auto-start Docker container if not running
+    docker_auto_start: bool = field(
+        default_factory=lambda: os.getenv("DOCKER_AUTO_START", "false").lower() == "true"
+    )
+
+    # Docker startup timeout (waiting for container to become healthy)
+    docker_startup_timeout: float = field(
+        default_factory=lambda: float(os.getenv("DOCKER_STARTUP_TIMEOUT", "180.0"))
     )
 
 
@@ -446,6 +486,319 @@ class ProcessOrchestrator:
             pass
 
         return False
+
+    # =========================================================================
+    # v93.8: Docker Hybrid Mode - Check Docker Before Local Process
+    # =========================================================================
+
+    async def _check_docker_available(self) -> bool:
+        """
+        v93.8: Check if Docker is available and running.
+
+        Returns True if Docker daemon is accessible.
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "docker", "info",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            return_code = await asyncio.wait_for(proc.wait(), timeout=5.0)
+            return return_code == 0
+        except (asyncio.TimeoutError, FileNotFoundError, Exception):
+            return False
+
+    async def _check_docker_container_running(self, container_name: str) -> bool:
+        """
+        v93.8: Check if a specific Docker container is running.
+
+        Args:
+            container_name: Name of the Docker container to check
+
+        Returns:
+            True if container is running
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "docker", "container", "inspect",
+                "-f", "{{.State.Running}}",
+                container_name,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+
+            if proc.returncode != 0:
+                return False
+
+            output = stdout.decode().strip().lower()
+            return output == "true"
+
+        except (asyncio.TimeoutError, FileNotFoundError, Exception) as e:
+            logger.debug(f"Docker container check failed: {e}")
+            return False
+
+    async def _check_docker_service_healthy(
+        self,
+        service_name: str,
+        port: int,
+        health_endpoint: str = "/health",
+    ) -> tuple[bool, Optional[str]]:
+        """
+        v93.8: Check if a Docker-hosted service is healthy via HTTP.
+
+        Args:
+            service_name: Name of the service (for logging)
+            port: Port the service is exposed on
+            health_endpoint: Health check endpoint path
+
+        Returns:
+            Tuple of (is_healthy, status_string)
+        """
+        url = f"http://localhost:{port}{health_endpoint}"
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    url,
+                    timeout=aiohttp.ClientTimeout(total=self.config.docker_health_timeout)
+                ) as response:
+                    if response.status != 200:
+                        return False, f"HTTP {response.status}"
+
+                    try:
+                        data = await response.json()
+                        status = data.get("status", "unknown")
+
+                        if status == "healthy":
+                            return True, "healthy"
+                        elif status == "starting":
+                            elapsed = data.get("model_load_elapsed_seconds", 0)
+                            return False, f"starting (model loading: {elapsed:.0f}s)"
+                        else:
+                            return False, status
+                    except Exception:
+                        # Couldn't parse JSON, but got 200 - assume healthy
+                        return True, "healthy (no JSON)"
+
+        except asyncio.TimeoutError:
+            return False, "timeout"
+        except aiohttp.ClientConnectorError:
+            return False, "connection refused"
+        except Exception as e:
+            return False, f"error: {e}"
+
+    async def _try_docker_hybrid_for_service(
+        self,
+        definition: ServiceDefinition,
+    ) -> tuple[bool, str]:
+        """
+        v93.8: Attempt to use Docker container for a service before spawning local.
+
+        This implements the "Docker-first, local-fallback" hybrid approach.
+
+        Args:
+            definition: Service definition to check
+
+        Returns:
+            Tuple of (should_skip_local_spawn, reason_message)
+            - If (True, msg): Docker container is handling the service, skip local spawn
+            - If (False, msg): Docker not available/healthy, proceed with local spawn
+        """
+        # Only jarvis-prime supports Docker hybrid mode currently
+        if definition.name != "jarvis-prime":
+            return False, "service does not support Docker hybrid mode"
+
+        if not self.config.docker_hybrid_enabled:
+            return False, "Docker hybrid mode disabled via config"
+
+        logger.info(f"    🐳 Checking Docker hybrid mode for {definition.name}...")
+
+        # Step 1: Check if Docker is available
+        docker_available = await self._check_docker_available()
+        if not docker_available:
+            logger.info(f"    ℹ️  Docker not available, using local process")
+            return False, "Docker not available"
+
+        # Step 2: Check if the container is running
+        container_name = self.config.jarvis_prime_docker_container
+        container_running = await self._check_docker_container_running(container_name)
+
+        if container_running:
+            logger.info(f"    ✅ Docker container '{container_name}' is running")
+
+            # Step 3: Check if the service is healthy
+            is_healthy, status = await self._check_docker_service_healthy(
+                definition.name,
+                definition.default_port,
+                definition.health_endpoint,
+            )
+
+            if is_healthy:
+                logger.info(
+                    f"    ⚡ Connected to {definition.name} via Docker (status: {status})"
+                )
+                return True, f"Docker container healthy ({status})"
+            else:
+                # Container running but not healthy - might be starting up
+                logger.info(
+                    f"    ℹ️  Docker container running but not healthy: {status}"
+                )
+
+                if "starting" in status or "model loading" in status:
+                    # Service is starting in Docker, wait for it
+                    logger.info(
+                        f"    ⏳ Waiting for Docker container to become healthy..."
+                    )
+
+                    healthy = await self._wait_for_docker_health(
+                        definition.name,
+                        definition.default_port,
+                        definition.health_endpoint,
+                        timeout=self.config.docker_startup_timeout,
+                    )
+
+                    if healthy:
+                        logger.info(
+                            f"    ⚡ Connected to {definition.name} via Docker (healthy after waiting)"
+                        )
+                        return True, "Docker container healthy after waiting"
+                    else:
+                        logger.warning(
+                            f"    ⚠️  Docker container failed to become healthy, using local process"
+                        )
+                        return False, "Docker container unhealthy after timeout"
+                else:
+                    # Container has error status
+                    logger.warning(
+                        f"    ⚠️  Docker container unhealthy ({status}), using local process"
+                    )
+                    return False, f"Docker container unhealthy: {status}"
+        else:
+            # Container not running
+            logger.info(f"    ℹ️  Docker container '{container_name}' not running")
+
+            # Optionally auto-start Docker container
+            if self.config.docker_auto_start:
+                logger.info(f"    🚀 Auto-starting Docker container...")
+                started = await self._start_docker_container(definition)
+                if started:
+                    logger.info(
+                        f"    ⚡ Connected to {definition.name} via Docker (auto-started)"
+                    )
+                    return True, "Docker container auto-started"
+                else:
+                    logger.warning(
+                        f"    ⚠️  Failed to auto-start Docker container, using local process"
+                    )
+                    return False, "Docker auto-start failed"
+            else:
+                return False, "Docker container not running (auto-start disabled)"
+
+    async def _wait_for_docker_health(
+        self,
+        service_name: str,
+        port: int,
+        health_endpoint: str,
+        timeout: float = 180.0,
+    ) -> bool:
+        """
+        v93.8: Wait for a Docker-hosted service to become healthy.
+
+        Args:
+            service_name: Name of the service (for logging)
+            port: Port the service is exposed on
+            health_endpoint: Health check endpoint path
+            timeout: Maximum time to wait
+
+        Returns:
+            True if service became healthy within timeout
+        """
+        start_time = time.time()
+        check_interval = 3.0
+        last_log_time = start_time
+
+        while (time.time() - start_time) < timeout:
+            is_healthy, status = await self._check_docker_service_healthy(
+                service_name, port, health_endpoint
+            )
+
+            if is_healthy:
+                return True
+
+            # Log progress every 30 seconds
+            if (time.time() - last_log_time) >= 30.0:
+                elapsed = time.time() - start_time
+                remaining = timeout - elapsed
+                logger.info(
+                    f"    ⏳ {service_name} Docker: {status} "
+                    f"({elapsed:.0f}s elapsed, {remaining:.0f}s remaining)"
+                )
+                last_log_time = time.time()
+
+            await asyncio.sleep(check_interval)
+
+        return False
+
+    async def _start_docker_container(self, definition: ServiceDefinition) -> bool:
+        """
+        v93.8: Start the Docker container for a service using docker-compose.
+
+        Args:
+            definition: Service definition
+
+        Returns:
+            True if container started and became healthy
+        """
+        if definition.name != "jarvis-prime":
+            return False
+
+        compose_file = definition.repo_path / self.config.jarvis_prime_docker_compose
+
+        if not compose_file.exists():
+            logger.warning(f"    Docker compose file not found: {compose_file}")
+            return False
+
+        try:
+            logger.info(f"    Running: docker compose -f {compose_file} up -d")
+
+            proc = await asyncio.create_subprocess_exec(
+                "docker", "compose",
+                "-f", str(compose_file),
+                "up", "-d",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=str(definition.repo_path),
+            )
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(),
+                timeout=60.0
+            )
+
+            if proc.returncode != 0:
+                logger.warning(
+                    f"    Docker compose up failed: {stderr.decode()}"
+                )
+                return False
+
+            logger.info(f"    Docker container starting, waiting for health...")
+
+            # Wait for container to become healthy
+            healthy = await self._wait_for_docker_health(
+                definition.name,
+                definition.default_port,
+                definition.health_endpoint,
+                timeout=self.config.docker_startup_timeout,
+            )
+
+            return healthy
+
+        except asyncio.TimeoutError:
+            logger.warning(f"    Docker compose up timed out")
+            return False
+        except Exception as e:
+            logger.warning(f"    Docker compose up failed: {e}")
+            return False
 
     @property
     def registry(self):
@@ -802,38 +1155,46 @@ class ProcessOrchestrator:
 
     async def _health_monitor_loop(self, managed: ManagedProcess) -> None:
         """
-        v93.0: Enhanced background health monitoring with robust auto-healing.
+        v93.8: Enhanced background health monitoring with Docker support.
 
         CRITICAL FIX: Previous version would `break` after auto-heal, which meant
         if auto-heal failed, monitoring would stop completely. Now we continue
         monitoring and retry auto-heal as needed.
 
         Features:
-        - Robust process death detection with poll()
+        - Robust process death detection with poll() (local processes)
+        - Docker container health monitoring (no local process)
         - Continuous monitoring even after auto-heal attempts
         - HTTP health check with consecutive failure tracking
         - Heartbeat updates to service registry
         - Graceful degradation on temporary failures
         """
+        # v93.8: Determine if this is a Docker-hosted service
+        is_docker_service = managed.pid is None and managed.port is not None
+
         try:
             while not self._shutdown_event.is_set():
                 await asyncio.sleep(self.config.health_check_interval)
 
-                # v93.0: Enhanced process death detection
-                # Use poll() to update returncode without blocking
-                if managed.process is not None:
-                    try:
-                        # poll() returns None if still running, exit code if terminated
-                        poll_result = managed.process.returncode
-                        if poll_result is None:
-                            # Process might have exited but returncode not updated yet
-                            # On macOS/Unix, we need to wait() to reap zombie processes
-                            # Use wait_for with 0 timeout to check without blocking
-                            pass  # returncode is None means still running
-                    except Exception:
-                        pass
+                # v93.8: For Docker services, skip process death detection
+                # Docker containers don't have a local process to monitor
+                if not is_docker_service:
+                    # v93.0: Enhanced process death detection for LOCAL processes
+                    # Use poll() to update returncode without blocking
+                    if managed.process is not None:
+                        try:
+                            # poll() returns None if still running, exit code if terminated
+                            poll_result = managed.process.returncode
+                            if poll_result is None:
+                                # Process might have exited but returncode not updated yet
+                                # On macOS/Unix, we need to wait() to reap zombie processes
+                                # Use wait_for with 0 timeout to check without blocking
+                                pass  # returncode is None means still running
+                        except Exception:
+                            pass
 
-                if not managed.is_running:
+                # v93.8: Check if running - for Docker services, always use HTTP health check
+                if not is_docker_service and not managed.is_running:
                     # Process died, trigger auto-heal if enabled
                     exit_code = managed.process.returncode if managed.process else "unknown"
                     logger.warning(
@@ -1628,8 +1989,46 @@ class ProcessOrchestrator:
             except Exception:
                 pass
 
-            # Need to spawn
-            logger.info(f"    ℹ️ {definition.name} not running, spawning...")
+            # v93.8: Try Docker hybrid mode before spawning local process
+            # This checks if a Docker container is running and healthy
+            use_docker, docker_reason = await self._try_docker_hybrid_for_service(definition)
+            if use_docker:
+                logger.info(f"    🐳 {definition.name}: Using Docker container ({docker_reason})")
+                results[definition.name] = True
+
+                # Create a managed process entry for Docker (no actual process, just tracking)
+                managed = ManagedProcess(definition=definition)
+                managed.status = ServiceStatus.HEALTHY
+                managed.port = definition.default_port
+                managed.pid = None  # Docker container, no local PID
+                self.processes[definition.name] = managed
+
+                # Start health monitor for Docker-hosted service
+                managed.health_monitor_task = asyncio.create_task(
+                    self._health_monitor_loop(managed)
+                )
+
+                # Register in service registry (with special metadata)
+                if self.registry:
+                    await self.registry.register_service(
+                        service_name=definition.name,
+                        pid=0,  # Special PID 0 indicates Docker
+                        port=managed.port,
+                        health_endpoint=definition.health_endpoint,
+                        metadata={
+                            "repo_path": str(definition.repo_path),
+                            "docker": True,
+                            "container": self.config.jarvis_prime_docker_container,
+                        }
+                    )
+                continue
+
+            # Docker not available or not healthy - fallback to local process
+            if docker_reason and "not available" not in docker_reason.lower():
+                logger.info(f"    ℹ️  Docker fallback: {docker_reason}")
+
+            # Need to spawn local process
+            logger.info(f"    ℹ️ {definition.name} not running, spawning local process...")
 
             managed = ManagedProcess(definition=definition)
             self.processes[definition.name] = managed
@@ -1638,7 +2037,7 @@ class ProcessOrchestrator:
             results[definition.name] = success
 
             if success:
-                logger.info(f"    ✅ {definition.name} started successfully")
+                logger.info(f"    ✅ {definition.name} started successfully (local)")
             else:
                 logger.warning(f"    ⚠️ {definition.name} failed to start (degraded mode)")
 
