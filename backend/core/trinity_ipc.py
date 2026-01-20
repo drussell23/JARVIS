@@ -191,6 +191,12 @@ class HeartbeatData:
     metrics: Dict[str, Any] = field(default_factory=dict)
     dependencies_ready: Dict[str, bool] = field(default_factory=dict)
 
+    # v93.3: Startup coordination fields
+    startup_phase: bool = True  # True during startup grace period
+    startup_progress_pct: float = 0.0  # 0-100% initialization progress
+    startup_step: str = ""  # Current initialization step name
+    registered_at: float = 0.0  # When component first registered
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "component_type": self.component_type.value if isinstance(self.component_type, ComponentType) else self.component_type,
@@ -203,6 +209,11 @@ class HeartbeatData:
             "version": self.version,
             "metrics": self.metrics,
             "dependencies_ready": self.dependencies_ready,
+            # v93.3: Startup coordination
+            "startup_phase": self.startup_phase,
+            "startup_progress_pct": self.startup_progress_pct,
+            "startup_step": self.startup_step,
+            "registered_at": self.registered_at,
         }
 
     @classmethod
@@ -231,6 +242,11 @@ class HeartbeatData:
             version=data.get("version", "unknown"),
             metrics=data.get("metrics", {}),
             dependencies_ready=data.get("dependencies_ready", {}),
+            # v93.3: Startup coordination
+            startup_phase=data.get("startup_phase", True),
+            startup_progress_pct=data.get("startup_progress_pct", 0.0),
+            startup_step=data.get("startup_step", ""),
+            registered_at=data.get("registered_at", 0.0),
         )
 
     @property
@@ -242,6 +258,52 @@ class HeartbeatData:
     def age_seconds(self) -> float:
         """Get age of heartbeat in seconds."""
         return time.time() - self.timestamp
+
+    def is_in_startup_phase(self, startup_grace_period: float = 120.0) -> bool:
+        """
+        v93.3: Check if component is still in startup grace period.
+
+        Args:
+            startup_grace_period: Seconds after registration during startup phase
+
+        Returns:
+            True if still in startup phase
+        """
+        if self.registered_at <= 0:
+            # No registered_at timestamp - use uptime as fallback
+            return self.uptime_seconds < startup_grace_period
+        return (time.time() - self.registered_at) < startup_grace_period
+
+    def is_stale_startup_aware(
+        self,
+        timeout_seconds: float = 30.0,
+        startup_grace_period: float = 120.0,
+        startup_multiplier: float = 5.0,
+    ) -> bool:
+        """
+        v93.3: Startup-aware stale detection for Trinity components.
+
+        During startup grace period, uses extended timeout to allow
+        components time to fully initialize.
+
+        Args:
+            timeout_seconds: Normal stale timeout
+            startup_grace_period: How long to consider component "starting"
+            startup_multiplier: Multiply timeout by this during startup
+
+        Returns:
+            True if heartbeat is stale (accounting for startup phase)
+        """
+        effective_timeout = timeout_seconds
+        if self.is_in_startup_phase(startup_grace_period):
+            effective_timeout = timeout_seconds * startup_multiplier
+
+        return self.age_seconds > effective_timeout
+
+    @property
+    def is_initializing(self) -> bool:
+        """v93.3: Check if component is still initializing."""
+        return self.startup_phase or self.status == "starting"
 
 
 @dataclass

@@ -1259,10 +1259,18 @@ class TrinityLaunchConfig:
     )
 
     # =========================================================================
-    # v100.0: Heartbeat Thresholds
+    # v93.3: Heartbeat Thresholds with Startup Awareness
     # =========================================================================
     heartbeat_stale_threshold_sec: float = field(default_factory=lambda:
-        float(os.getenv("TRINITY_HEARTBEAT_STALE_THRESHOLD", "30.0"))
+        float(os.getenv("TRINITY_HEARTBEAT_STALE_THRESHOLD", "60.0"))  # v93.3: Increased from 30s to 60s
+    )
+    # v93.3: Startup grace period - extended stale threshold during initial startup
+    startup_grace_period_sec: float = field(default_factory=lambda:
+        float(os.getenv("TRINITY_STARTUP_GRACE_PERIOD", "120.0"))  # 2 minutes grace
+    )
+    # v93.3: Multiplier for stale threshold during startup
+    startup_stale_multiplier: float = field(default_factory=lambda:
+        float(os.getenv("TRINITY_STARTUP_STALE_MULTIPLIER", "5.0"))  # 5x during startup
     )
 
     # =========================================================================

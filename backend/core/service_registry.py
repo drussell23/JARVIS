@@ -289,6 +289,51 @@ class ServiceInfo:
         """Check if service hasn't sent heartbeat in timeout period."""
         return (time.time() - self.last_heartbeat) > timeout_seconds
 
+    def is_in_startup_phase(self, startup_grace_period: float = 120.0) -> bool:
+        """
+        v93.3: Check if service is still in its startup grace period.
+
+        During startup, services may take longer to initialize and may not
+        send heartbeats as frequently. This method identifies services that
+        were registered recently and should be given extra time.
+
+        Args:
+            startup_grace_period: Seconds after registration during which
+                                  service is considered "starting up"
+
+        Returns:
+            True if service is within startup grace period
+        """
+        if self.registered_at <= 0:
+            return False
+        return (time.time() - self.registered_at) < startup_grace_period
+
+    def is_stale_startup_aware(
+        self,
+        timeout_seconds: float = 60.0,
+        startup_grace_period: float = 120.0,
+        startup_multiplier: float = 5.0,
+    ) -> bool:
+        """
+        v93.3: Startup-aware stale detection.
+
+        Uses extended timeout during startup grace period to allow
+        services time to fully initialize before marking them stale.
+
+        Args:
+            timeout_seconds: Normal stale timeout
+            startup_grace_period: How long to consider service "starting"
+            startup_multiplier: Multiply timeout by this during startup
+
+        Returns:
+            True if service is stale (accounting for startup phase)
+        """
+        effective_timeout = timeout_seconds
+        if self.is_in_startup_phase(startup_grace_period):
+            effective_timeout = timeout_seconds * startup_multiplier
+
+        return (time.time() - self.last_heartbeat) > effective_timeout
+
     def validate(self) -> tuple[bool, str]:
         """
         v4.0: Comprehensive validation of service entry.
@@ -339,7 +384,8 @@ class ServiceRegistry:
         self,
         registry_dir: Optional[Path] = None,
         heartbeat_timeout: float = 60.0,
-        cleanup_interval: float = 30.0
+        cleanup_interval: float = 30.0,
+        startup_grace_period: float = None,
     ):
         """
         Initialize service registry.
@@ -348,12 +394,22 @@ class ServiceRegistry:
             registry_dir: Directory for registry file (default: ~/.jarvis/registry)
             heartbeat_timeout: Seconds before service considered stale
             cleanup_interval: Seconds between cleanup cycles
+            startup_grace_period: v93.3 - Grace period for newly registered services (default: from env)
         """
         self.registry_dir = registry_dir or Path.home() / ".jarvis" / "registry"
         self.registry_file = self.registry_dir / "services.json"
         self.heartbeat_timeout = heartbeat_timeout
         self.cleanup_interval = cleanup_interval
         self._cleanup_task: Optional[asyncio.Task] = None
+
+        # v93.3: Startup-aware grace period configuration
+        self.startup_grace_period = startup_grace_period or float(
+            os.environ.get("JARVIS_SERVICE_STARTUP_GRACE", "120.0")
+        )
+        # v93.3: Extended stale threshold during startup (5x normal)
+        self.startup_stale_multiplier = float(
+            os.environ.get("JARVIS_STARTUP_STALE_MULTIPLIER", "5.0")
+        )
 
         # v93.0: Use DirectoryManager for robust directory handling
         self._dir_manager = DirectoryManager(self.registry_dir)
@@ -576,10 +632,18 @@ class ServiceRegistry:
             await self.deregister_service(service_name)
             return None
 
-        # Check if stale (no recent heartbeat)
-        if service.is_stale(self.heartbeat_timeout):
+        # v93.3: Startup-aware stale check
+        is_in_startup = service.is_in_startup_phase(self.startup_grace_period)
+        is_stale = service.is_stale_startup_aware(
+            timeout_seconds=self.heartbeat_timeout,
+            startup_grace_period=self.startup_grace_period,
+            startup_multiplier=self.startup_stale_multiplier,
+        )
+
+        if is_stale:
+            startup_note = " (after startup grace)" if not is_in_startup else ""
             logger.warning(
-                f"⚠️  Service {service_name} is stale "
+                f"⚠️  Service {service_name} is stale{startup_note} "
                 f"(last heartbeat {time.time() - service.last_heartbeat:.0f}s ago)"
             )
             return None
@@ -601,10 +665,15 @@ class ServiceRegistry:
         if not healthy_only:
             return list(services.values())
 
-        # Filter to only healthy services
+        # v93.3: Filter to only healthy services with startup-aware stale detection
         healthy = []
         for service in services.values():
-            if service.is_process_alive() and not service.is_stale(self.heartbeat_timeout):
+            is_stale = service.is_stale_startup_aware(
+                timeout_seconds=self.heartbeat_timeout,
+                startup_grace_period=self.startup_grace_period,
+                startup_multiplier=self.startup_stale_multiplier,
+            )
+            if service.is_process_alive() and not is_stale:
                 healthy.append(service)
 
         return healthy
@@ -665,13 +734,24 @@ class ServiceRegistry:
                 )
                 should_remove = True
 
-            # Check if stale
-            elif service.is_stale(self.heartbeat_timeout):
-                logger.info(
-                    f"🧹 Cleaning stale service: {service_name} "
-                    f"(last heartbeat {time.time() - service.last_heartbeat:.0f}s ago)"
-                )
-                should_remove = True
+            # v93.3: Check if stale with startup awareness
+            elif service.is_stale_startup_aware(
+                timeout_seconds=self.heartbeat_timeout,
+                startup_grace_period=self.startup_grace_period,
+                startup_multiplier=self.startup_stale_multiplier,
+            ):
+                in_startup = service.is_in_startup_phase(self.startup_grace_period)
+                # Only clean if past startup grace period
+                if not in_startup:
+                    logger.info(
+                        f"🧹 Cleaning stale service: {service_name} "
+                        f"(last heartbeat {time.time() - service.last_heartbeat:.0f}s ago)"
+                    )
+                    should_remove = True
+                else:
+                    logger.debug(
+                        f"⏳ Service {service_name} stale but in startup phase, keeping"
+                    )
 
             if should_remove:
                 del services[service_name]
@@ -826,16 +906,32 @@ class ServiceRegistry:
                     f"(PID: {service.pid}, Port: {service.port})"
                 )
             else:
-                # v4.1: Check for stale services with tiered cleanup
-                # Services without recent heartbeat should be cleaned up aggressively
-                if service.is_stale(self.heartbeat_timeout):
-                    stale_age = time.time() - service.last_heartbeat
+                # v93.3: Startup-aware stale detection with tiered cleanup
+                # Services without recent heartbeat should be cleaned up, but give
+                # newly registered services extra time during startup grace period
+                is_in_startup = service.is_in_startup_phase(self.startup_grace_period)
 
-                    # v4.1: Very stale threshold - 5 minutes (300s)
-                    # If a service hasn't heartbeated in 5+ minutes, it's zombie
-                    very_stale_threshold = float(os.environ.get(
+                # Use startup-aware stale detection
+                is_stale = service.is_stale_startup_aware(
+                    timeout_seconds=self.heartbeat_timeout,
+                    startup_grace_period=self.startup_grace_period,
+                    startup_multiplier=self.startup_stale_multiplier,
+                )
+
+                if is_stale:
+                    stale_age = time.time() - service.last_heartbeat
+                    service_age = time.time() - service.registered_at
+
+                    # v93.3: Effective very stale threshold - accounts for startup
+                    # During startup: 5x normal threshold
+                    # After startup: normal threshold (300s)
+                    base_very_stale = float(os.environ.get(
                         "JARVIS_VERY_STALE_THRESHOLD", "300.0"
                     ))
+                    very_stale_threshold = (
+                        base_very_stale * self.startup_stale_multiplier
+                        if is_in_startup else base_very_stale
+                    )
 
                     if stale_age > very_stale_threshold:
                         # Very stale - treat as dead and clean up
@@ -851,16 +947,19 @@ class ServiceRegistry:
                             "action": "removed"
                         })
                     else:
-                        # Mildly stale - warn but keep for now (might be starting up)
+                        # Mildly stale - warn but keep for now
+                        startup_status = " (in startup phase)" if is_in_startup else ""
                         logger.warning(
-                            f"  ⚠️  {service_name} is stale "
-                            f"(last heartbeat {stale_age:.0f}s ago) - keeping for now"
+                            f"  ⚠️  {service_name} is stale{startup_status} "
+                            f"(last heartbeat {stale_age:.0f}s ago, age {service_age:.0f}s) - keeping for now"
                         )
                         stats["valid_entries"] += 1
                         stats["removed_stale"].append({
                             "name": service_name,
                             "pid": service.pid,
                             "stale_seconds": stale_age,
+                            "service_age": service_age,
+                            "in_startup": is_in_startup,
                             "action": "kept"
                         })
                 else:
@@ -962,7 +1061,13 @@ class ServiceRegistry:
 
         for service_name, service in services.items():
             is_alive = service.is_process_alive()
-            is_stale = service.is_stale(self.heartbeat_timeout)
+            # v93.3: Use startup-aware stale detection for health report
+            is_in_startup = service.is_in_startup_phase(self.startup_grace_period)
+            is_stale = service.is_stale_startup_aware(
+                timeout_seconds=self.heartbeat_timeout,
+                startup_grace_period=self.startup_grace_period,
+                startup_multiplier=self.startup_stale_multiplier,
+            )
 
             service_report = {
                 "pid": service.pid,
@@ -971,6 +1076,7 @@ class ServiceRegistry:
                 "status": service.status,
                 "is_alive": is_alive,
                 "is_stale": is_stale,
+                "is_in_startup": is_in_startup,  # v93.3: Track startup phase
                 "registered_at": datetime.fromtimestamp(
                     service.registered_at
                 ).isoformat() if service.registered_at else None,
@@ -978,6 +1084,7 @@ class ServiceRegistry:
                     service.last_heartbeat
                 ).isoformat() if service.last_heartbeat else None,
                 "heartbeat_age_seconds": time.time() - service.last_heartbeat,
+                "service_age_seconds": time.time() - service.registered_at,  # v93.3
             }
 
             if not is_alive:
@@ -986,6 +1093,8 @@ class ServiceRegistry:
             elif is_stale:
                 service_report["health"] = "STALE"
                 report["stale_services"] += 1
+            elif is_in_startup:
+                service_report["health"] = "STARTING"  # v93.3: New status
             elif service.status == "degraded":
                 service_report["health"] = "DEGRADED"
                 report["degraded_services"] += 1
