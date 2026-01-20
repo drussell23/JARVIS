@@ -52,9 +52,17 @@ Architecture:
     └──────────────────────────────────────────────────────────────────┘
 
 Author: JARVIS AI System
-Version: 5.4.0 (v93.8)
+Version: 5.5.0 (v93.9)
 
 Changelog:
+- v93.9 (v5.5): Advanced Docker Operations with intelligent routing
+  - Circuit Breaker pattern prevents cascading failures
+  - Exponential backoff retry with jitter for resilience
+  - Memory-aware routing (Docker vs Local vs GCP)
+  - Auto-build Docker images if missing
+  - GCP cloud fallback when local resources insufficient
+  - System memory monitoring with psutil
+  - Intelligent routing decisions based on available resources
 - v93.8 (v5.4): Docker Hybrid Mode - checks Docker before spawning local process
   - Automatic detection of jarvis-prime Docker container
   - Docker-first, local-fallback approach for seamless deployment
@@ -246,6 +254,62 @@ class OrchestratorConfig:
         default_factory=lambda: float(os.getenv("DOCKER_STARTUP_TIMEOUT", "180.0"))
     )
 
+    # =========================================================================
+    # v93.9: Advanced Docker Operations Configuration
+    # =========================================================================
+
+    # Circuit Breaker Configuration
+    docker_circuit_breaker_failure_threshold: int = field(
+        default_factory=lambda: int(os.getenv("DOCKER_CB_FAILURE_THRESHOLD", "3"))
+    )
+    docker_circuit_breaker_recovery_timeout: float = field(
+        default_factory=lambda: float(os.getenv("DOCKER_CB_RECOVERY_TIMEOUT", "60.0"))
+    )
+    docker_circuit_breaker_half_open_requests: int = field(
+        default_factory=lambda: int(os.getenv("DOCKER_CB_HALF_OPEN_REQUESTS", "1"))
+    )
+
+    # Retry Configuration (Exponential Backoff)
+    docker_retry_max_attempts: int = field(
+        default_factory=lambda: int(os.getenv("DOCKER_RETRY_MAX_ATTEMPTS", "3"))
+    )
+    docker_retry_base_delay: float = field(
+        default_factory=lambda: float(os.getenv("DOCKER_RETRY_BASE_DELAY", "1.0"))
+    )
+    docker_retry_max_delay: float = field(
+        default_factory=lambda: float(os.getenv("DOCKER_RETRY_MAX_DELAY", "30.0"))
+    )
+    docker_retry_exponential_base: float = field(
+        default_factory=lambda: float(os.getenv("DOCKER_RETRY_EXP_BASE", "2.0"))
+    )
+
+    # Memory-Aware Routing Configuration
+    memory_minimum_available_gb: float = field(
+        default_factory=lambda: float(os.getenv("MEMORY_MIN_AVAILABLE_GB", "4.0"))
+    )
+    memory_route_to_gcp_threshold_gb: float = field(
+        default_factory=lambda: float(os.getenv("MEMORY_GCP_THRESHOLD_GB", "2.0"))
+    )
+    memory_model_size_estimation_factor: float = field(
+        default_factory=lambda: float(os.getenv("MEMORY_MODEL_SIZE_FACTOR", "1.5"))
+    )
+
+    # GCP Fallback Configuration
+    gcp_fallback_enabled: bool = field(
+        default_factory=lambda: os.getenv("GCP_FALLBACK_ENABLED", "true").lower() == "true"
+    )
+    gcp_vm_startup_timeout: float = field(
+        default_factory=lambda: float(os.getenv("GCP_VM_STARTUP_TIMEOUT", "300.0"))
+    )
+
+    # Docker Image Configuration
+    docker_auto_build: bool = field(
+        default_factory=lambda: os.getenv("DOCKER_AUTO_BUILD", "true").lower() == "true"
+    )
+    docker_build_timeout: float = field(
+        default_factory=lambda: float(os.getenv("DOCKER_BUILD_TIMEOUT", "600.0"))
+    )
+
 
 # =============================================================================
 # Data Models
@@ -260,6 +324,179 @@ class ServiceStatus(Enum):
     RESTARTING = "restarting"
     FAILED = "failed"
     STOPPED = "stopped"
+
+
+class CircuitBreakerState(Enum):
+    """
+    v93.9: Circuit Breaker state machine.
+
+    CLOSED: Normal operation, requests pass through
+    OPEN: Failures exceeded threshold, requests blocked
+    HALF_OPEN: Testing if service recovered
+    """
+    CLOSED = "closed"
+    OPEN = "open"
+    HALF_OPEN = "half_open"
+
+
+@dataclass
+class CircuitBreaker:
+    """
+    v93.9: Circuit Breaker pattern implementation for Docker operations.
+
+    Prevents cascading failures by:
+    - Tracking consecutive failures
+    - Opening circuit after failure threshold
+    - Allowing recovery testing after timeout
+    - Closing circuit on successful recovery
+    """
+    name: str
+    failure_threshold: int = 3
+    recovery_timeout: float = 60.0
+    half_open_max_requests: int = 1
+
+    state: CircuitBreakerState = CircuitBreakerState.CLOSED
+    failure_count: int = 0
+    last_failure_time: float = 0.0
+    half_open_requests: int = 0
+    success_count: int = 0
+
+    def record_success(self) -> None:
+        """Record a successful operation."""
+        if self.state == CircuitBreakerState.HALF_OPEN:
+            self.success_count += 1
+            if self.success_count >= self.half_open_max_requests:
+                # Recovery successful, close circuit
+                self.state = CircuitBreakerState.CLOSED
+                self.failure_count = 0
+                self.success_count = 0
+                logger.info(f"    ✅ Circuit breaker [{self.name}]: CLOSED (recovered)")
+        else:
+            self.failure_count = 0
+            self.success_count += 1
+
+    def record_failure(self) -> None:
+        """Record a failed operation."""
+        self.failure_count += 1
+        self.last_failure_time = time.time()
+        self.success_count = 0
+
+        if self.state == CircuitBreakerState.HALF_OPEN:
+            # Failed during recovery test, reopen circuit
+            self.state = CircuitBreakerState.OPEN
+            logger.warning(f"    ⚠️ Circuit breaker [{self.name}]: OPEN (recovery failed)")
+        elif self.failure_count >= self.failure_threshold:
+            # Threshold exceeded, open circuit
+            self.state = CircuitBreakerState.OPEN
+            logger.warning(
+                f"    ⚠️ Circuit breaker [{self.name}]: OPEN "
+                f"({self.failure_count} failures)"
+            )
+
+    def can_execute(self) -> bool:
+        """Check if operation can proceed."""
+        if self.state == CircuitBreakerState.CLOSED:
+            return True
+
+        if self.state == CircuitBreakerState.OPEN:
+            # Check if recovery timeout has passed
+            if (time.time() - self.last_failure_time) >= self.recovery_timeout:
+                self.state = CircuitBreakerState.HALF_OPEN
+                self.half_open_requests = 0
+                logger.info(f"    🔄 Circuit breaker [{self.name}]: HALF_OPEN (testing)")
+                return True
+            return False
+
+        if self.state == CircuitBreakerState.HALF_OPEN:
+            # Allow limited requests during half-open
+            if self.half_open_requests < self.half_open_max_requests:
+                self.half_open_requests += 1
+                return True
+            return False
+
+        return False
+
+
+@dataclass
+class MemoryStatus:
+    """
+    v93.9: System memory status for intelligent routing decisions.
+    """
+    total_gb: float = 0.0
+    available_gb: float = 0.0
+    used_gb: float = 0.0
+    percent_used: float = 0.0
+    swap_total_gb: float = 0.0
+    swap_used_gb: float = 0.0
+
+    @property
+    def is_memory_pressure(self) -> bool:
+        """Check if system is under memory pressure."""
+        return self.percent_used > 85.0 or self.available_gb < 2.0
+
+    @property
+    def can_load_local_model(self) -> bool:
+        """Check if there's enough memory for a local model (~6-8GB needed)."""
+        return self.available_gb >= 6.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "total_gb": self.total_gb,
+            "available_gb": self.available_gb,
+            "used_gb": self.used_gb,
+            "percent_used": self.percent_used,
+            "swap_total_gb": self.swap_total_gb,
+            "swap_used_gb": self.swap_used_gb,
+            "is_memory_pressure": self.is_memory_pressure,
+            "can_load_local_model": self.can_load_local_model,
+        }
+
+
+@dataclass
+class RetryState:
+    """
+    v93.9: State tracking for retry operations with exponential backoff.
+    """
+    attempt: int = 0
+    max_attempts: int = 3
+    base_delay: float = 1.0
+    max_delay: float = 30.0
+    exponential_base: float = 2.0
+    last_error: Optional[str] = None
+    total_elapsed: float = 0.0
+
+    def should_retry(self) -> bool:
+        """Check if another retry attempt should be made."""
+        return self.attempt < self.max_attempts
+
+    def get_next_delay(self) -> float:
+        """Calculate next delay with exponential backoff and jitter."""
+        import random
+        delay = self.base_delay * (self.exponential_base ** self.attempt)
+        # Add jitter (±25%) to prevent thundering herd
+        jitter = delay * 0.25 * (2 * random.random() - 1)
+        return min(delay + jitter, self.max_delay)
+
+    def record_attempt(self, error: Optional[str] = None) -> None:
+        """Record a retry attempt."""
+        self.attempt += 1
+        self.last_error = error
+
+    def reset(self) -> None:
+        """Reset retry state after success."""
+        self.attempt = 0
+        self.last_error = None
+        self.total_elapsed = 0.0
+
+
+class RoutingDecision(Enum):
+    """
+    v93.9: Intelligent routing decision for service deployment.
+    """
+    DOCKER_LOCAL = "docker_local"      # Use local Docker container
+    LOCAL_PROCESS = "local_process"    # Use local Python process
+    GCP_CLOUD = "gcp_cloud"            # Route to GCP cloud VM
+    HYBRID = "hybrid"                  # Use multiple backends
 
 
 @dataclass
@@ -353,6 +590,46 @@ class ProcessOrchestrator:
 
         # Signal handlers registered flag
         self._signals_registered = False
+
+        # v93.9: Circuit breakers for Docker operations (per-service)
+        self._circuit_breakers: Dict[str, CircuitBreaker] = {}
+
+        # v93.9: Retry states for operations
+        self._retry_states: Dict[str, RetryState] = {}
+
+        # v93.9: Cached memory status (refreshed periodically)
+        self._cached_memory_status: Optional[MemoryStatus] = None
+        self._memory_cache_time: float = 0.0
+        self._memory_cache_ttl: float = 5.0  # Refresh every 5 seconds
+
+        # v93.9: GCP VM manager reference (lazy loaded)
+        self._gcp_vm_manager = None
+
+    def _get_circuit_breaker(self, service_name: str) -> CircuitBreaker:
+        """
+        v93.9: Get or create circuit breaker for a service.
+        """
+        if service_name not in self._circuit_breakers:
+            self._circuit_breakers[service_name] = CircuitBreaker(
+                name=f"docker-{service_name}",
+                failure_threshold=self.config.docker_circuit_breaker_failure_threshold,
+                recovery_timeout=self.config.docker_circuit_breaker_recovery_timeout,
+                half_open_max_requests=self.config.docker_circuit_breaker_half_open_requests,
+            )
+        return self._circuit_breakers[service_name]
+
+    def _get_retry_state(self, operation_name: str) -> RetryState:
+        """
+        v93.9: Get or create retry state for an operation.
+        """
+        if operation_name not in self._retry_states:
+            self._retry_states[operation_name] = RetryState(
+                max_attempts=self.config.docker_retry_max_attempts,
+                base_delay=self.config.docker_retry_base_delay,
+                max_delay=self.config.docker_retry_max_delay,
+                exponential_base=self.config.docker_retry_exponential_base,
+            )
+        return self._retry_states[operation_name]
 
     # =========================================================================
     # Pre-Flight Cleanup (v5.0)
@@ -740,9 +1017,322 @@ class ProcessOrchestrator:
 
         return False
 
+    # =========================================================================
+    # v93.9: Advanced Memory Monitoring and Routing
+    # =========================================================================
+
+    async def _get_memory_status(self) -> MemoryStatus:
+        """
+        v93.9: Get current system memory status with caching.
+
+        Uses psutil for cross-platform memory info.
+        Caches result for performance (refreshed every 5s).
+        """
+        # Check cache
+        if (
+            self._cached_memory_status is not None
+            and (time.time() - self._memory_cache_time) < self._memory_cache_ttl
+        ):
+            return self._cached_memory_status
+
+        try:
+            import psutil
+
+            mem = psutil.virtual_memory()
+            swap = psutil.swap_memory()
+
+            status = MemoryStatus(
+                total_gb=mem.total / (1024 ** 3),
+                available_gb=mem.available / (1024 ** 3),
+                used_gb=mem.used / (1024 ** 3),
+                percent_used=mem.percent,
+                swap_total_gb=swap.total / (1024 ** 3),
+                swap_used_gb=swap.used / (1024 ** 3),
+            )
+
+            # Update cache
+            self._cached_memory_status = status
+            self._memory_cache_time = time.time()
+
+            return status
+
+        except ImportError:
+            logger.warning("    psutil not available, using default memory estimates")
+            return MemoryStatus(
+                total_gb=16.0,
+                available_gb=8.0,
+                used_gb=8.0,
+                percent_used=50.0,
+            )
+        except Exception as e:
+            logger.warning(f"    Memory check failed: {e}")
+            return MemoryStatus(available_gb=8.0)
+
+    async def _should_route_to_gcp(
+        self,
+        definition: ServiceDefinition,
+        memory_status: MemoryStatus,
+    ) -> bool:
+        """
+        v93.9: Determine if service should be routed to GCP instead of local.
+
+        Decision factors:
+        - Available memory vs model requirements
+        - GCP fallback enabled
+        - GCP VM availability
+        """
+        if not self.config.gcp_fallback_enabled:
+            return False
+
+        # Check if memory is critically low
+        if memory_status.available_gb < self.config.memory_route_to_gcp_threshold_gb:
+            logger.info(
+                f"    📊 Memory critically low ({memory_status.available_gb:.1f}GB), "
+                f"routing to GCP recommended"
+            )
+            return True
+
+        # Check if model won't fit in available memory
+        # Estimate model memory: file size * 1.5 (for runtime overhead)
+        try:
+            model_path = definition.repo_path / "models"
+            if model_path.exists():
+                # Find largest .gguf file
+                gguf_files = list(model_path.glob("*.gguf"))
+                if gguf_files:
+                    largest_model = max(gguf_files, key=lambda p: p.stat().st_size)
+                    model_size_gb = largest_model.stat().st_size / (1024 ** 3)
+                    estimated_runtime_gb = model_size_gb * self.config.memory_model_size_estimation_factor
+
+                    if estimated_runtime_gb > memory_status.available_gb:
+                        logger.info(
+                            f"    📊 Model requires ~{estimated_runtime_gb:.1f}GB, "
+                            f"only {memory_status.available_gb:.1f}GB available, "
+                            f"routing to GCP recommended"
+                        )
+                        return True
+        except Exception as e:
+            logger.debug(f"    Model size estimation failed: {e}")
+
+        return False
+
+    async def _make_routing_decision(
+        self,
+        definition: ServiceDefinition,
+    ) -> tuple[RoutingDecision, str]:
+        """
+        v93.9: Make intelligent routing decision for a service.
+
+        Order of preference:
+        1. Docker (if available, healthy, and memory sufficient)
+        2. Local process (if memory sufficient)
+        3. GCP cloud (if enabled and needed)
+
+        Returns:
+            Tuple of (decision, reason)
+        """
+        memory_status = await self._get_memory_status()
+
+        logger.info(f"    📊 Memory: {memory_status.available_gb:.1f}GB available "
+                   f"({memory_status.percent_used:.0f}% used)")
+
+        # Check if we need to route to GCP due to memory pressure
+        if await self._should_route_to_gcp(definition, memory_status):
+            return RoutingDecision.GCP_CLOUD, f"Low memory ({memory_status.available_gb:.1f}GB)"
+
+        # Check Docker availability
+        docker_available = await self._check_docker_available()
+        if docker_available:
+            # Check circuit breaker
+            cb = self._get_circuit_breaker(definition.name)
+            if cb.can_execute():
+                return RoutingDecision.DOCKER_LOCAL, "Docker available"
+            else:
+                logger.info(
+                    f"    ⚠️ Docker circuit breaker OPEN for {definition.name}, "
+                    f"using alternative"
+                )
+
+        # Check if local process is viable
+        if memory_status.can_load_local_model:
+            return RoutingDecision.LOCAL_PROCESS, "Sufficient memory for local"
+
+        # Fallback to GCP if enabled
+        if self.config.gcp_fallback_enabled:
+            return RoutingDecision.GCP_CLOUD, "Memory insufficient for local"
+
+        # Last resort: try local anyway
+        return RoutingDecision.LOCAL_PROCESS, "No alternatives, trying local"
+
+    # =========================================================================
+    # v93.9: Docker Image Management
+    # =========================================================================
+
+    async def _check_docker_image_exists(
+        self,
+        image_name: str = "jarvis-prime:latest",
+    ) -> bool:
+        """
+        v93.9: Check if Docker image exists locally.
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "docker", "image", "inspect", image_name,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            return_code = await asyncio.wait_for(proc.wait(), timeout=10.0)
+            return return_code == 0
+        except Exception:
+            return False
+
+    async def _build_docker_image(
+        self,
+        definition: ServiceDefinition,
+    ) -> bool:
+        """
+        v93.9: Build Docker image for a service.
+
+        Uses docker-compose build with progress output.
+        """
+        compose_file = definition.repo_path / self.config.jarvis_prime_docker_compose
+
+        if not compose_file.exists():
+            logger.warning(f"    Docker compose file not found: {compose_file}")
+            return False
+
+        try:
+            logger.info(f"    🔨 Building Docker image (this may take several minutes)...")
+
+            proc = await asyncio.create_subprocess_exec(
+                "docker", "compose",
+                "-f", str(compose_file),
+                "build", "--progress=plain",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                cwd=str(definition.repo_path),
+            )
+
+            # Stream build output
+            build_start = time.time()
+            last_log = build_start
+
+            while True:
+                line = await asyncio.wait_for(
+                    proc.stdout.readline(),
+                    timeout=self.config.docker_build_timeout
+                )
+                if not line:
+                    break
+
+                decoded = line.decode('utf-8', errors='replace').rstrip()
+                if decoded:
+                    # Log progress every 30 seconds or on important lines
+                    now = time.time()
+                    is_important = any(k in decoded.lower() for k in [
+                        'step', 'downloading', 'extracting', 'error', 'warning',
+                        'successfully', 'built', 'model'
+                    ])
+
+                    if is_important or (now - last_log) >= 30:
+                        elapsed = now - build_start
+                        logger.info(f"    [build {elapsed:.0f}s] {decoded[:100]}")
+                        last_log = now
+
+            return_code = await proc.wait()
+            build_time = time.time() - build_start
+
+            if return_code == 0:
+                logger.info(f"    ✅ Docker image built successfully ({build_time:.0f}s)")
+                return True
+            else:
+                logger.warning(f"    ❌ Docker build failed (exit code: {return_code})")
+                return False
+
+        except asyncio.TimeoutError:
+            logger.warning(f"    ❌ Docker build timed out after {self.config.docker_build_timeout}s")
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            return False
+        except Exception as e:
+            logger.warning(f"    ❌ Docker build failed: {e}")
+            return False
+
+    # =========================================================================
+    # v93.9: GCP Fallback Routing
+    # =========================================================================
+
+    async def _start_gcp_service(
+        self,
+        definition: ServiceDefinition,
+    ) -> bool:
+        """
+        v93.9: Start service on GCP cloud VM as fallback.
+
+        Uses GCPVMManager if available.
+        """
+        if not self.config.gcp_fallback_enabled:
+            return False
+
+        try:
+            # Lazy load GCP VM manager
+            if self._gcp_vm_manager is None:
+                try:
+                    from backend.core.gcp_vm_manager import GCPVMManager
+                    self._gcp_vm_manager = GCPVMManager()
+                    logger.info("    ☁️ GCP VM Manager initialized")
+                except ImportError:
+                    logger.warning("    ⚠️ GCP VM Manager not available")
+                    return False
+
+            logger.info(f"    ☁️ Starting {definition.name} on GCP cloud...")
+
+            # Check if VM already exists and is running
+            vm_status = await self._gcp_vm_manager.get_vm_status(
+                f"jarvis-prime-{definition.name}"
+            )
+
+            if vm_status and vm_status.get("status") == "RUNNING":
+                logger.info(f"    ✅ GCP VM already running")
+                # Get external IP and verify health
+                external_ip = vm_status.get("external_ip")
+                if external_ip:
+                    is_healthy, status = await self._check_docker_service_healthy(
+                        definition.name,
+                        definition.default_port,
+                        definition.health_endpoint,
+                    )
+                    if is_healthy:
+                        logger.info(f"    ⚡ Connected to {definition.name} via GCP ({external_ip})")
+                        return True
+
+            # Start or create VM
+            success = await self._gcp_vm_manager.ensure_vm_running(
+                name=f"jarvis-prime-{definition.name}",
+                machine_type="n1-standard-4",
+                timeout=self.config.gcp_vm_startup_timeout,
+            )
+
+            return success
+
+        except Exception as e:
+            logger.warning(f"    ⚠️ GCP service start failed: {e}")
+            return False
+
+    # =========================================================================
+    # v93.9: Enhanced Docker Container Startup
+    # =========================================================================
+
     async def _start_docker_container(self, definition: ServiceDefinition) -> bool:
         """
-        v93.8: Start the Docker container for a service using docker-compose.
+        v93.9: Enhanced Docker container startup with:
+        - Memory-aware routing (Docker vs GCP)
+        - Circuit breaker protection
+        - Retry with exponential backoff
+        - Auto-build if image missing
+        - Comprehensive error handling
 
         Args:
             definition: Service definition
@@ -753,52 +1343,218 @@ class ProcessOrchestrator:
         if definition.name != "jarvis-prime":
             return False
 
+        # Step 1: Check memory and make routing decision
+        memory_status = await self._get_memory_status()
+
+        if memory_status.is_memory_pressure:
+            logger.warning(
+                f"    ⚠️ System under memory pressure "
+                f"({memory_status.available_gb:.1f}GB available, "
+                f"{memory_status.percent_used:.0f}% used)"
+            )
+
+            if await self._should_route_to_gcp(definition, memory_status):
+                logger.info(f"    ☁️ Routing to GCP due to memory constraints...")
+                return await self._start_gcp_service(definition)
+
+        # Step 2: Check circuit breaker
+        cb = self._get_circuit_breaker(definition.name)
+        if not cb.can_execute():
+            logger.warning(
+                f"    ⚠️ Docker circuit breaker OPEN for {definition.name}, "
+                f"waiting for recovery timeout..."
+            )
+            return False
+
+        # Step 3: Check if Docker image exists, build if needed
+        image_name = "jarvis-prime:latest"
+        image_exists = await self._check_docker_image_exists(image_name)
+
+        if not image_exists:
+            if self.config.docker_auto_build:
+                logger.info(f"    🔨 Docker image '{image_name}' not found, building...")
+                built = await self._build_docker_image(definition)
+                if not built:
+                    cb.record_failure()
+                    logger.warning(f"    ⚠️ Docker build failed, trying alternative...")
+                    return await self._fallback_to_alternative(definition, memory_status)
+            else:
+                logger.warning(
+                    f"    ⚠️ Docker image '{image_name}' not found and auto-build disabled"
+                )
+                return False
+
+        # Step 4: Start container with retry and exponential backoff
         compose_file = definition.repo_path / self.config.jarvis_prime_docker_compose
 
         if not compose_file.exists():
             logger.warning(f"    Docker compose file not found: {compose_file}")
+            cb.record_failure()
+            return False
+
+        retry_state = self._get_retry_state(f"docker-start-{definition.name}")
+        retry_state.reset()  # Reset for new startup attempt
+        start_time = time.time()
+
+        while retry_state.should_retry():
+            attempt = retry_state.attempt + 1
+            logger.info(
+                f"    🚀 Starting Docker container (attempt {attempt}/"
+                f"{retry_state.max_attempts})..."
+            )
+
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "docker", "compose",
+                    "-f", str(compose_file),
+                    "up", "-d",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=str(definition.repo_path),
+                )
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(),
+                    timeout=60.0
+                )
+
+                if proc.returncode != 0:
+                    error_msg = stderr.decode()[:200]
+                    retry_state.record_attempt(f"Exit code {proc.returncode}: {error_msg}")
+                    logger.warning(f"    ⚠️ Docker compose up failed: {error_msg}")
+
+                    if retry_state.should_retry():
+                        delay = retry_state.get_next_delay()
+                        logger.info(f"    ⏳ Retrying in {delay:.1f}s...")
+                        await asyncio.sleep(delay)
+                        continue
+                    else:
+                        break
+
+                logger.info(f"    Docker container starting, waiting for health...")
+
+                # Wait for container to become healthy
+                healthy = await self._wait_for_docker_health(
+                    definition.name,
+                    definition.default_port,
+                    definition.health_endpoint,
+                    timeout=self.config.docker_startup_timeout,
+                )
+
+                if healthy:
+                    elapsed = time.time() - start_time
+                    cb.record_success()
+                    retry_state.reset()
+                    logger.info(
+                        f"    ✅ Docker container healthy after {elapsed:.1f}s "
+                        f"(attempt {attempt})"
+                    )
+                    return True
+                else:
+                    retry_state.record_attempt("Health check timeout")
+                    logger.warning(f"    ⚠️ Container started but health check failed")
+
+                    if retry_state.should_retry():
+                        delay = retry_state.get_next_delay()
+                        logger.info(f"    ⏳ Retrying in {delay:.1f}s...")
+                        # Stop unhealthy container before retry
+                        await self._stop_docker_container(definition)
+                        await asyncio.sleep(delay)
+                        continue
+                    else:
+                        break
+
+            except asyncio.TimeoutError:
+                retry_state.record_attempt("Timeout")
+                logger.warning(f"    ⚠️ Docker compose up timed out")
+
+                if retry_state.should_retry():
+                    delay = retry_state.get_next_delay()
+                    logger.info(f"    ⏳ Retrying in {delay:.1f}s...")
+                    await asyncio.sleep(delay)
+                    continue
+                else:
+                    break
+
+            except Exception as e:
+                retry_state.record_attempt(str(e))
+                logger.warning(f"    ⚠️ Docker compose up failed: {e}")
+
+                if retry_state.should_retry():
+                    delay = retry_state.get_next_delay()
+                    logger.info(f"    ⏳ Retrying in {delay:.1f}s...")
+                    await asyncio.sleep(delay)
+                    continue
+                else:
+                    break
+
+        # All retries exhausted
+        cb.record_failure()
+        total_elapsed = time.time() - start_time
+        logger.error(
+            f"    ❌ Docker startup failed after {retry_state.attempt} attempts "
+            f"({total_elapsed:.1f}s total). Last error: {retry_state.last_error}"
+        )
+
+        # Try fallback
+        return await self._fallback_to_alternative(definition, memory_status)
+
+    async def _stop_docker_container(self, definition: ServiceDefinition) -> bool:
+        """
+        v93.9: Stop Docker container gracefully.
+        """
+        compose_file = definition.repo_path / self.config.jarvis_prime_docker_compose
+
+        if not compose_file.exists():
             return False
 
         try:
-            logger.info(f"    Running: docker compose -f {compose_file} up -d")
-
             proc = await asyncio.create_subprocess_exec(
                 "docker", "compose",
                 "-f", str(compose_file),
-                "up", "-d",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+                "down",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
                 cwd=str(definition.repo_path),
             )
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(),
-                timeout=60.0
-            )
-
-            if proc.returncode != 0:
-                logger.warning(
-                    f"    Docker compose up failed: {stderr.decode()}"
-                )
-                return False
-
-            logger.info(f"    Docker container starting, waiting for health...")
-
-            # Wait for container to become healthy
-            healthy = await self._wait_for_docker_health(
-                definition.name,
-                definition.default_port,
-                definition.health_endpoint,
-                timeout=self.config.docker_startup_timeout,
-            )
-
-            return healthy
-
-        except asyncio.TimeoutError:
-            logger.warning(f"    Docker compose up timed out")
+            await asyncio.wait_for(proc.wait(), timeout=30.0)
+            return proc.returncode == 0
+        except Exception:
             return False
-        except Exception as e:
-            logger.warning(f"    Docker compose up failed: {e}")
+
+    async def _fallback_to_alternative(
+        self,
+        definition: ServiceDefinition,
+        memory_status: MemoryStatus,
+    ) -> bool:
+        """
+        v93.9: Fallback to alternative deployment when Docker fails.
+
+        Order of fallback:
+        1. GCP cloud (if enabled and sufficient resources)
+        2. Local process (if memory allows)
+        """
+        logger.info(f"    🔄 Attempting fallback for {definition.name}...")
+
+        # Try GCP if enabled and memory is an issue
+        if self.config.gcp_fallback_enabled:
+            if memory_status.is_memory_pressure or not memory_status.can_load_local_model:
+                logger.info(f"    ☁️ Trying GCP fallback...")
+                if await self._start_gcp_service(definition):
+                    return True
+
+        # Try local process if memory allows
+        if memory_status.can_load_local_model:
+            logger.info(f"    🐍 Falling back to local process...")
+            # Return False to let the caller spawn local process
             return False
+
+        # Last resort: try GCP anyway
+        if self.config.gcp_fallback_enabled:
+            logger.info(f"    ☁️ Last resort: trying GCP...")
+            return await self._start_gcp_service(definition)
+
+        logger.warning(f"    ❌ No viable fallback options for {definition.name}")
+        return False
 
     @property
     def registry(self):
