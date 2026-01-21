@@ -97,6 +97,7 @@ Changelog:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import signal
@@ -920,6 +921,13 @@ class ManagedProcess:
     # Background tasks
     output_stream_task: Optional[asyncio.Task] = None
     health_monitor_task: Optional[asyncio.Task] = None
+    # v95.0: Dedicated heartbeat task that runs independently of health checks
+    # This prevents services from becoming stale even when health checks fail
+    heartbeat_task: Optional[asyncio.Task] = None
+
+    # v95.0: Track last known health status for smarter heartbeat reporting
+    last_known_health: str = "unknown"
+    last_heartbeat_sent: float = 0.0
 
     @property
     def is_running(self) -> bool:
@@ -3374,17 +3382,40 @@ echo "=== JARVIS Prime started ==="
         return 'info'
 
     # v93.16: Patterns for warnings that should be suppressed
+    # v95.0: Extended with more ML framework warnings
     _SUPPRESSED_WARNING_PATTERNS = [
+        # Scikit-learn version warnings
         'scikit-learn version',
         'is not supported',
         'minimum required version',
         'maximum required version',
         'disabling scikit-learn conversion api',
+        # PyTorch/TorchAudio warnings
         'torch version',
         'has not been tested',
+        'list_audio_backends',
+        'torchaudio.backend',
+        # CoreML warnings
         'coremltools',
         'unexpected errors',
         'most recent version that has been tested',
+        # SpeechBrain/HuggingFace warnings (v95.0)
+        'wav2vec2model is frozen',
+        'model is frozen',
+        'weights were not initialized',
+        'you should probably train',
+        'some weights of the model checkpoint',
+        # TensorFlow warnings
+        'tf_cpp_min_log_level',
+        # Transformers/Tokenizers warnings
+        'tokenizers parallelism',
+        'special tokens have been added',
+        'clean_up_tokenization_spaces',
+        # NumPy/SciPy warnings
+        'numpy.ndarray size changed',
+        'scipy.ndimage',
+        # General benign patterns
+        'futurewarning',
     ]
 
     def _should_suppress_line(self, line: str) -> bool:
@@ -3635,6 +3666,8 @@ echo "=== JARVIS Prime started ==="
 
                 if healthy:
                     managed.consecutive_failures = 0
+                    # v95.0: Update last known health for heartbeat loop
+                    managed.last_known_health = "healthy"
 
                     # Log status transition only once
                     if managed.status != ServiceStatus.HEALTHY:
@@ -3643,6 +3676,7 @@ echo "=== JARVIS Prime started ==="
 
                     # ═══════════════════════════════════════════════════════════════════
                     # CRITICAL FIX: Send heartbeat on EVERY successful health check
+                    # (The dedicated heartbeat loop also sends, but this is belt-and-suspenders)
                     # ═══════════════════════════════════════════════════════════════════
                     if self.registry:
                         try:
@@ -3656,6 +3690,8 @@ echo "=== JARVIS Prime started ==="
                                 f"(non-fatal): {hb_error}"
                             )
                 else:
+                    # v95.0: Update last known health for heartbeat loop
+                    managed.last_known_health = "degraded"
                     managed.consecutive_failures += 1
                     logger.warning(
                         f"⚠️ {managed.definition.name} health check failed "
@@ -3676,6 +3712,161 @@ echo "=== JARVIS Prime started ==="
             logger.debug(f"[v93.0] Health monitor cancelled for {managed.definition.name}")
         except Exception as e:
             logger.error(f"Health monitor error for {managed.definition.name}: {e}")
+
+    # =========================================================================
+    # v95.0: Dedicated Heartbeat Loop (Prevents Stale Services)
+    # =========================================================================
+
+    async def _heartbeat_loop(self, managed: ManagedProcess) -> None:
+        """
+        v95.0: Enterprise-grade dedicated heartbeat loop.
+
+        CRITICAL: This loop runs INDEPENDENTLY of health checks.
+
+        The previous design had a fundamental flaw:
+        - Heartbeats were only sent when HTTP health checks passed
+        - If health checks failed, no heartbeat was sent
+        - This caused running services to be marked "stale" and removed
+        - Even if the process was alive, it would be deregistered
+
+        This new design ensures:
+        1. Heartbeats are sent as long as the process is alive
+        2. Health status is included in the heartbeat (healthy/degraded/unhealthy)
+        3. Services are NEVER marked stale if their process is running
+        4. Separate heartbeat interval (faster than health check interval)
+        5. Automatic recovery with fire-and-forget pattern
+
+        The heartbeat loop sends status-aware heartbeats:
+        - "healthy": HTTP health check passed
+        - "degraded": Process alive but HTTP check failed
+        - "starting": Process just started, not yet healthy
+        - "process_alive": Fallback when health status unknown
+        """
+        service_name = managed.definition.name
+        heartbeat_interval = min(
+            self.config.health_check_interval / 2,  # 2x faster than health checks
+            15.0  # Max 15 seconds between heartbeats
+        )
+
+        logger.info(
+            f"[v95.0] Starting dedicated heartbeat loop for {service_name} "
+            f"(interval: {heartbeat_interval:.1f}s)"
+        )
+
+        # v95.0: Path for file-based heartbeats (used by reactor-core and other services)
+        trinity_heartbeat_path = Path.home() / ".jarvis" / "trinity" / "heartbeats" / f"{service_name}.json"
+
+        try:
+            while not self._shutdown_event.is_set():
+                await asyncio.sleep(heartbeat_interval)
+
+                # Check if process is still alive
+                process_alive = managed.is_running
+
+                # For Docker services, process is None but port is set
+                is_docker = managed.pid is None and managed.port is not None
+
+                # v95.0: Check file-based heartbeat as fallback (reactor-core uses this)
+                file_heartbeat_alive = False
+                file_heartbeat_status = None
+                try:
+                    if trinity_heartbeat_path.exists():
+                        stat = trinity_heartbeat_path.stat()
+                        file_age = time.time() - stat.st_mtime
+                        # File heartbeat is fresh if modified within 2x heartbeat interval
+                        if file_age < (heartbeat_interval * 2):
+                            file_heartbeat_alive = True
+                            # Read status from file
+                            try:
+                                with open(trinity_heartbeat_path) as f:
+                                    hb_data = json.load(f)
+                                    file_heartbeat_status = hb_data.get("status", "unknown")
+                            except Exception:
+                                file_heartbeat_status = "file_heartbeat_active"
+                except Exception as e:
+                    logger.debug(f"[v95.0] File heartbeat check failed for {service_name}: {e}")
+
+                if not process_alive and not is_docker and not file_heartbeat_alive:
+                    # Process died AND no file heartbeat - stop sending heartbeats
+                    # (the health monitor or auto-heal will handle restart)
+                    logger.debug(
+                        f"[v95.0] Heartbeat loop for {service_name}: "
+                        f"process not running and no file heartbeat, stopping"
+                    )
+                    return
+
+                # v95.0: If process appears dead but file heartbeat is alive,
+                # the service is running (just not as a direct child process)
+                if not process_alive and file_heartbeat_alive:
+                    logger.debug(
+                        f"[v95.0] {service_name}: Process not running but file heartbeat "
+                        f"active ({file_heartbeat_status}) - service alive externally"
+                    )
+
+                # v95.0: Determine heartbeat status based on multiple sources
+                # Priority: file heartbeat > last known health > process state
+                if file_heartbeat_alive and file_heartbeat_status == "healthy":
+                    heartbeat_status = "healthy"
+                elif managed.last_known_health == "healthy":
+                    heartbeat_status = "healthy"
+                elif managed.status == ServiceStatus.STARTING:
+                    heartbeat_status = "starting"
+                elif file_heartbeat_alive:
+                    # File heartbeat is active but status is not "healthy"
+                    heartbeat_status = file_heartbeat_status or "file_heartbeat_active"
+                elif managed.last_known_health == "degraded":
+                    heartbeat_status = "degraded"
+                elif managed.consecutive_failures > 0:
+                    heartbeat_status = "degraded"
+                elif process_alive or is_docker:
+                    heartbeat_status = "process_alive"
+                else:
+                    heartbeat_status = "unknown"
+
+                # Send heartbeat to registry
+                if self.registry:
+                    try:
+                        await asyncio.wait_for(
+                            self.registry.heartbeat(
+                                service_name,
+                                status=heartbeat_status,
+                                metadata={
+                                    "pid": managed.pid,
+                                    "port": managed.port,
+                                    "consecutive_failures": managed.consecutive_failures,
+                                    "heartbeat_source": "dedicated_loop",
+                                    "is_docker": is_docker,
+                                    "file_heartbeat_active": file_heartbeat_alive,
+                                    "file_heartbeat_status": file_heartbeat_status,
+                                }
+                            ),
+                            timeout=5.0  # Don't block on slow registry
+                        )
+                        managed.last_heartbeat_sent = time.time()
+                        logger.debug(
+                            f"[v95.0] Heartbeat sent for {service_name} "
+                            f"(status: {heartbeat_status})"
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            f"[v95.0] Heartbeat timeout for {service_name} (non-fatal)"
+                        )
+                    except Exception as hb_err:
+                        logger.warning(
+                            f"[v95.0] Heartbeat failed for {service_name}: {hb_err} (non-fatal)"
+                        )
+
+        except asyncio.CancelledError:
+            logger.debug(f"[v95.0] Heartbeat loop cancelled for {service_name}")
+        except Exception as e:
+            logger.error(f"[v95.0] Heartbeat loop error for {service_name}: {e}")
+            # Attempt to restart heartbeat loop after error
+            if not self._shutdown_event.is_set():
+                logger.info(f"[v95.0] Restarting heartbeat loop for {service_name} after error")
+                await asyncio.sleep(5.0)
+                managed.heartbeat_task = asyncio.create_task(
+                    self._heartbeat_loop(managed)
+                )
 
     # =========================================================================
     # Auto-Healing
@@ -4041,6 +4232,14 @@ echo "=== JARVIS Prime started ==="
                     self._health_monitor_loop(managed)
                 )
 
+                # v95.0: Start dedicated heartbeat loop (prevents stale service issues)
+                # This runs independently of health checks to ensure services
+                # are NEVER marked stale as long as the process is running
+                managed.heartbeat_task = asyncio.create_task(
+                    self._heartbeat_loop(managed)
+                )
+                managed.last_known_health = "healthy"
+
                 return True
             else:
                 logger.warning(
@@ -4048,6 +4247,8 @@ echo "=== JARVIS Prime started ==="
                     f"within {definition.startup_timeout}s"
                 )
                 managed.status = ServiceStatus.DEGRADED
+                managed.last_known_health = "degraded"
+
                 # v95.0: Emit service unhealthy event
                 await _emit_event(
                     "SERVICE_UNHEALTHY",
@@ -4059,7 +4260,40 @@ echo "=== JARVIS Prime started ==="
                         "pid": managed.pid
                     }
                 )
-                return False
+
+                # v95.0: CRITICAL - Start heartbeat and health monitor even for degraded services
+                # This ensures services are NOT marked stale while the process is running
+                # and allows auto-healing to kick in when the health monitor detects failures
+                if self.registry and managed.is_running:
+                    await self.registry.register_service(
+                        service_name=definition.name,
+                        pid=managed.pid,
+                        port=managed.port,
+                        health_endpoint=definition.health_endpoint,
+                        metadata={
+                            "repo_path": str(definition.repo_path),
+                            "status": "degraded",
+                            "degraded_at": time.time()
+                        }
+                    )
+                    logger.info(
+                        f"[v95.0] Registered degraded service {definition.name} in registry"
+                    )
+
+                # Start health monitor to track recovery or trigger auto-heal
+                managed.health_monitor_task = asyncio.create_task(
+                    self._health_monitor_loop(managed)
+                )
+
+                # Start heartbeat loop to prevent stale service removal
+                managed.heartbeat_task = asyncio.create_task(
+                    self._heartbeat_loop(managed)
+                )
+                logger.info(
+                    f"[v95.0] Started heartbeat loop for degraded service {definition.name}"
+                )
+
+                return False  # Still return False to indicate not healthy
 
         except Exception as e:
             logger.error(f"❌ Failed to spawn {definition.name}: {e}", exc_info=True)
@@ -4324,8 +4558,13 @@ echo "=== JARVIS Prime started ==="
 
     async def _stop_process(self, managed: ManagedProcess) -> None:
         """Stop a managed process gracefully."""
-        # Cancel background tasks
-        for task in [managed.output_stream_task, managed.health_monitor_task]:
+        # Cancel background tasks (v95.0: includes dedicated heartbeat task)
+        background_tasks = [
+            managed.output_stream_task,
+            managed.health_monitor_task,
+            managed.heartbeat_task,  # v95.0: dedicated heartbeat task
+        ]
+        for task in background_tasks:
             if task and not task.done():
                 task.cancel()
                 try:

@@ -426,6 +426,20 @@ class ServiceRegistry:
         self._on_service_stale_callbacks: List[Callable[[str, float], Any]] = []
         self._on_service_recovered_callbacks: List[Callable[[str], Any]] = []
 
+        # v95.0: Service-specific adaptive stale thresholds
+        # Different services have different characteristics:
+        # - reactor-core: Long model loading, needs extended threshold
+        # - jarvis-prime: Model loading, needs extended threshold
+        # - jarvis-core: Quick startup, standard threshold
+        # Format: {"service_pattern": threshold_seconds}
+        self._service_stale_thresholds: Dict[str, float] = {
+            "reactor": float(os.environ.get("REACTOR_STALE_THRESHOLD", "600.0")),  # 10 minutes
+            "jarvis-prime": float(os.environ.get("JARVIS_PRIME_STALE_THRESHOLD", "600.0")),  # 10 minutes
+            "jprime": float(os.environ.get("JARVIS_PRIME_STALE_THRESHOLD", "600.0")),  # 10 minutes
+            "default": float(os.environ.get("JARVIS_VERY_STALE_THRESHOLD", "300.0")),  # 5 minutes
+        }
+        logger.debug(f"[v95.0] Service stale thresholds: {self._service_stale_thresholds}")
+
         # v93.0: Ensure directory exists with retry logic
         if not self._dir_manager.ensure_directory_sync():
             logger.error(f"[v93.0] CRITICAL: Failed to create registry directory: {self.registry_dir}")
@@ -513,6 +527,38 @@ class ServiceRegistry:
                     await result
             except Exception as e:
                 logger.warning(f"[v95.0] on_service_recovered callback error: {e}")
+
+    def _get_adaptive_stale_threshold(self, service_name: str) -> float:
+        """
+        v95.0: Get adaptive stale threshold based on service type.
+
+        Different services have different operational characteristics:
+        - reactor-core: Long model loading times, needs extended threshold
+        - jarvis-prime: Model loading, needs extended threshold
+        - Other services: Standard threshold
+
+        This prevents services with long initialization/loading times
+        from being incorrectly marked as stale.
+
+        Args:
+            service_name: Name of the service
+
+        Returns:
+            Stale threshold in seconds (appropriate for this service)
+        """
+        service_lower = service_name.lower()
+
+        # Check for service-specific thresholds (pattern matching)
+        for pattern, threshold in self._service_stale_thresholds.items():
+            if pattern != "default" and pattern in service_lower:
+                logger.debug(
+                    f"[v95.0] Using adaptive threshold for {service_name}: "
+                    f"{threshold}s (pattern: {pattern})"
+                )
+                return threshold
+
+        # Return default threshold
+        return self._service_stale_thresholds.get("default", 300.0)
 
     def _acquire_lock(self, file_handle) -> None:
         """Acquire exclusive lock on registry file (blocking)."""
@@ -1066,12 +1112,11 @@ class ServiceRegistry:
                     stale_age = time.time() - service.last_heartbeat
                     service_age = time.time() - service.registered_at
 
-                    # v93.3: Effective very stale threshold - accounts for startup
-                    # During startup: 5x normal threshold
-                    # After startup: normal threshold (300s)
-                    base_very_stale = float(os.environ.get(
-                        "JARVIS_VERY_STALE_THRESHOLD", "300.0"
-                    ))
+                    # v95.0: Adaptive very stale threshold - accounts for:
+                    # 1. Service type (reactor-core needs longer threshold)
+                    # 2. Startup phase (extra grace during startup)
+                    # This prevents services with long init times from being incorrectly removed
+                    base_very_stale = self._get_adaptive_stale_threshold(service_name)
                     very_stale_threshold = (
                         base_very_stale * self.startup_stale_multiplier
                         if is_in_startup else base_very_stale

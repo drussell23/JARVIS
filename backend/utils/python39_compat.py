@@ -277,6 +277,20 @@ class WarningSuppressionManager:
             message_pattern=r"speechbrain.*deprecated|torchaudio.*deprecated",
             description="SpeechBrain/TorchAudio deprecation warnings"
         ),
+        # v95.0: SpeechBrain "frozen model" warnings (expected behavior for inference)
+        WarningRule(
+            category=UserWarning,
+            message_pattern=r"Wav2Vec2Model is frozen|model is frozen|model.*frozen.*inference",
+            module_pattern=r"speechbrain|huggingface_transformers",
+            description="SpeechBrain frozen model warning (expected for inference)"
+        ),
+        # v95.0: HuggingFace weight initialization warnings
+        WarningRule(
+            category=UserWarning,
+            message_pattern=r"weights.*not initialized|you should probably train|some weights of the model checkpoint",
+            module_pattern=r"transformers|huggingface",
+            description="HuggingFace weight initialization warnings"
+        ),
         # Hugging Face token deprecation
         WarningRule(
             category=FutureWarning,

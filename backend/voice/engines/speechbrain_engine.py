@@ -137,6 +137,18 @@ warnings.filterwarnings("ignore", message=".*MPS backend.*", category=UserWarnin
 # Suppress torchaudio deprecation warning from SpeechBrain (cosmetic, works fine)
 warnings.filterwarnings("ignore", message="torchaudio._backend.list_audio_backends has been deprecated")
 
+# v95.0: Suppress "Wav2Vec2Model is frozen" warning (expected for inference - model frozen = not trainable)
+warnings.filterwarnings("ignore", message=".*Wav2Vec2Model is frozen.*", category=UserWarning)
+warnings.filterwarnings("ignore", message=".*model is frozen.*", category=UserWarning)
+
+# v95.0: Pre-configure SpeechBrain HuggingFace logger to ERROR before any model loading
+# This catches the logging.warning() calls that aren't Python warnings
+for _sb_hf_logger in [
+    "speechbrain.lobes.models.huggingface_transformers",
+    "speechbrain.lobes.models.huggingface_transformers.huggingface",
+]:
+    logging.getLogger(_sb_hf_logger).setLevel(logging.ERROR)
+
 # ============================================================================
 # TORCHAUDIO 2.9.0+ COMPATIBILITY PATCH
 # ============================================================================

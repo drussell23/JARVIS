@@ -473,10 +473,50 @@ warnings.filterwarnings(
     message=".*Wav2Vec2Model is frozen.*",
     category=UserWarning
 )
+warnings.filterwarnings(
+    "ignore",
+    message=".*model is frozen.*",
+    category=UserWarning
+)
+
+
+# v95.0: Custom logging filter for benign ML framework messages
+class BenignWarningFilter(logging.Filter):
+    """
+    Advanced filter to suppress known benign warnings from ML frameworks.
+
+    These warnings are informational and not actual problems:
+    - "Wav2Vec2Model is frozen" = Model frozen for inference (correct behavior)
+    - "Some weights not initialized" = Expected for fine-tuned models
+    - "You should probably TRAIN" = Irrelevant for inference-only usage
+    """
+
+    _SUPPRESSED_PATTERNS = [
+        'wav2vec2model is frozen',
+        'model is frozen',
+        'weights were not initialized',
+        'you should probably train',
+        'some weights of the model checkpoint',
+        'initializing bert',
+        'initializing wav2vec',
+    ]
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        """Return False to suppress the record, True to allow it."""
+        msg_lower = record.getMessage().lower()
+        for pattern in self._SUPPRESSED_PATTERNS:
+            if pattern in msg_lower:
+                return False
+        return True
+
+
+# v95.0: Install filter on SpeechBrain and HuggingFace loggers
+_benign_filter = BenignWarningFilter()
 
 # Also pre-configure SpeechBrain loggers to WARNING level BEFORE import
 # This prevents DEBUG messages during model loading
 # v93.14: Added huggingface_transformers for "frozen model" warnings
+# v95.0: Added filter and more comprehensive logger coverage
 for _sb_logger_name in [
     "speechbrain",
     "speechbrain.utils.checkpoints",
@@ -484,8 +524,12 @@ for _sb_logger_name in [
     "speechbrain.utils.torch_audio_backend",
     "speechbrain.lobes.models.huggingface_transformers",
     "speechbrain.lobes.models.huggingface_transformers.huggingface",
+    "transformers",
+    "transformers.modeling_utils",
 ]:
-    logging.getLogger(_sb_logger_name).setLevel(logging.ERROR)  # v93.14: Changed to ERROR to suppress frozen warnings
+    _sb_logger = logging.getLogger(_sb_logger_name)
+    _sb_logger.setLevel(logging.ERROR)  # v93.14: Changed to ERROR to suppress frozen warnings
+    _sb_logger.addFilter(_benign_filter)  # v95.0: Also add filter for extra coverage
 
 # =============================================================================
 # HYPER-RUNTIME ENGINE v9.0: Rust-First Async Architecture
