@@ -98,6 +98,27 @@ class StartupPhase(str, Enum):
     GMAIL_INIT = "gmail_init"
     CALENDAR_INIT = "calendar_init"
     NEURAL_MESH = "neural_mesh"
+    # v93.16: PROJECT TRINITY - Distributed Cognitive Architecture Phases
+    # Trinity represents the unified Mind (Prime), Body (JARVIS), Nerves (Reactor) system
+    TRINITY_INIT = "trinity_init"               # Project Trinity initialization starting
+    TRINITY_BODY = "trinity_body"               # JARVIS Body (execution layer)
+    TRINITY_MIND = "trinity_mind"               # JARVIS Prime (cognition layer)
+    TRINITY_NERVES = "trinity_nerves"           # Reactor Core (learning/nerve layer)
+    TRINITY_HEARTBEAT = "trinity_heartbeat"     # Cross-repo heartbeat system
+    TRINITY_IPC = "trinity_ipc"                 # Inter-process communication
+    TRINITY_SYNC = "trinity_sync"               # State synchronization
+    TRINITY_COMPLETE = "trinity_complete"       # Full Trinity online
+    TRINITY_PARTIAL = "trinity_partial"         # Trinity with missing components
+    # v93.16: Advanced Cross-Repo Subsystems
+    AGI_ORCHESTRATOR = "agi_orchestrator"       # AGI Orchestrator initialization
+    MODEL_SERVING = "model_serving"             # Unified model serving
+    AGENT_REGISTRY = "agent_registry"           # Agent registry initialization
+    STATE_MANAGER = "state_manager"             # Distributed state manager
+    CONTINUOUS_LEARNING = "continuous_learning" # Continuous learning orchestrator
+    EVENT_BUS = "event_bus"                     # Trinity event bus
+    KNOWLEDGE_GRAPH = "knowledge_graph"         # Knowledge graph initialization
+    TRAINING_PIPELINE = "training_pipeline"     # Training pipeline
+    OBSERVABILITY = "observability"             # Trinity observability/monitoring
 
 
 class NarrationPriority(Enum):
@@ -655,6 +676,235 @@ PHASE_NARRATION_TEMPLATES: Dict[StartupPhase, Dict[str, List[str]]] = {
             "Neural Mesh fully operational. All agents coordinated.",
             "Multi-agent swarm ready. Distributed intelligence enabled.",
             "Agent mesh initialized. Collaborative problem-solving active.",
+        ],
+    },
+    # ==========================================================================
+    # v93.16: PROJECT TRINITY - Distributed Cognitive Architecture
+    # ==========================================================================
+    StartupPhase.TRINITY_INIT: {
+        "start": [
+            "Initiating Project Trinity. Distributed cognitive architecture coming online.",
+            "Project Trinity activation sequence beginning. Mind, Body, and Nerves connecting.",
+            "Awakening the Trinity. Preparing distributed intelligence network.",
+        ],
+        "preparing": [
+            "Preparing cross-repository connections.",
+            "Establishing secure communication channels between systems.",
+        ],
+    },
+    StartupPhase.TRINITY_BODY: {
+        "start": [
+            "Trinity Body initializing. This is the execution layer.",
+            "Activating JARVIS Body. Command and control systems coming online.",
+        ],
+        "subsystems": [
+            "Body subsystems activating. Voice, vision, and motor functions preparing.",
+        ],
+        "complete": [
+            "Trinity Body online. Execution layer ready for commands.",
+            "JARVIS Body fully operational. Ready to execute.",
+        ],
+    },
+    StartupPhase.TRINITY_MIND: {
+        "start": [
+            "Trinity Mind connecting. JARVIS Prime cognition layer initializing.",
+            "Engaging the Mind. Tier-zero intelligence coming online.",
+        ],
+        "loading_model": [
+            "Loading cognitive model. This is the thinking layer.",
+            "Neural networks warming up. Reasoning capabilities initializing.",
+        ],
+        "local": [
+            "Mind running locally. On-device intelligence active.",
+        ],
+        "cloud": [
+            "Mind connected to cloud. Enhanced reasoning enabled.",
+        ],
+        "complete": [
+            "Trinity Mind online. Cognition layer fully operational.",
+            "JARVIS Prime connected. Intelligent reasoning ready.",
+        ],
+    },
+    StartupPhase.TRINITY_NERVES: {
+        "start": [
+            "Trinity Nerves activating. Reactor Core learning layer coming online.",
+            "Engaging the Nerves. Self-improvement and learning systems initializing.",
+        ],
+        "experience_pipeline": [
+            "Experience pipeline connecting. Learning from interactions enabled.",
+        ],
+        "training_ready": [
+            "Training infrastructure ready. Continuous improvement active.",
+        ],
+        "complete": [
+            "Trinity Nerves online. Learning and adaptation layer operational.",
+            "Reactor Core connected. Self-improvement capabilities enabled.",
+        ],
+    },
+    StartupPhase.TRINITY_HEARTBEAT: {
+        "start": [
+            "Establishing Trinity heartbeat system. Cross-repo health monitoring active.",
+        ],
+        "sync_active": [
+            "Heartbeat synchronization active. All components reporting status.",
+        ],
+        "complete": [
+            "Trinity heartbeat system operational. Health monitoring engaged.",
+        ],
+    },
+    StartupPhase.TRINITY_IPC: {
+        "start": [
+            "Initializing Trinity inter-process communication.",
+            "Establishing secure messaging between Mind, Body, and Nerves.",
+        ],
+        "channels_open": [
+            "Communication channels established.",
+        ],
+        "complete": [
+            "Trinity IPC online. Seamless communication enabled.",
+        ],
+    },
+    StartupPhase.TRINITY_SYNC: {
+        "start": [
+            "Synchronizing Trinity state across repositories.",
+        ],
+        "in_progress": [
+            "State synchronization in progress. Ensuring consistency.",
+        ],
+        "complete": [
+            "Trinity state synchronized. All systems in agreement.",
+        ],
+    },
+    StartupPhase.TRINITY_COMPLETE: {
+        "complete": [
+            "Project Trinity online. Mind, Body, and Nerves unified.",
+            "Trinity architecture fully operational. Distributed cognition enabled.",
+            "The Trinity is complete. JARVIS, Prime, and Reactor are one.",
+            "Project Trinity connected. Full distributed cognitive architecture active.",
+        ],
+        "announcement": [
+            "Project Trinity is now online. I have achieved distributed cognition across all three repositories. My mind thinks, my body acts, and my nerves learn. Ready to serve.",
+        ],
+    },
+    StartupPhase.TRINITY_PARTIAL: {
+        "partial": [
+            "Trinity partially online. Some components are still connecting.",
+            "Trinity operating in degraded mode. Missing component connections.",
+        ],
+        "mind_missing": [
+            "Trinity Body and Nerves online, but Mind is not connected. Running with limited cognition.",
+        ],
+        "nerves_missing": [
+            "Trinity Mind and Body online, but Nerves are not connected. Learning disabled.",
+        ],
+        "body_degraded": [
+            "Trinity operational but with reduced execution capabilities.",
+        ],
+    },
+    # v93.16: Advanced Cross-Repo Subsystem Phases
+    StartupPhase.AGI_ORCHESTRATOR: {
+        "start": [
+            "Initializing AGI Orchestrator. Unified cognitive architecture preparing.",
+        ],
+        "meta_cognitive": [
+            "Meta-cognitive engine starting. Self-aware reasoning activating.",
+        ],
+        "perception_fusion": [
+            "Multi-modal perception fusion ready. Vision, voice, and text integrated.",
+        ],
+        "complete": [
+            "AGI Orchestrator online. Advanced cognitive capabilities enabled.",
+        ],
+    },
+    StartupPhase.MODEL_SERVING: {
+        "start": [
+            "Initializing unified model serving. Local and cloud inference preparing.",
+        ],
+        "local_ready": [
+            "Local model inference ready.",
+        ],
+        "cloud_fallback": [
+            "Cloud fallback configured. High-availability inference enabled.",
+        ],
+        "complete": [
+            "Model serving operational. Intelligent routing between local and cloud.",
+        ],
+    },
+    StartupPhase.AGENT_REGISTRY: {
+        "start": [
+            "Initializing agent registry. Service discovery preparing.",
+        ],
+        "agents_discovered": [
+            "Agents discovered and registered.",
+        ],
+        "complete": [
+            "Agent registry online. All agents discoverable.",
+        ],
+    },
+    StartupPhase.STATE_MANAGER: {
+        "start": [
+            "Initializing distributed state manager.",
+        ],
+        "redis_connected": [
+            "Redis state backend connected. Distributed coordination enabled.",
+        ],
+        "complete": [
+            "State manager operational. Transactional state updates enabled.",
+        ],
+    },
+    StartupPhase.CONTINUOUS_LEARNING: {
+        "start": [
+            "Initializing continuous learning orchestrator.",
+        ],
+        "experience_aggregation": [
+            "Experience aggregation active. Learning from all interactions.",
+        ],
+        "complete": [
+            "Continuous learning online. I am always improving.",
+        ],
+    },
+    StartupPhase.EVENT_BUS: {
+        "start": [
+            "Initializing Trinity event bus. Pub-sub messaging preparing.",
+        ],
+        "subscribers_ready": [
+            "Event subscribers connected.",
+        ],
+        "complete": [
+            "Event bus operational. Real-time event streaming enabled.",
+        ],
+    },
+    StartupPhase.KNOWLEDGE_GRAPH: {
+        "start": [
+            "Initializing knowledge graph. Semantic memory preparing.",
+        ],
+        "loading": [
+            "Loading knowledge base. Connecting concepts.",
+        ],
+        "complete": [
+            "Knowledge graph online. Semantic understanding enhanced.",
+        ],
+    },
+    StartupPhase.TRAINING_PIPELINE: {
+        "start": [
+            "Initializing training pipeline. Model improvement infrastructure preparing.",
+        ],
+        "data_ready": [
+            "Training data pipeline connected.",
+        ],
+        "complete": [
+            "Training pipeline ready. Continuous model improvement enabled.",
+        ],
+    },
+    StartupPhase.OBSERVABILITY: {
+        "start": [
+            "Initializing Trinity observability. Distributed tracing preparing.",
+        ],
+        "metrics_active": [
+            "Metrics collection active. System health monitoring enabled.",
+        ],
+        "complete": [
+            "Observability online. Full system visibility achieved.",
         ],
     },
 }
@@ -1753,6 +2003,210 @@ class IntelligentStartupNarrator:
             logger.debug(f"Intelligent announcement failed: {e}, using fallback")
             await self._speak(fallback_message, NarrationPriority.MEDIUM)
 
+    # =========================================================================
+    # v93.16: PROJECT TRINITY Announcements - Distributed Cognitive Architecture
+    # =========================================================================
+
+    async def announce_trinity_init(self) -> None:
+        """v93.16: Announce Project Trinity initialization starting."""
+        text = self._get_phase_message(StartupPhase.TRINITY_INIT, "start")
+        if not text:
+            text = "Initiating Project Trinity. Distributed cognitive architecture coming online."
+        await self._speak(text, NarrationPriority.HIGH)
+        logger.info("[Narrator] Trinity initialization announced")
+
+    async def announce_trinity_body(self, mode: str = "start") -> None:
+        """v93.16: Announce Trinity Body (JARVIS execution layer) status."""
+        text = self._get_phase_message(StartupPhase.TRINITY_BODY, mode)
+        if not text:
+            if mode == "complete":
+                text = "Trinity Body online. Execution layer ready."
+            else:
+                text = "Trinity Body initializing. This is the execution layer."
+        await self._speak(text, NarrationPriority.MEDIUM)
+
+    async def announce_trinity_mind(self, mode: str = "start", is_local: bool = True) -> None:
+        """v93.16: Announce Trinity Mind (JARVIS-Prime cognition layer) status."""
+        if mode == "complete":
+            text = self._get_phase_message(StartupPhase.TRINITY_MIND, "complete")
+        elif is_local:
+            text = self._get_phase_message(StartupPhase.TRINITY_MIND, "local")
+        else:
+            text = self._get_phase_message(StartupPhase.TRINITY_MIND, "cloud")
+
+        if not text:
+            if mode == "complete":
+                text = "Trinity Mind online. Cognition layer fully operational."
+            elif is_local:
+                text = "Mind running locally. On-device intelligence active."
+            else:
+                text = "Mind connected to cloud. Enhanced reasoning enabled."
+
+        await self._speak(text, NarrationPriority.MEDIUM)
+
+    async def announce_trinity_nerves(self, mode: str = "start") -> None:
+        """v93.16: Announce Trinity Nerves (Reactor-Core learning layer) status."""
+        text = self._get_phase_message(StartupPhase.TRINITY_NERVES, mode)
+        if not text:
+            if mode == "complete":
+                text = "Trinity Nerves online. Learning and adaptation layer operational."
+            else:
+                text = "Trinity Nerves activating. Self-improvement systems initializing."
+        await self._speak(text, NarrationPriority.MEDIUM)
+
+    async def announce_trinity_complete(
+        self,
+        mind_online: bool = True,
+        body_online: bool = True,
+        nerves_online: bool = True,
+        startup_duration: Optional[float] = None,
+    ) -> None:
+        """
+        v93.16: Announce full Project Trinity completion.
+
+        This is the flagship announcement when all three components
+        (Mind/Prime, Body/JARVIS, Nerves/Reactor) are connected.
+
+        Args:
+            mind_online: Whether JARVIS-Prime (Mind) is connected
+            body_online: Whether JARVIS (Body) is running
+            nerves_online: Whether Reactor-Core (Nerves) is connected
+            startup_duration: Total startup time in seconds
+        """
+        all_online = mind_online and body_online and nerves_online
+
+        if all_online:
+            # Full Trinity - use the special announcement
+            text = self._get_phase_message(StartupPhase.TRINITY_COMPLETE, "announcement")
+            if not text:
+                text = (
+                    "Project Trinity is now online. I have achieved distributed cognition "
+                    "across all three repositories. My mind thinks, my body acts, and my "
+                    "nerves learn. Ready to serve."
+                )
+            priority = NarrationPriority.CRITICAL
+        else:
+            # Partial Trinity
+            missing = []
+            if not mind_online:
+                missing.append("Mind")
+            if not nerves_online:
+                missing.append("Nerves")
+
+            if len(missing) == 2:
+                text = (
+                    f"Trinity Body online, but {' and '.join(missing)} are not connected. "
+                    "Running in standalone mode with limited capabilities."
+                )
+            elif not mind_online:
+                text = self._get_phase_message(StartupPhase.TRINITY_PARTIAL, "mind_missing")
+                if not text:
+                    text = "Trinity operational but Mind is not connected. Running with limited cognition."
+            elif not nerves_online:
+                text = self._get_phase_message(StartupPhase.TRINITY_PARTIAL, "nerves_missing")
+                if not text:
+                    text = "Trinity operational but Nerves are not connected. Learning disabled."
+            else:
+                text = self._get_phase_message(StartupPhase.TRINITY_PARTIAL, "partial")
+                if not text:
+                    text = "Trinity partially online. Some components are still connecting."
+
+            priority = NarrationPriority.HIGH
+
+        # Add duration if provided
+        if startup_duration and all_online:
+            if startup_duration < 10:
+                text += f" That was quick - {startup_duration:.1f} seconds."
+            elif startup_duration > 60:
+                minutes = int(startup_duration // 60)
+                text += f" Startup took {minutes} minutes."
+
+        await self._speak(text, priority)
+        logger.info(f"[Narrator] Trinity status: mind={mind_online}, body={body_online}, nerves={nerves_online}")
+
+    async def announce_trinity_component(
+        self,
+        component: str,
+        status: str,
+        details: Optional[str] = None,
+    ) -> None:
+        """
+        v93.16: Generic Trinity component announcement.
+
+        Args:
+            component: One of 'mind', 'body', 'nerves', 'heartbeat', 'ipc', 'sync'
+            status: Status like 'start', 'complete', 'error'
+            details: Optional additional details
+        """
+        phase_map = {
+            "mind": StartupPhase.TRINITY_MIND,
+            "body": StartupPhase.TRINITY_BODY,
+            "nerves": StartupPhase.TRINITY_NERVES,
+            "heartbeat": StartupPhase.TRINITY_HEARTBEAT,
+            "ipc": StartupPhase.TRINITY_IPC,
+            "sync": StartupPhase.TRINITY_SYNC,
+        }
+
+        phase = phase_map.get(component.lower(), StartupPhase.TRINITY_INIT)
+        text = self._get_phase_message(phase, status)
+
+        if not text:
+            text = f"Trinity {component} {status}."
+
+        if details:
+            text = f"{text} {details}"
+
+        await self._speak(text, NarrationPriority.MEDIUM)
+
+    async def announce_subsystem(
+        self,
+        subsystem: str,
+        status: str = "start",
+        details: Optional[str] = None,
+    ) -> None:
+        """
+        v93.16: Announce advanced subsystem initialization.
+
+        Args:
+            subsystem: One of 'agi_orchestrator', 'model_serving', 'agent_registry',
+                       'state_manager', 'continuous_learning', 'event_bus',
+                       'knowledge_graph', 'training_pipeline', 'observability'
+            status: Status like 'start', 'complete', 'error'
+            details: Optional additional details
+        """
+        phase_map = {
+            "agi_orchestrator": StartupPhase.AGI_ORCHESTRATOR,
+            "model_serving": StartupPhase.MODEL_SERVING,
+            "agent_registry": StartupPhase.AGENT_REGISTRY,
+            "state_manager": StartupPhase.STATE_MANAGER,
+            "continuous_learning": StartupPhase.CONTINUOUS_LEARNING,
+            "event_bus": StartupPhase.EVENT_BUS,
+            "knowledge_graph": StartupPhase.KNOWLEDGE_GRAPH,
+            "training_pipeline": StartupPhase.TRAINING_PIPELINE,
+            "observability": StartupPhase.OBSERVABILITY,
+        }
+
+        phase = phase_map.get(subsystem.lower())
+        if phase:
+            text = self._get_phase_message(phase, status)
+        else:
+            text = None
+
+        if not text:
+            subsystem_name = subsystem.replace("_", " ").title()
+            if status == "complete":
+                text = f"{subsystem_name} online."
+            elif status == "error":
+                text = f"{subsystem_name} encountered an error."
+            else:
+                text = f"Initializing {subsystem_name}."
+
+        if details:
+            text = f"{text} {details}"
+
+        # Lower priority for subsystems to avoid overwhelming the user
+        await self._speak(text, NarrationPriority.LOW)
+
 
 # Phase mapping from progress reporter stages to StartupPhase
 STAGE_TO_PHASE: Dict[str, StartupPhase] = {
@@ -1790,6 +2244,27 @@ STAGE_TO_PHASE: Dict[str, StartupPhase] = {
     "reactor_core": StartupPhase.REACTOR_CORE,
     "reactor": StartupPhase.REACTOR_CORE,
     "training": StartupPhase.FLYWHEEL_TRAINING,
+    # v93.16: Project Trinity phases
+    "trinity": StartupPhase.TRINITY_INIT,
+    "trinity_init": StartupPhase.TRINITY_INIT,
+    "trinity_body": StartupPhase.TRINITY_BODY,
+    "trinity_mind": StartupPhase.TRINITY_MIND,
+    "trinity_nerves": StartupPhase.TRINITY_NERVES,
+    "trinity_heartbeat": StartupPhase.TRINITY_HEARTBEAT,
+    "trinity_ipc": StartupPhase.TRINITY_IPC,
+    "trinity_sync": StartupPhase.TRINITY_SYNC,
+    "trinity_complete": StartupPhase.TRINITY_COMPLETE,
+    "trinity_partial": StartupPhase.TRINITY_PARTIAL,
+    # v93.16: Advanced subsystem phases
+    "agi_orchestrator": StartupPhase.AGI_ORCHESTRATOR,
+    "model_serving": StartupPhase.MODEL_SERVING,
+    "agent_registry": StartupPhase.AGENT_REGISTRY,
+    "state_manager": StartupPhase.STATE_MANAGER,
+    "continuous_learning": StartupPhase.CONTINUOUS_LEARNING,
+    "event_bus": StartupPhase.EVENT_BUS,
+    "knowledge_graph": StartupPhase.KNOWLEDGE_GRAPH,
+    "training_pipeline": StartupPhase.TRAINING_PIPELINE,
+    "observability": StartupPhase.OBSERVABILITY,
 }
 
 

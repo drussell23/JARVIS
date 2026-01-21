@@ -386,13 +386,22 @@ class TrinityTrainingPipeline:
         logger.info("[TrainingPipeline] Initialization complete")
 
     async def _init_reactor_client(self) -> None:
-        """Initialize Reactor Core client."""
+        """Initialize Reactor Core client with proper two-step initialization."""
         try:
-            from backend.clients.reactor_core_client import get_reactor_core_client
-            self._reactor_client = await get_reactor_core_client()
-            logger.info("[TrainingPipeline] Reactor Core client connected")
-        except ImportError:
-            logger.warning("[TrainingPipeline] Reactor Core client not available")
+            from backend.clients.reactor_core_client import (
+                initialize_reactor_client,
+                get_reactor_client,
+            )
+            # Step 1: Initialize the global client (creates session, starts health monitor)
+            await initialize_reactor_client()
+            # Step 2: Get the initialized instance
+            self._reactor_client = get_reactor_client()
+            if self._reactor_client:
+                logger.info("[TrainingPipeline] Reactor Core client connected")
+            else:
+                logger.warning("[TrainingPipeline] Reactor Core client initialized but not available")
+        except ImportError as e:
+            logger.warning(f"[TrainingPipeline] Reactor Core client import failed: {e}")
         except Exception as e:
             logger.warning(f"[TrainingPipeline] Reactor Core connection failed: {e}")
 

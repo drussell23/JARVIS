@@ -211,6 +211,10 @@ class WebSocketCoordinator:
         self._heartbeat_task: Optional[asyncio.Task] = None
         self._reconnect_task: Optional[asyncio.Task] = None
 
+        # v1.1: Store connection URI for automatic reconnection
+        self._connection_uri: Optional[str] = None
+        self._reconnecting = False  # Prevent multiple concurrent reconnect attempts
+
         logger.info(f"WebSocket Coordinator v1.0 initialized (mode: {mode}, id: {self.client_id})")
 
     # =========================================================================
@@ -358,6 +362,9 @@ class WebSocketCoordinator:
         if self.mode != "client":
             raise RuntimeError("Can only connect in client mode")
 
+        # v1.1: Store URI for automatic reconnection
+        self._connection_uri = uri
+
         logger.info(f"Connecting to WebSocket server: {uri}")
 
         try:
@@ -369,6 +376,7 @@ class WebSocketCoordinator:
             )
 
             self._running = True
+            self._reconnecting = False  # v1.1: Clear reconnecting flag on successful connection
             logger.info(f"✅ Connected to {uri}")
 
             # Start background tasks
@@ -385,8 +393,9 @@ class WebSocketCoordinator:
         except Exception as e:
             logger.error(f"Failed to connect to WebSocket server: {e}", exc_info=True)
 
-            # Start reconnection if enabled
-            if self.config.reconnect_enabled:
+            # Start reconnection if enabled and not already reconnecting
+            if self.config.reconnect_enabled and not self._reconnecting:
+                self._reconnecting = True
                 self._reconnect_task = asyncio.create_task(
                     self._reconnect_loop(uri)
                 )
@@ -394,7 +403,11 @@ class WebSocketCoordinator:
             raise
 
     async def _receiver_loop(self) -> None:
-        """Receive and process messages from server."""
+        """
+        Receive and process messages from server.
+
+        v1.1: Fixed reconnection logic to properly use stored URI.
+        """
         if not self._client:
             return
 
@@ -408,14 +421,30 @@ class WebSocketCoordinator:
                 except Exception as e:
                     logger.error(f"Error processing server message: {e}")
 
-        except websockets.exceptions.ConnectionClosed:
-            logger.warning("Connection to server closed")
+        except websockets.exceptions.ConnectionClosed as e:
+            logger.warning(f"Connection to server closed: {e}")
             self._running = False
+            self._client = None
 
-            # Attempt reconnection
-            if self.config.reconnect_enabled:
-                # Note: would need to store original URI for reconnection
-                pass
+            # v1.1: Attempt reconnection using stored URI
+            if self.config.reconnect_enabled and self._connection_uri and not self._reconnecting:
+                self._reconnecting = True
+                logger.info(f"Starting automatic reconnection to {self._connection_uri}")
+                self._reconnect_task = asyncio.create_task(
+                    self._reconnect_loop(self._connection_uri)
+                )
+
+        except Exception as e:
+            logger.error(f"Unexpected error in receiver loop: {e}", exc_info=True)
+            self._running = False
+            self._client = None
+
+            # v1.1: Attempt reconnection on unexpected errors too
+            if self.config.reconnect_enabled and self._connection_uri and not self._reconnecting:
+                self._reconnecting = True
+                self._reconnect_task = asyncio.create_task(
+                    self._reconnect_loop(self._connection_uri)
+                )
 
     async def _process_server_message(self, message_data: dict) -> None:
         """Process message received from server."""
@@ -590,28 +619,49 @@ class WebSocketCoordinator:
                 logger.error(f"Heartbeat loop error: {e}", exc_info=True)
 
     async def _reconnect_loop(self, uri: str) -> None:
-        """Automatic reconnection with exponential backoff."""
+        """
+        Automatic reconnection with exponential backoff.
+
+        v1.1: Enhanced with proper state management and infinite retry option.
+        """
         attempt = 0
+        max_attempts = self.config.reconnect_max_attempts
 
-        while attempt < self.config.reconnect_max_attempts:
-            attempt += 1
-            delay = min(
-                self.config.reconnect_base_delay * (2 ** attempt),
-                self.config.reconnect_max_delay
-            )
+        try:
+            while attempt < max_attempts:
+                attempt += 1
+                delay = min(
+                    self.config.reconnect_base_delay * (2 ** attempt),
+                    self.config.reconnect_max_delay
+                )
 
-            logger.info(f"Reconnection attempt {attempt}/{self.config.reconnect_max_attempts} in {delay}s")
-            await asyncio.sleep(delay)
+                logger.info(f"Reconnection attempt {attempt}/{max_attempts} in {delay:.1f}s")
 
-            try:
-                await self.connect_client(uri)
-                logger.info("✅ Reconnection successful")
-                break
-            except Exception as e:
-                logger.warning(f"Reconnection attempt {attempt} failed: {e}")
+                try:
+                    await asyncio.sleep(delay)
+                except asyncio.CancelledError:
+                    logger.info("Reconnection cancelled during backoff")
+                    return
 
-        if attempt >= self.config.reconnect_max_attempts:
-            logger.error("Max reconnection attempts reached, giving up")
+                try:
+                    await self.connect_client(uri)
+                    logger.info("✅ Reconnection successful")
+                    return  # Success - exit the loop
+                except asyncio.CancelledError:
+                    logger.info("Reconnection cancelled")
+                    return
+                except Exception as e:
+                    logger.warning(f"Reconnection attempt {attempt} failed: {e}")
+
+            if attempt >= max_attempts:
+                logger.error(
+                    f"Max reconnection attempts ({max_attempts}) reached, giving up. "
+                    f"Manual reconnection required."
+                )
+
+        finally:
+            # v1.1: Always reset reconnecting flag when loop exits
+            self._reconnecting = False
 
     # =========================================================================
     # Lifecycle Management

@@ -12844,27 +12844,50 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
             # Status summary
             components_online = 1 + (1 if jprime_online else 0) + (1 if reactor_online else 0)
 
-            if components_online == 3:
-                self.logger.info("=" * 60)
-                self.logger.info("PROJECT TRINITY: FULL DISTRIBUTED MODE")
-                self.logger.info("   Mind ↔ Body ↔ Nerves: All connected")
-                self.logger.info("=" * 60)
-                print(f"  {TerminalUI.GREEN}✓ PROJECT TRINITY: Full distributed mode (3/3 components){TerminalUI.RESET}")
+            # v93.16: Enhanced Trinity voice announcements using the startup narrator
+            try:
+                from backend.core.supervisor.startup_narrator import get_startup_narrator
+                trinity_narrator = get_startup_narrator()
 
-                # Voice announcement for full Trinity
-                await self.narrator.speak(
-                    "PROJECT TRINITY connected. Distributed cognitive architecture active.",
-                    wait=False,
-                )
-            else:
-                status_parts = ["Body ✓"]
-                if jprime_online:
-                    status_parts.append("Mind ✓")
-                if reactor_online:
-                    status_parts.append("Nerves ✓")
+                if components_online == 3:
+                    self.logger.info("=" * 60)
+                    self.logger.info("PROJECT TRINITY: FULL DISTRIBUTED MODE")
+                    self.logger.info("   Mind ↔ Body ↔ Nerves: All connected")
+                    self.logger.info("=" * 60)
+                    print(f"  {TerminalUI.GREEN}✓ PROJECT TRINITY: Full distributed mode (3/3 components){TerminalUI.RESET}")
 
-                self.logger.info(f"   Trinity components: {', '.join(status_parts)}")
-                print(f"  {TerminalUI.GREEN}✓ PROJECT TRINITY: {components_online}/3 components online{TerminalUI.RESET}")
+                    # v93.16: Use enhanced Trinity complete announcement
+                    startup_duration = (time.time() - self._startup_time) if hasattr(self, '_startup_time') else None
+                    await trinity_narrator.announce_trinity_complete(
+                        mind_online=jprime_online,
+                        body_online=True,  # We're the body
+                        nerves_online=reactor_online,
+                        startup_duration=startup_duration,
+                    )
+                else:
+                    status_parts = ["Body ✓"]
+                    if jprime_online:
+                        status_parts.append("Mind ✓")
+                    if reactor_online:
+                        status_parts.append("Nerves ✓")
+
+                    self.logger.info(f"   Trinity components: {', '.join(status_parts)}")
+                    print(f"  {TerminalUI.GREEN}✓ PROJECT TRINITY: {components_online}/3 components online{TerminalUI.RESET}")
+
+                    # v93.16: Use partial Trinity announcement
+                    await trinity_narrator.announce_trinity_complete(
+                        mind_online=jprime_online,
+                        body_online=True,
+                        nerves_online=reactor_online,
+                    )
+            except Exception as narrator_err:
+                self.logger.debug(f"Trinity narrator unavailable: {narrator_err}")
+                # Fallback to basic announcement
+                if components_online == 3:
+                    await self.narrator.speak(
+                        "PROJECT TRINITY connected. Distributed cognitive architecture active.",
+                        wait=False,
+                    )
 
             # Broadcast Trinity status to loading server
             await self._broadcast_trinity_status()
