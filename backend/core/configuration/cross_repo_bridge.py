@@ -921,14 +921,37 @@ async def initialize_cross_repo_config() -> bool:
 
 
 async def shutdown_cross_repo_config():
-    """Shutdown the global configuration bridge."""
+    """
+    Shutdown the global configuration bridge.
+
+    v95.0: Enterprise-grade error handling:
+    - Timeout protection to prevent hanging
+    - Exception isolation
+    - Guaranteed cleanup of global state
+    """
     global _bridge
 
     async with _bridge_lock:
         if _bridge is not None:
-            await _bridge.shutdown()
-            _bridge = None
-            logger.info("Cross-repo config bridge shutdown")
+            bridge_to_shutdown = _bridge
+            logger.info("[v95.0] Initiating cross-repo config bridge shutdown...")
+
+            try:
+                # v95.0: Timeout protection
+                await asyncio.wait_for(
+                    bridge_to_shutdown.shutdown(),
+                    timeout=30.0
+                )
+                logger.info("Cross-repo config bridge shutdown complete")
+            except asyncio.TimeoutError:
+                logger.warning("[v95.0] Config bridge shutdown timed out - forcing cleanup")
+            except asyncio.CancelledError:
+                logger.warning("[v95.0] Config bridge shutdown cancelled - forcing cleanup")
+            except Exception as e:
+                logger.error(f"[v95.0] Config bridge shutdown error: {e}")
+            finally:
+                # v95.0: ALWAYS clean up global state
+                _bridge = None
 
 
 # =============================================================================
