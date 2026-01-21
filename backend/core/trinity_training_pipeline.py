@@ -386,24 +386,58 @@ class TrinityTrainingPipeline:
         logger.info("[TrainingPipeline] Initialization complete")
 
     async def _init_reactor_client(self) -> None:
-        """Initialize Reactor Core client with proper two-step initialization."""
+        """
+        v95.0: Initialize Reactor Core client with proper two-step initialization and retry logic.
+
+        Critical operation that benefits from retry on transient failures (network issues,
+        timing during startup, etc.).
+        """
         try:
             from backend.clients.reactor_core_client import (
                 initialize_reactor_client,
                 get_reactor_client,
             )
-            # Step 1: Initialize the global client (creates session, starts health monitor)
-            await initialize_reactor_client()
-            # Step 2: Get the initialized instance
-            self._reactor_client = get_reactor_client()
-            if self._reactor_client:
-                logger.info("[TrainingPipeline] Reactor Core client connected")
-            else:
-                logger.warning("[TrainingPipeline] Reactor Core client initialized but not available")
+
+            # v95.0: Use retry logic for this critical initialization
+            # Import retry utility (available in backend framework)
+            try:
+                from backend.core.coding_council.framework.retry import retry_async, RetryPolicy
+
+                async def _do_init():
+                    await initialize_reactor_client()
+                    client = get_reactor_client()
+                    if not client:
+                        raise RuntimeError("Client initialized but not available")
+                    return client
+
+                # Retry up to 3 times with exponential backoff for transient failures
+                policy = RetryPolicy(
+                    max_attempts=3,
+                    base_delay=1.0,
+                    max_delay=10.0,
+                    retryable_exceptions=(ConnectionError, TimeoutError, RuntimeError),
+                )
+
+                self._reactor_client = await retry_async(
+                    _do_init,
+                    policy=policy,
+                    operation_name="reactor_client_init",
+                )
+                logger.info("[TrainingPipeline] Reactor Core client connected (with retry)")
+
+            except ImportError:
+                # Fallback to simple initialization if retry framework not available
+                await initialize_reactor_client()
+                self._reactor_client = get_reactor_client()
+                if self._reactor_client:
+                    logger.info("[TrainingPipeline] Reactor Core client connected")
+                else:
+                    logger.warning("[TrainingPipeline] Reactor Core client initialized but not available")
+
         except ImportError as e:
             logger.warning(f"[TrainingPipeline] Reactor Core client import failed: {e}")
         except Exception as e:
-            logger.warning(f"[TrainingPipeline] Reactor Core connection failed: {e}")
+            logger.warning(f"[TrainingPipeline] Reactor Core connection failed after retries: {e}")
 
     async def _init_prime_client(self) -> None:
         """Initialize JARVIS Prime client."""

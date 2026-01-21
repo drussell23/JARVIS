@@ -1943,6 +1943,98 @@ class RetryWithBackoff:
         return False, None, exceptions
 
 
+# =============================================================================
+# v95.0: SIMPLE ASYNC RETRY UTILITY
+# Standalone retry function for critical operations (HTTP, subprocess, etc.)
+# =============================================================================
+
+async def async_retry(
+    operation: Callable[[], Any],
+    max_retries: int = 3,
+    base_delay: float = 1.0,
+    max_delay: float = 30.0,
+    exponential_base: float = 2.0,
+    operation_name: str = "operation",
+    retryable_exceptions: Optional[Tuple[type, ...]] = None,
+    logger: Optional[logging.Logger] = None,
+) -> Any:
+    """
+    v95.0: Simple async retry utility for critical operations.
+
+    Unlike RetryWithBackoff (tied to TrinityLaunchConfig), this is a standalone
+    function that can be used anywhere for HTTP requests, subprocess ops, etc.
+
+    Args:
+        operation: Async callable to execute (can be lambda returning coroutine)
+        max_retries: Maximum number of retry attempts (default: 3)
+        base_delay: Initial delay in seconds (default: 1.0)
+        max_delay: Maximum delay cap (default: 30.0)
+        exponential_base: Multiplier for exponential backoff (default: 2.0)
+        operation_name: Name for logging (default: "operation")
+        retryable_exceptions: Tuple of exception types to retry on (default: all)
+        logger: Optional logger instance
+
+    Returns:
+        The result of the operation
+
+    Raises:
+        The last exception if all retries fail
+
+    Example:
+        result = await async_retry(
+            lambda: session.get(url),
+            max_retries=3,
+            operation_name="health_check",
+            retryable_exceptions=(aiohttp.ClientError, asyncio.TimeoutError),
+        )
+    """
+    _logger = logger or logging.getLogger("AsyncRetry")
+    last_exception: Optional[Exception] = None
+    max_attempts = max_retries + 1
+
+    for attempt in range(max_attempts):
+        try:
+            # Handle both async functions and lambdas returning coroutines
+            if asyncio.iscoroutinefunction(operation):
+                result = await operation()
+            else:
+                result = operation()
+                if asyncio.iscoroutine(result):
+                    result = await result
+
+            if attempt > 0:
+                _logger.info(f"[{operation_name}] Succeeded on attempt {attempt + 1}")
+
+            return result
+
+        except Exception as e:
+            last_exception = e
+
+            # Check if this exception type should be retried
+            if retryable_exceptions and not isinstance(e, retryable_exceptions):
+                _logger.debug(f"[{operation_name}] Non-retryable exception: {type(e).__name__}")
+                raise
+
+            _logger.warning(f"[{operation_name}] Attempt {attempt + 1}/{max_attempts} failed: {e}")
+
+            # Check if we have retries left
+            if attempt < max_attempts - 1:
+                # Calculate delay with exponential backoff and jitter
+                import random
+                delay = min(base_delay * (exponential_base ** attempt), max_delay)
+                jitter = delay * 0.1 * (2 * random.random() - 1)  # ±10% jitter
+                delay = max(0, delay + jitter)
+
+                _logger.debug(f"[{operation_name}] Retrying in {delay:.2f}s...")
+                await asyncio.sleep(delay)
+
+    # All retries exhausted
+    _logger.error(f"[{operation_name}] All {max_attempts} attempts failed")
+    if last_exception:
+        raise last_exception
+    raise RuntimeError(f"{operation_name} failed after {max_attempts} attempts")
+
+
 # Global Trinity config (lazy initialization)
 _trinity_config: Optional[TrinityLaunchConfig] = None
 
@@ -2457,9 +2549,16 @@ class ParallelProcessCleaner:
         
         # Wait for all with gather
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        # Count successes
-        terminated = sum(1 for r in results if r is True)
+
+        # v95.0: Count successes and log exceptions for observability
+        terminated = 0
+        for i, result in enumerate(results):
+            if result is True:
+                terminated += 1
+            elif isinstance(result, Exception):
+                # Log exceptions from individual termination tasks
+                self.logger.debug(f"Process termination exception: {result}")
+
         return terminated
     
     async def _terminate_process(self, pid: int, info: ProcessInfo) -> bool:
@@ -3847,6 +3946,14 @@ class SupervisorBootstrapper:
         self._reactor_core_orchestrator_process: Optional[asyncio.subprocess.Process] = None
         self._trinity_auto_launch_enabled = os.getenv("TRINITY_AUTO_LAUNCH", "true").lower() == "true"
 
+        # v95.0: Direct Subprocess Health Monitoring (complements heartbeat-based monitoring)
+        # - Directly monitors process handles for early crash detection
+        # - Faster detection than heartbeat timeout (immediate vs 15s)
+        # - Triggers restart callbacks when subprocess dies unexpectedly
+        self._subprocess_health_task: Optional[asyncio.Task] = None
+        self._subprocess_health_interval = float(os.getenv("SUBPROCESS_HEALTH_INTERVAL", "5.0"))
+        self._subprocess_health_enabled = os.getenv("SUBPROCESS_HEALTH_ENABLED", "true").lower() == "true"
+
         # v75.0: Trinity Health Monitor for crash detection & auto-recovery
         self._trinity_health_monitor = None
         self._jprime_repo_path = Path(os.getenv(
@@ -4962,65 +5069,57 @@ class SupervisorBootstrapper:
                 self.logger.info(f"[v85.0] Entry point detected: {entry_point}")
                 TerminalUI.print_success(f"[v85.0] Entry point: {entry_point}")
 
-                # Check if we should manage Trinity (prevents double-startup)
-                should_manage = await TrinityEntryPointDetector.should_manage_trinity()
-                if not should_manage:
-                    coord_status = await TrinityEntryPointDetector.get_coordination_status()
-                    existing_owner = coord_status.get("current_owner")
+                # v95.0: ATOMIC OWNERSHIP ACQUISITION - fixes TOCTOU race condition
+                # Previously: should_manage_trinity() -> acquire_ownership() had a gap
+                # where two processes could both get True and race to acquire.
+                # Now: Always attempt atomic lock acquisition directly. The fcntl lock
+                # ensures only one process wins, eliminating the race condition.
+                # ═══════════════════════════════════════════════════════════════════
+                self._state_coordinator = UnifiedStateCoordinator()
+
+                # First, cleanup any stale owners (crash recovery)
+                try:
+                    cleaned = await self._state_coordinator._cleanup_stale_owners()
+                    if cleaned > 0:
+                        self.logger.info(f"[v95.0] Cleaned {cleaned} stale owner(s)")
+                except Exception as e:
+                    self.logger.debug(f"[v95.0] Stale cleanup skipped: {e}")
+
+                # ATOMIC: Try to acquire ownership with fcntl lock
+                # This is the ONLY place where ownership is decided - no pre-check needed
+                acquired, existing_owner = await self._state_coordinator.acquire_ownership(
+                    entry_point=entry_point,
+                    component="jarvis",  # v85.0: Unified component name
+                    timeout=30.0,
+                    force=False,  # Don't force - respect existing owners
+                )
+
+                if acquired:
+                    self._ownership_acquired = True
+                    self.logger.info("[v95.0] ✅ Ownership acquired successfully (atomic lock)")
+                    TerminalUI.print_success("[v95.0] Exclusive ownership acquired (atomic lock)")
+
+                    # Start heartbeat loop to maintain ownership
+                    self._heartbeat_task = await self._state_coordinator.start_heartbeat_loop(
+                        component="jarvis",  # v85.0: Unified component name
+                        interval=5.0,  # 5-second heartbeat
+                    )
+                    self.logger.debug("[v95.0] Heartbeat loop started")
+                else:
+                    # v95.0: Didn't acquire - but this is fine, we continue as subordinate
+                    # The atomic lock ensures no race condition - someone else won fairly
                     if existing_owner:
-                        owner_pid = existing_owner.get("pid", "unknown")
-                        owner_entry = existing_owner.get("entry_point", "unknown")
-                        self.logger.warning(
-                            f"[v85.0] Another process is managing Trinity: "
-                            f"PID={owner_pid}, entry={owner_entry}"
+                        owner_pid = getattr(existing_owner, 'pid', 'unknown')
+                        owner_entry = getattr(existing_owner, 'entry_point', 'unknown')
+                        self.logger.info(
+                            f"[v95.0] Another process owns Trinity: "
+                            f"PID={owner_pid}, entry={owner_entry} - continuing as subordinate"
                         )
                         TerminalUI.print_warning(
-                            f"[v85.0] Trinity already managed by PID {owner_pid} ({owner_entry})"
+                            f"[v95.0] Trinity managed by PID {owner_pid} ({owner_entry}) - subordinate mode"
                         )
-                        # Don't fail - let existing manager continue
-                        # We can still start as a subordinate
-                else:
-                    # We should be the manager - acquire ownership
-                    self._state_coordinator = UnifiedStateCoordinator()
-
-                    # First, cleanup any stale owners (crash recovery)
-                    try:
-                        cleaned = await self._state_coordinator._cleanup_stale_owners()
-                        if cleaned > 0:
-                            self.logger.info(f"[v85.0] Cleaned {cleaned} stale owner(s)")
-                    except Exception as e:
-                        self.logger.debug(f"[v85.0] Stale cleanup skipped: {e}")
-
-                    # Try to acquire ownership with atomic lock
-                    acquired, existing_owner = await self._state_coordinator.acquire_ownership(
-                        entry_point=entry_point,
-                        component="jarvis",  # v85.0: Unified component name
-                        timeout=30.0,
-                        force=False,  # Don't force - respect existing owners
-                    )
-
-                    if acquired:
-                        self._ownership_acquired = True
-                        self.logger.info("[v85.0] ✅ Ownership acquired successfully")
-                        TerminalUI.print_success("[v85.0] Exclusive ownership acquired (atomic lock)")
-
-                        # Start heartbeat loop to maintain ownership
-                        self._heartbeat_task = await self._state_coordinator.start_heartbeat_loop(
-                            component="jarvis",  # v85.0: Unified component name
-                            interval=5.0,  # 5-second heartbeat
-                        )
-                        self.logger.debug("[v85.0] Heartbeat loop started")
                     else:
-                        if existing_owner:
-                            self.logger.warning(
-                                f"[v85.0] Could not acquire ownership - "
-                                f"held by PID {existing_owner.pid} ({existing_owner.entry_point})"
-                            )
-                            TerminalUI.print_warning(
-                                f"[v85.0] Ownership held by PID {existing_owner.pid}"
-                            )
-                        else:
-                            self.logger.warning("[v85.0] Could not acquire ownership (unknown reason)")
+                        self.logger.warning("[v95.0] Could not acquire ownership (unknown reason)")
 
                 # v85.0: Resource pre-flight check
                 # Verify we have enough resources before proceeding
@@ -10516,10 +10615,15 @@ class SupervisorBootstrapper:
                 # Run all discovery tasks in parallel
                 results = await asyncio.gather(*tasks, return_exceptions=True)
 
+                # v95.0: Validate results and log exceptions for observability
                 total_discovered = 0
-                for result in results:
+                source_names = ["experiences_db", "logs", "reactor_core"]
+                for i, result in enumerate(results):
                     if isinstance(result, list):
                         total_discovered += len(result)
+                    elif isinstance(result, Exception):
+                        source = source_names[i] if i < len(source_names) else f"source_{i}"
+                        self.logger.debug(f"Discovery exception from {source}: {result}")
 
                 if total_discovered > 0:
                     self.logger.info(f"🎯 Discovered {total_discovered} new learning topics")
@@ -16524,6 +16628,9 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
             # v75.0: Start Trinity Health Monitor
             await self._start_trinity_health_monitor()
 
+            # v95.0: Start Direct Subprocess Health Monitor (complements heartbeat monitoring)
+            await self._start_subprocess_health_monitor()
+
             # v17.0: Start Service Supervisor for auto-restart of dead services
             await self._initialize_service_supervisor()
 
@@ -16965,6 +17072,159 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
             self.logger.info("✅ Trinity Health Monitor stopped")
         except Exception as e:
             self.logger.debug(f"Health Monitor stop error: {e}")
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # v95.0: DIRECT SUBPROCESS HEALTH MONITORING
+    # Complements heartbeat-based monitoring with immediate process state checks
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    async def _start_subprocess_health_monitor(self) -> None:
+        """
+        v95.0: Start direct subprocess health monitoring.
+
+        Unlike heartbeat-based monitoring (which has a 15s timeout), this directly
+        monitors the subprocess process handles for immediate crash detection.
+
+        Features:
+        - Immediate detection when subprocess exits (vs 15s heartbeat timeout)
+        - Captures exit codes for debugging
+        - Triggers restart callbacks via the trinity health monitor
+        - Respects circuit breaker limits from trinity health monitor
+        """
+        if not self._subprocess_health_enabled:
+            self.logger.info("[v95.0] Subprocess health monitoring disabled via env")
+            return
+
+        if self._subprocess_health_task is not None:
+            self.logger.debug("[v95.0] Subprocess health monitor already running")
+            return
+
+        self._subprocess_health_task = asyncio.create_task(
+            self._subprocess_health_monitor_loop(),
+            name="subprocess_health_monitor"
+        )
+        self.logger.info("[v95.0] ✅ Subprocess health monitor started")
+        print(f"  {TerminalUI.GREEN}✓ Subprocess Health: Direct process monitoring active{TerminalUI.RESET}")
+
+    async def _stop_subprocess_health_monitor(self) -> None:
+        """v95.0: Stop subprocess health monitoring."""
+        if self._subprocess_health_task is not None:
+            self._subprocess_health_task.cancel()
+            try:
+                await self._subprocess_health_task
+            except asyncio.CancelledError:
+                pass
+            self._subprocess_health_task = None
+            self.logger.info("[v95.0] ✅ Subprocess health monitor stopped")
+
+    async def _subprocess_health_monitor_loop(self) -> None:
+        """
+        v95.0: Background loop monitoring subprocess processes directly.
+
+        Checks returncode to detect when processes exit unexpectedly.
+        """
+        max_runtime = float(os.getenv("TIMEOUT_SUBPROCESS_HEALTH_SESSION", "86400.0"))  # 24 hours
+        start = time.monotonic()
+        cancelled = False
+
+        # Track restart cooldowns to avoid rapid restart loops
+        restart_cooldown: Dict[str, float] = {}
+        cooldown_period = 30.0  # Don't restart same process within 30s
+
+        while time.monotonic() - start < max_runtime:
+            try:
+                await asyncio.sleep(self._subprocess_health_interval)
+
+                # Check J-Prime subprocess
+                if self._jprime_orchestrator_process is not None:
+                    returncode = self._jprime_orchestrator_process.returncode
+                    if returncode is not None:
+                        # Process has exited
+                        pid = self._jprime_orchestrator_process.pid
+                        self.logger.warning(
+                            f"[v95.0] J-Prime subprocess (PID {pid}) exited with code {returncode}"
+                        )
+
+                        # Clear the process reference
+                        self._jprime_orchestrator_process = None
+
+                        # Check cooldown
+                        last_restart = restart_cooldown.get("j_prime", 0)
+                        if time.monotonic() - last_restart > cooldown_period:
+                            restart_cooldown["j_prime"] = time.monotonic()
+
+                            # Trigger restart via callback if registered
+                            if self._trinity_health_monitor:
+                                callback = self._trinity_health_monitor._restart_callbacks.get("j_prime")
+                                if callback:
+                                    self.logger.info("[v95.0] Triggering J-Prime restart via health monitor")
+                                    try:
+                                        await callback()
+                                    except Exception as e:
+                                        self.logger.error(f"[v95.0] J-Prime restart callback failed: {e}")
+                            else:
+                                # Direct restart if no health monitor
+                                self.logger.info("[v95.0] Attempting direct J-Prime restart")
+                                try:
+                                    await self._restart_jprime_on_crash()
+                                except Exception as e:
+                                    self.logger.error(f"[v95.0] J-Prime direct restart failed: {e}")
+                        else:
+                            self.logger.warning(
+                                f"[v95.0] J-Prime restart skipped (cooldown: "
+                                f"{cooldown_period - (time.monotonic() - last_restart):.1f}s remaining)"
+                            )
+
+                # Check Reactor-Core subprocess
+                if self._reactor_core_orchestrator_process is not None:
+                    returncode = self._reactor_core_orchestrator_process.returncode
+                    if returncode is not None:
+                        # Process has exited
+                        pid = self._reactor_core_orchestrator_process.pid
+                        self.logger.warning(
+                            f"[v95.0] Reactor-Core subprocess (PID {pid}) exited with code {returncode}"
+                        )
+
+                        # Clear the process reference
+                        self._reactor_core_orchestrator_process = None
+
+                        # Check cooldown
+                        last_restart = restart_cooldown.get("reactor_core", 0)
+                        if time.monotonic() - last_restart > cooldown_period:
+                            restart_cooldown["reactor_core"] = time.monotonic()
+
+                            # Trigger restart via callback if registered
+                            if self._trinity_health_monitor:
+                                callback = self._trinity_health_monitor._restart_callbacks.get("reactor_core")
+                                if callback:
+                                    self.logger.info("[v95.0] Triggering Reactor-Core restart via health monitor")
+                                    try:
+                                        await callback()
+                                    except Exception as e:
+                                        self.logger.error(f"[v95.0] Reactor-Core restart callback failed: {e}")
+                            else:
+                                # Direct restart if no health monitor
+                                self.logger.info("[v95.0] Attempting direct Reactor-Core restart")
+                                try:
+                                    await self._restart_reactor_core_on_crash()
+                                except Exception as e:
+                                    self.logger.error(f"[v95.0] Reactor-Core direct restart failed: {e}")
+                        else:
+                            self.logger.warning(
+                                f"[v95.0] Reactor-Core restart skipped (cooldown: "
+                                f"{cooldown_period - (time.monotonic() - last_restart):.1f}s remaining)"
+                            )
+
+            except asyncio.CancelledError:
+                cancelled = True
+                break
+            except Exception as e:
+                self.logger.exception(f"[v95.0] Subprocess health monitor error: {e}")
+
+        if cancelled:
+            self.logger.info("[v95.0] Subprocess health monitor cancelled (shutdown)")
+        else:
+            self.logger.info("[v95.0] Subprocess health monitor reached max runtime, exiting")
 
     async def _initialize_service_supervisor(self) -> None:
         """
@@ -18150,6 +18410,9 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
                     self.logger.debug(f"   Error closing {description} file handle: {e}")
                 finally:
                     setattr(self, attr_name, None)
+
+        # v95.0: Stop Subprocess Health Monitor (before trinity health monitor)
+        await self._stop_subprocess_health_monitor()
 
         # v75.0: Stop Trinity Health Monitor
         await self._stop_trinity_health_monitor()
