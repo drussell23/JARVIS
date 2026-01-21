@@ -557,14 +557,48 @@ class CrossRepoConfigBridge:
     # =========================================================================
 
     async def sync_with_repo(self, target_repo: str) -> SyncResult:
-        """Synchronize configuration with a specific repository."""
+        """
+        v95.0: Synchronize configuration with a specific repository.
+
+        Enhanced with timeout protection and better error handling.
+        """
         start_time = time.time()
         result = SyncResult()
+        sync_timeout = getattr(self.config, 'sync_timeout', 10.0)
 
         try:
-            # Get local config
-            local_config = await self._config_engine.get_all()
-            local_version = await self._config_engine.get_version()
+            # v95.0: Get local config with timeout protection
+            try:
+                local_config = await asyncio.wait_for(
+                    self._config_engine.get_all(),
+                    timeout=sync_timeout
+                )
+            except asyncio.TimeoutError:
+                result.success = False
+                result.errors.append(f"Timeout getting local config for {target_repo}")
+                self.logger.warning(f"Sync with {target_repo}: local config fetch timed out")
+                result.duration_ms = (time.time() - start_time) * 1000
+                return result
+            except Exception as e:
+                result.success = False
+                error_msg = f"Error getting local config: {type(e).__name__}: {str(e)}"
+                result.errors.append(error_msg)
+                self.logger.warning(f"Sync with {target_repo}: {error_msg}")
+                result.duration_ms = (time.time() - start_time) * 1000
+                return result
+
+            # v95.0: Get version with timeout protection
+            try:
+                local_version = await asyncio.wait_for(
+                    self._config_engine.get_version(),
+                    timeout=sync_timeout
+                )
+            except asyncio.TimeoutError:
+                local_version = None
+                self.logger.debug(f"Sync with {target_repo}: version fetch timed out, using 0")
+            except Exception as e:
+                local_version = None
+                self.logger.debug(f"Sync with {target_repo}: version fetch failed: {e}")
 
             # Request remote config
             event = ConfigEvent(
@@ -576,13 +610,25 @@ class CrossRepoConfigBridge:
                     "checksum": self._calculate_config_checksum(local_config),
                 },
             )
-            await self.event_bus.publish(event)
+
+            # v95.0: Publish event with timeout
+            try:
+                await asyncio.wait_for(
+                    self.event_bus.publish(event),
+                    timeout=sync_timeout
+                )
+            except asyncio.TimeoutError:
+                result.success = False
+                result.errors.append(f"Timeout publishing sync event to {target_repo}")
+                self.logger.warning(f"Sync with {target_repo}: event publish timed out")
+                result.duration_ms = (time.time() - start_time) * 1000
+                return result
 
             # Note: In a real implementation, this would wait for response
             # For now, we'll simulate a successful sync
 
             result.success = True
-            result.synced_keys = list(local_config.keys())
+            result.synced_keys = list(local_config.keys()) if local_config else []
 
             # Update repo state
             async with self._lock:
@@ -590,10 +636,15 @@ class CrossRepoConfigBridge:
                     self._repo_states[target_repo].last_sync = datetime.utcnow()
                     self._repo_states[target_repo].sync_status = SyncStatus.SYNCED
 
+        except asyncio.CancelledError:
+            raise  # Don't suppress cancellation
         except Exception as e:
             result.success = False
-            result.errors.append(str(e))
-            self.logger.error(f"Sync with {target_repo} failed: {e}")
+            # v95.0: Better error message formatting
+            error_type = type(e).__name__
+            error_msg = str(e) if str(e) else repr(e)
+            result.errors.append(f"{error_type}: {error_msg}")
+            self.logger.error(f"Sync with {target_repo} failed: {error_type}: {error_msg}")
 
         result.duration_ms = (time.time() - start_time) * 1000
         return result

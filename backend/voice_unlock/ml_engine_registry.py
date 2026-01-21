@@ -137,15 +137,21 @@ class MLConfig:
         }
 
     @classmethod
-    def check_memory_pressure(cls) -> Tuple[bool, float, str]:
+    def check_memory_pressure(cls, attempt_relief: bool = True) -> Tuple[bool, float, str]:
         """
         Check current memory pressure and decide routing.
+
+        v95.0: Enhanced with automatic memory relief when close to threshold.
+
+        Args:
+            attempt_relief: If True, try memory relief when close to threshold
 
         Returns:
             (use_cloud, available_ram_gb, reason)
         """
         try:
             import subprocess
+            import gc
 
             # Get available RAM using macOS vm_stat
             result = subprocess.run(
@@ -175,14 +181,83 @@ class MLConfig:
                 # Calculate available RAM (free + inactive + speculative)
                 available_bytes = (free_pages + inactive_pages + speculative_pages) * page_size
                 available_gb = available_bytes / (1024 ** 3)
+                initial_available_gb = available_gb
 
-                # Decision logic
-                if available_gb < cls.RAM_THRESHOLD_CRITICAL:
-                    return (True, available_gb, f"Critical RAM: {available_gb:.1f}GB < {cls.RAM_THRESHOLD_CRITICAL}GB")
-                elif available_gb < cls.RAM_THRESHOLD_LOCAL:
-                    return (True, available_gb, f"Low RAM: {available_gb:.1f}GB < {cls.RAM_THRESHOLD_LOCAL}GB")
+                # v95.0: Attempt memory relief if close to threshold
+                if attempt_relief and available_gb < cls.RAM_THRESHOLD_LOCAL and available_gb >= cls.RAM_THRESHOLD_CRITICAL * 0.8:
+                    logger.debug(f"[MLConfig] Attempting memory relief (have {available_gb:.1f}GB, need {cls.RAM_THRESHOLD_LOCAL:.1f}GB)")
+
+                    # Try garbage collection first
+                    gc.collect()
+
+                    # Try LocalMemoryFallback if available
+                    try:
+                        from backend.core.gcp_vm_manager import get_local_memory_fallback
+                        import asyncio
+
+                        fallback = get_local_memory_fallback()
+
+                        # Run async relief in sync context
+                        try:
+                            loop = asyncio.get_running_loop()
+                            # We're already in async context - can't run another event loop
+                            # Just trigger GC which was already done above
+                        except RuntimeError:
+                            # Not in async context - can run relief
+                            loop = asyncio.new_event_loop()
+                            try:
+                                loop.run_until_complete(
+                                    fallback.attempt_local_relief(target_free_mb=cls.RAM_THRESHOLD_LOCAL * 1024)
+                                )
+                            finally:
+                                loop.close()
+
+                    except Exception as relief_error:
+                        logger.debug(f"[MLConfig] Memory relief failed: {relief_error}")
+
+                    # Re-check memory after relief
+                    result2 = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=5)
+                    if result2.returncode == 0:
+                        for line in result2.stdout.split('\n'):
+                            if 'Pages free:' in line:
+                                free_pages = int(line.split(':')[1].strip().rstrip('.'))
+                            elif 'Pages inactive:' in line:
+                                inactive_pages = int(line.split(':')[1].strip().rstrip('.'))
+                            elif 'Pages speculative:' in line:
+                                speculative_pages = int(line.split(':')[1].strip().rstrip('.'))
+
+                        available_bytes = (free_pages + inactive_pages + speculative_pages) * page_size
+                        available_gb = available_bytes / (1024 ** 3)
+
+                        if available_gb > initial_available_gb:
+                            logger.info(f"[MLConfig] Memory relief freed {(available_gb - initial_available_gb):.2f}GB")
+
+                # v95.0: Adaptive thresholds based on system total RAM
+                try:
+                    import psutil
+                    total_gb = psutil.virtual_memory().total / (1024 ** 3)
+
+                    # Scale thresholds for smaller systems
+                    if total_gb < 8:
+                        effective_local_threshold = max(cls.RAM_THRESHOLD_LOCAL * 0.5, 1.5)
+                        effective_critical_threshold = max(cls.RAM_THRESHOLD_CRITICAL * 0.5, 0.8)
+                    elif total_gb < 16:
+                        effective_local_threshold = max(cls.RAM_THRESHOLD_LOCAL * 0.75, 2.0)
+                        effective_critical_threshold = max(cls.RAM_THRESHOLD_CRITICAL * 0.75, 1.2)
+                    else:
+                        effective_local_threshold = cls.RAM_THRESHOLD_LOCAL
+                        effective_critical_threshold = cls.RAM_THRESHOLD_CRITICAL
+                except Exception:
+                    effective_local_threshold = cls.RAM_THRESHOLD_LOCAL
+                    effective_critical_threshold = cls.RAM_THRESHOLD_CRITICAL
+
+                # Decision logic with adaptive thresholds
+                if available_gb < effective_critical_threshold:
+                    return (True, available_gb, f"Critical RAM: {available_gb:.1f}GB < {effective_critical_threshold:.1f}GB")
+                elif available_gb < effective_local_threshold:
+                    return (True, available_gb, f"Low RAM: {available_gb:.1f}GB < {effective_local_threshold:.1f}GB")
                 else:
-                    return (False, available_gb, f"Sufficient RAM: {available_gb:.1f}GB >= {cls.RAM_THRESHOLD_LOCAL}GB")
+                    return (False, available_gb, f"Sufficient RAM: {available_gb:.1f}GB >= {effective_local_threshold:.1f}GB")
 
         except Exception as e:
             logger.warning(f"Failed to check memory pressure: {e}")

@@ -420,6 +420,12 @@ class ServiceRegistry:
             os.environ.get("JARVIS_STALE_WARNING_RATE_LIMIT", "60.0")
         )
 
+        # v95.0: Callback system for service lifecycle events
+        # Allows orchestrators to be notified when services die/become stale
+        self._on_service_dead_callbacks: List[Callable[[str, int], Any]] = []
+        self._on_service_stale_callbacks: List[Callable[[str, float], Any]] = []
+        self._on_service_recovered_callbacks: List[Callable[[str], Any]] = []
+
         # v93.0: Ensure directory exists with retry logic
         if not self._dir_manager.ensure_directory_sync():
             logger.error(f"[v93.0] CRITICAL: Failed to create registry directory: {self.registry_dir}")
@@ -428,6 +434,85 @@ class ServiceRegistry:
         # Initialize registry file if doesn't exist
         if not self.registry_file.exists():
             self._write_registry({})
+
+    # =========================================================================
+    # v95.0: Callback Registration for Service Lifecycle Events
+    # =========================================================================
+
+    def register_on_service_dead(
+        self,
+        callback: Callable[[str, int], Any]
+    ) -> None:
+        """
+        v95.0: Register callback for when a service's process dies.
+
+        The callback receives:
+        - service_name: Name of the dead service
+        - pid: The dead PID
+
+        This allows orchestrators to be notified and restart services.
+        """
+        self._on_service_dead_callbacks.append(callback)
+        logger.debug(f"[v95.0] Registered on_service_dead callback: {callback}")
+
+    def register_on_service_stale(
+        self,
+        callback: Callable[[str, float], Any]
+    ) -> None:
+        """
+        v95.0: Register callback for when a service becomes stale.
+
+        The callback receives:
+        - service_name: Name of the stale service
+        - last_heartbeat_age: Seconds since last heartbeat
+
+        This allows orchestrators to be notified of unresponsive services.
+        """
+        self._on_service_stale_callbacks.append(callback)
+        logger.debug(f"[v95.0] Registered on_service_stale callback: {callback}")
+
+    def register_on_service_recovered(
+        self,
+        callback: Callable[[str], Any]
+    ) -> None:
+        """
+        v95.0: Register callback for when a service recovers (becomes healthy).
+
+        The callback receives:
+        - service_name: Name of the recovered service
+        """
+        self._on_service_recovered_callbacks.append(callback)
+        logger.debug(f"[v95.0] Registered on_service_recovered callback: {callback}")
+
+    async def _notify_service_dead(self, service_name: str, pid: int) -> None:
+        """v95.0: Notify all registered callbacks that a service died."""
+        for callback in self._on_service_dead_callbacks:
+            try:
+                result = callback(service_name, pid)
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception as e:
+                logger.warning(f"[v95.0] on_service_dead callback error: {e}")
+
+    async def _notify_service_stale(self, service_name: str, age: float) -> None:
+        """v95.0: Notify all registered callbacks that a service is stale."""
+        for callback in self._on_service_stale_callbacks:
+            try:
+                result = callback(service_name, age)
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception as e:
+                logger.warning(f"[v95.0] on_service_stale callback error: {e}")
+
+    async def _notify_service_recovered(self, service_name: str) -> None:
+        """v95.0: Notify all registered callbacks that a service recovered."""
+        for callback in self._on_service_recovered_callbacks:
+            try:
+                result = callback(service_name)
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception as e:
+                logger.warning(f"[v95.0] on_service_recovered callback error: {e}")
 
     def _acquire_lock(self, file_handle) -> None:
         """Acquire exclusive lock on registry file (blocking)."""
@@ -632,10 +717,13 @@ class ServiceRegistry:
 
         # Check if process is still alive
         if not service.is_process_alive():
+            dead_pid = service.pid
             logger.warning(
-                f"⚠️  Service {service_name} has dead PID {service.pid}, cleaning up"
+                f"⚠️  Service {service_name} has dead PID {dead_pid}, cleaning up"
             )
             await self.deregister_service(service_name)
+            # v95.0: Notify callbacks that service died (for auto-restart)
+            await self._notify_service_dead(service_name, dead_pid)
             return None
 
         # v93.3: Startup-aware stale check
@@ -650,14 +738,17 @@ class ServiceRegistry:
             # v93.14: Rate limit stale warnings to prevent log flooding
             current_time = time.time()
             last_warning_time = self._stale_warning_times.get(service_name, 0)
+            heartbeat_age = current_time - service.last_heartbeat
 
             if current_time - last_warning_time >= self._warning_rate_limit_seconds:
                 startup_note = " (after startup grace)" if not is_in_startup else ""
                 logger.warning(
                     f"⚠️  Service {service_name} is stale{startup_note} "
-                    f"(last heartbeat {current_time - service.last_heartbeat:.0f}s ago)"
+                    f"(last heartbeat {heartbeat_age:.0f}s ago)"
                 )
                 self._stale_warning_times[service_name] = current_time
+                # v95.0: Notify callbacks that service is stale (for potential restart)
+                await self._notify_service_stale(service_name, heartbeat_age)
 
             return None
 

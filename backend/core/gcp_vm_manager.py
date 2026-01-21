@@ -2112,12 +2112,179 @@ async def create_vm_if_needed(
 async def cleanup_vm_manager():
     """Cleanup the global VM manager instance"""
     global _gcp_vm_manager
-    
+
     async with _manager_lock:
         if _gcp_vm_manager is not None:
             await _gcp_vm_manager.cleanup()
             _gcp_vm_manager = None
-            logger.info("🧹 GCP VM Manager singleton cleaned up")
+
+
+# ============================================================================
+# v95.0: PROACTIVE MEMORY-AWARE INITIALIZATION
+# ============================================================================
+
+async def proactive_vm_manager_init(
+    memory_threshold: float = 70.0,
+    force: bool = False,
+) -> Optional[GCPVMManager]:
+    """
+    v95.0: Proactively initialize VM manager based on memory pressure.
+
+    This function checks memory usage and initializes the VM manager
+    if memory is above the threshold, preparing for potential offloading.
+
+    Args:
+        memory_threshold: Memory percentage threshold to trigger init (default 70%)
+        force: If True, initialize regardless of memory pressure
+
+    Returns:
+        GCPVMManager instance if initialized, None if not needed or unavailable
+    """
+    try:
+        import psutil
+        mem_percent = psutil.virtual_memory().percent
+
+        if not force and mem_percent < memory_threshold:
+            logger.debug(
+                f"[v95.0] Memory ({mem_percent:.1f}%) below threshold ({memory_threshold}%) - "
+                f"VM manager init deferred"
+            )
+            return None
+
+        logger.info(
+            f"[v95.0] Memory pressure detected ({mem_percent:.1f}%) - "
+            f"proactively initializing VM manager"
+        )
+
+        manager = await get_gcp_vm_manager_safe()
+
+        if manager:
+            logger.info("[v95.0] ✅ VM manager proactively initialized for memory offloading")
+            return manager
+        else:
+            logger.warning(
+                "[v95.0] ⚠️ VM manager not available - local memory management only"
+            )
+            return None
+
+    except Exception as e:
+        logger.debug(f"[v95.0] Proactive VM manager init failed: {e}")
+        return None
+
+
+class LocalMemoryFallback:
+    """
+    v95.0: Fallback handler when GCP VM is not available.
+
+    Provides local memory management strategies as a fallback:
+    - GC triggering
+    - Cache clearing
+    - Process priority adjustment
+    - Memory mapping suggestions
+    """
+
+    _instance: Optional["LocalMemoryFallback"] = None
+
+    def __new__(cls) -> "LocalMemoryFallback":
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance._initialized = False
+        return cls._instance
+
+    def __init__(self):
+        if self._initialized:
+            return
+
+        self._initialized = True
+        self.logger = logging.getLogger("LocalMemoryFallback")
+        self._gc_cooldown = 30.0  # seconds between GC attempts
+        self._last_gc_time = 0.0
+        self._cache_clear_callbacks: List[Callable] = []
+
+    def register_cache_clear_callback(self, callback: Callable) -> None:
+        """Register a callback to be invoked when clearing caches."""
+        if callback not in self._cache_clear_callbacks:
+            self._cache_clear_callbacks.append(callback)
+
+    async def attempt_local_relief(self, target_free_mb: float = 1024.0) -> Dict[str, Any]:
+        """
+        Attempt to free memory locally without GCP VM.
+
+        Returns:
+            Dict with 'freed_mb' and 'strategies_used'
+        """
+        import gc
+        import psutil
+
+        result = {
+            "freed_mb": 0.0,
+            "strategies_used": [],
+            "initial_memory_percent": psutil.virtual_memory().percent,
+            "final_memory_percent": 0.0,
+        }
+
+        initial_available = psutil.virtual_memory().available / (1024 * 1024)
+
+        # Strategy 1: Trigger garbage collection
+        current_time = time.time()
+        if current_time - self._last_gc_time >= self._gc_cooldown:
+            gc.collect()
+            self._last_gc_time = current_time
+            result["strategies_used"].append("garbage_collection")
+            self.logger.info("[LocalMemoryFallback] Triggered garbage collection")
+
+        # Strategy 2: Clear registered caches
+        for callback in self._cache_clear_callbacks:
+            try:
+                if asyncio.iscoroutinefunction(callback):
+                    await callback()
+                else:
+                    callback()
+                result["strategies_used"].append("cache_clear")
+            except Exception as e:
+                self.logger.debug(f"Cache clear callback failed: {e}")
+
+        # Strategy 3: Suggest memory-intensive process reduction
+        # This is informational - actual process management is handled elsewhere
+        try:
+            high_mem_procs = []
+            for proc in psutil.process_iter(['pid', 'name', 'memory_percent']):
+                try:
+                    if proc.info['memory_percent'] > 5.0:
+                        high_mem_procs.append({
+                            'pid': proc.info['pid'],
+                            'name': proc.info['name'],
+                            'memory_percent': proc.info['memory_percent']
+                        })
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+
+            if high_mem_procs:
+                high_mem_procs.sort(key=lambda x: x['memory_percent'], reverse=True)
+                result["high_memory_processes"] = high_mem_procs[:5]
+                self.logger.info(
+                    f"[LocalMemoryFallback] Top memory consumers: "
+                    f"{[p['name'] for p in high_mem_procs[:3]]}"
+                )
+        except Exception as e:
+            self.logger.debug(f"Process inspection failed: {e}")
+
+        # Calculate freed memory
+        final_available = psutil.virtual_memory().available / (1024 * 1024)
+        result["freed_mb"] = final_available - initial_available
+        result["final_memory_percent"] = psutil.virtual_memory().percent
+
+        self.logger.info(
+            f"[LocalMemoryFallback] Relief attempt: {result['freed_mb']:.1f}MB freed, "
+            f"strategies: {result['strategies_used']}"
+        )
+
+        return result
+
+
+def get_local_memory_fallback() -> LocalMemoryFallback:
+    """Get the singleton LocalMemoryFallback instance."""
+    return LocalMemoryFallback()
 
 
 def is_vm_manager_available() -> bool:

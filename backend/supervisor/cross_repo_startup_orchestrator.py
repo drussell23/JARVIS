@@ -3060,6 +3060,12 @@ echo "=== JARVIS Prime started ==="
                 from backend.core.service_registry import get_service_registry
                 self._registry = get_service_registry()
                 logger.debug("[v93.0] Service registry loaded successfully")
+
+                # v95.0: Register callbacks for service lifecycle events
+                # This enables automatic restart when services die
+                self._registry.register_on_service_dead(self._on_registry_service_dead)
+                self._registry.register_on_service_stale(self._on_registry_service_stale)
+                logger.debug("[v95.0] Registered service lifecycle callbacks with registry")
             except ImportError:
                 logger.warning("[v93.0] Service registry module not available")
             except RuntimeError as e:
@@ -3098,6 +3104,98 @@ echo "=== JARVIS Prime started ==="
             logger.debug(f"Removed service: {name}")
             return True
         return False
+
+    # =========================================================================
+    # v95.0: Service Registry Lifecycle Callbacks
+    # =========================================================================
+
+    async def _on_registry_service_dead(self, service_name: str, dead_pid: int) -> None:
+        """
+        v95.0: Callback invoked when service registry detects a dead service.
+
+        This triggers automatic restart of the service if:
+        1. The service is managed by this orchestrator
+        2. Auto-healing is enabled
+        3. The service hasn't exceeded max restart attempts
+        """
+        logger.warning(
+            f"[v95.0] Registry notified service '{service_name}' died (PID {dead_pid})"
+        )
+
+        # Check if we manage this service
+        if service_name not in self.processes:
+            logger.debug(f"[v95.0] Service '{service_name}' not managed by this orchestrator")
+            return
+
+        managed = self.processes[service_name]
+
+        # Mark as failed
+        managed.status = ServiceStatus.FAILED
+        managed.pid = None  # PID is dead
+
+        # Emit event for voice narration
+        await _emit_event(
+            "SERVICE_CRASHED",
+            service_name=service_name,
+            priority="CRITICAL",
+            details={
+                "reason": "registry_detected_dead_pid",
+                "dead_pid": dead_pid,
+                "auto_healing": self.config.auto_healing_enabled
+            }
+        )
+
+        # Attempt auto-restart if enabled
+        if self.config.auto_healing_enabled:
+            logger.info(f"[v95.0] Attempting auto-restart of '{service_name}'")
+            success = await self._auto_heal(managed)
+            if success:
+                logger.info(f"[v95.0] Successfully restarted '{service_name}'")
+            else:
+                logger.error(f"[v95.0] Failed to restart '{service_name}'")
+        else:
+            logger.warning(f"[v95.0] Auto-healing disabled, '{service_name}' will remain down")
+
+    async def _on_registry_service_stale(self, service_name: str, heartbeat_age: float) -> None:
+        """
+        v95.0: Callback invoked when service registry detects a stale service.
+
+        This can trigger investigation or restart if the service is unresponsive.
+        """
+        logger.warning(
+            f"[v95.0] Registry notified service '{service_name}' is stale "
+            f"(no heartbeat for {heartbeat_age:.0f}s)"
+        )
+
+        # Check if we manage this service
+        if service_name not in self.processes:
+            return
+
+        managed = self.processes[service_name]
+
+        # Mark as degraded
+        if managed.status != ServiceStatus.FAILED:
+            managed.status = ServiceStatus.DEGRADED
+
+        # Emit event for monitoring
+        await _emit_event(
+            "SERVICE_UNHEALTHY",
+            service_name=service_name,
+            priority="HIGH",
+            details={
+                "reason": "stale_heartbeat",
+                "heartbeat_age_seconds": int(heartbeat_age)
+            }
+        )
+
+        # If very stale (>5 minutes), consider it dead and restart
+        if heartbeat_age > 300 and self.config.auto_healing_enabled:
+            logger.warning(
+                f"[v95.0] Service '{service_name}' extremely stale ({heartbeat_age:.0f}s), "
+                f"treating as dead and attempting restart"
+            )
+            managed.status = ServiceStatus.FAILED
+            await self._auto_heal(managed)
 
     def _get_service_definitions(self) -> List[ServiceDefinition]:
         """

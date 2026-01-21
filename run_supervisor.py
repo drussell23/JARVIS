@@ -14500,6 +14500,23 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
                     print(f"  {TerminalUI.YELLOW}⚠️ Hybrid Router: Degraded (unhealthy: {', '.join(unhealthy_tiers) or 'all tiers'}){TerminalUI.RESET}")
                     self.logger.warning(f"[v101.0] ⚠️ Hybrid Router: Degraded - unhealthy tiers: {unhealthy_tiers}")
 
+            # v95.0: Pre-initialize VM manager if memory pressure is high
+            # This ensures the _gcp_vm_manager global is set for monitoring displays
+            try:
+                import psutil
+                mem_percent = psutil.virtual_memory().percent
+                if mem_percent >= 70:  # Same threshold as GCPHybridPrimeRouter
+                    self.logger.info(f"[v95.0] High memory ({mem_percent:.1f}%) - pre-initializing GCP VM manager")
+                    from backend.core.gcp_vm_manager import get_gcp_vm_manager_safe
+                    vm_manager = await get_gcp_vm_manager_safe()
+                    if vm_manager:
+                        self.logger.info("[v95.0] ✅ GCP VM manager pre-initialized for high memory handling")
+                        print(f"  {TerminalUI.CYAN}ℹ VM Manager: Pre-initialized (memory: {mem_percent:.1f}%){TerminalUI.RESET}")
+                    else:
+                        self.logger.debug("[v95.0] VM manager not available (GCP credentials may be missing)")
+            except Exception as vm_init_error:
+                self.logger.debug(f"[v95.0] VM manager pre-init skipped: {vm_init_error}")
+
         except ImportError as e:
             self.logger.warning(f"[v101.0] ⚠️ Hybrid Router import failed: {e}")
             print(f"  {TerminalUI.YELLOW}⚠️ Hybrid Router: Not available{TerminalUI.RESET}")

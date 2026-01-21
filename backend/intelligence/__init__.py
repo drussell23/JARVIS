@@ -293,6 +293,29 @@ _LAZY_MODULES = {
             'show_status', 'create_webview', 'provide_completions',
         ]
     ),
+    # =========================================================================
+    # v1.0: Enhanced SAI Orchestrator - Continuous Situational Awareness
+    # =========================================================================
+    'enhanced_sai_orchestrator': (
+        '.enhanced_sai_orchestrator',
+        [
+            # Main orchestrator
+            'EnhancedSAIOrchestrator',
+            'get_enhanced_sai',
+            'initialize_enhanced_sai',
+            # Engines
+            'ResourceAwarenessEngine',
+            'CrossRepoAwarenessEngine',
+            'CoordinationAwarenessEngine',
+            'WorkspaceIntelligenceEngine',
+            # Types
+            'SAIStatus',
+            'SAIInsight',
+            'AwarenessLevel',
+            'InsightCategory',
+            'InsightSeverity',
+        ]
+    ),
 }
 
 # Build reverse lookup: export name -> module info
@@ -745,6 +768,22 @@ __all__ = [
     'show_status',
     'create_webview',
     'provide_completions',
+
+    # =========================================================================
+    # v1.0: Enhanced SAI Orchestrator - Continuous Situational Awareness
+    # =========================================================================
+    'EnhancedSAIOrchestrator',
+    'get_enhanced_sai',
+    'initialize_enhanced_sai',
+    'ResourceAwarenessEngine',
+    'CrossRepoAwarenessEngine',
+    'CoordinationAwarenessEngine',
+    'WorkspaceIntelligenceEngine',
+    'SAIStatus',
+    'SAIInsight',
+    'AwarenessLevel',
+    'InsightCategory',
+    'InsightSeverity',
 ]
 
 

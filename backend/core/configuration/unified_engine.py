@@ -817,12 +817,9 @@ class ConfigurationStore:
         self.logger = logging.getLogger("ConfigurationStore")
 
         # Config layers (lower index = lower priority)
+        # v95.0: Include ALL ConfigSource enum values to prevent KeyError
         self._layers: Dict[ConfigSource, Dict[str, ConfigValue]] = {
-            ConfigSource.DEFAULT: {},
-            ConfigSource.FILE: {},
-            ConfigSource.ENVIRONMENT: {},
-            ConfigSource.RUNTIME: {},
-            ConfigSource.OVERRIDE: {},
+            source: {} for source in ConfigSource
         }
 
         self._cache: Dict[str, Any] = {}

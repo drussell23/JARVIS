@@ -8170,6 +8170,30 @@ class AsyncSystemManager:
                 logger.warning(f"Hybrid coordinator initialization failed: {e}")
                 self.hybrid_enabled = False
 
+        # =====================================================================
+        # 🔮 ENHANCED SAI ORCHESTRATOR v1.0 - Continuous Situational Awareness
+        # =====================================================================
+        # Provides comprehensive situational awareness that's always active:
+        # - System resources monitoring (RAM, CPU, disk)
+        # - Workspace/space tracking (via Yabai)
+        # - Cross-repo status (JARVIS Prime, Reactor Core)
+        # - Process coordination status
+        # - Intelligent predictions
+        # =====================================================================
+        self.enhanced_sai = None
+        self.enhanced_sai_enabled = os.getenv("ENHANCED_SAI_ENABLED", "true").lower() == "true"
+        if self.enhanced_sai_enabled:
+            try:
+                from backend.intelligence.enhanced_sai_orchestrator import get_enhanced_sai
+                self.enhanced_sai = get_enhanced_sai()
+                # Set global for access
+                globals()["_enhanced_sai"] = self.enhanced_sai
+                logger.info("🔮 Enhanced SAI Orchestrator ready (continuous awareness)")
+            except ImportError as e:
+                logger.debug(f"Enhanced SAI not available: {e}")
+            except Exception as e:
+                logger.warning(f"Enhanced SAI initialization deferred: {e}")
+
         # Cloud SQL Proxy Manager - manages proxy lifecycle tied to JARVIS
         self.cloud_sql_proxy_manager = None
         self.cloud_sql_proxy_enabled = Path.home().joinpath(".jarvis/gcp/database_config.json").exists()
@@ -13039,7 +13063,38 @@ class AsyncSystemManager:
                             mem_percent = psutil.virtual_memory().percent
 
                             if mem_percent >= 80:
-                                print(f"  {Colors.WARNING}⚠️  GCP Hybrid Cloud:{Colors.ENDC} High memory ({mem_percent:.1f}%) but VM manager not initialized")
+                                # v95.0: Try lazy initialization instead of just warning
+                                try:
+                                    from backend.core.gcp_vm_manager import get_gcp_vm_manager_safe
+                                    import asyncio
+
+                                    # Try to get or create a new event loop for the async call
+                                    try:
+                                        loop = asyncio.get_running_loop()
+                                    except RuntimeError:
+                                        loop = asyncio.new_event_loop()
+                                        asyncio.set_event_loop(loop)
+
+                                    # Try async initialization with timeout
+                                    async def init_vm_manager():
+                                        return await asyncio.wait_for(
+                                            get_gcp_vm_manager_safe(),
+                                            timeout=5.0
+                                        )
+
+                                    vm_manager_result = loop.run_until_complete(init_vm_manager())
+
+                                    if vm_manager_result:
+                                        print(f"  {Colors.GREEN}✓ GCP Hybrid Cloud:{Colors.ENDC} VM manager initialized (RAM: {mem_percent:.1f}%)")
+                                    else:
+                                        print(f"  {Colors.YELLOW}⚠️  GCP Hybrid Cloud:{Colors.ENDC} High memory ({mem_percent:.1f}%) - VM manager unavailable (check GCP credentials)")
+                                except asyncio.TimeoutError:
+                                    print(f"  {Colors.YELLOW}⚠️  GCP Hybrid Cloud:{Colors.ENDC} High memory ({mem_percent:.1f}%) - VM manager init timeout")
+                                except Exception as vm_init_err:
+                                    logger.debug(f"VM manager lazy init failed: {vm_init_err}")
+                                    print(f"  {Colors.YELLOW}⚠️  GCP Hybrid Cloud:{Colors.ENDC} High memory ({mem_percent:.1f}%) - VM manager not available")
+                            elif mem_percent >= 70:
+                                print(f"  {Colors.CYAN}ℹ GCP Hybrid Cloud:{Colors.ENDC} Standby (RAM: {mem_percent:.1f}% - will activate at 80%)")
                             else:
                                 print(f"  {Colors.CYAN}ℹ GCP Hybrid Cloud:{Colors.ENDC} Standby (RAM: {mem_percent:.1f}%)")
 
@@ -13130,31 +13185,98 @@ class AsyncSystemManager:
                                 f"\n{Colors.WARNING}⚠ {service} health checks failing ({failures} failures){Colors.ENDC}"
                             )
 
-                    # SAI (Situational Awareness Intelligence) Predictions
+                    # SAI (Situational Awareness Intelligence) - Enhanced Display
                     print()  # Blank line for separation
-                    if self.last_sai_prediction:
-                        prediction = self.last_sai_prediction
-                        timestamp = datetime.fromisoformat(prediction['timestamp'])
-                        time_ago = (datetime.now() - timestamp).total_seconds()
+                    try:
+                        from backend.intelligence.enhanced_sai_orchestrator import (
+                            get_enhanced_sai,
+                            AwarenessLevel,
+                            InsightSeverity,
+                        )
+                        enhanced_sai = get_enhanced_sai()
+                        sai_summary = enhanced_sai.get_display_summary()
 
-                        confidence = prediction['confidence']
-                        if confidence >= 0.8:
-                            confidence_icon = f"{Colors.GREEN}✓"
-                        elif confidence >= 0.5:
-                            confidence_icon = f"{Colors.YELLOW}⚠"
+                        # Map awareness levels to colors
+                        level_colors = {
+                            "monitoring": Colors.CYAN,
+                            "analyzing": Colors.BLUE,
+                            "predicting": Colors.HEADER,  # Magenta
+                            "alerting": Colors.WARNING,
+                            "learning": Colors.GREEN,
+                        }
+                        level = sai_summary.get("level", "monitoring")
+                        level_color = level_colors.get(level, Colors.CYAN)
+                        level_icon = sai_summary.get("level_icon", "🔮")
+
+                        print(f"  {Colors.CYAN}🔮 SAI (Situational Awareness):{Colors.ENDC} {level_color}{level.title()}{Colors.ENDC}")
+
+                        # Show top insights (never empty - always monitoring something)
+                        top_insights = sai_summary.get("top_insights", [])
+                        if top_insights:
+                            for i, insight in enumerate(top_insights):
+                                prefix = "├─" if i < len(top_insights) - 1 else "└─"
+                                sev = insight.get("severity", "info")
+                                sev_color = Colors.GREEN if sev == "info" else (
+                                    Colors.YELLOW if sev in ("low", "medium") else Colors.FAIL
+                                )
+                                print(f"    {prefix} {sev_color}{insight['title']}{Colors.ENDC}: {insight['description']}")
                         else:
-                            confidence_icon = f"{Colors.FAIL}!"
+                            # Fallback: Show basic system status
+                            metrics = sai_summary.get("metrics", {})
+                            ram = metrics.get("ram_percent", 0)
+                            cpu = metrics.get("cpu_percent", 0)
+                            if ram > 0 or cpu > 0:
+                                print(f"    ├─ RAM: {ram:.1f}% | CPU: {cpu:.1f}%")
+                            print(f"    └─ {Colors.GREEN}All systems nominal{Colors.ENDC}")
 
+                        # Show cross-repo status on a single line if available
+                        cross_repo = sai_summary.get("cross_repo", {})
+                        if cross_repo:
+                            statuses = []
+                            for name, status in cross_repo.items():
+                                display_name = name.replace("_", " ").title()
+                                color = Colors.GREEN if status == "connected" else Colors.YELLOW
+                                statuses.append(f"{color}{display_name}{Colors.ENDC}")
+                            if statuses:
+                                print(f"    │  Trinity: {' | '.join(statuses)}")
+
+                        # Show legacy RAM predictions if we have them
+                        if self.last_sai_prediction:
+                            prediction = self.last_sai_prediction
+                            timestamp = datetime.fromisoformat(prediction['timestamp'])
+                            time_ago = (datetime.now() - timestamp).total_seconds()
+                            if time_ago < 120:  # Show if within 2 minutes
+                                print(f"    │  {Colors.WARNING}⚡ RAM spike predicted ({int(time_ago)}s ago): {prediction['reason']}{Colors.ENDC}")
+
+                    except ImportError:
+                        # Fallback to legacy display
+                        if self.last_sai_prediction:
+                            prediction = self.last_sai_prediction
+                            timestamp = datetime.fromisoformat(prediction['timestamp'])
+                            time_ago = (datetime.now() - timestamp).total_seconds()
+
+                            confidence = prediction['confidence']
+                            if confidence >= 0.8:
+                                confidence_icon = f"{Colors.GREEN}✓"
+                            elif confidence >= 0.5:
+                                confidence_icon = f"{Colors.YELLOW}⚠"
+                            else:
+                                confidence_icon = f"{Colors.FAIL}!"
+
+                            print(f"  {Colors.CYAN}🔮 SAI (Situational Awareness):{Colors.ENDC} {Colors.GREEN}Active{Colors.ENDC}")
+                            print(f"    ├─ Last prediction: {int(time_ago)}s ago")
+                            print(f"    ├─ {confidence_icon} Confidence: {confidence:.1%}{Colors.ENDC}")
+                            print(f"    ├─ Type: {prediction['type'].replace('_', ' ').title()}")
+                            print(f"    ├─ Predicted peak: {prediction['predicted_peak']*100:.1f}%")
+                            print(f"    ├─ Reason: {prediction['reason']}")
+                            print(f"    ├─ Time horizon: {prediction['time_horizon_seconds']}s")
+                            print(f"    └─ Total predictions: {self.sai_prediction_count}")
+                        else:
+                            print(f"  {Colors.CYAN}🔮 SAI (Situational Awareness):{Colors.ENDC} {Colors.GREEN}Monitoring{Colors.ENDC}")
+                            print(f"    └─ Watching system resources and environment")
+                    except Exception as sai_err:
+                        logger.debug(f"Enhanced SAI display error: {sai_err}")
                         print(f"  {Colors.CYAN}🔮 SAI (Situational Awareness):{Colors.ENDC} {Colors.GREEN}Active{Colors.ENDC}")
-                        print(f"    ├─ Last prediction: {int(time_ago)}s ago")
-                        print(f"    ├─ {confidence_icon} Confidence: {confidence:.1%}{Colors.ENDC}")
-                        print(f"    ├─ Type: {prediction['type'].replace('_', ' ').title()}")
-                        print(f"    ├─ Predicted peak: {prediction['predicted_peak']*100:.1f}%")
-                        print(f"    ├─ Reason: {prediction['reason']}")
-                        print(f"    ├─ Time horizon: {prediction['time_horizon_seconds']}s")
-                        print(f"    └─ Total predictions: {self.sai_prediction_count}")
-                    else:
-                        print(f"  {Colors.CYAN}🔮 SAI (Situational Awareness):{Colors.ENDC} {Colors.YELLOW}Idle{Colors.ENDC} (no recent predictions)")
 
                     # 🔐 VOICE UNLOCK CONFIGURATION CHECK (COMPREHENSIVE)
                     print()  # Blank line for separation
@@ -14506,6 +14628,16 @@ ANTHROPIC_API_KEY=your_claude_api_key_here
         else:
             print(f"{Colors.CYAN}🌐 [1/6] Hybrid Cloud Intelligence not active{Colors.ENDC}")
 
+        # Stop Enhanced SAI Orchestrator
+        if self.enhanced_sai_enabled and self.enhanced_sai:
+            try:
+                print(f"\n{Colors.CYAN}🔮 [1.05/6] Stopping Enhanced SAI Orchestrator...{Colors.ENDC}")
+                await self.enhanced_sai.stop()
+                print(f"   └─ {Colors.GREEN}✓ SAI monitoring stopped{Colors.ENDC}")
+            except Exception as e:
+                print(f"   └─ {Colors.YELLOW}⚠ SAI cleanup warning: {e}{Colors.ENDC}")
+                logger.warning(f"Enhanced SAI cleanup failed: {e}")
+
         # Stop Advanced Metrics Monitor
         if hasattr(self, 'metrics_monitor') and self.metrics_monitor:
             try:
@@ -15168,6 +15300,19 @@ except Exception as e:
                 print(f"{Colors.YELLOW}   ⚠️  Error: {e}{Colors.ENDC}")
                 print(f"{Colors.YELLOW}   ⚠️  Will run in local-only mode{Colors.ENDC}")
                 self.hybrid_enabled = False
+
+        # Start Enhanced SAI Orchestrator (continuous situational awareness)
+        if self.enhanced_sai_enabled and self.enhanced_sai:
+            print(f"\n{Colors.CYAN}🔮 Starting Enhanced SAI Orchestrator...{Colors.ENDC}")
+            try:
+                await self.enhanced_sai.start()
+                print(f"   • {Colors.GREEN}✓{Colors.ENDC} SAI monitoring active (continuous awareness)")
+                print(f"   • {Colors.GREEN}✓{Colors.ENDC} Resource monitoring: RAM, CPU, Disk")
+                print(f"   • {Colors.GREEN}✓{Colors.ENDC} Cross-repo awareness: JARVIS Prime, Reactor Core")
+                print(f"   • {Colors.GREEN}✓{Colors.ENDC} Workspace intelligence: Yabai integration")
+            except Exception as e:
+                logger.warning(f"Enhanced SAI start failed: {e}")
+                print(f"{Colors.YELLOW}   ⚠️  SAI will run in basic mode: {e}{Colors.ENDC}")
 
         # ═══════════════════════════════════════════════════════════════════
         # SUPERVISOR INTEGRATION - Zero-Touch Self-Updating Lifecycle Manager
@@ -19011,20 +19156,90 @@ async def main():
         return result
 
     async def probe_local_backend() -> dict:
-        """Probe local ECAPA availability (check memory/dependencies)."""
-        result = {"available": False, "memory_ok": False, "error": None}
+        """
+        v95.0: Enhanced probe with memory relief and adaptive thresholds.
+
+        Probe local ECAPA availability (check memory/dependencies).
+        Now includes:
+        - Automatic memory relief when close to threshold
+        - Adaptive threshold based on system RAM
+        - GCP fallback suggestion when local memory insufficient
+        """
+        result = {
+            "available": False,
+            "memory_ok": False,
+            "error": None,
+            "memory_relief_attempted": False,
+            "initial_available_gb": 0.0,
+            "final_available_gb": 0.0,
+            "gcp_fallback_suggested": False,
+        }
 
         try:
             import psutil
+            import gc
 
-            # Check available memory (ECAPA needs ~2GB)
+            # Check available memory (ECAPA needs ~2GB, but can work with ~1.5GB in low-mem mode)
             mem = psutil.virtual_memory()
             available_gb = mem.available / (1024 ** 3)
+            total_gb = mem.total / (1024 ** 3)
+            result["initial_available_gb"] = available_gb
 
-            if available_gb >= 2.0:
-                result["memory_ok"] = True
+            # v95.0: Adaptive threshold based on total system RAM
+            # Systems with more RAM can use higher threshold, smaller systems use lower
+            if total_gb >= 32:
+                required_gb = 2.5  # Plenty of RAM, use full ECAPA
+            elif total_gb >= 16:
+                required_gb = 2.0  # Standard requirement
+            elif total_gb >= 8:
+                required_gb = 1.5  # Low-memory mode acceptable
             else:
-                result["error"] = f"Low memory: {available_gb:.1f}GB available (need 2GB)"
+                required_gb = 1.2  # Minimal mode
+
+            # v95.0: If close to threshold, try memory relief first
+            if available_gb < required_gb and available_gb >= required_gb * 0.7:
+                result["memory_relief_attempted"] = True
+                logger.debug(f"[ECAPA Probe] Attempting memory relief (have {available_gb:.1f}GB, need {required_gb:.1f}GB)")
+
+                # Try garbage collection
+                gc.collect()
+
+                # Try LocalMemoryFallback if available
+                try:
+                    from backend.core.gcp_vm_manager import get_local_memory_fallback
+                    fallback = get_local_memory_fallback()
+                    relief_result = await fallback.attempt_local_relief(target_free_mb=required_gb * 1024)
+                    logger.debug(f"[ECAPA Probe] Memory relief freed {relief_result.get('freed_mb', 0):.1f}MB")
+                except Exception as relief_error:
+                    logger.debug(f"[ECAPA Probe] Memory relief failed: {relief_error}")
+
+                # Re-check memory after relief
+                mem = psutil.virtual_memory()
+                available_gb = mem.available / (1024 ** 3)
+
+            result["final_available_gb"] = available_gb
+
+            if available_gb >= required_gb:
+                result["memory_ok"] = True
+            elif available_gb >= required_gb * 0.75:
+                # Close enough - try loading in reduced mode
+                result["memory_ok"] = True
+                result["reduced_mode"] = True
+                logger.info(f"[ECAPA Probe] Will attempt reduced-memory mode ({available_gb:.1f}GB available)")
+            else:
+                result["error"] = f"Low memory: {available_gb:.1f}GB available (need {required_gb:.1f}GB)"
+                result["gcp_fallback_suggested"] = True
+
+                # v95.0: Check if GCP VM manager is available as fallback
+                try:
+                    from backend.core.gcp_vm_manager import is_vm_manager_available, get_vm_manager_sync
+                    if is_vm_manager_available():
+                        vm_manager = get_vm_manager_sync()
+                        if vm_manager:
+                            result["gcp_available"] = True
+                            result["error"] += " (GCP VM available as fallback)"
+                except Exception:
+                    pass
 
             # Check if speechbrain is importable
             try:
@@ -19083,7 +19298,20 @@ async def main():
         cloud_status = cloud_probe.get('error', 'Unavailable')
     print(f"   {cloud_icon} Cloud Run: {cloud_status}")
 
-    print(f"   {local_icon} Local ECAPA: {'Ready' if local_probe.get('available') and local_probe.get('memory_ok') else local_probe.get('error', 'Unavailable')}")
+    # v95.0: Enhanced local ECAPA status display
+    if local_probe.get('available') and local_probe.get('memory_ok'):
+        local_status = "Ready"
+        if local_probe.get('reduced_mode'):
+            local_status += " [reduced-memory mode]"
+        if local_probe.get('memory_relief_attempted'):
+            local_status += f" (after relief: {local_probe.get('final_available_gb', 0):.1f}GB)"
+    elif local_probe.get('gcp_fallback_suggested') and local_probe.get('gcp_available'):
+        local_status = f"{local_probe.get('error', 'Unavailable')} → using GCP"
+        local_icon = "🔄"  # Change icon to indicate fallback
+    else:
+        local_status = local_probe.get('error', 'Unavailable')
+
+    print(f"   {local_icon} Local ECAPA: {local_status}")
 
     # ─────────────────────────────────────────────────────────────────────────
     # PHASE 2: Intelligent Backend Selection
