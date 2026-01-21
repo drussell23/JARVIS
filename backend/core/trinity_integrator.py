@@ -9483,13 +9483,53 @@ class TrinityUnifiedOrchestrator:
                             # TrinityIntegrator focuses on coordination, not launching
                             logger.info("   ℹ️  [v100.4] Skipping component launch (supervisor handles)")
                             logger.info("   ℹ️  [v100.4] TrinityIntegrator: coordination mode only")
-                            # Just check if components already running (via heartbeat or process)
-                            jprime_ok = await self._discover_running_component("jarvis_prime")
-                            reactor_ok = await self._discover_running_component("reactor_core")
+
+                            # v93.13: Wait for components with retry since orchestrator launches in parallel
+                            # The cross_repo_startup_orchestrator runs BEFORE Trinity starts,
+                            # but components may still be initializing when Trinity checks
+                            discovery_timeout = float(os.getenv("TRINITY_DISCOVERY_TIMEOUT", "60.0"))
+                            discovery_interval = float(os.getenv("TRINITY_DISCOVERY_INTERVAL", "3.0"))
+                            discovery_start = time.time()
+
+                            logger.info(
+                                f"   ⏳ [v93.13] Waiting for components to become discoverable "
+                                f"(timeout: {discovery_timeout}s)..."
+                            )
+
+                            while (time.time() - discovery_start) < discovery_timeout:
+                                # Check components in parallel
+                                jprime_ok = await self._discover_running_component("jarvis_prime") if self.enable_jprime else True
+                                reactor_ok = await self._discover_running_component("reactor_core") if self.enable_reactor else True
+
+                                # Success condition
+                                if jprime_ok and reactor_ok:
+                                    elapsed = time.time() - discovery_start
+                                    logger.info(
+                                        f"   ✅ [v93.13] All components discovered after {elapsed:.1f}s"
+                                    )
+                                    break
+
+                                # Log partial status
+                                if not jprime_ok and self.enable_jprime:
+                                    logger.debug("   ⏳ [v93.13] Waiting for J-Prime...")
+                                if not reactor_ok and self.enable_reactor:
+                                    logger.debug("   ⏳ [v93.13] Waiting for Reactor-Core...")
+
+                                # Wait before retry with progressive backoff
+                                await asyncio.sleep(discovery_interval)
+                                discovery_interval = min(discovery_interval * 1.2, 10.0)  # Max 10s between checks
+
+                            # Final status logging
                             if not jprime_ok and self.enable_jprime:
-                                logger.info("   ⏳ [v100.4] J-Prime will be launched by supervisor")
+                                logger.warning(
+                                    f"   ⚠️  [v93.13] J-Prime not discovered after {discovery_timeout}s - "
+                                    "will continue in degraded mode"
+                                )
                             if not reactor_ok and self.enable_reactor:
-                                logger.info("   ⏳ [v100.4] Reactor-Core will be launched by supervisor")
+                                logger.warning(
+                                    f"   ⚠️  [v93.13] Reactor-Core not discovered after {discovery_timeout}s - "
+                                    "will continue in degraded mode"
+                                )
                         else:
                             # Legacy mode: TrinityIntegrator launches components directly
                             async with self._tracer.span("start_external_components"):
@@ -10078,24 +10118,65 @@ class TrinityUnifiedOrchestrator:
 
         # ═══════════════════════════════════════════════════════════════════════
         # PHASE 1: HTTP Health Check (HIGHEST PRIORITY)
+        # v93.13: Enhanced with multi-signal detection and fallback acceptance
         # ═══════════════════════════════════════════════════════════════════════
+        primary_port = config["ports"][0] if config["ports"] else None  # First port is primary
+
         for port in config["ports"]:
             try:
                 async with aiohttp.ClientSession(
-                    timeout=aiohttp.ClientTimeout(total=3.0)
+                    timeout=aiohttp.ClientTimeout(total=5.0)  # v93.13: Increased timeout from 3s to 5s
                 ) as session:
                     url = f"http://localhost:{port}/health"
                     async with session.get(url) as resp:
                         if resp.status == 200:
                             try:
                                 health_data = await resp.json()
-                                # Verify it's the right component
+
+                                # v93.13: Multi-signal component verification
+                                # Signal 1: Explicit service field (highest confidence)
                                 service_name = health_data.get("service", "")
-                                if component.replace("_", "") in service_name.replace("_", "").lower():
+                                if service_name and component.replace("_", "") in service_name.replace("_", "").lower():
                                     logger.info(
-                                        f"[Discovery] ✅ {component} discovered via HTTP at port {port}"
+                                        f"[Discovery] ✅ {component} discovered via HTTP at port {port} "
+                                        f"(service={service_name})"
                                     )
                                     return True
+
+                                # Signal 2: Status/phase indicates healthy service
+                                status = health_data.get("status", "")
+                                phase = health_data.get("phase", "")
+                                ready_for_inference = health_data.get("ready_for_inference", False)
+                                model_loaded = health_data.get("model_loaded", False)
+
+                                is_healthy = (
+                                    status == "healthy"
+                                    or phase == "ready"
+                                    or (ready_for_inference and model_loaded)
+                                )
+
+                                # Signal 3: Primary port with healthy-ish response (degraded confidence)
+                                # If we're on the primary expected port AND get ANY valid JSON response,
+                                # it's likely the right service even without explicit identification
+                                is_expected_port = (port == primary_port)
+                                has_health_indicators = bool(status or phase or "pid" in health_data)
+
+                                if is_healthy:
+                                    logger.info(
+                                        f"[Discovery] ✅ {component} discovered via HTTP at port {port} "
+                                        f"(status={status}, phase={phase})"
+                                    )
+                                    return True
+
+                                # v93.13: Accept service on primary port even if still starting
+                                # This prevents DEGRADED mode when service is almost ready
+                                if is_expected_port and has_health_indicators:
+                                    logger.info(
+                                        f"[Discovery] ✅ {component} detected on primary port {port} "
+                                        f"(status={status}, phase={phase}) - accepting as discovered"
+                                    )
+                                    return True
+
                             except Exception:
                                 # Response isn't JSON but status is 200
                                 logger.info(
@@ -11107,25 +11188,92 @@ class TrinityUnifiedOrchestrator:
     # =========================================================================
 
     async def _health_loop(self) -> None:
-        """Background health monitoring loop."""
+        """
+        Background health monitoring loop with late discovery support.
+
+        v93.13: Enhanced with:
+        - State transition logging
+        - Late component discovery for components that weren't available at startup
+        - Automatic client initialization when components become available
+        """
+        # v93.13: Track components that need late discovery
+        late_discovery_attempts = 0
+        max_late_discovery_attempts = int(os.getenv("TRINITY_MAX_LATE_DISCOVERY_ATTEMPTS", "10"))
+
         while self._running:
             try:
                 await asyncio.sleep(self.health_check_interval)
 
                 health = await self.get_health()
 
+                # v93.13: Attempt late discovery for missing components
+                # This allows Trinity to recover from DEGRADED state when
+                # components that weren't ready at startup become available
+                if self._state == TrinityState.DEGRADED and late_discovery_attempts < max_late_discovery_attempts:
+                    await self._attempt_late_component_discovery()
+                    late_discovery_attempts += 1
+
                 # Update state based on health
                 if health.degraded_components:
                     if self._state == TrinityState.READY:
+                        logger.warning(
+                            f"[TrinityIntegrator] State transition: READY -> DEGRADED "
+                            f"(degraded: {health.degraded_components})"
+                        )
                         self._set_state(TrinityState.DEGRADED)
                 elif self._state == TrinityState.DEGRADED:
                     if not health.degraded_components:
+                        logger.info(
+                            "[TrinityIntegrator] State transition: DEGRADED -> READY "
+                            "(all components healthy)"
+                        )
                         self._set_state(TrinityState.READY)
+                        # Reset late discovery counter on recovery
+                        late_discovery_attempts = 0
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.debug(f"[TrinityIntegrator] Health check error: {e}")
+
+    async def _attempt_late_component_discovery(self) -> None:
+        """
+        v93.13: Attempt to discover and connect to components that weren't
+        available during startup.
+
+        This enables recovery from DEGRADED state when components come online later.
+        """
+        try:
+            # Check J-Prime if enabled but not connected
+            if self.enable_jprime and (not self._jprime_client or not self._jprime_client.is_online):
+                if await self._discover_running_component("jarvis_prime"):
+                    logger.info("[v93.13] Late discovery: J-Prime now available, initializing client...")
+                    try:
+                        from backend.clients.jarvis_prime_client import get_jarvis_prime_client
+                        self._jprime_client = await get_jarvis_prime_client()
+                        if self._jprime_client and self._jprime_client.is_online:
+                            logger.info("[v93.13] Late discovery: J-Prime client connected successfully")
+                    except Exception as e:
+                        logger.debug(f"[v93.13] Late discovery: J-Prime client init failed: {e}")
+
+            # Check Reactor-Core if enabled but not connected
+            if self.enable_reactor and (not self._reactor_client or not self._reactor_client.is_online):
+                if await self._discover_running_component("reactor_core"):
+                    logger.info("[v93.13] Late discovery: Reactor-Core now available, initializing client...")
+                    try:
+                        from backend.clients.reactor_core_client import (
+                            initialize_reactor_client,
+                            get_reactor_client,
+                        )
+                        await initialize_reactor_client()
+                        self._reactor_client = get_reactor_client()
+                        if self._reactor_client and self._reactor_client.is_online:
+                            logger.info("[v93.13] Late discovery: Reactor-Core client connected successfully")
+                    except Exception as e:
+                        logger.debug(f"[v93.13] Late discovery: Reactor-Core client init failed: {e}")
+
+        except Exception as e:
+            logger.debug(f"[v93.13] Late component discovery error: {e}")
 
     async def _crash_recovery_loop(self) -> None:
         """
