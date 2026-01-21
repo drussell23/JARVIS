@@ -428,24 +428,70 @@ class CircuitBreakerState(Enum):
 @dataclass
 class CircuitBreaker:
     """
-    v93.9: Circuit Breaker pattern implementation for Docker operations.
+    v95.0: Enhanced Circuit Breaker pattern with forced recovery.
 
     Prevents cascading failures by:
     - Tracking consecutive failures
     - Opening circuit after failure threshold
     - Allowing recovery testing after timeout
     - Closing circuit on successful recovery
+    - v95.0: Forced recovery after max open duration
+    - v95.0: State transition logging and metrics
     """
     name: str
     failure_threshold: int = 3
     recovery_timeout: float = 60.0
     half_open_max_requests: int = 1
+    # v95.0: Maximum time circuit stays OPEN before forced recovery attempt
+    max_open_duration: float = field(
+        default_factory=lambda: float(os.getenv("CIRCUIT_BREAKER_MAX_OPEN", "600.0"))  # 10 minutes
+    )
 
     state: CircuitBreakerState = CircuitBreakerState.CLOSED
     failure_count: int = 0
     last_failure_time: float = 0.0
     half_open_requests: int = 0
     success_count: int = 0
+    # v95.0: Tracking for stuck circuit detection
+    last_state_change: float = field(default_factory=time.time)
+    consecutive_recovery_failures: int = 0
+    total_open_duration: float = 0.0
+
+    def _transition_state(self, new_state: CircuitBreakerState, reason: str) -> None:
+        """v95.0: Handle state transition with logging and metrics."""
+        old_state = self.state
+        if old_state == new_state:
+            return
+
+        now = time.time()
+        duration_in_old_state = now - self.last_state_change
+
+        # Track total open duration
+        if old_state == CircuitBreakerState.OPEN:
+            self.total_open_duration += duration_in_old_state
+
+        self.state = new_state
+        self.last_state_change = now
+
+        # Log with appropriate level based on transition
+        if new_state == CircuitBreakerState.CLOSED:
+            logger.info(
+                f"    ✅ Circuit breaker [{self.name}]: {old_state.value} → CLOSED "
+                f"({reason}, was {old_state.value} for {duration_in_old_state:.1f}s)"
+            )
+            self.consecutive_recovery_failures = 0
+        elif new_state == CircuitBreakerState.OPEN:
+            logger.warning(
+                f"    ⚠️ Circuit breaker [{self.name}]: {old_state.value} → OPEN "
+                f"({reason})"
+            )
+            if old_state == CircuitBreakerState.HALF_OPEN:
+                self.consecutive_recovery_failures += 1
+        else:  # HALF_OPEN
+            logger.info(
+                f"    🔄 Circuit breaker [{self.name}]: {old_state.value} → HALF_OPEN "
+                f"({reason})"
+            )
 
     def record_success(self) -> None:
         """Record a successful operation."""
@@ -453,10 +499,9 @@ class CircuitBreaker:
             self.success_count += 1
             if self.success_count >= self.half_open_max_requests:
                 # Recovery successful, close circuit
-                self.state = CircuitBreakerState.CLOSED
+                self._transition_state(CircuitBreakerState.CLOSED, "recovery successful")
                 self.failure_count = 0
                 self.success_count = 0
-                logger.info(f"    ✅ Circuit breaker [{self.name}]: CLOSED (recovered)")
         else:
             self.failure_count = 0
             self.success_count += 1
@@ -469,14 +514,12 @@ class CircuitBreaker:
 
         if self.state == CircuitBreakerState.HALF_OPEN:
             # Failed during recovery test, reopen circuit
-            self.state = CircuitBreakerState.OPEN
-            logger.warning(f"    ⚠️ Circuit breaker [{self.name}]: OPEN (recovery failed)")
+            self._transition_state(CircuitBreakerState.OPEN, "recovery test failed")
         elif self.failure_count >= self.failure_threshold:
             # Threshold exceeded, open circuit
-            self.state = CircuitBreakerState.OPEN
-            logger.warning(
-                f"    ⚠️ Circuit breaker [{self.name}]: OPEN "
-                f"({self.failure_count} failures)"
+            self._transition_state(
+                CircuitBreakerState.OPEN,
+                f"{self.failure_count} consecutive failures"
             )
 
     def can_execute(self) -> bool:
@@ -485,11 +528,30 @@ class CircuitBreaker:
             return True
 
         if self.state == CircuitBreakerState.OPEN:
-            # Check if recovery timeout has passed
-            if (time.time() - self.last_failure_time) >= self.recovery_timeout:
-                self.state = CircuitBreakerState.HALF_OPEN
+            now = time.time()
+            time_since_failure = now - self.last_failure_time
+            time_in_open = now - self.last_state_change
+
+            # v95.0: Check for forced recovery after max open duration
+            if time_in_open >= self.max_open_duration:
+                logger.warning(
+                    f"    ⏰ Circuit breaker [{self.name}]: FORCED RECOVERY "
+                    f"(open for {time_in_open:.0f}s, max: {self.max_open_duration:.0f}s)"
+                )
+                self._transition_state(
+                    CircuitBreakerState.HALF_OPEN,
+                    f"forced recovery after {time_in_open:.0f}s"
+                )
                 self.half_open_requests = 0
-                logger.info(f"    🔄 Circuit breaker [{self.name}]: HALF_OPEN (testing)")
+                return True
+
+            # Normal recovery timeout check
+            if time_since_failure >= self.recovery_timeout:
+                self._transition_state(
+                    CircuitBreakerState.HALF_OPEN,
+                    f"recovery timeout ({time_since_failure:.0f}s)"
+                )
+                self.half_open_requests = 0
                 return True
             return False
 
@@ -501,6 +563,26 @@ class CircuitBreaker:
             return False
 
         return False
+
+    def force_reset(self) -> None:
+        """v95.0: Force circuit to CLOSED state (for manual intervention)."""
+        logger.warning(f"    🔧 Circuit breaker [{self.name}]: FORCE RESET to CLOSED")
+        self._transition_state(CircuitBreakerState.CLOSED, "forced reset")
+        self.failure_count = 0
+        self.success_count = 0
+        self.consecutive_recovery_failures = 0
+
+    def get_stats(self) -> Dict[str, Any]:
+        """v95.0: Get circuit breaker statistics."""
+        return {
+            "name": self.name,
+            "state": self.state.value,
+            "failure_count": self.failure_count,
+            "success_count": self.success_count,
+            "consecutive_recovery_failures": self.consecutive_recovery_failures,
+            "total_open_duration": self.total_open_duration,
+            "time_in_current_state": time.time() - self.last_state_change,
+        }
 
 
 @dataclass
@@ -591,7 +673,7 @@ class ServiceDefinition:
     Definition of a service to manage.
 
     v4.0: Enhanced with script_args for command-line argument passing.
-    v95.0: Added dynamic script discovery and validation methods.
+    v95.0: Added dynamic script discovery, validation methods, and dependency tracking.
     """
     name: str
     repo_path: Path
@@ -601,6 +683,24 @@ class ServiceDefinition:
     health_endpoint: str = "/health"
     startup_timeout: float = 60.0
     environment: Dict[str, str] = field(default_factory=dict)
+
+    # v95.0: Service dependency tracking
+    # Services listed here must be healthy before this service starts
+    depends_on: List[str] = field(default_factory=list)
+
+    # v95.0: Startup priority (lower = starts first, same priority = parallel)
+    # Default priorities: jarvis-body=10, jarvis-prime=20, reactor-core=30
+    startup_priority: int = 50
+
+    # v95.0: Grace period before checking dependencies (allows for parallel startup optimization)
+    dependency_check_delay: float = 5.0
+
+    # v95.0: Whether this service is critical (system fails if this service fails)
+    is_critical: bool = True
+
+    # v95.0: Retry configuration for dependency wait
+    dependency_wait_timeout: float = 120.0  # Max time to wait for dependencies
+    dependency_check_interval: float = 2.0  # How often to check dependency health
 
     # v4.0: Command-line arguments to pass to the script
     # e.g., ["--port", "8000", "--host", "0.0.0.0"]
@@ -740,6 +840,15 @@ class ServiceDefinitionRegistry:
 
     # Canonical service configurations - DO NOT modify these directly
     # Use environment variables to override paths/ports
+    #
+    # v95.0: Service Dependency Graph (startup order):
+    #   jarvis-body (priority 10) ──────────────────────────┐
+    #         │                                              │
+    #         └──► jarvis-prime (priority 20) ──────────────┼──► reactor-core (priority 30)
+    #                                                        │
+    # Note: jarvis-prime depends on jarvis-body for service registry
+    #       reactor-core depends on jarvis-prime for AGI integration
+    #
     _CANONICAL_DEFINITIONS = {
         "jarvis-prime": {
             "script_name": "run_server.py",
@@ -759,6 +868,11 @@ class ServiceDefinitionRegistry:
                 "TOKENIZERS_PARALLELISM": "false",
                 "COREMLTOOLS_LOG_LEVEL": "ERROR",
             },
+            # v95.0: Dependency and priority configuration
+            "depends_on": [],  # jarvis-prime can start independently
+            "startup_priority": 20,  # Start second (after jarvis-body)
+            "is_critical": True,  # System fails without this
+            "dependency_wait_timeout": 120.0,
         },
         "reactor-core": {
             "script_name": "run_reactor.py",
@@ -775,6 +889,11 @@ class ServiceDefinitionRegistry:
                 "REACTOR_PORT": str(os.getenv("REACTOR_CORE_PORT", 8090)),
             },
             "use_uvicorn": False,
+            # v95.0: Dependency and priority configuration
+            "depends_on": ["jarvis-prime"],  # reactor-core depends on jarvis-prime for AGI
+            "startup_priority": 30,  # Start third (after jarvis-prime)
+            "is_critical": False,  # System can degrade without this
+            "dependency_wait_timeout": 180.0,  # Wait longer for jarvis-prime to load models
         },
     }
 
@@ -847,6 +966,11 @@ class ServiceDefinitionRegistry:
             environment=canonical.get("environment_factory", lambda p: {})(repo_path),
             use_uvicorn=canonical.get("use_uvicorn", False),
             uvicorn_app=canonical.get("uvicorn_app"),
+            # v95.0: Dependency and priority configuration
+            depends_on=canonical.get("depends_on", []),
+            startup_priority=canonical.get("startup_priority", 50),
+            is_critical=canonical.get("is_critical", True),
+            dependency_wait_timeout=canonical.get("dependency_wait_timeout", 120.0),
         )
 
         # Validate if requested
@@ -3787,12 +3911,43 @@ echo "=== JARVIS Prime started ==="
                     logger.debug(f"[v95.0] File heartbeat check failed for {service_name}: {e}")
 
                 if not process_alive and not is_docker and not file_heartbeat_alive:
-                    # Process died AND no file heartbeat - stop sending heartbeats
-                    # (the health monitor or auto-heal will handle restart)
+                    # Process died AND no file heartbeat - notify registry and stop
                     logger.debug(
                         f"[v95.0] Heartbeat loop for {service_name}: "
-                        f"process not running and no file heartbeat, stopping"
+                        f"process not running and no file heartbeat, sending final notification"
                     )
+
+                    # v95.0: Send final "dead" notification to registry before exiting
+                    # This prevents the 30s gap where service appears alive but is dead
+                    if self.registry:
+                        try:
+                            await asyncio.wait_for(
+                                self.registry.heartbeat(
+                                    service_name,
+                                    status="dead",
+                                    metadata={
+                                        "pid": managed.pid,
+                                        "reason": "process_died",
+                                        "last_heartbeat_source": "cleanup",
+                                        "exit_code": getattr(managed.process, 'returncode', None) if managed.process else None,
+                                    }
+                                ),
+                                timeout=2.0
+                            )
+                            logger.info(f"[v95.0] Sent final 'dead' heartbeat for {service_name}")
+                        except Exception as final_hb_err:
+                            logger.debug(f"[v95.0] Final heartbeat failed for {service_name}: {final_hb_err}")
+
+                        # Also explicitly deregister to immediately free up the slot
+                        try:
+                            await asyncio.wait_for(
+                                self.registry.deregister_service(service_name),
+                                timeout=2.0
+                            )
+                            logger.info(f"[v95.0] Deregistered dead service: {service_name}")
+                        except Exception as dereg_err:
+                            logger.debug(f"[v95.0] Deregister failed for {service_name}: {dereg_err}")
+
                     return
 
                 # v95.0: If process appears dead but file heartbeat is alive,
@@ -3858,6 +4013,19 @@ echo "=== JARVIS Prime started ==="
 
         except asyncio.CancelledError:
             logger.debug(f"[v95.0] Heartbeat loop cancelled for {service_name}")
+            # v95.0: On cancellation (shutdown), send final status update
+            if self.registry and self._shutdown_event.is_set():
+                try:
+                    await asyncio.wait_for(
+                        self.registry.heartbeat(
+                            service_name,
+                            status="shutting_down",
+                            metadata={"reason": "orchestrator_shutdown"}
+                        ),
+                        timeout=1.0
+                    )
+                except Exception:
+                    pass  # Best effort during shutdown
         except Exception as e:
             logger.error(f"[v95.0] Heartbeat loop error for {service_name}: {e}")
             # Attempt to restart heartbeat loop after error
@@ -3867,6 +4035,11 @@ echo "=== JARVIS Prime started ==="
                 managed.heartbeat_task = asyncio.create_task(
                     self._heartbeat_loop(managed)
                 )
+        finally:
+            # v95.0: Ensure heartbeat task reference is cleared
+            if managed.heartbeat_task and managed.heartbeat_task.done():
+                managed.heartbeat_task = None
+            logger.debug(f"[v95.0] Heartbeat loop exited for {service_name}")
 
     # =========================================================================
     # Auto-Healing
@@ -4080,11 +4253,112 @@ echo "=== JARVIS Prime started ==="
 
         return True, python_exec
 
+    async def _wait_for_dependencies(self, definition: ServiceDefinition) -> bool:
+        """
+        v95.0: Wait for service dependencies to be healthy before proceeding.
+
+        This implements intelligent dependency resolution:
+        1. Check if all dependencies are listed in the registry
+        2. Wait for each dependency to become healthy
+        3. Use exponential backoff for checks
+        4. Respect timeout limits
+        5. Emit events for monitoring
+
+        Returns True if all dependencies are healthy, False on timeout/failure.
+        """
+        if not definition.depends_on:
+            return True  # No dependencies
+
+        logger.info(
+            f"[v95.0] Checking dependencies for {definition.name}: "
+            f"{definition.depends_on}"
+        )
+
+        # Emit dependency check event
+        await _emit_event(
+            "DEPENDENCY_CHECK_START",
+            service_name=definition.name,
+            priority="MEDIUM",
+            details={"dependencies": definition.depends_on}
+        )
+
+        start_time = time.time()
+        timeout = definition.dependency_wait_timeout
+        check_interval = definition.dependency_check_interval
+
+        pending_deps = set(definition.depends_on)
+
+        while pending_deps and (time.time() - start_time) < timeout:
+            for dep_name in list(pending_deps):
+                # Check if dependency is in our managed processes
+                if dep_name in self.processes:
+                    dep_managed = self.processes[dep_name]
+                    if dep_managed.status == ServiceStatus.HEALTHY:
+                        logger.info(f"  ✓ Dependency '{dep_name}' is healthy")
+                        pending_deps.discard(dep_name)
+                        continue
+
+                # Also check the service registry
+                if self.registry:
+                    try:
+                        services = await self.registry.list_services(healthy_only=True)
+                        if any(s.service_name == dep_name for s in services):
+                            logger.info(f"  ✓ Dependency '{dep_name}' found healthy in registry")
+                            pending_deps.discard(dep_name)
+                            continue
+                    except Exception as e:
+                        logger.debug(f"  Registry check for {dep_name} failed: {e}")
+
+            if pending_deps:
+                elapsed = time.time() - start_time
+                remaining = timeout - elapsed
+                logger.debug(
+                    f"  Waiting for dependencies: {pending_deps} "
+                    f"({elapsed:.1f}s elapsed, {remaining:.1f}s remaining)"
+                )
+                await asyncio.sleep(check_interval)
+                # Exponential backoff (cap at 10s)
+                check_interval = min(check_interval * 1.5, 10.0)
+
+        if pending_deps:
+            elapsed = time.time() - start_time
+            logger.error(
+                f"[v95.0] Dependency timeout for {definition.name} after {elapsed:.1f}s: "
+                f"still waiting for {pending_deps}"
+            )
+            await _emit_event(
+                "DEPENDENCY_CHECK_FAILED",
+                service_name=definition.name,
+                priority="HIGH",
+                details={
+                    "pending_dependencies": list(pending_deps),
+                    "timeout_seconds": elapsed
+                }
+            )
+            return False
+
+        elapsed = time.time() - start_time
+        logger.info(
+            f"[v95.0] All dependencies healthy for {definition.name} "
+            f"(checked in {elapsed:.1f}s)"
+        )
+        await _emit_event(
+            "DEPENDENCY_CHECK_PASSED",
+            service_name=definition.name,
+            priority="MEDIUM",
+            details={
+                "dependencies": definition.depends_on,
+                "check_time_seconds": elapsed
+            }
+        )
+        return True
+
     async def _spawn_service(self, managed: ManagedProcess) -> bool:
         """
         v95.0: Spawn a service process with comprehensive event emissions.
 
         Enhanced with:
+        - Dependency checking before spawn
         - Pre-spawn validation (venv detection, port check)
         - Better error reporting
         - Environment isolation
@@ -4094,6 +4368,22 @@ echo "=== JARVIS Prime started ==="
         """
         definition = managed.definition
 
+        # v95.0: Wait for dependencies to be healthy before spawning
+        if definition.depends_on:
+            deps_ready = await self._wait_for_dependencies(definition)
+            if not deps_ready:
+                logger.error(
+                    f"[v95.0] Cannot spawn {definition.name}: dependencies not ready"
+                )
+                managed.status = ServiceStatus.FAILED
+                await _emit_event(
+                    "SERVICE_BLOCKED",
+                    service_name=definition.name,
+                    priority="HIGH",
+                    details={"reason": "dependencies_not_ready"}
+                )
+                return False
+
         # v95.0: Emit service spawning event
         await _emit_event(
             "SERVICE_SPAWNING",
@@ -4102,7 +4392,8 @@ echo "=== JARVIS Prime started ==="
             details={
                 "port": definition.default_port,
                 "repo_path": str(definition.repo_path),
-                "startup_timeout": definition.startup_timeout
+                "startup_timeout": definition.startup_timeout,
+                "depends_on": definition.depends_on
             }
         )
 

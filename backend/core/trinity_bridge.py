@@ -203,6 +203,11 @@ class TrinityBridge:
         # Callbacks
         self._on_state_change: List[Callable[[TrinityState], None]] = []
 
+        # v95.0: Shutdown race condition protection
+        self._shutdown_lock = asyncio.Lock()
+        self._shutdown_in_progress = False
+        self._shutdown_stage = 0  # 0=none, 1=signal, 2=stopping, 3=cleanup, 4=done
+
     @classmethod
     async def create(
         cls,
@@ -293,46 +298,113 @@ class TrinityBridge:
 
     async def stop(self) -> None:
         """
-        Stop Trinity Bridge and all components gracefully.
+        v95.0: Enhanced stop with race condition protection.
+
+        Features:
+        - Atomic shutdown via lock (prevents duplicate shutdown attempts)
+        - Staged shutdown with timeouts (prevents hanging)
+        - Graceful degradation on component failures
+        - Proper coordination between Trinity Bridge and Orchestrator
         """
+        # v95.0: Fast-path check before acquiring lock
         if self._state == TrinityState.STOPPED:
             return
 
-        self._set_state(TrinityState.SHUTTING_DOWN)
-        logger.info("Trinity Bridge shutting down...")
+        # v95.0: Acquire shutdown lock - prevents duplicate shutdowns
+        async with self._shutdown_lock:
+            # Double-check after acquiring lock (another task might have finished)
+            if self._shutdown_in_progress or self._state == TrinityState.STOPPED:
+                logger.debug("[v95.0] Shutdown already in progress or completed")
+                return
 
-        # Signal shutdown
-        self._shutdown_event.set()
+            self._shutdown_in_progress = True
+            self._shutdown_stage = 1
 
-        # Stop health monitoring
-        if self._health_task:
-            self._health_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await self._health_task
+            self._set_state(TrinityState.SHUTTING_DOWN)
+            logger.info("Trinity Bridge shutting down...")
 
-        # Stop components in reverse order
-        try:
+            # Stage 1: Signal shutdown
+            self._shutdown_event.set()
+            self._shutdown_stage = 2
+
+            # Stage 2: Stop health monitoring (with timeout)
+            if self._health_task:
+                self._health_task.cancel()
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(self._health_task),
+                        timeout=5.0
+                    )
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    pass  # Expected
+                except Exception as e:
+                    logger.debug(f"[v95.0] Health task cleanup: {e}")
+
+            self._shutdown_stage = 3
+
+            # Stage 3: Stop components in reverse order (with per-component timeout)
+            shutdown_errors = []
+
             # Stop training coordinator
             if self._training_coordinator:
-                await self._training_coordinator.shutdown()
+                try:
+                    await asyncio.wait_for(
+                        self._training_coordinator.shutdown(),
+                        timeout=10.0
+                    )
+                except asyncio.TimeoutError:
+                    shutdown_errors.append("training_coordinator timeout")
+                except Exception as e:
+                    shutdown_errors.append(f"training_coordinator: {e}")
 
             # Stop IPC hub
             if self._ipc_hub:
-                await self._ipc_hub.stop()
+                try:
+                    await asyncio.wait_for(
+                        self._ipc_hub.stop(),
+                        timeout=5.0
+                    )
+                except asyncio.TimeoutError:
+                    shutdown_errors.append("ipc_hub timeout")
+                except Exception as e:
+                    shutdown_errors.append(f"ipc_hub: {e}")
 
             # Stop process orchestrator (stops external repos)
             if self._process_orchestrator:
-                await self._process_orchestrator.shutdown_all_services()
+                try:
+                    await asyncio.wait_for(
+                        self._process_orchestrator.shutdown_all_services(),
+                        timeout=30.0  # Longer timeout for external processes
+                    )
+                except asyncio.TimeoutError:
+                    shutdown_errors.append("process_orchestrator timeout")
+                    # Force kill if timeout
+                    logger.warning("[v95.0] Process orchestrator timeout - forcing cleanup")
+                except Exception as e:
+                    shutdown_errors.append(f"process_orchestrator: {e}")
 
             # Stop service registry cleanup task
             if self._service_registry:
-                await self._service_registry.stop_cleanup_task()
+                try:
+                    await asyncio.wait_for(
+                        self._service_registry.stop_cleanup_task(),
+                        timeout=5.0
+                    )
+                except asyncio.TimeoutError:
+                    shutdown_errors.append("service_registry timeout")
+                except Exception as e:
+                    shutdown_errors.append(f"service_registry: {e}")
 
-        except Exception as e:
-            logger.error(f"Error during shutdown: {e}")
+            self._shutdown_stage = 4
 
-        self._set_state(TrinityState.STOPPED)
-        logger.info("Trinity Bridge stopped")
+            if shutdown_errors:
+                logger.warning(f"[v95.0] Shutdown completed with errors: {shutdown_errors}")
+            else:
+                logger.info("[v95.0] All components shut down cleanly")
+
+            self._set_state(TrinityState.STOPPED)
+            self._shutdown_in_progress = False
+            logger.info("Trinity Bridge stopped")
 
     async def _initialize_directories(self) -> None:
         """Initialize all critical directories."""

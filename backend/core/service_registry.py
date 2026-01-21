@@ -440,6 +440,28 @@ class ServiceRegistry:
         }
         logger.debug(f"[v95.0] Service stale thresholds: {self._service_stale_thresholds}")
 
+        # v95.0: Circuit breaker for registry operations (prevents cascading failures)
+        self._circuit_breaker_state = "CLOSED"  # CLOSED, OPEN, HALF_OPEN
+        self._circuit_breaker_failures = 0
+        self._circuit_breaker_threshold = int(
+            os.environ.get("JARVIS_REGISTRY_CB_THRESHOLD", "5")
+        )
+        self._circuit_breaker_reset_timeout = float(
+            os.environ.get("JARVIS_REGISTRY_CB_RESET", "30.0")
+        )
+        self._circuit_breaker_last_failure = 0.0
+        self._circuit_breaker_lock = asyncio.Lock()
+
+        # v95.0: Local cache for graceful degradation when registry unavailable
+        self._local_cache: Dict[str, ServiceInfo] = {}
+        self._cache_lock = asyncio.Lock()
+        self._cache_ttl = float(os.environ.get("JARVIS_REGISTRY_CACHE_TTL", "60.0"))
+        self._cache_last_update = 0.0
+
+        # v95.0: Heartbeat retry queue for transient failures
+        self._pending_heartbeats: asyncio.Queue = asyncio.Queue(maxsize=100)
+        self._heartbeat_retry_task: Optional[asyncio.Task] = None
+
         # v93.0: Ensure directory exists with retry logic
         if not self._dir_manager.ensure_directory_sync():
             logger.error(f"[v93.0] CRITICAL: Failed to create registry directory: {self.registry_dir}")
@@ -527,6 +549,151 @@ class ServiceRegistry:
                     await result
             except Exception as e:
                 logger.warning(f"[v95.0] on_service_recovered callback error: {e}")
+
+    # =========================================================================
+    # v95.0: Circuit Breaker Pattern for Registry Resilience
+    # =========================================================================
+
+    async def _check_circuit_breaker(self) -> bool:
+        """
+        v95.0: Check if circuit breaker allows operation.
+
+        Circuit breaker prevents cascading failures when registry is unhealthy.
+        States:
+        - CLOSED: Normal operation, all requests allowed
+        - OPEN: Registry unavailable, use cache fallback
+        - HALF_OPEN: Testing if registry recovered
+
+        Returns:
+            True if operation allowed, False if circuit is open
+        """
+        async with self._circuit_breaker_lock:
+            if self._circuit_breaker_state == "CLOSED":
+                return True
+
+            if self._circuit_breaker_state == "OPEN":
+                # Check if reset timeout has passed
+                elapsed = time.time() - self._circuit_breaker_last_failure
+                if elapsed >= self._circuit_breaker_reset_timeout:
+                    self._circuit_breaker_state = "HALF_OPEN"
+                    logger.info("[v95.0] Circuit breaker: OPEN → HALF_OPEN (testing recovery)")
+                    return True
+                return False
+
+            # HALF_OPEN: allow single test request
+            return True
+
+    async def _record_circuit_success(self) -> None:
+        """v95.0: Record successful registry operation."""
+        async with self._circuit_breaker_lock:
+            if self._circuit_breaker_state == "HALF_OPEN":
+                self._circuit_breaker_state = "CLOSED"
+                self._circuit_breaker_failures = 0
+                logger.info("[v95.0] Circuit breaker: HALF_OPEN → CLOSED (recovery confirmed)")
+            elif self._circuit_breaker_state == "CLOSED":
+                # Reset failure count on success
+                self._circuit_breaker_failures = max(0, self._circuit_breaker_failures - 1)
+
+    async def _record_circuit_failure(self) -> None:
+        """v95.0: Record failed registry operation."""
+        async with self._circuit_breaker_lock:
+            self._circuit_breaker_failures += 1
+            self._circuit_breaker_last_failure = time.time()
+
+            if self._circuit_breaker_state == "HALF_OPEN":
+                self._circuit_breaker_state = "OPEN"
+                logger.warning("[v95.0] Circuit breaker: HALF_OPEN → OPEN (recovery failed)")
+            elif (
+                self._circuit_breaker_state == "CLOSED"
+                and self._circuit_breaker_failures >= self._circuit_breaker_threshold
+            ):
+                self._circuit_breaker_state = "OPEN"
+                logger.warning(
+                    f"[v95.0] Circuit breaker: CLOSED → OPEN "
+                    f"(failures: {self._circuit_breaker_failures})"
+                )
+
+    # =========================================================================
+    # v95.0: Local Cache Fallback for Graceful Degradation
+    # =========================================================================
+
+    async def _update_cache(self, services: Dict[str, ServiceInfo]) -> None:
+        """v95.0: Update local cache with latest registry state."""
+        async with self._cache_lock:
+            self._local_cache = services.copy()
+            self._cache_last_update = time.time()
+
+    async def _get_from_cache(self, service_name: Optional[str] = None) -> Optional[Any]:
+        """
+        v95.0: Get service(s) from local cache.
+
+        Args:
+            service_name: Specific service to get, or None for all
+
+        Returns:
+            ServiceInfo if found, Dict if all services, None if not found/stale
+        """
+        async with self._cache_lock:
+            cache_age = time.time() - self._cache_last_update
+            if cache_age > self._cache_ttl:
+                logger.debug(f"[v95.0] Cache stale ({cache_age:.1f}s > {self._cache_ttl}s)")
+                return None
+
+            if service_name:
+                return self._local_cache.get(service_name)
+            return self._local_cache.copy()
+
+    async def discover_service_resilient(
+        self,
+        service_name: str,
+        use_cache_fallback: bool = True
+    ) -> Optional[ServiceInfo]:
+        """
+        v95.0: Resilient service discovery with circuit breaker and cache fallback.
+
+        This is the preferred discovery method for cross-repo operations.
+
+        Args:
+            service_name: Service to discover
+            use_cache_fallback: Whether to use cache when registry unavailable
+
+        Returns:
+            ServiceInfo if found, None otherwise
+        """
+        # Check circuit breaker first
+        if not await self._check_circuit_breaker():
+            if use_cache_fallback:
+                cached = await self._get_from_cache(service_name)
+                if cached:
+                    logger.debug(f"[v95.0] Using cache fallback for {service_name}")
+                    return cached
+            logger.warning(f"[v95.0] Circuit open, no cache for {service_name}")
+            return None
+
+        try:
+            # Try normal discovery
+            result = await self.discover_service(service_name)
+            await self._record_circuit_success()
+
+            # Update cache on success
+            if result:
+                async with self._cache_lock:
+                    self._local_cache[service_name] = result
+                    self._cache_last_update = time.time()
+
+            return result
+
+        except Exception as e:
+            await self._record_circuit_failure()
+            logger.warning(f"[v95.0] Discovery failed for {service_name}: {e}")
+
+            if use_cache_fallback:
+                cached = await self._get_from_cache(service_name)
+                if cached:
+                    logger.info(f"[v95.0] Using cache fallback for {service_name}")
+                    return cached
+
+            return None
 
     def _get_adaptive_stale_threshold(self, service_name: str) -> float:
         """

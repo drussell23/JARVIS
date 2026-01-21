@@ -72,6 +72,9 @@ class ConfigEventType(Enum):
     CONFIG_ROLLBACK = auto()
     SCHEMA_UPDATE = auto()
     HEARTBEAT = auto()
+    # v95.0: Reconnection events for cross-repo bridge auto-recovery
+    REPO_RECONNECTED = auto()  # Fired when a previously offline repo comes back
+    REPO_DISCONNECTED = auto()  # Fired when a repo goes offline
 
 
 class ConflictResolutionStrategy(Enum):
@@ -832,11 +835,79 @@ class CrossRepoConfigBridge:
         await self.event_bus.publish(response)
 
     async def _handle_heartbeat(self, event: ConfigEvent):
-        """Handle heartbeat from another repo."""
+        """
+        Handle heartbeat from another repo.
+
+        v95.0: Enhanced with reconnection detection and auto-sync.
+        When a previously offline repo comes back online, we:
+        1. Mark it as online
+        2. Trigger a sync to restore consistency
+        3. Emit a reconnection event
+        """
         async with self._lock:
             if event.source_repo in self._repo_states:
-                self._repo_states[event.source_repo].online = True
-                self._repo_states[event.source_repo].last_heartbeat = datetime.utcnow()
+                state = self._repo_states[event.source_repo]
+                was_offline = not state.online
+
+                # Update state
+                state.online = True
+                state.last_heartbeat = datetime.utcnow()
+
+                # v95.0: Detect reconnection and trigger sync
+                if was_offline:
+                    self.logger.info(
+                        f"[v95.0] Repo '{event.source_repo}' reconnected - triggering sync"
+                    )
+                    state.sync_status = SyncStatus.PENDING
+
+                    # Emit reconnection event
+                    reconnect_event = ConfigEvent(
+                        event_type=ConfigEventType.REPO_RECONNECTED,
+                        source_repo="jarvis_body",
+                        target_repos=[event.source_repo],
+                        metadata={
+                            "reconnected_repo": event.source_repo,
+                            "timestamp": time.time()
+                        }
+                    )
+                    await self.event_bus.publish(reconnect_event)
+
+                    # Schedule immediate sync with reconnected repo
+                    asyncio.create_task(
+                        self._sync_with_reconnected_repo(event.source_repo)
+                    )
+
+    async def _sync_with_reconnected_repo(self, repo_id: str):
+        """
+        v95.0: Sync with a repo that has just reconnected.
+
+        This ensures configuration consistency is restored after
+        a service restart.
+        """
+        try:
+            self.logger.info(f"[v95.0] Starting reconnection sync with {repo_id}")
+
+            # Small delay to allow repo to fully initialize
+            await asyncio.sleep(2.0)
+
+            # Perform sync
+            result = await self.sync_with_repo(repo_id)
+
+            if result.success:
+                self.logger.info(
+                    f"[v95.0] Reconnection sync with {repo_id} successful "
+                    f"({result.synced_count} items synced)"
+                )
+                async with self._lock:
+                    if repo_id in self._repo_states:
+                        self._repo_states[repo_id].sync_status = SyncStatus.SYNCED
+            else:
+                self.logger.warning(
+                    f"[v95.0] Reconnection sync with {repo_id} failed: {result.errors}"
+                )
+
+        except Exception as e:
+            self.logger.error(f"[v95.0] Reconnection sync error for {repo_id}: {e}")
 
     # =========================================================================
     # Background Tasks
@@ -877,7 +948,11 @@ class CrossRepoConfigBridge:
                 self.logger.error(f"Heartbeat loop error: {e}")
 
     async def _check_stale_repos(self):
-        """Check for repos that haven't sent heartbeat."""
+        """
+        Check for repos that haven't sent heartbeat.
+
+        v95.0: Enhanced with disconnection events for monitoring.
+        """
         now = datetime.utcnow()
         timeout = timedelta(seconds=self.config.heartbeat_timeout)
 
@@ -886,7 +961,22 @@ class CrossRepoConfigBridge:
                 if state.online and now - state.last_heartbeat > timeout:
                     state.online = False
                     state.sync_status = SyncStatus.FAILED
-                    self.logger.warning(f"Repo {repo_id} appears offline")
+                    self.logger.warning(f"[v95.0] Repo '{repo_id}' appears offline (no heartbeat)")
+
+                    # v95.0: Emit disconnection event for monitoring
+                    disconnect_event = ConfigEvent(
+                        event_type=ConfigEventType.REPO_DISCONNECTED,
+                        source_repo="jarvis_body",
+                        target_repos=[repo_id],
+                        metadata={
+                            "disconnected_repo": repo_id,
+                            "last_heartbeat": state.last_heartbeat.isoformat(),
+                            "timeout_seconds": self.config.heartbeat_timeout,
+                            "timestamp": time.time()
+                        }
+                    )
+                    # Use fire-and-forget to not block the check loop
+                    asyncio.create_task(self.event_bus.publish(disconnect_event))
 
     def _calculate_config_checksum(self, config: Dict[str, Any]) -> str:
         """Calculate checksum for config data."""
