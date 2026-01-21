@@ -436,6 +436,8 @@ class ServiceRegistry:
             "reactor": float(os.environ.get("REACTOR_STALE_THRESHOLD", "600.0")),  # 10 minutes
             "jarvis-prime": float(os.environ.get("JARVIS_PRIME_STALE_THRESHOLD", "600.0")),  # 10 minutes
             "jprime": float(os.environ.get("JARVIS_PRIME_STALE_THRESHOLD", "600.0")),  # 10 minutes
+            # v95.0: jarvis-body (registry owner) has highest threshold - should never be stale
+            "jarvis-body": float(os.environ.get("JARVIS_BODY_STALE_THRESHOLD", "3600.0")),  # 1 hour
             "default": float(os.environ.get("JARVIS_VERY_STALE_THRESHOLD", "300.0")),  # 5 minutes
         }
         logger.debug(f"[v95.0] Service stale thresholds: {self._service_stale_thresholds}")
@@ -461,6 +463,19 @@ class ServiceRegistry:
         # v95.0: Heartbeat retry queue for transient failures
         self._pending_heartbeats: asyncio.Queue = asyncio.Queue(maxsize=100)
         self._heartbeat_retry_task: Optional[asyncio.Task] = None
+
+        # v95.0: Owner service identification and self-heartbeat
+        # The owner is the service that RUNS this registry (jarvis-body)
+        # Owner is NEVER marked stale because if the registry is running,
+        # the owner must be alive (by definition)
+        self._owner_service_name: str = os.environ.get(
+            "JARVIS_REGISTRY_OWNER", "jarvis-body"
+        )
+        self._self_heartbeat_task: Optional[asyncio.Task] = None
+        self._self_heartbeat_interval: float = float(
+            os.environ.get("JARVIS_SELF_HEARTBEAT_INTERVAL", "15.0")
+        )
+        logger.debug(f"[v95.0] Registry owner: {self._owner_service_name}")
 
         # v93.0: Ensure directory exists with retry logic
         if not self._dir_manager.ensure_directory_sync():
@@ -1144,6 +1159,14 @@ class ServiceRegistry:
                 f"(interval: {self.cleanup_interval}s, timeout: {self.heartbeat_timeout}s)"
             )
 
+        # v95.0: Start self-heartbeat task for the registry owner
+        if self._self_heartbeat_task is None or self._self_heartbeat_task.done():
+            self._self_heartbeat_task = asyncio.create_task(self._self_heartbeat_loop())
+            logger.info(
+                f"[v95.0] Self-heartbeat started for owner '{self._owner_service_name}' "
+                f"(interval: {self._self_heartbeat_interval}s)"
+            )
+
     async def stop_cleanup_task(self) -> None:
         """Stop background cleanup task."""
         if self._cleanup_task and not self._cleanup_task.done():
@@ -1153,6 +1176,55 @@ class ServiceRegistry:
             except asyncio.CancelledError:
                 pass
             logger.info("🛑 Service registry cleanup stopped")
+
+        # v95.0: Stop self-heartbeat task
+        if self._self_heartbeat_task and not self._self_heartbeat_task.done():
+            self._self_heartbeat_task.cancel()
+            try:
+                await self._self_heartbeat_task
+            except asyncio.CancelledError:
+                pass
+            logger.info("🛑 Service registry cleanup loop stopped")
+
+    async def _self_heartbeat_loop(self) -> None:
+        """
+        v95.0: Self-heartbeat loop for the registry owner service.
+
+        The registry owner (jarvis-body) is the service that RUNS this registry.
+        If the registry is running, the owner must be alive (by definition).
+        This loop sends heartbeats on behalf of the owner to ensure it's
+        never marked stale.
+
+        This solves the "jarvis-body is very stale" issue where the owner
+        was being incorrectly marked stale because it didn't send heartbeats
+        to itself.
+        """
+        logger.info(f"[v95.0] Self-heartbeat loop started for {self._owner_service_name}")
+
+        while True:
+            try:
+                await asyncio.sleep(self._self_heartbeat_interval)
+
+                # Send heartbeat for owner
+                await self.heartbeat(
+                    self._owner_service_name,
+                    status="healthy",
+                    metadata={
+                        "heartbeat_source": "self_heartbeat",
+                        "is_registry_owner": True,
+                        "pid": os.getpid(),
+                    }
+                )
+                logger.debug(
+                    f"[v95.0] Self-heartbeat sent for {self._owner_service_name}"
+                )
+
+            except asyncio.CancelledError:
+                logger.debug(f"[v95.0] Self-heartbeat loop cancelled for {self._owner_service_name}")
+                break
+            except Exception as e:
+                # Log but don't crash - the owner should stay alive
+                logger.warning(f"[v95.0] Self-heartbeat error (non-fatal): {e}")
 
     async def wait_for_service(
         self,

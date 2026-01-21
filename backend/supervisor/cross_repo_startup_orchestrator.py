@@ -3750,12 +3750,31 @@ echo "=== JARVIS Prime started ==="
                 if not is_docker_service and not managed.is_running:
                     # Process died, trigger auto-heal if enabled
                     exit_code = managed.process.returncode if managed.process else "unknown"
-                    logger.warning(
-                        f"🚨 Process {managed.definition.name} died (exit code: {exit_code})"
-                    )
-                    managed.status = ServiceStatus.FAILED
 
-                    if self.config.auto_healing_enabled:
+                    # v95.0: Check if this is an intentional shutdown (exit code -15 = SIGTERM)
+                    # During shutdown, processes are killed with SIGTERM, so we shouldn't
+                    # log scary warnings or attempt to restart them
+                    is_intentional_shutdown = (
+                        self._shutdown_event.is_set() or
+                        exit_code == -15 or  # SIGTERM
+                        exit_code == -2      # SIGINT
+                    )
+
+                    if is_intentional_shutdown:
+                        logger.info(
+                            f"[v95.0] Process {managed.definition.name} stopped "
+                            f"(exit code: {exit_code}, shutdown: {self._shutdown_event.is_set()})"
+                        )
+                        managed.status = ServiceStatus.STOPPED
+                        return  # Exit health monitor - this is expected
+                    else:
+                        logger.warning(
+                            f"🚨 Process {managed.definition.name} died unexpectedly "
+                            f"(exit code: {exit_code})"
+                        )
+                        managed.status = ServiceStatus.FAILED
+
+                    if self.config.auto_healing_enabled and not is_intentional_shutdown:
                         success = await self._auto_heal(managed)
                         if success:
                             # v93.0: After successful auto-heal, the new process has
@@ -3777,6 +3796,13 @@ echo "=== JARVIS Prime started ==="
                             # Wait longer before retrying
                             await asyncio.sleep(self.config.health_check_interval * 2)
                             continue
+                    elif is_intentional_shutdown:
+                        # Intentional shutdown - just exit cleanly
+                        logger.debug(
+                            f"[v95.0] {managed.definition.name} stopped intentionally, "
+                            f"health monitor exiting"
+                        )
+                        return
                     else:
                         # Auto-healing disabled, just log and exit
                         logger.error(
@@ -4051,6 +4077,17 @@ echo "=== JARVIS Prime started ==="
 
         Returns True if restart succeeded.
         """
+        # v95.0: CRITICAL - Check if shutdown is in progress BEFORE restarting
+        # This prevents the "restart during shutdown" issue where services
+        # are killed intentionally (SIGTERM = exit code -15) but the orchestrator
+        # tries to restart them.
+        if self._shutdown_event.is_set():
+            logger.info(
+                f"[v95.0] Skipping restart of {managed.definition.name}: "
+                f"shutdown in progress"
+            )
+            return False
+
         if managed.restart_count >= self.config.max_restart_attempts:
             logger.error(
                 f"❌ {managed.definition.name} exceeded max restart attempts "
