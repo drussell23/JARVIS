@@ -383,6 +383,12 @@ class AgentRegistry:
 
         self._metrics.heartbeats_received += 1
 
+        # v93.16: Update metrics when recovering from OFFLINE
+        if old_status == AgentStatus.OFFLINE:
+            self._metrics.currently_offline -= 1
+            self._metrics.currently_online += 1
+            logger.info("Agent %s recovered via heartbeat: offline -> %s", agent_name, agent_info.status.value)
+
         # Fire status change callback if changed
         if old_status != agent_info.status:
             await self._fire_status_change(agent_info, old_status)
@@ -732,11 +738,20 @@ class AgentRegistry:
 
                 else:
                     # Healthy heartbeat timing
-                    if agent_info.health != HealthStatus.HEALTHY:
-                        # Recovery: agent is sending heartbeats again
+                    if agent_info.health != HealthStatus.HEALTHY or agent_info.status == AgentStatus.OFFLINE:
+                        # v93.16: Allow recovery from OFFLINE when heartbeat is fresh
+                        # This enables external repos (jarvis_prime, reactor_core) to recover
+                        # when their heartbeat files are updated and the bridge sends heartbeats.
                         if agent_info.status == AgentStatus.OFFLINE:
-                            # Don't auto-recover from offline - require explicit heartbeat
-                            pass
+                            # Recovery from offline - agent is sending heartbeats again
+                            old_status = agent_info.status
+                            agent_info.status = AgentStatus.ONLINE
+                            agent_info.health = HealthStatus.HEALTHY
+                            recovering_agents.append(agent_name)
+                            # Update metrics
+                            self._metrics.currently_offline -= 1
+                            self._metrics.currently_online += 1
+                            logger.info("Agent %s recovered: offline -> online", agent_name)
                         else:
                             agent_info.health = HealthStatus.HEALTHY
                             recovering_agents.append(agent_name)

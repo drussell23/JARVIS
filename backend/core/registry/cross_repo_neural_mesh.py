@@ -591,14 +591,33 @@ class CrossRepoNeuralMeshBridge:
             await self._notify_status_change(agent)
 
     async def _update_mesh_status(self) -> None:
-        """Update status of external agents in Neural Mesh."""
+        """
+        Update status of external agents in Neural Mesh.
+
+        v93.16: Now sends heartbeats to allow offline agents to recover.
+        The registry requires explicit heartbeats to recover from OFFLINE status.
+        """
         if not self._neural_mesh or not hasattr(self._neural_mesh, 'registry'):
             return
 
         for agent in [self._prime_agent, self._reactor_agent]:
             try:
+                is_healthy = agent.is_healthy()
+
+                # v93.16: CRITICAL - Send heartbeat for healthy agents
+                # This allows agents to recover from OFFLINE status.
+                # The registry won't auto-recover without explicit heartbeats.
+                if is_healthy:
+                    try:
+                        await self._neural_mesh.registry.heartbeat(
+                            agent.agent_id,
+                            load=agent.load,
+                        )
+                    except Exception as hb_err:
+                        self.logger.debug(f"Heartbeat send error for {agent.agent_id}: {hb_err}")
+
                 # Update status in mesh
-                new_status = "online" if agent.is_healthy() else "offline"
+                new_status = "online" if is_healthy else "offline"
                 await self._neural_mesh.registry.update_status(
                     agent.agent_id,
                     new_status,

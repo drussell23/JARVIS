@@ -840,6 +840,33 @@ class PrimeNeuralMeshBridge:
                 logger.info("[PrimeNeuralMesh] Event stream cancelled")
                 break
 
+            # v93.16: Handle WebSocket connection closed errors gracefully
+            # This includes "no close frame received or sent" which happens when:
+            # - Server restarts/crashes
+            # - Network interruption
+            # - Idle timeout
+            except Exception as ws_exc:
+                # Check if this is a websockets ConnectionClosed exception
+                exc_type_name = type(ws_exc).__name__
+                exc_module = type(ws_exc).__module__
+
+                if exc_type_name in ("ConnectionClosed", "ConnectionClosedError", "ConnectionClosedOK") and "websockets" in exc_module:
+                    # WebSocket closed - this is normal, just reconnect
+                    retry_count += 1
+                    delay = min(base_delay * (1.2 ** min(retry_count - 1, 5)), 15.0)
+
+                    # Only log occasionally to avoid spam
+                    if retry_count == 1:
+                        logger.debug("[PrimeNeuralMesh] WebSocket closed, reconnecting...")
+                    elif retry_count % 5 == 0:
+                        logger.debug(f"[PrimeNeuralMesh] WebSocket reconnect attempt {retry_count}")
+
+                    await asyncio.sleep(delay)
+                    continue  # Try to reconnect
+
+                # Not a WebSocket close error - re-raise to be handled by the generic handler
+                raise
+
             except Exception as e:
                 error_msg = str(e)
                 retry_count += 1
