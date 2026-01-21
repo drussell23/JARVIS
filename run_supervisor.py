@@ -225,9 +225,7 @@ if _sys.version_info < (3, 10):
                 return {}
             _metadata.packages_distributions = _packages_distributions_fallback
     except Exception:
-        pass
-    except Exception:
-        pass
+        pass  # Silently ignore - this is a best-effort compatibility fix
 del _sys
 
 # =============================================================================
@@ -3344,6 +3342,7 @@ class HotReloadWatcher:
         
         self.logger.info("   🔨 Triggering frontend rebuild...")
         
+        process = None
         try:
             # Run npm run build in frontend directory
             process = await asyncio.create_subprocess_exec(
@@ -3353,21 +3352,35 @@ class HotReloadWatcher:
                 stderr=asyncio.subprocess.PIPE,
                 env={**os.environ, "CI": "true"}  # Prevent interactive prompts
             )
-            
+
             stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=120)
-            
+
             if process.returncode == 0:
                 self.logger.info("   ✅ Frontend rebuild completed successfully")
                 return True
             else:
                 self.logger.error(f"   ❌ Frontend rebuild failed: {stderr.decode()[:200]}")
                 return False
-                
+
         except asyncio.TimeoutError:
             self.logger.error("   ❌ Frontend rebuild timed out (120s)")
+            # Clean up zombie process on timeout
+            if process is not None:
+                try:
+                    process.kill()
+                    await asyncio.wait_for(process.wait(), timeout=5.0)
+                except Exception:
+                    pass  # Best effort cleanup
             return False
         except Exception as e:
             self.logger.error(f"   ❌ Frontend rebuild error: {e}")
+            # Clean up zombie process on error
+            if process is not None:
+                try:
+                    process.kill()
+                    await asyncio.wait_for(process.wait(), timeout=5.0)
+                except Exception:
+                    pass  # Best effort cleanup
             return False
     
     def _should_watch_file(self, file_path: Path) -> bool:
