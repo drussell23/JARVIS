@@ -2386,6 +2386,12 @@ echo "=== JARVIS Prime started ==="
                 ],
                 environment={
                     "PYTHONPATH": str(self.config.jarvis_prime_path),
+                    # v93.16: Suppress library version warnings at environment level
+                    "PYTHONWARNINGS": "ignore::UserWarning,ignore::DeprecationWarning,ignore::FutureWarning",
+                    "TF_CPP_MIN_LOG_LEVEL": "2",
+                    "TRANSFORMERS_VERBOSITY": "error",
+                    "TOKENIZERS_PARALLELISM": "false",
+                    "COREMLTOOLS_LOG_LEVEL": "ERROR",
                 },
             ))
 
@@ -2502,6 +2508,25 @@ echo "=== JARVIS Prime started ==="
         # Default to info for normal output
         return 'info'
 
+    # v93.16: Patterns for warnings that should be suppressed
+    _SUPPRESSED_WARNING_PATTERNS = [
+        'scikit-learn version',
+        'is not supported',
+        'minimum required version',
+        'maximum required version',
+        'disabling scikit-learn conversion api',
+        'torch version',
+        'has not been tested',
+        'coremltools',
+        'unexpected errors',
+        'most recent version that has been tested',
+    ]
+
+    def _should_suppress_line(self, line: str) -> bool:
+        """v93.16: Check if a line should be suppressed (known benign warnings)."""
+        line_lower = line.lower()
+        return any(pattern in line_lower for pattern in self._SUPPRESSED_WARNING_PATTERNS)
+
     async def _stream_output(
         self,
         managed: ManagedProcess,
@@ -2510,6 +2535,7 @@ echo "=== JARVIS Prime started ==="
     ) -> None:
         """
         v93.0: Stream process output with intelligent log level detection.
+        v93.16: Added warning suppression for known benign library warnings.
 
         Python's logging module outputs to stderr by default, which previously
         caused all child process logs to appear as WARNING in our output.
@@ -2532,6 +2558,11 @@ echo "=== JARVIS Prime started ==="
 
                 decoded = line.decode('utf-8', errors='replace').rstrip()
                 if decoded:
+                    # v93.16: Suppress known benign warnings
+                    if self._should_suppress_line(decoded):
+                        logger.debug(f"{prefix} [SUPPRESSED] {decoded}")
+                        continue
+
                     # Detect actual log level from content
                     level = self._detect_log_level(decoded)
 
@@ -2966,6 +2997,14 @@ echo "=== JARVIS Prime started ==="
             # Add port hint for service registration
             env["SERVICE_PORT"] = str(definition.default_port)
             env["SERVICE_NAME"] = definition.name
+
+            # v93.16: Suppress library warnings at environment level
+            # This ensures warnings are suppressed BEFORE Python interpreter loads modules
+            env.setdefault("PYTHONWARNINGS", "ignore::UserWarning,ignore::DeprecationWarning,ignore::FutureWarning")
+            env.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")  # Suppress TensorFlow warnings
+            env.setdefault("TRANSFORMERS_VERBOSITY", "error")  # Suppress transformers warnings
+            env.setdefault("TOKENIZERS_PARALLELISM", "false")  # Suppress tokenizers warning
+            env.setdefault("COREMLTOOLS_LOG_LEVEL", "ERROR")  # Suppress coremltools warnings
 
             # v4.0: Build command using the detected Python executable
             cmd: List[str] = []
