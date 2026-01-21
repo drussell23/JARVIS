@@ -809,7 +809,7 @@ class RedisMetrics:
     async def close(self):
         """Close Redis connection"""
         if self.redis:
-            await self.redis.close()
+            await self.redis.aclose()  # v93.14
             logger.info("✅ Redis connection closed")
 
 
@@ -2820,7 +2820,7 @@ class HybridDatabaseSync:
 
         # Phase 2: Close Redis connection
         if self.redis:
-            await self.redis.close()
+            await self.redis.aclose()  # v93.14
 
         # Shutdown thread pool
         if self.thread_pool:

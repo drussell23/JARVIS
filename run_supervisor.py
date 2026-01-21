@@ -15250,7 +15250,8 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
                 print(f"  {TerminalUI.GREEN}   ├─ Pub/sub for real-time updates{TerminalUI.RESET}")
                 print(f"  {TerminalUI.GREEN}   └─ Circuit breaker protection{TerminalUI.RESET}")
             else:
-                print(f"  {TerminalUI.YELLOW}   └─ Running in local-only mode (Redis unavailable){TerminalUI.RESET}")
+                # v93.14: Changed from YELLOW to DIM - Redis is optional, local mode is fine
+                print(f"  {TerminalUI.DIM}   └─ Local mode (Redis optional){TerminalUI.RESET}")
 
         except ImportError as e:
             self.logger.warning(f"[v100.0] ⚠️ Unified Agent Registry import failed: {e}")

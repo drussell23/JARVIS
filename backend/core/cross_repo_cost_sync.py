@@ -314,7 +314,7 @@ class CrossRepoCostSync:
 
         if self._redis:
             try:
-                await self._redis.close()
+                await self._redis.aclose()  # v93.14
             except Exception:
                 pass
 

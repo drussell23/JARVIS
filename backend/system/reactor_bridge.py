@@ -475,7 +475,7 @@ class RedisTransport(TrinityTransport):
             await self._pubsub.unsubscribe()
             await self._pubsub.close()
         if self._redis:
-            await self._redis.close()
+            await self._redis.aclose()  # v93.14
         logger.info("[Trinity] RedisTransport disconnected")
 
     def is_connected(self) -> bool:

@@ -287,7 +287,8 @@ class RedisStateManager:
     async def disconnect(self) -> None:
         """Disconnect from Redis."""
         if self._redis:
-            await self._redis.close()
+            # v93.14: Use aclose() instead of deprecated close()
+            await self._redis.aclose()
             self._redis = None
         self._connected = False
 

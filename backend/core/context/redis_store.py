@@ -128,7 +128,7 @@ class RedisContextStore(ContextStore):
         Should be called when shutting down the application.
         """
         if self._redis:
-            await self._redis.close()
+            await self._redis.aclose()  # v93.14
             self._redis = None
             logger.info("Disconnected from Redis")
 

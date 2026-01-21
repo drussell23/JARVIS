@@ -384,7 +384,7 @@ class RedisStateStore(StateStore):
     async def disconnect(self) -> None:
         """Disconnect from Redis."""
         if self._redis:
-            await self._redis.close()
+            await self._redis.aclose()  # v93.14
         self._connected = False
 
     def _key(self, key: str, namespace: StateNamespace) -> str:

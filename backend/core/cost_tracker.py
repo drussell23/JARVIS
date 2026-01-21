@@ -503,11 +503,11 @@ class CostTracker:
             # Close Pub/Sub
             if self._redis_pubsub:
                 await self._redis_pubsub.unsubscribe()
-                await self._redis_pubsub.close()
+                await self._redis_pubsub.aclose()  # v93.14
             
             # Close Redis connection
             if self._redis:
-                await self._redis.close()
+                await self._redis.aclose()  # v93.14
                 
             logger.info("🔴 Redis connections closed")
             

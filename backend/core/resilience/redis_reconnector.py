@@ -282,7 +282,7 @@ class ResilientRedisClient:
         # Close main connection
         if self._redis:
             try:
-                await self._redis.close()
+                await self._redis.aclose()  # v93.14
             except Exception:
                 pass
             self._redis = None
@@ -373,7 +373,7 @@ class ResilientRedisClient:
                 # Close existing connection if any
                 if self._redis:
                     try:
-                        await self._redis.close()
+                        await self._redis.aclose()  # v93.14
                     except Exception:
                         pass
                     self._redis = None
