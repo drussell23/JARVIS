@@ -4248,7 +4248,15 @@ class SupervisorBootstrapper:
                 except KeyboardInterrupt:
                     self.logger.info("Shutdown requested...")
                     process.terminate()
-                    process.wait(timeout=5)
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        self.logger.warning("Process didn't terminate gracefully, forcing kill...")
+                        process.kill()
+                        try:
+                            process.wait(timeout=3)
+                        except subprocess.TimeoutExpired:
+                            self.logger.error("Process couldn't be killed - may be zombie")
 
                 return process.returncode or 0
 
@@ -10327,10 +10335,24 @@ class SupervisorBootstrapper:
                         (r"failed to (?:import|load|find)\s+(\w+)", DiscoverySource.FAILED_INTERACTION),
                     ]
 
-                    # Scan recent log files
+                    # v94.0: Non-blocking file I/O - run in executor to avoid blocking event loop
+                    def _read_file_sync(file_path: Path) -> str:
+                        """Read file content synchronously (runs in thread pool)."""
+                        try:
+                            return file_path.read_text(errors='ignore')
+                        except Exception:
+                            return ""
+
+                    loop = asyncio.get_running_loop()
+
+                    # Scan recent log files (non-blocking)
                     for log_file in sorted(log_dir.glob("*.log"), reverse=True)[:10]:
                         try:
-                            content = log_file.read_text(errors='ignore')
+                            # Run blocking I/O in executor to prevent event loop blocking
+                            content = await loop.run_in_executor(None, _read_file_sync, log_file)
+                            if not content:
+                                continue
+
                             for pattern, source in patterns:
                                 matches = re.findall(pattern, content, re.IGNORECASE)
                                 for match in matches[:5]:
