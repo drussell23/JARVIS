@@ -590,6 +590,7 @@ class ServiceDefinition:
     Definition of a service to manage.
 
     v4.0: Enhanced with script_args for command-line argument passing.
+    v95.0: Added dynamic script discovery and validation methods.
     """
     name: str
     repo_path: Path
@@ -615,6 +616,292 @@ class ServiceDefinition:
     # v3.1: Use uvicorn for FastAPI apps
     use_uvicorn: bool = False
     uvicorn_app: Optional[str] = None  # e.g., "reactor_core.api.server:app"
+
+    # v95.0: Dynamic script discovery patterns (regex)
+    discovery_patterns: List[str] = field(default_factory=lambda: [
+        r"run_.*\.py$",  # run_server.py, run_reactor.py, etc.
+        r"main\.py$",
+        r"server\.py$",
+        r"app\.py$",
+    ])
+
+    def discover_entry_script(self) -> Optional[Path]:
+        """
+        v95.0: Dynamically discover the best entry script for this service.
+
+        Uses intelligent scoring based on:
+        1. Explicit script_name match (highest priority)
+        2. Pattern matching (run_*.py preferred)
+        3. Fallback scripts
+        4. Size-based heuristic (larger files often have more functionality)
+
+        Returns:
+            Path to the best entry script, or None if not found.
+        """
+        import re
+
+        if not self.repo_path.exists():
+            return None
+
+        # Build candidate list with scores
+        candidates: List[tuple[Path, int]] = []
+
+        # Score: explicit script_name gets highest priority (100)
+        explicit_script = self.repo_path / self.script_name
+        if explicit_script.exists():
+            candidates.append((explicit_script, 100))
+
+        # Score: nested scripts (90)
+        for nested in self.nested_scripts:
+            nested_path = self.repo_path / nested
+            if nested_path.exists():
+                candidates.append((nested_path, 90))
+
+        # Score: fallback scripts (80)
+        for fallback in self.fallback_scripts:
+            fallback_path = self.repo_path / fallback
+            if fallback_path.exists():
+                candidates.append((fallback_path, 80))
+
+        # Score: pattern-discovered scripts (60-70)
+        try:
+            for py_file in self.repo_path.glob("*.py"):
+                if py_file in [c[0] for c in candidates]:
+                    continue  # Already scored
+
+                for i, pattern in enumerate(self.discovery_patterns):
+                    if re.search(pattern, py_file.name, re.IGNORECASE):
+                        # Earlier patterns get higher scores
+                        score = 70 - i * 2
+                        candidates.append((py_file, score))
+                        break
+        except Exception:
+            pass
+
+        if not candidates:
+            return None
+
+        # Sort by score (descending), then by file size as tiebreaker
+        def sort_key(item: tuple[Path, int]) -> tuple[int, int]:
+            path, score = item
+            try:
+                size = path.stat().st_size
+            except Exception:
+                size = 0
+            return (-score, -size)
+
+        candidates.sort(key=sort_key)
+        return candidates[0][0]
+
+    def validate(self) -> tuple[bool, List[str]]:
+        """
+        v95.0: Validate the service definition.
+
+        Returns:
+            Tuple of (is_valid, list_of_issues)
+        """
+        issues: List[str] = []
+
+        # Check repo path
+        if not self.repo_path.exists():
+            issues.append(f"Repository not found: {self.repo_path}")
+
+        # Check entry script
+        script = self.discover_entry_script()
+        if script is None and not self.module_path and not self.uvicorn_app:
+            issues.append(f"No entry script found (tried: {self.script_name}, {self.fallback_scripts})")
+
+        # Check port range
+        if not (1 <= self.default_port <= 65535):
+            issues.append(f"Invalid port number: {self.default_port}")
+
+        # Check health endpoint format
+        if not self.health_endpoint.startswith("/"):
+            issues.append(f"Health endpoint should start with '/': {self.health_endpoint}")
+
+        return len(issues) == 0, issues
+
+
+class ServiceDefinitionRegistry:
+    """
+    v95.0: Centralized registry for canonical service definitions.
+
+    This is the SINGLE SOURCE OF TRUTH for service configurations.
+    All components (trinity_bridge, orchestrator, etc.) should use
+    this registry to get consistent service definitions.
+
+    Features:
+    - Immutable canonical definitions for each service
+    - Dynamic path resolution from environment or config
+    - Automatic validation before returning definitions
+    - Caching with TTL for performance
+    """
+
+    # Canonical service configurations - DO NOT modify these directly
+    # Use environment variables to override paths/ports
+    _CANONICAL_DEFINITIONS = {
+        "jarvis-prime": {
+            "script_name": "run_server.py",
+            "fallback_scripts": ["main.py", "server.py", "app.py"],
+            "default_port_env": "JARVIS_PRIME_PORT",
+            "default_port": 8000,
+            "health_endpoint": "/health",
+            "startup_timeout": 180.0,  # ML model loading
+            "repo_path_env": "JARVIS_PRIME_PATH",
+            "default_repo_path": "~/Documents/repos/jarvis-prime",
+            "script_args_factory": lambda port: ["--port", str(port), "--host", "0.0.0.0"],
+            "environment_factory": lambda path: {
+                "PYTHONPATH": str(path),
+                "PYTHONWARNINGS": "ignore::UserWarning,ignore::DeprecationWarning,ignore::FutureWarning",
+                "TF_CPP_MIN_LOG_LEVEL": "2",
+                "TRANSFORMERS_VERBOSITY": "error",
+                "TOKENIZERS_PARALLELISM": "false",
+                "COREMLTOOLS_LOG_LEVEL": "ERROR",
+            },
+        },
+        "reactor-core": {
+            "script_name": "run_reactor.py",
+            "fallback_scripts": ["run_supervisor.py", "main.py", "server.py"],
+            "default_port_env": "REACTOR_CORE_PORT",
+            "default_port": 8090,
+            "health_endpoint": "/health",
+            "startup_timeout": 90.0,
+            "repo_path_env": "REACTOR_CORE_PATH",
+            "default_repo_path": "~/Documents/repos/reactor-core",
+            "script_args_factory": lambda port: ["--port", str(port)],
+            "environment_factory": lambda path: {
+                "PYTHONPATH": str(path),
+                "REACTOR_PORT": str(os.getenv("REACTOR_CORE_PORT", 8090)),
+            },
+            "use_uvicorn": False,
+        },
+    }
+
+    _instance = None
+    _cache: Dict[str, tuple[ServiceDefinition, float]] = {}
+    _cache_ttl = 60.0  # seconds
+
+    def __new__(cls) -> "ServiceDefinitionRegistry":
+        """Singleton pattern."""
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    @classmethod
+    def get_definition(
+        cls,
+        service_name: str,
+        port_override: Optional[int] = None,
+        path_override: Optional[Path] = None,
+        validate: bool = True,
+    ) -> Optional[ServiceDefinition]:
+        """
+        Get a canonical service definition.
+
+        Args:
+            service_name: Name of the service (jarvis-prime, reactor-core)
+            port_override: Optional port override
+            path_override: Optional repo path override
+            validate: Whether to validate the definition
+
+        Returns:
+            ServiceDefinition or None if service not found
+        """
+        canonical = cls._CANONICAL_DEFINITIONS.get(service_name)
+        if not canonical:
+            logger.warning(f"Unknown service: {service_name}")
+            return None
+
+        # Check cache
+        cache_key = f"{service_name}:{port_override}:{path_override}"
+        if cache_key in cls._cache:
+            cached_def, cached_time = cls._cache[cache_key]
+            if time.time() - cached_time < cls._cache_ttl:
+                return cached_def
+
+        # Resolve port
+        port = port_override
+        if port is None:
+            port = int(os.getenv(canonical["default_port_env"], canonical["default_port"]))
+
+        # Resolve path
+        repo_path = path_override
+        if repo_path is None:
+            env_path = os.getenv(canonical["repo_path_env"])
+            if env_path:
+                repo_path = Path(env_path).expanduser()
+            else:
+                repo_path = Path(canonical["default_repo_path"]).expanduser()
+
+        # Build definition
+        definition = ServiceDefinition(
+            name=service_name,
+            repo_path=repo_path,
+            script_name=canonical["script_name"],
+            fallback_scripts=canonical["fallback_scripts"],
+            default_port=port,
+            health_endpoint=canonical["health_endpoint"],
+            startup_timeout=canonical["startup_timeout"],
+            script_args=canonical.get("script_args_factory", lambda p: [])(port),
+            environment=canonical.get("environment_factory", lambda p: {})(repo_path),
+            use_uvicorn=canonical.get("use_uvicorn", False),
+            uvicorn_app=canonical.get("uvicorn_app"),
+        )
+
+        # Validate if requested
+        if validate:
+            is_valid, issues = definition.validate()
+            if not is_valid:
+                logger.warning(f"Service definition validation failed for {service_name}:")
+                for issue in issues:
+                    logger.warning(f"  - {issue}")
+
+        # Cache and return
+        cls._cache[cache_key] = (definition, time.time())
+        return definition
+
+    @classmethod
+    def get_all_definitions(
+        cls,
+        validate: bool = True,
+    ) -> List[ServiceDefinition]:
+        """Get all canonical service definitions."""
+        definitions = []
+        for name in cls._CANONICAL_DEFINITIONS:
+            definition = cls.get_definition(name, validate=validate)
+            if definition:
+                definitions.append(definition)
+        return definitions
+
+    @classmethod
+    def list_services(cls) -> List[str]:
+        """List all known service names."""
+        return list(cls._CANONICAL_DEFINITIONS.keys())
+
+    @classmethod
+    def clear_cache(cls) -> None:
+        """Clear the definition cache."""
+        cls._cache.clear()
+
+
+# Convenience function for getting service definitions
+def get_service_definition(
+    service_name: str,
+    port: Optional[int] = None,
+    path: Optional[Path] = None,
+) -> Optional[ServiceDefinition]:
+    """
+    v95.0: Get a canonical service definition from the registry.
+
+    This is the preferred way to get service definitions as it ensures
+    consistency across all components.
+
+    Example:
+        definition = get_service_definition("reactor-core")
+        if definition:
+            # Use definition...
+    """
+    return ServiceDefinitionRegistry.get_definition(service_name, port, path)
 
 
 @dataclass
@@ -2819,63 +3106,80 @@ echo "=== JARVIS Prime started ==="
         v4.0: Uses actual entry point scripts from each repo:
         - jarvis-prime: run_server.py (port 8000)
         - reactor-core: run_reactor.py (port 8090)
+
+        v95.0: Now uses ServiceDefinitionRegistry for consistency.
+        The registry provides canonical definitions that can be overridden
+        by the orchestrator's config.
         """
         definitions = []
 
         if self.config.jarvis_prime_enabled:
-            # jarvis-prime uses run_server.py as main entry point
-            # Port is passed via --port CLI arg (not env var)
-            # v93.0: Uses extended timeout for ML model loading
-            definitions.append(ServiceDefinition(
-                name="jarvis-prime",
-                repo_path=self.config.jarvis_prime_path,
-                script_name="run_server.py",  # Primary entry point
-                fallback_scripts=["main.py", "server.py", "app.py"],
-                default_port=self.config.jarvis_prime_default_port,
-                health_endpoint="/health",
-                # v93.0: Use jarvis_prime_startup_timeout (180s) for ML model loading
-                startup_timeout=self.config.jarvis_prime_startup_timeout,
-                # Pass port via command-line (run_server.py uses argparse)
-                script_args=[
-                    "--port", str(self.config.jarvis_prime_default_port),
-                    "--host", "0.0.0.0",
-                ],
-                environment={
-                    "PYTHONPATH": str(self.config.jarvis_prime_path),
-                    # v93.16: Suppress library version warnings at environment level
-                    "PYTHONWARNINGS": "ignore::UserWarning,ignore::DeprecationWarning,ignore::FutureWarning",
-                    "TF_CPP_MIN_LOG_LEVEL": "2",
-                    "TRANSFORMERS_VERBOSITY": "error",
-                    "TOKENIZERS_PARALLELISM": "false",
-                    "COREMLTOOLS_LOG_LEVEL": "ERROR",
-                },
-            ))
+            # v95.0: Use registry for canonical definition, override with config
+            jprime_def = ServiceDefinitionRegistry.get_definition(
+                "jarvis-prime",
+                port_override=self.config.jarvis_prime_default_port,
+                path_override=self.config.jarvis_prime_path,
+                validate=True,
+            )
+            if jprime_def:
+                # Override timeout from config
+                jprime_def.startup_timeout = self.config.jarvis_prime_startup_timeout
+                definitions.append(jprime_def)
+                logger.debug(f"Using registry definition for jarvis-prime: {jprime_def.script_name}")
+            else:
+                logger.warning("Could not get jarvis-prime definition from registry, using fallback")
+                # Fallback to inline definition if registry fails
+                definitions.append(ServiceDefinition(
+                    name="jarvis-prime",
+                    repo_path=self.config.jarvis_prime_path,
+                    script_name="run_server.py",
+                    fallback_scripts=["main.py", "server.py", "app.py"],
+                    default_port=self.config.jarvis_prime_default_port,
+                    health_endpoint="/health",
+                    startup_timeout=self.config.jarvis_prime_startup_timeout,
+                    script_args=["--port", str(self.config.jarvis_prime_default_port), "--host", "0.0.0.0"],
+                    environment={
+                        "PYTHONPATH": str(self.config.jarvis_prime_path),
+                        "PYTHONWARNINGS": "ignore::UserWarning,ignore::DeprecationWarning,ignore::FutureWarning",
+                        "TF_CPP_MIN_LOG_LEVEL": "2",
+                        "TRANSFORMERS_VERBOSITY": "error",
+                        "TOKENIZERS_PARALLELISM": "false",
+                        "COREMLTOOLS_LOG_LEVEL": "ERROR",
+                    },
+                ))
 
         if self.config.reactor_core_enabled:
-            # reactor-core uses run_reactor.py as main entry point
-            # Port is passed via --port CLI arg
-            # v93.0: Uses reactor_core_startup_timeout (90s)
-            definitions.append(ServiceDefinition(
-                name="reactor-core",
-                repo_path=self.config.reactor_core_path,
-                script_name="run_reactor.py",  # Primary entry point
-                fallback_scripts=["run_supervisor.py", "main.py", "server.py"],
-                default_port=self.config.reactor_core_default_port,
-                health_endpoint="/health",
-                # v93.0: Use reactor_core_startup_timeout
-                startup_timeout=self.config.reactor_core_startup_timeout,
-                # Don't use uvicorn - run_reactor.py handles its own server
-                use_uvicorn=False,
-                uvicorn_app=None,
-                # Pass port via command-line
-                script_args=[
-                    "--port", str(self.config.reactor_core_default_port),
-                ],
-                environment={
-                    "PYTHONPATH": str(self.config.reactor_core_path),
-                    "REACTOR_PORT": str(self.config.reactor_core_default_port),
-                },
-            ))
+            # v95.0: Use registry for canonical definition, override with config
+            reactor_def = ServiceDefinitionRegistry.get_definition(
+                "reactor-core",
+                port_override=self.config.reactor_core_default_port,
+                path_override=self.config.reactor_core_path,
+                validate=True,
+            )
+            if reactor_def:
+                # Override timeout from config
+                reactor_def.startup_timeout = self.config.reactor_core_startup_timeout
+                definitions.append(reactor_def)
+                logger.debug(f"Using registry definition for reactor-core: {reactor_def.script_name}")
+            else:
+                logger.warning("Could not get reactor-core definition from registry, using fallback")
+                # Fallback to inline definition if registry fails
+                definitions.append(ServiceDefinition(
+                    name="reactor-core",
+                    repo_path=self.config.reactor_core_path,
+                    script_name="run_reactor.py",
+                    fallback_scripts=["run_supervisor.py", "main.py", "server.py"],
+                    default_port=self.config.reactor_core_default_port,
+                    health_endpoint="/health",
+                    startup_timeout=self.config.reactor_core_startup_timeout,
+                    use_uvicorn=False,
+                    uvicorn_app=None,
+                    script_args=["--port", str(self.config.reactor_core_default_port)],
+                    environment={
+                        "PYTHONPATH": str(self.config.reactor_core_path),
+                        "REACTOR_PORT": str(self.config.reactor_core_default_port),
+                    },
+                ))
 
         return definitions
 
@@ -2884,12 +3188,17 @@ echo "=== JARVIS Prime started ==="
         Find the startup script for a service.
 
         v3.1: Enhanced discovery with nested script paths and module detection.
+        v95.0: Now uses intelligent discover_entry_script() with pattern matching and scoring.
 
         Search order:
-        1. Module path (returns None but module_path is used directly in spawn)
-        2. Uvicorn app (returns None but uvicorn is used in spawn)
-        3. Nested scripts (e.g., "reactor_core/api/server.py")
-        4. Root scripts (main.py, server.py, etc.)
+        1. Module path (returns sentinel but module_path is used directly in spawn)
+        2. Uvicorn app (returns sentinel but uvicorn is used in spawn)
+        3. Intelligent discovery via discover_entry_script() which:
+           - Checks explicit script_name (highest priority)
+           - Checks nested_scripts
+           - Checks fallback_scripts
+           - Pattern matches run_*.py, main.py, server.py, app.py
+           - Uses file size as tiebreaker for equal scores
         """
         repo_path = definition.repo_path
 
@@ -2903,28 +3212,30 @@ echo "=== JARVIS Prime started ==="
             logger.debug(f"Service {definition.name} uses module/uvicorn entry point")
             return Path("__module__")  # Sentinel value
 
-        # v3.1: Try nested scripts first (more specific paths)
-        for nested in definition.nested_scripts:
-            script_path = repo_path / nested
-            if script_path.exists():
-                logger.debug(f"Found nested script: {script_path}")
-                return script_path
+        # v95.0: Use intelligent discovery
+        script_path = definition.discover_entry_script()
 
-        # Try main script in root
-        script_path = repo_path / definition.script_name
-        if script_path.exists():
+        if script_path:
+            logger.debug(f"Discovered entry script for {definition.name}: {script_path}")
             return script_path
 
-        # Try fallback scripts in root
-        for fallback in definition.fallback_scripts:
-            script_path = repo_path / fallback
-            if script_path.exists():
-                return script_path
-
+        # v95.0: Enhanced logging for debugging
         logger.warning(
-            f"No startup script found in {repo_path} "
-            f"(tried: {definition.script_name}, {definition.fallback_scripts})"
+            f"No startup script found for {definition.name} in {repo_path}"
         )
+        logger.debug(f"  Tried explicit: {definition.script_name}")
+        logger.debug(f"  Tried nested: {definition.nested_scripts}")
+        logger.debug(f"  Tried fallbacks: {definition.fallback_scripts}")
+        logger.debug(f"  Discovery patterns: {definition.discovery_patterns}")
+
+        # List actual files for debugging
+        try:
+            py_files = [f.name for f in repo_path.glob("*.py")][:10]
+            if py_files:
+                logger.debug(f"  Available .py files: {py_files}")
+        except Exception:
+            pass
+
         return None
 
     # =========================================================================
@@ -3420,18 +3731,39 @@ echo "=== JARVIS Prime started ==="
         - Venv Python found (optional but preferred)
         - Port not already in use
 
+        v95.0: Enhanced with detailed diagnostic logging for troubleshooting.
+
         Returns:
             Tuple of (is_valid, python_executable)
         """
+        logger.info(f"    🔍 Pre-spawn validation for {definition.name}...")
+
         # Check repo exists
         if not definition.repo_path.exists():
-            logger.error(f"Repository not found: {definition.repo_path}")
+            logger.error(f"    ❌ Repository not found: {definition.repo_path}")
+            logger.error(f"    💡 Hint: Set {definition.name.upper().replace('-', '_')}_PATH env var or ensure repo is cloned")
             return False, None
+
+        logger.debug(f"    ✓ Repository found: {definition.repo_path}")
 
         # Check script exists
         script_path = self._find_script(definition)
         if script_path is None:
+            logger.error(f"    ❌ No startup script found for {definition.name}")
+            logger.error(f"    💡 Looking for: {definition.script_name} in {definition.repo_path}")
+            logger.error(f"    💡 Fallbacks: {definition.fallback_scripts}")
+            # List what files ARE in the repo
+            try:
+                py_files = list(definition.repo_path.glob("*.py"))
+                if py_files:
+                    logger.error(f"    💡 Python files found: {[f.name for f in py_files[:5]]}")
+                else:
+                    logger.error(f"    💡 No .py files found in {definition.repo_path}")
+            except Exception as e:
+                logger.debug(f"    Could not list repo files: {e}")
             return False, None
+
+        logger.debug(f"    ✓ Script found: {script_path}")
 
         # Find Python executable (prefer venv)
         python_exec = self._find_venv_python(definition.repo_path)

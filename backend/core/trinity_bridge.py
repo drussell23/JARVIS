@@ -398,36 +398,44 @@ class TrinityBridge:
         try:
             from backend.supervisor.cross_repo_startup_orchestrator import (
                 ProcessOrchestrator,
-                ServiceDefinition,
-                ServiceStatus
+                ServiceDefinitionRegistry,
+                get_service_definition,
             )
 
             self._process_orchestrator = ProcessOrchestrator()
 
-            # Define services to launch
+            # v95.0: Use centralized ServiceDefinitionRegistry for consistency
+            # This ensures the same service configurations are used everywhere
             services = []
 
             if self.config.jprime_enabled and self.config.jprime_repo_path.exists():
-                services.append(ServiceDefinition(
-                    name="jarvis-prime",
-                    repo_path=self.config.jprime_repo_path,
-                    script_name="main.py",
-                    default_port=self.config.jprime_port,
-                    health_endpoint="/health"
-                ))
+                # Get canonical definition, but override path/port from our config
+                jprime_def = get_service_definition(
+                    "jarvis-prime",
+                    port=self.config.jprime_port,
+                    path=self.config.jprime_repo_path,
+                )
+                if jprime_def:
+                    services.append(jprime_def)
+                else:
+                    logger.warning("Could not get jarvis-prime service definition from registry")
 
             if self.config.reactor_enabled and self.config.reactor_repo_path.exists():
-                services.append(ServiceDefinition(
-                    name="reactor-core",
-                    repo_path=self.config.reactor_repo_path,
-                    script_name="main.py",
-                    default_port=self.config.reactor_port,
-                    health_endpoint="/api/health"
-                ))
+                # Get canonical definition, but override path/port from our config
+                reactor_def = get_service_definition(
+                    "reactor-core",
+                    port=self.config.reactor_port,
+                    path=self.config.reactor_repo_path,
+                )
+                if reactor_def:
+                    services.append(reactor_def)
+                else:
+                    logger.warning("Could not get reactor-core service definition from registry")
 
             # Add services to orchestrator
             for service in services:
                 self._process_orchestrator.add_service(service)
+                logger.debug(f"    Added service: {service.name} (script: {service.script_name})")
 
             # Start all services
             results = await self._process_orchestrator.start_all_services()
