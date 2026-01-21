@@ -223,6 +223,11 @@ class ConfigEventBus:
         self._running = False
         self._processor_task: Optional[asyncio.Task] = None
 
+        # v95.1: Overflow metrics for monitoring and alerting
+        self._overflow_count: int = 0
+        self._last_overflow_time: float = 0.0
+        self._dropped_events: List[str] = []  # Recent dropped event IDs for debugging
+
     async def start(self):
         """Start the event bus."""
         if self._running:
@@ -247,15 +252,98 @@ class ConfigEventBus:
 
         self.logger.info("Config event bus stopped")
 
-    async def publish(self, event: ConfigEvent):
-        """Publish an event."""
+    async def publish(self, event: ConfigEvent, timeout: float = 5.0):
+        """
+        v95.1: Publish an event with intelligent overflow handling.
+
+        Features:
+        - Timeout-based queue insertion (prevents indefinite blocking)
+        - Priority-based overflow handling (critical events get priority)
+        - Metrics tracking for monitoring
+        - Fallback to direct delivery for critical events
+
+        Args:
+            event: The configuration event to publish
+            timeout: Maximum time to wait for queue slot (default 5s)
+        """
         # Calculate checksum
         event.checksum = self._calculate_checksum(event)
 
+        # Determine event priority
+        is_critical = event.event_type in (
+            ConfigEventType.CONFIG_UPDATE,
+            ConfigEventType.CONFIG_SYNC_REQUEST,
+            ConfigEventType.REPO_DISCONNECTED,
+        )
+
         try:
-            await self._queue.put(event)
-        except asyncio.QueueFull:
-            self.logger.warning("Config event queue full")
+            # Try to put with timeout to prevent indefinite blocking
+            await asyncio.wait_for(
+                self._queue.put(event),
+                timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            # Queue is congested
+            self._overflow_count += 1
+            self._last_overflow_time = time.time()
+
+            if len(self._dropped_events) < 100:  # Keep last 100 for debugging
+                self._dropped_events.append(event.event_id)
+
+            if is_critical:
+                # Critical events: try direct delivery to bypass queue congestion
+                self.logger.warning(
+                    f"[v95.1] Queue congested, delivering critical event directly: "
+                    f"{event.event_type.value} (overflow #{self._overflow_count})"
+                )
+                try:
+                    await self._deliver_event_directly(event)
+                except Exception as e:
+                    self.logger.error(
+                        f"[v95.1] Failed to deliver critical event directly: {e}"
+                    )
+            else:
+                # Non-critical events: log and drop
+                self.logger.warning(
+                    f"[v95.1] Config event queue congested, dropping event: "
+                    f"{event.event_type.value} (overflow #{self._overflow_count})"
+                )
+
+    async def _deliver_event_directly(self, event: ConfigEvent):
+        """
+        v95.1: Deliver event directly to subscribers, bypassing the queue.
+
+        Used for critical events when the queue is congested.
+        """
+        # Type-specific subscribers
+        for callback in self._subscribers.get(event.event_type, []):
+            try:
+                if asyncio.iscoroutinefunction(callback):
+                    await asyncio.wait_for(callback(event), timeout=10.0)
+                else:
+                    callback(event)
+            except Exception as e:
+                self.logger.error(f"[v95.1] Direct delivery callback error: {e}")
+
+        # Global subscribers
+        for callback in self._global_subscribers:
+            try:
+                if asyncio.iscoroutinefunction(callback):
+                    await asyncio.wait_for(callback(event), timeout=10.0)
+                else:
+                    callback(event)
+            except Exception as e:
+                self.logger.error(f"[v95.1] Direct delivery global callback error: {e}")
+
+    def get_overflow_stats(self) -> Dict[str, Any]:
+        """v95.1: Get queue overflow statistics for monitoring."""
+        return {
+            "overflow_count": self._overflow_count,
+            "last_overflow_time": self._last_overflow_time,
+            "queue_size": self._queue.qsize(),
+            "queue_maxsize": self._queue.maxsize,
+            "recent_dropped_events": self._dropped_events[-10:],  # Last 10
+        }
 
     def subscribe(
         self,
@@ -485,6 +573,9 @@ class CrossRepoConfigBridge:
         self._sync_task: Optional[asyncio.Task] = None
         self._heartbeat_task: Optional[asyncio.Task] = None
 
+        # v95.1: Track background tasks for proper cleanup
+        self._background_tasks: Set[asyncio.Task] = set()
+
         # Locks
         self._lock = asyncio.Lock()
 
@@ -530,14 +621,41 @@ class CrossRepoConfigBridge:
 
         self.logger.info("CrossRepoConfigBridge started")
 
+    def _track_task(self, task: asyncio.Task) -> asyncio.Task:
+        """
+        v95.1: Track a background task for proper cleanup on shutdown.
+
+        Prevents fire-and-forget task leaks and ensures unhandled exceptions
+        are logged rather than silently lost.
+        """
+        self._background_tasks.add(task)
+        task.add_done_callback(self._on_task_done)
+        return task
+
+    def _on_task_done(self, task: asyncio.Task) -> None:
+        """v95.1: Cleanup callback when a tracked task completes."""
+        self._background_tasks.discard(task)
+        if not task.cancelled():
+            try:
+                exc = task.exception()
+                if exc:
+                    task_name = task.get_name() if hasattr(task, 'get_name') else 'unknown'
+                    self.logger.error(f"[v95.1] Background task '{task_name}' failed: {exc}")
+            except asyncio.InvalidStateError:
+                pass
+
     async def stop(self):
-        """Stop the configuration bridge."""
+        """
+        v95.1: Stop the configuration bridge with comprehensive cleanup.
+
+        Ensures all tracked background tasks are cancelled properly.
+        """
         if not self._running:
             return
 
         self._running = False
 
-        # Cancel tasks
+        # Cancel main tasks
         for task in [self._sync_task, self._heartbeat_task]:
             if task:
                 task.cancel()
@@ -545,6 +663,23 @@ class CrossRepoConfigBridge:
                     await task
                 except asyncio.CancelledError:
                     pass
+
+        # v95.1: Cancel all tracked background tasks
+        if self._background_tasks:
+            self.logger.info(f"[v95.1] Cancelling {len(self._background_tasks)} background tasks...")
+            for task in list(self._background_tasks):
+                if not task.done():
+                    task.cancel()
+            # Wait briefly for cancellation
+            if self._background_tasks:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*self._background_tasks, return_exceptions=True),
+                        timeout=5.0
+                    )
+                except asyncio.TimeoutError:
+                    self.logger.warning("[v95.1] Timeout waiting for tasks to cancel")
+            self._background_tasks.clear()
 
         # Stop event bus
         await self.event_bus.stop()
@@ -872,9 +1007,12 @@ class CrossRepoConfigBridge:
                     )
                     await self.event_bus.publish(reconnect_event)
 
-                    # Schedule immediate sync with reconnected repo
-                    asyncio.create_task(
-                        self._sync_with_reconnected_repo(event.source_repo)
+                    # Schedule immediate sync with reconnected repo (tracked)
+                    self._track_task(
+                        asyncio.create_task(
+                            self._sync_with_reconnected_repo(event.source_repo),
+                            name=f"reconnect_sync_{event.source_repo}"
+                        )
                     )
 
     async def _sync_with_reconnected_repo(self, repo_id: str):
@@ -975,8 +1113,13 @@ class CrossRepoConfigBridge:
                             "timestamp": time.time()
                         }
                     )
-                    # Use fire-and-forget to not block the check loop
-                    asyncio.create_task(self.event_bus.publish(disconnect_event))
+                    # v95.1: Fire-and-forget with tracking to prevent task leaks
+                    self._track_task(
+                        asyncio.create_task(
+                            self.event_bus.publish(disconnect_event),
+                            name=f"disconnect_event_{repo_id}"
+                        )
+                    )
 
     def _calculate_config_checksum(self, config: Dict[str, Any]) -> str:
         """Calculate checksum for config data."""

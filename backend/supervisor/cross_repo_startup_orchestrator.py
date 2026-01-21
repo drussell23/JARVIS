@@ -102,6 +102,7 @@ import logging
 import os
 import signal
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -428,7 +429,7 @@ class CircuitBreakerState(Enum):
 @dataclass
 class CircuitBreaker:
     """
-    v95.0: Enhanced Circuit Breaker pattern with forced recovery.
+    v95.1: Thread-safe Circuit Breaker pattern with forced recovery.
 
     Prevents cascading failures by:
     - Tracking consecutive failures
@@ -437,6 +438,11 @@ class CircuitBreaker:
     - Closing circuit on successful recovery
     - v95.0: Forced recovery after max open duration
     - v95.0: State transition logging and metrics
+    - v95.1: Thread-safe state transitions using lock
+
+    Thread Safety:
+    All state modifications are protected by a threading.Lock to ensure
+    atomic state transitions even when called from multiple coroutines.
     """
     name: str
     failure_threshold: int = 3
@@ -457,8 +463,15 @@ class CircuitBreaker:
     consecutive_recovery_failures: int = 0
     total_open_duration: float = 0.0
 
+    # v95.1: Thread-safe lock for atomic state transitions
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+
     def _transition_state(self, new_state: CircuitBreakerState, reason: str) -> None:
-        """v95.0: Handle state transition with logging and metrics."""
+        """
+        v95.1: Handle state transition with logging and metrics.
+
+        NOTE: This method assumes _lock is already held by caller.
+        """
         old_state = self.state
         if old_state == new_state:
             return
@@ -466,7 +479,7 @@ class CircuitBreaker:
         now = time.time()
         duration_in_old_state = now - self.last_state_change
 
-        # Track total open duration
+        # Track total open duration (atomic with state change)
         if old_state == CircuitBreakerState.OPEN:
             self.total_open_duration += duration_in_old_state
 
@@ -494,95 +507,120 @@ class CircuitBreaker:
             )
 
     def record_success(self) -> None:
-        """Record a successful operation."""
-        if self.state == CircuitBreakerState.HALF_OPEN:
-            self.success_count += 1
-            if self.success_count >= self.half_open_max_requests:
-                # Recovery successful, close circuit
-                self._transition_state(CircuitBreakerState.CLOSED, "recovery successful")
+        """
+        v95.1: Record a successful operation (thread-safe).
+
+        Atomically updates success counter and potentially transitions to CLOSED.
+        """
+        with self._lock:
+            if self.state == CircuitBreakerState.HALF_OPEN:
+                self.success_count += 1
+                if self.success_count >= self.half_open_max_requests:
+                    # Recovery successful, close circuit
+                    self._transition_state(CircuitBreakerState.CLOSED, "recovery successful")
+                    self.failure_count = 0
+                    self.success_count = 0
+            else:
                 self.failure_count = 0
-                self.success_count = 0
-        else:
-            self.failure_count = 0
-            self.success_count += 1
+                self.success_count += 1
 
     def record_failure(self) -> None:
-        """Record a failed operation."""
-        self.failure_count += 1
-        self.last_failure_time = time.time()
-        self.success_count = 0
+        """
+        v95.1: Record a failed operation (thread-safe).
 
-        if self.state == CircuitBreakerState.HALF_OPEN:
-            # Failed during recovery test, reopen circuit
-            self._transition_state(CircuitBreakerState.OPEN, "recovery test failed")
-        elif self.failure_count >= self.failure_threshold:
-            # Threshold exceeded, open circuit
-            self._transition_state(
-                CircuitBreakerState.OPEN,
-                f"{self.failure_count} consecutive failures"
-            )
+        Atomically updates failure counter and potentially transitions to OPEN.
+        """
+        with self._lock:
+            self.failure_count += 1
+            self.last_failure_time = time.time()
+            self.success_count = 0
+
+            if self.state == CircuitBreakerState.HALF_OPEN:
+                # Failed during recovery test, reopen circuit
+                self._transition_state(CircuitBreakerState.OPEN, "recovery test failed")
+            elif self.failure_count >= self.failure_threshold:
+                # Threshold exceeded, open circuit
+                self._transition_state(
+                    CircuitBreakerState.OPEN,
+                    f"{self.failure_count} consecutive failures"
+                )
 
     def can_execute(self) -> bool:
-        """Check if operation can proceed."""
-        if self.state == CircuitBreakerState.CLOSED:
-            return True
+        """
+        v95.1: Check if operation can proceed (thread-safe).
 
-        if self.state == CircuitBreakerState.OPEN:
-            now = time.time()
-            time_since_failure = now - self.last_failure_time
-            time_in_open = now - self.last_state_change
-
-            # v95.0: Check for forced recovery after max open duration
-            if time_in_open >= self.max_open_duration:
-                logger.warning(
-                    f"    ⏰ Circuit breaker [{self.name}]: FORCED RECOVERY "
-                    f"(open for {time_in_open:.0f}s, max: {self.max_open_duration:.0f}s)"
-                )
-                self._transition_state(
-                    CircuitBreakerState.HALF_OPEN,
-                    f"forced recovery after {time_in_open:.0f}s"
-                )
-                self.half_open_requests = 0
+        Atomically checks state and potentially transitions to HALF_OPEN.
+        """
+        with self._lock:
+            if self.state == CircuitBreakerState.CLOSED:
                 return True
 
-            # Normal recovery timeout check
-            if time_since_failure >= self.recovery_timeout:
-                self._transition_state(
-                    CircuitBreakerState.HALF_OPEN,
-                    f"recovery timeout ({time_since_failure:.0f}s)"
-                )
-                self.half_open_requests = 0
-                return True
+            if self.state == CircuitBreakerState.OPEN:
+                now = time.time()
+                time_since_failure = now - self.last_failure_time
+                time_in_open = now - self.last_state_change
+
+                # v95.0: Check for forced recovery after max open duration
+                if time_in_open >= self.max_open_duration:
+                    logger.warning(
+                        f"    ⏰ Circuit breaker [{self.name}]: FORCED RECOVERY "
+                        f"(open for {time_in_open:.0f}s, max: {self.max_open_duration:.0f}s)"
+                    )
+                    self._transition_state(
+                        CircuitBreakerState.HALF_OPEN,
+                        f"forced recovery after {time_in_open:.0f}s"
+                    )
+                    self.half_open_requests = 0
+                    return True
+
+                # Normal recovery timeout check
+                if time_since_failure >= self.recovery_timeout:
+                    self._transition_state(
+                        CircuitBreakerState.HALF_OPEN,
+                        f"recovery timeout ({time_since_failure:.0f}s)"
+                    )
+                    self.half_open_requests = 0
+                    return True
+                return False
+
+            if self.state == CircuitBreakerState.HALF_OPEN:
+                # Allow limited requests during half-open
+                if self.half_open_requests < self.half_open_max_requests:
+                    self.half_open_requests += 1
+                    return True
+                return False
+
             return False
-
-        if self.state == CircuitBreakerState.HALF_OPEN:
-            # Allow limited requests during half-open
-            if self.half_open_requests < self.half_open_max_requests:
-                self.half_open_requests += 1
-                return True
-            return False
-
-        return False
 
     def force_reset(self) -> None:
-        """v95.0: Force circuit to CLOSED state (for manual intervention)."""
-        logger.warning(f"    🔧 Circuit breaker [{self.name}]: FORCE RESET to CLOSED")
-        self._transition_state(CircuitBreakerState.CLOSED, "forced reset")
-        self.failure_count = 0
-        self.success_count = 0
-        self.consecutive_recovery_failures = 0
+        """
+        v95.1: Force circuit to CLOSED state (thread-safe).
+
+        For manual intervention when circuit is stuck.
+        """
+        with self._lock:
+            logger.warning(f"    🔧 Circuit breaker [{self.name}]: FORCE RESET to CLOSED")
+            self._transition_state(CircuitBreakerState.CLOSED, "forced reset")
+            self.failure_count = 0
+            self.success_count = 0
+            self.consecutive_recovery_failures = 0
 
     def get_stats(self) -> Dict[str, Any]:
-        """v95.0: Get circuit breaker statistics."""
-        return {
-            "name": self.name,
-            "state": self.state.value,
-            "failure_count": self.failure_count,
-            "success_count": self.success_count,
-            "consecutive_recovery_failures": self.consecutive_recovery_failures,
-            "total_open_duration": self.total_open_duration,
-            "time_in_current_state": time.time() - self.last_state_change,
-        }
+        """
+        v95.1: Get circuit breaker statistics (thread-safe snapshot).
+
+        Returns a consistent point-in-time view of circuit breaker state.
+        """
+        with self._lock:
+            return {
+                "name": self.name,
+                "state": self.state.value,
+                "failure_count": self.failure_count,
+                "success_count": self.success_count,
+                "consecutive_recovery_failures": self.consecutive_recovery_failures,
+                "total_open_duration": self.total_open_duration,
+                "time_in_current_state": time.time() - self.last_state_change,
+            }
 
 
 @dataclass
@@ -1128,6 +1166,10 @@ class ProcessOrchestrator:
         self._services_ready: Set[str] = set()
         self._startup_events: Dict[str, asyncio.Event] = {}
 
+        # v95.1: Background task tracking (prevents fire-and-forget task leaks)
+        self._background_tasks: Set[asyncio.Task] = set()
+        self._background_tasks_lock: Optional[asyncio.Lock] = None
+
     def _ensure_locks_initialized(self) -> None:
         """
         v93.11: Lazily initialize asyncio primitives.
@@ -1146,6 +1188,8 @@ class ProcessOrchestrator:
             self._service_startup_semaphore = asyncio.Semaphore(3)
         if self._http_session_lock is None:
             self._http_session_lock = asyncio.Lock()
+        if self._background_tasks_lock is None:
+            self._background_tasks_lock = asyncio.Lock()
         if self._health_cache_lock is None:
             self._health_cache_lock = asyncio.Lock()
 
@@ -1193,11 +1237,95 @@ class ProcessOrchestrator:
         Called during shutdown.
         """
         if self._http_session and not self._http_session.closed:
-            await self._http_session.close()
-            # Allow connections to close gracefully
-            await asyncio.sleep(0.25)
-            self._http_session = None
+            try:
+                await self._http_session.close()
+                # Allow connections to close gracefully
+                await asyncio.sleep(0.25)
+            except Exception as e:
+                logger.warning(f"[v95.1] HTTP session close error: {e}")
+            finally:
+                self._http_session = None
             logger.debug("[v93.11] Shared HTTP session closed")
+
+    def _track_background_task(self, task: asyncio.Task) -> None:
+        """
+        v95.1: Track a background task for proper cleanup on shutdown.
+
+        Fire-and-forget tasks MUST be tracked to:
+        1. Prevent task leaks (unfinished tasks in memory)
+        2. Ensure proper cancellation during shutdown
+        3. Catch and log exceptions that would otherwise be lost
+
+        Usage:
+            task = asyncio.create_task(some_async_func(), name="descriptive_name")
+            self._track_background_task(task)
+        """
+        self._background_tasks.add(task)
+        task.add_done_callback(self._on_background_task_done)
+
+    def _on_background_task_done(self, task: asyncio.Task) -> None:
+        """
+        v95.1: Callback when a tracked background task completes.
+
+        Handles:
+        1. Removing task from tracking set
+        2. Logging any unhandled exceptions (prevents silent failures)
+        """
+        self._background_tasks.discard(task)
+
+        # Check for exceptions (prevents "Task exception was never retrieved")
+        if not task.cancelled():
+            try:
+                exc = task.exception()
+                if exc is not None:
+                    task_name = task.get_name() if hasattr(task, 'get_name') else "unknown"
+                    logger.error(
+                        f"[v95.1] Background task '{task_name}' failed with exception: {exc}",
+                        exc_info=exc
+                    )
+            except asyncio.InvalidStateError:
+                pass  # Task not done yet (shouldn't happen in done callback)
+
+    async def _cancel_all_background_tasks(self, timeout: float = 10.0) -> int:
+        """
+        v95.1: Cancel all tracked background tasks gracefully.
+
+        Called during shutdown to ensure no orphaned coroutines.
+
+        Returns the number of tasks that were cancelled.
+        """
+        if not self._background_tasks:
+            return 0
+
+        tasks_to_cancel = list(self._background_tasks)
+        cancelled_count = 0
+
+        logger.info(f"[v95.1] Cancelling {len(tasks_to_cancel)} background tasks...")
+
+        # Cancel all tasks
+        for task in tasks_to_cancel:
+            if not task.done():
+                task.cancel()
+                cancelled_count += 1
+
+        if cancelled_count > 0:
+            # Wait for cancellation with timeout
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*tasks_to_cancel, return_exceptions=True),
+                    timeout=timeout
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"[v95.1] Timeout waiting for {cancelled_count} tasks to cancel "
+                    f"(some may still be running)"
+                )
+            except Exception as e:
+                logger.warning(f"[v95.1] Error during task cancellation: {e}")
+
+        self._background_tasks.clear()
+        logger.info(f"[v95.1] Cancelled {cancelled_count} background tasks")
+        return cancelled_count
 
     def _get_circuit_breaker(self, service_name: str) -> CircuitBreaker:
         """
@@ -5008,23 +5136,68 @@ echo "=== JARVIS Prime started ==="
         definition: ServiceDefinition,
     ) -> tuple[str, bool, str]:
         """
-        v93.11: Start a single service with proper coordination and error handling.
+        v95.1: Start a single service with deadlock-free coordination.
 
-        Uses semaphore to limit concurrent startups and prevent resource exhaustion.
+        CRITICAL FIX: Dependency waiting happens OUTSIDE the semaphore to prevent
+        deadlock scenarios where services waiting for dependencies hold semaphore
+        slots while their dependencies wait to acquire semaphore slots.
+
+        Architecture:
+        1. Wait for dependencies (NO semaphore held - prevents deadlock)
+        2. Acquire semaphore with timeout (prevents indefinite blocking)
+        3. Perform actual startup (semaphore held only for I/O-bound work)
+        4. Release semaphore on completion or error
+
         Returns tuple of (service_name, success, reason).
         """
         self._ensure_locks_initialized()
+        service_name = definition.name
 
-        async with self._service_startup_semaphore:
-            service_name = definition.name
+        # Mark service as starting (outside semaphore - just bookkeeping)
+        async with self._startup_coordination_lock:
+            self._services_starting.add(service_name)
+            if service_name not in self._startup_events:
+                self._startup_events[service_name] = asyncio.Event()
 
-            # Mark service as starting
-            async with self._startup_coordination_lock:
-                self._services_starting.add(service_name)
-                if service_name not in self._startup_events:
-                    self._startup_events[service_name] = asyncio.Event()
+        try:
+            # ==================================================================
+            # PHASE 1: Wait for dependencies OUTSIDE semaphore (prevents deadlock)
+            # ==================================================================
+            if definition.depends_on:
+                logger.info(
+                    f"[v95.1] {service_name}: Waiting for dependencies "
+                    f"(semaphore NOT held - deadlock-free): {definition.depends_on}"
+                )
+                deps_ready = await self._wait_for_dependencies(definition)
+                if not deps_ready:
+                    logger.error(
+                        f"[v95.1] Cannot start {service_name}: dependencies not ready"
+                    )
+                    return service_name, False, "dependencies_not_ready"
+
+            # ==================================================================
+            # PHASE 2: Acquire semaphore WITH TIMEOUT (prevents indefinite block)
+            # ==================================================================
+            semaphore_timeout = 60.0  # Max wait for semaphore slot
+            try:
+                acquired = await asyncio.wait_for(
+                    self._service_startup_semaphore.acquire(),
+                    timeout=semaphore_timeout
+                )
+                if not acquired:
+                    return service_name, False, "semaphore_acquisition_failed"
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"[v95.1] {service_name}: Semaphore timeout after {semaphore_timeout}s "
+                    f"(other services blocking startup slots)"
+                )
+                return service_name, False, f"semaphore_timeout_{semaphore_timeout}s"
 
             try:
+                # ==============================================================
+                # PHASE 3: Perform actual startup (semaphore held)
+                # ==============================================================
+
                 # Step 1: Check if already running via registry
                 if self.registry:
                     existing = await self.registry.discover_service(service_name)
@@ -5057,10 +5230,13 @@ echo "=== JARVIS Prime started ==="
                     managed.pid = None
                     self.processes[service_name] = managed
 
-                    # Start health monitor
-                    managed.health_monitor_task = asyncio.create_task(
-                        self._health_monitor_loop(managed)
+                    # Start health monitor (track task for proper cleanup)
+                    monitor_task = asyncio.create_task(
+                        self._health_monitor_loop(managed),
+                        name=f"health_monitor_{service_name}"
                     )
+                    managed.health_monitor_task = monitor_task
+                    self._track_background_task(monitor_task)
 
                     # Register in service registry
                     if self.registry:
@@ -5089,16 +5265,22 @@ echo "=== JARVIS Prime started ==="
                 else:
                     return service_name, False, "spawn failed"
 
-            except Exception as e:
-                logger.error(f"    ❌ {service_name} startup error: {e}")
-                return service_name, False, f"error: {e}"
-
             finally:
-                # Mark service as no longer starting
-                async with self._startup_coordination_lock:
-                    self._services_starting.discard(service_name)
-                    if service_name in self._startup_events:
-                        self._startup_events[service_name].set()
+                # ==============================================================
+                # PHASE 4: Release semaphore (always, even on error)
+                # ==============================================================
+                self._service_startup_semaphore.release()
+
+        except Exception as e:
+            logger.error(f"    ❌ {service_name} startup error: {e}")
+            return service_name, False, f"error: {e}"
+
+        finally:
+            # Mark service as no longer starting
+            async with self._startup_coordination_lock:
+                self._services_starting.discard(service_name)
+                if service_name in self._startup_events:
+                    self._startup_events[service_name].set()
 
     async def _start_services_parallel(
         self,
@@ -5435,39 +5617,124 @@ echo "=== JARVIS Prime started ==="
 
     async def shutdown_all_services(self) -> None:
         """
-        v93.11: Gracefully shutdown all managed services.
+        v95.1: Gracefully shutdown all managed services with proper ordering.
 
         Enhanced with:
-        - Parallel process shutdown
-        - HTTP session cleanup
+        - REVERSE DEPENDENCY ORDER: Services shutdown in reverse startup order
+          (dependents first, then their dependencies)
+        - Background task cancellation (prevents orphaned coroutines)
+        - HTTP session cleanup with error handling
         - Startup coordination cleanup
+        - Timeout protection per service
         """
         logger.info("\n🛑 Shutting down all services...")
 
-        # Stop all processes in parallel
-        shutdown_tasks = [
-            self._stop_process(managed)
-            for managed in self.processes.values()
-        ]
+        # v95.1: Calculate reverse dependency order for shutdown
+        # Services that depend on others should shutdown FIRST
+        shutdown_order = self._calculate_shutdown_order()
+        logger.info(f"[v95.1] Shutdown order: {' → '.join(shutdown_order)}")
 
-        if shutdown_tasks:
-            await asyncio.gather(*shutdown_tasks, return_exceptions=True)
+        # v95.1: Shutdown in phases by dependency level
+        for service_name in shutdown_order:
+            if service_name in self.processes:
+                managed = self.processes[service_name]
+                try:
+                    logger.info(f"  Stopping {service_name}...")
+                    await asyncio.wait_for(
+                        self._stop_process(managed),
+                        timeout=30.0  # Per-service shutdown timeout
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        f"[v95.1] Timeout stopping {service_name}, forcing termination"
+                    )
+                    if managed.process and managed.process.returncode is None:
+                        try:
+                            managed.process.kill()
+                        except Exception:
+                            pass
+                except Exception as e:
+                    logger.error(f"[v95.1] Error stopping {service_name}: {e}")
+
+        # v95.1: Cancel all tracked background tasks
+        await self._cancel_all_background_tasks(timeout=10.0)
 
         # Stop registry cleanup
         if self.registry:
-            await self.registry.stop_cleanup_task()
+            try:
+                await self.registry.stop_cleanup_task()
+            except Exception as e:
+                logger.warning(f"[v95.1] Registry cleanup error: {e}")
 
-        # v93.11: Close shared HTTP session
+        # v95.1: Close shared HTTP session with error handling
         await self._close_http_session()
 
-        # v93.11: Clear startup coordination state
+        # v95.1: Clear startup coordination state
         self._services_starting.clear()
         self._services_ready.clear()
         self._startup_events.clear()
         self._service_health_cache.clear()
+        self._background_tasks.clear()
 
         logger.info("✅ All services shut down")
         self._running = False
+
+    def _calculate_shutdown_order(self) -> List[str]:
+        """
+        v95.1: Calculate optimal shutdown order based on dependencies.
+
+        Returns services in REVERSE dependency order:
+        - Services with NO dependents shutdown first
+        - Services that others depend on shutdown last
+
+        This prevents connection errors when services try to communicate
+        with dependencies that have already shutdown.
+        """
+        # Build dependency graph
+        dependents: Dict[str, Set[str]] = {}  # service -> set of services that depend on it
+        all_services = set(self.processes.keys())
+
+        for service_name in all_services:
+            dependents[service_name] = set()
+
+        # Populate dependents from service definitions
+        for service_name, managed in self.processes.items():
+            if managed.definition and managed.definition.depends_on:
+                for dep in managed.definition.depends_on:
+                    if dep in dependents:
+                        dependents[dep].add(service_name)
+
+        # Topological sort in reverse order (Kahn's algorithm)
+        # Start with services that have NO dependents (leaf nodes)
+        no_dependents = [s for s in all_services if not dependents[s]]
+        shutdown_order = []
+
+        while no_dependents:
+            # Pick next service to shutdown (one with no remaining dependents)
+            service = no_dependents.pop(0)
+            shutdown_order.append(service)
+
+            # "Remove" this service from the graph
+            # Update services that this one depends on
+            if service in self.processes:
+                definition = self.processes[service].definition
+                if definition and definition.depends_on:
+                    for dep in definition.depends_on:
+                        if dep in dependents:
+                            dependents[dep].discard(service)
+                            # If dep now has no dependents, add to queue
+                            if not dependents[dep] and dep not in shutdown_order:
+                                no_dependents.append(dep)
+
+        # Handle any remaining services (circular dependencies or orphans)
+        remaining = all_services - set(shutdown_order)
+        if remaining:
+            logger.warning(
+                f"[v95.1] Services with circular dependencies or missing from graph: {remaining}"
+            )
+            shutdown_order.extend(remaining)
+
+        return shutdown_order
 
 
 # =============================================================================
