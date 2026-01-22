@@ -2034,7 +2034,14 @@ class CloudSQLConnectionManager:
             return False
 
     async def _close_pool_internal(self) -> None:
-        """Close connection pool gracefully (internal, no lock)."""
+        """
+        v95.1: Close connection pool gracefully (internal, no lock).
+
+        Handles edge cases during shutdown:
+        - TCPTransport already closed (connection dropped before shutdown)
+        - Event loop closing during pool close
+        - Timeout waiting for pool to close
+        """
         if self.pool:
             try:
                 logger.info("🔌 Closing connection pool...")
@@ -2048,9 +2055,21 @@ class CloudSQLConnectionManager:
                         except (asyncio.CancelledError, asyncio.TimeoutError):
                             pass
 
-                # Close pool
-                await asyncio.wait_for(self.pool.close(), timeout=10.0)
-                logger.info("✅ Connection pool closed")
+                # v95.1: Check if pool is already closed or transport gone
+                try:
+                    # Close pool with timeout
+                    await asyncio.wait_for(self.pool.close(), timeout=10.0)
+                    logger.info("✅ Connection pool closed")
+                except (ConnectionResetError, BrokenPipeError) as e:
+                    # Transport already closed - this is fine during shutdown
+                    logger.debug(f"Pool transport already closed: {e}")
+                except Exception as e:
+                    error_msg = str(e).lower()
+                    # v95.1: Handle "handler is closed" and "transport closed" gracefully
+                    if "closed" in error_msg or "handler" in error_msg or "transport" in error_msg:
+                        logger.debug(f"Pool already closed during shutdown: {e}")
+                    else:
+                        raise
 
             except asyncio.TimeoutError:
                 logger.warning("⏱️ Pool close timeout - terminating")
@@ -2059,7 +2078,12 @@ class CloudSQLConnectionManager:
                 except Exception:
                     pass
             except Exception as e:
-                logger.error(f"❌ Error closing pool: {e}")
+                # v95.1: Only log as error if it's a genuine problem
+                error_msg = str(e).lower()
+                if "closed" in error_msg or "handler" in error_msg:
+                    logger.debug(f"Pool cleanup during shutdown: {e}")
+                else:
+                    logger.error(f"❌ Error closing pool: {e}")
             finally:
                 self.pool = None
 

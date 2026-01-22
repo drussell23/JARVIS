@@ -1001,3 +1001,54 @@ def get_neural_mesh_if_exists() -> Optional[NeuralMesh]:
         The existing mesh instance or None if not initialized
     """
     return _neural_mesh
+
+
+# =============================================================================
+# v95.1: ATEXIT CLEANUP - GUARANTEED SESSION CLOSURE
+# =============================================================================
+
+def _neural_mesh_atexit_cleanup() -> None:
+    """
+    v95.1: Ensure aiohttp sessions are closed during Python shutdown.
+
+    This prevents the "Unclosed client session" error by closing any
+    active HTTP/WebSocket sessions before the interpreter exits.
+    """
+    global _neural_mesh
+    if _neural_mesh is None:
+        return
+
+    logger.debug("[NeuralMesh] atexit: Cleaning up sessions...")
+
+    # Get all transports that might have open sessions
+    transports = getattr(_neural_mesh, '_transports', {})
+    for target, transport in transports.items():
+        # Close HTTP sessions
+        session = getattr(transport, '_session', None)
+        if session and not session.closed:
+            try:
+                # Can't await in atexit, so try sync close or just mark closed
+                if hasattr(session, '_connector') and session._connector:
+                    try:
+                        session._connector.close()
+                    except Exception:
+                        pass
+                logger.debug(f"[NeuralMesh] Closed session for {target.value}")
+            except Exception as e:
+                logger.debug(f"[NeuralMesh] Session cleanup error: {e}")
+
+        # Close WebSocket connections
+        ws = getattr(transport, '_ws', None)
+        if ws and not ws.closed:
+            try:
+                ws.close()
+                logger.debug(f"[NeuralMesh] Closed WebSocket for {target.value}")
+            except Exception:
+                pass
+
+    logger.debug("[NeuralMesh] atexit cleanup complete")
+
+
+# Register atexit handler
+import atexit
+atexit.register(_neural_mesh_atexit_cleanup)

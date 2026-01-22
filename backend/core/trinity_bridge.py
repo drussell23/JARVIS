@@ -911,16 +911,65 @@ class TrinityBridge:
                     logger.error(f"State callback error: {e}")
 
     def _setup_signal_handlers(self) -> None:
-        """Setup signal handlers for graceful shutdown."""
+        """
+        v95.1: Setup signal handlers for graceful shutdown with async-safe pattern.
+
+        Signal handlers run in the main thread but may be called when:
+        1. Event loop is running normally
+        2. Event loop is shutting down
+        3. Event loop no longer exists (threading._shutdown)
+
+        We handle all cases safely.
+        """
+        # Store reference to loop at setup time
+        self._signal_loop: Optional[asyncio.AbstractEventLoop] = None
+        try:
+            self._signal_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            pass  # No loop running yet - will be set later
+
         def handle_signal(signum, frame):
             sig_name = signal.Signals(signum).name
             logger.info(f"Received {sig_name}, initiating shutdown...")
             self._shutdown_event.set()
 
-            # Schedule async shutdown
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                loop.create_task(self.stop())
+            # v95.1: Async-safe signal handling
+            # Try multiple strategies in order of preference
+            loop = None
+
+            # Strategy 1: Use stored loop reference
+            if self._signal_loop is not None:
+                try:
+                    if not self._signal_loop.is_closed():
+                        loop = self._signal_loop
+                except Exception:
+                    pass
+
+            # Strategy 2: Try to get running loop
+            if loop is None:
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    pass
+
+            # Strategy 3: Try get_event_loop (deprecated but fallback)
+            if loop is None:
+                try:
+                    loop = asyncio.get_event_loop()
+                    if loop.is_closed():
+                        loop = None
+                except RuntimeError:
+                    pass
+
+            # Schedule async shutdown if we have a valid loop
+            if loop is not None and loop.is_running() and not loop.is_closed():
+                try:
+                    loop.call_soon_threadsafe(
+                        lambda: asyncio.create_task(self.stop())
+                    )
+                except RuntimeError:
+                    # Loop closed between check and call - shutdown already happening
+                    logger.debug("Event loop closed during signal handling - shutdown in progress")
 
         signal.signal(signal.SIGTERM, handle_signal)
         signal.signal(signal.SIGINT, handle_signal)
