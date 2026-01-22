@@ -477,6 +477,17 @@ class ServiceRegistry:
         )
         logger.debug(f"[v95.0] Registry owner: {self._owner_service_name}")
 
+        # v95.1: Grace period tracking for premature deregistration prevention
+        # Tracks services that appear dead but haven't been confirmed yet
+        self._suspicious_services: Dict[str, float] = {}  # service_name -> first_detection_time
+        self._dead_confirmation_grace_period: float = float(
+            os.environ.get("JARVIS_DEAD_CONFIRMATION_GRACE", "30.0")  # 30 second grace
+        )
+        self._dead_confirmation_retries: int = int(
+            os.environ.get("JARVIS_DEAD_CONFIRMATION_RETRIES", "3")
+        )
+        self._suspicious_retry_counts: Dict[str, int] = {}  # service_name -> retry_count
+
         # v93.0: Ensure directory exists with retry logic
         if not self._dir_manager.ensure_directory_sync():
             logger.error(f"[v93.0] CRITICAL: Failed to create registry directory: {self.registry_dir}")
@@ -943,16 +954,64 @@ class ServiceRegistry:
         if not service:
             return None
 
-        # Check if process is still alive
+        # v95.1: Check if process is still alive with grace period
+        # This prevents premature deregistration due to transient PID issues
         if not service.is_process_alive():
             dead_pid = service.pid
-            logger.warning(
-                f"⚠️  Service {service_name} has dead PID {dead_pid}, cleaning up"
+            current_time = time.time()
+
+            # v95.1: Track suspicious services with grace period
+            if service_name not in self._suspicious_services:
+                # First detection - start grace period
+                self._suspicious_services[service_name] = current_time
+                self._suspicious_retry_counts[service_name] = 1
+                logger.warning(
+                    f"⚠️  Service {service_name} PID {dead_pid} appears dead - "
+                    f"starting {self._dead_confirmation_grace_period}s grace period "
+                    f"(attempt 1/{self._dead_confirmation_retries})"
+                )
+                # Return None but DON'T deregister yet - might recover
+                return None
+            else:
+                # Already suspicious - check if grace period expired
+                first_detection = self._suspicious_services[service_name]
+                elapsed = current_time - first_detection
+                retry_count = self._suspicious_retry_counts.get(service_name, 0) + 1
+                self._suspicious_retry_counts[service_name] = retry_count
+
+                if elapsed >= self._dead_confirmation_grace_period and \
+                   retry_count >= self._dead_confirmation_retries:
+                    # Grace period expired AND minimum retries reached - confirm dead
+                    logger.warning(
+                        f"🧹 Service {service_name} confirmed dead after "
+                        f"{elapsed:.1f}s grace period and {retry_count} checks - deregistering"
+                    )
+                    # Clean up tracking
+                    del self._suspicious_services[service_name]
+                    if service_name in self._suspicious_retry_counts:
+                        del self._suspicious_retry_counts[service_name]
+                    # NOW deregister
+                    await self.deregister_service(service_name)
+                    await self._notify_service_dead(service_name, dead_pid)
+                    return None
+                else:
+                    # Still in grace period - log but don't deregister
+                    remaining = self._dead_confirmation_grace_period - elapsed
+                    logger.debug(
+                        f"⏳ Service {service_name} still appears dead "
+                        f"(attempt {retry_count}/{self._dead_confirmation_retries}, "
+                        f"{remaining:.1f}s remaining in grace period)"
+                    )
+                    return None
+
+        # v95.1: Service is alive - clear any suspicious tracking
+        if service_name in self._suspicious_services:
+            logger.info(
+                f"✅ Service {service_name} recovered (PID confirmed alive)"
             )
-            await self.deregister_service(service_name)
-            # v95.0: Notify callbacks that service died (for auto-restart)
-            await self._notify_service_dead(service_name, dead_pid)
-            return None
+            del self._suspicious_services[service_name]
+            if service_name in self._suspicious_retry_counts:
+                del self._suspicious_retry_counts[service_name]
 
         # v93.3: Startup-aware stale check
         is_in_startup = service.is_in_startup_phase(self.startup_grace_period)
@@ -1088,7 +1147,10 @@ class ServiceRegistry:
 
     async def cleanup_stale_services(self) -> int:
         """
-        Remove services with dead PIDs or stale heartbeats.
+        v95.1: Remove services with dead PIDs or stale heartbeats.
+
+        CRITICAL: Registry owner (jarvis-body) is NEVER removed.
+        If the registry is running, the owner must be alive by definition.
 
         Returns:
             Number of services cleaned up
@@ -1097,6 +1159,12 @@ class ServiceRegistry:
         cleaned = 0
 
         for service_name, service in list(services.items()):
+            # v95.1: CRITICAL - Registry owner is EXEMPT from cleanup
+            # If the registry code is running, the owner service MUST be alive
+            if service_name == self._owner_service_name:
+                logger.debug(f"  ✓ {service_name} is registry owner - exempt from cleanup")
+                continue
+
             should_remove = False
 
             # Check if process is dead
@@ -1188,43 +1256,98 @@ class ServiceRegistry:
 
     async def _self_heartbeat_loop(self) -> None:
         """
-        v95.0: Self-heartbeat loop for the registry owner service.
+        v95.1: Enterprise-grade self-heartbeat loop for the registry owner service.
 
         The registry owner (jarvis-body) is the service that RUNS this registry.
         If the registry is running, the owner must be alive (by definition).
-        This loop sends heartbeats on behalf of the owner to ensure it's
-        never marked stale.
 
-        This solves the "jarvis-body is very stale" issue where the owner
-        was being incorrectly marked stale because it didn't send heartbeats
-        to itself.
+        CRITICAL FIXES (v95.1):
+        1. Auto-register owner on startup if not registered
+        2. Send IMMEDIATE heartbeat (no wait-first pattern)
+        3. Owner is NEVER marked stale (exemption in cleanup)
+        4. Self-healing registration if owner entry disappears
         """
-        logger.info(f"[v95.0] Self-heartbeat loop started for {self._owner_service_name}")
+        logger.info(f"[v95.1] Self-heartbeat loop started for {self._owner_service_name}")
+
+        # v95.1: CRITICAL - Ensure owner is registered IMMEDIATELY on startup
+        await self._ensure_owner_registered()
+
+        # v95.1: Send FIRST heartbeat immediately (no wait-first pattern!)
+        await self._send_owner_heartbeat()
 
         while True:
             try:
+                # Now wait for interval AFTER first heartbeat
                 await asyncio.sleep(self._self_heartbeat_interval)
 
+                # v95.1: Verify owner is still registered (self-healing)
+                await self._ensure_owner_registered()
+
                 # Send heartbeat for owner
-                await self.heartbeat(
-                    self._owner_service_name,
-                    status="healthy",
-                    metadata={
-                        "heartbeat_source": "self_heartbeat",
-                        "is_registry_owner": True,
-                        "pid": os.getpid(),
-                    }
-                )
-                logger.debug(
-                    f"[v95.0] Self-heartbeat sent for {self._owner_service_name}"
-                )
+                await self._send_owner_heartbeat()
 
             except asyncio.CancelledError:
-                logger.debug(f"[v95.0] Self-heartbeat loop cancelled for {self._owner_service_name}")
+                logger.debug(f"[v95.1] Self-heartbeat loop cancelled for {self._owner_service_name}")
                 break
             except Exception as e:
                 # Log but don't crash - the owner should stay alive
-                logger.warning(f"[v95.0] Self-heartbeat error (non-fatal): {e}")
+                logger.warning(f"[v95.1] Self-heartbeat error (non-fatal): {e}")
+                # Try to recover by re-registering
+                try:
+                    await self._ensure_owner_registered()
+                except Exception:
+                    pass
+
+    async def _ensure_owner_registered(self) -> None:
+        """
+        v95.1: Ensure the registry owner service is always registered.
+
+        This is CRITICAL for preventing "jarvis-body is stale" issues.
+        If the registry is running, the owner MUST exist in the registry.
+        """
+        try:
+            # Check if owner exists
+            owner = await self.discover_service(self._owner_service_name)
+            if owner is None:
+                # Owner not registered - register it now!
+                logger.info(
+                    f"[v95.1] Auto-registering owner service '{self._owner_service_name}' "
+                    f"(PID: {os.getpid()})"
+                )
+                # Get port from environment or use default
+                owner_port = int(os.environ.get("JARVIS_BODY_PORT", "8010"))
+
+                await self.register_service(
+                    service_name=self._owner_service_name,
+                    pid=os.getpid(),
+                    port=owner_port,
+                    health_endpoint="/health",
+                    metadata={
+                        "is_registry_owner": True,
+                        "auto_registered": True,
+                        "registration_source": "self_heartbeat_loop",
+                    }
+                )
+                logger.info(f"[v95.1] Owner '{self._owner_service_name}' auto-registered successfully")
+        except Exception as e:
+            logger.error(f"[v95.1] Failed to ensure owner registered: {e}")
+
+    async def _send_owner_heartbeat(self) -> None:
+        """v95.1: Send heartbeat for the registry owner."""
+        try:
+            await self.heartbeat(
+                self._owner_service_name,
+                status="healthy",
+                metadata={
+                    "heartbeat_source": "self_heartbeat",
+                    "is_registry_owner": True,
+                    "pid": os.getpid(),
+                    "timestamp": time.time(),
+                }
+            )
+            logger.debug(f"[v95.1] Self-heartbeat sent for {self._owner_service_name}")
+        except Exception as e:
+            logger.warning(f"[v95.1] Failed to send owner heartbeat: {e}")
 
     async def wait_for_service(
         self,
@@ -1335,6 +1458,15 @@ class ServiceRegistry:
                     f"(PID: {service.pid}, Port: {service.port})"
                 )
             else:
+                # v95.1: CRITICAL - Registry owner is NEVER marked stale or removed
+                # If the registry is running, the owner MUST be alive (by definition)
+                if service_name == self._owner_service_name:
+                    stats["valid_entries"] += 1
+                    logger.debug(
+                        f"  ✓ {service_name} is registry owner - exempt from stale checks"
+                    )
+                    continue
+
                 # v93.3: Startup-aware stale detection with tiered cleanup
                 # Services without recent heartbeat should be cleaned up, but give
                 # newly registered services extra time during startup grace period

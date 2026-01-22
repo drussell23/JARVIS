@@ -1170,6 +1170,18 @@ class ProcessOrchestrator:
         self._background_tasks: Set[asyncio.Task] = set()
         self._background_tasks_lock: Optional[asyncio.Lock] = None
 
+        # v95.1: Intelligent cross-repo recovery coordination
+        self._recovery_coordinator_task: Optional[asyncio.Task] = None
+        self._recovery_check_interval: float = float(
+            os.environ.get("JARVIS_RECOVERY_CHECK_INTERVAL", "30.0")
+        )
+        self._proactive_recovery_enabled: bool = os.environ.get(
+            "JARVIS_PROACTIVE_RECOVERY", "true"
+        ).lower() == "true"
+        self._dependency_cascade_recovery: bool = os.environ.get(
+            "JARVIS_CASCADE_RECOVERY", "true"
+        ).lower() == "true"
+
     def _ensure_locks_initialized(self) -> None:
         """
         v93.11: Lazily initialize asyncio primitives.
@@ -4320,6 +4332,223 @@ echo "=== JARVIS Prime started ==="
         return await self._auto_heal(managed)
 
     # =========================================================================
+    # v95.1: Intelligent Cross-Repo Recovery Coordination
+    # =========================================================================
+
+    async def start_recovery_coordinator(self) -> None:
+        """
+        v95.1: Start the intelligent recovery coordinator.
+
+        The coordinator proactively monitors all services and handles:
+        1. Early failure detection (before stale marking)
+        2. Dependency cascade recovery (restart dependents when dependency fails)
+        3. Cross-repo coordination (JARVIS, J-Prime, Reactor-Core)
+        4. Intelligent restart ordering based on dependencies
+        """
+        if not self._proactive_recovery_enabled:
+            logger.info("[v95.1] Proactive recovery is disabled")
+            return
+
+        if self._recovery_coordinator_task is None or self._recovery_coordinator_task.done():
+            self._recovery_coordinator_task = asyncio.create_task(
+                self._recovery_coordinator_loop(),
+                name="recovery_coordinator"
+            )
+            self._track_background_task(self._recovery_coordinator_task)
+            logger.info(
+                f"[v95.1] Recovery coordinator started "
+                f"(interval: {self._recovery_check_interval}s, "
+                f"cascade: {self._dependency_cascade_recovery})"
+            )
+
+    async def stop_recovery_coordinator(self) -> None:
+        """v95.1: Stop the recovery coordinator."""
+        if self._recovery_coordinator_task and not self._recovery_coordinator_task.done():
+            self._recovery_coordinator_task.cancel()
+            try:
+                await self._recovery_coordinator_task
+            except asyncio.CancelledError:
+                pass
+            logger.info("[v95.1] Recovery coordinator stopped")
+
+    async def _recovery_coordinator_loop(self) -> None:
+        """
+        v95.1: Main recovery coordinator loop.
+
+        Performs proactive health checks and initiates recovery when needed.
+        """
+        logger.info("[v95.1] Recovery coordinator loop started")
+
+        while not self._shutdown_event.is_set():
+            try:
+                await asyncio.sleep(self._recovery_check_interval)
+
+                if self._shutdown_event.is_set():
+                    break
+
+                # Perform comprehensive service health assessment
+                health_report = await self._assess_service_health()
+
+                # Handle any services that need recovery
+                for service_name, health_status in health_report.items():
+                    if health_status["needs_recovery"]:
+                        await self._initiate_intelligent_recovery(
+                            service_name,
+                            health_status["reason"]
+                        )
+
+            except asyncio.CancelledError:
+                logger.info("[v95.1] Recovery coordinator cancelled")
+                break
+            except Exception as e:
+                logger.error(f"[v95.1] Recovery coordinator error: {e}")
+                await asyncio.sleep(5.0)  # Brief pause before retry
+
+    async def _assess_service_health(self) -> Dict[str, Dict[str, Any]]:
+        """
+        v95.1: Comprehensive health assessment for all managed services.
+
+        Checks:
+        1. Process alive status
+        2. Health endpoint responsiveness
+        3. Heartbeat recency
+        4. Dependency health (transitive)
+        """
+        health_report: Dict[str, Dict[str, Any]] = {}
+
+        for service_name, managed in self.processes.items():
+            status = {
+                "needs_recovery": False,
+                "reason": None,
+                "process_alive": False,
+                "health_check_passed": False,
+                "heartbeat_recent": False,
+                "dependencies_healthy": True,
+            }
+
+            # 1. Check process status
+            status["process_alive"] = managed.is_running
+
+            # 2. Check health endpoint (quick check)
+            if status["process_alive"]:
+                try:
+                    session = await self._get_http_session()
+                    url = f"http://localhost:{managed.port}{managed.definition.health_endpoint}"
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=5.0)) as resp:
+                        status["health_check_passed"] = resp.status == 200
+                except Exception:
+                    status["health_check_passed"] = False
+
+            # 3. Check heartbeat recency (via registry)
+            if self.registry:
+                try:
+                    service_info = await self.registry.discover_service(service_name)
+                    if service_info:
+                        heartbeat_age = time.time() - service_info.last_heartbeat
+                        status["heartbeat_recent"] = heartbeat_age < 60.0  # Within 1 minute
+                except Exception:
+                    pass
+
+            # 4. Check dependency health
+            if managed.definition.depends_on:
+                for dep in managed.definition.depends_on:
+                    if dep in self.processes:
+                        dep_managed = self.processes[dep]
+                        if dep_managed.status not in (ServiceStatus.HEALTHY, ServiceStatus.DEGRADED):
+                            status["dependencies_healthy"] = False
+                            break
+
+            # Determine if recovery is needed
+            if not status["process_alive"]:
+                status["needs_recovery"] = True
+                status["reason"] = "process_dead"
+            elif not status["health_check_passed"] and managed.status == ServiceStatus.HEALTHY:
+                # Was healthy but health check now fails
+                status["needs_recovery"] = True
+                status["reason"] = "health_check_failed"
+            elif not status["dependencies_healthy"] and self._dependency_cascade_recovery:
+                # Dependency failed - may need cascade restart
+                status["needs_recovery"] = True
+                status["reason"] = "dependency_failed"
+
+            health_report[service_name] = status
+
+        return health_report
+
+    async def _initiate_intelligent_recovery(
+        self,
+        service_name: str,
+        reason: str
+    ) -> bool:
+        """
+        v95.1: Initiate intelligent recovery for a failed service.
+
+        Handles:
+        1. Dependency ordering (restart dependencies first if needed)
+        2. Cascade recovery (restart dependents after dependency)
+        3. Cross-repo coordination
+        """
+        if self._shutdown_event.is_set():
+            return False
+
+        if service_name not in self.processes:
+            logger.warning(f"[v95.1] Cannot recover {service_name}: not managed")
+            return False
+
+        managed = self.processes[service_name]
+        logger.info(f"[v95.1] Initiating recovery for {service_name} (reason: {reason})")
+
+        # If reason is dependency failure, check and restart dependencies first
+        if reason == "dependency_failed" and managed.definition.depends_on:
+            for dep_name in managed.definition.depends_on:
+                if dep_name in self.processes:
+                    dep_managed = self.processes[dep_name]
+                    if not dep_managed.is_running or dep_managed.status == ServiceStatus.FAILED:
+                        logger.info(
+                            f"[v95.1] Recovering dependency '{dep_name}' first for {service_name}"
+                        )
+                        await self._auto_heal(dep_managed)
+                        # Wait briefly for dependency to stabilize
+                        await asyncio.sleep(5.0)
+
+        # Now recover the target service
+        success = await self._auto_heal(managed)
+
+        # If cascade recovery is enabled and this was a dependency, restart dependents
+        if success and self._dependency_cascade_recovery:
+            await self._cascade_restart_dependents(service_name)
+
+        return success
+
+    async def _cascade_restart_dependents(self, service_name: str) -> None:
+        """
+        v95.1: Restart services that depend on the recovered service.
+
+        When a dependency is recovered, its dependents may need to be
+        restarted to re-establish connections.
+        """
+        dependents = []
+
+        for name, managed in self.processes.items():
+            if managed.definition.depends_on and service_name in managed.definition.depends_on:
+                dependents.append(name)
+
+        if dependents:
+            logger.info(
+                f"[v95.1] Cascade restart: {len(dependents)} services depend on {service_name}: "
+                f"{dependents}"
+            )
+
+            for dep_name in dependents:
+                if dep_name in self.processes:
+                    dep_managed = self.processes[dep_name]
+                    # Only restart if not already healthy
+                    if dep_managed.status != ServiceStatus.HEALTHY:
+                        logger.info(f"[v95.1] Cascade restarting dependent: {dep_name}")
+                        await self._auto_heal(dep_managed)
+                        await asyncio.sleep(2.0)  # Brief pause between restarts
+
+    # =========================================================================
     # Process Spawning
     # =========================================================================
 
@@ -5605,6 +5834,14 @@ echo "=== JARVIS Prime started ==="
         except Exception as e:
             logger.warning(f"  ⚠️ Restart command registration failed (non-fatal): {e}")
 
+        # v95.1: Phase 5 - Start intelligent recovery coordinator
+        logger.info("\n📍 PHASE 5: Starting intelligent recovery coordinator")
+        try:
+            await self.start_recovery_coordinator()
+            logger.info("  ✅ Recovery coordinator active (proactive health monitoring enabled)")
+        except Exception as e:
+            logger.warning(f"  ⚠️ Recovery coordinator startup failed (non-fatal): {e}")
+
         # Print summary
         logger.info("\n" + "=" * 70)
         logger.info("🎯 Startup Summary:")
@@ -5628,6 +5865,9 @@ echo "=== JARVIS Prime started ==="
         - Timeout protection per service
         """
         logger.info("\n🛑 Shutting down all services...")
+
+        # v95.1: Stop recovery coordinator first (prevent restart during shutdown)
+        await self.stop_recovery_coordinator()
 
         # v95.1: Calculate reverse dependency order for shutdown
         # Services that depend on others should shutdown FIRST
