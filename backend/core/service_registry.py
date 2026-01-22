@@ -1300,37 +1300,78 @@ class ServiceRegistry:
 
     async def _ensure_owner_registered(self) -> None:
         """
-        v95.1: Ensure the registry owner service is always registered.
+        v95.2: Ensure the registry owner service is always registered with correct PID.
 
-        This is CRITICAL for preventing "jarvis-body is stale" issues.
-        If the registry is running, the owner MUST exist in the registry.
+        This is CRITICAL for preventing "jarvis-body is stale/dead" issues.
+        If the registry is running, the owner MUST exist in the registry with
+        the CURRENT process PID.
+
+        Key fixes (v95.2):
+        1. Always verify PID matches current process
+        2. Re-register if PID mismatch (process may have restarted)
+        3. Include process_start_time for accurate alive checks
         """
+        current_pid = os.getpid()
+        current_start_time = self._get_current_process_start_time()
+
         try:
-            # Check if owner exists
-            owner = await self.discover_service(self._owner_service_name)
+            # Read registry directly (bypass discover_service to avoid dead PID detection)
+            services = await asyncio.to_thread(self._read_registry)
+            owner = services.get(self._owner_service_name)
+
+            needs_registration = False
+            reason = ""
+
             if owner is None:
-                # Owner not registered - register it now!
+                needs_registration = True
+                reason = "not registered"
+            elif owner.pid != current_pid:
+                # PID mismatch - registry has old PID, need to update
+                needs_registration = True
+                reason = f"PID mismatch (stored: {owner.pid}, current: {current_pid})"
+            elif owner.process_start_time > 0 and abs(owner.process_start_time - current_start_time) > 2.0:
+                # Start time mismatch - process restarted with same PID
+                needs_registration = True
+                reason = f"start time mismatch (stored: {owner.process_start_time:.1f}, current: {current_start_time:.1f})"
+
+            if needs_registration:
                 logger.info(
-                    f"[v95.1] Auto-registering owner service '{self._owner_service_name}' "
-                    f"(PID: {os.getpid()})"
+                    f"[v95.2] Registering owner '{self._owner_service_name}': {reason} "
+                    f"(PID: {current_pid})"
                 )
-                # Get port from environment or use default
                 owner_port = int(os.environ.get("JARVIS_BODY_PORT", "8010"))
 
-                await self.register_service(
+                # Create ServiceInfo with explicit process_start_time
+                service = ServiceInfo(
                     service_name=self._owner_service_name,
-                    pid=os.getpid(),
+                    pid=current_pid,
                     port=owner_port,
+                    host="localhost",
                     health_endpoint="/health",
+                    status="healthy",
+                    process_start_time=current_start_time,
                     metadata={
                         "is_registry_owner": True,
                         "auto_registered": True,
                         "registration_source": "self_heartbeat_loop",
                     }
                 )
-                logger.info(f"[v95.1] Owner '{self._owner_service_name}' auto-registered successfully")
+
+                services[self._owner_service_name] = service
+                await asyncio.to_thread(self._write_registry, services)
+                logger.info(f"[v95.2] Owner '{self._owner_service_name}' registered successfully")
+            else:
+                logger.debug(f"[v95.2] Owner '{self._owner_service_name}' already registered correctly")
+
         except Exception as e:
-            logger.error(f"[v95.1] Failed to ensure owner registered: {e}")
+            logger.error(f"[v95.2] Failed to ensure owner registered: {e}")
+
+    def _get_current_process_start_time(self) -> float:
+        """v95.2: Get the start time of the current process."""
+        try:
+            return psutil.Process(os.getpid()).create_time()
+        except Exception:
+            return 0.0
 
     async def _send_owner_heartbeat(self) -> None:
         """v95.1: Send heartbeat for the registry owner."""

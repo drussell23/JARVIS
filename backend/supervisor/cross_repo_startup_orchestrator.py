@@ -3959,6 +3959,15 @@ echo "=== JARVIS Prime started ==="
                     # v95.0: Update last known health for heartbeat loop
                     managed.last_known_health = "healthy"
 
+                    # v95.2: Reset restart count when service is healthy
+                    # This allows the service to be restarted again if it fails later
+                    if managed.restart_count > 0:
+                        logger.info(
+                            f"[v95.2] Resetting restart count for {managed.definition.name} "
+                            f"(was {managed.restart_count}, service is now healthy)"
+                        )
+                        managed.restart_count = 0
+
                     # Log status transition only once
                     if managed.status != ServiceStatus.HEALTHY:
                         managed.status = ServiceStatus.HEALTHY
@@ -4213,31 +4222,73 @@ echo "=== JARVIS Prime started ==="
 
     async def _auto_heal(self, managed: ManagedProcess) -> bool:
         """
-        v95.0: Attempt to restart a failed service with exponential backoff and event emissions.
+        v95.2: Attempt to restart a failed service with intelligent prevention.
 
-        Returns True if restart succeeded.
+        CRITICAL FIXES (v95.2):
+        1. Check if service is ACTUALLY healthy before restarting
+        2. Skip restart if service is responding to health checks
+        3. Reset restart count if service recovered on its own
+        4. Prevent restart loops when service is already running
+
+        Returns True if restart succeeded or service is already healthy.
         """
+        definition = managed.definition
+
         # v95.0: CRITICAL - Check if shutdown is in progress BEFORE restarting
-        # This prevents the "restart during shutdown" issue where services
-        # are killed intentionally (SIGTERM = exit code -15) but the orchestrator
-        # tries to restart them.
         if self._shutdown_event.is_set():
             logger.info(
-                f"[v95.0] Skipping restart of {managed.definition.name}: "
-                f"shutdown in progress"
+                f"[v95.0] Skipping restart of {definition.name}: shutdown in progress"
             )
             return False
 
+        # v95.2: CRITICAL - Check if service is ACTUALLY healthy before restarting
+        # This prevents restart loops when the service is already running
+        is_healthy = await self._quick_health_check(
+            definition.default_port,
+            definition.health_endpoint
+        )
+
+        if is_healthy:
+            logger.info(
+                f"[v95.2] Skipping restart of {definition.name}: "
+                f"service is responding to health checks (already healthy!)"
+            )
+            # Reset state since service is actually healthy
+            managed.status = ServiceStatus.HEALTHY
+            managed.restart_count = 0
+            managed.consecutive_failures = 0
+            # Emit recovery event
+            await _emit_event(
+                "SERVICE_RECOVERED",
+                service_name=definition.name,
+                priority="HIGH",
+                details={"reason": "self_recovered", "restart_count": 0}
+            )
+            return True
+
         if managed.restart_count >= self.config.max_restart_attempts:
+            # v95.2: Before giving up, do one final health check
+            final_check = await self._quick_health_check(
+                definition.default_port,
+                definition.health_endpoint
+            )
+            if final_check:
+                logger.info(
+                    f"[v95.2] {definition.name} recovered just before giving up! "
+                    f"Resetting restart count."
+                )
+                managed.restart_count = 0
+                managed.status = ServiceStatus.HEALTHY
+                return True
+
             logger.error(
-                f"❌ {managed.definition.name} exceeded max restart attempts "
+                f"❌ {definition.name} exceeded max restart attempts "
                 f"({self.config.max_restart_attempts}). Giving up."
             )
             managed.status = ServiceStatus.FAILED
-            # v95.0: Emit service crashed event (gave up)
             await _emit_event(
                 "SERVICE_CRASHED",
-                service_name=managed.definition.name,
+                service_name=definition.name,
                 priority="CRITICAL",
                 details={
                     "reason": "max_restart_attempts_exceeded",
@@ -4254,7 +4305,7 @@ echo "=== JARVIS Prime started ==="
         )
 
         logger.info(
-            f"🔄 Restarting {managed.definition.name} in {backoff:.1f}s "
+            f"🔄 Restarting {definition.name} in {backoff:.1f}s "
             f"(attempt {managed.restart_count + 1}/{self.config.max_restart_attempts})"
         )
 
@@ -4629,23 +4680,82 @@ echo "=== JARVIS Prime started ==="
         else:
             logger.info(f"    ✓ Using venv Python for {definition.name}: {python_exec}")
 
-        # Check port availability
+        # v95.2: CRITICAL - Check if service is ALREADY RUNNING and HEALTHY
+        # This prevents the restart loop where we try to spawn when already running
         try:
             import socket
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(1)
             result = sock.connect_ex(('localhost', definition.default_port))
             sock.close()
+
             if result == 0:
-                logger.warning(
-                    f"    ⚠️ Port {definition.default_port} already in use - "
-                    f"{definition.name} may already be running"
+                # Port is in use - check if it's actually our service and healthy
+                logger.info(
+                    f"    🔍 Port {definition.default_port} in use - checking if {definition.name} is healthy..."
                 )
-                # Not a fatal error - the service might be running
+                is_healthy = await self._quick_health_check(
+                    definition.default_port,
+                    definition.health_endpoint
+                )
+
+                if is_healthy:
+                    # Service is already running and healthy - NO NEED TO SPAWN!
+                    logger.info(
+                        f"    ✅ {definition.name} is already running and healthy on port "
+                        f"{definition.default_port} - SKIPPING SPAWN"
+                    )
+                    # Return special marker to indicate "already healthy"
+                    return "ALREADY_HEALTHY", python_exec
+                else:
+                    # Port in use but not healthy - this is a real conflict
+                    logger.warning(
+                        f"    ⚠️ Port {definition.default_port} in use but {definition.name} "
+                        f"is NOT healthy - possible port conflict with another process"
+                    )
+                    # Check if we should try to kill the process on this port
+                    await self._handle_port_conflict(definition)
+
         except Exception as e:
             logger.debug(f"Port check failed: {e}")
 
         return True, python_exec
+
+    async def _quick_health_check(self, port: int, health_endpoint: str) -> bool:
+        """
+        v95.2: Quick health check to verify if a service is responding.
+
+        Used during pre-spawn validation to prevent restarting healthy services.
+        """
+        try:
+            session = await self._get_http_session()
+            url = f"http://localhost:{port}{health_endpoint}"
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=3.0)) as resp:
+                return resp.status == 200
+        except Exception:
+            return False
+
+    async def _handle_port_conflict(self, definition: ServiceDefinition) -> None:
+        """
+        v95.2: Handle port conflict by attempting to identify and resolve the issue.
+
+        If the port is in use by a process we don't recognize, log detailed info
+        for debugging.
+        """
+        try:
+            import psutil
+            for conn in psutil.net_connections(kind='inet'):
+                if conn.laddr.port == definition.default_port and conn.status == 'LISTEN':
+                    try:
+                        proc = psutil.Process(conn.pid)
+                        logger.warning(
+                            f"    📋 Port {definition.default_port} held by: "
+                            f"PID={conn.pid}, Name={proc.name()}, Cmdline={' '.join(proc.cmdline()[:3])}"
+                        )
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        logger.warning(f"    📋 Port {definition.default_port} held by PID={conn.pid}")
+        except Exception as e:
+            logger.debug(f"Could not identify process on port: {e}")
 
     async def _wait_for_dependencies(self, definition: ServiceDefinition) -> bool:
         """
@@ -4793,6 +4903,53 @@ echo "=== JARVIS Prime started ==="
 
         # Pre-spawn validation
         is_valid, python_exec = await self._pre_spawn_validation(definition)
+
+        # v95.2: Handle "ALREADY_HEALTHY" - service is running and responsive
+        if is_valid == "ALREADY_HEALTHY":
+            logger.info(
+                f"✅ {definition.name} is already running and healthy - no spawn needed"
+            )
+            managed.status = ServiceStatus.HEALTHY
+            managed.port = definition.default_port
+            managed.consecutive_failures = 0
+            managed.restart_count = 0  # Reset restart count since service is healthy
+
+            # Register in service registry
+            if self.registry:
+                # Discover existing registration to get PID
+                existing = await self.registry.discover_service(definition.name)
+                if existing:
+                    managed.pid = existing.pid
+                else:
+                    # Register with PID 0 (unknown) since we didn't spawn it
+                    await self.registry.register_service(
+                        service_name=definition.name,
+                        pid=0,
+                        port=managed.port,
+                        health_endpoint=definition.health_endpoint,
+                        metadata={
+                            "repo_path": str(definition.repo_path),
+                            "already_running": True,
+                        }
+                    )
+
+            # Start health monitor if not already running
+            if managed.health_monitor_task is None or managed.health_monitor_task.done():
+                managed.health_monitor_task = asyncio.create_task(
+                    self._health_monitor_loop(managed),
+                    name=f"health_monitor_{definition.name}"
+                )
+                self._track_background_task(managed.health_monitor_task)
+
+            # v95.0: Emit service healthy event
+            await _emit_event(
+                "SERVICE_HEALTHY",
+                service_name=definition.name,
+                priority="HIGH",
+                details={"reason": "already_running", "port": managed.port}
+            )
+            return True
+
         if not is_valid:
             logger.error(f"Cannot spawn {definition.name}: pre-spawn validation failed")
             managed.status = ServiceStatus.FAILED
