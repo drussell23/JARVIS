@@ -2671,6 +2671,84 @@ class ProcessOrchestrator:
             "circuit_reset_time": float(os.environ.get("JARVIS_CIRCUIT_RESET", "60.0")),
         }
 
+        # =====================================================================
+        # v95.10: Cross-Repo Integration Infrastructure (Issues 31-38)
+        # =====================================================================
+
+        # Issue 31: Unified Configuration - Trinity config system
+        self._unified_config: Dict[str, Any] = {}  # Merged config from all repos
+        self._config_sources: Dict[str, Dict[str, Any]] = {}  # repo -> config dict
+        self._config_overrides: Dict[str, Any] = {}  # User overrides (highest priority)
+        self._config_schema: Dict[str, Dict[str, Any]] = {}  # Config validation schema
+        self._config_watchers: Dict[str, Callable] = {}  # config_key -> callback
+        self._config_lock: Optional[asyncio.Lock] = None
+        self._config_sync_interval: float = float(os.environ.get("JARVIS_CONFIG_SYNC_INTERVAL", "30.0"))
+        self._config_sync_task: Optional[asyncio.Task] = None
+
+        # Issue 32: Cross-Repo Logging - Unified logging with W3C trace context
+        self._unified_log_handlers: Dict[str, Any] = {}  # handler_name -> handler
+        self._log_correlation_enabled: bool = os.environ.get("JARVIS_LOG_CORRELATION", "true").lower() == "true"
+        self._log_aggregation_buffer: List[Dict[str, Any]] = []  # Buffered log entries
+        self._log_buffer_size: int = int(os.environ.get("JARVIS_LOG_BUFFER_SIZE", "100"))
+        self._log_flush_interval: float = float(os.environ.get("JARVIS_LOG_FLUSH_INTERVAL", "5.0"))
+        self._log_flush_task: Optional[asyncio.Task] = None
+        self._log_lock: Optional[asyncio.Lock] = None
+        self._trace_id_header: str = "X-Trace-ID"
+        self._span_id_header: str = "X-Span-ID"
+        self._parent_id_header: str = "X-Parent-ID"
+
+        # Issue 33: Cross-Repo Metrics - Unified metrics collection
+        self._metrics_registry: Dict[str, Dict[str, Any]] = {}  # metric_name -> metric_info
+        self._metrics_collectors: Dict[str, Callable] = {}  # collector_name -> collector_fn
+        self._metrics_buffer: List[Dict[str, Any]] = []  # Buffered metrics
+        self._metrics_lock: Optional[asyncio.Lock] = None
+        self._metrics_enabled: bool = os.environ.get("JARVIS_METRICS_ENABLED", "true").lower() == "true"
+        self._metrics_collection_interval: float = float(os.environ.get("JARVIS_METRICS_INTERVAL", "10.0"))
+        self._metrics_collection_task: Optional[asyncio.Task] = None
+        self._service_metrics_cache: Dict[str, Dict[str, Any]] = {}  # service -> metrics snapshot
+
+        # Issue 34: Cross-Repo Error Propagation - Error context and correlation
+        self._error_registry: Dict[str, Dict[str, Any]] = {}  # error_id -> error_info
+        self._error_propagation_enabled: bool = os.environ.get("JARVIS_ERROR_PROPAGATION", "true").lower() == "true"
+        self._error_correlation_map: Dict[str, List[str]] = {}  # root_error_id -> [related_error_ids]
+        self._error_handlers: Dict[str, List[Callable]] = {}  # error_type -> [handlers]
+        self._error_lock: Optional[asyncio.Lock] = None
+        self._max_error_history: int = int(os.environ.get("JARVIS_MAX_ERROR_HISTORY", "1000"))
+
+        # Issue 35: Cross-Repo State Synchronization - Shared state management
+        self._shared_state: Dict[str, Any] = {}  # Cross-repo shared state
+        self._state_version: Dict[str, int] = {}  # key -> version number
+        self._state_subscribers: Dict[str, List[Callable]] = {}  # key -> [subscriber_callbacks]
+        self._state_lock: Optional[asyncio.Lock] = None
+        self._state_sync_enabled: bool = os.environ.get("JARVIS_STATE_SYNC", "true").lower() == "true"
+        self._state_persistence_path: Optional[Path] = None
+        self._state_sync_task: Optional[asyncio.Task] = None
+        self._state_change_buffer: List[Dict[str, Any]] = []  # Buffered state changes
+
+        # Issue 36: Cross-Repo Resource Coordination - Resource allocation
+        self._resource_registry: Dict[str, Dict[str, Any]] = {}  # resource_id -> resource_info
+        self._resource_allocations: Dict[str, Dict[str, int]] = {}  # service -> {resource -> amount}
+        self._resource_limits: Dict[str, int] = {}  # resource -> total_available
+        self._resource_lock: Optional[asyncio.Lock] = None
+        self._resource_coordination_enabled: bool = os.environ.get("JARVIS_RESOURCE_COORDINATION", "true").lower() == "true"
+        self._resource_conflict_handlers: Dict[str, Callable] = {}  # resource -> conflict_handler
+
+        # Issue 37: Cross-Repo Version Compatibility - Compatibility matrix
+        self._version_registry: Dict[str, str] = {}  # service -> version
+        self._compatibility_matrix: Dict[str, Dict[str, List[str]]] = {}  # service -> {dep -> [compatible_versions]}
+        self._version_check_enabled: bool = os.environ.get("JARVIS_VERSION_CHECK", "true").lower() == "true"
+        self._version_lock: Optional[asyncio.Lock] = None
+        self._incompatibility_handlers: Dict[str, Callable] = {}  # service_pair -> handler
+
+        # Issue 38: Cross-Repo Security Context - Unified security
+        self._security_context: Dict[str, Any] = {}  # Current security context
+        self._security_tokens: Dict[str, str] = {}  # service -> auth_token
+        self._security_policies: Dict[str, Dict[str, Any]] = {}  # policy_name -> policy_def
+        self._security_lock: Optional[asyncio.Lock] = None
+        self._security_context_enabled: bool = os.environ.get("JARVIS_SECURITY_CONTEXT", "true").lower() == "true"
+        self._token_refresh_interval: float = float(os.environ.get("JARVIS_TOKEN_REFRESH", "3600.0"))
+        self._token_refresh_task: Optional[asyncio.Task] = None
+
     def _ensure_locks_initialized(self) -> None:
         """
         v93.11: Lazily initialize asyncio primitives.
@@ -2701,6 +2779,24 @@ class ProcessOrchestrator:
             self._degradation_lock = asyncio.Lock()
         if self._trace_lock is None:
             self._trace_lock = asyncio.Lock()
+
+        # v95.10: Cross-repo integration locks
+        if self._config_lock is None:
+            self._config_lock = asyncio.Lock()
+        if self._log_lock is None:
+            self._log_lock = asyncio.Lock()
+        if self._metrics_lock is None:
+            self._metrics_lock = asyncio.Lock()
+        if self._error_lock is None:
+            self._error_lock = asyncio.Lock()
+        if self._state_lock is None:
+            self._state_lock = asyncio.Lock()
+        if self._resource_lock is None:
+            self._resource_lock = asyncio.Lock()
+        if self._version_lock is None:
+            self._version_lock = asyncio.Lock()
+        if self._security_lock is None:
+            self._security_lock = asyncio.Lock()
 
     @property
     def _degradation_lock_safe(self) -> asyncio.Lock:
@@ -3605,6 +3701,1607 @@ class ProcessOrchestrator:
                     for k, v in self._network_circuit_breakers.items()
                 },
                 "health": self._network_health_status,
+            },
+            "timestamp": time.time(),
+        }
+
+    # =========================================================================
+    # v95.10: Cross-Repo Integration Infrastructure (Issues 31-38)
+    # =========================================================================
+
+    # -------------------------------------------------------------------------
+    # Issue 31: Unified Configuration System
+    # -------------------------------------------------------------------------
+
+    async def _initialize_unified_config(self) -> None:
+        """
+        v95.10: Initialize unified cross-repo configuration system.
+
+        Features:
+        - Config inheritance (base -> repo-specific -> overrides)
+        - Schema validation with type coercion
+        - Change watchers for dynamic updates
+        - Conflict detection and resolution
+        """
+        self._ensure_locks_initialized()
+        assert self._config_lock is not None
+
+        async with self._config_lock:
+            # Define base Trinity configuration schema
+            self._config_schema = {
+                "ports": {
+                    "type": "dict",
+                    "schema": {
+                        "jarvis_body": {"type": "int", "default": 8010, "min": 1024, "max": 65535},
+                        "jarvis_prime": {"type": "int", "default": 8000, "min": 1024, "max": 65535},
+                        "reactor_core": {"type": "int", "default": 8090, "min": 1024, "max": 65535},
+                    },
+                },
+                "timeouts": {
+                    "type": "dict",
+                    "schema": {
+                        "startup": {"type": "float", "default": 120.0, "min": 10.0},
+                        "health_check": {"type": "float", "default": 5.0, "min": 1.0},
+                        "shutdown": {"type": "float", "default": 30.0, "min": 5.0},
+                    },
+                },
+                "retry": {
+                    "type": "dict",
+                    "schema": {
+                        "max_attempts": {"type": "int", "default": 5, "min": 1, "max": 20},
+                        "base_delay": {"type": "float", "default": 1.0, "min": 0.1},
+                        "max_delay": {"type": "float", "default": 60.0, "min": 1.0},
+                    },
+                },
+                "features": {
+                    "type": "dict",
+                    "schema": {
+                        "auto_recovery": {"type": "bool", "default": True},
+                        "metrics_collection": {"type": "bool", "default": True},
+                        "distributed_tracing": {"type": "bool", "default": True},
+                        "state_sync": {"type": "bool", "default": True},
+                    },
+                },
+            }
+
+            # Load configs from all repos
+            await self._load_repo_configs()
+
+            # Merge with inheritance
+            self._unified_config = await self._merge_configs_with_inheritance()
+
+            # Start config sync task
+            if self._config_sync_task is None or self._config_sync_task.done():
+                self._config_sync_task = asyncio.create_task(
+                    self._config_sync_loop(),
+                    name="config_sync_loop"
+                )
+                self._track_background_task(self._config_sync_task)
+
+            logger.info("[v95.10] ✅ Unified configuration system initialized")
+
+    async def _load_repo_configs(self) -> None:
+        """Load configuration from each repo's config file."""
+        repos = {
+            "jarvis": self.config.jarvis_path if hasattr(self.config, 'jarvis_path') else Path.cwd(),
+            "jarvis-prime": self.config.jarvis_prime_path,
+            "reactor-core": self.config.reactor_core_path,
+        }
+
+        for repo_name, repo_path in repos.items():
+            if not repo_path or not repo_path.exists():
+                continue
+
+            config_files = [
+                repo_path / "trinity_config.json",
+                repo_path / "config" / "trinity.json",
+                repo_path / ".trinity.json",
+            ]
+
+            for config_file in config_files:
+                if config_file.exists():
+                    try:
+                        with open(config_file, "r") as f:
+                            self._config_sources[repo_name] = json.load(f)
+                        logger.debug(f"[v95.10] Loaded config for {repo_name} from {config_file}")
+                        break
+                    except Exception as e:
+                        logger.warning(f"[v95.10] Failed to load config from {config_file}: {e}")
+
+    async def _merge_configs_with_inheritance(self) -> Dict[str, Any]:
+        """
+        Merge configurations with proper inheritance.
+
+        Priority (lowest to highest):
+        1. Schema defaults
+        2. JARVIS body config
+        3. JARVIS Prime config
+        4. Reactor Core config
+        5. Environment variables
+        6. User overrides
+        """
+        merged: Dict[str, Any] = {}
+
+        # 1. Apply schema defaults
+        merged = self._apply_schema_defaults(self._config_schema)
+
+        # 2-4. Merge repo configs in order
+        for repo in ["jarvis", "jarvis-prime", "reactor-core"]:
+            if repo in self._config_sources:
+                merged = self._deep_merge(merged, self._config_sources[repo])
+
+        # 5. Apply environment variable overrides
+        merged = self._apply_env_overrides(merged)
+
+        # 6. Apply user overrides
+        if self._config_overrides:
+            merged = self._deep_merge(merged, self._config_overrides)
+
+        # Validate merged config
+        validated = self._validate_config(merged, self._config_schema)
+
+        return validated
+
+    def _apply_schema_defaults(self, schema: Dict[str, Any]) -> Dict[str, Any]:
+        """Apply default values from schema."""
+        result: Dict[str, Any] = {}
+
+        for key, spec in schema.items():
+            if spec.get("type") == "dict" and "schema" in spec:
+                result[key] = self._apply_schema_defaults(spec["schema"])
+            elif "default" in spec:
+                result[key] = spec["default"]
+
+        return result
+
+    def _deep_merge(self, base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+        """Deep merge two dictionaries."""
+        result = base.copy()
+
+        for key, value in override.items():
+            if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+                result[key] = self._deep_merge(result[key], value)
+            else:
+                result[key] = value
+
+        return result
+
+    def _apply_env_overrides(self, config: Dict[str, Any]) -> Dict[str, Any]:
+        """Apply environment variable overrides."""
+        env_mappings = {
+            "JARVIS_BODY_PORT": ("ports", "jarvis_body"),
+            "JARVIS_PRIME_PORT": ("ports", "jarvis_prime"),
+            "REACTOR_CORE_PORT": ("ports", "reactor_core"),
+            "JARVIS_STARTUP_TIMEOUT": ("timeouts", "startup"),
+            "JARVIS_HEALTH_TIMEOUT": ("timeouts", "health_check"),
+            "JARVIS_MAX_RETRIES": ("retry", "max_attempts"),
+            "JARVIS_AUTO_RECOVERY": ("features", "auto_recovery"),
+            "JARVIS_METRICS": ("features", "metrics_collection"),
+        }
+
+        for env_var, (section, key) in env_mappings.items():
+            value = os.environ.get(env_var)
+            if value is not None:
+                if section not in config:
+                    config[section] = {}
+
+                # Type coercion
+                if value.lower() in ("true", "false"):
+                    config[section][key] = value.lower() == "true"
+                elif value.isdigit():
+                    config[section][key] = int(value)
+                else:
+                    try:
+                        config[section][key] = float(value)
+                    except ValueError:
+                        config[section][key] = value
+
+        return config
+
+    def _validate_config(self, config: Dict[str, Any], schema: Dict[str, Any]) -> Dict[str, Any]:
+        """Validate configuration against schema."""
+        validated: Dict[str, Any] = {}
+
+        for key, spec in schema.items():
+            value = config.get(key)
+
+            if value is None:
+                if "default" in spec:
+                    validated[key] = spec["default"]
+                continue
+
+            # Type validation and coercion
+            expected_type = spec.get("type", "any")
+
+            if expected_type == "dict" and "schema" in spec:
+                if isinstance(value, dict):
+                    validated[key] = self._validate_config(value, spec["schema"])
+                else:
+                    validated[key] = self._apply_schema_defaults(spec["schema"])
+            elif expected_type == "int":
+                try:
+                    val = int(value)
+                    # Range validation
+                    if "min" in spec:
+                        val = max(val, spec["min"])
+                    if "max" in spec:
+                        val = min(val, spec["max"])
+                    validated[key] = val
+                except (ValueError, TypeError):
+                    validated[key] = spec.get("default", 0)
+            elif expected_type == "float":
+                try:
+                    val = float(value)
+                    if "min" in spec:
+                        val = max(val, spec["min"])
+                    if "max" in spec:
+                        val = min(val, spec["max"])
+                    validated[key] = val
+                except (ValueError, TypeError):
+                    validated[key] = spec.get("default", 0.0)
+            elif expected_type == "bool":
+                validated[key] = bool(value)
+            else:
+                validated[key] = value
+
+        return validated
+
+    async def _config_sync_loop(self) -> None:
+        """Background task to sync configuration across repos."""
+        while not self._shutdown_event.is_set() and not self._shutdown_completed:
+            try:
+                await asyncio.sleep(self._config_sync_interval)
+
+                if self._shutdown_event.is_set():
+                    break
+
+                # Reload and re-merge configs
+                await self._load_repo_configs()
+                new_config = await self._merge_configs_with_inheritance()
+
+                # Detect changes and notify watchers
+                assert self._config_lock is not None
+                async with self._config_lock:
+                    changes = self._detect_config_changes(self._unified_config, new_config)
+                    if changes:
+                        logger.info(f"[v95.10] Config changes detected: {list(changes.keys())}")
+                        self._unified_config = new_config
+
+                        # Notify watchers
+                        for key, new_value in changes.items():
+                            if key in self._config_watchers:
+                                try:
+                                    callback = self._config_watchers[key]
+                                    if asyncio.iscoroutinefunction(callback):
+                                        await callback(key, new_value)
+                                    else:
+                                        callback(key, new_value)
+                                except Exception as e:
+                                    logger.error(f"[v95.10] Config watcher error for {key}: {e}")
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"[v95.10] Config sync error: {e}")
+
+    def _detect_config_changes(
+        self,
+        old_config: Dict[str, Any],
+        new_config: Dict[str, Any],
+        prefix: str = ""
+    ) -> Dict[str, Any]:
+        """Detect changes between two configs."""
+        changes: Dict[str, Any] = {}
+
+        all_keys = set(old_config.keys()) | set(new_config.keys())
+        for key in all_keys:
+            full_key = f"{prefix}.{key}" if prefix else key
+            old_val = old_config.get(key)
+            new_val = new_config.get(key)
+
+            if isinstance(old_val, dict) and isinstance(new_val, dict):
+                nested_changes = self._detect_config_changes(old_val, new_val, full_key)
+                changes.update(nested_changes)
+            elif old_val != new_val:
+                changes[full_key] = new_val
+
+        return changes
+
+    def get_config(self, key: str, default: Any = None) -> Any:
+        """
+        Get configuration value using dot notation.
+
+        Args:
+            key: Dot-separated key (e.g., "ports.jarvis_prime")
+            default: Default value if key not found
+
+        Returns:
+            Configuration value
+        """
+        parts = key.split(".")
+        value: Any = self._unified_config
+
+        for part in parts:
+            if isinstance(value, dict) and part in value:
+                value = value[part]
+            else:
+                return default
+
+        return value
+
+    def set_config_override(self, key: str, value: Any) -> None:
+        """
+        Set a configuration override.
+
+        Args:
+            key: Dot-separated key
+            value: New value
+        """
+        parts = key.split(".")
+        current = self._config_overrides
+
+        for part in parts[:-1]:
+            if part not in current:
+                current[part] = {}
+            current = current[part]
+
+        current[parts[-1]] = value
+
+    def watch_config(self, key: str, callback: Callable) -> None:
+        """Register a watcher for configuration changes."""
+        self._config_watchers[key] = callback
+
+    # -------------------------------------------------------------------------
+    # Issue 32: Cross-Repo Unified Logging
+    # -------------------------------------------------------------------------
+
+    async def _initialize_unified_logging(self) -> None:
+        """
+        v95.10: Initialize unified cross-repo logging system.
+
+        Features:
+        - W3C Trace Context propagation
+        - Log correlation with trace IDs
+        - Log aggregation and buffering
+        - Cross-repo log streaming
+        """
+        self._ensure_locks_initialized()
+        assert self._log_lock is not None
+
+        async with self._log_lock:
+            # Setup unified log formatter with trace context
+            self._setup_trace_context_formatter()
+
+            # Initialize state persistence path
+            jarvis_home = Path.home() / ".jarvis"
+            self._state_persistence_path = jarvis_home / "logs"
+            self._state_persistence_path.mkdir(parents=True, exist_ok=True)
+
+            # Start log flush task
+            if self._log_flush_task is None or self._log_flush_task.done():
+                self._log_flush_task = asyncio.create_task(
+                    self._log_flush_loop(),
+                    name="log_flush_loop"
+                )
+                self._track_background_task(self._log_flush_task)
+
+            logger.info("[v95.10] ✅ Unified logging system initialized")
+
+    def _setup_trace_context_formatter(self) -> None:
+        """Setup log formatter with W3C Trace Context."""
+
+        class TraceContextFormatter(logging.Formatter):
+            """Formatter that includes trace context in log messages."""
+
+            def __init__(self, orchestrator: "ProcessOrchestrator"):
+                super().__init__(
+                    fmt="%(asctime)s [%(levelname)s] [%(trace_id)s:%(span_id)s] %(name)s: %(message)s",
+                    datefmt="%Y-%m-%d %H:%M:%S"
+                )
+                self._orchestrator = orchestrator
+
+            def format(self, record: logging.LogRecord) -> str:
+                # Add trace context to record
+                trace_id = getattr(record, "trace_id", None)
+                span_id = getattr(record, "span_id", None)
+
+                if not trace_id:
+                    trace_id = self._orchestrator._startup_correlation_id or "-"
+                if not span_id:
+                    span_id = "-"
+
+                record.trace_id = trace_id[:16] if len(trace_id) > 16 else trace_id
+                record.span_id = span_id[:8] if len(span_id) > 8 else span_id
+
+                return super().format(record)
+
+        # Store formatter for use
+        self._unified_log_handlers["trace_formatter"] = TraceContextFormatter(self)
+
+    async def emit_cross_repo_log(
+        self,
+        level: str,
+        message: str,
+        source_repo: str,
+        trace_id: Optional[str] = None,
+        span_id: Optional[str] = None,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """
+        Emit a log entry with cross-repo correlation.
+
+        Args:
+            level: Log level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+            message: Log message
+            source_repo: Source repository name
+            trace_id: Optional trace ID (generated if not provided)
+            span_id: Optional span ID
+            extra: Additional context
+        """
+        if not self._log_correlation_enabled:
+            return
+
+        self._ensure_locks_initialized()
+        assert self._log_lock is not None
+
+        # Generate trace ID if not provided
+        if not trace_id:
+            trace_id = self._startup_correlation_id or self._generate_trace_id()
+
+        if not span_id:
+            span_id = self._generate_span_id()
+
+        log_entry = {
+            "timestamp": time.time(),
+            "level": level.upper(),
+            "message": message,
+            "source_repo": source_repo,
+            "trace_id": trace_id,
+            "span_id": span_id,
+            "extra": extra or {},
+        }
+
+        async with self._log_lock:
+            self._log_aggregation_buffer.append(log_entry)
+
+            # Flush if buffer is full
+            if len(self._log_aggregation_buffer) >= self._log_buffer_size:
+                await self._flush_log_buffer()
+
+    def _generate_trace_id(self) -> str:
+        """Generate W3C-compliant trace ID (32 hex chars)."""
+        import uuid
+        return uuid.uuid4().hex
+
+    def _generate_span_id(self) -> str:
+        """Generate W3C-compliant span ID (16 hex chars)."""
+        import uuid
+        return uuid.uuid4().hex[:16]
+
+    async def _log_flush_loop(self) -> None:
+        """Background task to periodically flush log buffer."""
+        while not self._shutdown_event.is_set() and not self._shutdown_completed:
+            try:
+                await asyncio.sleep(self._log_flush_interval)
+
+                if self._shutdown_event.is_set():
+                    break
+
+                assert self._log_lock is not None
+                async with self._log_lock:
+                    if self._log_aggregation_buffer:
+                        await self._flush_log_buffer()
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"[v95.10] Log flush error: {e}")
+
+    async def _flush_log_buffer(self) -> None:
+        """Flush log buffer to storage/aggregation."""
+        if not self._log_aggregation_buffer:
+            return
+
+        entries = self._log_aggregation_buffer.copy()
+        self._log_aggregation_buffer.clear()
+
+        # Write to aggregated log file
+        if self._state_persistence_path:
+            log_file = self._state_persistence_path / "unified_logs.jsonl"
+            try:
+                with open(log_file, "a") as f:
+                    for entry in entries:
+                        f.write(json.dumps(entry) + "\n")
+            except Exception as e:
+                logger.error(f"[v95.10] Failed to write logs: {e}")
+
+    def get_trace_context_headers(self) -> Dict[str, str]:
+        """Get trace context headers for HTTP propagation."""
+        trace_id = self._startup_correlation_id or self._generate_trace_id()
+        span_id = self._generate_span_id()
+
+        return {
+            self._trace_id_header: trace_id,
+            self._span_id_header: span_id,
+            "traceparent": f"00-{trace_id}-{span_id}-01",  # W3C format
+        }
+
+    # -------------------------------------------------------------------------
+    # Issue 33: Cross-Repo Metrics Collection
+    # -------------------------------------------------------------------------
+
+    async def _initialize_metrics_collection(self) -> None:
+        """
+        v95.10: Initialize unified metrics collection system.
+
+        Features:
+        - Cross-repo metric aggregation
+        - Custom metric collectors
+        - Metric buffering and batching
+        - Health dashboard data
+        """
+        self._ensure_locks_initialized()
+        assert self._metrics_lock is not None
+
+        if not self._metrics_enabled:
+            logger.info("[v95.10] Metrics collection disabled")
+            return
+
+        async with self._metrics_lock:
+            # Register default metrics
+            self._register_default_metrics()
+
+            # Start collection task
+            if self._metrics_collection_task is None or self._metrics_collection_task.done():
+                self._metrics_collection_task = asyncio.create_task(
+                    self._metrics_collection_loop(),
+                    name="metrics_collection_loop"
+                )
+                self._track_background_task(self._metrics_collection_task)
+
+            logger.info("[v95.10] ✅ Metrics collection system initialized")
+
+    def _register_default_metrics(self) -> None:
+        """Register default cross-repo metrics."""
+        self._metrics_registry = {
+            "service_health": {
+                "type": "gauge",
+                "description": "Service health status (0=unhealthy, 1=healthy)",
+                "labels": ["service", "repo"],
+            },
+            "service_uptime": {
+                "type": "gauge",
+                "description": "Service uptime in seconds",
+                "labels": ["service"],
+            },
+            "request_latency": {
+                "type": "histogram",
+                "description": "Request latency in milliseconds",
+                "labels": ["service", "endpoint"],
+                "buckets": [10, 50, 100, 250, 500, 1000, 2500, 5000],
+            },
+            "error_count": {
+                "type": "counter",
+                "description": "Total error count",
+                "labels": ["service", "error_type"],
+            },
+            "memory_usage": {
+                "type": "gauge",
+                "description": "Memory usage in bytes",
+                "labels": ["service"],
+            },
+            "cpu_usage": {
+                "type": "gauge",
+                "description": "CPU usage percentage",
+                "labels": ["service"],
+            },
+            "active_connections": {
+                "type": "gauge",
+                "description": "Active connection count",
+                "labels": ["service"],
+            },
+        }
+
+    async def _metrics_collection_loop(self) -> None:
+        """Background task to collect metrics from all repos."""
+        while not self._shutdown_event.is_set() and not self._shutdown_completed:
+            try:
+                await asyncio.sleep(self._metrics_collection_interval)
+
+                if self._shutdown_event.is_set():
+                    break
+
+                await self._collect_all_metrics()
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"[v95.10] Metrics collection error: {e}")
+
+    async def _collect_all_metrics(self) -> None:
+        """Collect metrics from all registered sources."""
+        self._ensure_locks_initialized()
+        assert self._metrics_lock is not None
+
+        timestamp = time.time()
+
+        async with self._metrics_lock:
+            # Collect from each service
+            for service_name, managed in self.processes.items():
+                try:
+                    metrics = await self._collect_service_metrics(service_name, managed)
+                    self._service_metrics_cache[service_name] = {
+                        "metrics": metrics,
+                        "timestamp": timestamp,
+                    }
+                except Exception as e:
+                    logger.debug(f"[v95.10] Failed to collect metrics from {service_name}: {e}")
+
+            # Run custom collectors
+            for collector_name, collector_fn in self._metrics_collectors.items():
+                try:
+                    if asyncio.iscoroutinefunction(collector_fn):
+                        metrics = await collector_fn()
+                    else:
+                        metrics = collector_fn()
+
+                    self._metrics_buffer.extend(metrics if isinstance(metrics, list) else [metrics])
+                except Exception as e:
+                    logger.debug(f"[v95.10] Collector {collector_name} failed: {e}")
+
+    async def _collect_service_metrics(
+        self,
+        service_name: str,
+        managed: "ManagedProcess"
+    ) -> Dict[str, Any]:
+        """Collect metrics from a single service."""
+        metrics: Dict[str, Any] = {
+            "service": service_name,
+            "timestamp": time.time(),
+        }
+
+        # Health status
+        metrics["health"] = 1 if managed.status == ServiceStatus.HEALTHY else 0
+
+        # Uptime
+        if managed.last_restart:
+            metrics["uptime"] = time.time() - managed.last_restart
+
+        # Process metrics (if available)
+        if managed.pid and managed.process:
+            try:
+                import psutil
+                proc = psutil.Process(managed.pid)
+                metrics["memory_bytes"] = proc.memory_info().rss
+                metrics["cpu_percent"] = proc.cpu_percent()
+            except Exception:
+                pass
+
+        # Restart count
+        metrics["restart_count"] = managed.restart_count
+
+        # Port
+        metrics["port"] = managed.port
+
+        return metrics
+
+    def register_metric_collector(self, name: str, collector: Callable) -> None:
+        """Register a custom metric collector."""
+        self._metrics_collectors[name] = collector
+
+    def record_metric(
+        self,
+        name: str,
+        value: float,
+        labels: Optional[Dict[str, str]] = None,
+    ) -> None:
+        """Record a metric value."""
+        if not self._metrics_enabled:
+            return
+
+        self._metrics_buffer.append({
+            "name": name,
+            "value": value,
+            "labels": labels or {},
+            "timestamp": time.time(),
+        })
+
+    def get_metrics_snapshot(self) -> Dict[str, Any]:
+        """Get current metrics snapshot for dashboard."""
+        return {
+            "services": self._service_metrics_cache.copy(),
+            "buffer_size": len(self._metrics_buffer),
+            "registry": list(self._metrics_registry.keys()),
+            "timestamp": time.time(),
+        }
+
+    # -------------------------------------------------------------------------
+    # Issue 34: Cross-Repo Error Propagation
+    # -------------------------------------------------------------------------
+
+    async def _initialize_error_propagation(self) -> None:
+        """
+        v95.10: Initialize cross-repo error propagation system.
+
+        Features:
+        - Error context preservation across repos
+        - Error correlation and chaining
+        - Cross-repo error handlers
+        - Distributed error tracking
+        """
+        self._ensure_locks_initialized()
+
+        if not self._error_propagation_enabled:
+            logger.info("[v95.10] Error propagation disabled")
+            return
+
+        # Register default error handlers
+        self._register_default_error_handlers()
+
+        logger.info("[v95.10] ✅ Error propagation system initialized")
+
+    def _register_default_error_handlers(self) -> None:
+        """Register default error handlers for common error types."""
+        self._error_handlers = {
+            "connection_error": [self._handle_connection_error],
+            "timeout_error": [self._handle_timeout_error],
+            "validation_error": [self._handle_validation_error],
+            "dependency_error": [self._handle_dependency_error],
+        }
+
+    async def propagate_error(
+        self,
+        error: Exception,
+        source_repo: str,
+        target_repos: Optional[List[str]] = None,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """
+        Propagate an error across repos with full context.
+
+        Args:
+            error: The exception to propagate
+            source_repo: Source repository name
+            target_repos: Target repos to notify (None = all)
+            context: Additional context
+
+        Returns:
+            Error ID for tracking
+        """
+        self._ensure_locks_initialized()
+        assert self._error_lock is not None
+
+        error_id = self._generate_error_id()
+        error_type = type(error).__name__
+
+        error_info = {
+            "id": error_id,
+            "type": error_type,
+            "message": str(error),
+            "source_repo": source_repo,
+            "target_repos": target_repos or ["jarvis", "jarvis-prime", "reactor-core"],
+            "context": context or {},
+            "trace_id": self._startup_correlation_id,
+            "timestamp": time.time(),
+            "traceback": self._format_traceback(error),
+        }
+
+        async with self._error_lock:
+            # Store in registry
+            self._error_registry[error_id] = error_info
+
+            # Maintain max history
+            if len(self._error_registry) > self._max_error_history:
+                oldest = min(self._error_registry.keys(), key=lambda k: self._error_registry[k]["timestamp"])
+                del self._error_registry[oldest]
+
+            # Check for correlated errors
+            await self._correlate_error(error_id, error_info)
+
+        # Call error handlers
+        await self._invoke_error_handlers(error_type, error_info)
+
+        # Emit log
+        await self.emit_cross_repo_log(
+            "ERROR",
+            f"Cross-repo error: {error_type}: {error}",
+            source_repo,
+            extra={"error_id": error_id}
+        )
+
+        return error_id
+
+    def _generate_error_id(self) -> str:
+        """Generate unique error ID."""
+        import uuid
+        return f"err-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
+
+    def _format_traceback(self, error: Exception) -> str:
+        """Format exception traceback."""
+        import traceback
+        return "".join(traceback.format_exception(type(error), error, error.__traceback__))
+
+    async def _correlate_error(self, error_id: str, error_info: Dict[str, Any]) -> None:
+        """Find and link correlated errors."""
+        trace_id = error_info.get("trace_id")
+        if not trace_id:
+            return
+
+        # Find other errors with same trace ID
+        for other_id, other_info in self._error_registry.items():
+            if other_id == error_id:
+                continue
+            if other_info.get("trace_id") == trace_id:
+                # Link errors
+                if trace_id not in self._error_correlation_map:
+                    self._error_correlation_map[trace_id] = []
+                if error_id not in self._error_correlation_map[trace_id]:
+                    self._error_correlation_map[trace_id].append(error_id)
+                if other_id not in self._error_correlation_map[trace_id]:
+                    self._error_correlation_map[trace_id].append(other_id)
+
+    async def _invoke_error_handlers(self, error_type: str, error_info: Dict[str, Any]) -> None:
+        """Invoke registered error handlers."""
+        handlers = self._error_handlers.get(error_type.lower(), [])
+        handlers.extend(self._error_handlers.get("*", []))  # Wildcard handlers
+
+        for handler in handlers:
+            try:
+                if asyncio.iscoroutinefunction(handler):
+                    await handler(error_info)
+                else:
+                    handler(error_info)
+            except Exception as e:
+                logger.error(f"[v95.10] Error handler failed: {e}")
+
+    async def _handle_connection_error(self, error_info: Dict[str, Any]) -> None:
+        """Handle connection errors."""
+        logger.warning(f"[v95.10] Connection error from {error_info['source_repo']}: {error_info['message']}")
+
+    async def _handle_timeout_error(self, error_info: Dict[str, Any]) -> None:
+        """Handle timeout errors."""
+        logger.warning(f"[v95.10] Timeout error from {error_info['source_repo']}: {error_info['message']}")
+
+    async def _handle_validation_error(self, error_info: Dict[str, Any]) -> None:
+        """Handle validation errors."""
+        logger.warning(f"[v95.10] Validation error from {error_info['source_repo']}: {error_info['message']}")
+
+    async def _handle_dependency_error(self, error_info: Dict[str, Any]) -> None:
+        """Handle dependency errors."""
+        logger.warning(f"[v95.10] Dependency error from {error_info['source_repo']}: {error_info['message']}")
+
+    def register_error_handler(self, error_type: str, handler: Callable) -> None:
+        """Register an error handler."""
+        if error_type not in self._error_handlers:
+            self._error_handlers[error_type] = []
+        self._error_handlers[error_type].append(handler)
+
+    def get_error_chain(self, error_id: str) -> List[Dict[str, Any]]:
+        """Get chain of correlated errors."""
+        error_info = self._error_registry.get(error_id)
+        if not error_info:
+            return []
+
+        trace_id = error_info.get("trace_id")
+        if not trace_id or trace_id not in self._error_correlation_map:
+            return [error_info]
+
+        return [
+            self._error_registry[eid]
+            for eid in self._error_correlation_map[trace_id]
+            if eid in self._error_registry
+        ]
+
+    # -------------------------------------------------------------------------
+    # Issue 35: Cross-Repo State Synchronization
+    # -------------------------------------------------------------------------
+
+    async def _initialize_state_sync(self) -> None:
+        """
+        v95.10: Initialize cross-repo state synchronization.
+
+        Features:
+        - Shared state with versioning
+        - State change notifications
+        - Conflict resolution
+        - State persistence
+        """
+        self._ensure_locks_initialized()
+        assert self._state_lock is not None
+
+        if not self._state_sync_enabled:
+            logger.info("[v95.10] State synchronization disabled")
+            return
+
+        async with self._state_lock:
+            # Setup state persistence
+            jarvis_home = Path.home() / ".jarvis"
+            self._state_persistence_path = jarvis_home / "state"
+            self._state_persistence_path.mkdir(parents=True, exist_ok=True)
+
+            # Load persisted state
+            await self._load_persisted_state()
+
+            # Start state sync task
+            if self._state_sync_task is None or self._state_sync_task.done():
+                self._state_sync_task = asyncio.create_task(
+                    self._state_sync_loop(),
+                    name="state_sync_loop"
+                )
+                self._track_background_task(self._state_sync_task)
+
+            logger.info("[v95.10] ✅ State synchronization system initialized")
+
+    async def _load_persisted_state(self) -> None:
+        """Load state from persistent storage."""
+        if not self._state_persistence_path:
+            return
+
+        state_file = self._state_persistence_path / "shared_state.json"
+        if state_file.exists():
+            try:
+                with open(state_file, "r") as f:
+                    data = json.load(f)
+                    self._shared_state = data.get("state", {})
+                    self._state_version = data.get("versions", {})
+                logger.debug("[v95.10] Loaded persisted state")
+            except Exception as e:
+                logger.warning(f"[v95.10] Failed to load state: {e}")
+
+    async def _persist_state(self) -> None:
+        """Persist state to storage."""
+        if not self._state_persistence_path:
+            return
+
+        state_file = self._state_persistence_path / "shared_state.json"
+        try:
+            with open(state_file, "w") as f:
+                json.dump({
+                    "state": self._shared_state,
+                    "versions": self._state_version,
+                    "timestamp": time.time(),
+                }, f, indent=2, default=str)
+        except Exception as e:
+            logger.error(f"[v95.10] Failed to persist state: {e}")
+
+    async def _state_sync_loop(self) -> None:
+        """Background task to sync and persist state."""
+        persist_interval = 30.0
+
+        while not self._shutdown_event.is_set() and not self._shutdown_completed:
+            try:
+                await asyncio.sleep(persist_interval)
+
+                if self._shutdown_event.is_set():
+                    break
+
+                assert self._state_lock is not None
+                async with self._state_lock:
+                    # Process buffered changes
+                    if self._state_change_buffer:
+                        await self._process_state_changes()
+
+                    # Persist state
+                    await self._persist_state()
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"[v95.10] State sync error: {e}")
+
+    async def _process_state_changes(self) -> None:
+        """Process buffered state changes."""
+        changes = self._state_change_buffer.copy()
+        self._state_change_buffer.clear()
+
+        for change in changes:
+            key = change["key"]
+            # Notify subscribers
+            if key in self._state_subscribers:
+                for callback in self._state_subscribers[key]:
+                    try:
+                        if asyncio.iscoroutinefunction(callback):
+                            await callback(key, change["value"], change["old_value"])
+                        else:
+                            callback(key, change["value"], change["old_value"])
+                    except Exception as e:
+                        logger.error(f"[v95.10] State subscriber error: {e}")
+
+    async def set_shared_state(
+        self,
+        key: str,
+        value: Any,
+        source_repo: str = "jarvis",
+        version: Optional[int] = None,
+    ) -> bool:
+        """
+        Set shared state with optimistic locking.
+
+        Args:
+            key: State key
+            value: New value
+            source_repo: Source repository
+            version: Expected version (for optimistic locking)
+
+        Returns:
+            True if successful, False if version conflict
+        """
+        self._ensure_locks_initialized()
+        assert self._state_lock is not None
+
+        async with self._state_lock:
+            current_version = self._state_version.get(key, 0)
+
+            # Optimistic locking check
+            if version is not None and version != current_version:
+                logger.warning(
+                    f"[v95.10] State version conflict for {key}: "
+                    f"expected {version}, got {current_version}"
+                )
+                return False
+
+            old_value = self._shared_state.get(key)
+            self._shared_state[key] = value
+            self._state_version[key] = current_version + 1
+
+            # Buffer change for notification
+            self._state_change_buffer.append({
+                "key": key,
+                "value": value,
+                "old_value": old_value,
+                "version": self._state_version[key],
+                "source_repo": source_repo,
+                "timestamp": time.time(),
+            })
+
+            return True
+
+    def get_shared_state(self, key: str, default: Any = None) -> Tuple[Any, int]:
+        """
+        Get shared state with version.
+
+        Returns:
+            Tuple of (value, version)
+        """
+        value = self._shared_state.get(key, default)
+        version = self._state_version.get(key, 0)
+        return value, version
+
+    def subscribe_to_state(self, key: str, callback: Callable) -> None:
+        """Subscribe to state changes for a key."""
+        if key not in self._state_subscribers:
+            self._state_subscribers[key] = []
+        self._state_subscribers[key].append(callback)
+
+    # -------------------------------------------------------------------------
+    # Issue 36: Cross-Repo Resource Coordination
+    # -------------------------------------------------------------------------
+
+    async def _initialize_resource_coordination(self) -> None:
+        """
+        v95.10: Initialize cross-repo resource coordination.
+
+        Features:
+        - Resource registration and tracking
+        - Resource allocation with limits
+        - Conflict detection and resolution
+        - Fair resource sharing
+        """
+        self._ensure_locks_initialized()
+        assert self._resource_lock is not None
+
+        if not self._resource_coordination_enabled:
+            logger.info("[v95.10] Resource coordination disabled")
+            return
+
+        async with self._resource_lock:
+            # Register default resources
+            self._resource_limits = {
+                "gpu_memory_mb": int(os.environ.get("JARVIS_GPU_MEMORY_LIMIT", "8192")),
+                "cpu_cores": int(os.environ.get("JARVIS_CPU_CORES_LIMIT", "8")),
+                "memory_mb": int(os.environ.get("JARVIS_MEMORY_LIMIT", "16384")),
+                "network_connections": int(os.environ.get("JARVIS_CONNECTION_LIMIT", "1000")),
+                "file_handles": int(os.environ.get("JARVIS_FILE_HANDLE_LIMIT", "10000")),
+            }
+
+            logger.info("[v95.10] ✅ Resource coordination system initialized")
+
+    async def allocate_resource(
+        self,
+        service: str,
+        resource: str,
+        amount: int,
+        priority: int = 0,
+    ) -> Tuple[bool, int]:
+        """
+        Allocate a resource to a service.
+
+        Args:
+            service: Service requesting resource
+            resource: Resource type
+            amount: Amount requested
+            priority: Priority (higher = more important)
+
+        Returns:
+            Tuple of (success, allocated_amount)
+        """
+        self._ensure_locks_initialized()
+        assert self._resource_lock is not None
+
+        async with self._resource_lock:
+            # Get current usage
+            current_usage = sum(
+                allocs.get(resource, 0)
+                for allocs in self._resource_allocations.values()
+            )
+
+            limit = self._resource_limits.get(resource, float("inf"))
+            available = limit - current_usage
+
+            if available <= 0:
+                # Try conflict resolution
+                if resource in self._resource_conflict_handlers:
+                    handler = self._resource_conflict_handlers[resource]
+                    result = handler(service, resource, amount, priority)
+                    if result:
+                        available = result
+
+            allocated = min(amount, int(available))
+
+            if allocated > 0:
+                if service not in self._resource_allocations:
+                    self._resource_allocations[service] = {}
+                self._resource_allocations[service][resource] = (
+                    self._resource_allocations[service].get(resource, 0) + allocated
+                )
+
+                self._resource_registry[f"{service}:{resource}"] = {
+                    "service": service,
+                    "resource": resource,
+                    "amount": allocated,
+                    "priority": priority,
+                    "timestamp": time.time(),
+                }
+
+                logger.debug(
+                    f"[v95.10] Allocated {allocated}/{amount} {resource} to {service}"
+                )
+                return True, allocated
+
+            logger.warning(
+                f"[v95.10] Resource exhausted: {resource} "
+                f"(requested: {amount}, available: {available})"
+            )
+            return False, 0
+
+    async def release_resource(self, service: str, resource: str, amount: Optional[int] = None) -> None:
+        """Release a resource allocation."""
+        self._ensure_locks_initialized()
+        assert self._resource_lock is not None
+
+        async with self._resource_lock:
+            if service not in self._resource_allocations:
+                return
+
+            if resource not in self._resource_allocations[service]:
+                return
+
+            if amount is None:
+                # Release all
+                del self._resource_allocations[service][resource]
+            else:
+                self._resource_allocations[service][resource] = max(
+                    0,
+                    self._resource_allocations[service][resource] - amount
+                )
+
+            # Clean up registry
+            registry_key = f"{service}:{resource}"
+            if registry_key in self._resource_registry:
+                del self._resource_registry[registry_key]
+
+            logger.debug(f"[v95.10] Released {resource} from {service}")
+
+    def get_resource_status(self) -> Dict[str, Any]:
+        """Get current resource allocation status."""
+        status: Dict[str, Any] = {}
+
+        for resource, limit in self._resource_limits.items():
+            used = sum(
+                allocs.get(resource, 0)
+                for allocs in self._resource_allocations.values()
+            )
+            status[resource] = {
+                "limit": limit,
+                "used": used,
+                "available": limit - used,
+                "utilization": used / limit if limit > 0 else 0,
+            }
+
+        return status
+
+    def register_resource_conflict_handler(self, resource: str, handler: Callable) -> None:
+        """Register a conflict resolution handler for a resource."""
+        self._resource_conflict_handlers[resource] = handler
+
+    # -------------------------------------------------------------------------
+    # Issue 37: Cross-Repo Version Compatibility
+    # -------------------------------------------------------------------------
+
+    async def _initialize_version_compatibility(self) -> None:
+        """
+        v95.10: Initialize version compatibility checking.
+
+        Features:
+        - Version registration for all components
+        - Compatibility matrix validation
+        - Upgrade coordination
+        - Incompatibility warnings
+        """
+        self._ensure_locks_initialized()
+        assert self._version_lock is not None
+
+        if not self._version_check_enabled:
+            logger.info("[v95.10] Version compatibility checking disabled")
+            return
+
+        async with self._version_lock:
+            # Register versions from all repos
+            await self._discover_versions()
+
+            # Build compatibility matrix
+            await self._build_compatibility_matrix()
+
+            # Check compatibility
+            issues = await self._check_compatibility()
+            if issues:
+                for issue in issues:
+                    logger.warning(f"[v95.10] Version incompatibility: {issue}")
+
+            logger.info("[v95.10] ✅ Version compatibility system initialized")
+
+    async def _discover_versions(self) -> None:
+        """Discover versions from all repos."""
+        repos = {
+            "jarvis-body": Path.cwd(),
+            "jarvis-prime": self.config.jarvis_prime_path,
+            "reactor-core": self.config.reactor_core_path,
+        }
+
+        for repo_name, repo_path in repos.items():
+            if not repo_path or not repo_path.exists():
+                continue
+
+            version = await self._get_repo_version(repo_path)
+            if version:
+                self._version_registry[repo_name] = version
+                logger.debug(f"[v95.10] {repo_name} version: {version}")
+
+    async def _get_repo_version(self, repo_path: Path) -> Optional[str]:
+        """Get version from a repository."""
+        # Check various version sources
+        version_files = [
+            repo_path / "VERSION",
+            repo_path / "version.txt",
+            repo_path / "pyproject.toml",
+            repo_path / "setup.py",
+        ]
+
+        for vf in version_files:
+            if vf.exists():
+                try:
+                    content = vf.read_text()
+                    if vf.name == "pyproject.toml":
+                        import re
+                        match = re.search(r'version\s*=\s*["\']([^"\']+)["\']', content)
+                        if match:
+                            return match.group(1)
+                    elif vf.name == "setup.py":
+                        import re
+                        match = re.search(r'version\s*=\s*["\']([^"\']+)["\']', content)
+                        if match:
+                            return match.group(1)
+                    else:
+                        return content.strip()
+                except Exception:
+                    continue
+
+        return None
+
+    async def _build_compatibility_matrix(self) -> None:
+        """Build compatibility matrix between components."""
+        # Define compatibility rules
+        # Format: {service: {dependency: [compatible_version_patterns]}}
+        self._compatibility_matrix = {
+            "reactor-core": {
+                "jarvis-prime": ["1.*", "2.*"],  # Reactor compatible with Prime 1.x or 2.x
+                "jarvis-body": ["1.*", "2.*"],
+            },
+            "jarvis-prime": {
+                "jarvis-body": ["1.*", "2.*"],
+            },
+        }
+
+    async def _check_compatibility(self) -> List[str]:
+        """Check version compatibility across repos."""
+        issues: List[str] = []
+
+        for service, deps in self._compatibility_matrix.items():
+            service_version = self._version_registry.get(service)
+            if not service_version:
+                continue
+
+            for dep, compatible_patterns in deps.items():
+                dep_version = self._version_registry.get(dep)
+                if not dep_version:
+                    continue
+
+                if not self._is_version_compatible(dep_version, compatible_patterns):
+                    issues.append(
+                        f"{service} ({service_version}) may not be compatible with "
+                        f"{dep} ({dep_version}). Expected: {compatible_patterns}"
+                    )
+
+        return issues
+
+    def _is_version_compatible(self, version: str, patterns: List[str]) -> bool:
+        """Check if version matches any pattern."""
+        import fnmatch
+        return any(fnmatch.fnmatch(version, pattern) for pattern in patterns)
+
+    def get_version_info(self) -> Dict[str, Any]:
+        """Get version information for all components."""
+        return {
+            "versions": self._version_registry.copy(),
+            "compatibility_matrix": self._compatibility_matrix.copy(),
+            "check_enabled": self._version_check_enabled,
+        }
+
+    # -------------------------------------------------------------------------
+    # Issue 38: Cross-Repo Security Context
+    # -------------------------------------------------------------------------
+
+    async def _initialize_security_context(self) -> None:
+        """
+        v95.10: Initialize unified security context.
+
+        Features:
+        - Cross-repo authentication
+        - Security token management
+        - Policy enforcement
+        - Audit logging
+        """
+        self._ensure_locks_initialized()
+        assert self._security_lock is not None
+
+        if not self._security_context_enabled:
+            logger.info("[v95.10] Security context disabled")
+            return
+
+        async with self._security_lock:
+            # Generate initial security context
+            self._security_context = {
+                "session_id": self._generate_session_id(),
+                "created_at": time.time(),
+                "principal": os.environ.get("USER", "jarvis"),
+                "roles": ["system", "orchestrator"],
+                "permissions": ["read", "write", "execute", "admin"],
+            }
+
+            # Initialize security policies
+            self._initialize_security_policies()
+
+            # Start token refresh task
+            if self._token_refresh_task is None or self._token_refresh_task.done():
+                self._token_refresh_task = asyncio.create_task(
+                    self._token_refresh_loop(),
+                    name="token_refresh_loop"
+                )
+                self._track_background_task(self._token_refresh_task)
+
+            logger.info("[v95.10] ✅ Security context system initialized")
+
+    def _generate_session_id(self) -> str:
+        """Generate secure session ID."""
+        import uuid
+        import hashlib
+        random_bytes = uuid.uuid4().bytes + str(time.time()).encode()
+        return hashlib.sha256(random_bytes).hexdigest()[:32]
+
+    def _initialize_security_policies(self) -> None:
+        """Initialize default security policies."""
+        self._security_policies = {
+            "cross_repo_communication": {
+                "require_token": True,
+                "token_lifetime": 3600,
+                "allowed_origins": ["jarvis", "jarvis-prime", "reactor-core"],
+            },
+            "resource_access": {
+                "require_role": True,
+                "allowed_roles": ["system", "orchestrator", "service"],
+            },
+            "api_access": {
+                "rate_limit": 1000,  # requests per minute
+                "require_authentication": True,
+            },
+        }
+
+    async def _token_refresh_loop(self) -> None:
+        """Background task to refresh security tokens."""
+        while not self._shutdown_event.is_set() and not self._shutdown_completed:
+            try:
+                await asyncio.sleep(self._token_refresh_interval)
+
+                if self._shutdown_event.is_set():
+                    break
+
+                await self._refresh_security_tokens()
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"[v95.10] Token refresh error: {e}")
+
+    async def _refresh_security_tokens(self) -> None:
+        """Refresh security tokens for all services."""
+        assert self._security_lock is not None
+
+        async with self._security_lock:
+            for service in ["jarvis-prime", "reactor-core"]:
+                token = self._generate_service_token(service)
+                self._security_tokens[service] = token
+                logger.debug(f"[v95.10] Refreshed token for {service}")
+
+    def _generate_service_token(self, service: str) -> str:
+        """Generate a service authentication token."""
+        import hashlib
+        import hmac
+
+        secret = os.environ.get("JARVIS_SECRET_KEY", "jarvis-default-secret")
+        timestamp = str(int(time.time()))
+        message = f"{service}:{self._security_context['session_id']}:{timestamp}"
+
+        signature = hmac.new(
+            secret.encode(),
+            message.encode(),
+            hashlib.sha256
+        ).hexdigest()
+
+        return f"{message}:{signature}"
+
+    def get_service_token(self, service: str) -> Optional[str]:
+        """Get authentication token for a service."""
+        return self._security_tokens.get(service)
+
+    def validate_service_token(self, token: str) -> Tuple[bool, Optional[str]]:
+        """
+        Validate a service token.
+
+        Returns:
+            Tuple of (is_valid, service_name)
+        """
+        try:
+            parts = token.split(":")
+            if len(parts) != 4:
+                return False, None
+
+            service, session_id, timestamp, signature = parts
+
+            # Check session
+            if session_id != self._security_context.get("session_id"):
+                return False, None
+
+            # Check timestamp (token valid for 2x refresh interval)
+            token_age = time.time() - int(timestamp)
+            if token_age > self._token_refresh_interval * 2:
+                return False, None
+
+            # Verify signature
+            secret = os.environ.get("JARVIS_SECRET_KEY", "jarvis-default-secret")
+            message = f"{service}:{session_id}:{timestamp}"
+            expected_signature = __import__("hmac").new(
+                secret.encode(),
+                message.encode(),
+                __import__("hashlib").sha256
+            ).hexdigest()
+
+            if signature != expected_signature:
+                return False, None
+
+            return True, service
+
+        except Exception:
+            return False, None
+
+    def get_security_context(self) -> Dict[str, Any]:
+        """Get current security context."""
+        return {
+            "session_id": self._security_context.get("session_id"),
+            "principal": self._security_context.get("principal"),
+            "roles": self._security_context.get("roles", []),
+            "created_at": self._security_context.get("created_at"),
+            "services_authenticated": list(self._security_tokens.keys()),
+        }
+
+    def check_permission(self, action: str, resource: str) -> bool:
+        """Check if current context has permission for an action."""
+        permissions = self._security_context.get("permissions", [])
+        return action in permissions or "admin" in permissions
+
+    # -------------------------------------------------------------------------
+    # v95.10: Cross-Repo Integration Initialization (called from startup)
+    # -------------------------------------------------------------------------
+
+    async def _initialize_cross_repo_integration(self) -> None:
+        """
+        v95.10: Initialize all cross-repo integration systems.
+
+        Called during startup to initialize:
+        - Unified configuration
+        - Cross-repo logging
+        - Metrics collection
+        - Error propagation
+        - State synchronization
+        - Resource coordination
+        - Version compatibility
+        - Security context
+        """
+        self._ensure_locks_initialized()
+
+        logger.info("[v95.10] 🔧 Initializing cross-repo integration systems...")
+
+        # Initialize in order (some depend on others)
+        await self._initialize_unified_config()
+        await self._initialize_security_context()
+        await self._initialize_unified_logging()
+        await self._initialize_error_propagation()
+        await self._initialize_state_sync()
+        await self._initialize_resource_coordination()
+        await self._initialize_version_compatibility()
+        await self._initialize_metrics_collection()
+
+        logger.info("[v95.10] ✅ All cross-repo integration systems initialized")
+
+    def get_cross_repo_integration_status(self) -> Dict[str, Any]:
+        """Get status of all cross-repo integration systems."""
+        return {
+            "config": {
+                "enabled": True,
+                "sources": list(self._config_sources.keys()),
+                "watchers": len(self._config_watchers),
+            },
+            "logging": {
+                "enabled": self._log_correlation_enabled,
+                "buffer_size": len(self._log_aggregation_buffer),
+            },
+            "metrics": {
+                "enabled": self._metrics_enabled,
+                "collectors": len(self._metrics_collectors),
+                "registered_metrics": len(self._metrics_registry),
+            },
+            "error_propagation": {
+                "enabled": self._error_propagation_enabled,
+                "error_count": len(self._error_registry),
+                "handlers": len(self._error_handlers),
+            },
+            "state_sync": {
+                "enabled": self._state_sync_enabled,
+                "keys": len(self._shared_state),
+                "subscribers": sum(len(s) for s in self._state_subscribers.values()),
+            },
+            "resource_coordination": {
+                "enabled": self._resource_coordination_enabled,
+                "resources": len(self._resource_limits),
+                "allocations": len(self._resource_registry),
+            },
+            "version_compatibility": {
+                "enabled": self._version_check_enabled,
+                "versions": self._version_registry,
+            },
+            "security": {
+                "enabled": self._security_context_enabled,
+                "session_id": self._security_context.get("session_id", "")[:8] + "...",
+                "authenticated_services": len(self._security_tokens),
             },
             "timestamp": time.time(),
         }
@@ -9296,6 +10993,9 @@ echo "=== JARVIS Prime started ==="
 
         # v95.5: Initialize graceful degradation infrastructure
         await self._initialize_graceful_degradation()
+
+        # v95.10: Initialize cross-repo integration systems
+        await self._initialize_cross_repo_integration()
 
         # v93.0: CRITICAL - Ensure all required directories exist FIRST
         # This prevents "No such file or directory" errors throughout startup
