@@ -481,6 +481,7 @@ warnings.filterwarnings(
 
 
 # v95.0: Custom logging filter for benign ML framework messages
+# v95.1: Extended to cover DEBUG messages and more patterns
 class BenignWarningFilter(logging.Filter):
     """
     Advanced filter to suppress known benign warnings from ML frameworks.
@@ -489,6 +490,7 @@ class BenignWarningFilter(logging.Filter):
     - "Wav2Vec2Model is frozen" = Model frozen for inference (correct behavior)
     - "Some weights not initialized" = Expected for fine-tuned models
     - "You should probably TRAIN" = Irrelevant for inference-only usage
+    - "Registered checkpoint" = DEBUG noise from SpeechBrain
     """
 
     _SUPPRESSED_PATTERNS = [
@@ -499,6 +501,17 @@ class BenignWarningFilter(logging.Filter):
         'some weights of the model checkpoint',
         'initializing bert',
         'initializing wav2vec',
+        # SpeechBrain DEBUG noise (v95.1)
+        'registered checkpoint',
+        'checkpoint save hook',
+        'checkpoint load hook',
+        # Google API version warnings (v95.1)
+        'non-supported python version',
+        'google will not post any further updates',
+        # Optional dependencies (v95.1)
+        'gspread not available',
+        'redis not available',
+        'install with: pip install',
     ]
 
     def filter(self, record: logging.LogRecord) -> bool:

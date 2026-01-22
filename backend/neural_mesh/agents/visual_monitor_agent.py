@@ -169,18 +169,25 @@ except ImportError:
     logger.warning("MultiSpaceWindowDetector not available - multi-space watching disabled")
 
 # v25.0: Ghost Display Manager for Shadow Monitor infrastructure
-try:
-    from backend.vision.yabai_space_detector import (
-        GhostDisplayManager,
-        GhostDisplayStatus,
-        WindowLayoutStyle,
-        get_ghost_manager,
-    )
-    GHOST_MANAGER_AVAILABLE = True
-    logger.info("[VisualMonitor] ✅ GhostDisplayManager available for Shadow Monitor")
-except ImportError as e:
-    GHOST_MANAGER_AVAILABLE = False
-    logger.warning(f"[VisualMonitor] GhostDisplayManager not available: {e}")
+# v95.0: Lazy import to prevent circular import during startup
+GHOST_MANAGER_AVAILABLE = False
+_ghost_manager_module = None
+
+def _lazy_import_ghost_manager():
+    """v95.0: Lazy import to avoid circular import on module load."""
+    global GHOST_MANAGER_AVAILABLE, _ghost_manager_module
+    if _ghost_manager_module is not None:
+        return GHOST_MANAGER_AVAILABLE
+
+    try:
+        from backend.vision import yabai_space_detector as ysm
+        _ghost_manager_module = ysm
+        GHOST_MANAGER_AVAILABLE = True
+        logger.info("[VisualMonitor] ✅ GhostDisplayManager available for Shadow Monitor")
+    except ImportError as e:
+        GHOST_MANAGER_AVAILABLE = False
+        logger.warning(f"[VisualMonitor] GhostDisplayManager not available: {e}")
+    return GHOST_MANAGER_AVAILABLE
 
 # v27.0: Adaptive Resource Governor for FPS throttling under load
 try:

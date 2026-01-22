@@ -3654,6 +3654,7 @@ echo "=== JARVIS Prime started ==="
 
     # v93.16: Patterns for warnings that should be suppressed
     # v95.0: Extended with more ML framework warnings
+    # v95.1: Added Google API, gspread, and asyncio patterns
     _SUPPRESSED_WARNING_PATTERNS = [
         # Scikit-learn version warnings
         'scikit-learn version',
@@ -3676,6 +3677,7 @@ echo "=== JARVIS Prime started ==="
         'weights were not initialized',
         'you should probably train',
         'some weights of the model checkpoint',
+        'registered checkpoint',
         # TensorFlow warnings
         'tf_cpp_min_log_level',
         # Transformers/Tokenizers warnings
@@ -3685,8 +3687,26 @@ echo "=== JARVIS Prime started ==="
         # NumPy/SciPy warnings
         'numpy.ndarray size changed',
         'scipy.ndimage',
+        # Google API/GCP warnings (v95.1)
+        'non-supported python version',
+        'google will not post any further updates',
+        'please upgrade to the latest python version',
+        'google.api_core',
+        # Optional dependencies not installed (v95.1)
+        'gspread not available',
+        'redis not available',
+        'pip install',
+        # aiohttp/asyncio cleanup warnings (v95.1)
+        'unclosed client session',
+        'unclosed connector',
+        'event loop is closed',
+        # Thread pool shutdown warnings (v95.1)
+        'thread pool',
+        'cannot schedule new futures',
+        'interpreter shutdown',
         # General benign patterns
         'futurewarning',
+        'deprecationwarning',
     ]
 
     def _should_suppress_line(self, line: str) -> bool:
