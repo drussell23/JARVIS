@@ -10649,16 +10649,63 @@ class TrinityUnifiedOrchestrator:
                                     age = time.time() - max(registered_at, last_heartbeat)
 
                                     if age <= 60.0:
-                                        registry_confirmed = True
-                                        verification_result["phase_2_registry_confirmed"] = True
-                                        verification_result["registered_at"] = time.time()
-                                        verification_result["pid"] = service_info.get("pid")
+                                        # v96.0: Enhanced process identity validation
+                                        # Check if the registered PID still matches the expected process
+                                        process_valid = True
+                                        validation_reason = ""
 
-                                        logger.info(
-                                            f"[Registration] ✅ Phase 2: {component} "
-                                            f"registered in service registry (name: {reg_name})"
-                                        )
-                                        break
+                                        service_pid = service_info.get("pid")
+                                        process_start_time = service_info.get("process_start_time", 0.0)
+                                        process_name = service_info.get("process_name", "")
+
+                                        if service_pid:
+                                            try:
+                                                import psutil
+                                                if psutil.pid_exists(service_pid):
+                                                    proc = psutil.Process(service_pid)
+
+                                                    # Validate process start time (PID reuse detection)
+                                                    if process_start_time > 0:
+                                                        actual_start_time = proc.create_time()
+                                                        time_diff = abs(actual_start_time - process_start_time)
+                                                        if time_diff > 2.0:  # Allow 2s tolerance
+                                                            process_valid = False
+                                                            validation_reason = f"PID reused (start time mismatch: {time_diff:.1f}s)"
+
+                                                    # Validate process name if available
+                                                    if process_valid and process_name:
+                                                        actual_name = proc.name()
+                                                        if process_name != actual_name:
+                                                            process_valid = False
+                                                            validation_reason = f"Process name mismatch: {actual_name} vs {process_name}"
+                                                else:
+                                                    process_valid = False
+                                                    validation_reason = f"PID {service_pid} no longer exists"
+                                            except Exception as e:
+                                                logger.debug(f"[Registration] Process validation error: {e}")
+                                                # Continue without validation on error
+
+                                        if process_valid:
+                                            registry_confirmed = True
+                                            verification_result["phase_2_registry_confirmed"] = True
+                                            verification_result["registered_at"] = time.time()
+                                            verification_result["pid"] = service_pid
+                                            # v96.0: Include port tracking info
+                                            verification_result["port"] = service_info.get("port")
+                                            verification_result["is_fallback_port"] = service_info.get("is_fallback_port", False)
+                                            verification_result["primary_port"] = service_info.get("primary_port", 0)
+
+                                            logger.info(
+                                                f"[Registration] ✅ Phase 2: {component} "
+                                                f"registered in service registry (name: {reg_name})"
+                                            )
+                                            break
+                                        else:
+                                            logger.warning(
+                                                f"[Registration] ⚠️  Phase 2: {component} "
+                                                f"registry entry invalid: {validation_reason}"
+                                            )
+                                            # Don't break - try other registry names
                     except json.JSONDecodeError as e:
                         logger.debug(f"[Registration] Registry parse error: {e}")
                     except Exception as e:

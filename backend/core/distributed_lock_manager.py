@@ -59,7 +59,7 @@ import time
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import AsyncIterator, Optional
+from typing import AsyncIterator, Optional, Tuple
 from uuid import uuid4
 
 import aiofiles
@@ -101,12 +101,39 @@ class LockConfig:
 
 @dataclass
 class LockMetadata:
-    """Metadata stored in lock file."""
+    """
+    v96.0: Enhanced metadata stored in lock file.
+
+    CRITICAL FIX for Problem 19 (Startup lock not released on crash):
+    - Added process_start_time for PID reuse detection
+    - Added process_name and process_cmdline for identity validation
+    - Added machine_id for distributed environments
+    - Enhanced stale detection with multiple signals
+
+    Lock File Format (v96.0):
+    {
+        "acquired_at": 1736895345.123,
+        "expires_at": 1736895355.123,
+        "owner": "jarvis-12345-1736895300.5",  # pid-process_start_time
+        "token": "f47ac10b-58cc-4372-a567...",
+        "lock_name": "vbia_events",
+        "process_start_time": 1736895300.5,  # v96.0
+        "process_name": "python3",            # v96.0
+        "process_cmdline": "python3 -m ...",  # v96.0
+        "machine_id": "darwin-hostname"       # v96.0
+    }
+    """
     acquired_at: float  # Timestamp when lock was acquired
     expires_at: float  # Timestamp when lock expires (acquired_at + TTL)
-    owner: str  # Process identifier (e.g., "jarvis-core-pid-12345")
+    owner: str  # Process identifier (e.g., "jarvis-{pid}-{start_time}")
     token: str  # Unique token for this lock instance
     lock_name: str  # Name of the locked resource
+
+    # v96.0: Enhanced process tracking for PID reuse detection
+    process_start_time: float = 0.0    # Process creation timestamp
+    process_name: str = ""              # Process name (e.g., "python3")
+    process_cmdline: str = ""           # Command line (truncated)
+    machine_id: str = ""                # Machine identifier
 
     def is_expired(self) -> bool:
         """Check if lock has expired."""
@@ -120,6 +147,35 @@ class LockMetadata:
         """Get remaining time before expiration (negative if expired)."""
         return self.expires_at - time.time()
 
+    def get_pid(self) -> int:
+        """
+        v96.0: Extract PID from owner string.
+
+        Supports both old format "jarvis-{pid}" and new format "jarvis-{pid}-{start_time}".
+        """
+        try:
+            parts = self.owner.split("-")
+            if len(parts) >= 2:
+                return int(parts[1])
+        except (ValueError, IndexError):
+            pass
+        return 0
+
+    def get_owner_start_time(self) -> float:
+        """
+        v96.0: Extract process start time from owner string.
+
+        Returns 0.0 if using old format without start time.
+        """
+        try:
+            parts = self.owner.split("-")
+            if len(parts) >= 3:
+                return float(parts[2])
+        except (ValueError, IndexError):
+            pass
+        # Fall back to stored process_start_time
+        return self.process_start_time
+
 
 # =============================================================================
 # Distributed Lock Manager
@@ -127,7 +183,7 @@ class LockMetadata:
 
 class DistributedLockManager:
     """
-    v93.0: Production-grade distributed lock manager for cross-repo coordination.
+    v96.0: Production-grade distributed lock manager for cross-repo coordination.
 
     Features:
     - Automatic lock expiration (TTL-based)
@@ -138,17 +194,67 @@ class DistributedLockManager:
     - v93.0: Aggressive pre-cleanup on initialization
     - v93.0: PID validation for stale lock detection
     - v93.0: Faster acquisition with optimistic locking
+    - v96.0: Process start time tracking for PID reuse detection (Problem 19 fix)
+    - v96.0: Process fingerprint in lock metadata
+    - v96.0: Machine ID tracking for distributed environments
+    - v96.0: Enhanced owner ID format: "jarvis-{pid}-{start_time}"
+
+    CRITICAL FIX (v96.0) - Problem 19: Startup lock not released on crash
+    ════════════════════════════════════════════════════════════════════════
+    Before: Process crash → PID reused → stale lock appears valid → deadlock
+    After: Process start time validated → PID reuse detected → stale lock cleaned
     """
 
     def __init__(self, config: Optional[LockConfig] = None):
         """Initialize distributed lock manager."""
         self.config = config or LockConfig()
         self._cleanup_task: Optional[asyncio.Task] = None
-        self._owner_id = f"jarvis-{os.getpid()}"
+
+        # v96.0: Enhanced owner ID with process start time for PID reuse detection
+        self._process_start_time = self._get_own_process_start_time()
+        self._owner_id = f"jarvis-{os.getpid()}-{self._process_start_time:.1f}"
+        self._process_name = self._get_own_process_name()
+        self._process_cmdline = self._get_own_process_cmdline()
+        self._machine_id = self._get_machine_id()
+
         self._initialized = False
         self._init_lock = asyncio.Lock()
 
-        logger.info(f"Distributed Lock Manager v93.0 initialized (owner: {self._owner_id})")
+        logger.info(f"Distributed Lock Manager v96.0 initialized (owner: {self._owner_id})")
+
+    def _get_own_process_start_time(self) -> float:
+        """v96.0: Get our own process start time for owner ID."""
+        try:
+            import psutil
+            return psutil.Process(os.getpid()).create_time()
+        except Exception:
+            return time.time()  # Fallback to current time
+
+    def _get_own_process_name(self) -> str:
+        """v96.0: Get our own process name for lock metadata."""
+        try:
+            import psutil
+            return psutil.Process(os.getpid()).name()
+        except Exception:
+            return "unknown"
+
+    def _get_own_process_cmdline(self) -> str:
+        """v96.0: Get our own command line for lock metadata (truncated)."""
+        try:
+            import psutil
+            cmdline = psutil.Process(os.getpid()).cmdline()
+            return " ".join(cmdline)[:500] if cmdline else ""
+        except Exception:
+            return ""
+
+    def _get_machine_id(self) -> str:
+        """v96.0: Get machine identifier for distributed environments."""
+        try:
+            import platform
+            import socket
+            return f"{platform.system().lower()}-{socket.gethostname()}"
+        except Exception:
+            return "unknown"
 
     async def initialize(self) -> None:
         """
@@ -311,14 +417,19 @@ class DistributedLockManager:
                         )
                         return False
 
-            # Create new lock
+            # v96.0: Create new lock with enhanced metadata for PID reuse detection
             now = time.time()
             metadata = LockMetadata(
                 acquired_at=now,
                 expires_at=now + ttl,
                 owner=self._owner_id,
                 token=token,
-                lock_name=lock_name
+                lock_name=lock_name,
+                # v96.0: Process fingerprint for identity validation
+                process_start_time=self._process_start_time,
+                process_name=self._process_name,
+                process_cmdline=self._process_cmdline,
+                machine_id=self._machine_id,
             )
 
             # Write lock file atomically (with fsync for durability)
@@ -378,11 +489,27 @@ class DistributedLockManager:
     # =========================================================================
 
     async def _read_lock_metadata(self, lock_file: Path) -> Optional[LockMetadata]:
-        """Read and parse lock metadata from file."""
+        """
+        v96.0: Read and parse lock metadata from file with backward compatibility.
+
+        Handles both old format (without v96.0 fields) and new format (with process fingerprint).
+        """
         try:
             async with aiofiles.open(lock_file, 'r') as f:
                 data = await f.read()
                 metadata_dict = json.loads(data)
+
+                # v96.0: Handle legacy lock files without new fields
+                # Set default values for missing fields to maintain backward compatibility
+                if "process_start_time" not in metadata_dict:
+                    metadata_dict["process_start_time"] = 0.0
+                if "process_name" not in metadata_dict:
+                    metadata_dict["process_name"] = ""
+                if "process_cmdline" not in metadata_dict:
+                    metadata_dict["process_cmdline"] = ""
+                if "machine_id" not in metadata_dict:
+                    metadata_dict["machine_id"] = ""
+
                 return LockMetadata(**metadata_dict)
         except FileNotFoundError:
             return None
@@ -390,6 +517,28 @@ class DistributedLockManager:
             logger.error(f"Corrupted lock file: {lock_file} (will remove)")
             await self._remove_lock_file(lock_file)
             return None
+        except TypeError as e:
+            # v96.0: Handle unknown fields from newer lock format gracefully
+            logger.debug(f"Lock file has unknown fields: {lock_file} - {e}")
+            try:
+                # Try reading with only known fields
+                async with aiofiles.open(lock_file, 'r') as f:
+                    data = await f.read()
+                    metadata_dict = json.loads(data)
+                    # Extract only the fields we know about
+                    return LockMetadata(
+                        acquired_at=metadata_dict.get("acquired_at", 0.0),
+                        expires_at=metadata_dict.get("expires_at", 0.0),
+                        owner=metadata_dict.get("owner", ""),
+                        token=metadata_dict.get("token", ""),
+                        lock_name=metadata_dict.get("lock_name", ""),
+                        process_start_time=metadata_dict.get("process_start_time", 0.0),
+                        process_name=metadata_dict.get("process_name", ""),
+                        process_cmdline=metadata_dict.get("process_cmdline", ""),
+                        machine_id=metadata_dict.get("machine_id", ""),
+                    )
+            except Exception:
+                return None
         except Exception as e:
             logger.error(f"Error reading lock metadata {lock_file}: {e}")
             return None
@@ -457,34 +606,61 @@ class DistributedLockManager:
                 logger.error(f"Error removing lock file {lock_file}: {e}")
 
     # =========================================================================
-    # v93.0: Advanced Cleanup with PID Validation
+    # v96.0: Advanced Cleanup with PID Reuse Detection
     # =========================================================================
 
-    def _is_process_alive(self, owner_id: str) -> bool:
+    def _is_process_alive(
+        self,
+        owner_id: str,
+        lock_metadata: Optional[LockMetadata] = None,
+    ) -> bool:
         """
-        v93.0: Check if the process that owns a lock is still alive.
+        v96.0: Check if the process that owns a lock is still alive.
 
-        Extracts PID from owner ID (format: "jarvis-{pid}") and validates.
+        CRITICAL FIX for Problem 19 (PID reuse detection):
+        - Extracts PID from owner ID
+        - Validates process start time against stored value
+        - Detects PID reuse and treats as stale lock
 
         Args:
-            owner_id: Lock owner identifier
+            owner_id: Lock owner identifier (format: "jarvis-{pid}-{start_time}")
+            lock_metadata: Optional metadata for additional validation
 
         Returns:
-            True if process is alive, False if dead or unable to determine
+            True if process is alive AND matches stored identity
+            False if dead, PID reused, or unable to determine
 
-        v93.0 FIX: Previously returned True on any unexpected exception,
-        which caused stale locks to persist forever. Now uses more
-        conservative logic that assumes dead unless proven alive.
+        Validation Phases:
+        ┌─────────────────────────────────────────────────────────────────────┐
+        │ Phase 1: PID Extraction                                             │
+        │   - Parse owner_id for PID                                          │
+        │   - Handle both old "jarvis-{pid}" and new "jarvis-{pid}-{start}"  │
+        ├─────────────────────────────────────────────────────────────────────┤
+        │ Phase 2: Process Existence Check                                    │
+        │   - Use signal 0 to check if PID exists                            │
+        │   - Handle permission errors                                        │
+        ├─────────────────────────────────────────────────────────────────────┤
+        │ Phase 3: PID Reuse Detection (v96.0 CRITICAL FIX)                  │
+        │   - Compare process start time with stored value                    │
+        │   - If mismatch > 1s, PID was reused → treat as stale             │
+        │   - Optionally validate process name/cmdline                        │
+        └─────────────────────────────────────────────────────────────────────┘
         """
+        import psutil
+
         try:
-            # Extract PID from owner_id (format: "jarvis-{pid}")
+            # ═══════════════════════════════════════════════════════════════
+            # Phase 1: PID Extraction
+            # ═══════════════════════════════════════════════════════════════
             if "-" not in owner_id:
                 logger.debug(f"Cannot extract PID from owner_id: {owner_id}")
-                return True  # Can't validate, assume alive
+                return True  # Can't validate, assume alive (conservative)
 
-            pid_str = owner_id.split("-")[-1]
+            parts = owner_id.split("-")
+
+            # Extract PID (always second part)
             try:
-                pid = int(pid_str)
+                pid = int(parts[1]) if len(parts) >= 2 else 0
             except ValueError:
                 logger.debug(f"Invalid PID in owner_id: {owner_id}")
                 return False  # Invalid PID format = dead process
@@ -493,32 +669,159 @@ class DistributedLockManager:
                 logger.debug(f"Invalid PID value: {pid}")
                 return False  # Invalid PID = dead process
 
-            # Check if process exists using signal 0
-            os.kill(pid, 0)
-            return True  # Process exists
+            # v96.0: Extract stored start time from owner_id (third part)
+            stored_start_time = 0.0
+            if len(parts) >= 3:
+                try:
+                    stored_start_time = float(parts[2])
+                except ValueError:
+                    pass
 
-        except ProcessLookupError:
-            # Process doesn't exist - ESRCH
-            return False
-        except PermissionError:
-            # Process exists but we can't signal it (different user)
-            # This is actually a valid live process
+            # Fall back to metadata if owner_id doesn't have start time
+            if stored_start_time == 0.0 and lock_metadata:
+                stored_start_time = lock_metadata.process_start_time
+
+            # ═══════════════════════════════════════════════════════════════
+            # Phase 2: Process Existence Check
+            # ═══════════════════════════════════════════════════════════════
+            try:
+                os.kill(pid, 0)
+                # Process exists - continue to Phase 3
+            except ProcessLookupError:
+                # Process doesn't exist - definitely dead
+                logger.debug(f"[v96.0] Process {pid} does not exist (ProcessLookupError)")
+                return False
+            except PermissionError:
+                # Process exists but we can't signal it (different user)
+                # Continue to Phase 3 for start time validation
+                pass
+            except OSError as e:
+                import errno
+                if e.errno == errno.ESRCH:  # No such process
+                    return False
+                elif e.errno == errno.EPERM:  # Permission denied
+                    pass  # Process exists, continue to Phase 3
+                else:
+                    logger.debug(f"OSError checking PID {pid}: {e}")
+                    return False  # Conservative: assume dead
+
+            # ═══════════════════════════════════════════════════════════════
+            # Phase 3: PID Reuse Detection (v96.0 CRITICAL FIX)
+            # ═══════════════════════════════════════════════════════════════
+            if stored_start_time > 0.0:
+                try:
+                    process = psutil.Process(pid)
+                    current_start_time = process.create_time()
+
+                    # Allow 1 second tolerance for timing differences
+                    time_diff = abs(current_start_time - stored_start_time)
+                    if time_diff > 1.0:
+                        logger.info(
+                            f"[v96.0] PID REUSE DETECTED for {owner_id}: "
+                            f"stored_start={stored_start_time:.1f}, "
+                            f"current_start={current_start_time:.1f}, "
+                            f"diff={time_diff:.1f}s"
+                        )
+                        return False  # PID was reused → stale lock
+
+                    # v96.0: Optional process name validation
+                    if lock_metadata and lock_metadata.process_name:
+                        current_name = process.name()
+                        if current_name != lock_metadata.process_name:
+                            logger.info(
+                                f"[v96.0] Process NAME MISMATCH for PID {pid}: "
+                                f"expected={lock_metadata.process_name}, "
+                                f"actual={current_name}"
+                            )
+                            return False  # Different process → stale lock
+
+                except psutil.NoSuchProcess:
+                    logger.debug(f"[v96.0] Process {pid} gone during validation")
+                    return False
+                except psutil.AccessDenied:
+                    # Can't validate start time, assume process is valid
+                    logger.debug(f"[v96.0] Access denied validating PID {pid}")
+                    pass
+                except Exception as e:
+                    logger.debug(f"[v96.0] Error validating PID {pid}: {e}")
+                    pass
+
+            # Process exists and passed all validation checks
             return True
-        except OSError as e:
-            import errno
-            if e.errno == errno.ESRCH:  # No such process
-                return False
-            elif e.errno == errno.EPERM:  # Permission denied (process exists)
-                return True
-            else:
-                # Other OSError - log and assume dead (conservative approach)
-                logger.debug(f"OSError checking PID from {owner_id}: {e}")
-                return False
+
         except Exception as e:
             # v93.0: Log unexpected errors instead of silently assuming alive
             logger.warning(f"Unexpected error checking process {owner_id}: {e}")
             # Conservative approach: assume dead to prevent stale lock accumulation
             return False
+
+    def _validate_lock_owner_identity(
+        self,
+        metadata: LockMetadata,
+    ) -> Tuple[bool, str]:
+        """
+        v96.0: Comprehensive validation of lock owner identity.
+
+        This is used during lock acquisition to determine if an existing lock
+        is still valid or should be removed as stale.
+
+        Args:
+            metadata: Lock metadata to validate
+
+        Returns:
+            Tuple of (is_valid: bool, reason: str)
+        """
+        import psutil
+
+        pid = metadata.get_pid()
+        if pid <= 0:
+            return False, "invalid_pid"
+
+        # Check if process exists
+        try:
+            process = psutil.Process(pid)
+            if not process.is_running():
+                return False, "process_not_running"
+
+            if process.status() == psutil.STATUS_ZOMBIE:
+                return False, "zombie_process"
+
+        except psutil.NoSuchProcess:
+            return False, "process_not_found"
+        except psutil.AccessDenied:
+            # Process exists but can't inspect - assume valid
+            return True, "access_denied_assumed_valid"
+
+        # Validate start time
+        stored_start_time = metadata.get_owner_start_time()
+        if stored_start_time > 0.0:
+            try:
+                current_start_time = process.create_time()
+                time_diff = abs(current_start_time - stored_start_time)
+                if time_diff > 1.0:
+                    return False, f"pid_reused:time_diff={time_diff:.1f}s"
+            except (psutil.AccessDenied, psutil.NoSuchProcess):
+                pass
+
+        # Validate process name
+        if metadata.process_name:
+            try:
+                current_name = process.name()
+                if current_name != metadata.process_name:
+                    return False, f"name_mismatch:{metadata.process_name}!={current_name}"
+            except (psutil.AccessDenied, psutil.NoSuchProcess):
+                pass
+
+        # Validate machine ID (for distributed setups)
+        if metadata.machine_id and metadata.machine_id != self._machine_id:
+            # Different machine - can't validate PID, but lock may be valid
+            # Check TTL instead
+            if metadata.is_expired():
+                return False, "expired_remote_lock"
+            # Assume valid if not expired (distributed scenario)
+            return True, "remote_lock_not_expired"
+
+        return True, "identity_verified"
 
     async def _aggressive_stale_cleanup(self) -> int:
         """
@@ -565,17 +868,26 @@ class DistributedLockManager:
                     reason = f"expired {-metadata.time_remaining():.1f}s ago"
 
                 # Check 2: Owner process is dead (even if not expired yet)
-                elif not self._is_process_alive(metadata.owner):
+                # v96.0: Pass metadata for enhanced PID reuse detection
+                elif not self._is_process_alive(metadata.owner, metadata):
                     should_clean = True
                     reason = f"owner process dead (was {metadata.owner})"
 
-                # Check 3: Lock is our own from a previous run (same PID reused)
-                elif metadata.owner == self._owner_id:
-                    # Same PID as us - this is a stale lock from a previous run
-                    # that got the same PID (process recycling)
-                    if metadata.acquired_at < time.time() - 60:  # More than 1 min old
+                # Check 3: v96.0 Enhanced - Validate lock owner identity comprehensively
+                else:
+                    is_valid, validation_reason = self._validate_lock_owner_identity(metadata)
+                    if not is_valid:
                         should_clean = True
-                        reason = "own stale lock from previous run"
+                        reason = f"identity validation failed: {validation_reason}"
+                    # Also check for our own stale lock from previous run
+                    elif metadata.owner == self._owner_id:
+                        # Same owner ID as us - check if this is truly our lock
+                        # or a stale lock from a previous run that got same PID + start_time collision
+                        if metadata.acquired_at < time.time() - 60:  # More than 1 min old
+                            # If lock was acquired more than 60s ago but we just started,
+                            # this is definitely stale
+                            should_clean = True
+                            reason = "own stale lock from previous run"
 
                 if should_clean:
                     logger.info(
@@ -639,13 +951,23 @@ class DistributedLockManager:
                     )
                     should_clean = True
 
-                # v93.0: Also check if owner process is dead
-                elif not self._is_process_alive(metadata.owner):
+                # v96.0: Enhanced - Check if owner process is dead with PID reuse detection
+                elif not self._is_process_alive(metadata.owner, metadata):
                     logger.warning(
                         f"Cleaning orphaned lock: {metadata.lock_name} "
                         f"(owner process {metadata.owner} is dead)"
                     )
                     should_clean = True
+
+                # v96.0: Also validate lock owner identity comprehensively
+                else:
+                    is_valid, validation_reason = self._validate_lock_owner_identity(metadata)
+                    if not is_valid:
+                        logger.warning(
+                            f"Cleaning invalid lock: {metadata.lock_name} "
+                            f"(identity validation failed: {validation_reason})"
+                        )
+                        should_clean = True
 
                 if should_clean:
                     await self._remove_lock_file(lock_file)
@@ -674,6 +996,10 @@ class DistributedLockManager:
         if not metadata:
             return None
 
+        # v96.0: Include identity validation in status
+        is_valid, validation_reason = self._validate_lock_owner_identity(metadata)
+        is_alive = self._is_process_alive(metadata.owner, metadata)
+
         return {
             "lock_name": metadata.lock_name,
             "owner": metadata.owner,
@@ -681,7 +1007,13 @@ class DistributedLockManager:
             "expires_at": metadata.expires_at,
             "time_remaining": metadata.time_remaining(),
             "is_expired": metadata.is_expired(),
-            "is_stale": metadata.is_stale()
+            "is_stale": metadata.is_stale(),
+            # v96.0: Enhanced validation fields
+            "owner_alive": is_alive,
+            "identity_valid": is_valid,
+            "validation_reason": validation_reason,
+            "process_name": metadata.process_name,
+            "machine_id": metadata.machine_id,
         }
 
     async def list_all_locks(self) -> list[dict]:

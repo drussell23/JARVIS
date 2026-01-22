@@ -441,19 +441,31 @@ class TrinityBridge:
             self._service_registry = get_service_registry()
             await self._service_registry.start_cleanup_task()
 
-            # Register JARVIS Body
+            # Register JARVIS Body with v96.0 enhanced fields
+            # Determine configured port vs actual port
+            import os as os_module
+            configured_port = int(os_module.getenv("JARVIS_PORT", "8080"))
+            actual_port = self.config.jarvis_port
+            is_fallback = actual_port != configured_port
+
             await self._service_registry.register_service(
                 service_name="jarvis-body",
                 pid=os.getpid(),
-                port=self.config.jarvis_port,
+                port=actual_port,
                 health_endpoint="/health",
                 metadata={
                     "version": "4.0.0",
                     "role": "orchestrator"
-                }
+                },
+                # v96.0: Port fallback tracking
+                primary_port=configured_port,
+                is_fallback_port=is_fallback,
+                fallback_reason=f"Port {configured_port} unavailable" if is_fallback else "",
+                ports_tried=[configured_port] if is_fallback else [],
             )
 
-            logger.info("  Service Registry started")
+            fallback_msg = f" (fallback from {configured_port})" if is_fallback else ""
+            logger.info(f"  [v96.0] Service Registry started - jarvis-body on port {actual_port}{fallback_msg}")
 
         except Exception as e:
             logger.error(f"Failed to start service registry: {e}")

@@ -1976,15 +1976,73 @@ class ProcessOrchestrator:
                     sock_read=10,
                 )
 
+                # v95.5: Add trace headers for distributed tracing
+                trace_headers = self.get_trace_headers()
+
                 self._http_session = aiohttp.ClientSession(
                     connector=connector,
                     timeout=timeout,
                     raise_for_status=False,
+                    headers=trace_headers,  # v95.5: Include correlation headers in all requests
                 )
 
-                logger.debug("[v93.11] Shared HTTP session initialized with connection pooling")
+                logger.debug(f"[v93.11] Shared HTTP session initialized with connection pooling and trace headers: {trace_headers.get('X-Correlation-ID', 'none')}")
 
             return self._http_session
+
+    async def _traced_request(
+        self,
+        method: str,
+        url: str,
+        span_name: Optional[str] = None,
+        **kwargs
+    ) -> Any:
+        """
+        v95.5: Make HTTP request with distributed tracing.
+
+        Automatically adds correlation headers and creates a trace span
+        for the request.
+
+        Args:
+            method: HTTP method (GET, POST, etc.)
+            url: Request URL
+            span_name: Optional span name (defaults to method + url path)
+            **kwargs: Additional aiohttp request arguments
+
+        Returns:
+            aiohttp.ClientResponse
+        """
+        session = await self._get_http_session()
+
+        # Create span for this request
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        if span_name is None:
+            span_name = f"http_{method.lower()}_{parsed.netloc}"
+
+        span_id = await self._create_span(span_name, metadata={
+            "method": method,
+            "url": url,
+            "host": parsed.netloc,
+        })
+
+        # Add trace headers to request
+        headers = kwargs.pop("headers", {})
+        headers.update(self.get_trace_headers())
+        headers["X-Span-ID"] = span_id
+
+        try:
+            response = await session.request(method, url, headers=headers, **kwargs)
+
+            # End span with status
+            status = "success" if response.status < 400 else "error"
+            await self._end_span(span_id, status=status, error_message=f"HTTP {response.status}" if status == "error" else None)
+
+            return response
+
+        except Exception as e:
+            await self._end_span(span_id, status="error", error_message=str(e))
+            raise
 
     async def _close_http_session(self) -> None:
         """
@@ -6398,6 +6456,9 @@ echo "=== JARVIS Prime started ==="
                     logger.error(
                         f"[v95.1] Cannot start {service_name}: dependencies not ready"
                     )
+                    # v95.5: Publish failed event for dependency timeout
+                    await self._end_span(service_span, status="error", error_message="dependencies_not_ready")
+                    await self.publish_service_lifecycle_event(service_name, "failed", {"error": "dependencies_not_ready"})
                     return service_name, False, "dependencies_not_ready"
 
             # ==================================================================
@@ -6416,6 +6477,9 @@ echo "=== JARVIS Prime started ==="
                     f"[v95.1] {service_name}: Semaphore timeout after {semaphore_timeout}s "
                     f"(other services blocking startup slots)"
                 )
+                # v95.5: Publish failed event for semaphore timeout
+                await self._end_span(service_span, status="error", error_message="semaphore_timeout")
+                await self.publish_service_lifecycle_event(service_name, "failed", {"error": "semaphore_timeout"})
                 return service_name, False, f"semaphore_timeout_{semaphore_timeout}s"
 
             try:
@@ -6428,6 +6492,9 @@ echo "=== JARVIS Prime started ==="
                     existing = await self.registry.discover_service(service_name)
                     if existing:
                         reason = f"already running (PID: {existing.pid}, Port: {existing.port})"
+                        # v95.5: Service already running, publish ready event
+                        await self._end_span(service_span, status="success")
+                        await self.publish_service_lifecycle_event(service_name, "ready", {"mode": "existing"})
                         return service_name, True, reason
 
                 # Step 2: HTTP probe using shared session
@@ -6441,6 +6508,9 @@ echo "=== JARVIS Prime started ==="
                     ) as resp:
                         if resp.status == 200:
                             reason = f"already running at port {definition.default_port}"
+                            # v95.5: Service already running, publish ready event
+                            await self._end_span(service_span, status="success")
+                            await self.publish_service_lifecycle_event(service_name, "ready", {"mode": "existing_http"})
                             return service_name, True, reason
                 except Exception:
                     pass  # Service not running, need to start
@@ -6477,6 +6547,9 @@ echo "=== JARVIS Prime started ==="
                             }
                         )
 
+                    # v95.5: Publish ready event for Docker service
+                    await self._end_span(service_span, status="success")
+                    await self.publish_service_lifecycle_event(service_name, "ready", {"mode": "docker"})
                     return service_name, True, f"Docker container ({docker_reason})"
 
                 # Step 4: Spawn local process
@@ -6486,8 +6559,14 @@ echo "=== JARVIS Prime started ==="
                 success = await self._spawn_service(managed)
 
                 if success:
+                    # v95.5: Publish ready event for local process
+                    await self._end_span(service_span, status="success")
+                    await self.publish_service_lifecycle_event(service_name, "ready", {"mode": "local"})
                     return service_name, True, "local process"
                 else:
+                    # v95.5: Publish failed event
+                    await self._end_span(service_span, status="error", error_message="spawn failed")
+                    await self.publish_service_lifecycle_event(service_name, "failed", {"error": "spawn failed"})
                     return service_name, False, "spawn failed"
 
             finally:
@@ -6498,6 +6577,9 @@ echo "=== JARVIS Prime started ==="
 
         except Exception as e:
             logger.error(f"    ❌ {service_name} startup error: {e}")
+            # v95.5: End span with error status
+            await self._end_span(service_span, status="error", error_message=str(e))
+            await self.publish_service_lifecycle_event(service_name, "failed", {"error": str(e)})
             return service_name, False, f"error: {e}"
 
         finally:

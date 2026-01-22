@@ -208,6 +208,19 @@ class ServiceInfo:
 
     v4.0: Enhanced with process start time tracking to detect PID reuse,
     which can cause false-positive alive checks.
+
+    v96.0: CRITICAL ENHANCEMENTS for port fallback tracking and process validation:
+    ┌─────────────────────────────────────────────────────────────────────────┐
+    │ Problem 17 Fix: Port Fallback Confusion                                 │
+    │   - Tracks ACTUAL port vs configured PRIMARY port                       │
+    │   - Records port allocation history (which ports were tried)            │
+    │   - Fallback reason tracking for debugging                              │
+    ├─────────────────────────────────────────────────────────────────────────┤
+    │ Problem 18 Fix: Process Tree Validation                                 │
+    │   - Stores process fingerprint (name, cmdline, exe_path)                │
+    │   - Validates process identity before termination                       │
+    │   - Prevents killing wrong process on PID reuse                         │
+    └─────────────────────────────────────────────────────────────────────────┘
     """
     service_name: str
     pid: int
@@ -221,6 +234,21 @@ class ServiceInfo:
     # v4.0: Track process start time to detect PID reuse
     process_start_time: float = 0.0
 
+    # v96.0: Port fallback tracking (Problem 17 fix)
+    primary_port: int = 0           # Originally configured/requested port
+    is_fallback_port: bool = False  # True if using fallback, not primary
+    fallback_reason: str = ""       # Why fallback was needed (e.g., "port_in_use")
+    ports_tried: List = None        # History of ports attempted [port1, port2, ...]
+    port_allocation_time: float = 0.0  # When port was allocated
+
+    # v96.0: Process fingerprint for identity validation (Problem 18 fix)
+    process_name: str = ""          # Process name (e.g., "python3")
+    process_cmdline: str = ""       # Full command line
+    process_exe_path: str = ""      # Executable path
+    process_cwd: str = ""           # Working directory
+    parent_pid: int = 0             # Parent process ID
+    parent_name: str = ""           # Parent process name
+
     def __post_init__(self):
         if self.registered_at == 0.0:
             self.registered_at = time.time()
@@ -228,9 +256,20 @@ class ServiceInfo:
             self.last_heartbeat = time.time()
         if self.metadata is None:
             self.metadata = {}
+        if self.ports_tried is None:
+            self.ports_tried = []
         # v4.0: Capture process start time if not provided
         if self.process_start_time == 0.0:
             self.process_start_time = self._get_process_start_time()
+        # v96.0: Capture process fingerprint if not provided
+        if not self.process_name:
+            self._capture_process_fingerprint()
+        # v96.0: Set primary_port to port if not specified
+        if self.primary_port == 0:
+            self.primary_port = self.port
+        # v96.0: Record port allocation time
+        if self.port_allocation_time == 0.0:
+            self.port_allocation_time = time.time()
 
     def _get_process_start_time(self) -> float:
         """v4.0: Get the process start time for PID reuse detection."""
@@ -240,17 +279,245 @@ class ServiceInfo:
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
             return 0.0
 
+    def _capture_process_fingerprint(self) -> None:
+        """
+        v96.0: Capture comprehensive process fingerprint for identity validation.
+
+        This fingerprint is used to verify that when we try to manage (terminate,
+        signal, etc.) a process by PID, we're actually targeting the correct
+        process and not a different process that reused the same PID.
+        """
+        try:
+            process = psutil.Process(self.pid)
+
+            # Basic identity
+            self.process_name = process.name()
+            self.process_exe_path = process.exe() if process.exe() else ""
+            self.process_cwd = process.cwd() if process.cwd() else ""
+
+            # Command line (may be sensitive, truncate for safety)
+            try:
+                cmdline = process.cmdline()
+                self.process_cmdline = " ".join(cmdline)[:500] if cmdline else ""
+            except (psutil.AccessDenied, psutil.ZombieProcess):
+                self.process_cmdline = ""
+
+            # Parent process info for ancestry validation
+            try:
+                parent = process.parent()
+                if parent:
+                    self.parent_pid = parent.pid
+                    self.parent_name = parent.name()
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                pass
+
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            logger.debug(f"[v96.0] Could not capture fingerprint for PID {self.pid}")
+
+    def validate_process_identity(self) -> Tuple[bool, str]:
+        """
+        v96.0: Validate that the current process at self.pid matches our stored fingerprint.
+
+        This is CRITICAL for Problem 18 fix - prevents killing wrong processes when PIDs
+        are reused. Should be called BEFORE any process management operations.
+
+        Validation Phases:
+        ┌─────────────────────────────────────────────────────────────────────┐
+        │ Phase 1: Basic Existence Check                                      │
+        │   - Process with PID exists                                         │
+        │   - Process is not zombie                                           │
+        ├─────────────────────────────────────────────────────────────────────┤
+        │ Phase 2: Start Time Validation (PID Reuse Detection)                │
+        │   - Compare stored vs current process start time                    │
+        │   - 1-second tolerance for timing differences                       │
+        ├─────────────────────────────────────────────────────────────────────┤
+        │ Phase 3: Process Identity Validation                                │
+        │   - Compare process name (must match exactly)                       │
+        │   - Compare command line (JARVIS-specific patterns)                 │
+        │   - Compare executable path (if available)                          │
+        └─────────────────────────────────────────────────────────────────────┘
+
+        Returns:
+            Tuple of (identity_valid: bool, reason: str)
+        """
+        try:
+            process = psutil.Process(self.pid)
+
+            # Phase 1: Basic existence
+            if not process.is_running():
+                return False, "process_not_running"
+
+            if process.status() == psutil.STATUS_ZOMBIE:
+                return False, "process_is_zombie"
+
+            # Phase 2: Start time validation (strongest PID reuse detection)
+            if self.process_start_time > 0.0:
+                current_start_time = process.create_time()
+                time_diff = abs(current_start_time - self.process_start_time)
+                if time_diff > 1.0:
+                    return False, f"pid_reused:start_time_mismatch:{time_diff:.1f}s"
+
+            # Phase 3: Process identity validation
+            # 3a: Name validation (fast check)
+            if self.process_name:
+                current_name = process.name()
+                if current_name != self.process_name:
+                    return False, f"name_mismatch:expected={self.process_name},got={current_name}"
+
+            # 3b: Command line validation (JARVIS-specific patterns)
+            if self.process_cmdline:
+                try:
+                    current_cmdline = " ".join(process.cmdline())
+
+                    # Extract key patterns from stored cmdline
+                    jarvis_patterns = [
+                        "jarvis", "prime", "reactor", "trinity",
+                        "backend", "server.py", "run_supervisor",
+                    ]
+
+                    stored_has_jarvis = any(p in self.process_cmdline.lower() for p in jarvis_patterns)
+                    current_has_jarvis = any(p in current_cmdline.lower() for p in jarvis_patterns)
+
+                    # If stored was JARVIS but current isn't, that's a reuse
+                    if stored_has_jarvis and not current_has_jarvis:
+                        return False, "cmdline_mismatch:jarvis_pattern_missing"
+
+                    # Check for specific module match
+                    stored_modules = set()
+                    current_modules = set()
+
+                    for pattern in ["jarvis_prime", "reactor_core", "backend.main", "run_supervisor"]:
+                        if pattern in self.process_cmdline:
+                            stored_modules.add(pattern)
+                        if pattern in current_cmdline:
+                            current_modules.add(pattern)
+
+                    if stored_modules and stored_modules != current_modules:
+                        return False, f"cmdline_mismatch:modules:{stored_modules}!={current_modules}"
+
+                except (psutil.AccessDenied, psutil.ZombieProcess):
+                    pass  # Can't check cmdline, rely on other validations
+
+            # 3c: Executable path validation
+            if self.process_exe_path:
+                try:
+                    current_exe = process.exe()
+                    if current_exe and current_exe != self.process_exe_path:
+                        # Python interpreters may vary, check if both are Python
+                        stored_is_python = "python" in self.process_exe_path.lower()
+                        current_is_python = "python" in current_exe.lower() if current_exe else False
+
+                        if not (stored_is_python and current_is_python):
+                            return False, f"exe_mismatch:{self.process_exe_path}!={current_exe}"
+                except (psutil.AccessDenied, psutil.ZombieProcess):
+                    pass
+
+            return True, "identity_verified"
+
+        except psutil.NoSuchProcess:
+            return False, "process_not_found"
+        except psutil.AccessDenied:
+            # Can't validate, assume valid (conservative)
+            return True, "access_denied:assumed_valid"
+        except psutil.ZombieProcess:
+            return False, "zombie_process"
+        except Exception as e:
+            logger.warning(f"[v96.0] Process validation error for PID {self.pid}: {e}")
+            return False, f"validation_error:{str(e)}"
+
     def to_dict(self) -> Dict:
-        """Convert to dictionary for JSON serialization."""
-        return asdict(self)
+        """
+        v96.0: Convert to dictionary for JSON serialization.
+
+        Includes all port tracking and process fingerprint fields.
+        """
+        result = asdict(self)
+        # Ensure ports_tried is serializable (list of ints)
+        if result.get("ports_tried"):
+            result["ports_tried"] = list(result["ports_tried"])
+        return result
 
     @classmethod
     def from_dict(cls, data: Dict) -> "ServiceInfo":
-        """Create from dictionary."""
+        """
+        v96.0: Create from dictionary with backward compatibility.
+
+        Handles legacy entries that don't have:
+        - v4.0 fields: process_start_time
+        - v96.0 fields: port tracking, process fingerprint
+        """
+        # Make a copy to avoid modifying original
+        data = dict(data)
+
         # v4.0: Handle legacy entries without process_start_time
         if "process_start_time" not in data:
             data["process_start_time"] = 0.0
+
+        # v96.0: Handle legacy entries without port tracking fields
+        if "primary_port" not in data:
+            data["primary_port"] = data.get("port", 0)
+        if "is_fallback_port" not in data:
+            data["is_fallback_port"] = False
+        if "fallback_reason" not in data:
+            data["fallback_reason"] = ""
+        if "ports_tried" not in data:
+            data["ports_tried"] = []
+        if "port_allocation_time" not in data:
+            data["port_allocation_time"] = data.get("registered_at", 0.0)
+
+        # v96.0: Handle legacy entries without process fingerprint fields
+        if "process_name" not in data:
+            data["process_name"] = ""
+        if "process_cmdline" not in data:
+            data["process_cmdline"] = ""
+        if "process_exe_path" not in data:
+            data["process_exe_path"] = ""
+        if "process_cwd" not in data:
+            data["process_cwd"] = ""
+        if "parent_pid" not in data:
+            data["parent_pid"] = 0
+        if "parent_name" not in data:
+            data["parent_name"] = ""
+
         return cls(**data)
+
+    def update_port(
+        self,
+        new_port: int,
+        is_fallback: bool = False,
+        reason: str = "",
+    ) -> None:
+        """
+        v96.0: Update the port and track the change.
+
+        This should be called when a fallback port is allocated instead of
+        the primary port. It updates the service registry to track the ACTUAL
+        port being used, not just the configured port.
+
+        Args:
+            new_port: The new port number to use
+            is_fallback: True if this is a fallback (not primary)
+            reason: Why fallback was needed (e.g., "primary_port_in_use")
+        """
+        # Track the old port in history
+        if self.port not in self.ports_tried:
+            self.ports_tried.append(self.port)
+
+        # Update port
+        old_port = self.port
+        self.port = new_port
+        self.is_fallback_port = is_fallback
+        self.fallback_reason = reason
+        self.port_allocation_time = time.time()
+
+        # Track new port in history
+        if new_port not in self.ports_tried:
+            self.ports_tried.append(new_port)
+
+        logger.info(
+            f"[v96.0] Port updated for {self.service_name}: "
+            f"{old_port} → {new_port} (fallback={is_fallback}, reason={reason})"
+        )
 
     def is_process_alive(self) -> bool:
         """
@@ -888,18 +1155,31 @@ class ServiceRegistry:
         port: Optional[int] = None,
         host: str = "localhost",
         health_endpoint: str = "/health",
-        metadata: Optional[Dict] = None
+        metadata: Optional[Dict] = None,
+        # v96.0: Port fallback tracking (Problem 17 fix)
+        primary_port: Optional[int] = None,
+        is_fallback_port: bool = False,
+        fallback_reason: str = "",
+        ports_tried: Optional[List[int]] = None,
     ) -> ServiceInfo:
         """
-        v95.2: Register a service with atomic locking to prevent race conditions.
+        v96.0: Register a service with port fallback tracking and process fingerprinting.
+
+        This method now tracks the ACTUAL port being used vs the PRIMARY configured port,
+        solving Problem 17 (port fallback confusion). It also captures process fingerprint
+        for Problem 18 (process tree validation).
 
         Args:
             service_name: Unique service identifier
             pid: Process ID (defaults to current process)
-            port: Port number service is listening on
+            port: ACTUAL port number service is listening on
             host: Hostname (default: localhost)
             health_endpoint: Health check endpoint path
             metadata: Optional additional metadata
+            primary_port: Originally configured/requested port (v96.0)
+            is_fallback_port: True if using fallback port (v96.0)
+            fallback_reason: Why fallback was needed (v96.0)
+            ports_tried: List of ports attempted before success (v96.0)
 
         Returns:
             ServiceInfo for the registered service
@@ -912,6 +1192,16 @@ class ServiceRegistry:
             os.environ.get("JARVIS_BODY_PORT", "8010")
         )
 
+        # v96.0: Determine primary port (configured port)
+        if primary_port is None:
+            primary_port = actual_port  # If not specified, assume actual = primary
+
+        # v96.0: Track ports tried
+        if ports_tried is None:
+            ports_tried = []
+        if actual_port not in ports_tried:
+            ports_tried.append(actual_port)
+
         service = ServiceInfo(
             service_name=service_name,
             pid=actual_pid,
@@ -919,7 +1209,13 @@ class ServiceRegistry:
             host=host,
             health_endpoint=health_endpoint,
             status="starting",
-            metadata=metadata or {}
+            metadata=metadata or {},
+            # v96.0: Port tracking fields
+            primary_port=primary_port,
+            is_fallback_port=is_fallback_port,
+            fallback_reason=fallback_reason,
+            ports_tried=ports_tried,
+            # Process fingerprint will be captured in __post_init__
         )
 
         lock = self._ensure_registry_lock()
@@ -932,7 +1228,7 @@ class ServiceRegistry:
             # Add/update service
             services[service_name] = service
 
-            # v95.2: Update unified state
+            # v95.2/v96.0: Update unified state with port tracking
             self._state_version += 1
             self._unified_state[service_name] = {
                 "pid": actual_pid,
@@ -942,17 +1238,92 @@ class ServiceRegistry:
                 "supervisor_healthy": None,
                 "state_version": self._state_version,
                 "registered_at": time.time(),
+                # v96.0: Port tracking in unified state
+                "port": actual_port,
+                "primary_port": primary_port,
+                "is_fallback_port": is_fallback_port,
+                "fallback_reason": fallback_reason,
             }
 
             # Write back atomically
             await asyncio.to_thread(self._write_registry, services)
 
+        # v96.0: Enhanced logging with port tracking info
+        port_info = f"Port: {actual_port}"
+        if is_fallback_port:
+            port_info = f"Port: {actual_port} (FALLBACK from {primary_port}, reason: {fallback_reason})"
+
         logger.info(
             f"📝 Service registered: {service_name} "
-            f"(PID: {actual_pid}, Port: {actual_port}, Host: {host})"
+            f"(PID: {actual_pid}, {port_info}, Host: {host})"
         )
 
         return service
+
+    async def update_service_port(
+        self,
+        service_name: str,
+        new_port: int,
+        is_fallback: bool = False,
+        reason: str = "",
+    ) -> bool:
+        """
+        v96.0: Update a service's port when fallback is used.
+
+        This is CRITICAL for Problem 17 fix - when a component allocates a fallback
+        port, it MUST call this method to update the registry so other components
+        can discover the ACTUAL port, not just the configured primary port.
+
+        Args:
+            service_name: Service to update
+            new_port: New port number
+            is_fallback: True if this is a fallback (not primary)
+            reason: Why the port change was needed
+
+        Returns:
+            True if update was successful
+        """
+        lock = self._ensure_registry_lock()
+
+        async with lock:
+            services = await asyncio.to_thread(self._read_registry)
+
+            if service_name not in services:
+                logger.warning(f"[v96.0] Cannot update port - service {service_name} not registered")
+                return False
+
+            service = services[service_name]
+
+            # Track old port in history
+            if service.port not in service.ports_tried:
+                service.ports_tried.append(service.port)
+
+            # Update port info
+            old_port = service.port
+            service.port = new_port
+            service.is_fallback_port = is_fallback
+            service.fallback_reason = reason
+            service.port_allocation_time = time.time()
+
+            # Track new port in history
+            if new_port not in service.ports_tried:
+                service.ports_tried.append(new_port)
+
+            # Update unified state
+            if service_name in self._unified_state:
+                self._unified_state[service_name]["port"] = new_port
+                self._unified_state[service_name]["is_fallback_port"] = is_fallback
+                self._unified_state[service_name]["fallback_reason"] = reason
+
+            # Write back
+            await asyncio.to_thread(self._write_registry, services)
+
+        logger.info(
+            f"[v96.0] Port updated for {service_name}: "
+            f"{old_port} → {new_port} (fallback={is_fallback}, reason={reason})"
+        )
+
+        return True
 
     async def deregister_service(self, service_name: str) -> bool:
         """
