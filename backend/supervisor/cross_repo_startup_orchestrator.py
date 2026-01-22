@@ -11276,7 +11276,7 @@ echo "=== JARVIS Prime started ==="
 
     async def shutdown_all_services(self) -> None:
         """
-        v95.3: Gracefully shutdown all managed services with proper ordering.
+        v95.3 + v95.11: Gracefully shutdown all managed services with proper ordering.
 
         Enhanced with:
         - REVERSE DEPENDENCY ORDER: Services shutdown in reverse startup order
@@ -11286,6 +11286,7 @@ echo "=== JARVIS Prime started ==="
         - Startup coordination cleanup
         - Timeout protection per service
         - Shutdown completion flag (v95.3) prevents post-shutdown recovery
+        - v95.11: Operation draining before service termination
         """
         logger.info("\n🛑 Shutting down all services...")
 
@@ -11294,6 +11295,39 @@ echo "=== JARVIS Prime started ==="
         self._shutdown_completed = True
         self._shutdown_completed_timestamp = time.time()
         logger.info("[v95.3] Shutdown completion flag set - recovery disabled")
+
+        # v95.11: Start draining all operations FIRST (before stopping services)
+        # This prevents new database operations from starting during shutdown
+        drain_timeout = float(os.environ.get("SHUTDOWN_DRAIN_TIMEOUT", "10.0"))
+        try:
+            from backend.core.resilience.graceful_shutdown import get_operation_guard_sync
+            guard = get_operation_guard_sync()
+
+            # Signal global shutdown - no new operations allowed
+            await guard.begin_global_shutdown()
+            logger.info(f"[v95.11] 🛑 Operation draining started (timeout: {drain_timeout}s)")
+
+            # Wait for in-flight operations to complete
+            active_before = guard.get_total_active()
+            if active_before > 0:
+                logger.info(f"[v95.11] Waiting for {active_before} in-flight operations to complete...")
+                drained = await guard.wait_for_all_drain(timeout=drain_timeout)
+
+                if drained:
+                    logger.info("[v95.11] ✅ All operations drained successfully")
+                else:
+                    remaining = guard.get_total_active()
+                    stats = guard.get_stats()
+                    logger.warning(
+                        f"[v95.11] ⚠️ Drain incomplete: {remaining} operations still active "
+                        f"(categories: {stats['active_by_category']})"
+                    )
+            else:
+                logger.info("[v95.11] ✅ No in-flight operations to drain")
+        except ImportError:
+            logger.debug("[v95.11] OperationGuard not available, skipping drain")
+        except Exception as e:
+            logger.warning(f"[v95.11] Error during operation drain: {e}")
 
         # v95.1: Stop recovery coordinator first (prevent restart during shutdown)
         await self.stop_recovery_coordinator()

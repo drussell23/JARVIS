@@ -52,7 +52,34 @@ except ImportError:
     except ImportError:
         SECRET_MANAGER_AVAILABLE = False
 
+# v95.11: Import graceful shutdown coordinator
+SHUTDOWN_GUARD_AVAILABLE = False
+_shutdown_guard = None
+try:
+    from core.resilience.graceful_shutdown import (
+        get_operation_guard_sync,
+        ShutdownInProgressError,
+    )
+    SHUTDOWN_GUARD_AVAILABLE = True
+except ImportError:
+    try:
+        from backend.core.resilience.graceful_shutdown import (
+            get_operation_guard_sync,
+            ShutdownInProgressError,
+        )
+        SHUTDOWN_GUARD_AVAILABLE = True
+    except ImportError:
+        pass
+
 logger = logging.getLogger(__name__)
+
+
+def _get_shutdown_guard():
+    """Lazily get the shutdown guard singleton."""
+    global _shutdown_guard
+    if SHUTDOWN_GUARD_AVAILABLE and _shutdown_guard is None:
+        _shutdown_guard = get_operation_guard_sync()
+    return _shutdown_guard
 
 
 class DatabaseConfig:
@@ -726,7 +753,10 @@ class CloudSQLConnection:
         max_retries: int = None,
     ):
         """
-        v19.0: Execute an async operation with retry and circuit breaker.
+        v19.0 + v95.11: Execute an async operation with retry and circuit breaker.
+
+        v95.11: Now checks shutdown state before executing to prevent
+        operations during graceful shutdown.
 
         Args:
             operation: Description for logging
@@ -740,81 +770,105 @@ class CloudSQLConnection:
         Raises:
             asyncio.CancelledError: Always re-raised (never retried)
             asyncio.TimeoutError: After all retries exhausted
+            ShutdownInProgressError: If shutdown is in progress
             Exception: Other exceptions after all retries exhausted
         """
         import random
 
-        max_retries = max_retries or self.DEFAULT_MAX_RETRIES
-        circuit = CloudSQLConnection._circuit_breaker
+        # v95.11: Check shutdown state before starting operation
+        guard = _get_shutdown_guard()
+        if guard and not guard.try_start("database"):
+            logger.debug(f"[v95.11] Database operation rejected (shutdown): {operation}")
+            if SHUTDOWN_GUARD_AVAILABLE:
+                raise ShutdownInProgressError(f"Database shutting down: {operation}")
+            else:
+                raise asyncio.CancelledError(f"Database shutting down: {operation}")
 
-        last_exception = None
+        try:
+            max_retries = max_retries or self.DEFAULT_MAX_RETRIES
+            circuit = CloudSQLConnection._circuit_breaker
 
-        for attempt in range(max_retries + 1):
-            # Check circuit breaker
-            if not await circuit.can_execute():
-                logger.warning(f"[v19.0] Circuit breaker OPEN, failing fast: {operation}")
-                raise asyncio.TimeoutError(f"Circuit breaker open for: {operation}")
+            last_exception = None
 
-            try:
-                # Create fresh coroutine for this attempt
-                result = await asyncio.wait_for(coro_factory(), timeout=timeout)
-                await circuit.record_success()
-                return result
+            for attempt in range(max_retries + 1):
+                # v95.11: Check shutdown state before each retry
+                if guard and guard.is_shutting_down:
+                    logger.debug(f"[v95.11] Operation aborted during retry (shutdown): {operation}")
+                    raise asyncio.CancelledError(f"Shutdown during retry: {operation}")
 
-            except asyncio.CancelledError:
-                # NEVER retry cancelled operations - always re-raise immediately
-                logger.debug(f"[v19.0] Operation cancelled (not retrying): {operation}")
-                raise
+                # Check circuit breaker
+                if circuit and not await circuit.can_execute():
+                    logger.warning(f"[v19.0] Circuit breaker OPEN, failing fast: {operation}")
+                    raise asyncio.TimeoutError(f"Circuit breaker open for: {operation}")
 
-            except asyncio.TimeoutError as e:
-                last_exception = e
-                await circuit.record_failure()
+                try:
+                    # Create fresh coroutine for this attempt
+                    result = await asyncio.wait_for(coro_factory(), timeout=timeout)
+                    if circuit:
+                        await circuit.record_success()
+                    return result
 
-                if attempt < max_retries:
-                    # Exponential backoff with jitter
-                    delay = min(
-                        self.DEFAULT_BASE_DELAY * (2 ** attempt),
-                        self.DEFAULT_MAX_DELAY
-                    )
-                    jitter = delay * random.uniform(0.1, 0.3)
-                    actual_delay = delay + jitter
+                except asyncio.CancelledError:
+                    # NEVER retry cancelled operations - always re-raise immediately
+                    logger.debug(f"[v19.0] Operation cancelled (not retrying): {operation}")
+                    raise
 
-                    logger.warning(
-                        f"[v19.0] Timeout on {operation} (attempt {attempt + 1}/{max_retries + 1}), "
-                        f"retrying in {actual_delay:.2f}s..."
-                    )
-                    await asyncio.sleep(actual_delay)
-                else:
-                    logger.error(f"[v19.0] {operation} failed after {max_retries + 1} attempts (timeout)")
+                except asyncio.TimeoutError as e:
+                    last_exception = e
+                    if circuit:
+                        await circuit.record_failure()
 
-            except (ConnectionError, OSError) as e:
-                # Network errors - retry with backoff
-                last_exception = e
-                await circuit.record_failure()
+                    if attempt < max_retries:
+                        # Exponential backoff with jitter
+                        delay = min(
+                            self.DEFAULT_BASE_DELAY * (2 ** attempt),
+                            self.DEFAULT_MAX_DELAY
+                        )
+                        jitter = delay * random.uniform(0.1, 0.3)
+                        actual_delay = delay + jitter
 
-                if attempt < max_retries:
-                    delay = min(
-                        self.DEFAULT_BASE_DELAY * (2 ** attempt),
-                        self.DEFAULT_MAX_DELAY
-                    )
-                    logger.warning(
-                        f"[v19.0] Connection error on {operation} (attempt {attempt + 1}): {e}, "
-                        f"retrying in {delay:.2f}s..."
-                    )
-                    await asyncio.sleep(delay)
-                else:
-                    logger.error(f"[v19.0] {operation} failed after {max_retries + 1} attempts: {e}")
+                        logger.warning(
+                            f"[v19.0] Timeout on {operation} (attempt {attempt + 1}/{max_retries + 1}), "
+                            f"retrying in {actual_delay:.2f}s..."
+                        )
+                        await asyncio.sleep(actual_delay)
+                    else:
+                        logger.error(f"[v19.0] {operation} failed after {max_retries + 1} attempts (timeout)")
 
-            except Exception as e:
-                # Unexpected errors - log but don't retry (likely query error)
-                last_exception = e
-                logger.error(f"[v19.0] Unexpected error on {operation}: {type(e).__name__}: {e}")
-                raise
+                except (ConnectionError, OSError) as e:
+                    # Network errors - retry with backoff
+                    last_exception = e
+                    if circuit:
+                        await circuit.record_failure()
 
-        # All retries exhausted
-        if last_exception:
-            raise last_exception
-        raise asyncio.TimeoutError(f"Operation failed: {operation}")
+                    if attempt < max_retries:
+                        delay = min(
+                            self.DEFAULT_BASE_DELAY * (2 ** attempt),
+                            self.DEFAULT_MAX_DELAY
+                        )
+                        logger.warning(
+                            f"[v19.0] Connection error on {operation} (attempt {attempt + 1}): {e}, "
+                            f"retrying in {delay:.2f}s..."
+                        )
+                        await asyncio.sleep(delay)
+                    else:
+                        logger.error(f"[v19.0] {operation} failed after {max_retries + 1} attempts: {e}")
+
+                except Exception as e:
+                    # Unexpected errors - log but don't retry (likely query error)
+                    last_exception = e
+                    logger.error(f"[v19.0] Unexpected error on {operation}: {type(e).__name__}: {e}")
+                    raise
+
+            # All retries exhausted
+            if last_exception:
+                raise last_exception
+            raise asyncio.TimeoutError(f"Operation failed: {operation}")
+
+        finally:
+            # v95.11: Always mark operation as finished
+            if guard:
+                guard.finish("database")
 
     async def execute(self, query: str, *args, timeout: float = None):
         """Execute query with timeout protection and retry."""

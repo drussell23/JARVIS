@@ -2088,12 +2088,44 @@ class CloudSQLConnectionManager:
                 self.pool = None
 
     async def shutdown(self) -> None:
-        """Graceful shutdown with metrics reporting."""
+        """
+        Graceful shutdown with metrics reporting.
+
+        v95.11: Now integrates with the OperationGuard to drain
+        in-flight database operations before closing the pool.
+        """
         if self.is_shutting_down and not self.pool:
             return
 
         self.is_shutting_down = True
         logger.info("🛑 Shutting down CloudSQL Connection Manager...")
+
+        # v95.11: Start draining database operations
+        drain_timeout = float(os.getenv("SHUTDOWN_DB_DRAIN_TIMEOUT", "10.0"))
+        try:
+            from core.resilience.graceful_shutdown import get_operation_guard_sync
+            guard = get_operation_guard_sync()
+
+            # Signal that we're draining - no new operations allowed
+            await guard.begin_drain("database")
+            logger.info(f"[v95.11] Draining database operations (timeout: {drain_timeout}s)...")
+
+            # Wait for in-flight operations to complete
+            active_before = guard.get_count("database")
+            drained = await guard.wait_for_drain("database", timeout=drain_timeout)
+
+            if drained:
+                logger.info("[v95.11] ✅ All database operations drained successfully")
+            else:
+                remaining = guard.get_count("database")
+                logger.warning(
+                    f"[v95.11] ⚠️ Drain timeout: {remaining} operations still active "
+                    f"(started with {active_before})"
+                )
+        except ImportError:
+            logger.debug("[v95.11] OperationGuard not available, skipping drain")
+        except Exception as e:
+            logger.warning(f"[v95.11] Error during drain: {e}")
 
         # Log metrics
         self._log_final_metrics()

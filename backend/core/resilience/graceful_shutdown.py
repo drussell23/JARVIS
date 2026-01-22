@@ -55,6 +55,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from enum import Enum
+from contextlib import asynccontextmanager
 from typing import Any, Callable, Coroutine, Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger("GracefulShutdown")
@@ -738,6 +739,281 @@ class ShutdownInProgressError(Exception):
 
 
 # =============================================================================
+# v95.11: Operation Guard for Database Operations
+# =============================================================================
+
+class OperationGuard:
+    """
+    v95.11: Lightweight guard for database operations during shutdown.
+
+    Uses reference counting instead of unique request IDs for high-throughput
+    database operations. Provides:
+    - Atomic increment/decrement of operation count
+    - Shutdown-aware operation rejection
+    - Drain waiting with timeout
+    - Category-based tracking (e.g., 'database', 'file_io', 'network')
+
+    Usage:
+        guard = get_operation_guard()
+
+        # Before starting an operation
+        if not guard.try_start("database"):
+            raise ShutdownInProgressError("Database shutting down")
+
+        try:
+            await do_database_operation()
+        finally:
+            guard.finish("database")
+
+    Or use the context manager:
+        async with guard.operation("database"):
+            await do_database_operation()
+    """
+
+    def __init__(self):
+        self._counts: Dict[str, int] = {}
+        self._draining: Set[str] = set()
+        self._drain_events: Dict[str, asyncio.Event] = {}
+        self._global_shutdown = False
+        self._lock = asyncio.Lock()
+        self._total_operations = 0
+        self._rejected_operations = 0
+
+    @property
+    def is_shutting_down(self) -> bool:
+        """Check if global shutdown is in progress."""
+        return self._global_shutdown
+
+    def get_count(self, category: str = "default") -> int:
+        """Get current operation count for a category."""
+        return self._counts.get(category, 0)
+
+    def get_total_active(self) -> int:
+        """Get total active operations across all categories."""
+        return sum(self._counts.values())
+
+    def try_start(self, category: str = "default") -> bool:
+        """
+        Try to start an operation. Returns False if shutting down.
+
+        Thread-safe, uses lock-free atomic increment when not draining.
+        """
+        if self._global_shutdown or category in self._draining:
+            self._rejected_operations += 1
+            return False
+
+        if category not in self._counts:
+            self._counts[category] = 0
+
+        self._counts[category] += 1
+        self._total_operations += 1
+        return True
+
+    def finish(self, category: str = "default") -> None:
+        """Mark an operation as finished."""
+        if category in self._counts:
+            self._counts[category] = max(0, self._counts[category] - 1)
+
+            # Signal drain if we're draining and count reached zero
+            if category in self._draining and self._counts[category] == 0:
+                event = self._drain_events.get(category)
+                if event and not event.is_set():
+                    event.set()
+
+    async def begin_drain(self, category: str = "default") -> None:
+        """Begin draining a category - reject new operations."""
+        async with self._lock:
+            self._draining.add(category)
+            if category not in self._drain_events:
+                self._drain_events[category] = asyncio.Event()
+
+            # If already empty, set the event
+            if self._counts.get(category, 0) == 0:
+                self._drain_events[category].set()
+
+    async def begin_global_shutdown(self) -> None:
+        """Begin global shutdown - reject ALL new operations."""
+        async with self._lock:
+            self._global_shutdown = True
+            # Start draining all categories
+            for category in list(self._counts.keys()):
+                await self.begin_drain(category)
+
+    async def wait_for_drain(
+        self,
+        category: str = "default",
+        timeout: float = DRAIN_TIMEOUT,
+    ) -> bool:
+        """
+        Wait for all operations in a category to complete.
+
+        Returns True if drained, False if timeout.
+        """
+        if category not in self._draining:
+            await self.begin_drain(category)
+
+        event = self._drain_events.get(category)
+        if not event:
+            return True  # Nothing to drain
+
+        try:
+            await asyncio.wait_for(event.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            remaining = self._counts.get(category, 0)
+            logger.warning(f"Drain timeout for '{category}': {remaining} operations still active")
+            return False
+
+    async def wait_for_all_drain(self, timeout: float = DRAIN_TIMEOUT) -> bool:
+        """Wait for all categories to drain."""
+        await self.begin_global_shutdown()
+
+        categories = list(self._counts.keys())
+        if not categories:
+            return True
+
+        # Calculate per-category timeout
+        per_category_timeout = timeout / max(len(categories), 1)
+
+        all_drained = True
+        for category in categories:
+            drained = await self.wait_for_drain(category, per_category_timeout)
+            if not drained:
+                all_drained = False
+
+        return all_drained
+
+    @asynccontextmanager
+    async def operation(self, category: str = "default"):
+        """
+        Async context manager for operations.
+
+        Raises ShutdownInProgressError if shutdown is in progress.
+        """
+        if not self.try_start(category):
+            raise ShutdownInProgressError(f"Operation rejected: {category} is shutting down")
+        try:
+            yield
+        finally:
+            self.finish(category)
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Get operation guard statistics."""
+        return {
+            "global_shutdown": self._global_shutdown,
+            "draining_categories": list(self._draining),
+            "active_by_category": dict(self._counts),
+            "total_active": self.get_total_active(),
+            "total_operations": self._total_operations,
+            "rejected_operations": self._rejected_operations,
+        }
+
+
+# Global operation guard instance
+_operation_guard: Optional[OperationGuard] = None
+_operation_guard_lock = asyncio.Lock()
+
+
+async def get_operation_guard() -> OperationGuard:
+    """Get or create the global OperationGuard instance."""
+    global _operation_guard
+
+    if _operation_guard is None:
+        async with _operation_guard_lock:
+            if _operation_guard is None:
+                _operation_guard = OperationGuard()
+                logger.info("OperationGuard initialized")
+
+    return _operation_guard
+
+
+def get_operation_guard_sync() -> OperationGuard:
+    """Get the global OperationGuard instance synchronously (creates if needed)."""
+    global _operation_guard
+
+    if _operation_guard is None:
+        _operation_guard = OperationGuard()
+        logger.info("OperationGuard initialized (sync)")
+
+    return _operation_guard
+
+
+# =============================================================================
+# v95.11: Database Operation Context Manager
+# =============================================================================
+
+@asynccontextmanager
+async def database_operation():
+    """
+    Context manager for database operations.
+
+    Automatically tracks the operation and handles shutdown gracefully.
+
+    Usage:
+        async with database_operation():
+            await db.execute("SELECT * FROM users")
+    """
+    guard = get_operation_guard_sync()
+    if not guard.try_start("database"):
+        raise ShutdownInProgressError("Database operations are shutting down")
+    try:
+        yield
+    finally:
+        guard.finish("database")
+
+
+# =============================================================================
+# v95.11: Integration Helpers
+# =============================================================================
+
+async def register_database_shutdown(
+    coordinator: ShutdownCoordinator,
+    drain_timeout: float = 10.0,
+) -> None:
+    """
+    Register database shutdown handling with the coordinator.
+
+    This ensures database operations are properly drained before
+    connection pools are closed.
+    """
+    guard = await get_operation_guard()
+
+    # Register high-priority handler to start draining
+    coordinator.register_handler(
+        name="database_drain_start",
+        callback=lambda: guard.begin_drain("database"),
+        priority=5,  # Run early
+        timeout=1.0,
+    )
+
+    # Register handler to wait for drain completion
+    async def wait_for_database_drain():
+        await guard.wait_for_drain("database", timeout=drain_timeout)
+        active = guard.get_count("database")
+        if active > 0:
+            logger.warning(f"Database drain incomplete: {active} operations still active")
+        else:
+            logger.info("Database operations fully drained")
+
+    coordinator.register_handler(
+        name="database_drain_wait",
+        callback=wait_for_database_drain,
+        priority=10,  # Run after drain start
+        timeout=drain_timeout + 2.0,
+    )
+
+
+def should_reject_operation(category: str = "default") -> bool:
+    """
+    Quick check if an operation should be rejected.
+
+    Use this at the start of long-running operations.
+    """
+    guard = get_operation_guard_sync()
+    return guard.is_shutting_down or category in guard._draining
+
+
+# =============================================================================
 # Exports
 # =============================================================================
 
@@ -752,4 +1028,11 @@ __all__ = [
     "get_shutdown_coordinator",
     "shutdown_coordinator",
     "track_request",
+    # v95.11: New exports
+    "OperationGuard",
+    "get_operation_guard",
+    "get_operation_guard_sync",
+    "database_operation",
+    "register_database_shutdown",
+    "should_reject_operation",
 ]
