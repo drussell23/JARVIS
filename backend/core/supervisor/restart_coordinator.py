@@ -33,12 +33,17 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from typing import Any, Callable, Optional, List
 
 logger = logging.getLogger(__name__)
+
+# v108.4: Startup grace period to prevent hot-reload restarts during startup
+STARTUP_GRACE_PERIOD_SECONDS = float(os.getenv("JARVIS_RESTART_GRACE_PERIOD", "120"))
 
 
 class RestartUrgency(str, Enum):
@@ -149,6 +154,10 @@ class RestartCoordinator:
         self._is_restarting = False
         self._initialized = False
 
+        # v108.4: Track startup time for grace period
+        self._startup_time = time.time()
+        self._grace_period_ended = False
+
         logger.info("🔄 Restart coordinator initialized")
 
     async def initialize(self) -> None:
@@ -189,6 +198,21 @@ class RestartCoordinator:
         if self._is_restarting and urgency != RestartUrgency.CRITICAL:
             logger.debug(f"Restart already in progress, ignoring {source.value} request")
             return False
+
+        # v108.4: Skip non-critical restarts during startup grace period
+        # This prevents hot-reload from killing JARVIS before it's fully started
+        if urgency not in (RestartUrgency.HIGH, RestartUrgency.CRITICAL):
+            elapsed = time.time() - self._startup_time
+            if elapsed < STARTUP_GRACE_PERIOD_SECONDS:
+                if not self._grace_period_ended:
+                    logger.info(
+                        f"[v108.4] ⏳ Startup grace period active ({elapsed:.0f}s/{STARTUP_GRACE_PERIOD_SECONDS:.0f}s) - "
+                        f"deferring {source.value} restart: {reason}"
+                    )
+                return False
+            elif not self._grace_period_ended:
+                self._grace_period_ended = True
+                logger.info(f"[v108.4] ⏰ Startup grace period ended after {elapsed:.0f}s - restarts now allowed")
 
         async with self._lock:
             request = RestartRequest(

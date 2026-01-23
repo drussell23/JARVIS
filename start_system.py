@@ -310,7 +310,7 @@ if _sys.version_info < (3, 10):
 import os
 import sys
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 
 class VenvAutoActivator:
