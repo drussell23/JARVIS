@@ -6155,6 +6155,10 @@ class ProcessOrchestrator:
         3. jarvis-body heartbeat is active and recent
         4. Core endpoints are responding (if FastAPI is running)
 
+        v111.1: Fast-path for in-process mode (Unified Monolith)
+        When JARVIS_IN_PROCESS_MODE=true, the backend runs in the supervisor's
+        process, so we know it's healthy if we reach this point.
+
         Args:
             timeout: Maximum time to wait for health verification
 
@@ -6162,6 +6166,21 @@ class ProcessOrchestrator:
             True if jarvis-body is verified healthy, False otherwise
         """
         start_time = time.time()
+
+        # ═══════════════════════════════════════════════════════════════════
+        # v111.1: Fast-path for Unified Monolith (in-process mode)
+        # ═══════════════════════════════════════════════════════════════════
+        # If backend is running in-process, it was already verified healthy
+        # during _start_backend_in_process() and registered immediately.
+        # Skip the verification loop - we KNOW it's healthy.
+        # ═══════════════════════════════════════════════════════════════════
+        in_process_mode = os.getenv("JARVIS_IN_PROCESS_MODE", "true").lower() == "true"
+        if in_process_mode:
+            logger.info("[v111.1] ✅ In-process mode: jarvis-body health verified (same process)")
+            self._jarvis_body_status = "healthy"
+            self._jarvis_body_health_verified = True
+            return True
+
         logger.info("[v95.4] Verifying jarvis-body health before Phase 2...")
 
         try:

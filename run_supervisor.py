@@ -5728,6 +5728,54 @@ class SupervisorBootstrapper:
             TerminalUI.print_success(
                 f"[v111.0] Backend in-process: port {self._backend_port} ({elapsed:.1f}s)"
             )
+
+            # ═══════════════════════════════════════════════════════════════════
+            # v111.1: IMMEDIATE SERVICE REGISTRY REGISTRATION (Phase 2 - Cross-Repo)
+            # ═══════════════════════════════════════════════════════════════════
+            # Register jarvis-body with the service registry IMMEDIATELY so external
+            # services (J-Prime, Reactor-Core) can discover us without waiting.
+            #
+            # This eliminates the jarvis-body discovery race condition:
+            # - OLD: External services wait for jarvis-body to appear in registry
+            # - NEW: We register instantly because backend is in-process (no subprocess)
+            # ═══════════════════════════════════════════════════════════════════
+            try:
+                from backend.core.service_registry import ServiceRegistry
+                registry = ServiceRegistry()
+                await registry.register_service(
+                    service_name="jarvis-body",
+                    pid=os.getpid(),  # Same PID as supervisor (in-process)
+                    port=self._backend_port,
+                    host="localhost",
+                    health_endpoint="/health",
+                    metadata={
+                        "mode": "in-process",
+                        "version": "v111.1",
+                        "supervisor_pid": os.getpid(),
+                        "startup_time_ms": int(elapsed * 1000),
+                        "unified_monolith": True,
+                    },
+                    primary_port=self._backend_port,
+                    is_fallback_port=False,
+                )
+                # Mark as healthy immediately since we verified startup
+                await registry.heartbeat(
+                    "jarvis-body",
+                    status="healthy",
+                    metadata={
+                        "mode": "in-process",
+                        "uptime_seconds": elapsed,
+                    }
+                )
+                self.logger.info(
+                    "[v111.1] ✅ jarvis-body registered in service registry (in-process mode)"
+                )
+            except Exception as reg_err:
+                # Registry failure is not fatal - log and continue
+                self.logger.warning(
+                    f"[v111.1] ⚠️ Service registry registration failed (non-fatal): {reg_err}"
+                )
+
             return True
 
         except ImportError as e:
@@ -5749,10 +5797,11 @@ class SupervisorBootstrapper:
         v111.0: Stop the in-process backend gracefully.
 
         Shutdown sequence:
-        1. Signal server to exit (should_exit = True)
-        2. Wait for graceful shutdown with timeout
-        3. Cancel task if it doesn't respond
-        4. Clean up references
+        1. Deregister from service registry (v111.1)
+        2. Signal server to exit (should_exit = True)
+        3. Wait for graceful shutdown with timeout
+        4. Cancel task if it doesn't respond
+        5. Clean up references
 
         Args:
             timeout: Maximum time to wait for graceful shutdown
@@ -5762,6 +5811,20 @@ class SupervisorBootstrapper:
 
         self.logger.info("[v111.0] Stopping backend...")
         TerminalUI.print_step("[v111.0] Stopping in-process backend")
+
+        # ═══════════════════════════════════════════════════════════════════
+        # v111.1: DEREGISTER FROM SERVICE REGISTRY FIRST
+        # ═══════════════════════════════════════════════════════════════════
+        # Deregister jarvis-body so external services know we're shutting down
+        # and don't try to connect to us during the shutdown window.
+        # ═══════════════════════════════════════════════════════════════════
+        try:
+            from backend.core.service_registry import ServiceRegistry
+            registry = ServiceRegistry()
+            await registry.deregister_service("jarvis-body")
+            self.logger.info("[v111.1] ✅ jarvis-body deregistered from service registry")
+        except Exception as reg_err:
+            self.logger.debug(f"[v111.1] Service registry deregistration: {reg_err}")
 
         try:
             # Signal graceful shutdown
