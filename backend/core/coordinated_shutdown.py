@@ -39,6 +39,7 @@ import asyncio
 import enum
 import logging
 import os
+import psutil
 import signal
 import time
 from dataclasses import dataclass, field
@@ -1469,6 +1470,22 @@ class OrphanProcessDetector:
                         if age_hours > self.max_orphan_age_hours:
                             # v93.0: Before marking as orphan, verify via HTTP health check
                             component = hb_file.stem
+
+                            # v108.1: Check if process was RECENTLY started (within 120s)
+                            # A freshly started process may have a stale heartbeat file from
+                            # a previous run - don't mark it as orphan during startup grace period
+                            try:
+                                proc = psutil.Process(pid)
+                                proc_age_seconds = time.time() - proc.create_time()
+                                if proc_age_seconds < 120.0:  # 2 minute grace period
+                                    logger.info(
+                                        f"[OrphanDetector] {component} (PID={pid}) has stale heartbeat "
+                                        f"but process is only {proc_age_seconds:.1f}s old - "
+                                        f"allowing startup grace period"
+                                    )
+                                    continue
+                            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                                pass  # Process may have died, continue to check
 
                             # Try HTTP health check first - process may be healthy
                             if await self._http_health_check(component, pid):

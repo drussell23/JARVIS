@@ -10541,15 +10541,22 @@ class TrinityUnifiedOrchestrator:
         # v95.12: Component-specific configuration with per-component require_explicit
         # reactor_core uses atomic file locking which can race with supervisor's registry
         # so we allow grace period fallback for it
+        # v108.2: Configurable grace period for non-blocking startup
+        # When cross-repo orchestrator uses non-blocking model loading,
+        # we can accept "starting" status much faster since health was pre-verified
+        jprime_starting_grace = float(os.getenv(
+            "JARVIS_PRIME_STARTING_GRACE_PERIOD", "5.0"
+        ))
+
         component_config = {
             "jarvis_prime": {
                 "ports": [8000, 8002, 8004, 8005, 8006],
                 "registry_names": ["jarvis_prime", "jarvis-prime", "jprime"],
                 "required_capabilities": ["inference", "api"],
                 "require_explicit": True,  # jarvis-prime should register explicitly
-                # v95.18: J-Prime model loading takes 60-90s on first startup
-                # Accept "starting" status after this grace period to avoid blocking
-                "starting_acceptance_grace_period": 30.0,  # 30s before accepting degraded mode
+                # v108.2: Reduced from 30s to 5s (env configurable) for non-blocking startup
+                # Cross-repo orchestrator already verified health before TrinityIntegrator
+                "starting_acceptance_grace_period": jprime_starting_grace,
             },
             "reactor_core": {
                 "ports": [8090, 8091, 8092, 8093],
@@ -10732,7 +10739,10 @@ class TrinityUnifiedOrchestrator:
                                 if process_valid:
                                     registry_confirmed = True
                                     verification_result["phase_2_registry_confirmed"] = True
-                                    verification_result["registered_at"] = time.time()
+                                    # v108.2: Only set registered_at on FIRST Phase 2 pass
+                                    # to prevent grace period timer reset
+                                    if verification_result.get("registered_at") is None:
+                                        verification_result["registered_at"] = time.time()
                                     verification_result["pid"] = service_pid
                                     # v96.0: Include port tracking info
                                     verification_result["port"] = service_info.get("port")
@@ -10808,10 +10818,11 @@ class TrinityUnifiedOrchestrator:
                                         if verification_result.get("registered_at"):
                                             elapsed_since_phase2 = time.time() - verification_result["registered_at"]
 
-                                        # Accept "starting" after 30s grace period (model loading takes time)
+                                        # v108.2: Accept "starting" after configurable grace period
+                                        # Default 5s (was 30s) since cross-repo orchestrator pre-verifies
                                         starting_grace_period = comp_specific_config.get(
                                             "starting_acceptance_grace_period",
-                                            30.0  # Default 30s wait before accepting "starting"
+                                            5.0  # v108.2: Reduced default for non-blocking startup
                                         )
 
                                         if is_fully_healthy:

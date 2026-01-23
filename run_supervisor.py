@@ -5418,6 +5418,19 @@ class SupervisorBootstrapper:
         are actually functional, not just responding to HTTP.
         """
         try:
+            # v108.3: Reset global shutdown flag at the very beginning
+            # This clears any stale shutdown state from previous runs or
+            # interrupted startups. Critical for ensuring recovery mechanisms
+            # work correctly and services don't skip initialization.
+            try:
+                from backend.core.resilience.graceful_shutdown import reset_global_shutdown
+                reset_global_shutdown()
+                self.logger.debug("[v108.3] Global shutdown flag reset at startup")
+            except ImportError:
+                pass  # Module not available
+            except Exception as e:
+                self.logger.debug(f"[v108.3] Could not reset global shutdown: {e}")
+
             # Setup signal handlers
             self._setup_signal_handlers()
 
@@ -5701,8 +5714,10 @@ class SupervisorBootstrapper:
                 from backend.supervisor.cross_repo_startup_orchestrator import initialize_cross_repo_orchestration
 
                 self.logger.info("🚀 [v10.1] Pre-launching external services...")
+                self.logger.info("📋 [v108.1] Non-blocking model loading enabled - services will be 'started' once responding")
+                self.logger.info("    (Model loading will continue in background while main JARVIS backend starts)")
                 await initialize_cross_repo_orchestration()
-                self.logger.info("✅ [v10.1] External services launched")
+                self.logger.info("✅ [v10.1] External services launched (servers responding)")
 
             except ImportError as e:
                 self.logger.warning(f"⚠️ [v10.1] Cross-Repo Orchestrator not available: {e}")

@@ -397,6 +397,22 @@ class OrchestratorConfig:
         default_factory=lambda: float(os.getenv("DOCKER_BUILD_TIMEOUT", "600.0"))
     )
 
+    # =========================================================================
+    # v108.1: Non-Blocking Model Loading Configuration
+    # =========================================================================
+    # When True, heavy services (like jarvis-prime) are considered "started" as soon
+    # as their HTTP server responds (Phase 1), even if models are still loading.
+    # Model loading health monitoring continues in the background.
+    # This allows the main JARVIS backend (port 8010) to start while external
+    # services load their ML models.
+    non_blocking_model_loading: bool = field(
+        default_factory=lambda: os.getenv("NON_BLOCKING_MODEL_LOADING", "true").lower() == "true"
+    )
+    # Timeout for Phase 1 (server responding) - should be fast
+    server_responding_timeout: float = field(
+        default_factory=lambda: float(os.getenv("SERVER_RESPONDING_TIMEOUT", "60.0"))
+    )
+
 
 # =============================================================================
 # Data Models
@@ -10372,8 +10388,27 @@ echo "=== JARVIS Prime started ==="
             # Start output streaming
             await self._start_output_streaming(managed)
 
+            # v108.1: Determine if we should use non-blocking model loading
+            # Heavy ML services (startup_timeout > 90s) can use background model loading
+            # so the main JARVIS backend can start while external services load models
+            is_ml_heavy = definition.startup_timeout > 90.0
+            use_background_loading = (
+                self.config.non_blocking_model_loading
+                and is_ml_heavy
+            )
+
+            if use_background_loading:
+                logger.info(
+                    f"📋 [v108.1] {definition.name}: Using non-blocking model loading "
+                    f"(server will be considered 'started' once responding)"
+                )
+
             # Wait for service to become healthy
-            healthy = await self._wait_for_health(managed, timeout=definition.startup_timeout)
+            healthy = await self._wait_for_health(
+                managed,
+                timeout=definition.startup_timeout,
+                background_model_loading=use_background_loading,
+            )
 
             if healthy:
                 managed.status = ServiceStatus.HEALTHY
@@ -10589,7 +10624,8 @@ echo "=== JARVIS Prime started ==="
     async def _wait_for_health(
         self,
         managed: ManagedProcess,
-        timeout: float = 60.0
+        timeout: float = 60.0,
+        background_model_loading: bool = False,
     ) -> bool:
         """
         Wait for service to become healthy with intelligent progress-based timeout extension.
@@ -10608,11 +10644,21 @@ echo "=== JARVIS Prime started ==="
           timeout is dynamically extended up to max_startup_timeout
         - This prevents timeout when model is actively loading (just slow)
 
+        v108.1: Non-blocking model loading mode:
+        - When background_model_loading=True, returns after Phase 1 (server responding)
+        - Phase 2 (model loading) continues in background task
+        - This allows the main JARVIS backend to start while J-Prime loads its model
+
         This prevents the scenario where:
         - Server takes 5s to start listening
         - Model takes 304s to load (just 4s over 300s timeout)
         - Old approach: times out at 300s even though model was 98% loaded
         - New approach: detects progress, extends timeout, model loads successfully
+
+        Args:
+            managed: The managed process to wait for
+            timeout: Timeout for full health check (Phase 1 + Phase 2)
+            background_model_loading: If True, return after Phase 1 and continue Phase 2 in background
         """
         start_time = time.time()
         check_interval = 1.0
@@ -10671,6 +10717,30 @@ echo "=== JARVIS Prime started ==="
                 f"    ⚠️ {managed.definition.name} server failed to start within {elapsed:.1f}s"
             )
             return False
+
+        # v108.1: Non-blocking model loading mode
+        # If enabled, return success after Phase 1 and continue Phase 2 in background
+        if background_model_loading and is_ml_heavy:
+            elapsed = time.time() - start_time
+            logger.info(
+                f"    🚀 [v108.1] Non-blocking mode: {managed.definition.name} server responding, "
+                f"returning early (model loading continues in background)"
+            )
+
+            # Start background task to monitor Phase 2 (model loading)
+            background_task = asyncio.create_task(
+                self._background_model_loading_monitor(
+                    managed=managed,
+                    effective_timeout=effective_timeout,
+                    max_timeout=max_timeout,
+                ),
+                name=f"model_loading_monitor_{managed.definition.name}"
+            )
+            self._track_background_task(background_task)
+
+            # Return True - service is "started" (server responding)
+            # Model loading will be monitored in background
+            return True
 
         # Phase 2: Wait for "healthy" status (model loading) with intelligent progress detection
         phase2_start = time.time()
@@ -10830,6 +10900,189 @@ echo "=== JARVIS Prime started ==="
             f"({check_count} phase 2 checks, effective_timeout={effective_timeout:.0f}s)"
         )
         return False
+
+    async def _background_model_loading_monitor(
+        self,
+        managed: ManagedProcess,
+        effective_timeout: float,
+        max_timeout: float,
+    ) -> None:
+        """
+        v108.1: Background task to monitor model loading for non-blocking startup.
+
+        This task continues monitoring Phase 2 (model loading) in the background
+        after Phase 1 (server responding) completes. This allows the main JARVIS
+        backend to start while heavy services like jarvis-prime load their ML models.
+
+        The task:
+        - Monitors health endpoint for "healthy" status
+        - Tracks model loading progress
+        - Extends timeout if progress is detected
+        - Updates managed.status when fully healthy
+        - Emits events for voice narration
+
+        Args:
+            managed: The managed process to monitor
+            effective_timeout: Initial Phase 2 timeout
+            max_timeout: Maximum timeout (hard cap)
+        """
+        service_name = managed.definition.name
+        start_time = time.time()
+        last_model_elapsed = 0.0
+        progress_detected_at = 0.0
+        timeout_extended = False
+        check_interval = 3.0
+        last_milestone_log = start_time
+        milestone_interval = 30.0
+        check_count = 0
+        last_status = "starting"
+
+        logger.info(
+            f"    🔄 [v108.1] Background model loading monitor started for {service_name}"
+        )
+
+        try:
+            while not self._shutdown_event.is_set():
+                phase2_elapsed = time.time() - start_time
+                check_count += 1
+
+                # Check against effective (possibly extended) timeout
+                if phase2_elapsed >= effective_timeout:
+                    # Final timeout check - but only if no recent progress
+                    if progress_detected_at > 0 and (time.time() - progress_detected_at) < 60:
+                        # Progress was detected within last 60s - extend if under max
+                        if effective_timeout < max_timeout:
+                            extension = min(
+                                self.config.model_loading_timeout_extension,
+                                max_timeout - effective_timeout
+                            )
+                            effective_timeout += extension
+                            logger.info(
+                                f"    🔄 [v108.1] {service_name}: Progress detected, extending "
+                                f"background timeout by {extension:.0f}s (new: {effective_timeout:.0f}s)"
+                            )
+                            timeout_extended = True
+                            continue
+                    # Actually timed out
+                    logger.warning(
+                        f"    ⚠️ [v108.1] {service_name} background model loading timed out "
+                        f"after {phase2_elapsed:.1f}s"
+                    )
+                    managed.status = ServiceStatus.DEGRADED
+                    await _emit_event(
+                        "MODEL_LOADING_TIMEOUT",
+                        service_name=service_name,
+                        priority="HIGH",
+                        details={
+                            "elapsed_seconds": phase2_elapsed,
+                            "timeout_seconds": effective_timeout,
+                            "timeout_extended": timeout_extended,
+                        }
+                    )
+                    return
+
+                # Check if process died
+                if not managed.is_running:
+                    exit_code = managed.process.returncode if managed.process else "unknown"
+                    logger.error(
+                        f"    ❌ [v108.1] {service_name} process died during model loading "
+                        f"(exit code: {exit_code})"
+                    )
+                    managed.status = ServiceStatus.FAILED
+                    await _emit_event(
+                        "SERVICE_CRASHED",
+                        service_name=service_name,
+                        priority="CRITICAL",
+                        details={"reason": "process_died_during_model_loading", "exit_code": exit_code}
+                    )
+                    return
+
+                # Health check
+                try:
+                    url = f"http://localhost:{managed.port}{managed.definition.health_endpoint}"
+                    session = await self._get_http_session()
+                    async with session.get(
+                        url,
+                        timeout=aiohttp.ClientTimeout(total=self.config.health_check_timeout)
+                    ) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            current_status = data.get("status", "unknown")
+                            current_phase = data.get("phase", "")
+                            model_elapsed = data.get("model_load_elapsed_seconds", 0)
+                            current_step = data.get("current_step", "")
+                            model_progress = data.get("model_load_progress_pct", 0)
+
+                            # Check if healthy
+                            is_healthy = (
+                                current_status == "healthy"
+                                or current_phase == "ready"
+                                or (data.get("ready_for_inference", False) and data.get("model_loaded", False))
+                            )
+
+                            if is_healthy:
+                                logger.info(
+                                    f"    ✅ [v108.1] {service_name} fully healthy after "
+                                    f"{phase2_elapsed:.1f}s (background monitoring)"
+                                    + (f" [timeout was extended]" if timeout_extended else "")
+                                )
+                                managed.status = ServiceStatus.HEALTHY
+                                await _emit_event(
+                                    "MODEL_LOADING_COMPLETE",
+                                    service_name=service_name,
+                                    priority="HIGH",
+                                    details={
+                                        "elapsed_seconds": phase2_elapsed,
+                                        "model_load_seconds": model_elapsed,
+                                    }
+                                )
+                                return
+
+                            # Track progress
+                            if model_elapsed and model_elapsed > last_model_elapsed:
+                                progress_detected_at = time.time()
+                                last_model_elapsed = model_elapsed
+
+                            # Log status changes
+                            if current_status != last_status:
+                                step_info = f" (step: {current_step})" if current_step else ""
+                                logger.info(
+                                    f"    ℹ️  [v108.1] {service_name}: status={current_status}{step_info}"
+                                )
+                                last_status = current_status
+
+                            # Milestone logging
+                            if (time.time() - last_milestone_log) >= milestone_interval:
+                                remaining = effective_timeout - phase2_elapsed
+                                model_info = f", model: {model_elapsed:.0f}s" if model_elapsed else ""
+                                progress_info = f" ({model_progress:.0f}%)" if model_progress > 0 else ""
+                                logger.info(
+                                    f"    ⏳ [v108.1] {service_name}: {current_status}{progress_info} "
+                                    f"({phase2_elapsed:.0f}s elapsed, {remaining:.0f}s remaining{model_info})"
+                                )
+                                last_milestone_log = time.time()
+
+                except asyncio.TimeoutError:
+                    pass  # Health check timeout, retry
+                except Exception as e:
+                    logger.debug(f"    [v108.1] Background health check error: {e}")
+
+                # Adaptive check intervals
+                if phase2_elapsed > 180:
+                    check_interval = 10.0
+                elif phase2_elapsed > 60:
+                    check_interval = 5.0
+                else:
+                    check_interval = 3.0
+
+                await asyncio.sleep(check_interval)
+
+        except asyncio.CancelledError:
+            logger.info(f"    🛑 [v108.1] Background model loading monitor cancelled for {service_name}")
+            raise
+        except Exception as e:
+            logger.error(f"    ❌ [v108.1] Background model loading monitor error for {service_name}: {e}")
+            managed.status = ServiceStatus.DEGRADED
 
     # =========================================================================
     # Process Stopping
