@@ -2524,6 +2524,88 @@ class ManagedProcess:
 
 
 # =============================================================================
+# v109.1: Health Check Result (Enterprise-Grade State Tracking)
+# =============================================================================
+
+class HealthState(Enum):
+    """
+    v109.1: Nuanced health state for intelligent failure tracking.
+
+    CRITICAL: Previous design only had True/False, which couldn't distinguish
+    between "service is starting" and "service has failed". This caused
+    the health monitor to count startup time as failures, triggering
+    premature auto-heal attempts.
+    """
+    HEALTHY = "healthy"      # Service is fully operational
+    STARTING = "starting"    # Service is responding but still initializing
+    DEGRADED = "degraded"    # Service responds but reports degraded state
+    UNHEALTHY = "unhealthy"  # Service responds with error status
+    UNREACHABLE = "unreachable"  # Service not responding (connection failed)
+    TIMEOUT = "timeout"      # Health check timed out
+
+
+@dataclass
+class HealthCheckResult:
+    """
+    v109.1: Enterprise-grade health check result with nuanced state tracking.
+
+    This enables the health monitor to:
+    - Not count "starting" as a failure during startup
+    - Track startup progress (elapsed time, current step)
+    - Distinguish between "unreachable" and "unhealthy"
+    - Make intelligent decisions about auto-heal triggers
+    """
+    state: HealthState
+    is_responding: bool = False  # True if HTTP connection succeeded
+    status_text: str = ""        # Raw status from response
+    phase: str = ""              # Current phase (J-Prime specific)
+    startup_elapsed: Optional[float] = None  # Seconds since startup began
+    startup_step: Optional[str] = None       # Current startup step
+    startup_progress: Optional[int] = None   # Step N of M
+    error_message: Optional[str] = None      # Error details if unhealthy
+    raw_data: Optional[Dict[str, Any]] = None  # Full response for debugging
+
+    @property
+    def is_healthy(self) -> bool:
+        """True if service is fully operational."""
+        return self.state == HealthState.HEALTHY
+
+    @property
+    def is_starting(self) -> bool:
+        """True if service is starting but not yet ready."""
+        return self.state == HealthState.STARTING
+
+    @property
+    def should_count_as_failure(self) -> bool:
+        """
+        v109.1: CRITICAL - Determine if this should count as a health failure.
+
+        A "failure" triggers consecutive_failures counter, which can lead to
+        auto-heal. We should NOT count as failure if:
+        - Service is starting (normal startup process)
+        - Service is degraded but responding (might recover)
+
+        We SHOULD count as failure if:
+        - Service is unreachable (connection failed)
+        - Service explicitly reports error/unhealthy
+        - Service timed out (not responding)
+        """
+        return self.state in (HealthState.UNHEALTHY, HealthState.UNREACHABLE, HealthState.TIMEOUT)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for logging/serialization."""
+        return {
+            "state": self.state.value,
+            "is_responding": self.is_responding,
+            "status_text": self.status_text,
+            "phase": self.phase,
+            "startup_elapsed": self.startup_elapsed,
+            "startup_step": self.startup_step,
+            "error_message": self.error_message,
+        }
+
+
+# =============================================================================
 # Process Orchestrator
 # =============================================================================
 
@@ -8864,32 +8946,24 @@ echo "=== JARVIS Prime started ==="
     # Health Monitoring
     # =========================================================================
 
-    async def _check_health(
+    async def _check_health_detailed(
         self,
         managed: ManagedProcess,
-        require_ready: bool = True,
-    ) -> bool:
+    ) -> HealthCheckResult:
         """
-        Check health of a service via HTTP endpoint.
+        v109.1: Enterprise-grade health check with nuanced state tracking.
 
-        v109.0: Enhanced to accept multiple health response formats:
-        - {"status": "healthy"} (standard)
-        - {"status": "ok"} (common alternative)
-        - {"status": "UP"} (Spring Boot style)
-        - {"healthy": true} (boolean flag)
-        - {"ready": true} (boolean flag)
-        - {"phase": "ready"} (J-Prime specific)
-        - HTTP 200 with any JSON body (lenient fallback)
+        Returns a HealthCheckResult with detailed state information, enabling
+        the health monitor to make intelligent decisions about failure counting.
 
-        Args:
-            managed: The managed process to check
-            require_ready: If True, require "healthy" status. If False, accept "starting" too.
-
-        Returns:
-            True if service is responding appropriately
+        Key improvement: "starting" status is NOT counted as a failure.
         """
         if managed.port is None:
-            return False
+            return HealthCheckResult(
+                state=HealthState.UNREACHABLE,
+                is_responding=False,
+                error_message="No port configured"
+            )
 
         url = f"http://localhost:{managed.port}{managed.definition.health_endpoint}"
 
@@ -8900,70 +8974,128 @@ echo "=== JARVIS Prime started ==="
                 timeout=aiohttp.ClientTimeout(total=self.config.health_check_timeout)
             ) as response:
                 if response.status != 200:
-                    return False
+                    return HealthCheckResult(
+                        state=HealthState.UNHEALTHY,
+                        is_responding=True,
+                        status_text=f"HTTP {response.status}",
+                        error_message=f"Non-200 status code: {response.status}"
+                    )
 
                 try:
                     data = await response.json()
 
-                    # v109.0: Multiple ways to detect healthy status
-                    # Priority order: explicit status > boolean flags > phase indicators
-
-                    # 1. Check explicit status field (multiple accepted values)
+                    # Extract common fields
                     status = data.get("status", "").lower() if data.get("status") else ""
+                    phase = data.get("phase", "").lower() if data.get("phase") else ""
+                    startup_elapsed = data.get("startup_elapsed_seconds") or data.get("model_load_elapsed_seconds")
+                    startup_step = data.get("current_step")
+                    details = data.get("details", {})
+                    if details and isinstance(details, dict):
+                        startup_progress = details.get("step_num")
+                    else:
+                        startup_progress = None
+
+                    # v109.1: Determine health state with nuanced logic
+
+                    # 1. Check for explicit healthy states
                     if status in ("healthy", "ok", "up", "running", "ready"):
-                        return True
+                        return HealthCheckResult(
+                            state=HealthState.HEALTHY,
+                            is_responding=True,
+                            status_text=status,
+                            phase=phase,
+                            raw_data=data
+                        )
 
                     # 2. Check boolean healthy/ready flags
                     if data.get("healthy") is True:
-                        return True
+                        return HealthCheckResult(
+                            state=HealthState.HEALTHY,
+                            is_responding=True,
+                            status_text="healthy (boolean)",
+                            raw_data=data
+                        )
                     if data.get("ready") is True:
-                        return True
+                        return HealthCheckResult(
+                            state=HealthState.HEALTHY,
+                            is_responding=True,
+                            status_text="ready (boolean)",
+                            raw_data=data
+                        )
                     if data.get("ready_for_inference") is True and data.get("model_loaded") is True:
-                        return True
+                        return HealthCheckResult(
+                            state=HealthState.HEALTHY,
+                            is_responding=True,
+                            status_text="ready_for_inference",
+                            raw_data=data
+                        )
 
                     # 3. Check phase indicator (J-Prime specific)
-                    phase = data.get("phase", "").lower() if data.get("phase") else ""
                     if phase == "ready":
-                        return True
+                        return HealthCheckResult(
+                            state=HealthState.HEALTHY,
+                            is_responding=True,
+                            status_text=status,
+                            phase=phase,
+                            raw_data=data
+                        )
 
-                    # 4. Check starting status (if not requiring ready)
-                    if not require_ready:
-                        if status == "starting" or phase in ("starting", "loading", "initializing"):
-                            return True
+                    # 4. v109.1: CRITICAL - Check starting status (this is NOT a failure!)
+                    if status == "starting" or phase in ("starting", "loading", "initializing"):
+                        return HealthCheckResult(
+                            state=HealthState.STARTING,
+                            is_responding=True,
+                            status_text=status,
+                            phase=phase,
+                            startup_elapsed=startup_elapsed,
+                            startup_step=startup_step,
+                            startup_progress=startup_progress,
+                            raw_data=data
+                        )
 
                     # 5. Check error status explicitly
                     if status == "error":
                         error = data.get("model_load_error") or data.get("error") or "unknown error"
-                        logger.warning(
-                            f"    ⚠️ {managed.definition.name}: status=error - {error}"
+                        return HealthCheckResult(
+                            state=HealthState.UNHEALTHY,
+                            is_responding=True,
+                            status_text=status,
+                            error_message=str(error),
+                            raw_data=data
                         )
-                        return False
 
-                    # 6. If status is explicitly "starting" but we require_ready, return False
-                    if status == "starting":
-                        elapsed = data.get("model_load_elapsed_seconds")
-                        if elapsed:
-                            logger.debug(
-                                f"    ℹ️  {managed.definition.name}: status=starting, "
-                                f"model loading for {elapsed:.0f}s"
-                            )
-                        return False
+                    # 6. Check degraded status
+                    if status == "degraded":
+                        return HealthCheckResult(
+                            state=HealthState.DEGRADED,
+                            is_responding=True,
+                            status_text=status,
+                            raw_data=data
+                        )
 
-                    # 7. v109.0: If we got a valid JSON response with HTTP 200 but no
-                    #    recognized status field, log it and return True (lenient mode)
+                    # 7. v109.0: If we got HTTP 200 with no recognized status, accept as healthy
                     if status == "":
                         logger.debug(
                             f"    ℹ️  {managed.definition.name}: HTTP 200 OK with no status field "
                             f"(keys: {list(data.keys())[:5]}) - accepting as healthy"
                         )
-                        return True
+                        return HealthCheckResult(
+                            state=HealthState.HEALTHY,
+                            is_responding=True,
+                            status_text="(no status field)",
+                            raw_data=data
+                        )
 
-                    # Unknown status value - log for debugging but be conservative
+                    # Unknown status value - treat as degraded (not unhealthy)
                     logger.debug(
-                        f"    ℹ️  {managed.definition.name}: unrecognized status='{status}' "
-                        f"- treating as unhealthy"
+                        f"    ℹ️  {managed.definition.name}: unrecognized status='{status}'"
                     )
-                    return False
+                    return HealthCheckResult(
+                        state=HealthState.DEGRADED,
+                        is_responding=True,
+                        status_text=status,
+                        raw_data=data
+                    )
 
                 except Exception as json_error:
                     # Couldn't parse JSON - HTTP 200 is still success
@@ -8971,14 +9103,56 @@ echo "=== JARVIS Prime started ==="
                         f"    ℹ️  {managed.definition.name}: HTTP 200 but not JSON - "
                         f"accepting as healthy"
                     )
-                    return True
+                    return HealthCheckResult(
+                        state=HealthState.HEALTHY,
+                        is_responding=True,
+                        status_text="HTTP 200 (non-JSON)"
+                    )
 
         except asyncio.TimeoutError:
-            logger.debug(f"    Health check timeout for {managed.definition.name}")
-            return False
+            return HealthCheckResult(
+                state=HealthState.TIMEOUT,
+                is_responding=False,
+                error_message=f"Timeout after {self.config.health_check_timeout}s"
+            )
+        except aiohttp.ClientConnectorError as e:
+            return HealthCheckResult(
+                state=HealthState.UNREACHABLE,
+                is_responding=False,
+                error_message=f"Connection refused: {e}"
+            )
         except Exception as e:
-            logger.debug(f"    Health check error for {managed.definition.name}: {e}")
-            return False
+            return HealthCheckResult(
+                state=HealthState.UNREACHABLE,
+                is_responding=False,
+                error_message=str(e)
+            )
+
+    async def _check_health(
+        self,
+        managed: ManagedProcess,
+        require_ready: bool = True,
+    ) -> bool:
+        """
+        Check health of a service via HTTP endpoint.
+
+        v109.1: Now delegates to _check_health_detailed() for nuanced state tracking.
+        Maintains backward compatibility by returning bool.
+
+        Args:
+            managed: The managed process to check
+            require_ready: If True, require "healthy" status. If False, accept "starting" too.
+
+        Returns:
+            True if service is responding appropriately
+        """
+        result = await self._check_health_detailed(managed)
+
+        if require_ready:
+            return result.is_healthy
+        else:
+            # Accept starting or healthy
+            return result.state in (HealthState.HEALTHY, HealthState.STARTING, HealthState.DEGRADED)
 
     async def _check_service_responding(self, managed: ManagedProcess) -> bool:
         """
@@ -9103,11 +9277,12 @@ echo "=== JARVIS Prime started ==="
                         )
                         return
 
-                # HTTP health check
-                healthy = await self._check_health(managed)
+                # v109.1: HTTP health check with nuanced state tracking
+                health_result = await self._check_health_detailed(managed)
                 managed.last_health_check = time.time()
 
-                if healthy:
+                if health_result.is_healthy:
+                    # Service is fully healthy
                     managed.consecutive_failures = 0
                     # v95.0: Update last known health for heartbeat loop
                     managed.last_known_health = "healthy"
@@ -9141,24 +9316,67 @@ echo "=== JARVIS Prime started ==="
                                 f"[v93.0] Heartbeat failed for {managed.definition.name} "
                                 f"(non-fatal): {hb_error}"
                             )
+
+                elif health_result.is_starting:
+                    # v109.1: CRITICAL FIX - Service is starting, NOT a failure!
+                    # Do NOT increment consecutive_failures for starting services
+                    managed.last_known_health = "starting"
+
+                    # Update status to STARTING if not already
+                    if managed.status not in (ServiceStatus.STARTING, ServiceStatus.HEALTHY):
+                        managed.status = ServiceStatus.STARTING
+
+                    # Log startup progress periodically (not every check)
+                    if health_result.startup_elapsed:
+                        elapsed_int = int(health_result.startup_elapsed)
+                        if elapsed_int % 30 == 0 or elapsed_int < 10:  # Log every 30s or during first 10s
+                            step_info = f", step: {health_result.startup_step}" if health_result.startup_step else ""
+                            logger.info(
+                                f"    ⏳ {managed.definition.name} starting ({elapsed_int}s elapsed{step_info})"
+                            )
+
+                    # Send heartbeat with "starting" status
+                    if self.registry:
+                        try:
+                            await self.registry.heartbeat(
+                                managed.definition.name,
+                                status="starting"
+                            )
+                        except Exception:
+                            pass  # Non-fatal
+
                 else:
-                    # v95.0: Update last known health for heartbeat loop
-                    managed.last_known_health = "degraded"
-                    managed.consecutive_failures += 1
-                    logger.warning(
-                        f"⚠️ {managed.definition.name} health check failed "
-                        f"({managed.consecutive_failures} consecutive failures)"
-                    )
+                    # v109.1: Check if this should count as a failure
+                    if health_result.should_count_as_failure:
+                        # This is a real failure (unreachable, timeout, or explicit error)
+                        managed.last_known_health = "degraded"
+                        managed.consecutive_failures += 1
 
-                    if managed.consecutive_failures >= 3:
-                        managed.status = ServiceStatus.DEGRADED
+                        # Log with detail about the failure type
+                        logger.warning(
+                            f"⚠️ {managed.definition.name} health check failed: "
+                            f"{health_result.state.value} "
+                            f"({managed.consecutive_failures} consecutive failures)"
+                            + (f" - {health_result.error_message}" if health_result.error_message else "")
+                        )
 
-                        if self.config.auto_healing_enabled:
-                            success = await self._auto_heal(managed)
-                            if success:
-                                # Reset consecutive failures after successful heal
-                                managed.consecutive_failures = 0
-                            # v93.0: Don't break - continue monitoring
+                        if managed.consecutive_failures >= 3:
+                            managed.status = ServiceStatus.DEGRADED
+
+                            if self.config.auto_healing_enabled:
+                                success = await self._auto_heal(managed)
+                                if success:
+                                    # Reset consecutive failures after successful heal
+                                    managed.consecutive_failures = 0
+                                # v93.0: Don't break - continue monitoring
+                    else:
+                        # Degraded but responding - don't count as failure, just note it
+                        managed.last_known_health = "degraded"
+                        if managed.status == ServiceStatus.HEALTHY:
+                            managed.status = ServiceStatus.DEGRADED
+                            logger.info(
+                                f"    ⚠️ {managed.definition.name} is degraded but responding"
+                            )
 
         except asyncio.CancelledError:
             logger.debug(f"[v93.0] Health monitor cancelled for {managed.definition.name}")
