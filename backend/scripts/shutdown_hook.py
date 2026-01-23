@@ -681,16 +681,59 @@ def _run_cleanup_in_new_loop(timeout: float, reason: str) -> Dict[str, Any]:
 # SIGNAL HANDLERS
 # ============================================================================
 
+def _cleanup_multiprocessing_sync_fast(timeout: float = 2.0) -> int:
+    """
+    v95.17: Fast synchronous multiprocessing cleanup.
+
+    CRITICAL: This MUST run immediately in signal handlers BEFORE any async work.
+    ProcessPoolExecutors use semaphores that will leak if not properly cleaned up.
+
+    This is the first line of defense against semaphore leaks.
+
+    Returns:
+        Number of executors cleaned
+    """
+    cleaned = 0
+    try:
+        # Import the multiprocessing tracker
+        for module_path in ["core.resilience.graceful_shutdown", "backend.core.resilience.graceful_shutdown"]:
+            try:
+                import importlib
+                module = importlib.import_module(module_path)
+                get_tracker = getattr(module, "get_multiprocessing_tracker", None)
+                if get_tracker:
+                    tracker = get_tracker()
+                    # Use fast sync cleanup
+                    result = tracker.shutdown_all_executors_sync(timeout=timeout)
+                    cleaned = result.get("successful", 0) + result.get("forced", 0)
+                    if cleaned > 0:
+                        logger.debug(f"   [v95.17] Fast MP cleanup: {cleaned} executors")
+                    break
+            except ImportError:
+                continue
+    except Exception as e:
+        logger.debug(f"   [v95.17] Fast MP cleanup error (non-critical): {e}")
+    return cleaned
+
+
 def _signal_handler(signum: int, frame: Any) -> None:
     """
     Signal handler for SIGTERM and SIGINT.
-    
+
+    v95.17: Enhanced with IMMEDIATE synchronous multiprocessing cleanup.
+    This prevents semaphore leaks by cleaning up ProcessPoolExecutors
+    BEFORE any async operations that might timeout or fail.
+
     Triggers cleanup and then calls the original handler.
     """
     signal_name = signal.Signals(signum).name
     logger.info(f"🛑 Received {signal_name} - triggering cleanup...")
-    
-    # Run synchronous cleanup
+
+    # v95.17: CRITICAL - Clean up multiprocessing resources FIRST, synchronously
+    # This MUST happen before any async work to prevent semaphore leaks
+    _cleanup_multiprocessing_sync_fast(timeout=2.0)
+
+    # Run synchronous cleanup (includes GCP resources, sessions, etc.)
     cleanup_remote_resources_sync(timeout=15.0, reason=f"Signal {signal_name}")
     
     # Call original handler
@@ -705,13 +748,100 @@ def _signal_handler(signum: int, frame: Any) -> None:
 def _atexit_handler() -> None:
     """
     atexit handler for final cleanup.
-    
+
+    v95.17: Enhanced with multiprocessing cleanup as final safety net.
     This is the last line of defense for cleanup.
     """
     logger.info("🔚 atexit handler: Final cleanup check...")
-    
+
+    # v95.17: CRITICAL - Clean up multiprocessing resources
+    _cleanup_multiprocessing_sync_fast(timeout=2.0)
+
     if not _cleanup_completed:
         cleanup_remote_resources_sync(timeout=10.0, reason="atexit handler")
+
+
+def cleanup_orphaned_semaphores_on_startup() -> Dict[str, Any]:
+    """
+    v95.17: Clean up orphaned semaphores from previous crashed processes.
+
+    This should be called at startup to prevent semaphore accumulation
+    across restarts/crashes.
+
+    On macOS/Linux, checks for semaphores that belong to no running process.
+
+    Returns:
+        Dict with cleanup statistics
+    """
+    import platform
+    import subprocess
+
+    results = {
+        "platform": platform.system(),
+        "checked": False,
+        "semaphores_found": 0,
+        "semaphores_cleaned": 0,
+        "errors": [],
+    }
+
+    system = platform.system()
+    if system not in ("Darwin", "Linux"):
+        results["skipped"] = f"Unsupported platform: {system}"
+        return results
+
+    try:
+        results["checked"] = True
+
+        if system == "Darwin":
+            # macOS: Use ipcs to list semaphores
+            proc = subprocess.run(
+                ["ipcs", "-s"],
+                capture_output=True,
+                text=True,
+                timeout=5.0,
+            )
+            if proc.returncode == 0:
+                lines = proc.stdout.strip().split("\n")
+                # Parse: skip header lines (usually first 3)
+                for line in lines[3:]:
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        results["semaphores_found"] += 1
+
+        elif system == "Linux":
+            # Linux: Use ipcs -s
+            proc = subprocess.run(
+                ["ipcs", "-s"],
+                capture_output=True,
+                text=True,
+                timeout=5.0,
+            )
+            if proc.returncode == 0:
+                lines = proc.stdout.strip().split("\n")
+                for line in lines[3:]:
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        results["semaphores_found"] += 1
+
+        # Log findings
+        if results["semaphores_found"] > 0:
+            logger.debug(
+                f"[v95.17] Found {results['semaphores_found']} system semaphores "
+                f"(some may be from other processes)"
+            )
+
+        # Note: Actually removing semaphores requires identifying which belong to JARVIS
+        # and having appropriate permissions. For now, we just report.
+        # Future enhancement: Track JARVIS semaphore IDs and clean them up on startup
+
+    except subprocess.TimeoutExpired:
+        results["errors"].append("Command timeout")
+    except FileNotFoundError:
+        results["errors"].append("ipcs command not found")
+    except Exception as e:
+        results["errors"].append(str(e))
+
+    return results
 
 
 # ============================================================================

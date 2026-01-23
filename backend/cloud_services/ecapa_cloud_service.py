@@ -1384,50 +1384,71 @@ class ECAPAModelManager:
         
         # Use spawn method to ensure clean process (avoids fork issues on macOS)
         ctx = mp.get_context('spawn')
-        
+
         loop = asyncio.get_running_loop()
-        
+
+        # v95.17: Register executor for proper cleanup to prevent semaphore leaks
+        try:
+            from backend.core.resilience.graceful_shutdown import register_executor_for_cleanup
+        except ImportError:
+            def register_executor_for_cleanup(*args, **kwargs):
+                pass  # Gracefully degrade if module not available
+
+        executor = None
         try:
             # Create executor with spawn context
-            with ProcessPoolExecutor(max_workers=1, mp_context=ctx) as executor:
-                # Submit model loading to separate process
-                future = loop.run_in_executor(
-                    executor,
-                    _isolated_model_load,
-                    cache_dir,
-                    self.device
-                )
-                
-                # Wait with real timeout (event loop not blocked!)
-                result = await asyncio.wait_for(future, timeout=timeout)
-                
-                if result.get('success'):
-                    # Model loaded successfully in subprocess
-                    # Now do a quick local verification/warm-up
-                    self._using_optimized = result.get('optimized', False)
-                    self.load_source = result.get('strategy', 'process_isolated')
-                    self.load_time_ms = result.get('load_time_ms', 0)
-                    
-                    logger.info(f"✅ Process-isolated load: {self.load_source}")
-                    logger.info(f"   Load time: {self.load_time_ms:.1f}ms")
-                    
-                    # Now initialize the model in this process (should be fast - cached)
-                    # This is safe because the heavy lifting was done in subprocess
-                    await self._quick_model_init(cache_dir)
-                    
-                    return True
-                else:
-                    error = result.get('error', 'Unknown error')
-                    logger.error(f"Process-isolated load failed: {error}")
-                    return False
-                    
+            executor = ProcessPoolExecutor(max_workers=1, mp_context=ctx)
+            register_executor_for_cleanup(executor, "ecapa_model_loader", is_process_pool=True)
+
+            # Submit model loading to separate process
+            future = loop.run_in_executor(
+                executor,
+                _isolated_model_load,
+                cache_dir,
+                self.device
+            )
+
+            # Wait with real timeout (event loop not blocked!)
+            result = await asyncio.wait_for(future, timeout=timeout)
+
+            if result.get('success'):
+                # Model loaded successfully in subprocess
+                # Now do a quick local verification/warm-up
+                self._using_optimized = result.get('optimized', False)
+                self.load_source = result.get('strategy', 'process_isolated')
+                self.load_time_ms = result.get('load_time_ms', 0)
+
+                logger.info(f"✅ Process-isolated load: {self.load_source}")
+                logger.info(f"   Load time: {self.load_time_ms:.1f}ms")
+
+                # Now initialize the model in this process (should be fast - cached)
+                # This is safe because the heavy lifting was done in subprocess
+                await self._quick_model_init(cache_dir)
+
+                return True
+            else:
+                error = result.get('error', 'Unknown error')
+                logger.error(f"Process-isolated load failed: {error}")
+                return False
+
         except FuturesTimeout:
             logger.error(f"Process-isolated load timed out after {timeout}s")
             raise asyncio.TimeoutError(f"Model loading timed out after {timeout}s")
-            
+
         except Exception as e:
             logger.error(f"Process-isolated load error: {e}")
             raise
+
+        finally:
+            # v95.17: Ensure executor is properly shut down to release semaphores
+            if executor is not None:
+                try:
+                    executor.shutdown(wait=True, cancel_futures=True)
+                except Exception:
+                    try:
+                        executor.shutdown(wait=False, cancel_futures=True)
+                    except Exception:
+                        pass
 
     async def _quick_model_init(self, cache_dir: str):
         """

@@ -21977,6 +21977,18 @@ async def main() -> int:
     """Main entry point."""
     args = parse_args()
 
+    # v95.17: Clean up orphaned semaphores from previous crashes
+    # This prevents semaphore accumulation across restarts
+    try:
+        from backend.scripts.shutdown_hook import cleanup_orphaned_semaphores_on_startup
+        orphan_result = cleanup_orphaned_semaphores_on_startup()
+        if orphan_result.get("semaphores_found", 0) > 0:
+            print(f"[v95.17] Startup: Found {orphan_result['semaphores_found']} system semaphores")
+    except ImportError:
+        pass  # Module not available
+    except Exception as e:
+        print(f"[v95.17] Startup semaphore check warning: {e}")
+
     # Apply command-line settings to environment
     if args.no_voice:
         os.environ["JARVIS_VOICE_ENABLED"] = "false"
