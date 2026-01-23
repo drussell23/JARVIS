@@ -1016,7 +1016,7 @@ class JARVISSupervisor:
             # Start health monitoring with loading page progress
             if self._health_monitor:
                 asyncio.create_task(self._monitor_health())
-            
+
             # Start loading progress monitor - this handles ALL startup narration
             # and will announce "JARVIS online" when truly ready
             if self._progress_reporter:
@@ -1025,9 +1025,148 @@ class JARVISSupervisor:
                 # No loading page - announce ready after a brief startup period
                 # This fallback ensures we still narrate when running without loading page
                 asyncio.create_task(self._announce_ready_fallback())
-            
-            # Wait for process to exit
-            exit_code = await self._process.wait()
+
+            # ═══════════════════════════════════════════════════════════════════════════
+            # v102.0: ZOMBIE PROCESS WATCHDOG
+            # ═══════════════════════════════════════════════════════════════════════════
+            # This watchdog runs in parallel with process.wait() to detect stuck processes
+            # that are technically "running" but no longer responding (e.g., stuck in
+            # Python shutdown with deadlocked threads).
+            #
+            # The watchdog checks:
+            # 1. Process.returncode (already exited?)
+            # 2. Health endpoint (responding?)
+            # 3. Consecutive health failures → force kill → restart
+            # ═══════════════════════════════════════════════════════════════════════════
+
+            async def _zombie_watchdog():
+                """
+                Monitor process health and force-kill if stuck/zombie.
+
+                Returns:
+                    Exit code if process should be considered crashed (-1 = zombie killed)
+                """
+                import aiohttp
+
+                # Configuration from environment
+                health_check_interval = float(os.environ.get("ZOMBIE_WATCHDOG_INTERVAL", "15.0"))
+                max_consecutive_failures = int(os.environ.get("ZOMBIE_WATCHDOG_MAX_FAILURES", "6"))
+                health_timeout = float(os.environ.get("ZOMBIE_WATCHDOG_HEALTH_TIMEOUT", "5.0"))
+                startup_grace_period = float(os.environ.get("ZOMBIE_WATCHDOG_GRACE_PERIOD", "120.0"))
+                backend_port = int(os.environ.get("BACKEND_PORT", "8010"))
+
+                health_url = f"http://localhost:{backend_port}/health"
+                consecutive_failures = 0
+                last_success = time.time()
+
+                # Wait for startup grace period
+                await asyncio.sleep(startup_grace_period)
+                logger.debug(f"[Watchdog] Starting zombie detection after {startup_grace_period}s grace period")
+
+                while True:
+                    try:
+                        # Check if process has already exited
+                        if self._process.returncode is not None:
+                            logger.debug("[Watchdog] Process already exited, stopping")
+                            return None  # Let process.wait() handle the exit
+
+                        # Check health endpoint
+                        try:
+                            async with aiohttp.ClientSession() as session:
+                                async with session.get(
+                                    health_url,
+                                    timeout=aiohttp.ClientTimeout(total=health_timeout)
+                                ) as resp:
+                                    if resp.status == 200:
+                                        consecutive_failures = 0
+                                        last_success = time.time()
+                                        logger.debug("[Watchdog] Health check passed")
+                                    else:
+                                        consecutive_failures += 1
+                                        logger.warning(
+                                            f"[Watchdog] Health check returned {resp.status} "
+                                            f"({consecutive_failures}/{max_consecutive_failures})"
+                                        )
+                        except Exception as health_err:
+                            consecutive_failures += 1
+                            logger.warning(
+                                f"[Watchdog] Health check failed: {type(health_err).__name__} "
+                                f"({consecutive_failures}/{max_consecutive_failures})"
+                            )
+
+                        # Check if we've exceeded max failures
+                        if consecutive_failures >= max_consecutive_failures:
+                            # Process is likely stuck/zombie
+                            logger.error(
+                                f"[Watchdog] 🚨 Process appears stuck/zombie "
+                                f"({consecutive_failures} consecutive health failures, "
+                                f"last success {time.time() - last_success:.1f}s ago)"
+                            )
+
+                            # Force kill the process
+                            if self._process.returncode is None:
+                                logger.warning("[Watchdog] Sending SIGKILL to stuck process...")
+                                try:
+                                    import signal
+                                    os.kill(self._process.pid, signal.SIGKILL)
+                                    # Wait a bit for the process to die
+                                    await asyncio.sleep(2)
+                                    logger.info(f"[Watchdog] Process force-killed (was PID {self._process.pid})")
+                                except ProcessLookupError:
+                                    logger.info("[Watchdog] Process already dead")
+                                except Exception as kill_err:
+                                    logger.error(f"[Watchdog] Failed to kill process: {kill_err}")
+
+                            return -1  # Signal that process was killed due to zombie state
+
+                        await asyncio.sleep(health_check_interval)
+
+                    except asyncio.CancelledError:
+                        logger.debug("[Watchdog] Cancelled")
+                        raise
+                    except Exception as e:
+                        logger.error(f"[Watchdog] Unexpected error: {e}")
+                        await asyncio.sleep(health_check_interval)
+
+            # Start watchdog as background task
+            watchdog_task = asyncio.create_task(_zombie_watchdog())
+
+            # Wait for EITHER process to exit OR watchdog to detect zombie
+            try:
+                done, pending = await asyncio.wait(
+                    [
+                        asyncio.create_task(self._process.wait()),
+                        watchdog_task
+                    ],
+                    return_when=asyncio.FIRST_COMPLETED
+                )
+
+                # Cancel pending tasks
+                for task in pending:
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+
+                # Get the result from whichever completed first
+                for task in done:
+                    result = task.result()
+                    if result is not None:
+                        exit_code = result if isinstance(result, int) else 1
+                        break
+                else:
+                    exit_code = self._process.returncode if self._process.returncode is not None else 1
+
+            except Exception as wait_err:
+                logger.error(f"Error waiting for process: {wait_err}")
+                exit_code = 1
+            finally:
+                watchdog_task.cancel()
+                try:
+                    await watchdog_task
+                except asyncio.CancelledError:
+                    pass
             
             self.process_info.last_exit_code = exit_code
             self.process_info.uptime_seconds = (
