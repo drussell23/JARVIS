@@ -148,13 +148,21 @@ class ConfigEvent:
     event_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     event_type: ConfigEventType = ConfigEventType.HEARTBEAT
     source_repo: str = "jarvis_body"
-    target_repo: Optional[str] = None
+    target_repo: Optional[str] = None  # Single target (backward compat)
+    target_repos: List[str] = field(default_factory=list)  # v95.15: Multiple targets
     config_key: str = ""
     config_value: Any = None
     version: int = 0
     timestamp: datetime = field(default_factory=datetime.utcnow)
     checksum: str = ""
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def get_targets(self) -> List[str]:
+        """Get all target repos (combines target_repo and target_repos)."""
+        targets = list(self.target_repos) if self.target_repos else []
+        if self.target_repo and self.target_repo not in targets:
+            targets.append(self.target_repo)
+        return targets
 
 
 @dataclass
