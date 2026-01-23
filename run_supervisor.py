@@ -435,9 +435,11 @@ import os
 import platform
 import signal
 import sys
+import threading
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -838,6 +840,204 @@ except ImportError:
         def packages_distributions():
             return {}
         metadata.packages_distributions = packages_distributions
+
+# =============================================================================
+# v111.0: UNIFIED SIGNAL HANDLER - Graceful Shutdown Orchestration
+# =============================================================================
+# Provides escalating shutdown behavior for SIGINT (Ctrl+C) and SIGTERM:
+#   - 1st signal: Graceful shutdown (waits for cleanup)
+#   - 2nd signal: Faster shutdown (shorter timeouts)
+#   - 3rd signal: Immediate exit (os._exit)
+#
+# This ensures the monolith shuts down cleanly without signal handler conflicts
+# between the supervisor and Uvicorn.
+# =============================================================================
+
+
+class UnifiedSignalHandler:
+    """
+    v111.0: Unified signal handling for the monolith.
+
+    Handles SIGINT (Ctrl+C) and SIGTERM gracefully, ensuring
+    all components shut down in the correct order.
+
+    Signal escalation:
+    - 1st signal: Graceful shutdown (waits for cleanup)
+    - 2nd signal: Faster shutdown (shorter timeouts)
+    - 3rd signal: Immediate exit (sys.exit)
+
+    Thread-safe: Uses threading.Lock for signal counting since signals
+    can arrive from any thread context.
+    """
+
+    def __init__(self):
+        self._shutdown_event: Optional[asyncio.Event] = None
+        self._shutdown_requested = False
+        self._shutdown_count = 0
+        self._lock = threading.Lock()
+        self._shutdown_reason: Optional[str] = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._installed = False
+
+    def _get_event(self) -> asyncio.Event:
+        """Lazily create shutdown event (needs running event loop)."""
+        if self._shutdown_event is None:
+            self._shutdown_event = asyncio.Event()
+        return self._shutdown_event
+
+    def install(self, loop: asyncio.AbstractEventLoop) -> None:
+        """
+        Install signal handlers on the event loop.
+
+        Args:
+            loop: The running asyncio event loop
+        """
+        if self._installed:
+            return  # Avoid duplicate registration
+
+        self._loop = loop
+
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                # Unix: Use async-safe loop.add_signal_handler
+                loop.add_signal_handler(
+                    sig,
+                    lambda s=sig: self._schedule_signal_handling(s)
+                )
+            except NotImplementedError:
+                # Windows doesn't support add_signal_handler
+                signal.signal(sig, lambda s, f, sig=sig: self._sync_handle_signal(sig))
+            except Exception as e:
+                # Log but don't fail - signal handling is best-effort
+                print(f"[v111.0] Warning: Could not install handler for {sig.name}: {e}")
+
+        self._installed = True
+        print("[v111.0] Unified signal handlers installed (SIGINT, SIGTERM)")
+
+    def _schedule_signal_handling(self, sig: signal.Signals) -> None:
+        """
+        Schedule async signal handling from sync context.
+
+        This is called by loop.add_signal_handler which runs in sync context.
+        We use create_task to handle the signal asynchronously.
+        """
+        if self._loop is not None and self._loop.is_running():
+            self._loop.create_task(self._handle_signal(sig))
+        else:
+            # Fallback to sync handling if loop not available
+            self._sync_handle_signal(sig.value)
+
+    def _sync_handle_signal(self, sig: int) -> None:
+        """
+        Synchronous signal handler (for Windows compatibility and fallback).
+
+        This handles signals when async handling is not possible.
+        """
+        with self._lock:
+            self._shutdown_count += 1
+            count = self._shutdown_count
+            self._shutdown_requested = True
+
+            try:
+                sig_name = signal.Signals(sig).name
+            except (ValueError, AttributeError):
+                sig_name = f"signal_{sig}"
+
+            self._shutdown_reason = sig_name
+
+            if count == 1:
+                print(f"\n[v111.0] Received {sig_name} - initiating graceful shutdown...")
+            elif count == 2:
+                print(f"[v111.0] Received second {sig_name} - forcing faster shutdown...")
+            else:
+                print(f"[v111.0] Received third {sig_name} - forcing immediate exit!")
+                os._exit(128 + sig)
+
+            # Try to set the shutdown event if available
+            if self._shutdown_event is not None:
+                try:
+                    if self._loop is not None and self._loop.is_running():
+                        self._loop.call_soon_threadsafe(self._shutdown_event.set)
+                    else:
+                        # Direct set as fallback
+                        self._shutdown_event.set()
+                except Exception:
+                    pass  # Best effort
+
+    async def _handle_signal(self, sig: signal.Signals) -> None:
+        """
+        Handle incoming signal asynchronously.
+
+        Provides escalating shutdown behavior based on signal count.
+        """
+        with self._lock:
+            self._shutdown_count += 1
+            count = self._shutdown_count
+
+        sig_name = sig.name
+        self._shutdown_reason = sig_name
+        self._shutdown_requested = True
+
+        if count == 1:
+            print(f"\n[v111.0] Received {sig_name} - initiating graceful shutdown...")
+            self._get_event().set()
+        elif count == 2:
+            print(f"[v111.0] Received second {sig_name} - forcing faster shutdown...")
+            self._get_event().set()
+        else:
+            print(f"[v111.0] Received third {sig_name} - forcing immediate exit!")
+            os._exit(128 + sig.value)
+
+    async def wait_for_shutdown(self) -> None:
+        """Wait for shutdown signal."""
+        await self._get_event().wait()
+
+    @property
+    def shutdown_requested(self) -> bool:
+        """Check if shutdown was requested."""
+        return self._shutdown_requested
+
+    @property
+    def shutdown_count(self) -> int:
+        """Number of shutdown signals received."""
+        return self._shutdown_count
+
+    @property
+    def shutdown_reason(self) -> Optional[str]:
+        """Reason for shutdown (signal name)."""
+        return self._shutdown_reason
+
+    @property
+    def is_fast_shutdown(self) -> bool:
+        """Check if we're in fast shutdown mode (2+ signals received)."""
+        return self._shutdown_count >= 2
+
+    def reset(self) -> None:
+        """Reset the signal handler state (for testing or restart scenarios)."""
+        with self._lock:
+            self._shutdown_requested = False
+            self._shutdown_count = 0
+            self._shutdown_reason = None
+            if self._shutdown_event is not None:
+                self._shutdown_event.clear()
+
+
+# v111.0: Global signal handler instance
+_unified_signal_handler: Optional[UnifiedSignalHandler] = None
+
+
+def get_unified_signal_handler() -> UnifiedSignalHandler:
+    """
+    Get or create the unified signal handler singleton.
+
+    Returns:
+        The global UnifiedSignalHandler instance
+    """
+    global _unified_signal_handler
+    if _unified_signal_handler is None:
+        _unified_signal_handler = UnifiedSignalHandler()
+    return _unified_signal_handler
+
 
 # =============================================================================
 # EARLY SHUTDOWN HOOK REGISTRATION
@@ -22260,7 +22460,22 @@ async def shutdown_trinity() -> None:
 
 
 async def main() -> int:
-    """Main entry point."""
+    """
+    Main entry point.
+
+    v111.0: Integrated unified signal handling for graceful shutdown.
+    Signal escalation: 1st=graceful, 2nd=faster, 3rd=immediate exit.
+    """
+    # =========================================================================
+    # v111.0: UNIFIED SIGNAL HANDLING - Install before anything else
+    # =========================================================================
+    # This ensures signals are handled consistently throughout startup and
+    # runtime, preventing conflicts between supervisor and Uvicorn.
+    # =========================================================================
+    signal_handler = get_unified_signal_handler()
+    loop = asyncio.get_running_loop()
+    signal_handler.install(loop)
+
     args = parse_args()
 
     # =========================================================================
@@ -22344,15 +22559,78 @@ async def main() -> int:
 
         return exit_code
     else:
-        # Normal supervisor mode
-        return await bootstrapper.run()
+        # =====================================================================
+        # v111.0: Normal supervisor mode with unified signal handling
+        # =====================================================================
+        # Run the bootstrapper with shutdown signal monitoring.
+        # If a shutdown signal is received, we gracefully stop the supervisor.
+        # =====================================================================
+        supervisor_task = asyncio.create_task(
+            bootstrapper.run(),
+            name="supervisor_main"
+        )
+        shutdown_task = asyncio.create_task(
+            signal_handler.wait_for_shutdown(),
+            name="shutdown_monitor"
+        )
+
+        try:
+            # Wait for either supervisor completion or shutdown signal
+            done, pending = await asyncio.wait(
+                [supervisor_task, shutdown_task],
+                return_when=asyncio.FIRST_COMPLETED
+            )
+
+            if shutdown_task in done:
+                # Shutdown signal received - stop supervisor gracefully
+                print("[v111.0] Shutdown signal received, stopping supervisor...")
+
+                # Cancel the supervisor task
+                supervisor_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await supervisor_task
+
+                # Return appropriate exit code based on signal
+                if signal_handler.shutdown_reason == "SIGINT":
+                    return 130  # 128 + SIGINT(2)
+                elif signal_handler.shutdown_reason == "SIGTERM":
+                    return 143  # 128 + SIGTERM(15)
+                else:
+                    return 0
+
+            # Supervisor completed on its own
+            if supervisor_task in done:
+                # Cancel the shutdown monitor
+                shutdown_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await shutdown_task
+
+                # Get the supervisor's exit code
+                try:
+                    return supervisor_task.result()
+                except Exception as e:
+                    print(f"[v111.0] Supervisor failed with error: {e}")
+                    return 1
+
+        except asyncio.CancelledError:
+            # Handle cancellation during wait
+            print("[v111.0] Main task cancelled, cleaning up...")
+            for task in [supervisor_task, shutdown_task]:
+                if not task.done():
+                    task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await task
+            return 130
+
+        return 0
 
 
 if __name__ == "__main__":
     try:
         exit_code = asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n[Supervisor] Interrupted by user")
+        # v111.0: This should rarely fire now since signals are handled in main()
+        print("\n[Supervisor] Interrupted by user (unhandled KeyboardInterrupt)")
         exit_code = 130  # 128 + SIGINT(2)
     except Exception as e:
         print(f"\n[Supervisor] Fatal error: {e}")
@@ -22361,4 +22639,10 @@ if __name__ == "__main__":
         # v110.0: Release singleton lock on exit
         if _SINGLETON_AVAILABLE:
             release_supervisor_lock()
+
+        # v111.0: Log final shutdown state
+        handler = _unified_signal_handler
+        if handler and handler.shutdown_count > 0:
+            print(f"[v111.0] Shutdown completed (signals received: {handler.shutdown_count}, reason: {handler.shutdown_reason})")
+
     sys.exit(exit_code)
